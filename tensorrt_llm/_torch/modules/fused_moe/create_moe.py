@@ -47,14 +47,21 @@ def get_moe_cls(
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
     elif moe_backend.upper() == "DENSEGEMM":
-        if quant_config is not None and quant_config.quant_mode.has_nvfp4():
-            return DenseGEMMFusedMoE
-        else:
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
             logger.warning(
                 "DenseGEMMFusedMoE only supports nvfp4. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
+        # DenseGEMM CuTe DSL kernels only support SM100/SM103.
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS:
+            logger.warning(
+                f"DenseGEMMFusedMoE only supports SM {DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS} "
+                f"(got SM {sm_version}). Using CutlassFusedMoE instead.")
+            return CutlassFusedMoE
+        return DenseGEMMFusedMoE
     elif moe_backend.upper() == "TRTLLM":
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
@@ -302,6 +309,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")

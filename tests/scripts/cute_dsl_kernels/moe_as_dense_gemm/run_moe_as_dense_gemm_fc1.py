@@ -601,7 +601,6 @@ def run(
             cute.testing.convert(ref_f8, ref_tensor)
             ref = ref_device.cpu()
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
-        # {$nv-internal-release begin}
         elif c_dtype is cutlass.Float4E2M1FN:
             # FP4 quantization with SFC (Scale Factor C) verification
             # Reference: run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py
@@ -807,7 +806,6 @@ def run(
             assert pass_rate >= 0.95, (
                 f"Only {pass_rate * 100:.2f}% elements within tolerance, expected >= 95%"
             )
-        # {$nv-internal-release end}
 
     def generate_tensors():
         a_tensor, _ = cutlass_torch.cute_tensor_like(

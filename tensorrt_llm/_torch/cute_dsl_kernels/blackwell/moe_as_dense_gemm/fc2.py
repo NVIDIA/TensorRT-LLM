@@ -144,15 +144,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         - Float32
         - Float16/BFloat16
         - Float8E4M3FN/Float8E5M2
-        # {$nv-internal-release begin}
         # Note: We don't have SFD generation support in this example for now,
         # so Float4E2M1FN output is only for internal testing and will not be released.
         - Float4E2M1FN
-        # {$nv-internal-release end}
 
     :note: Constraints:
         - MMA tiler M must be 128 or 256 (use_2cta_instrs)
-        # TODO: Add 64 and 192 support # {$nv-internal-release}
+        # TODO: Add 64 and 192 support
         - MMA tiler N must be 128/256
         - Cluster shape M must be multiple of 2 if Mma tiler M is 256
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
@@ -276,7 +274,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_tiler[1],
         )
         # (CTA_Tile_Shape_M, Round_Up(MMA_Tile_Shape_N, 128), MMA_Inst_Shape_K)
-        # TODO: round up to 128, it is prepared for supporting N=64 or 192. # {$nv-internal-release}
+        # TODO: round up to 128, it is prepared for supporting N=64 or 192.
         self.mma_inst_shape_mn_sfb = (
             self.mma_inst_shape_mn[0] // (2 if self.use_2cta_instrs else 1),
             cute.round_up(self.mma_inst_shape_mn[1], 128),
@@ -482,7 +480,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_inst_shape_mn,
         )
 
-        # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs. # {$nv-internal-release}
+        # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs.
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.a_major_mode,
@@ -2073,7 +2071,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cutlass.BFloat16,
             cutlass.Float8E5M2,
             cutlass.Float8E4M3FN,
-            cutlass.Float4E2M1FN,  # {$nv-internal-release}
+            cutlass.Float4E2M1FN,
         }:
             is_valid = False
 
@@ -2108,11 +2106,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             is_valid = False
-        # {$nv-internal-release begin}
         # TODO: Currently we don't support m major output for Float4E2M1FN
         if c_dtype is cutlass.Float4E2M1FN and c_major == "m":
             is_valid = False
-        # {$nv-internal-release end}
 
         return is_valid
 
@@ -2136,7 +2132,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Skip invalid mma tile shape
         if mma_tiler_mn[0] not in [128, 256]:
             is_valid = False
-        # TODO: Add tile_n=64 and tile_n=192 support  # {$nv-internal-release}
+        # TODO: Add tile_n=64 and tile_n=192 support
         if mma_tiler_mn[1] not in [64, 128, 256]:
             is_valid = False
         # Skip illegal cluster shape

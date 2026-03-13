@@ -96,6 +96,9 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
     # Memory buffer pool for CUDA graph compatibility
     buffers = get_memory_buffers()
 
+    # DenseGEMM only supports SM100 and SM103 (Blackwell CuTe DSL kernels).
+    _SUPPORTED_SM_VERSIONS = (100, 103)
+
     def __init__(
         self,
         *,
@@ -112,7 +115,29 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type=None,
     ):
+        # DenseGEMM CuTe DSL kernels only support SM100 and SM103.
+        from tensorrt_llm._utils import get_sm_version
+
+        sm_version = get_sm_version()
+        assert sm_version in self._SUPPORTED_SM_VERSIONS, (
+            f"DenseGEMMFusedMoE only supports SM {self._SUPPORTED_SM_VERSIONS} "
+            f"(got SM {sm_version}). The CuTe DSL kernels require Blackwell architecture."
+        )
+
+        # DenseGEMM kernel hardcodes SwiGLU fusion — reject other activation types
+        # before calling super().__init__() to fail fast with a clear message.
+        from ...utils import ActivationType
+
+        if activation_type is None:
+            activation_type = ActivationType.Swiglu
+        assert activation_type == ActivationType.Swiglu, (
+            f"DenseGEMMFusedMoE only supports SwiGLU activation "
+            f"(got activation_type={activation_type}). "
+            f"The FC1 kernel fuses SwiGLU into the GEMM epilogue."
+        )
+
         # FC2 DenseGEMM kernel tiles K dimension with MMA tile size 256.
         # weight_per_expert (= intermediate_size) must be 256-aligned so that
         # expert boundaries align with MMA tile boundaries.
@@ -138,7 +163,9 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
+
         # Environment variable to control fc2_alpha fusion into FC1's alpha_post
         # Default: enabled (1). Set to "0" to use the original per-token per-expert fc2_alpha in FC2.
         self.use_fused_fc2_alpha = os.environ.get("TRTLLM_MOE_FUSED_FC2_ALPHA", "1") == "1"
@@ -161,9 +188,10 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
     def load_weights(self, weights: List[Dict]):
         super().load_weights(weights)
         # Transpose w2_weight layout: (E, H, ...) -> (H, E, ...) for dense GEMM.
-        # Use contiguous() to materialize the transposed layout, then copy back
-        # into self.w2_weight in-place. This avoids clone() which would double
-        # peak memory for large expert counts.
+        # NOTE: .contiguous() on the transposed view allocates a full-size temporary,
+        # temporarily doubling peak memory.  An in-place multi-dim transpose is not
+        # feasible without complex cycle-following, and this runs only once during
+        # weight loading, so the trade-off is acceptable.
         w2_transposed = self.w2_weight.transpose(0, 1).contiguous()
         self.w2_weight.reshape([-1]).copy_(w2_transposed.reshape([-1]), non_blocking=True)
         del w2_transposed

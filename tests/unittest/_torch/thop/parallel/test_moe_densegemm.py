@@ -398,5 +398,4 @@ def test_nvfp4_dense_gemm_fc2_blackwell(
     is_close = torch.isclose(c.float(), c_ref.float(), rtol=rtol, atol=atol)
     match_ratio = is_close.sum().item() / c.numel()
 
-    print(f"FC2 Output match ratio: {match_ratio * 100:.2f}%")
     assert match_ratio > 0.90, f"Only {match_ratio * 100:.2f}% elements match, expected >= 90%"

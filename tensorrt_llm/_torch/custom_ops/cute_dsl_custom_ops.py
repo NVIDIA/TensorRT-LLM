@@ -3048,6 +3048,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.scaling_vector_size,
                 self.expert_count,
                 alpha_post is not None,  # Whether alpha_post is enabled
+                self.
+                output_dtype,  # Include output dtype to avoid cache collision
             )
 
             if cache_key not in self.__class__.kernel_cache:
@@ -3407,6 +3409,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn,
                 cluster_shape_mn,
                 self.scaling_vector_size,
+                self.
+                output_dtype,  # Include output dtype to avoid cache collision
             )
 
             if cache_key not in self.__class__.kernel_cache:

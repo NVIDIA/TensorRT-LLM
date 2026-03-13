@@ -413,7 +413,6 @@ def run(
             cute.testing.convert(ref_f8, ref_tensor)
             ref = ref_device.cpu()
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
-        # {$nv-internal-release begin}
         elif c_dtype is cutlass.Float4E2M1FN:
             # Convert ref : f32 -> f4 -> f32
             ref_f4_ = torch.empty(*(l, m, n), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
@@ -427,7 +426,6 @@ def run(
             cute.testing.convert(ref_f4, ref_tensor)
             ref = ref_device.cpu()
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
-        # {$nv-internal-release end}
 
     def generate_tensors():
         a_tensor, _ = cutlass_torch.cute_tensor_like(
