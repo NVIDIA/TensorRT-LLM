@@ -27,7 +27,6 @@ from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
-from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
@@ -1629,145 +1628,6 @@ class TestToolParserIntegration:
 
 
 # ============================================================================
-# Glm47ToolParser Tests
-# ============================================================================
-
-
-class TestGlm47ToolParser(BaseToolParserTestClass):
-    """Test suite for Glm47ToolParser class."""
-
-    def make_parser(self):
-        return Glm47ToolParser()
-
-    def make_tool_parser_test_cases(self):
-        single_text = ("Normal text"
-                       "<tool_call>get_weather\n"
-                       "<arg_key>location</arg_key>\n"
-                       "<arg_value>NYC</arg_value>\n"
-                       "</tool_call>")
-        single_expected_normal = "Normal text"
-        single_expected_name = "get_weather"
-        single_expected_params = {"location": "NYC"}
-
-        multiple_text = ("<tool_call>get_weather\n"
-                         "<arg_key>location</arg_key>\n"
-                         "<arg_value>LA</arg_value>\n"
-                         "</tool_call>"
-                         "<tool_call>search_web\n"
-                         "<arg_key>query</arg_key>\n"
-                         "<arg_value>AI</arg_value>\n"
-                         "</tool_call>")
-        multiple_names = ("get_weather", "search_web")
-
-        malformed_text = ("<tool_call>"
-                          "MALFORMED_NO_FUNCTION</tool_call>")
-
-        with_parameters_text = ("<tool_call>search_web\n"
-                                "<arg_key>query</arg_key>\n"
-                                "<arg_value>test</arg_value>\n"
-                                "</tool_call>")
-        with_parameters_name = "search_web"
-        with_parameters_params = {"query": "test"}
-
-        partial_bot_token = "<tool_cal"
-
-        undefined_tool_text = ("<tool_call>undefined_func\n"
-                               "<arg_key>arg</arg_key>\n"
-                               "<arg_value>value</arg_value>\n"
-                               "</tool_call>")
-
-        return ToolParserTestCases(
-            has_tool_call_true=
-            "Some text <tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>NYC</arg_value>\n</tool_call>",
-            detect_and_parse_single_tool=(
-                single_text,
-                single_expected_normal,
-                single_expected_name,
-                single_expected_params,
-            ),
-            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
-            detect_and_parse_malformed_tool=malformed_text,
-            detect_and_parse_with_parameters_key=(
-                with_parameters_text,
-                with_parameters_name,
-                with_parameters_params,
-            ),
-            parse_streaming_increment_partial_bot_token=partial_bot_token,
-            undefined_tool=undefined_tool_text,
-        )
-
-    def test_initialization(self, parser):
-        """Test that Glm47ToolParser initializes correctly."""
-        assert parser.bot_token == "<tool_call>"
-        assert parser.eot_token == "</tool_call>"
-
-    def test_detect_and_parse_no_arguments(self, sample_tools):
-        """Test GLM-4.7 specific: tool call with no arguments."""
-        parser = Glm47ToolParser()
-        text = "<tool_call>get_weather</tool_call>"
-
-        result = parser.detect_and_parse(text, sample_tools)
-
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-        assert json.loads(result.calls[0].parameters) == {}
-
-    def test_detect_and_parse_with_arguments(self, sample_tools):
-        """Test GLM-4.7 with normal arguments."""
-        parser = Glm47ToolParser()
-        text = ("<tool_call>get_weather\n"
-                "<arg_key>location</arg_key>\n"
-                "<arg_value>Tokyo</arg_value>\n"
-                "</tool_call>")
-
-        result = parser.detect_and_parse(text, sample_tools)
-
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
-
-    def test_streaming_no_args_tool_call(self, sample_tools):
-        """Test streaming a GLM-4.7 tool call with no arguments."""
-        parser = Glm47ToolParser()
-
-        # First increment sends the tool name
-        result1 = parser.parse_streaming_increment("<tool_call>get_weather",
-                                                   sample_tools)
-        names = [c.name for c in result1.calls if c.name]
-        assert "get_weather" in names
-
-        # Close the tool call directly (no args)
-        result2 = parser.parse_streaming_increment("</tool_call>", sample_tools)
-        params = "".join(c.parameters for c in result2.calls)
-        assert "{}" in params
-
-    def test_streaming_with_arguments(self, sample_tools):
-        """Test streaming a GLM-4.7 tool call with arguments."""
-        parser = Glm47ToolParser()
-
-        # Send bot token with function name
-        result = parser.parse_streaming_increment("<tool_call>get_weather\n",
-                                                  sample_tools)
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-
-        # Send arguments and close
-        result = parser.parse_streaming_increment(
-            "<arg_key>location</arg_key>\n"
-            "<arg_value>SF</arg_value>\n"
-            "</tool_call>", sample_tools)
-
-        all_params = "".join(call.parameters for call in result.calls
-                             if call.parameters)
-        assert "location" in all_params
-        assert "SF" in all_params
-
-    def test_supports_structural_tag(self, parser):
-        """Test that supports_structural_tag returns False."""
-        assert parser.supports_structural_tag() is False
-
-
-# ============================================================================
 # MiniMaxM2ToolParser Tests
 # ============================================================================
 
@@ -1943,11 +1803,6 @@ class TestMiniMaxM2ToolParser:
 class TestInterleavedThinkingReasoningParsers:
     """Test reasoning parsers used for interleaved thinking models."""
 
-    def test_glm45_reasoning_parser_registered(self):
-        """Test that glm45 reasoning parser is registered."""
-        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-        assert "glm45" in ReasoningParserFactory.keys()
-
     def test_minimax_m2_reasoning_parser_registered(self):
         """Test that minimax_m2 reasoning parser is registered."""
         from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
@@ -1957,31 +1812,6 @@ class TestInterleavedThinkingReasoningParsers:
         """Test that minimax_m2_append_think reasoning parser is registered."""
         from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
         assert "minimax_m2_append_think" in ReasoningParserFactory.keys()
-
-    def test_glm45_parser_handles_think_tags(self):
-        """Test GLM-4.5 reasoning parser correctly extracts thinking content."""
-        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-        parser = ReasoningParserFactory.create_reasoning_parser("glm45")
-
-        text = "I need to analyze this request.\nLet me think step by step.</think>The weather in NYC is sunny."
-        result = parser.parse(text)
-
-        assert result.reasoning_content == "I need to analyze this request.\nLet me think step by step."
-        assert result.content == "The weather in NYC is sunny."
-
-    def test_glm45_parser_streaming(self):
-        """Test GLM-4.5 reasoning parser streaming behavior."""
-        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-        parser = ReasoningParserFactory.create_reasoning_parser("glm45")
-
-        # Streaming: first chunk is reasoning content
-        result1 = parser.parse_delta("I need to think")
-        assert result1.reasoning_content == "I need to think"
-        assert result1.content == ""
-
-        # Then thinking ends
-        result2 = parser.parse_delta("</think>Final answer")
-        assert result2.content == "Final answer"
 
     def test_minimax_m2_parser_handles_think_tags(self):
         """Test MiniMax-M2 reasoning parser correctly extracts thinking content."""
@@ -1993,51 +1823,6 @@ class TestInterleavedThinkingReasoningParsers:
 
         assert result.reasoning_content == "Let me reason about this..."
         assert result.content == "Here is the answer."
-
-    def test_interleaved_thinking_with_tool_call(self):
-        """Test that reasoning parser + tool parser work together for interleaved thinking.
-
-        This simulates the key interleaved thinking pattern:
-        <think>reasoning</think><tool_call>...</tool_call>
-        """
-        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-
-        # The reasoning parser extracts thinking, leaving tool call in content
-        parser = ReasoningParserFactory.create_reasoning_parser("glm45")
-        text = ("I need to check the weather first.</think>"
-                "<tool_call>get_weather\n"
-                "<arg_key>location</arg_key>\n"
-                "<arg_value>NYC</arg_value>\n"
-                "</tool_call>")
-
-        result = parser.parse(text)
-
-        assert result.reasoning_content == "I need to check the weather first."
-        # The tool call should be in the content, ready for the tool parser
-        assert "<tool_call>" in result.content
-        assert "get_weather" in result.content
-
-        # Now the tool parser processes the content
-        tool_parser = Glm47ToolParser()
-        tool_result = tool_parser.detect_and_parse(result.content, [
-            ChatCompletionToolsParam(
-                type="function",
-                function=FunctionDefinition(
-                    name="get_weather",
-                    description="Get weather",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "location": {
-                                "type": "string"
-                            },
-                        },
-                    },
-                ),
-            )
-        ])
-        assert len(tool_result.calls) == 1
-        assert tool_result.calls[0].name == "get_weather"
 
     def test_interleaved_thinking_minimax_with_tool_call(self):
         """Test MiniMax-M2 reasoning + tool parsing pipeline."""
@@ -2088,24 +1873,11 @@ class TestInterleavedThinkingReasoningParsers:
 class TestToolParserFactory:
     """Test that the tool parser factory registers all expected parsers."""
 
-    def test_glm47_registered(self):
-        """Test that glm47 parser is registered in factory."""
-        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
-            ToolParserFactory
-        assert "glm47" in ToolParserFactory.parsers
-
     def test_minimax_m2_registered(self):
         """Test that minimax_m2 parser is registered in factory."""
         from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
             ToolParserFactory
         assert "minimax_m2" in ToolParserFactory.parsers
-
-    def test_create_glm47_parser(self):
-        """Test creating glm47 parser via factory."""
-        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
-            ToolParserFactory
-        parser = ToolParserFactory.create_tool_parser("glm47")
-        assert isinstance(parser, Glm47ToolParser)
 
     def test_create_minimax_m2_parser(self):
         """Test creating minimax_m2 parser via factory."""
