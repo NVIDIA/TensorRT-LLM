@@ -49,6 +49,85 @@ class _TinySharedKVModule(torch.nn.Module):
         return regular + shared
 
 
+def _context_meta(seq_len: int):
+    return (
+        torch.tensor([1, 0, 0], dtype=torch.int32),
+        torch.tensor([seq_len], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int64),
+        torch.tensor([0], dtype=torch.int32),
+    )
+
+
+def _decode_meta(input_pos: int):
+    return (
+        torch.tensor([0, 0, 1], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([input_pos], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int64),
+        torch.tensor([0], dtype=torch.int32),
+    )
+
+
+def _manual_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    batch, seq_len_q, num_heads, _ = q.shape
+    _, seq_len_k, num_kv_heads, _ = k.shape
+    if num_heads != num_kv_heads:
+        repeat_factor = num_heads // num_kv_heads
+        k = k.repeat_interleave(repeat_factor, dim=2)
+        v = v.repeat_interleave(repeat_factor, dim=2)
+
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    scores = torch.matmul(q_t, k_t.transpose(-2, -1))
+    causal_mask = torch.triu(
+        torch.ones(seq_len_q, seq_len_k, dtype=torch.bool),
+        diagonal=seq_len_k - seq_len_q + 1,
+    )
+    scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    if sliding_window is not None:
+        query_positions = torch.arange(seq_len_k - seq_len_q, seq_len_k)
+        key_positions = torch.arange(seq_len_k)
+        pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)
+        sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window)
+        scores = scores.masked_fill(sliding_window_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    weights = torch.softmax(scores, dim=-1)
+    return torch.matmul(weights, v_t).transpose(1, 2)
+
+
+def _make_layer_inputs(offset: float, seq_len: int, decode: bool = False):
+    base_q = torch.tensor(
+        [[[1.0, 0.0], [0.0, 1.0]]] if decode else
+        [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[0.5, 0.5], [0.5, -0.5]],
+            [[0.25, 0.75], [0.75, 0.25]],
+        ],
+        dtype=torch.float32,
+    )
+    base_k = torch.tensor(
+        [[[1.0, 0.0]]] if decode else
+        [[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]],
+        dtype=torch.float32,
+    )
+    base_v = torch.tensor(
+        [[[10.0, 1.0]]] if decode else
+        [[[10.0, 1.0]], [[2.0, 20.0]], [[30.0, 3.0]]],
+        dtype=torch.float32,
+    )
+    q = (base_q + offset).unsqueeze(0)
+    k = (base_k + offset).unsqueeze(0)
+    v = (base_v + offset * 10.0).unsqueeze(0)
+    assert q.shape[1] == seq_len
+    return q, k, v
+
+
 def test_shared_kv_transform_aliases_source_cache_placeholders():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -145,3 +224,146 @@ def test_torch_backend_attention_metadata_for_shared_kv_node():
     assert TorchBackendAttention.get_layer_idx(shared) == 1
     assert TorchBackendAttention.get_shared_kv_source_layer_idx(regular) is None
     assert TorchBackendAttention.get_shared_kv_source_layer_idx(shared) == 0
+
+
+def test_shared_kv_six_layer_stack_matches_reference_for_prefill_and_decode():
+    layer_sources = {4: 2, 5: 3}
+    sliding_layers = {2, 4}
+    prefill_len = 3
+    decode_pos = prefill_len
+    owner_caches = {
+        layer_idx: (
+            torch.zeros(1, 8, 1, 2, dtype=torch.float32),
+            torch.zeros(1, 8, 1, 2, dtype=torch.float32),
+        )
+        for layer_idx in range(4)
+    }
+    owner_history = {}
+
+    for layer_idx in range(6):
+        q_prefill, k_prefill, v_prefill = _make_layer_inputs(offset=float(layer_idx), seq_len=prefill_len)
+        batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen = _context_meta(prefill_len)
+        sliding_window = 2 if layer_idx in sliding_layers else None
+
+        if layer_idx in layer_sources:
+            source_idx = layer_sources[layer_idx]
+            k_cache, v_cache = owner_caches[source_idx]
+            output_prefill = torch.ops.auto_deploy.torch_cached_shared_kv_attention_with_cache(
+                q_prefill,
+                k_prefill,
+                v_prefill,
+                batch_info_host,
+                seq_len,
+                input_pos,
+                slot_idx,
+                cu_seqlen,
+                k_cache,
+                v_cache,
+                1.0,
+                None,
+                sliding_window,
+                None,
+            )
+            expected_prefill = _manual_attention(
+                q_prefill,
+                owner_history[source_idx]["k_prefill"],
+                owner_history[source_idx]["v_prefill"],
+                sliding_window=sliding_window,
+            )
+        else:
+            k_cache, v_cache = owner_caches[layer_idx]
+            output_prefill = torch.ops.auto_deploy.torch_cached_attention_with_cache(
+                q_prefill,
+                k_prefill,
+                v_prefill,
+                batch_info_host,
+                seq_len,
+                input_pos,
+                slot_idx,
+                cu_seqlen,
+                k_cache,
+                v_cache,
+                1.0,
+                None,
+                sliding_window,
+                None,
+            )
+            expected_prefill = _manual_attention(
+                q_prefill,
+                k_prefill,
+                v_prefill,
+                sliding_window=sliding_window,
+            )
+            owner_history[layer_idx] = {
+                "k_prefill": k_prefill.clone(),
+                "v_prefill": v_prefill.clone(),
+            }
+            torch.testing.assert_close(k_cache[0, :prefill_len], k_prefill[0], rtol=0.0, atol=0.0)
+            torch.testing.assert_close(v_cache[0, :prefill_len], v_prefill[0], rtol=0.0, atol=0.0)
+
+        torch.testing.assert_close(output_prefill, expected_prefill, rtol=1e-5, atol=1e-5)
+
+    for layer_idx in range(6):
+        q_decode, k_decode, v_decode = _make_layer_inputs(
+            offset=100.0 + float(layer_idx), seq_len=1, decode=True
+        )
+        batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen = _decode_meta(decode_pos)
+        sliding_window = 2 if layer_idx in sliding_layers else None
+
+        if layer_idx in layer_sources:
+            source_idx = layer_sources[layer_idx]
+            k_cache, v_cache = owner_caches[source_idx]
+            k_cache_before = k_cache.clone()
+            v_cache_before = v_cache.clone()
+            output_decode = torch.ops.auto_deploy.torch_cached_shared_kv_attention_with_cache(
+                q_decode,
+                k_decode,
+                v_decode,
+                batch_info_host,
+                seq_len,
+                input_pos,
+                slot_idx,
+                cu_seqlen,
+                k_cache,
+                v_cache,
+                1.0,
+                None,
+                sliding_window,
+                None,
+            )
+            torch.testing.assert_close(k_cache, k_cache_before, rtol=0.0, atol=0.0)
+            torch.testing.assert_close(v_cache, v_cache_before, rtol=0.0, atol=0.0)
+            expected_k = owner_history[source_idx]["k_full"]
+            expected_v = owner_history[source_idx]["v_full"]
+        else:
+            k_cache, v_cache = owner_caches[layer_idx]
+            output_decode = torch.ops.auto_deploy.torch_cached_attention_with_cache(
+                q_decode,
+                k_decode,
+                v_decode,
+                batch_info_host,
+                seq_len,
+                input_pos,
+                slot_idx,
+                cu_seqlen,
+                k_cache,
+                v_cache,
+                1.0,
+                None,
+                sliding_window,
+                None,
+            )
+            expected_k = torch.cat([owner_history[layer_idx]["k_prefill"], k_decode], dim=1)
+            expected_v = torch.cat([owner_history[layer_idx]["v_prefill"], v_decode], dim=1)
+            owner_history[layer_idx]["k_full"] = expected_k
+            owner_history[layer_idx]["v_full"] = expected_v
+            torch.testing.assert_close(k_cache[0, : decode_pos + 1], expected_k[0], rtol=0.0, atol=0.0)
+            torch.testing.assert_close(v_cache[0, : decode_pos + 1], expected_v[0], rtol=0.0, atol=0.0)
+
+        expected_decode = _manual_attention(
+            q_decode,
+            expected_k,
+            expected_v,
+            sliding_window=sliding_window,
+        )
+        torch.testing.assert_close(output_decode, expected_decode, rtol=1e-5, atol=1e-5)

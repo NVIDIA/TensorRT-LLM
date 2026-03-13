@@ -360,6 +360,16 @@ def test_gemma3n_reduced_layer_load_hook_slices_per_layer_weights():
     assert "model.layers.3.self_attn.q_proj.weight" in unexpected
 
 
+def test_gemma3n_causal_lm_ties_lm_head_to_input_embeddings():
+    model = Gemma3nForCausalLM(_small_text_config())
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+
+
+def test_gemma3n_conditional_lm_ties_lm_head_to_input_embeddings():
+    model = Gemma3nForConditionalGeneration(_small_full_config())
+    assert model.lm_head.weight.data_ptr() == model.model.language_model.embed_tokens.weight.data_ptr()
+
+
 def test_gemma3n_shared_kv_layer_metadata_matches_config():
     model = Gemma3nForCausalLM(_shared_kv_text_config())
     layer_expectations = [
