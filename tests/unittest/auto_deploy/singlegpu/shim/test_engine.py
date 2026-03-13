@@ -304,6 +304,46 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     cache_seq_interface.shutdown()
 
 
+def test_ad_engine_skips_multimodal_runtime_metadata_when_no_multimodal_requests():
+    """Chunked prefill should not stage multimodal metadata for pure text requests."""
+    device = torch.device("cuda")
+    max_seq_len = 64
+    max_batch_size = 8
+
+    kv_cache_config = KvCacheConfig(tokens_per_block=8)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        device=device,
+        kv_cache_config=kv_cache_config,
+    )
+    cache_seq_interface.to(device)
+
+    engine = ADEngine(get_inference_model, cache_seq_interface)
+    engine._enable_chunked_prefill = True
+
+    kv_manager = _DummyKVCacheManager(tokens_per_block=8)
+    resource_manager = _DummyResourceManager(kv_manager)
+
+    req = _DummyRequest(tokens=[1, 2, 3, 4], begin=0, size=4, seq_slot=0)
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests.append(req)
+
+    engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
+
+    named_args = cache_seq_interface.named_args
+    assert "mm_item_cu_seqlen" not in named_args
+    assert "mm_token_positions" not in named_args
+    assert "mm_token_lengths" not in named_args
+    assert "mm_special_offsets_cu_seqlen" not in named_args
+    assert "mm_special_offsets" not in named_args
+    assert "mm_chunk_flat_start" not in named_args
+    assert "mm_chunk_count" not in named_args
+
+    cache_seq_interface.shutdown()
+
+
 # =============================================================================
 # Hybrid Cache Manager Integration Tests
 # =============================================================================
