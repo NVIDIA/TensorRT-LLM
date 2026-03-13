@@ -181,6 +181,9 @@ public:
     using IdType = std::int32_t;
 
     static constexpr IdType kCachedBlocksRootId = -1;
+    //! Sentinel block ID used by placeholder blocks; chosen to be out of range so
+    //! any accidental mAllBlocksById[id] lookup produces an obvious OOB failure.
+    static constexpr IdType kPlaceholderBlockId = std::numeric_limits<IdType>::min();
 
     explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx);
 
@@ -259,9 +262,10 @@ public:
     [[nodiscard]] bool isPlaceholder() const;
 
     //! \brief Create a placeholder KVCacheBlock with no GPU memory.
-    //! \details The placeholder holds a block ID for sequence bookkeeping but mIsPlaceholder
-    //! is set so that getCacheBlockIndices returns a nil index and the eviction pool ignores it.
-    static BlockPtr createPlaceholder(IdType blockId);
+    //! \details mIsPlaceholder is set so that getCacheBlockIndices returns a nil index and
+    //! the eviction pool ignores it. The block ID is set to kPlaceholderBlockId to ensure
+    //! any accidental mAllBlocksById[id] lookup produces an obvious OOB failure.
+    static BlockPtr createPlaceholder();
 
     void detachDescendantsFromLookupTree();
     void freeBlockAndAllDescendants();

@@ -136,8 +136,13 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     TLLM_CHECK_WITH_INFO(
         block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
         "Attempted to release the cached-blocks root into the eviction queue");
-    // Placeholder blocks have no physical GPU memory and must never enter the eviction queue.
-    TLLM_CHECK_WITH_INFO(!block->isPlaceholder(), "Attempted to release a placeholder block into the eviction queue");
+    // Placeholder blocks (OOW sentinels) have no physical GPU memory and are not tracked in
+    // the eviction queue. releaseBlocks() may call this for any block whose ref count drops
+    // to zero, including placeholders, so we silently skip them here.
+    if (block->isPlaceholder())
+    {
+        return;
+    }
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 

@@ -534,10 +534,10 @@ TEST(MambaTest, kRecurrentStatesSentinelIsNegative)
 
 TEST(MambaTest, CreatePlaceholderIsPlaceholder)
 {
-    auto ph = KVCacheBlock::createPlaceholder(42);
+    auto ph = KVCacheBlock::createPlaceholder();
     ASSERT_NE(ph, nullptr);
     EXPECT_TRUE(ph->isPlaceholder());
-    EXPECT_EQ(ph->getBlockId(), 42);
+    EXPECT_EQ(ph->getBlockId(), KVCacheBlock::kPlaceholderBlockId);
 }
 
 TEST(MambaTest, RegularBlockIsNotPlaceholder)

@@ -108,13 +108,13 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
 {
 }
 
-BlockPtr KVCacheBlock::createPlaceholder(IdType blockId)
+BlockPtr KVCacheBlock::createPlaceholder()
 {
     // Use an out-of-range pool index as sentinel; the mIsPlaceholder flag gates
     // getCacheBlockIndices to return nil so this index is never submitted to the GPU.
     // The illegal value (INT32_MAX) ensures accidental use triggers an obvious OOB failure.
     static constexpr auto kInvalidPoolIndex = std::numeric_limits<tk::KVCacheIndex::UnderlyingType>::max();
-    auto block = std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{kInvalidPoolIndex});
+    auto block = std::make_shared<KVCacheBlock>(kPlaceholderBlockId, tk::KVCacheIndex{kInvalidPoolIndex});
     block->mIsPlaceholder = true;
     return block;
 }
@@ -2022,19 +2022,15 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
         auto& block = *it;
-        // Skip placeholder blocks: they were created by detachFrontBlock to mark OOW slots
-        // and have no ref count or GPU memory of their own.
-        if (block->isPlaceholder())
-        {
-            continue;
-        }
         // Decrease ref count
         if (block->hasRefs())
         {
             // An out-of-window block may not have any ref count.
             block->decRefCount();
         }
-        // If ref count is zero, move block to free blocks
+        // If ref count is zero, move block to free blocks.
+        // Placeholder blocks (OOW sentinels) have mRefCount==0 and are silently ignored
+        // by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
             mEvictionPolicy->releaseBlock(block);
@@ -2057,7 +2053,8 @@ void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 {
     for (auto& block : mAllocatedBlocksPerSeq.at(requestId))
     {
-        // Skip placeholder blocks: they are OOW sentinels with no scheduling ref count.
+        // Skip placeholder blocks: they are OOW sentinels whose mSchedulingRefCount is
+        // always 0. Calling decSchedulingRefCount() on them would underflow.
         if (block->isPlaceholder())
         {
             continue;
@@ -2474,8 +2471,8 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         // Replace the real block in mAllocatedBlocksPerSeq with a placeholder so that
         // subsequent storeBlocks calls see a placeholder at this OOW position and do a
         // trie lookup (advance searchRoot) rather than trying to re-insert the real block.
-        // The placeholder carries the same blockId for tracing but has no GPU memory.
-        blockSlot = KVCacheBlock::createPlaceholder(outOfWindowBlock->getBlockId());
+        // Use kPlaceholderBlockId (not the real block's ID) to avoid mAllBlocksById aliasing.
+        blockSlot = KVCacheBlock::createPlaceholder();
 
         outOfWindowBlock->decRefCount();
 
