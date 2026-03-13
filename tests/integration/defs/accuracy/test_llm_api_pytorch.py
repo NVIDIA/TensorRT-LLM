@@ -2118,7 +2118,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
-            moe_config=MoeConfig(backend=moe_backend),
+            moe_config=MoeConfig(
+                backend=moe_backend,
+                use_low_precision_moe_combine=low_precision_combine,
+            ),
         )
 
         mtp_config = None
@@ -2128,15 +2131,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             kv_cache_config.dtype = "fp8"
 
-        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config,
-                 use_low_precision_moe_combine=low_precision_combine) as llm:
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                speculative_config=mtp_config,
+        ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
             task = GSM8K(self.MODEL_NAME)
