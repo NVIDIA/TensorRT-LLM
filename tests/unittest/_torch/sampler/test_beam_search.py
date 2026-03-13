@@ -116,6 +116,10 @@ def _single_process_context():
 @pytest.fixture(scope="module")
 def llm(fixed_params, input_prompts, model_kwargs, single_process: bool,
         with_cuda_graph_and_overlap: bool):
+    check_no_sync = single_process  # single_process only used for sync check
+    if check_no_sync and model_kwargs["sampler_type"] != "TorchSampler":
+        pytest.skip("Sync check only supported for TorchSampler")
+
     gc.collect(
         2)  # force destruction of any other LLM instances (cf. comment above)
     with _single_process_context() if single_process else nullcontext():
@@ -366,9 +370,6 @@ def test_beam_search_e2e(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     llm_args = cast(TorchLlmArgs, llm.args)  # type: ignore[redundant-cast]
-    check_no_sync = single_process  # single_process only used for sync check
-    if check_no_sync and llm_args.sampler_type != "TorchSampler":
-        pytest.skip("Sync check only supported for TorchSampler")
 
     if return_log_probs and num_prompts > 1 and llm_args.sampler_type == "TRTLLMSampler":
         pytest.skip(
@@ -402,7 +403,7 @@ def test_beam_search_e2e(
         llm,
         input_prompts[:num_prompts],
         sampling_params,
-        check_no_sync=check_no_sync,
+        check_no_sync=single_process,
         monkeypatch=monkeypatch,
     )
 
