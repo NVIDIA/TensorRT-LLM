@@ -421,8 +421,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         if not self._is_started_request(req):
             return False
-        kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
-        return kv_cache is not None and kv_cache.is_active
+        return self.kv_cache_manager.is_request_active(req.py_request_id)
 
     def _try_evict_for_gen(self, req, requests_list, req_it, req_it_end, evicted):
         """Evict started requests from active_requests tail to make room.

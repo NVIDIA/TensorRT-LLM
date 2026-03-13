@@ -43,6 +43,7 @@ def make_gen_request(
 ):
     req = Mock()
     req.request_id = request_id
+    req.py_request_id = request_id
     req.state_value = GEN_IN_PROGRESS
     req.get_beam_width_by_iter.return_value = beam_width
     req.num_draft_tokens = num_draft_tokens
@@ -66,6 +67,7 @@ def make_ctx_request(
 ):
     req = Mock()
     req.request_id = request_id
+    req.py_request_id = request_id
     req.state_value = CONTEXT_INIT
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len or context_remaining_length
@@ -85,6 +87,7 @@ def make_ctx_request(
 def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     req = Mock()
     req.request_id = request_id
+    req.py_request_id = request_id
     req.state_value = ENCODER_INIT
     req.encoder_output_len = encoder_output_len
     req.lora_task_id = lora_task_id
@@ -97,6 +100,7 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
 def make_disagg_request(request_id):
     req = Mock()
     req.request_id = request_id
+    req.py_request_id = request_id
     req.state_value = DISAGG_GEN_INIT
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
@@ -107,11 +111,27 @@ def make_disagg_request(request_id):
 def make_filtered_request(request_id, state_value=0):
     req = Mock()
     req.request_id = request_id
+    req.py_request_id = request_id
     req.state_value = state_value
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
     return req
+
+
+class _KVCacheMap(dict):
+    """Dict that auto-creates active mock KV cache entries on first access.
+
+    This mirrors real KVCacheManagerV2 behaviour where every scheduled request
+    has a kv_cache entry. Tests that need a suspended entry can explicitly set
+    ``kv_cache_map[req_id].is_active = False``.
+    """
+
+    def __missing__(self, key):
+        entry = Mock()
+        entry.is_active = True
+        self[key] = entry
+        return entry
 
 
 def make_kv_cache_manager(
@@ -122,6 +142,7 @@ def make_kv_cache_manager(
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
+    mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
@@ -472,6 +493,26 @@ class TestKVCacheFailuresGen:
         reqs = [make_gen_request(0), make_gen_request(1)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
+
+    def test_suspended_request_not_evictable(self):
+        """A started request with suspended (inactive) KV cache is not a valid victim."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] <= 1  # only first succeeds
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        # Mark victim's KV cache as suspended (inactive)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        reqs = [make_gen_request(0), make_gen_request(1), victim]
+        out = sched.schedule_request(reqs, set())
+        # gen0 succeeds, gen1 fails, victim is not evictable (suspended)
+        # → gen1 self-evicts, victim is not in paused list from eviction
+        assert ids(out.generation_requests) == [0]
+        assert 99 not in ids(out.paused_requests)
 
 
 class TestKVCacheFailuresCtx:
@@ -872,12 +913,8 @@ class TestPEFT:
         """determine_num_pages returns different values per req."""
         mgr = make_kv_cache_manager()
         peft = make_peft_cache_manager(max_device_pages=5, pages_per_task=1)
-        # Override to return different values per call
-        call_count = [0]
-
         def determine_pages(req):
-            call_count[0] += 1
-            return 3 if call_count[0] == 1 else 3  # 3+3=6 > 5
+            return 3  # 3+3=6 > 5
 
         peft.determine_num_pages.side_effect = determine_pages
         sched = make_scheduler(mgr, peft_cache_manager=peft)
