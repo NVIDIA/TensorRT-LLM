@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1957,7 +1957,8 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
         "--max_num_tokens=2048",
         "--disable_kv_cache_reuse",
     ]
-    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
+    output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
+    assert "Generated text:" in output, output[-4000:]
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -3118,6 +3119,55 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
             print_info(f"eval output:\n{output}")
             mmlu_accuracy = get_mmlu_accuracy(output)
             assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_mpi_world_size(2)
+@pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (1, 2)],
+                         ids=["tp2", "pp2"])
+@pytest.mark.parametrize("model_path", [
+    pytest.param('llama-3.1-model/Meta-Llama-3.1-70B', marks=skip_pre_hopper),
+    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
+                 marks=skip_pre_hopper),
+    pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
+                 marks=skip_pre_blackwell),
+    pytest.param('DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B',
+                 marks=skip_pre_hopper),
+    pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8',
+                 marks=skip_pre_hopper),
+    pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct',
+                 marks=skip_pre_hopper),
+    pytest.param('modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
+                                           tp_size, pp_size):
+    print(
+        f"Testing quickstart {model_path} with tp_size={tp_size}, pp_size={pp_size}."
+    )
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    prompt = "Explain why New York is great city to live in, in 1 short paragraph"
+    run_cmd = [
+        "python3",
+        str(example_root / "quickstart_advanced.py"),
+        f"--model_dir={llm_models_root()}/{model_path}",
+        f"--tp_size={tp_size}",
+        f"--pp_size={pp_size}",
+        "--max_num_tokens=4096",
+        "--max_batch_size=1",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--prompt",
+        prompt,
+    ]
+
+    if ("Llama-4" in model_path or "Qwen3" in model_path) and tp_size > 1:
+        run_cmd.append(f"--moe_ep_size={tp_size}")
+
+    output = check_output(run_cmd, env=llm_venv._new_env)
+    print(output)
+    assert "Generated text:" in output, output[-4000:]
 
 
 @pytest.mark.skip_less_device_memory(80000)
