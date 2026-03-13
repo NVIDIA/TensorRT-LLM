@@ -2162,6 +2162,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                  kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
@@ -2201,6 +2202,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             kv_cache_config.dtype = "fp8"
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                  kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
                  **pytorch_config,
                  enable_attention_dp=False,
                  speculative_config=mtp_config) as llm:
@@ -2267,6 +2269,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
+                enable_chunked_prefill=False,
                 **pytorch_config,
                 enable_attention_dp=attention_dp,
                 speculative_config=mtp_config,

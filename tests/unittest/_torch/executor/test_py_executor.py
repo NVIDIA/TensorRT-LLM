@@ -7,6 +7,7 @@ to PyExecutor, including:
 - waiting_queue management
 - is_shutdown state management
 - expected_num_active_requests tracking
+- one-model MTP draft token normalization before scheduling
 """
 
 from unittest.mock import Mock
@@ -17,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
 
@@ -178,3 +180,110 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert mock_executor.get_waiting_queue_size() == 1
+
+
+def _normalize_one_model_mtp_draft_tokens(drafter, model_engine, active_requests):
+    """Replicate the one-model MTP draft token normalization from
+    PyExecutor._prepare_and_schedule_batch so it can be unit-tested
+    without standing up a full executor.
+    """
+    if drafter is None and model_engine.enable_spec_decode:
+        max_draft = model_engine.max_total_draft_tokens
+        if max_draft > 0:
+            for request in active_requests:
+                if request.state not in (
+                    LlmRequestState.GENERATION_IN_PROGRESS,
+                    LlmRequestState.DISAGG_GENERATION_INIT,
+                ):
+                    continue
+                request.draft_tokens = [0] * max_draft
+
+
+def test_one_model_mtp_draft_token_normalization():
+    """Verify that one-model MTP normalizes C++ draft_tokens for all
+    generation requests before the scheduler runs.
+
+    Without this normalization the C++ scheduler can under-budget
+    generation requests (seeing fewer draft tokens than the runtime
+    will actually materialize), causing a total_num_tokens overflow.
+    """
+    max_total_draft_tokens = 2  # e.g. MTP nextn=2
+
+    model_engine = Mock()
+    model_engine.enable_spec_decode = True
+    model_engine.max_total_draft_tokens = max_total_draft_tokens
+
+    # Generation request with stale (empty) draft_tokens — simulates
+    # a request that just transitioned from context to generation.
+    gen_req = Mock()
+    gen_req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    gen_req.draft_tokens = []
+
+    # Context request — should NOT be touched.
+    ctx_req = Mock()
+    ctx_req.state = LlmRequestState.CONTEXT_INIT
+    ctx_req.draft_tokens = []
+
+    # Disagg generation init — should be normalized.
+    disagg_req = Mock()
+    disagg_req.state = LlmRequestState.DISAGG_GENERATION_INIT
+    disagg_req.draft_tokens = [99]  # stale value
+
+    active_requests = [gen_req, ctx_req, disagg_req]
+
+    _normalize_one_model_mtp_draft_tokens(
+        drafter=None,
+        model_engine=model_engine,
+        active_requests=active_requests,
+    )
+
+    assert gen_req.draft_tokens == [0] * max_total_draft_tokens, (
+        "GENERATION_IN_PROGRESS request should have normalized draft_tokens"
+    )
+    assert ctx_req.draft_tokens == [], "CONTEXT_INIT request should not be modified"
+    assert disagg_req.draft_tokens == [0] * max_total_draft_tokens, (
+        "DISAGG_GENERATION_INIT request should have normalized draft_tokens"
+    )
+
+
+def test_one_model_mtp_normalization_skipped_with_drafter():
+    """When a two-model drafter is present, one-model normalization
+    should be skipped (the drafter path handles it separately)."""
+    model_engine = Mock()
+    model_engine.enable_spec_decode = True
+    model_engine.max_total_draft_tokens = 3
+
+    drafter = Mock()  # non-None drafter
+
+    gen_req = Mock()
+    gen_req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    gen_req.draft_tokens = []
+
+    _normalize_one_model_mtp_draft_tokens(
+        drafter=drafter,
+        model_engine=model_engine,
+        active_requests=[gen_req],
+    )
+
+    assert gen_req.draft_tokens == [], (
+        "With a two-model drafter, one-model normalization should not run"
+    )
+
+
+def test_one_model_mtp_normalization_skipped_when_spec_decode_off():
+    """When spec decode is disabled, normalization should be skipped."""
+    model_engine = Mock()
+    model_engine.enable_spec_decode = False
+    model_engine.max_total_draft_tokens = 2
+
+    gen_req = Mock()
+    gen_req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    gen_req.draft_tokens = []
+
+    _normalize_one_model_mtp_draft_tokens(
+        drafter=None,
+        model_engine=model_engine,
+        active_requests=[gen_req],
+    )
+
+    assert gen_req.draft_tokens == [], "With spec decode disabled, normalization should not run"
