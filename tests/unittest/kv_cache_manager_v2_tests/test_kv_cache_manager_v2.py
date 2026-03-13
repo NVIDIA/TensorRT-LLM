@@ -1089,28 +1089,54 @@ class TestResizeQuota(TestKVCacheManagerV2):
         # blocks, 5 is for SWA (window=128), n is for full attention.
         max_seq_len = 32 * 22  # 23 blocks will require more than 32MB memory
         seq_len = max_seq_len
-        kv_cache_lst = [self.manager.create_kv_cache() for _ in range(2)]
+        tokens_per_block = self.cfg.tokens_per_block
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
+
+        # First commit some blocks to fill all levels of cache. This helps test the case where shrinking
+        # the quota will drop some pages from the last-level cache.
+        for _ in range(11):
+            kv_cache = self.manager.create_kv_cache()
+            kv_cache.resume(stream)
+            for i in range(exact_div(seq_len, tokens_per_block)):
+                kv_cache.capacity = tokens_per_block * (i + 1)
+                input = [self.next_token() for _ in range(tokens_per_block)]
+                kv_cache.commit(input)
+            kv_cache.close()
+
+        # Now create two requests.
+        kv_cache_lst = [self.manager.create_kv_cache() for _ in range(2)]
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
             assert success
             kv_cache.stop_committing()
             success = kv_cache.resize(seq_len, seq_len)
             assert success
-        for kv_cache in kv_cache_lst:
+        # Without reversed, we will hit a corner case where all cache levels are
+        # full, but the kv cache we want to resume is in the last level, while
+        # the gpu cache level is occupied by the request we don't resume first.
+        # Then we have a dead lock.
+        # To fix this, we need to have a fallback non-batched iterative page
+        # migration strategy instead of batched_lock_to_gpu. But this happens
+        # only in very rare case, where the last-level cache can't hold all
+        # suspended requests, and resume happens in FIFO order.
+        for kv_cache in reversed(kv_cache_lst):
             kv_cache.suspend()
         GPU_LEVEL = CacheLevel(0)
         HOST_LEVEL = CacheLevel(1)
+        DISK_LEVEL = CacheLevel(2)
         # Shrink the gpu quota
         success = self.manager.resize(GPU_LEVEL, 32 << 20)
-        assert success
+        assert success and self.manager.get_quota(GPU_LEVEL) <= 32 << 20
         # also shrink the host quota, this would evict some pages to disk
         success = self.manager.resize(HOST_LEVEL, 2 << 20)
-        assert success
+        assert success and self.manager.get_quota(HOST_LEVEL) <= 2 << 20
+        # also shrink the disk quota, this would drop some old pages
+        success = self.manager.resize(DISK_LEVEL, 32 << 20)
+        assert success and self.manager.get_quota(DISK_LEVEL) <= 32 << 20
         success = kv_cache_lst[0].resume(stream)
         assert success
-        # After shrinking, GPU memory can hold only one request, so expect
+        # After shrinking, GPU memory can hold only one request, so expect failure
         # for resuming of the second request.
         success = kv_cache_lst[1].resume(stream)
         assert not success

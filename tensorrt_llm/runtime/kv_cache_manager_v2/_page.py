@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 from ._eviction_controller import NodeRef
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
-from ._storage._core import PoolIndex0, Slot
+from ._storage._core import Slot
 from ._utils import (
     CachedCudaEvent,
     assert_critical,
@@ -394,9 +394,6 @@ class _SharedPageLock:
             beam_index, ordinal, life_cycle, PageIndex(self.page.slot_id)
         )
         assert old_base_index == BAD_PAGE_INDEX
-        new_index = self._get_page_index()
-        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
-        assert old_index == BAD_PAGE_INDEX
 
     def __del__(self) -> None:
         if self._uniq_lock is not None:
@@ -415,21 +412,8 @@ class _SharedPageLock:
             beam_index, ordinal, life_cycle, new_index
         )
         assert NDEBUG or old_base_index == self._get_base_page_index()
-        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
-        assert NDEBUG or old_index == self._get_page_index()
         self._uniq_lock = None
         return page
-
-    def replicate(self, ordinal: BlockOrdinal) -> "_SharedPageLock":
-        user = self._user
-        kv_cache, beam_index, _, life_cycle = user
-        return self.holder.lock(unwrap_rawref(kv_cache), beam_index, ordinal, life_cycle, True)
-
-    def _get_page_index(self) -> PageIndex:
-        storage = unwrap_rawref(self._user.kv_cache).manager._storage
-        user = self._user
-        num_buffers_per_slot = storage._slot_to_page_indices[user.life_cycle][PoolIndex0]
-        return PageIndex(self.page.slot_id * num_buffers_per_slot)
 
     def _get_base_page_index(self) -> PageIndex:
         return PageIndex(self.page.slot_id)

@@ -186,6 +186,45 @@ class CudaGraphConfig(StrictBaseModel):
 
         return batch_sizes
 
+    @staticmethod
+    def _merge_schedule_keys(batch_sizes: List[int],
+                             schedule: dict[int, int]) -> List[int]:
+        """Merge draft_len_schedule keys into batch_sizes so that each
+        schedule threshold has a corresponding CUDA graph.
+
+        e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300
+        into batch_sizes.
+
+        Args:
+            batch_sizes: Sorted list of existing CUDA graph batch sizes.
+            schedule: draft_len_schedule mapping batch-size thresholds to
+                draft lengths.
+
+        Returns:
+            Sorted, deduplicated list of batch sizes.
+        """
+        max_bs = batch_sizes[-1]
+        extra = sorted(bs for bs in schedule if bs <= max_bs)
+        if not extra:
+            return batch_sizes
+
+        merged = []
+        i, j = 0, 0
+        while i < len(batch_sizes) and j < len(extra):
+            if batch_sizes[i] < extra[j]:
+                merged.append(batch_sizes[i])
+                i += 1
+            elif batch_sizes[i] > extra[j]:
+                merged.append(extra[j])
+                j += 1
+            else:
+                merged.append(batch_sizes[i])
+                i += 1
+                j += 1
+        merged.extend(batch_sizes[i:])
+        merged.extend(extra[j:])
+        return merged
+
 
 class GuidedDecodingConfig(StrictBaseModel):
 
@@ -669,21 +708,25 @@ class DecodingBaseConfig(StrictBaseModel):
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
     )
 
-    max_concurrency: Optional[NonNegativeInt] = Field(
+    max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
-        "When specified, speculation will be disabled at batch sizes above this value. Otherwise, "
-        "speculation will always be on. PyTorch backend only.")
+        "When specified (>0), speculation will be disabled at batch sizes above this value. Otherwise, "
+        "speculation will always be on. PyTorch backend only. "
+        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly supports max concurrency control."
+    )
 
     draft_len_schedule: Optional[dict[int, int]] = Field(
         default=None,
         description=
-        "Developer interface: dynamically adjust draft length based on active batch size in runtime. "
-        "Maps batch size to draft lengths. For example, {1: 4, 4: 2, 8: 0} means: "
-        "batch_size >= 1 uses draft_len=4, batch_size >= 4 uses draft_len=2, "
-        "batch_size >= 8 uses draft_len=0 (disable speculation). "
-        "draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals "
-        "max_draft_len for consistency; for example, if max_draft_len=4, the schedule must contain {1: 4}."
+        "Developer interface: dynamically adjust draft length based on active batch size in runtime."
+        "Maps batch size to draft lengths."
+        "For example: draft_len_schedule = {4:4, 8:2, 32:1}"
+        " - Batch sizes 1-4:   use draft_len=4"
+        " - Batch sizes 5-8:   use draft_len=2"
+        " - Batch sizes 9-32:  use draft_len=1"
+        " - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). "
+        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
     )
 
     load_format: Optional[str] = Field(
@@ -719,6 +762,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
+    _translated_from_max_concurrency: bool = PrivateAttr(False)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -736,20 +781,16 @@ class DecodingBaseConfig(StrictBaseModel):
                         f"draft_len_schedule: draft length must be >= 0, got {draft_len}"
                     )
 
-            # Require batch_size=1 in schedule
-            if 1 not in v:
-                raise ValueError(
-                    "draft_len_schedule must include batch_size=1. "
-                    "All systems can have batch_size=1. Add {1: <max_draft_len>} to your schedule."
-                )
-
-            # Enforce schedule[1] == max_draft_len for consistency
+            # Enforce smallest schedule key maps to max_draft_len for consistency.
+            smallest_batch_size = min(v.keys())
             max_draft_len = info.data.get('max_draft_len')
-            if max_draft_len is not None and v[1] != max_draft_len:
+            if max_draft_len is not None and v[
+                    smallest_batch_size] != max_draft_len:
                 raise ValueError(
-                    f"draft_len_schedule[1] must equal max_draft_len for consistency. "
-                    f"Got schedule[1]={v[1]}, but max_draft_len={max_draft_len}. "
-                    f"batch_size=1 should use maximum draft length.")
+                    f"draft_len_schedule[{smallest_batch_size}] must equal max_draft_len "
+                    f"because it is the smallest batch-size key. "
+                    f"Got schedule[{smallest_batch_size}]={v[smallest_batch_size]}, "
+                    f"but max_draft_len={max_draft_len}.")
 
             # Enforce all draft lengths <= max_draft_len
             if max_draft_len is not None:
@@ -764,6 +805,34 @@ class DecodingBaseConfig(StrictBaseModel):
             # This ensures efficient lookup
             return dict(sorted(v.items(), key=lambda x: x[0]))
         return v
+
+    @model_validator(mode='after')
+    # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
+    # 2. If max_concurrency is set, translate it to the corresponding draft_len_schedule.
+    def validate_max_concurrency_and_draft_len_schedule_mutually_exclusive(
+            self) -> "DecodingBaseConfig":
+        if self.max_concurrency is not None and self.draft_len_schedule is not None:
+            # Avoid ValueError during nested re-validation when only max_concurrency is set and draft_len_schedule is translated from max_concurrency
+            if self._translated_from_max_concurrency:
+                return self
+            raise ValueError(
+                "max_concurrency and draft_len_schedule are mutually exclusive. "
+                "Use max_concurrency for a simple speculation cutoff, or "
+                "draft_len_schedule for dynamic draft-length control.")
+
+        if self.max_concurrency is None:
+            return self
+
+        if (self.max_draft_len is None
+                or not self.spec_dec_mode.support_dynamic_draft_len()):
+            return self
+
+        self.draft_len_schedule = {
+            int(self.max_concurrency): int(self.max_draft_len)
+        }
+        self._translated_from_max_concurrency = True
+
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         """
@@ -3462,6 +3531,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
                 if self.backend == "_autodeploy":
                     self.speculative_config._draft_target_one_model = False
+
+            # If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.
+            # Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.
+            if (self.cuda_graph_config is not None
+                    and self.speculative_config.draft_len_schedule is not None):
+                if not self.cuda_graph_config.enable_padding:
+                    logger.info(
+                        "Automatically enabling cuda_graph_config.enable_padding "
+                        "because draft_len_schedule is set.")
+                    self.cuda_graph_config.enable_padding = True
+                self.cuda_graph_config.batch_sizes = CudaGraphConfig._merge_schedule_keys(
+                    self.cuda_graph_config.batch_sizes,
+                    self.speculative_config.draft_len_schedule)
+                logger.debug(
+                    f"draft_len_schedule keys added to cuda_graph_config.batch_sizes, current batch_sizes: {self.cuda_graph_config.batch_sizes}"
+                )
 
         else:
             self.decoding_config = None
