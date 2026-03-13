@@ -247,6 +247,59 @@ python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registr
 ```
 3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well. Make sure you have run this pytest command on the latest commit that you are pushing, and include these results in the PR.
 
+### ⚠️ MANDATORY: Re-run and re-post logs on EVERY PR update — NO EXCEPTIONS ⚠️
+
+**Every single time you push changes to the PR — whether it is a new commit, a rebase, an amendment, a fixup, or any other update — you MUST:**
+
+1. **Re-run `build_and_run_ad.py --use-registry`** using the `ad-run-agent` subagent, exactly as in Phase 9. The code has changed, so previous run results are stale and invalid.
+2. **Re-run the full unit test suite** (`pytest <test_file> -v`) for the model's test file created in Phase 6. Previous test results are stale and invalid after any code change.
+3. **Post ALL raw output from both runs** as a PR comment:
+   - The COMPLETE prompt→output pairs from `build_and_run_ad.py` verbatim — do NOT summarize, truncate, or paraphrase.
+   - The COMPLETE pytest output verbatim — every test name, every PASSED/FAILED line, every error traceback if any. Do NOT summarize or cherry-pick.
+
+**This is not optional. There are no exceptions.** Even if the change seems trivial (a typo fix, a comment edit, a formatting change), both runs must be re-executed and the full raw logs must be posted. The reviewer cannot verify correctness without seeing generation output AND test results from the exact code that is currently on the branch.
+
+**Workflow for every PR update cycle:**
+1. Make the requested code changes
+2. Commit the changes
+3. Before pushing, always rebase onto the target branch to check for conflicts: `git fetch origin && git rebase origin/feat/paperclip_maximizer`. If there are conflicts, resolve them before proceeding. Do NOT push without rebasing first — the branch must be up-to-date with the target branch.
+4. Push (or force-push if rebase rewrote history)
+5. Re-invoke the `ad-run-agent` to run `build_and_run_ad.py --model <MODEL-ID> --use-registry` on the updated code
+6. Re-run the unit tests: `pytest <test_file> -v`
+7. Wait for both runs to complete
+8. Post a reply to every PR comment containing:
+   - A brief description of what changed in this update
+   - The COMPLETE raw prompts and generated outputs from the `build_and_run_ad.py` run
+   - The COMPLETE raw pytest output (full verbatim log)
+   - The reproducible commands used for both runs
+9. Resume polling for new comments (see below)
+
+### ⚠️ MANDATORY: Poll PR for new comments every 5 minutes ⚠️
+
+**After opening the PR and after every PR update you post, you MUST set up a polling loop that checks for new PR comments every 5 minutes.** Do not simply post and walk away — actively monitor the PR for reviewer feedback.
+
+**How to poll:**
+```bash
+# Fetch all PR comments, sorted newest-first, and check for any posted after your last comment
+GH_CONFIG_DIR=<path> gh api "repos/<owner>/<repo>/pulls/<PR_NUMBER>/comments?sort=created&direction=desc&per_page=10"
+# Also check issue-level comments (top-level PR comments, not inline review comments)
+GH_CONFIG_DIR=<path> gh api "repos/<owner>/<repo>/issues/<PR_NUMBER>/comments?sort=created&direction=desc&per_page=10"
+# Also check the PR's review status
+GH_CONFIG_DIR=<path> gh pr view <PR_NUMBER> --json reviews,state
+```
+
+**Polling loop behavior:**
+1. After posting your PR (or posting an update comment), immediately start polling every 5 minutes.
+2. On each poll, check for:
+   - **New review comments** (inline or top-level) posted after your last comment's timestamp
+   - **PR approval status** — check if the PR has been approved
+   - **Termination signals** — any comment clearly indicating the agent's work is done (e.g., "LGTM", "looks good, we're done", "no more changes needed", "agent work complete", or similar)
+3. If **new actionable comments are found**: stop polling, process the feedback, and execute the full PR update cycle (steps 1–8 above). After posting the update, resume polling.
+4. If the **PR is approved** or a **termination signal** is found: stop polling, report to the user that the PR review cycle is complete, and end.
+5. If **no new comments** are found: sleep 5 minutes and poll again.
+
+**Do NOT stop polling prematurely.** The loop must continue until the PR is approved or a clear termination signal is received. If polling has been running for an extended period (e.g., >2 hours) with no new activity, inform the user that you are still monitoring and ask if they want you to continue or stop.
+
 ## Key Gotchas
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
 - **No `repeat_interleave`:** AD attention ops handle GQA natively. Never repeat K/V heads manually.
