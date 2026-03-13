@@ -24,6 +24,7 @@ from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextFor
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_olmo3 import Olmo3ForCausalLM
+from .modeling_openelm import OpenELMForCausalLM
 from .modeling_phi4 import Phi4ForCausalLM
 from .modeling_phi4_visionr import Phi4VisionRForConditionalGeneration
 from .modeling_phi4flash import Phi4FlashForCausalLM
@@ -71,6 +72,7 @@ __all__ = (
     "NemotronFlashPreTrainedTokenizerFast",
     "NemotronHForCausalLM",
     "Olmo3ForCausalLM",
+    "OpenELMForCausalLM",
     "Phi4ForCausalLM",
     "Phi4FlashForCausalLM",
     "Phi4MMForCausalLM",
