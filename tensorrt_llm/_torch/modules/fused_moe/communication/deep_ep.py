@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
@@ -76,14 +77,24 @@ class DeepEP(Communication):
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
 
+    def destroy(self):
+        """Release the DeepEP buffer to prevent deadlock/hang.
+
+        Buffer.__del__ calls intranode::barrier (collective op). Without
+        explicit release, non-deterministic GC timing across ranks causes
+        some ranks to block in the barrier indefinitely.
+        """
+        self.deep_ep_buffer = None
+
     @staticmethod
     def is_platform_supported() -> bool:
         """
-        Check if DeepEP is supported on the current platform
+        Check if DeepEP is supported on the current platform.
+
+        DeepEP requires NVLink connectivity between all GPUs
+        (NUM_MAX_NVL_PEERS=8 hardcoded in upstream configs.cuh).
         """
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") != "1":
-            return False
-        return deep_ep_installed
+        return deep_ep_installed and MnnvlMemory.supports_mnnvl()
 
     @staticmethod
     def _is_deepep_feasible(num_ranks: int) -> bool:
@@ -144,6 +155,13 @@ class DeepEP(Communication):
         DeepEP dispatch
         """
         all_rank_max_num_tokens = max(all_rank_num_tokens)
+
+        # DeepEP C++ kernel requires topk_weights (token_final_scales) to be float32,
+        # but downstream backends (e.g. TRTLLM) may require the original dtype.
+        # Convert to float32 for dispatch, then restore afterward.
+        original_scales_dtype = token_final_scales.dtype if token_final_scales is not None else None
+        if token_final_scales is not None and token_final_scales.dtype != torch.float32:
+            token_final_scales = token_final_scales.to(torch.float32)
 
         if not self.supports_post_quant_dispatch():
             # Pre-quant dispatch (unquantized data)
@@ -214,6 +232,14 @@ class DeepEP(Communication):
                 "deep_ep_handle": deep_ep_handle,
                 "padded": padded,
             }
+
+        # Restore token_final_scales to original dtype for downstream consumers
+        if (
+            token_final_scales is not None
+            and original_scales_dtype is not None
+            and token_final_scales.dtype != original_scales_dtype
+        ):
+            token_final_scales = token_final_scales.to(original_scales_dtype)
 
         return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 

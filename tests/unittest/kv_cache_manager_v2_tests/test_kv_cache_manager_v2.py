@@ -33,7 +33,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         AttentionLayerConfig,
         BufferConfig,
         BufferId,
-        BufferSlice,
         CacheLevel,
         CudaStream,
         DataRole,
@@ -44,12 +43,14 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        SsmLayerConfig,
         TokenId,
         TokenIdExt,
         _KVCache,
     )
     from kv_cache_manager_v2._block_radix_tree import traverse_post_order
     from kv_cache_manager_v2._common import (
+        BAD_PAGE_INDEX,
         GPU_LEVEL,
         CacheTier,
         MemAddress,
@@ -58,6 +59,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
+    from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         TemporaryCudaStream,
@@ -76,7 +78,6 @@ else:
         AttentionLayerConfig,
         BufferConfig,
         BufferId,
-        BufferSlice,
         CacheLevel,
         CudaStream,
         DataRole,
@@ -87,12 +88,14 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        SsmLayerConfig,
         TokenId,
         TokenIdExt,
         _KVCache,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import traverse_post_order
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
+        BAD_PAGE_INDEX,
         GPU_LEVEL,
         CacheTier,
         MemAddress,
@@ -101,6 +104,7 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         TemporaryCudaStream,
@@ -209,7 +213,7 @@ def create_config(
         layers=[
             AttentionLayerConfig(
                 layer_id=layer_id,
-                buffers=layer_buffers,
+                buffers=deepcopy(layer_buffers),
                 sliding_window_size=window_size if layer_id % 2 == 0 else None,
                 num_sink_tokens=sink_tokens if layer_id % 2 == 0 else None,
             )
@@ -233,6 +237,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
     def tearDown(self) -> None:
         gc.enable()
         if hasattr(self, "manager"):
+            self.manager.shutdown()
             del self.manager
 
     def next_token(self) -> TokenIdExt:
@@ -767,7 +772,9 @@ class TestDisaggregatedServing(unittest.TestCase):
         def __iter__(self) -> Iterator[Node]:
             return iter(self._nodes)
 
-        def __init__(self, full_config: KVCacheManagerConfig, tp_size: int, pp_size: int):
+        def __init__(
+            self, full_config: KVCacheManagerConfig, num_heads: int, tp_size: int, pp_size: int
+        ):
             self.tp_size = tp_size
             full_layers = full_config.layers
             assert len(full_layers) % pp_size == 0
@@ -779,7 +786,7 @@ class TestDisaggregatedServing(unittest.TestCase):
             self._nodes = []
             for pp_rank in range(pp_size):
                 layer_start = num_local_layers * pp_rank
-                layers = full_layers[layer_start : layer_start + num_local_layers]
+                layers = deepcopy(full_layers[layer_start : layer_start + num_local_layers])
                 for layer in layers:
                     for b in layer.buffers:
                         b.size = exact_div(b.size, tp_size)
@@ -792,7 +799,7 @@ class TestDisaggregatedServing(unittest.TestCase):
                     stream = CachedCudaStream()
                     kv_cache.resume(CudaStream(stream.handle))
                     kv_cache.stop_committing()
-                    engine = FakeEngine(config)
+                    engine = FakeEngine(config, exact_div(num_heads, tp_size))
                     self._nodes.append(self.Node(manager, stream, engine, kv_cache))
 
     _token_id_gen: Iterator[int]
@@ -818,6 +825,10 @@ class TestDisaggregatedServing(unittest.TestCase):
 
     def prepare(
         self,
+        prefill_pp_size: int = 1,
+        prefill_tp_size: int = 1,
+        decode_pp_size: int = 1,
+        decode_tp_size: int = 1,
         gpu_quota: int = 128 << 20,
         host_quota: int = 128 << 20,
         disk_quota: int = 0,
@@ -827,10 +838,6 @@ class TestDisaggregatedServing(unittest.TestCase):
         tokens_per_block: int = 32,
         kv_buf_size: int = 8192,
         block_quant_buf_size: int | None = None,
-        prefill_pp_size: int = 1,
-        prefill_tp_size: int = 1,
-        decode_pp_size: int = 1,
-        decode_tp_size: int = 1,
     ) -> None:
         assert max(prefill_tp_size, decode_tp_size) % min(prefill_tp_size, decode_tp_size) == 0
         assert max(decode_pp_size, prefill_pp_size) % min(decode_pp_size, prefill_pp_size) == 0
@@ -845,8 +852,9 @@ class TestDisaggregatedServing(unittest.TestCase):
             kv_buf_size,
             block_quant_buf_size,
         )
-        self.prefill = self.NodeGroup(self.full_config, prefill_tp_size, prefill_pp_size)
-        self.decode = self.NodeGroup(self.full_config, decode_tp_size, decode_pp_size)
+        num_heads = max(prefill_tp_size, decode_tp_size)
+        self.prefill = self.NodeGroup(self.full_config, num_heads, prefill_tp_size, prefill_pp_size)
+        self.decode = self.NodeGroup(self.full_config, num_heads, decode_tp_size, decode_pp_size)
 
     def transfer(self, stream: CudaStream) -> None:
         prefill = self.prefill
@@ -879,49 +887,67 @@ class TestDisaggregatedServing(unittest.TestCase):
                 dst_tp_rank, dst_tp_slice = get_rank_and_slice(max_tp, decode.tp_size, tp_idx)
                 src = prefill[src_pp_rank, src_tp_rank]
                 dst = decode[dst_pp_rank, dst_tp_rank]
-                src_buffer_slices = (
-                    BufferSlice(b, src_tp_slice.num_slices, src_tp_slice.slice_rank)
-                    for b in buffers
-                )
-                dst_buffer_slices = (
-                    BufferSlice(b, dst_tp_slice.num_slices, dst_tp_slice.slice_rank)
-                    for b in buffers
-                )
-                src_pages = src.manager.get_aggregated_pages(src_buffer_slices)
-                dst_pages = dst.manager.get_aggregated_pages(dst_buffer_slices)
+                src_pages = src.manager.get_aggregated_pages(buffers)
+                dst_pages = dst.manager.get_aggregated_pages(buffers)
                 for src_page, dst_page in zip(src_pages, dst_pages, strict=True):
-                    assert src_page.size == dst_page.size
-                    num_bytes = src_page.size
-                    assert all(
-                        s.buffer_id == d.buffer_id
-                        for s, d in zip(src_page.buffers, dst_page.buffers, strict=True)
+                    assert src_page.buffers == dst_page.buffers
+                    assert src_page.size * prefill.tp_size == dst_page.size * decode.tp_size
+                    assert (
+                        dst_page.size / dst_tp_slice.num_slices
+                        == src_page.size / src_tp_slice.num_slices
                     )
-                    tasks = [
-                        CopyTask(
-                            MemAddress(dst_page.base + dst_page.stride * i),
-                            MemAddress(src_page.base + src_page.stride * j),
-                        )
-                        for i, j in zip(
-                            dst.kv_cache.get_aggregated_page_indices(
-                                dst_page.layer_group_id, valid_only=True
-                            ),
-                            src.kv_cache.get_aggregated_page_indices(
-                                src_page.layer_group_id, valid_only=True
-                            ),
-                            strict=True,
-                        )
-                    ]
+                    dst_indices = dst.kv_cache.get_aggregated_page_indices(
+                        dst_page.layer_group_id, valid_only=True
+                    )
+                    src_indices = src.kv_cache.get_aggregated_page_indices(
+                        src_page.layer_group_id, valid_only=True
+                    )
+                    need_slicing = prefill.tp_size != decode.tp_size
+                    tasks = []
+                    num_bytes: int
+                    if not need_slicing:
+                        assert src_tp_slice.num_slices == 1 and dst_tp_slice.num_slices == 1
+                        num_bytes = exact_div(src_page.size, src_tp_slice.num_slices)
+                        for i, j in zip(dst_indices, src_indices, strict=True):
+                            task = CopyTask(
+                                MemAddress(dst_page.base + dst_page.stride * i),
+                                MemAddress(src_page.base + src_page.stride * j),
+                            )
+                            tasks.append(task)
+                    else:
+                        num_buffers = len(dst_page.buffers)
+                        dst_buf_size = exact_div(dst_page.size, num_buffers)
+                        src_buf_size = exact_div(src_page.size, num_buffers)
+                        num_bytes = exact_div(dst_buf_size, dst_tp_slice.num_slices)
+                        assert num_bytes == exact_div(src_buf_size, src_tp_slice.num_slices)
+                        for i, j in zip(dst_indices, src_indices, strict=True):
+                            dst_base = (
+                                dst_page.base
+                                + dst_page.stride * i
+                                + num_bytes * dst_tp_slice.slice_rank
+                            )
+                            src_base = (
+                                src_page.base
+                                + src_page.stride * j
+                                + num_bytes * src_tp_slice.slice_rank
+                            )
+                            for b in range(num_buffers):
+                                task = CopyTask(
+                                    MemAddress(dst_base + dst_buf_size * b),
+                                    MemAddress(src_base + src_buf_size * b),
+                                )
+                                tasks.append(task)
                     batched_copy(CacheTier.GPU_MEM, CacheTier.GPU_MEM, num_bytes, tasks, stream)
 
     @parameterized.expand([(1, 1, 1, 1), (1, 2, 1, 1), (1, 1, 1, 2), (2, 1, 1, 1), (1, 1, 2, 1)])
     def test_disaggregated_serving(
         self,
-        prefill_tp_size: int,
         prefill_pp_size: int,
-        decode_tp_size: int,
+        prefill_tp_size: int,
         decode_pp_size: int,
+        decode_tp_size: int,
     ) -> None:
-        self.prepare(prefill_tp_size, prefill_pp_size, decode_tp_size, decode_pp_size)
+        self.prepare(prefill_pp_size, prefill_tp_size, decode_pp_size, decode_tp_size)
 
         prompt_len = 185
         prompt = [self.next_token() for _ in range(prompt_len)]
@@ -1054,6 +1080,274 @@ class TestComplexModels(unittest.TestCase):
         )
         manager = KVCacheManager(config)
         del manager
+
+
+class TestResizeQuota(TestKVCacheManagerV2):
+    def test_resize_quota(self) -> None:
+        self.prepare(64 << 20, 128 << 20, 128 << 20, 36, 128, 1, kv_buf_size=32768)
+        # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink
+        # blocks, 5 is for SWA (window=128), n is for full attention.
+        max_seq_len = 32 * 22  # 23 blocks will require more than 32MB memory
+        seq_len = max_seq_len
+        tokens_per_block = self.cfg.tokens_per_block
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        # First commit some blocks to fill all levels of cache. This helps test the case where shrinking
+        # the quota will drop some pages from the last-level cache.
+        for _ in range(11):
+            kv_cache = self.manager.create_kv_cache()
+            kv_cache.resume(stream)
+            for i in range(exact_div(seq_len, tokens_per_block)):
+                kv_cache.capacity = tokens_per_block * (i + 1)
+                input = [self.next_token() for _ in range(tokens_per_block)]
+                kv_cache.commit(input)
+            kv_cache.close()
+
+        # Now create two requests.
+        kv_cache_lst = [self.manager.create_kv_cache() for _ in range(2)]
+        for kv_cache in kv_cache_lst:
+            success = kv_cache.resume(stream)
+            assert success
+            kv_cache.stop_committing()
+            success = kv_cache.resize(seq_len, seq_len)
+            assert success
+        # Without reversed, we will hit a corner case where all cache levels are
+        # full, but the kv cache we want to resume is in the last level, while
+        # the gpu cache level is occupied by the request we don't resume first.
+        # Then we have a dead lock.
+        # To fix this, we need to have a fallback non-batched iterative page
+        # migration strategy instead of batched_lock_to_gpu. But this happens
+        # only in very rare case, where the last-level cache can't hold all
+        # suspended requests, and resume happens in FIFO order.
+        for kv_cache in reversed(kv_cache_lst):
+            kv_cache.suspend()
+        GPU_LEVEL = CacheLevel(0)
+        HOST_LEVEL = CacheLevel(1)
+        DISK_LEVEL = CacheLevel(2)
+        # Shrink the gpu quota
+        success = self.manager.resize(GPU_LEVEL, 32 << 20)
+        assert success and self.manager.get_quota(GPU_LEVEL) <= 32 << 20
+        # also shrink the host quota, this would evict some pages to disk
+        success = self.manager.resize(HOST_LEVEL, 2 << 20)
+        assert success and self.manager.get_quota(HOST_LEVEL) <= 2 << 20
+        # also shrink the disk quota, this would drop some old pages
+        success = self.manager.resize(DISK_LEVEL, 32 << 20)
+        assert success and self.manager.get_quota(DISK_LEVEL) <= 32 << 20
+        success = kv_cache_lst[0].resume(stream)
+        assert success
+        # After shrinking, GPU memory can hold only one request, so expect failure
+        # for resuming of the second request.
+        success = kv_cache_lst[1].resume(stream)
+        assert not success
+
+        kv_cache_lst[0].suspend()
+        # Expand it back to the original size
+        success = self.manager.resize(GPU_LEVEL, 64 << 20)
+        assert success
+        success = self.manager.resize(HOST_LEVEL, 128 << 20)
+        assert success
+        # Now both requests can resume
+        for kv_cache in kv_cache_lst:
+            success = kv_cache.resume(stream)
+            assert success
+
+        for kv_cache in kv_cache_lst:
+            kv_cache.close()
+        self.manager.shutdown()
+
+
+class TestHeteroTokensPerBlock(TestKVCacheManagerV2):
+    def test_hetero_tokens_per_block(self) -> None:
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=131072),
+                    BufferConfig(role=Role.VALUE, size=131072),
+                ],
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=131072, tokens_per_block_override=64),
+                    BufferConfig(role=Role.VALUE, size=131072, tokens_per_block_override=64),
+                ],
+            ),
+        ]
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=128,
+            vocab_size=1024,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=256 << 20),
+                HostCacheTierConfig(quota=1 << 30),
+            ],
+            layers=layers,
+        )
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+        kv_cache = self.manager.create_kv_cache()
+        prompt_len = 163
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        kv_cache.capacity = prompt_len
+        history = []
+        input = prompt
+        self.engine.execute([Step(kv_cache, input, history)], stream)
+        kv_cache.commit(input)
+        history.extend(input)
+        decode_len = 97
+        for _ in range(decode_len):
+            kv_cache.capacity = len(history) + 1
+            input = [self.next_token()]
+            self.engine.execute([Step(kv_cache, input, history)], stream)
+            kv_cache.commit(input)
+            history.extend(input)
+        kv_cache.close()
+
+        # test reuse.
+        second_prompt_len = 79
+        prompt = history + [self.next_token() for _ in range(second_prompt_len)]
+        kv_cache = self.manager.create_kv_cache(None, prompt)
+        kv_cache.resume(stream)
+        assert kv_cache.num_committed_tokens == len(history)
+        # empty input just for ref-check.
+        input = []
+        self.engine.execute([Step(kv_cache, input, history)], stream)
+        kv_cache.close()
+
+
+class TestSSMSupport(unittest.TestCase):
+    """Tests for basic SSM (State Space Model / Mamba) support in KVCacheManager v2."""
+
+    _token_id_gen: Iterator[int]
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        self._token_id_gen = itertools.count()
+        gc.collect()
+        gc.disable()
+
+    def tearDown(self) -> None:
+        gc.enable()
+        if hasattr(self, "manager"):
+            self.manager.shutdown()
+            del self.manager
+
+    def next_token(self) -> TokenIdExt:
+        return TokenId(next(self._token_id_gen))
+
+    def _make_ssm_config(
+        self,
+        tokens_per_block: int = 32,
+        gpu_quota: int = 32 << 20,
+        num_attn_layers: int = 2,
+        num_ssm_layers: int = 2,
+        window_size: SlidingWindowSize = None,
+    ) -> KVCacheManagerConfig:
+        layers = []
+        lid = 0
+        for _ in range(num_attn_layers):
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[
+                        BufferConfig(role=DataRole("key"), size=8192),
+                        BufferConfig(role=DataRole("value"), size=8192),
+                    ],
+                    sliding_window_size=window_size,
+                )
+            )
+            lid += 1
+        for _ in range(num_ssm_layers):
+            layers.append(
+                SsmLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[
+                        BufferConfig(role=DataRole("ssm_state"), size=8192),
+                    ],
+                )
+            )
+            lid += 1
+        return KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            vocab_size=1024,
+            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            layers=layers,
+        )
+
+    def test_suspend_and_resume_with_ssm(self) -> None:
+        """Suspend and resume work correctly (SSM page locks/unlocks)."""
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        kv_cache = self.manager.create_kv_cache()
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        ssm_lg = None
+        for lc_id, lc in self.manager._life_cycles.items():
+            if isinstance(lc, SsmLifeCycle):
+                ssm_lg = LayerGroupId(lc_id)
+                break
+        assert ssm_lg is not None
+        # Grow some capacity
+        kv_cache.capacity = 100
+        initial_slot = kv_cache.get_ssm_block_base_index(ssm_lg)
+        self.assertNotEqual(initial_slot, BAD_PAGE_INDEX)
+        # Suspend
+        kv_cache.stop_committing()
+        kv_cache.suspend()
+        self.assertEqual(kv_cache.status, _KVCache.Status.SUSPENDED)
+        # Resume
+        success = kv_cache.resume(stream)
+        self.assertTrue(success)
+        self.assertEqual(kv_cache.status, _KVCache.Status.ACTIVE)
+        # SSM slot should be the same
+        resumed_slot = kv_cache.get_ssm_block_base_index(ssm_lg)
+        self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
+        kv_cache.close()
+
+    def test_no_reuse_with_ssm(self) -> None:
+        """input_tokens are accepted but no prefix reuse happens with SSM layers."""
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        tokens = [self.next_token() for _ in range(64)]
+        kv_cache = self.manager.create_kv_cache(input_tokens=tokens)
+        self.assertEqual(kv_cache.num_committed_tokens, 0, "No reuse when SSM layers present")
+        # Resume before close so cuda_stream is set
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        kv_cache.close()
+
+    def test_ssm(self) -> None:
+        """Inference with SSM layer: prefill 63 tokens, decode 52 tokens."""
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        kv_cache = self.manager.create_kv_cache()
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        kv_cache.stop_committing()
+        # prefill
+        prompt = [self.next_token() for _ in range(63)]
+        kv_cache.capacity = len(prompt)
+        kv_cache.history_length = len(prompt)
+        engine.execute([Step(kv_cache, prompt, [])], stream)
+        history = list(prompt)
+        # decode
+        for _ in range(52):
+            kv_cache.capacity = len(history) + 1
+            token = self.next_token()
+            engine.execute([Step(kv_cache, [token], history)], stream)
+            history.append(token)
+            kv_cache.history_length = len(history)
+        # final check
+        engine.execute([Step(kv_cache, [], history)], stream)
+        kv_cache.close()
 
 
 if __name__ == "__main__":

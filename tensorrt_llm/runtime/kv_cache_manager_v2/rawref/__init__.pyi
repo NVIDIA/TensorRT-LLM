@@ -53,6 +53,14 @@ class ReferenceType(Generic[T]):
         """
         ...
 
+    def __hash__(self) -> int:
+        """Return the hash of the referenced object (its ID).
+
+        Raises:
+            RuntimeError: If the reference is invalid.
+        """
+        ...
+
     def invalidate(self) -> None:
         """Invalidate the reference.
 

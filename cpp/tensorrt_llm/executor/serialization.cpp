@@ -552,9 +552,37 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto hasIndexerKCache = su::deserialize<bool>(is);
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
-    return CacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
+    // RNN config (optional)
+    auto hasRnnConfig = su::deserialize<bool>(is);
+    std::optional<CacheState::RnnModelConfig> rnnModelConfig;
+    std::vector<SizeType32> rnnLayerNumPerPP;
+    nvinfer1::DataType convStateDataType{nvinfer1::DataType::kFLOAT};
+    nvinfer1::DataType ssmStateDataType{nvinfer1::DataType::kFLOAT};
+    if (hasRnnConfig)
+    {
+        CacheState::RnnModelConfig rnnCfg;
+        rnnCfg.mDState = su::deserialize<decltype(CacheState::RnnModelConfig::mDState)>(is);
+        rnnCfg.mDConv = su::deserialize<decltype(CacheState::RnnModelConfig::mDConv)>(is);
+        rnnCfg.mHiddenSize = su::deserialize<decltype(CacheState::RnnModelConfig::mHiddenSize)>(is);
+        rnnCfg.mHeadDim = su::deserialize<decltype(CacheState::RnnModelConfig::mHeadDim)>(is);
+        rnnCfg.mConvDimSize = su::deserialize<decltype(CacheState::RnnModelConfig::mConvDimSize)>(is);
+        rnnCfg.mNGroups = su::deserialize<decltype(CacheState::RnnModelConfig::mNGroups)>(is);
+        rnnCfg.mNumLayers = su::deserialize<decltype(CacheState::RnnModelConfig::mNumLayers)>(is);
+        rnnCfg.mNumHeads = su::deserialize<decltype(CacheState::RnnModelConfig::mNumHeads)>(is);
+        convStateDataType = su::deserialize<nvinfer1::DataType>(is);
+        ssmStateDataType = su::deserialize<nvinfer1::DataType>(is);
+        rnnLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
+        rnnModelConfig = std::move(rnnCfg);
+    }
+    CacheState cacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
         DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+    if (rnnModelConfig.has_value())
+    {
+        cacheState.setRnnConfig(
+            std::move(rnnModelConfig.value()), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
+    }
+    return cacheState;
 }
 
 void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& os)
@@ -577,6 +605,23 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.getHasIndexerKCache(), os);
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
+    // RNN config (optional)
+    su::serialize(state.mRnnCacheState.has_value(), os);
+    if (state.mRnnCacheState.has_value())
+    {
+        auto const& rnn = state.mRnnCacheState->mModelConfig;
+        su::serialize(rnn.mDState, os);
+        su::serialize(rnn.mDConv, os);
+        su::serialize(rnn.mHiddenSize, os);
+        su::serialize(rnn.mHeadDim, os);
+        su::serialize(rnn.mConvDimSize, os);
+        su::serialize(rnn.mNGroups, os);
+        su::serialize(rnn.mNumLayers, os);
+        su::serialize(rnn.mNumHeads, os);
+        su::serialize(state.mRnnCacheState->mConvStateDataType, os);
+        su::serialize(state.mRnnCacheState->mSsmStateDataType, os);
+        su::serialize(state.mRnnCacheState->mLayerNumPerPP, os);
+    }
 }
 
 size_t Serialization::serializedSize(kv_cache::CacheState const& state)
@@ -600,6 +645,23 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.getHasIndexerKCache());
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());
+    // RNN config (optional)
+    totalSize += su::serializedSize(state.mRnnCacheState.has_value());
+    if (state.mRnnCacheState.has_value())
+    {
+        auto const& rnn = state.mRnnCacheState->mModelConfig;
+        totalSize += su::serializedSize(rnn.mDState);
+        totalSize += su::serializedSize(rnn.mDConv);
+        totalSize += su::serializedSize(rnn.mHiddenSize);
+        totalSize += su::serializedSize(rnn.mHeadDim);
+        totalSize += su::serializedSize(rnn.mConvDimSize);
+        totalSize += su::serializedSize(rnn.mNGroups);
+        totalSize += su::serializedSize(rnn.mNumLayers);
+        totalSize += su::serializedSize(rnn.mNumHeads);
+        totalSize += su::serializedSize(state.mRnnCacheState->mConvStateDataType);
+        totalSize += su::serializedSize(state.mRnnCacheState->mSsmStateDataType);
+        totalSize += su::serializedSize(state.mRnnCacheState->mLayerNumPerPP);
+    }
     return totalSize;
 }
 
@@ -2519,6 +2581,7 @@ size_t Serialization::serializedSize(tensorrt_llm::batch_manager::kv_cache_manag
     totalSize += su::serializedSize(key.uniqueTokens);
     // std::vector<MmKey> where MmKey is pair<std::array<uint8_t,32>, SizeType32>
     totalSize += su::serializedSize(key.extraKeys);
+    totalSize += su::serializedSize(key.cacheSaltID);
     return totalSize;
 }
 
@@ -2528,6 +2591,7 @@ void Serialization::serialize(tensorrt_llm::batch_manager::kv_cache_manager::Blo
     su::serialize(key.loraTaskId, os);
     su::serialize(key.uniqueTokens, os);
     su::serialize(key.extraKeys, os);
+    su::serialize(key.cacheSaltID, os);
 }
 
 tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deserializeBlockKey(std::istream& is)
@@ -2536,11 +2600,13 @@ tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deseriali
     auto loraTaskId = su::deserialize<std::optional<tensorrt_llm::batch_manager::kv_cache_manager::LoraTaskIdType>>(is);
     auto uniqueTokens = su::deserialize<std::vector<tensorrt_llm::runtime::UniqueToken>>(is);
     auto extraKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
+    auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
     tensorrt_llm::batch_manager::kv_cache_manager::BlockKey key;
     key.usesExtraIds = usesExtraIds;
     key.loraTaskId = std::move(loraTaskId);
     key.uniqueTokens = std::move(uniqueTokens);
     key.extraKeys = std::move(extraKeys);
+    key.cacheSaltID = std::move(cacheSaltID);
     return key;
 }
 

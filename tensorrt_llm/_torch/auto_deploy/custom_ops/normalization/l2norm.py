@@ -42,7 +42,7 @@ def _torch_l2norm_fake(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 @torch.library.custom_op("auto_deploy::fla_l2norm", mutates_args=())
 def fla_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    y = l2norm_fwd(x, eps)
+    y = l2norm_fwd(x.contiguous(), eps)
     return y
 
 

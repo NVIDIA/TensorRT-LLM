@@ -4,7 +4,7 @@ import atexit
 
 import pytest
 from execution.executor import JobManager
-from utils.common import CONFIG_BASE_DIR, EnvManager
+from utils.common import CONFIG_BASE_DIR, EnvManager, InfoPrinter
 from utils.config_loader import ConfigLoader, TestConfig
 from utils.config_validator import ConfigValidator
 from utils.logger import logger
@@ -53,6 +53,7 @@ def session_lifecycle():
     JobTracker.record_pid()
 
     session_tracker.start()
+
     try:
         yield
     finally:
@@ -95,6 +96,7 @@ class TestDisaggBenchmark:
             logger.info(f"Benchmark: {test_config.benchmark_type}")
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
+            InfoPrinter.print(test_config)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -123,7 +125,9 @@ class TestDisaggBenchmark:
 
             # Check results and generate report
             result = JobManager.check_result(job_id, test_config, timestamps, full_test_name)
-            assert result["success"], f"Performance test failed: {job_id}"
+            assert result["success"], (
+                f"Performance test failed: {job_id}\n{result.get('error', 'Unknown error')}"
+            )
 
         except Exception as e:
             test_tracker.end_test_case()
@@ -174,6 +178,7 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
+            InfoPrinter.print(test_config)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -255,6 +260,7 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
+            InfoPrinter.print(test_config)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@ from typing import Optional, Tuple, TypeAlias, Union, cast
 import torch
 from torch import nn
 
+from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..utils import Fp4QuantizedTensor
@@ -41,6 +42,7 @@ class RMSNorm(nn.Module):
         use_gemma: bool = False,
         quantize_type: Optional[str] = None,
         use_cuda_tile: bool = False,
+        return_hp_output: bool = False,
     ):
         super().__init__()
 
@@ -73,6 +75,18 @@ class RMSNorm(nn.Module):
         self.use_gemma = use_gemma
         self.use_cuda_tile = use_cuda_tile
 
+        # fused_add_rms_norm_quant only supports SM 9.x / 10.x because:
+        #  - Device code is guarded by is_major_v<9> || is_major_v<10>
+        #    (ws_layernorm.cuh:828, low_latency_layernorm.cuh:157).
+        # On unsupported SMs, fall back to flashinfer/generic RMSNorm and let
+        # the downstream linear layer handle FP4 quantization.
+        if self.is_nvfp4:
+            sm_version = get_sm_version()
+            if not (90 <= sm_version < 120):
+                self.is_nvfp4 = False
+                return_hp_output = False
+        self.return_hp_output = return_hp_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -80,7 +94,8 @@ class RMSNorm(nn.Module):
             Optional[torch.Tensor],
             _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
     ) -> Union[torch.Tensor, Fp4QuantizedTensor, Tuple[Union[
-            torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]]]:
+            torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]], Tuple[
+                Fp4QuantizedTensor, torch.Tensor, torch.Tensor]]:
         has_residual = residual is not self._ARGUMENT_NOT_SPECIFIED_SENTINEL
         if not has_residual:
             residual = None
@@ -116,14 +131,16 @@ class RMSNorm(nn.Module):
 
             sf_scale = nvfp4_scale.contiguous()
 
-            normed_fp4_i32, residual_out_2d, sf_fused = torch.ops.trtllm.fused_add_rms_norm_quant(
+            results = torch.ops.trtllm.fused_add_rms_norm_quant(
                 hs_2d,
                 res_2d,
                 gamma,
                 sf_scale,
                 True,
                 eps=self.variance_epsilon,
+                output_hp_norm=self.return_hp_output,
             )
+            normed_fp4_i32, residual_out_2d, sf_fused = results[:3]
             normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
             if len(orig_shape) != 2:
                 normed_fp4_u8 = normed_fp4_u8.reshape(*orig_shape[:-1], n // 2)
@@ -132,9 +149,21 @@ class RMSNorm(nn.Module):
                 residual_out = residual_out_2d
 
             hidden_states_fused = Fp4QuantizedTensor(normed_fp4_u8, sf_fused)
-            return (hidden_states_fused,
-                    residual_out) if has_residual else hidden_states_fused
-        elif self.use_cuda_tile:
+
+            outputs = [hidden_states_fused]
+            if has_residual:
+                outputs.append(residual_out)
+            if self.return_hp_output:
+                high_precision_normed_output = results[3].reshape(orig_shape)
+                outputs.append(high_precision_normed_output)
+            return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+        if self.return_hp_output:
+            raise ValueError(
+                "Auxiliary high precision output is only supported for NVFP4 fused path"
+            )
+
+        if self.use_cuda_tile:
             if isinstance(residual, torch.Tensor):
                 # Use fused residual kernel
                 hidden_states = hidden_states.contiguous()

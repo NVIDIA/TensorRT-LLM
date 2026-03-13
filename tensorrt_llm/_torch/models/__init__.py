@@ -3,6 +3,7 @@ import transformers
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
+from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
@@ -86,6 +87,7 @@ __all__ = [
     "MiniMaxM2ForCausalLM",
     "Qwen3_5Model",
     "Qwen3_5MoeModel",
+    "Cohere2ForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":

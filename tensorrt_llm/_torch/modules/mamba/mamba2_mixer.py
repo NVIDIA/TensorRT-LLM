@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
-
 import torch
 from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
@@ -33,6 +31,8 @@ from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
+from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
+                                   fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
@@ -59,8 +59,8 @@ class Mamba2Mixer(nn.Module):
         remove_padding: bool = True,
         apply_silu: bool = True,
         rms_norm_eps: float = 1e-5,
-        dtype: Optional[torch.dtype] = None,
-        config: Optional[ModelConfig] = None,
+        dtype: torch.dtype | None = None,
+        config: ModelConfig | None = None,
     ):
         super().__init__()
 
@@ -140,20 +140,29 @@ class Mamba2Mixer(nn.Module):
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
         supported_head_dim_in_flashinfer = [64, 128]
-        if head_dim in supported_head_dim_in_flashinfer:
-            logger.info_once(
-                "Using flashinfer for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_fi
+        self._use_flashinfer = head_dim in supported_head_dim_in_flashinfer
+        # Stochastic rounding requires FlashInfer and fp16 cache
+        self._use_stochastic_rounding = (
+            config.quant_config.mamba_ssm_stochastic_rounding
+            and self._use_flashinfer
+            and self._mamba_ssm_cache_dtype == torch.float16)
+        self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
+
+        if self._use_flashinfer:
+            logger.info_once("Using flashinfer for selective state update",
+                             key="selective_state_update")
+            self.selective_state_update_func = selective_state_update_fi
         else:
-            logger.info_once(
-                "Using native for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_native
-        # TODO: support MTP selective state update in flashinfer.
-        logger.info_once("Using native for selective state update for MTP",
-                         key="selective_state_update_mtp")
-        self.selective_state_update_func_mtp = selective_state_update_native
+            logger.info_once("Using native for selective state update",
+                             key="selective_state_update")
+            self.selective_state_update_func = selective_state_update_native
+
+        # Warn if stochastic rounding was requested but couldn't be enabled
+        if config.quant_config.mamba_ssm_stochastic_rounding and not self._use_stochastic_rounding:
+            logger.warning_once(
+                f"Stochastic rounding requires FlashInfer and float16 SSM cache, "
+                f"but got head_dim={head_dim}, dtype={self._mamba_ssm_cache_dtype}. Disabled.",
+                key="stochastic_rounding_disabled")
 
         # D
         self.D = nn.Parameter(
@@ -167,6 +176,11 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
+        # Determine if NVFP4 quantization is enabled
+        self.is_nvfp4 = (config.quant_config is not None
+                         and config.quant_config.quant_mode is not None
+                         and config.quant_config.quant_mode.has_nvfp4())
+
         # norm
         self.norm = RMSNormGated(
             self.tp_d_inner,
@@ -174,6 +188,9 @@ class Mamba2Mixer(nn.Module):
             norm_before_gate=False,
             group_size=self.tp_d_inner // self.tp_ngroups,
             dtype=dtype,
+            # Enable fused NVFP4 quantization if possible.
+            # It might be overridden in `_try_attach_nvfp4_scale` function.
+            is_nvfp4=self.is_nvfp4,
         )
 
         # out_proj
@@ -188,12 +205,27 @@ class Mamba2Mixer(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy)
 
+    def post_load_weights(self):
+        """Post-process after loading weights."""
+        if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
+            self._try_attach_nvfp4_scale()
+
+    def _try_attach_nvfp4_scale(self):
+        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant.
+
+        Called from post_load_weights (weights don't exist during __init__).
+        """
+        if getattr(self.out_proj, 'input_scale', None) is not None:
+            self.norm.nvfp4_scale = self.out_proj.input_scale
+        else:
+            self.norm.is_nvfp4 = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
-        spec_metadata: Optional[SpecMetadata] = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -227,14 +259,16 @@ class Mamba2Mixer(nn.Module):
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
-        z, xbc, dt = torch.split(
-            zxbcdt,
-            [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
-            dim=-1,
-        )
+
+        # Split z and dt with views.
+        z = zxbcdt[:, :self.tp_d_inner]
+        dt = zxbcdt[:, self.tp_d_inner + self.tp_conv_dim:]
         z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
-        xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
+
+        # Decode path uses regular view since no transpose is needed.
+        xbc_d = zxbcdt[num_prefill_tokens:num_actual_tokens,
+                       self.tp_d_inner:self.tp_d_inner + self.tp_conv_dim]
 
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
@@ -243,8 +277,8 @@ class Mamba2Mixer(nn.Module):
                 zxbcdt.shape[0],
                 (self.num_heads * self.head_dim) // self.tp_size,
             ],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            dtype=zxbcdt.dtype,
+            device=zxbcdt.device,
         )
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out,
@@ -259,27 +293,29 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
-            xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
+            # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
+            xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
+                                                    self.tp_d_inner,
+                                                    self.tp_conv_dim)
+            xbc_p = causal_conv1d_fn(xbc_p_t,
                                      self.conv1d.weight,
                                      self.conv1d.bias,
                                      activation="silu",
                                      conv_states=conv_states,
                                      has_initial_state=has_initial_states,
                                      query_start_loc=cu_seqlens,
-                                     cache_indices=state_indices_p).transpose(
-                                         0, 1)
+                                     cache_indices=state_indices_p)
 
-            x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
+            # Fused kernel to avoid expensive .contiguous() calls after split/rearrange.
+            x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
+                xbc_p,
                 self.tp_d_inner,
-                self.tp_ngroups * self.d_state,
-                self.tp_ngroups * self.d_state,
-            ],
-                                        dim=-1)
-
-            x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
+                self.tp_ngroups,
+                self.d_state,
+                self.tp_nheads,
+                self.head_dim,
+            )
             dt_p = dt_p.unsqueeze(0)
-            B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
-            C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
             z_p = rearrange(z_p.unsqueeze(0),
                             "b l (h p) -> b l h p",
                             h=self.tp_nheads)
@@ -370,10 +406,16 @@ class Mamba2Mixer(nn.Module):
             )
             # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
             dt_d = dt_d.to(dtype=torch.float32)
-            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+            # Use .contiguous() to ensure proper 128-byte alignment required by
+            # flashinfer's selective_state_update kernel. x_d, B_d, C_d are views
+            # into sliced tensors which may not be 128-byte aligned.
+            x_d = rearrange(x_d, "b (h p) -> b h p",
+                            p=self.head_dim).contiguous()
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
-            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            B_d = rearrange(B_d, "b (g n) -> b g n",
+                            g=self.tp_ngroups).contiguous()
+            C_d = rearrange(C_d, "b (g n) -> b g n",
+                            g=self.tp_ngroups).contiguous()
             z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
 
             A = repeat(self.A, "h -> h p n", p=self.head_dim,
@@ -382,7 +424,31 @@ class Mamba2Mixer(nn.Module):
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
-                self.selective_state_update_func_mtp(
+                # Build kwargs for MTP selective_state_update
+                mtp_kwargs = dict(
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_d[:num_decodes],
+                    out=preallocated_ssm_out_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_ssm_states,
+                    cache_steps=draft_token_num,
+                    intermediate_state_indices=self.intermediate_state_indices,
+                )
+                if self._use_stochastic_rounding:
+                    mtp_kwargs['rand_seed'] = torch.randint(0,
+                                                            2**62, (1, ),
+                                                            device=x_d.device,
+                                                            dtype=torch.int64)
+                    mtp_kwargs['philox_rounds'] = self._philox_rounds
+
+                self.selective_state_update_func(
                     ssm_states,
                     x_d.view(
                         num_decodes,
@@ -400,23 +466,27 @@ class Mamba2Mixer(nn.Module):
                     B_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
                     C_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
                     D,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_d[:num_decodes],
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_ssm_states,
-                    cache_steps=draft_token_num,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    **mtp_kwargs,
                 )
             else:
-                self.selective_state_update_func_no_mtp(
+                # Build kwargs for selective_state_update
+                ssu_kwargs = dict(
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=self.delta_softplus,
+                    state_batch_indices=state_indices_d,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1,
+                                                    self.head_dim),
+                )
+
+                if self._use_stochastic_rounding:
+                    ssu_kwargs['rand_seed'] = torch.randint(0,
+                                                            2**62, (1, ),
+                                                            device=x_d.device,
+                                                            dtype=torch.int64)
+                    ssu_kwargs['philox_rounds'] = self._philox_rounds
+
+                self.selective_state_update_func(
                     ssm_states,
                     x_d,
                     dt_d,
@@ -424,12 +494,7 @@ class Mamba2Mixer(nn.Module):
                     B_d,
                     C_d,
                     D,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=self.delta_softplus,
-                    state_batch_indices=state_indices_d,
-                    out=preallocated_ssm_out_d.view(num_decodes, -1,
-                                                    self.head_dim),
+                    **ssu_kwargs,
                 )
 
         # norm

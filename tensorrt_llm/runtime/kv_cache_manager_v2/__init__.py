@@ -35,15 +35,9 @@ from ._config import (
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheManagerConfig,
+    SsmLayerConfig,
 )
-from ._core import (
-    DEFAULT_BEAM_INDEX,
-    AggregatedPageDesc,
-    BeamIndex,
-    BufferSlice,
-    KVCacheManager,
-    _KVCache,
-)
+from ._core import DEFAULT_BEAM_INDEX, AggregatedPageDesc, BeamIndex, KVCacheManager, _KVCache
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
 from ._storage import BufferId
 
@@ -65,6 +59,7 @@ __all__ = [
     "NDEBUG",
     "KVCacheManagerConfig",
     "AttentionLayerConfig",
+    "SsmLayerConfig",
     "BufferConfig",
     "DataRole",
     "DiskCacheTierConfig",
@@ -73,7 +68,6 @@ __all__ = [
     "CacheTierConfig",
     "gen_multi_modal_tokens",
     "rawref",
-    "BufferSlice",
     "AggregatedPageDesc",
     "BufferId",
 ]

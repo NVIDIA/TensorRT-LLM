@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -318,7 +333,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if CuteDslFusedMoE can implement the given quantization algorithm.
@@ -327,14 +342,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         - NVFP4: SM in {100, 103}
 
         Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
-        Does NOT support gptoss_style (bias/swiglu with custom alpha/beta/limit).
+        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation input data type. Only bfloat16 is supported
                 because output dtype is hardcoded to bfloat16 (input/output dtype must match).
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CuteDslFusedMoE does NOT support gptoss_style.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CuteDslFusedMoE does NOT support swiglu_gptoss_style.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -360,10 +375,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             return _warn_and_return(
                 "CuteDslFusedMoE does not support unquantized mode")
 
-        # CuteDslFusedMoE does NOT support gptoss_style
-        if gptoss_style:
+        # CuteDslFusedMoE does NOT support swiglu_gptoss_style
+        if swiglu_gptoss_style:
             return _warn_and_return(
-                "CuteDslFusedMoE does not support gptoss_style (bias/swiglu with custom alpha/beta/limit)"
+                "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
         # NVFP4 - SM in {100, 103}
@@ -498,11 +513,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                          self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        # After DeepEPLowLatency dispatch, token_selected_experts has shape
+        # [N, 1] instead of [N, top_k], because each row is already assigned
+        # to exactly one expert. Use the tensor shape as the effective top_k.
+        effective_top_k = token_selected_experts.size(-1)
+
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoENvfp4Runner(
             forward_impl=self.run_moe_nvfp4_impl,
             num_experts=self.num_slots,
-            top_k=self.routing_method.experts_per_token,
+            top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             enable_finalize_fusion=self.use_fused_finalize,
@@ -532,11 +552,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         output_dtype = torch.bfloat16
 
+        # Use effective top_k from tensor shape rather than routing config.
+        # After DeepEPLowLatency dispatch, each row maps to one expert (top_k=1).
+        effective_top_k = token_selected_experts.size(1)
+
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
-            top_k=self.routing_method.experts_per_token,
+            top_k=effective_top_k,
             local_expert_offset=self.slot_start,
             local_num_experts=self.expert_size_per_partition,
             tile_tokens_dim=tile_size,
@@ -559,7 +583,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_non_exiting_tiles=num_non_exiting_tiles,
             global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,
-            top_k=self.routing_method.experts_per_token,
+            top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
@@ -576,7 +600,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
                     num_non_exiting_tiles=num_non_exiting_tiles,
                     tile_tokens_dim=tile_size,
-                    top_k=self.routing_method.experts_per_token,
+                    top_k=effective_top_k,
                     ep_size=self.mapping.moe_ep_size,
                     enable_alltoall=enable_alltoall,
                 )
@@ -597,7 +621,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 token_final_scales=token_final_scales,
                 num_experts=self.num_slots,
-                top_k=self.routing_method.experts_per_token,
+                top_k=effective_top_k,
                 num_local_experts=self.expert_size_per_partition,
                 local_expert_offset=self.slot_start,
                 tile_size=tile_size,
@@ -614,7 +638,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,
-                top_k=self.routing_method.experts_per_token,
+                top_k=effective_top_k,
                 num_local_experts=self.expert_size_per_partition,
                 local_expert_offset=self.slot_start,
                 tile_size=tile_size,
@@ -682,6 +706,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             b_sf=self.quant_scales[1],
             offset_array=expert_first_token_offset,
         )
+        top_k = self.routing_method.top_k
+        if token_selected_experts is not None:
+            top_k = token_selected_experts.shape[-1]
+
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
@@ -694,7 +722,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_final_scales.size(0),  # num_rows
             self.hidden_size,  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
+            top_k,
             self.expert_size_per_partition,  # num_experts_per_node
             self.tp_size,
             self.tp_rank,

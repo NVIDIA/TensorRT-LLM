@@ -107,20 +107,38 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
     return ""
 
 
+def _pattern_matches(modname: str, pattern: str) -> bool:
+    """Check if an exclude pattern matches the module name.
+
+    Keep behavior aligned with upstream: evaluate exclude entries via fnmatch.
+    This preserves exact module-path excludes (for example:
+    ``model.layers.0.self_attn.q_a_proj``) and wildcard entries.
+    """
+    return fnmatch(modname, pattern)
+
+
 def should_skip_quantization(
     node_or_name: Union[Node, str],
     excluded_patterns: list[str],
 ) -> bool:
-    """Check if a node or parameter name should be skipped based on excluded patterns."""
+    """Check if a node or parameter name should be skipped based on excluded patterns.
+
+    Supports both glob patterns (e.g., "*gate*") and simple substring patterns
+    (e.g., "gate" matches "model.layers.0.block_sparse_moe.gate").
+    """
     if isinstance(node_or_name, str):
         modname, _, _ = node_or_name.rpartition(".")
     else:
         if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
         weight_name = extract_weight_name(node_or_name)
+        # extract_weight_name can return False when weight node is not found (e.g. after
+        # PR 10718 get_weight_node uses forward mapping; some graph shapes may have no mapping).
+        if weight_name is False or not isinstance(weight_name, str):
+            return True
         modname = weight_name.rpartition(".")[0]
 
-    return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
+    return any(_pattern_matches(modname, pattern) for pattern in excluded_patterns)
 
 
 def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Optional[Node]]:

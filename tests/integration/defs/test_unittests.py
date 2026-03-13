@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
 import warnings
 from subprocess import CalledProcessError
 
@@ -119,11 +120,19 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     import shlex
     arg_list = shlex.split(case)
-    case_fn = case.replace('/', '-')
+    case_fn = re.sub(r'[/\s"\']+', '-', case)
     if len(case_fn) > 80:
         case_fn = case_fn[:80]
-    output_xml = os.path.join(output_dir,
-                              f'results-sub-unittests-{case_fn}.xml')
+    # MoE entries expand to too many sub-tests, which introduces noise into
+    # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
+    # for MoE by prefixing with "moe-" (CI only collects files starting
+    # with "results" for JUnit reporting).
+    if case.startswith("unittest/_torch/modules/moe/"):
+        output_xml = os.path.join(output_dir,
+                                  f'moe-results-sub-unittests-{case_fn}.xml')
+    else:
+        output_xml = os.path.join(output_dir,
+                                  f'results-sub-unittests-{case_fn}.xml')
 
     command = [
         '-m', 'pytest', ignore_opt, "-vv", "--tb=short", "-rF",

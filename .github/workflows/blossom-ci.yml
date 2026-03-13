@@ -76,6 +76,7 @@ jobs:
         "chenfeiz0326",
         "cherichy",
         "cheshirekow",
+        "chienchunhung",
         "ChristinaZ",
         "chuangz0",
         "chzblych",
@@ -97,11 +98,15 @@ jobs:
         "dongfengy",
         "dongjiyingdjy",
         "dongxuy04",
+        "dpitman-nvda",
         "DylanChen-NV",
         "ebarilanM",
+        "ekou24",
         "elvischenv",
         "EmmaQiaoCh",
         "eopXD",
+        "esha-nvidia",
+        "etz-lmn",
         "evezhier",
         "faradawn",
         "farazkh80",
@@ -137,6 +142,7 @@ jobs:
         "JadoTu",
         "jaedeok-nvidia",
         "jdemouth-nvidia",
+        "janbernloehr",
         "JennyLiu-nv",
         "jershi425",
         "jgangani",
@@ -224,6 +230,7 @@ jobs:
         "nvzhihanj",
         "nvzhou",
         "nzmora-nvidia",
+        "o-stoner",
         "omera-nv",
         "pamelap-nvidia",
         "pcastonguay",
@@ -309,9 +316,12 @@ jobs:
         "wu6u3tw",
         "wyw1267",
         "xavier-nvidia",
+        "xd-nv",
         "xiaoweiw-nv",
         "xinhe-nv",
         "xmchen1987",
+        "xrq-phys",
+        "xuantengh",
         "xuanzic",
         "xueweilnvidia",
         "xupinjie",
@@ -346,6 +356,7 @@ jobs:
         "zerollzeng",
         "zhanga5",
         "zhangcl",
+        "zhaoyangwang-nvidia",
         "ZhanruiSunCh",
         "zhengd-nv",
         "zhenhuaw-me",
@@ -372,7 +383,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
         with:
           repository: ${{ fromJson(needs.Authorization.outputs.args).repo }}
           ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}

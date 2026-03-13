@@ -244,7 +244,7 @@ Sample result in Blackwell.
 
 FP4 command for GSM8K
 
-* Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for LLama 3.3 70B instruction model. So set add\_special\_tokens=False to avoid it.
+* Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for Llama 3.3 70B instruction model. So set add\_special\_tokens=False to avoid it.
 
 ```shell
 MODEL_PATH=nvidia/Llama-3.3-70B-Instruct-FP4
@@ -263,7 +263,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh

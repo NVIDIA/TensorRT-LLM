@@ -93,16 +93,19 @@ inline std::string mmaKindToString(MmaKind mmaKind)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Get the TMEM column stride per group (i.e. kGroupSize * blockSize K elements)
-inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK, int32_t kGroupSize)
+// Get the TMEM column stride per group.
+// A group is one or more MMA instructions that share the same TMEM columns.
+inline int32_t getTmemColStridePerGroup(int32_t mmaMn, int32_t mmaK, [[maybe_unused]] int32_t kGroupSize)
 {
-    int32_t colStride = 2 * ceilDiv(tileMn, 64);
+    int32_t colStride = 2 * ceilDiv(mmaMn, 64);
     if (mmaK == 96)
     {
         colStride = std::max(4, colStride);
     }
     return colStride;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

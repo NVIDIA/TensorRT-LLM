@@ -322,7 +322,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("missed_blocks", &tbk::KvCacheStats::missedBlocks)
         .def_rw("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate)
         .def_rw("num_free_blocks_per_window_size", &tbk::KvCacheStats::numFreeBlocksPerWindowSize)
-        .def_ro("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
+        .def_rw("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
 
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
         .def(nb::init<>())
@@ -431,6 +431,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
                 return pool.index({torch::indexing::Slice(), layer_idx});
             },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_indexer_k_cache_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor { return tr::Torch::tensor(self.getIndexerKCachePool()); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },

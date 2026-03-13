@@ -230,9 +230,9 @@ class ConfigLoader:
         if gpu_type is None:
             gpu_type = EnvManager.get_gpu_type()
 
-        # GB200_LYRIS in also in the GB200 family
-        if gpu_type.startswith("GB200_"):
-            gpu_type = "GB200"
+        # Normalize GPU type by extracting base name before any variant suffix
+        # e.g., GB200-LYRIS -> GB200, GB300-LYRIS -> GB300, GB200-OCI -> GB200
+        gpu_type = gpu_type.split("-")[0]
         configs = []
 
         if not self.base_dir.exists():
@@ -345,6 +345,15 @@ class ConfigLoader:
         supported_gpus = metadata.get("supported_gpus", ["GB200", "GB300", "H100", "B200", "B300"])
         # Override config with environment variables (in memory only, do not write back)
         config_data = self._apply_env_overrides(config_data, model_name)
+
+        # Apply concurrency override if DISAGG_CONCURRENCY_OVERRIDE is set
+        # This enables running a single test case with a specific concurrency level
+        # e.g., DISAGG_CONCURRENCY_OVERRIDE=2048 will override concurrency_list to "2048"
+        concurrency_override = os.getenv("DISAGG_CONCURRENCY_OVERRIDE", "")
+        if concurrency_override:
+            original = config_data.get("benchmark", {}).get("concurrency_list", "")
+            config_data["benchmark"]["concurrency_list"] = concurrency_override
+            logger.info(f"Concurrency overridden: '{original}' -> '{concurrency_override}'")
 
         # Generate benchmark_type from sequence configuration
         benchmark_type = self._generate_benchmark_type(config_data)

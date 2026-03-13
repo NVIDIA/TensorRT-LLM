@@ -470,21 +470,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The scheduled requests with the context requests that are being loaded asynchronously removed.
         """
-        allowed_context_requests = []
 
-        for req in scheduled_requests.context_requests:
-            # If this request is being loaded asynchronously, in addition to removing it from the list of scheduled requests,
-            # we also need to update it's state.
-            if req.request_id in self.new_async_requests.loading.keys():
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        for key in ["context_requests_chunking", "context_requests_last_chunk"]:
+            allowed_context_requests = []
+            for req in getattr(scheduled_requests, key):
+                # If this request is being loaded asynchronously, in addition to removing it from the list of scheduled requests,
+                # we also need to update it's state.
+                if req.request_id in self.new_async_requests.loading.keys():
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 
-                # Replace the request with the canonical request.
-                self.new_async_requests.loading[req.request_id] = req
-            else:
-                allowed_context_requests.append(req)
-
-        # Update the list of scheduled requests.
-        scheduled_requests.context_requests = allowed_context_requests
+                    # Replace the request with the canonical request.
+                    self.new_async_requests.loading[req.request_id] = req
+                else:
+                    allowed_context_requests.append(req)
+            setattr(scheduled_requests, key, allowed_context_requests)
 
     def handle_metadata(self) -> object:
         metadata = self._run_on_leader(

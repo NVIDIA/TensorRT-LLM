@@ -50,6 +50,9 @@ public:
         kMOE_ROUTER = 16,
         kMLP_ROUTER = 17,
         kMLP_GATE_UP = 18,
+        kSHARED_EXPERT_H_TO_4H = 19,
+        kSHARED_EXPERT_4H_TO_H = 20,
+        kSHARED_EXPERT_GATE = 21,
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
@@ -192,7 +195,8 @@ public:
 
     static std::vector<LoraModule> createLoraModules(std::vector<std::string> const& loraModuleNames,
         SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
-        SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts);
+        SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts, SizeType32 sharedExpertHiddenSize = 0,
+        SizeType32 moeHiddenSize = 0);
 
     static ModuleType constexpr toModuleType(std::string_view const& name)
     {
@@ -234,6 +238,12 @@ public:
             return ModuleType::kMLP_ROUTER;
         else if (name == "mlp_gate_up")
             return ModuleType::kMLP_GATE_UP;
+        else if (name == "shared_expert_h_to_4h")
+            return ModuleType::kSHARED_EXPERT_H_TO_4H;
+        else if (name == "shared_expert_4h_to_h")
+            return ModuleType::kSHARED_EXPERT_4H_TO_H;
+        else if (name == "shared_expert_gate")
+            return ModuleType::kSHARED_EXPERT_GATE;
         else
             return ModuleType::kINVALID;
     }
@@ -261,6 +271,9 @@ public:
         case ModuleType::kMOE_ROUTER: return "moe_router";
         case ModuleType::kMLP_ROUTER: return "mlp_router";
         case ModuleType::kMLP_GATE_UP: return "mlp_gate_up";
+        case ModuleType::kSHARED_EXPERT_H_TO_4H: return "shared_expert_h_to_4h";
+        case ModuleType::kSHARED_EXPERT_4H_TO_H: return "shared_expert_4h_to_h";
+        case ModuleType::kSHARED_EXPERT_GATE: return "shared_expert_gate";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";

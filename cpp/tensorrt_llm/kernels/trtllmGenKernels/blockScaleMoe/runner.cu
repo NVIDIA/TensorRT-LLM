@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 #include <iostream>
 #include <tensorrt_llm/common/assert.h>
+#include <tensorrt_llm/common/envUtils.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -167,7 +168,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-        routingData.mUsePdl = true;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnableTrtllmgenMoeRoutingRenormPDL();
         routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
         routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
 
@@ -240,11 +241,18 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     }
     else
     {
+        EltwiseActType eltwiseActType = EltwiseActType::None;
+        switch (actType)
+        {
+        default:
+        case ActType::Relu2: eltwiseActType = EltwiseActType::Relu2; break;
+        case ActType::Silu: eltwiseActType = EltwiseActType::Silu; break;
+        }
         options = {
             .dtypeA = dtypeWeights,
             .dtypeB = dtypeAct,
             .dtypeC = dtypeAct,
-            .eltwiseActType = EltwiseActType::Relu2,
+            .eltwiseActType = eltwiseActType,
             .deepSeekFp8 = useDeepSeekFp8,
             .fusedAct = false,
             .routeAct = true,

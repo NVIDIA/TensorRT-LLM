@@ -21,6 +21,7 @@ set(SRCS
     runtime/bindings.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
+    suffixAutomaton/bindings.cpp
     testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
@@ -53,7 +54,6 @@ target_link_libraries(
          ${TORCH_LIBRARIES}
          torch_python
          ${CUDA_DRV_LIB}
-         ${CUDA_NVML_LIB}
          th_common
          pg_utils)
 target_compile_definitions(

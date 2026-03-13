@@ -163,6 +163,9 @@ struct QKVPreprocessingParams
 
     float2 const* mrope_rotary_cos_sin{nullptr};
     int32_t const* mrope_position_deltas{nullptr};
+    // Helix parallelism params.
+    int32_t const* helix_position_offsets{nullptr};
+    bool const* helix_is_inactive_rank{nullptr};
 
     // Scalars.
     int batch_size{0};

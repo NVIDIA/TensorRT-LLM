@@ -342,6 +342,8 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
 
     // Attention sinks.
     params.attention_sinks = reinterpret_cast<float*>(attention_sinks_d);
+    assert((attention_sinks_d == nullptr || launch_params.flash_attention)
+        && "attention sinks are only supported with flash attention");
 
 #if defined(STORE_P)
     params.p_ptr = p_d;
@@ -779,6 +781,10 @@ int main(int argc, char** argv)
         {
             attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
         }
+        else if (!strcmp(argv[ii], "-bidirectional-sliding-window-mask"))
+        {
+            attention_mask_type = Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW;
+        }
         else if (!strcmp(argv[ii], "-custom-mask"))
         {
             attention_mask_type = Attention_mask_type::CUSTOM_MASK;
@@ -941,13 +947,20 @@ int main(int argc, char** argv)
     {
         assert(
             chunked_attention_size == 0 && "chunked_attention_size should not be used when sliding_window_size is set");
-        attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+        // Default to causal sliding window if the user did not explicitly set the mask type to bidirectional sliding
+        // window
+        if (attention_mask_type != Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW)
+        {
+            attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+        }
     }
     // Chunked attention.
     if (chunked_attention_size > 0)
     {
         assert((chunked_attention_size & (chunked_attention_size - 1)) == 0
             && "chunked_attention_size has to be a power of 2");
+        assert(attention_mask_type != Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW
+            && "Bidirectional sliding window attention should not use chunked attention");
         attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
     }
 
@@ -1629,6 +1642,11 @@ int main(int argc, char** argv)
                     {
                         valid = valid && (si >= std::max(int(so + 1 - sliding_window_size), 0));
                     }
+                }
+                else if (attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW)
+                {
+                    valid = valid && si >= std::max(int(so - sliding_window_size / 2), 0);
+                    valid = valid && si <= std::min(int(so + sliding_window_size / 2), int(actual_seqlen - 1));
                 }
                 if (is_mtp)
                 {
