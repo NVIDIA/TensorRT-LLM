@@ -2191,6 +2191,16 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     config_file = get_test_config("llama31_8b_nixl",
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
+    # Inject gather_generation_logits for top_logprobs coverage
+    with open(config_file, 'r') as f:
+        cluster_config = yaml.safe_load(f)
+    cluster_config["gather_generation_logits"] = True
+    with tempfile.NamedTemporaryFile(mode='w',
+                                     suffix='.yaml',
+                                     delete=False) as tmp:
+        yaml.dump(cluster_config, tmp)
+        config_file = tmp.name
+
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=llm_venv._new_env,
                              model_name=llama_model_root,
@@ -2274,11 +2284,46 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                             verify_logprobs_valid(
                                 lps, f"{api_type}/{mode}/{prompt[:30]}")
 
+                # 3) Chat API with top_logprobs (requires gather_generation_logits)
+                if api_type == "chat":
+                    top_lp_payload = {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": prompts[0]}],
+                        "max_tokens": max_tokens,
+                        "logprobs": True,
+                        "top_logprobs": 3,
+                        "stream": False,
+                        "temperature": 0,
+                    }
+                    async with session.post(
+                            f"{server_url}/v1/chat/completions",
+                            json=top_lp_payload,
+                            timeout=timeout) as resp:
+                        assert resp.status == 200, (
+                            f"[chat/top_logprobs] {resp.status}: "
+                            f"{await resp.text()}")
+                        result = await resp.json()
+                    lp_obj = result["choices"][0].get("logprobs")
+                    assert lp_obj is not None, "top_logprobs response should have logprobs"
+                    content = lp_obj.get("content", [])
+                    assert len(content) > 0, "top_logprobs content should be non-empty"
+                    for item in content:
+                        top_lps = item.get("top_logprobs") or []
+                        for tl in top_lps:
+                            assert "token" in tl and "logprob" in tl, (
+                                f"top_logprob entry missing token/logprob: {tl}")
+                            assert tl["logprob"] <= 0.0, (
+                                f"top_logprob {tl['logprob']} should be <= 0")
+
     try:
         asyncio.run(check_logprobs())
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
+        try:
+            os.unlink(config_file)
+        except OSError:
+            pass
 
 
 @pytest.mark.skip_less_device(8)

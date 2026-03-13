@@ -105,11 +105,8 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
                             bytes=list(tk.encode("utf-8", errors="replace")))
                         for tid, logprob in logprob.items()
                     ]
-                else:
-                    chat_logprob.top_logprobs = []
         else:
             chat_logprob.logprob = max(logprob, -9999.0)
-            chat_logprob.top_logprobs = []
         content.append(chat_logprob)
     chat_logprobs = ChatCompletionLogProbs(content=content)
     return chat_logprobs
