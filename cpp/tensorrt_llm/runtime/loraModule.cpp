@@ -22,12 +22,19 @@ namespace tensorrt_llm::runtime
 std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> const& loraModuleNames,
     SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
     SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts, SizeType32 sharedExpertHiddenSize,
-    SizeType32 moeHiddenSize)
+    SizeType32 moeHiddenSize, SizeType32 mambaInProjSize, SizeType32 mambaInnerSize, SizeType32 moeLatentSize)
 {
     auto const hidden = hiddenSize * tpSize;
     auto const mlpHidden = mlpHiddenSize * tpSize;
     auto const sharedExpertHidden = sharedExpertHiddenSize > 0 ? sharedExpertHiddenSize * tpSize : mlpHidden;
     auto const moeHidden = moeHiddenSize > 0 ? moeHiddenSize * tpSize : mlpHidden;
+    // Mamba dimensions: in_proj outputs d_in_proj, out_proj inputs d_inner
+    // Fall back to mlpHidden if not specified (for backward compatibility)
+    auto const mambaInProj = mambaInProjSize > 0 ? mambaInProjSize * tpSize : mlpHidden;
+    auto const mambaInner = mambaInnerSize > 0 ? mambaInnerSize * tpSize : mlpHidden;
+    // MoE latent projections are replicated (not TP-sharded), so moeLatentSize
+    // is the actual per-GPU dimension and should not be scaled by tpSize.
+    auto const moeLatent = moeLatentSize;
     auto const numHeads = numAttentionHeads * tpSize;
     auto const numKvHeads = numKvAttentionHeads * tpSize;
     auto const attnHeadSize = attentionHeadSize;
@@ -74,6 +81,12 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMOE_ROUTER: modules.emplace_back(t, hidden, numExperts, false, true, -1, -1); break;
         case ModuleType::kMLP_ROUTER: modules.emplace_back(t, hidden, 1, false, true, -1, -1); break;
         case ModuleType::kMLP_GATE_UP: modules.emplace_back(t, hidden, 2 * mlpHidden, false, true, -1, 0); break;
+        // Mamba modules: in_proj (hidden -> d_in_proj), out_proj (d_inner -> hidden)
+        case ModuleType::kMAMBA_IN_PROJ: modules.emplace_back(t, hidden, mambaInProj, false, true, -1, 0); break;
+        case ModuleType::kMAMBA_OUT_PROJ: modules.emplace_back(t, mambaInner, hidden, false, true, 1, -1); break;
+        // MoE latent projections: replicated (not TP-sharded), no TP split dims
+        case ModuleType::kMOE_LATENT_UP: modules.emplace_back(t, hidden, moeLatent, false, true, -1, -1); break;
+        case ModuleType::kMOE_LATENT_DOWN: modules.emplace_back(t, moeLatent, hidden, false, true, -1, -1); break;
         case ModuleType::kINVALID: throw std::runtime_error("Invalid LoRA module " + moduleName);
         }
     }

@@ -60,6 +60,10 @@ def get_default_trtllm_modules_to_hf_modules():
         "shared_expert_h_to_4h": "shared_expert.gate_proj",
         "shared_expert_4h_to_h": "shared_expert.down_proj",
         "shared_expert_gate": "shared_expert.up_proj",
+        "mamba_in_proj": "in_proj",
+        "mamba_out_proj": "out_proj",
+        "moe_latent_up": "fc1_latent_proj",
+        "moe_latent_down": "fc2_latent_proj",
     }
 
 

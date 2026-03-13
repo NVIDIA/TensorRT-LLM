@@ -160,7 +160,7 @@ def iterate_hf_lora(
             # Skip this fallback for shared_expert modules to avoid
             # silently mapping them to the wrong mlp_* module type.
             if hf_module not in hf_modules and "." in hf_module:
-                if not hf_module.startswith("shared_expert."):
+                if not hf_module.startswith(("shared_expert.", "shared_experts.")):
                     final_component = hf_module.split(".")[-1]
                     if final_component in hf_modules:
                         hf_module = final_component
@@ -680,6 +680,10 @@ class LoraManager(object):
         "shared_expert_h_to_4h": 19,
         "shared_expert_4h_to_h": 20,
         "shared_expert_gate": 21,
+        "mamba_in_proj": 22,
+        "mamba_out_proj": 23,
+        "moe_latent_up": 24,
+        "moe_latent_down": 25,
     }
 
     def __init__(
