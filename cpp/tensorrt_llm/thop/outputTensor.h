@@ -60,7 +60,7 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
             if (commPtr && *commPtr != nullptr)
             {
                 auto [tensor, buffer]
-                    = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(*commPtr, output_size, dtype);
+                    = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, output_size, dtype);
                 if (tensor.defined() && buffer.isValid())
                 {
                     result = tensor;
