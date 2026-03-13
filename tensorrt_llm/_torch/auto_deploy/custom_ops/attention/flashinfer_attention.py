@@ -55,6 +55,7 @@ class PlanParams:
     sm_scale: Optional[float] = None
 
     causal: bool = True
+    window_left: int = -1
 
     def __hash__(self):
         """Convert all fields to a string representation and concatenate them."""
@@ -186,6 +187,7 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
                 seq_lens=kv_lens_arr_host,
             )
             self.plan_params_prefill = plan_params
@@ -218,6 +220,7 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
@@ -249,6 +252,13 @@ class _FlashInferPlanner:
 
 
 _GlobalFlashInferPlanner = _FlashInferPlanner()
+
+
+def _to_flashinfer_window_left(sliding_window: Optional[int]) -> int:
+    """Convert AD sliding-window size to FlashInfer's inclusive window_left contract."""
+    if sliding_window is None or sliding_window <= 0:
+        return -1
+    return sliding_window - 1
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
@@ -342,11 +352,14 @@ def flashinfer_mha_with_cache(
     kv_cache: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
+    sliding_window: Optional[int],
     k_scale: float,
     v_scale: float,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    _GlobalFlashInferPlanner.reset(q.device)
+
     # kv_cache shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
     head_dim = kv_cache.shape[-1]
     page_size = kv_cache.shape[3]  # tokens_per_block
@@ -365,6 +378,7 @@ def flashinfer_mha_with_cache(
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
+    window_left = _to_flashinfer_window_left(sliding_window)
 
     # Assuming k_scale = v_scale = 1.0
     k_scale, v_scale = 1.0, 1.0
@@ -403,6 +417,7 @@ def flashinfer_mha_with_cache(
             q_dtype=q_prefill.dtype,
             kv_dtype=kv_cache.dtype,
             sm_scale=scale,
+            window_left=window_left,
         )
 
         wrapper_prefill = _GlobalFlashInferPlanner.plan_prefill(
@@ -435,6 +450,7 @@ def flashinfer_mha_with_cache(
             q_dtype=q_decode.dtype,
             kv_dtype=kv_cache.dtype,
             sm_scale=scale,
+            window_left=window_left,
         )
 
         wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
@@ -463,6 +479,120 @@ def flashinfer_mha_with_cache(
     return y.view(q_shape_og)
 
 
+@torch.library.custom_op("auto_deploy::flashinfer_attention_shared_kv_mha_with_cache", mutates_args=())
+def flashinfer_shared_kv_mha_with_cache(
+    # Q, K, V
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
+    cu_seqlen_host: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
+    last_page_len_host: torch.Tensor,
+    seq_len_with_cache_host: torch.Tensor,
+    # EXTRA METADATA
+    flashinfer_batch_indices: torch.Tensor,
+    flashinfer_positions: torch.Tensor,
+    # CACHES - combined KV cache
+    kv_cache: torch.Tensor,
+    # CONSTANTS
+    scale: Optional[float],
+    sliding_window: Optional[int],
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor:
+    _GlobalFlashInferPlanner.reset(q.device)
+
+    del k, v, flashinfer_batch_indices, flashinfer_positions
+
+    head_dim = kv_cache.shape[-1]
+    page_size = kv_cache.shape[3]
+    q_shape_og = q.shape
+    b, s = q_shape_og[:2]
+
+    q = q.reshape(b * s, -1, head_dim).contiguous()
+
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
+
+    n_heads = q.shape[1]
+    n_kv_heads = kv_cache.shape[2]
+    window_left = _to_flashinfer_window_left(sliding_window)
+
+    y = torch.zeros_like(q)
+
+    if num_prefill > 0:
+        q_prefill = q[:num_prefill_tokens]
+
+        pp_prefill = PlanParams(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            num_seq=num_prefill,
+            page_size=page_size,
+            q_dtype=q_prefill.dtype,
+            kv_dtype=kv_cache.dtype,
+            sm_scale=scale,
+            window_left=window_left,
+        )
+
+        wrapper_prefill = _GlobalFlashInferPlanner.plan_prefill(
+            qo_indptr_host=cu_seqlen_host[: num_prefill + 1],
+            kv_page_indptr_host=cu_num_pages_host[: num_prefill + 1],
+            kv_page_indices=cache_loc,
+            kv_last_page_len_host=last_page_len_host[:num_prefill],
+            kv_lens_arr_host=seq_len_with_cache_host[:num_prefill],
+            plan_params=pp_prefill,
+        )
+
+        y_prefill = wrapper_prefill.run(
+            q_prefill,
+            kv_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            enable_pdl=get_env_enable_pdl(),
+        )
+        y[:num_prefill_tokens] = y_prefill
+
+    if num_decode > 0:
+        q_decode = q[num_prefill_tokens:num_total_tokens]
+
+        pp_decode = PlanParams(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            num_seq=num_decode,
+            page_size=page_size,
+            q_dtype=q_decode.dtype,
+            kv_dtype=kv_cache.dtype,
+            sm_scale=scale,
+            window_left=window_left,
+        )
+
+        wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
+            kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
+            kv_page_indices=cache_loc,
+            kv_last_page_len=last_page_len[num_prefill:num_seq],
+            plan_params=pp_decode,
+        )
+
+        y_decode = wrapper_decode.run(
+            q_decode,
+            kv_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            enable_pdl=get_env_enable_pdl(),
+        )
+        y[num_prefill_tokens:num_total_tokens] = y_decode
+
+    return y.view(q_shape_og)
+
+
 @flashinfer_mha_with_cache.register_fake
 def flashinfer_mha_with_cache_fake(
     # Q, K, V
@@ -485,6 +615,31 @@ def flashinfer_mha_with_cache_fake(
     kv_cache: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
+    sliding_window: Optional[int],
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor:
+    return torch.empty_like(q.contiguous())
+
+
+@flashinfer_shared_kv_mha_with_cache.register_fake
+def flashinfer_shared_kv_mha_with_cache_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_info_host: torch.Tensor,
+    cu_seqlen_host: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
+    last_page_len_host: torch.Tensor,
+    seq_len_with_cache_host: torch.Tensor,
+    flashinfer_batch_indices: torch.Tensor,
+    flashinfer_positions: torch.Tensor,
+    kv_cache: torch.Tensor,
+    scale: Optional[float],
+    sliding_window: Optional[int],
     k_scale: float,
     v_scale: float,
     # OPTIONAL PRE-ALLOCATED OUTPUT
@@ -517,8 +672,21 @@ class FlashInferAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_attention
 
     @classmethod
+    def get_source_attention_ops(cls) -> List[OpOverloadPacket]:
+        return [
+            torch.ops.auto_deploy.torch_attention,
+            torch.ops.auto_deploy.torch_attention_shared_kv,
+        ]
+
+    @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default
+
+    @classmethod
+    def get_cached_attention_op_for_source_node(cls, source_attn_node: Node) -> MHACallable:
+        if source_attn_node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default:
+            return torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default
+        return cls.get_cached_attention_op()
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
@@ -564,15 +732,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        # Sanity check: layout == "bsnd"
-        # Prefer kwargs; fall back to the final positional arg if it's a string.
-        layout = source_attn_node.kwargs.get("layout", None)
-        if (
-            layout is None
-            and len(source_attn_node.args) > 0
-            and isinstance(source_attn_node.args[-1], str)
-        ):
-            layout = source_attn_node.args[-1]
+        layout = extract_op_args(source_attn_node, "layout")[0]
         if layout != "bsnd":
             raise RuntimeError(
                 f"Expected torch_attention layout='bsnd' but got {layout!r} "
@@ -589,11 +749,7 @@ class FlashInferAttention(AttentionDescriptor):
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
             )
 
-        # Get scale from args or kwargs
-        if len(source_attn_node.args) > 6:
-            scale = source_attn_node.args[6]
-        else:
-            scale = source_attn_node.kwargs.get("scale", None)
+        scale = extract_op_args(source_attn_node, "scale")[0]
 
         if not (isinstance(scale, float) or scale is None):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
@@ -601,6 +757,17 @@ class FlashInferAttention(AttentionDescriptor):
 
         return [
             scale,  # softmax scale
+            extract_op_args(source_attn_node, "sliding_window")[0],  # sliding window parameter
             1.0,  # k_scale
             1.0,  # v_scale
         ]
+
+    @classmethod
+    def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
+        return extract_op_args(source_attn_node, "layer_idx")[0]
+
+    @classmethod
+    def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
+        if source_attn_node.target != torch.ops.auto_deploy.torch_attention_shared_kv.default:
+            return None
+        return extract_op_args(source_attn_node, "shared_kv_source_layer_idx")[0]
