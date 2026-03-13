@@ -207,11 +207,20 @@ def test_nano_v3_reasoning_parser_stream(delta_texts: list, content: list,
 
 @pytest.mark.parametrize(("delta_texts", "finish_content", "finish_reasoning",
                           "reasoning_completed", "chat_template_kwargs"), [
-                              (["a", "b"], "ab", "", False, None),
+                              (["a", "b"], "", "", False, None),
                               ([R1_END, "a", "b"], "", "", True, None),
                               (["a", R1_END, "b"], "", "", True, None),
                               (["a", "b"], "", "", True, {
                                   "enable_thinking": False
+                              }),
+                              (["a", "b"], "", "", False, {
+                                  "force_nonempty_content": False
+                              }),
+                              (["a", "b"], "ab", "", False, {
+                                  "force_nonempty_content": True
+                              }),
+                              ([R1_END, "a", "b"], "", "", True, {
+                                  "force_nonempty_content": True
                               }),
                           ])
 def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,

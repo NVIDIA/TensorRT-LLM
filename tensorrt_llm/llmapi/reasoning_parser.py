@@ -231,5 +231,17 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                                          reasoning_content="")
         return result
 
+    def finish(self) -> ReasoningParserResult:
+        if (not self._force_nonempty_content and self.in_reasoning
+                and not self._found_closing_tag):
+            remaining = self._buffer
+            self._buffer = ""
+            self._accumulated_reasoning = ""
+            self.in_reasoning = False
+            if remaining:
+                return ReasoningParserResult(reasoning_content=remaining)
+            return ReasoningParserResult()
+        return self._maybe_swap_content(super().finish())
+
     def parse(self, text: str) -> ReasoningParserResult:
         return self._maybe_swap_content(super().parse(text))
