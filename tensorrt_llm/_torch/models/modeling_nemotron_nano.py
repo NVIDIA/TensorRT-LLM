@@ -1,11 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import copy
+import math
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.transforms as T
 import transformers
+from einops import rearrange as einops_rearrange
 from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
@@ -32,12 +37,191 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-from .modeling_radio import RADIOVisionModel
+from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model
 
 VIDEO_PRUNING_RATIO = float(os.getenv("TLLM_VIDEO_PRUNING_RATIO", "0"))
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
+
+
+@dataclass
+class DynamicResolutionParams:
+    media: Image.Image
+    num_tiles: int
+    num_embeddings: int
+    patch_size: Tuple[int, int]  # (width_patches, height_patches)
+
+
+class DynamicResolutionImageTiler:
+    """Adaptive image sizing for dynamic resolution encoding.
+
+    Instead of the InternVL-style fixed-tile approach, dynamic resolution
+    scales each image to a target size based on a token budget, preserving
+    aspect ratio and using pixel shuffle for downsampling.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_model_len: int,
+        patch_size: int,
+        min_num_patches: int,
+        max_num_patches: int,
+        downsample_ratio: float,
+        norm_mean: Sequence[float],
+        norm_std: Sequence[float],
+        factor_max: float = 1.0,
+    ) -> None:
+        self._patch_size = patch_size
+        self._max_model_len = max_model_len
+        self._min_num_patches = min_num_patches
+        self._max_num_patches = max_num_patches if max_num_patches > 0 else float("inf")
+        self._factor_max = factor_max
+        self.norm_mean = torch.tensor(norm_mean).reshape(3, 1, 1)
+        self.norm_std = torch.tensor(norm_std).reshape(3, 1, 1)
+        self._transform = T.Compose(
+            [
+                T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                T.ToTensor(),
+            ]
+        )
+        # For pixel_shuffle with downsample_ratio=0.5, each 2x2 patch grid -> 1 token
+        if downsample_ratio >= 1:
+            raise ValueError(f"downsample_ratio must be < 1, got {downsample_ratio}.")
+        reduction_factor = 1 / downsample_ratio
+        if reduction_factor != 2.0:
+            raise ValueError(
+                "Only a reduction factor of 2.0 is supported (downsample_ratio=0.5), "
+                f"got {reduction_factor} ({downsample_ratio=})."
+            )
+        self._reduction_factor = int(reduction_factor)
+
+    def _get_num_embeddings(self, width: int, height: int) -> int:
+        """Post pixel-shuffle token count."""
+        num_patches = width * height
+        return num_patches // (self._reduction_factor**2)
+
+    def max_num_tokens_available(self, text_prompt_length: int) -> int:
+        # The -4 is to account for BOS, EOS, and image start / end tokens.
+        # TODO: investigate whether this should take the number of images into account.
+        return self._max_model_len - text_prompt_length - 4
+
+    def process_media(
+        self, media: Image.Image, num_tokens_available: int
+    ) -> Tuple[DynamicResolutionParams, int]:
+        """Process a single media item and return its parameters.
+
+        Args:
+            media: The media item to process (image).
+            num_tokens_available: Number of tokens available for this media.
+
+        Returns:
+            DynamicResolutionParams for the media, and the token count.
+        """
+        orig_width, orig_height = media.width, media.height
+        closest_patch_height = round(orig_height / self._patch_size + 0.5)
+        closest_patch_width = round(orig_width / self._patch_size + 0.5)
+        patches = closest_patch_height * closest_patch_width
+
+        factor = min(math.sqrt(num_tokens_available / patches), self._factor_max)
+        target_patch_height = math.floor(factor * closest_patch_height)
+        target_patch_width = math.floor(factor * closest_patch_width)
+
+        # Enforce min_num_patches.
+        if (
+            num_tokens_available > self._min_num_patches
+            and target_patch_height * target_patch_width < self._min_num_patches
+        ):
+            up_factor = math.sqrt(
+                self._min_num_patches / (target_patch_height * target_patch_width)
+            )
+            target_patch_height = math.ceil(up_factor * target_patch_height)
+            target_patch_width = math.ceil(up_factor * target_patch_width)
+
+        # Round patch grid to be divisible by 2 for pixel shuffle.
+        required_divisor = 2
+        rem_h = target_patch_height % required_divisor
+        if rem_h != 0:
+            inc_h = required_divisor - rem_h
+            if (target_patch_height + inc_h) * target_patch_width <= num_tokens_available:
+                target_patch_height += inc_h
+            else:
+                target_patch_height = max(required_divisor, target_patch_height - rem_h)
+
+        rem_w = target_patch_width % required_divisor
+        if rem_w != 0:
+            inc_w = required_divisor - rem_w
+            if target_patch_height * (target_patch_width + inc_w) <= num_tokens_available:
+                target_patch_width += inc_w
+            else:
+                target_patch_width = max(required_divisor, target_patch_width - rem_w)
+
+        num_embeddings = self._get_num_embeddings(target_patch_width, target_patch_height)
+        token_count = target_patch_width * target_patch_height
+
+        return DynamicResolutionParams(
+            media=media,
+            num_tiles=1,
+            num_embeddings=num_embeddings,
+            patch_size=(target_patch_width, target_patch_height),
+        ), token_count
+
+    def compute_params(
+        self, media_list: List[Image.Image], num_tokens_available: int
+    ) -> List[DynamicResolutionParams]:
+        """Compute parameters for all images with iterative token budgeting."""
+        # Scale up by pixel shuffle factor (2^2 = 4)
+        num_tokens_available = num_tokens_available * (self._reduction_factor**2)
+        num_tokens_available = max(num_tokens_available, self._min_num_patches * len(media_list))
+
+        num_tokens_per_media = [
+            max(min(num_tokens_available, self._max_num_patches), self._min_num_patches)
+        ] * len(media_list)
+
+        # This loop keeps scaling down the number of tokens for each element in `num_tokens_per_media`
+        # by the same amount until the sum of the token counts across all elements fits within the
+        # `num_tokens_available` budget. The cap at 10 is to ensure the loop terminates, since the
+        # `process_media` method applies rounding in such a way that could lead to the token count
+        # (slightly) exceeding the prior iteration's downscaling.
+        for _ in range(10):
+            params = []
+            token_counts = []
+
+            for media, tokens_for_media in zip(media_list, num_tokens_per_media):
+                param, token_count = self.process_media(media, tokens_for_media)
+                params.append(param)
+                token_counts.append(token_count)
+
+            total_tokens = sum(token_counts)
+            if total_tokens <= num_tokens_available:
+                return params
+
+            # Over budget - scale down proportionally.
+            scaling_factor = num_tokens_available / total_tokens
+            scaled = [max(self._min_num_patches, int(tc * scaling_factor)) for tc in token_counts]
+            if any(s < o for s, o in zip(scaled, num_tokens_per_media)):
+                num_tokens_per_media = scaled
+            else:
+                num_tokens_per_media = [self._min_num_patches] * len(media_list)
+
+        raise ValueError("Token budget iteration failed to converge")
+
+    def apply_params(self, params: DynamicResolutionParams) -> torch.Tensor:
+        """Resize the image to target dimensions and convert to tensor."""
+        resized = params.media.resize(
+            (
+                params.patch_size[0] * self._patch_size,
+                params.patch_size[1] * self._patch_size,
+            )
+        )
+        return self._transform(resized)
+
+    @staticmethod
+    def stack(images: List[torch.Tensor], patch_size: int) -> torch.Tensor:
+        """Rearrange images into patches and concatenate."""
+        imgs = [_rearrange_img(img, patch_size) for img in images]
+        return torch.cat(imgs, dim=0).unsqueeze(0)
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
@@ -62,17 +246,28 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         )
         self.downsample_ratio = config.downsample_ratio
         self.spatial_merge_size = int(self.patch_size / self.downsample_ratio)
-        self.ps_version = config.ps_version  # Pixel shuffle version.
+        # Pixel shuffle version.
+        self.ps_version = config.ps_version
+        if self.ps_version not in (supported_versions := {"v1", "v2"}):
+            raise NotImplementedError(
+                f"Unsupported {config.ps_version=}. Supported versions: {supported_versions}."
+            )
         self.video_pruning_ratio = VIDEO_PRUNING_RATIO
 
         # Construct the vision projection.
         self.vit_hidden_size = config.vit_hidden_size
         self.vision_projection_hidden_size = config.projector_hidden_size
         self.llm_hidden_size = config.llm_config.hidden_size
+
+        # Different versions of the configuration code may have a different name for the same value.
+        eps = getattr(config.llm_config, "rms_norm_eps", None)
+        if eps is None:
+            eps = config.llm_config.layer_norm_epsilon
+
         self.mlp1 = nn.Sequential(
             nn.RMSNorm(
                 self.vit_hidden_size * int(1 / self.downsample_ratio) ** 2,
-                eps=config.llm_config.rms_norm_eps,
+                eps=eps,
                 dtype=config.torch_dtype,
             ),
             nn.Linear(
@@ -146,6 +341,50 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             vit_embeds = self.mlp1(vit_embeds)
             vit_embeds_lst.append(vit_embeds)
         vit_embeds = torch.cat(vit_embeds_lst, dim=0)
+        return vit_embeds
+
+    def pixel_shuffle_dynamic_res(
+        self, x: torch.Tensor, image_sizes: List[Tuple[int, int]]
+    ) -> torch.Tensor:
+        """Pixel shuffle for variable-size images in a concatenated sequence."""
+        scale_factor = self.downsample_ratio
+        patch_dim = self.patch_size
+        seq_lens = calc_seq_lens(image_sizes, patch_dim)
+        splits = torch.split(x, seq_lens, dim=1)
+        out = []
+        for i, sv in enumerate(splits):
+            h = image_sizes[i][0] // patch_dim
+            w = image_sizes[i][1] // patch_dim
+            sv = sv.reshape(sv.shape[0], h, w, -1)
+
+            n, h_dim, w_dim, c = sv.size()
+            sv = sv.view(n, h_dim, int(w_dim * scale_factor), int(c / scale_factor))
+            sv = sv.permute(0, 2, 1, 3).contiguous()
+            sv = sv.view(
+                n,
+                int(w_dim * scale_factor),
+                int(h_dim * scale_factor),
+                int(c / (scale_factor * scale_factor)),
+            )
+
+            # NOTE: the input processor explicitly checks that dynamic resolution is always used
+            # with `ps_version="v2"`..
+            if self.ps_version != "v2":
+                raise RuntimeError("Dynamic resolution requires pixel shuffling version 'v2'.")
+            sv = sv.permute(0, 2, 1, 3).contiguous()
+
+            sv = sv.reshape(sv.shape[0], -1, sv.shape[-1])
+            out.append(sv)
+
+        return torch.cat(out, dim=1)
+
+    def extract_feature_dynamic(
+        self, pixel_values_flat: torch.Tensor, image_sizes: List[Tuple[int, int]]
+    ) -> torch.Tensor:
+        """Dynamic resolution feature extraction for variable-size images."""
+        vit_embeds = self.vision_model(pixel_values_flat, image_sizes=image_sizes)
+        vit_embeds = self.pixel_shuffle_dynamic_res(vit_embeds, image_sizes=image_sizes)
+        vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
     def apply_evs_per_video(
@@ -234,7 +473,25 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         modality_types = [
             multimodal_data["modality_type"] for multimodal_data in multimodal_data_lst
         ]
-        # Batch data.
+
+        for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst):
+            data = multimodal_data[modality_type]
+            # Dynamic resolution path is indicated by the presence of "image_sizes".
+            if "image_sizes" in data:
+                pixel_values_flat = data["pixel_values"]
+                image_sizes = data["image_sizes"]
+                embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
+                mm_embedding.append(embeds.reshape(-1, self.llm_hidden_size))
+            # This applies to images without dynamic resolution, or videos.
+            else:
+                # Fallback to fixed-tile extraction for this modality.
+                pixel_values = data["pixel_values"]
+                embeds = self.extract_feature(pixel_values)
+                mm_embedding.append(embeds.reshape(-1, self.llm_hidden_size))
+
+        return mm_embedding, [None] * len(modality_types)
+
+        # Existing fixed-tile path.
         pixel_values = [
             multimodal_data[modality_type]["pixel_values"]
             for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst)
@@ -312,6 +569,27 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             self.img_end_token, add_special_tokens=False
         )[0]
 
+        # Detect dynamic resolution from config.
+        self.dynamic_tiler = None
+        vision_args = getattr(getattr(config, "vision_config", None), "args", None)
+        if isinstance(vision_args, dict) and "min_num_patches" in vision_args:
+            pixel_shuffle_version = config.ps_version
+            if pixel_shuffle_version != "v2":
+                raise NotImplementedError(
+                    "Dynamic resolution (enabled via `vision_config.min_num_patches`) only supports "
+                    f"`config.ps_version='v2'. Got {pixel_shuffle_version=}."
+                )
+            self.dynamic_tiler = DynamicResolutionImageTiler(
+                max_model_len=config.max_sequence_length,
+                patch_size=self.patch_size,
+                downsample_ratio=self.downsample_ratio,
+                min_num_patches=vision_args["min_num_patches"],
+                max_num_patches=vision_args["max_num_patches"],
+                norm_mean=config.norm_mean,
+                norm_std=config.norm_std,
+            )
+            logger.info("Dynamic resolution enabled for NanoV2VL input processor")
+
     @property
     def config(self) -> transformers.PretrainedConfig:
         return self._config
@@ -348,6 +626,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         image: Image.Image,
         **kwargs,
     ):
+        # Dynamic resolution path.
+        if self.dynamic_tiler is not None:
+            budget = self.dynamic_tiler._max_num_patches
+            params, _ = self.dynamic_tiler.process_media(image, budget)
+            num_image_tokens = params.num_embeddings
+            # Add special tokens.
+            num_image_tokens += len(self.get_mm_special_token_ids())
+            return num_image_tokens
+
         # The logic is copied and modified from HuggingFace ImageProcessor.
 
         def _get_internvl_target_ratios(
@@ -481,6 +768,79 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             processed_query, add_special_tokens=False, return_tensors="pt"
         )
         return processed_images, input_ids
+
+    def _process_images_dynamic(
+        self, images: List[Image.Image | torch.Tensor], text_prompt: str
+    ) -> Tuple[Dict[str, Any], torch.Tensor]:
+        """Process images using dynamic resolution tiling."""
+        tiler = self.dynamic_tiler
+
+        # Convert tensors to PIL if needed (e.g. when image_data_format="pt").
+        # TODO: this seems like a perf sink. Just get rid of PIL and convert everything to torch tensors
+        # right from the get-go.
+        pil_images = []
+        for img in images:
+            if isinstance(img, torch.Tensor):
+                # CHW float [0,1] -> HWC uint8 PIL
+                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                pil_images.append(Image.fromarray(img_np))
+            else:
+                pil_images.append(img)
+        images = pil_images
+
+        # Compute text-only length for token budgeting.
+        sans_images = text_prompt.replace(self.img_context_token, "")
+        text_ids = self.tokenizer.encode(sans_images, add_special_tokens=False)
+        text_prompt_length = len(text_ids)
+
+        budget = tiler.max_num_tokens_available(text_prompt_length)
+        params_list = tiler.compute_params(images, budget)
+
+        # Resize, convert to tensor, and normalize each image.
+        processed_tensors = []
+        image_sizes = []
+        num_tokens_per_image = []
+        for params in params_list:
+            tensor = tiler.apply_params(params)  # [3, H, W]
+            # Normalize with same mean/std as training.
+            tensor = (tensor - tiler.norm_mean) / tiler.norm_std
+            processed_tensors.append(tensor)
+            image_sizes.append((tensor.shape[-2], tensor.shape[-1]))
+            num_tokens_per_image.append(params.num_embeddings)
+
+        # Rearrange into patches and concatenate.
+        pixel_values_flat = DynamicResolutionImageTiler.stack(
+            processed_tensors, self.patch_size
+        ).to(self.dtype)
+        # -> [1, total_patches, C*P*P]
+
+        # Build text prompt with per-image token counts.
+        parts = text_prompt.split(self.img_context_token)
+        if len(parts) - 1 != len(images):
+            raise ValueError(
+                f"Number of {self.img_context_token} tokens ({len(parts) - 1}) doesn't match "
+                f"the number of images ({len(images)})"
+            )
+        processed_query = parts[0]
+        for num_tokens, part in zip(num_tokens_per_image, parts[1:]):
+            image_repl = (
+                self.img_start_token + self.img_context_token * num_tokens + self.img_end_token
+            )
+            processed_query += image_repl + part
+
+        input_ids = self.tokenizer.encode(
+            processed_query, add_special_tokens=False, return_tensors="pt"
+        )
+
+        processed_data = {
+            "pixel_values": pixel_values_flat,
+            "num_patches": torch.tensor([len(images)]),
+            # NOTE: this is what the vision encoder uses to determine whether we are in the dynamic
+            # resolution code path.
+            "image_sizes": image_sizes,
+            "num_tokens_per_image": num_tokens_per_image,
+        }
+        return processed_data, input_ids
 
     def _process_videos_frames(
         self, videos: List[List[Image.Image | torch.Tensor]]
@@ -647,10 +1007,20 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         input_ids = None
         if images is not None:
             modality_type = "image"
-            processed_images, input_ids = self._process_images(images, text_prompt)
-            evs_ids = None
-            modality_data["pixel_values"] = processed_images["pixel_values"].to(self.dtype)
-            modality_data["num_patches"] = processed_images["num_patches"].sum(dim=0, keepdim=True)
+            if self.dynamic_tiler is not None:
+                # Dynamic resolution path.
+                processed_data, input_ids = self._process_images_dynamic(images, text_prompt)
+                modality_data["pixel_values"] = processed_data["pixel_values"]
+                modality_data["num_patches"] = processed_data["num_patches"]
+                modality_data["image_sizes"] = processed_data["image_sizes"]
+                modality_data["num_tokens_per_image"] = processed_data["num_tokens_per_image"]
+            else:
+                # Existing fixed-tile path.
+                processed_images, input_ids = self._process_images(images, text_prompt)
+                modality_data["pixel_values"] = processed_images["pixel_values"].to(self.dtype)
+                modality_data["num_patches"] = processed_images["num_patches"].sum(
+                    dim=0, keepdim=True
+                )
             modality_data["video_size"] = None
             # During model inference, the image/video modality data can be mixed during inflight-batching.
             # Store input_ids for image modality here when EVS is enabled,
@@ -888,3 +1258,16 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
+
+
+def _rearrange_img(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    py = x.shape[-2] // patch_size
+    px = x.shape[-1] // patch_size
+    return einops_rearrange(
+        x,
+        "c (py yy) (px xx) -> (py px) (c yy xx)",
+        py=py,
+        yy=patch_size,
+        px=px,
+        xx=patch_size,
+    )

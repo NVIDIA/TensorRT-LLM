@@ -111,7 +111,7 @@ public:
         NB_OVERRIDE_PURE(addToken, requestId);
     }
 
-    bool addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
+    void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
     {
         NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
@@ -431,6 +431,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
                 return pool.index({torch::indexing::Slice(), layer_idx});
             },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_indexer_k_cache_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor { return tr::Torch::tensor(self.getIndexerKCachePool()); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
