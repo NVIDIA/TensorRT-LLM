@@ -65,6 +65,15 @@ _LOGITS_GATHER_OPS = [
     "auto_deploy::gather_tokens",
 ]
 
+# Persistent-buffer dynamic ops: these ops produce outputs in pre-allocated
+# persistent buffers with stable addresses.  They must run eagerly (cannot be
+# captured in CUDA graphs due to CPU control flow / dynamic kernel grids),
+# but they do NOT need MetadataWrapper (addresses are already stable) or
+# DynamicOpWrapper (no fresh allocation, returns persistent buffer directly).
+_PERSISTENT_BUFFER_OPS = [
+    "auto_deploy::trtllm_attention_prepare_metadata",
+]
+
 # Inplace dynamic ops: these ops mutate their input tensor and return None,
 # so they do NOT produce a new output tensor and do NOT need an out= buffer.
 # This is a semantic property separate from _CACHED_CONV_OPS (which classifies
@@ -84,6 +93,7 @@ def _get_all_dynamic_op_names() -> Set[str]:
         + _CACHED_DELTA_OPS
         + _METADATA_PREP_OPS
         + _LOGITS_GATHER_OPS
+        + _PERSISTENT_BUFFER_OPS
     )
 
 
@@ -168,7 +178,10 @@ def submod_has_cuda_ops(submod: nn.Module) -> bool:
 
 
 _SKIP_OUT_DYNAMIC_OPS: Set[str] = (
-    set(_INPLACE_DYNAMIC_OPS) | set(_METADATA_PREP_OPS) | set(_LOGITS_GATHER_OPS)
+    set(_INPLACE_DYNAMIC_OPS)
+    | set(_METADATA_PREP_OPS)
+    | set(_LOGITS_GATHER_OPS)
+    | set(_PERSISTENT_BUFFER_OPS)
 )
 
 
