@@ -2140,3 +2140,44 @@ def test_vlm_wrapper_decode_only_with_delta():
         atol=1e-5,
         msg="Decode-only with deltas should apply delta-adjusted 3D expansion",
     )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_flattened_prefill_with_request_deltas():
+    """Flattened cached prefill should expand request deltas per token, not per batch."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    req1_len = 3
+    req2_len = 2
+    total_tokens = req1_len + req2_len
+
+    input_ids = torch.randint(0, 50, (1, total_tokens))
+    position_ids = torch.tensor([[10, 11, 12, 20, 21]])
+    deltas = torch.tensor([[7], [-4]])
+    batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32)
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        mrope_position_deltas=deltas,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+    )
+
+    expected_token_delta = torch.tensor([[7, 7, 7, -4, -4]])
+    expected_pos_3d = (position_ids + expected_token_delta)[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Flattened cached prefill should repeat request deltas across tokens",
+    )

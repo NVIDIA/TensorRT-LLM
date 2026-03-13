@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 
 """Qwen3.5 MoE model for auto_deploy (text + vision).
 
@@ -1916,8 +1916,12 @@ class Qwen3_5MoeModel(nn.Module):
         else:
             if position_ids is None:
                 raise ValueError("position_ids is required for text-only or decode-only forward")
-            if position_ids.ndim == 1:
-                token_delta = torch.zeros_like(position_ids)
+            is_flattened_cached_layout = position_ids.ndim == 1 or (
+                position_ids.ndim == 2 and position_ids.shape[0] == 1
+            )
+            if is_flattened_cached_layout:
+                flat_position_ids = position_ids.reshape(-1)
+                token_delta = torch.zeros_like(flat_position_ids)
                 if (
                     delta is not None
                     and cu_seqlen is not None
@@ -1926,10 +1930,10 @@ class Qwen3_5MoeModel(nn.Module):
                 ):
                     seq_lens = (cu_seqlen[1:] - cu_seqlen[:-1]).to(torch.long)
                     token_delta = torch.repeat_interleave(
-                        delta.squeeze(-1).to(position_ids.device, position_ids.dtype),
-                        seq_lens.to(position_ids.device),
+                        delta.squeeze(-1).to(flat_position_ids.device, flat_position_ids.dtype),
+                        seq_lens.to(flat_position_ids.device),
                     )
-                position_ids_3d = (position_ids + token_delta).view(1, 1, -1).expand(3, 1, -1)
+                position_ids_3d = (flat_position_ids + token_delta).view(1, 1, -1).expand(3, 1, -1)
             else:
                 position_ids_3d = (position_ids + delta)[None].expand(3, -1, -1)
 

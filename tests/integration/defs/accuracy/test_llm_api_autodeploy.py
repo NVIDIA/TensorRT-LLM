@@ -998,12 +998,6 @@ class TestKimiK2_5(LlmapiAccuracyTestHarness):
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16",
-                "text_config": {
-                    "num_hidden_layers": 6,
-                },
-                "vision_config": {
-                    "depth": 2,
-                },
             },
             "transforms": {
                 "export_to_gm": {
