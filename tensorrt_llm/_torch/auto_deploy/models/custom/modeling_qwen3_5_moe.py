@@ -2510,8 +2510,10 @@ class Qwen3_5MoeADInputProcessor:
             extra_processed_inputs = {}
         extra_processed_inputs["multimodal_input"] = multimodal_input
         multimodal_data = extra_processed_inputs.get("multimodal_data", {})
-        multimodal_data["special_token_offsets"] = torch.tensor(special_offsets, dtype=torch.int32)
-        multimodal_data["item_types"] = torch.tensor(item_types, dtype=torch.int32)
+        multimodal_data["layout_metadata"] = {
+            "special_token_offsets": torch.tensor(special_offsets, dtype=torch.int32),
+            "item_types": torch.tensor(item_types, dtype=torch.int32),
+        }
         extra_processed_inputs["multimodal_data"] = multimodal_data
         return token_ids, extra_processed_inputs
 

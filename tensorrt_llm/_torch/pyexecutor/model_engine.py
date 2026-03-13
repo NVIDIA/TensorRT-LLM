@@ -2265,12 +2265,16 @@ class PyTorchModelEngine(ModelEngine):
             request.cached_tokens = num_cached_tokens_per_seq[-1]
 
             # Multimodal
+            layout_metadata = {}
+            if request.py_multimodal_data is not None:
+                layout_metadata = request.py_multimodal_data.get(
+                    'layout_metadata', request.py_multimodal_data)
             py_multimodal_runtime = MultimodalRuntimeData(
                 mm_token_lengths=request.multimodal_lengths,
                 mm_token_positions=request.multimodal_positions,
                 past_seen_token_num=past_seen_token_num,
                 chunk_end_pos=end_compute,
-                special_token_offsets=request.py_multimodal_data.get(
+                special_token_offsets=layout_metadata.get(
                     'special_token_offsets', []),
             ) if request.multimodal_hashes is not None else None
 

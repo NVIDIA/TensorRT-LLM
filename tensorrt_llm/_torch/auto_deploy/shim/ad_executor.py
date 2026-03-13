@@ -75,6 +75,10 @@ from ..utils._graph import get_input_embeddings, get_lm_head_weights
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
+# `layout_metadata` is a reserved multimodal payload used to carry request-level
+# layout semantics that the wrapper reconstructs into tensor kwargs separately.
+_RESERVED_MM_DATA_KEYS = frozenset({"layout_metadata"})
+
 
 @dataclass
 class ReportingInfo:
@@ -594,13 +598,14 @@ class ADEngine(ModelEngine):
             end_compute = begin_compute + (cu_seqlen[i + 1] - cu_seqlen[i])
             mm_pos = getattr(req, "multimodal_positions", None)
             mm_len = getattr(req, "multimodal_lengths", None)
-            mm_item_types = (
-                req.py_multimodal_data.get("item_types", []) if req.py_multimodal_data else []
-            )
+            layout_metadata = {}
+            if req.py_multimodal_data:
+                layout_metadata = req.py_multimodal_data.get(
+                    "layout_metadata", req.py_multimodal_data
+                )
+            mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
             special_offsets = (
-                req.py_multimodal_data.get("special_token_offsets", [])
-                if req.py_multimodal_data
-                else []
+                layout_metadata.get("special_token_offsets", []) if layout_metadata else []
             )
             mm_pos_list = list(mm_pos) if mm_pos is not None else []
             mm_len_list = list(mm_len) if mm_len is not None else []
@@ -728,7 +733,7 @@ class ADEngine(ModelEngine):
             # store extra arguments
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
-                    if k in {"special_token_offsets", "item_types"}:
+                    if k in _RESERVED_MM_DATA_KEYS:
                         continue
                     extra_args[k].append(v)
 
