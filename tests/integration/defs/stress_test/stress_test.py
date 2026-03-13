@@ -951,8 +951,6 @@ def create_aiperf_command(model_name,
         str(concurrency),
         "--warmup-request-count",
         str(warmup_request_count),
-        "--warmup-concurrency",
-        "1",
         # "--verbose",
     ]
 
