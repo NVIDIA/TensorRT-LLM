@@ -718,6 +718,14 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help=help_info_with_stability_tag(
                   "Keyword arguments for media I/O.", "prototype"))
+@click.option("--video_pruning_rate",
+              type=float,
+              default=None,
+              help=help_info_with_stability_tag(
+                  "Pruning rate for video frames in multimodal models. "
+                  "Applied by Efficient Video Sampling (EVS). "
+                  "None disables EVS, values in [0, 1) enable pruning.",
+                  "beta"))
 @click.option("--chat_template",
               type=str,
               default=None,
@@ -760,8 +768,9 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str],
-        grpc: bool, served_model_name: Optional[str],
+        video_pruning_rate: Optional[float], custom_module_dirs: list[Path],
+        chat_template: Optional[str], grpc: bool,
+        served_model_name: Optional[str],
         extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -823,6 +832,10 @@ def serve(
                 llm_args_extra_dict = yaml.safe_load(f)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
+
+        # Add video_pruning_rate if specified via CLI (not None)
+        if video_pruning_rate is not None:
+            llm_args["video_pruning_rate"] = video_pruning_rate
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)

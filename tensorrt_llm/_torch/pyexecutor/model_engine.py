@@ -204,7 +204,8 @@ class PyTorchModelEngine(ModelEngine):
         self.input_processor = create_input_processor(
             model_path,
             tokenizer=None,
-            checkpoint_format=llm_args.checkpoint_format)
+            checkpoint_format=llm_args.checkpoint_format,
+            video_pruning_rate=llm_args.video_pruning_rate)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
