@@ -78,6 +78,50 @@ def _get_default_torch_compile_config(torch_compile):
                               max_num_streams=3) if torch_compile else None
 
 
+def _run_multinode_accuracy(model_path,
+                            model_name,
+                            *,
+                            benchmarks,
+                            tp_size=2,
+                            pp_size=1,
+                            ep_size=1,
+                            draft_model_path=None,
+                            max_draft_len=2,
+                            kv_cache_config=None,
+                            max_num_tokens=4096,
+                            max_batch_size=1,
+                            **llm_kwargs):
+    benchmark_task_map = {
+        "mmlu": MMLU,
+        "gsm8k": GSM8K,
+    }
+    if kv_cache_config is None:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=draft_model_path
+                                        is None)
+    spec_config = None
+    if draft_model_path is not None:
+        spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
+                                           speculative_model=draft_model_path,
+                                           eagle3_one_model=True)
+
+    with LLM(model_path,
+             tensor_parallel_size=tp_size,
+             pipeline_parallel_size=pp_size,
+             moe_expert_parallel_size=ep_size,
+             max_num_tokens=max_num_tokens,
+             max_batch_size=max_batch_size,
+             kv_cache_config=kv_cache_config,
+             speculative_config=spec_config,
+             **llm_kwargs) as llm:
+        for benchmark in benchmarks:
+            task_cls = benchmark_task_map.get(benchmark)
+            if task_cls is None:
+                raise ValueError(f"Unsupported benchmark: {benchmark}")
+            task = task_cls(model_name)
+            task.evaluate(llm)
+
+
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
@@ -740,6 +784,32 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestLlama3_1_70B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-70B"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-70B"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(2)
+    def test_auto_dtype_tp2(self):
+        _run_multinode_accuracy(self.MODEL_PATH,
+                                self.MODEL_NAME,
+                                benchmarks=["mmlu"])
+
+
+class TestLlama3_1_405BInstructFp4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3.1-405B-Instruct-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(2)
+    def test_fp4_tp2(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        _run_multinode_accuracy(self.MODEL_PATH,
+                                self.MODEL_NAME,
+                                benchmarks=["mmlu"],
+                                kv_cache_config=kv_cache_config)
+
+
 @pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
@@ -756,6 +826,13 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+    @pytest.mark.skip_less_mpi_world_size(2)
+    def test_auto_dtype_tp2(self):
+        _run_multinode_accuracy(
+            f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct",
+            self.MODEL_NAME,
+            benchmarks=["mmlu"])
 
     @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(8)
@@ -1103,6 +1180,28 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(2)
+    def test_auto_dtype_tp2(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        _run_multinode_accuracy(
+            f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct",
+            self.MODEL_NAME,
+            benchmarks=["mmlu"],
+            ep_size=2,
+            kv_cache_config=kv_cache_config)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(2)
+    def test_fp8_tp2(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        _run_multinode_accuracy(
+            f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
+            self.MODEL_NAME,
+            benchmarks=["mmlu"],
+            ep_size=2,
+            kv_cache_config=kv_cache_config)
 
 
 class TestMistral7B(LlmapiAccuracyTestHarness):
@@ -2831,6 +2930,20 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestDeepSeekR1DistillLlama70B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(2)
+    def test_auto_dtype_tp2(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        _run_multinode_accuracy(self.MODEL_PATH,
+                                self.MODEL_NAME,
+                                benchmarks=["mmlu"],
+                                kv_cache_config=kv_cache_config)
+
+
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device(8)
 class TestDeepSeekV3(LlmapiAccuracyTestHarness):
@@ -4449,6 +4562,42 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(2)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
+        [
+            (2, 1, 2, False, False, False, "CUTLASS", False),
+            (2, 1, 2, False, False, False, "CUTLASS", True),
+        ],
+        ids=[
+            "latency_moe_cutlass",
+            "latency_moe_cutlass_eagle3",
+        ],
+    )
+    def test_nvfp4_2gpus(self, tp_size, pp_size, ep_size, attention_dp,
+                         cuda_graph, overlap_scheduler, moe_backend, eagle3):
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=not eagle3)
+        _run_multinode_accuracy(
+            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+            self.MODEL_NAME,
+            benchmarks=["mmlu"],
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            draft_model_path=(f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/"
+                              if eagle3 else None),
+            kv_cache_config=kv_cache_config,
+            enable_attention_dp=attention_dp,
+            **pytorch_config)
 
 
 class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
