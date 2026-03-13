@@ -55,9 +55,9 @@ class CachedSequenceInterface:
         self,
         max_seq_len: int,
         max_batch_size: int,
+        max_num_tokens: int,
         device: Optional[DeviceLikeType] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
-        max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
     ) -> None:
         """Initialize the CachedSequenceInterface.
@@ -65,10 +65,9 @@ class CachedSequenceInterface:
         Args:
             max_seq_len: Maximum sequence length including input and generated tokens.
             max_batch_size: Maximum number of sequences (requests) that can be processed.
+            max_num_tokens: Maximum total tokens across all sequences.
             device: Target device for tensors. Defaults to "cuda".
             kv_cache_config: KV cache configuration. If None, uses default KvCacheConfig.
-            max_num_tokens: Maximum total tokens across all sequences. If None, computed from
-                max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired

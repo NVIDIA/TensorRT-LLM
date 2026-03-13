@@ -1,0 +1,4 @@
+# MiniMax-M2 - override model dtype and attention backend for AutoDeploy
+attn_backend: flashinfer
+model_kwargs:
+  torch_dtype: bfloat16

@@ -1,0 +1,27 @@
+# Configuration for Qwen3.5 dense models (0.8B, 27B)
+# Hybrid GatedDeltaNet + full attention, no MoE
+
+kv_cache_config:
+  enable_block_reuse: false
+model_kwargs:
+  torch_dtype: bfloat16
+enable_lm_head_tp_in_adp: true
+transforms:
+  gather_logits_before_lm_head:
+    enabled: true
+  detect_sharding:
+    sharding_dims: ['tp']
+    sharding_source: ['manual']
+    manual_config:
+      tp_plan:
+        # GDN layer
+        "in_proj_qkv": "delta"
+        # attention layer
+        "q_proj": "colwise"
+        "k_proj": "colwise"
+        "v_proj": "colwise"
+        "o_proj": "rowwise"
+        # MLP
+        "gate_proj": "colwise"
+        "up_proj": "colwise"
+        "down_proj": "rowwise"

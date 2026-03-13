@@ -1,0 +1,9 @@
+# Configuration for granite-4.0-micro (and similar GraniteMoeHybrid models)
+# Note: Uses flashinfer attention backend (trtllm attn ackend produces garbled output)
+runtime: trtllm
+attn_backend: flashinfer
+compile_backend: torch-cudagraph
+model_factory: AutoModelForCausalLM
+skip_loading_weights: false
+max_seq_len: 512
+world_size: 1
