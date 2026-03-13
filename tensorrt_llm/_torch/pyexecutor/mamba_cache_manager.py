@@ -531,7 +531,7 @@ class MambaCacheManager(BaseResourceManager):
                 n_groups=n_groups,
                 head_dim=head_dim,
                 num_layers=num_layers,
-                max_batch_size=max_batch_size,
+                max_batch_size=max_num_sequences,
                 spec_state_size=spec_state_size,
                 mapping=mapping,
                 dtype=dtype,
