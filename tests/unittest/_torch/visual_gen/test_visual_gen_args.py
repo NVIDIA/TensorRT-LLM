@@ -232,7 +232,7 @@ class TestVisualGenBatchInputParsing:
         return VisualGenParams()
 
     def test_string_input(self):
-        """String input → single prompt in DiffusionRequest."""
+        """String input → single-element list in DiffusionRequest."""
         vg = self._make_visual_gen_with_mock_executor()
         params = self._make_params()
 
@@ -241,10 +241,10 @@ class TestVisualGenBatchInputParsing:
         # Check the DiffusionRequest passed to enqueue_requests
         call_args = vg.executor.enqueue_requests.call_args[0][0]
         assert len(call_args) == 1
-        assert call_args[0].prompt == "a cat"
+        assert call_args[0].prompt == ["a cat"]
 
     def test_dict_input(self):
-        """Dict input → prompt + negative_prompt extracted."""
+        """Dict input → prompt wrapped in list + negative_prompt extracted."""
         vg = self._make_visual_gen_with_mock_executor()
         params = self._make_params()
 
@@ -254,7 +254,7 @@ class TestVisualGenBatchInputParsing:
         )
 
         call_args = vg.executor.enqueue_requests.call_args[0][0]
-        assert call_args[0].prompt == "a cat"
+        assert call_args[0].prompt == ["a cat"]
         assert call_args[0].negative_prompt == "blurry"
 
     def test_list_of_strings_input(self):

@@ -534,11 +534,13 @@ class VisualGen:
         req_id = self.req_counter
         self.req_counter += 1
 
+        # Normalize inputs to (prompt: List[str], negative_prompt: Optional[str])
+        # so DiffusionRequest.prompt is always a list.
         if isinstance(inputs, dict):
-            prompt = inputs.get("prompt")
+            prompt = [inputs.get("prompt")]
             negative_prompt = inputs.get("negative_prompt", None)
         elif isinstance(inputs, str):
-            prompt = inputs
+            prompt = [inputs]
             negative_prompt = None
         elif isinstance(inputs, (list, tuple)):
             # Batch generation: list of prompts
