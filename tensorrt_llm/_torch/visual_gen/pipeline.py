@@ -1,3 +1,4 @@
+import os
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
@@ -117,11 +118,37 @@ class BasePipeline(nn.Module):
     def forward(self, *args, **kwargs):
         raise NotImplementedError
 
+    def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+        """Load transformer weights from checkpoint.
+
+        Default implementation reads from a ``transformer/`` sub-directory
+        using :class:`WeightLoader`.  Override for custom checkpoint formats
+        (e.g. LTX-2 single-safetensor with embedded prefix).
+        """
+        if self.transformer is None:
+            raise ValueError("Pipeline has no transformer component")
+
+        transformer_components = self.transformer_components
+        logger.info(f"Transformer components: {transformer_components}")
+
+        transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
+        if not os.path.exists(transformer_path):
+            raise FileNotFoundError(
+                f"Transformer path does not exist: {transformer_path}. "
+                f"Checkpoint directory must contain a 'transformer' subdirectory."
+            )
+
+        from .checkpoints import WeightLoader
+
+        weight_loader = WeightLoader(components=transformer_components)
+        return weight_loader.load_weights(checkpoint_dir, self.mapping)
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
         device: torch.device,
         skip_components: Optional[list] = None,
+        **kwargs,
     ) -> None:
         raise NotImplementedError
 
@@ -480,7 +507,8 @@ class BasePipeline(nn.Module):
 
         c_start = time.time()
 
-        # All-gather primary noise
+        # All-gather primary noise (must be contiguous for NCCL)
+        noise_pred_local = noise_pred_local.contiguous()
         gather_list = [torch.empty_like(noise_pred_local) for _ in range(self.world_size)]
         dist.all_gather(gather_list, noise_pred_local)
         noise_cond = gather_list[0]
@@ -490,6 +518,7 @@ class BasePipeline(nn.Module):
         # All-gather extra stream noises
         extra_noise_preds = {}
         for name, noise_local in extra_noise_locals.items():
+            noise_local = noise_local.contiguous()
             gather_list_extra = [torch.empty_like(noise_local) for _ in range(self.world_size)]
             dist.all_gather(gather_list_extra, noise_local)
             noise_cond_extra = gather_list_extra[0]
