@@ -317,10 +317,20 @@ class ZeroMqQueue:
                         return obj
             except zmq.Again:
                 # No message available yet
-                if asyncio.get_event_loop().time() >= deadline:
+                remaining_ms = int(
+                    (deadline - asyncio.get_event_loop().time()) * 1000)
+                if remaining_ms <= 0:
                     raise asyncio.TimeoutError()
-                # Short sleep to avoid busy-waiting
-                await asyncio.sleep(0.01)
+                # Use async poller to wait for data without busy-polling on a
+                # fixed interval, which avoids latency spikes from sleep(0.01)
+                async_poller = zmq.asyncio.Poller()
+                async_poller.register(self.socket, zmq.POLLIN)
+                try:
+                    events = await async_poller.poll(timeout=remaining_ms)
+                finally:
+                    async_poller.unregister(self.socket)
+                if not events:
+                    raise asyncio.TimeoutError()
 
     def close(self):
         if self.socket:
