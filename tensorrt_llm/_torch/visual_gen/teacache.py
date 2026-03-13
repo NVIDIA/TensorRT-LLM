@@ -65,7 +65,7 @@ class ExtractorConfig:
     Only the timestep embedding logic is model-specific; all other logic is handled generically.
 
     Attributes:
-        model_class_name: Model class name (e.g., "LTX2VideoTransformer3DModel")
+        model_class_name: Model class name
         timestep_embed_fn: Callable(module, **forward_kwargs) -> Tensor
         timestep_param_name: Parameter name for timestep in forward() (default: "timestep")
         guidance_param_name: Parameter name for guidance if used (default: None)

@@ -11,6 +11,7 @@ from pydantic import Field as PydanticField
 
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -259,6 +260,16 @@ class VisualGenArgs(StrictBaseModel):
             "Local directory path or HuggingFace Hub model ID "
             "(e.g., 'Wan-AI/Wan2.1-T2V-1.3B-Diffusers'). "
             "Hub models are downloaded and cached automatically."
+        ),
+    )
+
+    # Path to the text encoder model (e.g. Gemma3 directory) used by LTX-2 pipelines.
+    text_encoder_path: str = PydanticField(
+        "",
+        description=(
+            "Path to the text encoder model directory (e.g. Gemma3). "
+            "Required for LTX-2 pipelines. Must contain model weights, "
+            "tokenizer files, and preprocessor config."
         ),
     )
 
@@ -511,6 +522,115 @@ class DiffusionModelConfig(BaseModel):
 
         return quant_config, layer_quant_config, dynamic_weight_quant, dynamic_activation_quant
 
+    @staticmethod
+    def _convert_quantization_metadata(
+        qmeta: Dict,
+        tensor_keys: List[str],
+    ) -> Dict:
+        """
+        TODO: Consider refactor this to be a utility functions.
+        Convert per-layer ``_quantization_metadata`` to ModelOpt format.
+
+        Some checkpoints (e.g. HuggingFace-quantized FP8) embed per-layer
+        quantization info as::
+
+            {"format_version": "1.0",
+             "layers": {"model.diffusion_model.block.attn.to_q": {"format": "float8_e4m3fn"}, ...}}
+
+        This converts it to the ModelOpt-compatible dict that
+        :meth:`load_diffusion_quant_config` understands::
+
+            {"quant_algo": "FP8",
+             "config_groups": {"default": {"weights": {"dynamic": false}, ...}},
+             "ignore": ["proj_in", "proj_out", ...]}
+        """
+        _FORMAT_TO_ALGO = {
+            "float8_e4m3fn": "FP8",
+        }
+
+        layers = qmeta.get("layers", {})
+        if not layers:
+            return {}
+
+        formats = {info.get("format") for info in layers.values()}
+        if len(formats) != 1:
+            logger.warning(f"_quantization_metadata has mixed formats {formats}; skipping")
+            return {}
+
+        fmt = formats.pop()
+        quant_algo = _FORMAT_TO_ALGO.get(fmt)
+        if quant_algo is None:
+            logger.warning(f"_quantization_metadata format '{fmt}' is not supported; skipping")
+            return {}
+
+        quantized_layers = set(layers.keys())
+
+        # Build ignore list: weight-bearing layers NOT in the quantized set.
+        # Tensor keys ending with ".weight" (but not ".weight_scale") indicate
+        # layers that own learnable weights.
+        non_quantized = []
+        for key in tensor_keys:
+            if key.endswith(".weight") and not key.endswith("_scale.weight"):
+                layer_name = key[: -len(".weight")]
+                if layer_name not in quantized_layers:
+                    non_quantized.append(layer_name)
+
+        result = {
+            "quant_algo": quant_algo,
+            "config_groups": {
+                "default": {
+                    "weights": {"dynamic": False},
+                    "input_activations": {"dynamic": False},
+                }
+            },
+            "ignore": sorted(non_quantized),
+        }
+        logger.info(
+            f"Converted _quantization_metadata: algo={quant_algo}, "
+            f"{len(quantized_layers)} quantized layers, "
+            f"{len(non_quantized)} excluded layers"
+        )
+        return result
+
+    @classmethod
+    def _try_load_safetensors_config(cls, checkpoint_path: Path) -> Optional[Dict]:
+        """Try to read embedded config from a single-safetensors checkpoint.
+
+        Accepts either a directory (globs for ``*.safetensors``) or a direct
+        path to a ``.safetensors`` file.
+
+        Returns the full config dict if found, ``None`` otherwise.
+        """
+        try:
+            import safetensors.torch
+        except ImportError:
+            return None
+
+        if checkpoint_path.is_file() and checkpoint_path.suffix == ".safetensors":
+            sft_files = [checkpoint_path]
+        else:
+            sft_files = sorted(checkpoint_path.glob("*.safetensors"))
+
+        if not sft_files:
+            return None
+
+        try:
+            with safetensors.torch.safe_open(str(sft_files[0]), framework="pt") as f:
+                meta = f.metadata()
+                if meta and "config" in meta:
+                    config = json.loads(meta["config"])
+                    if "quantization_config" in meta:
+                        config["quantization_config"] = json.loads(meta["quantization_config"])
+                    elif "_quantization_metadata" in meta:
+                        qmeta = json.loads(meta["_quantization_metadata"])
+                        converted = cls._convert_quantization_metadata(qmeta, list(f.keys()))
+                        if converted:
+                            config["quantization_config"] = converted
+                    return config
+        except Exception:
+            pass
+        return None
+
     @classmethod
     def from_pretrained(
         cls,
@@ -526,6 +646,15 @@ class DiffusionModelConfig(BaseModel):
                 checkpoint_dir=args.checkpoint_path,
                 args=args,
             )
+
+        Supports two checkpoint formats:
+        * **Diffusers directory layout** -- ``model_index.json`` with
+          component sub-directories each containing ``config.json``.
+        * **Single-safetensors** -- no ``model_index.json``; config embedded
+          in the safetensors metadata header under a ``"config"`` key.  The
+          transformer section is extracted as ``pretrained_config`` and the
+          full dict is stored in ``extra_attrs["monolithic_safetensors_config"]``
+          for use by component configurators.
 
         Args:
             checkpoint_dir: Path to checkpoint
@@ -545,42 +674,79 @@ class DiffusionModelConfig(BaseModel):
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
+        extra_attrs: Dict[str, Any] = {}
 
-        # Discover pipeline components
+        # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
 
-        # Determine config path
         if components:
+            # ---------- Diffusers directory layout ----------
             if component not in components:
                 raise ValueError(
                     f"Component '{component}' not found. Available: {list(components.keys())}"
                 )
             config_path = components[component]
+            if not config_path.exists():
+                raise ValueError(f"Config not found at {config_path}")
+
+            with open(config_path) as f:
+                config_dict = json.load(f)
+            pretrained_config = SimpleNamespace(**config_dict)
+
+            # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
+            if not getattr(pretrained_config, "_name_or_path", None):
+                pretrained_config._name_or_path = str(checkpoint_path)
+
+            model_index_path = checkpoint_path / "model_index.json"
+            if model_index_path.exists():
+                with open(model_index_path) as f:
+                    model_index = json.load(f)
+                if "boundary_ratio" in model_index and "transformer_2" in model_index:
+                    transformer_2_spec = model_index.get("transformer_2")
+                    if transformer_2_spec and transformer_2_spec[0] is not None:
+                        pretrained_config.boundary_ratio = model_index["boundary_ratio"]
         else:
-            config_path = checkpoint_path / "config.json"
+            # ---------- Single safetensors ----------
+            native_config = cls._try_load_safetensors_config(checkpoint_path)
 
-        if not config_path.exists():
-            raise ValueError(f"Config not found at {config_path}")
+            if native_config is not None:
+                transformer_dict = native_config.get("transformer", {})
+                pretrained_config = SimpleNamespace(**transformer_dict)
+                extra_attrs["monolithic_safetensors_config"] = native_config
 
-        # Load pretrained_config from checkpoint
-        with open(config_path) as f:
-            config_dict = json.load(f)
-        pretrained_config = SimpleNamespace(**config_dict)
+                # quantization_config lives as a separate safetensors metadata
+                # key, not inside the transformer section. Propagate it so
+                # the quant-config resolution below can pick it up.
+                if "quantization_config" in native_config:
+                    qc = native_config["quantization_config"]
+                    # ModelOpt prefixes module names with the wrapped model
+                    # attribute (e.g. "velocity_model.proj_out"). Strip that
+                    # wrapper prefix so the ignore list matches TRT-LLM names.
+                    _MODELOPT_WRAPPER_PREFIXES = (
+                        "model.diffusion_model.",
+                        "velocity_model.",
+                        "denoiser.",
+                        "unet.",
+                        "dit.",
+                    )
+                    if "ignore" in qc and qc["ignore"]:
+                        cleaned = []
+                        for entry in qc["ignore"]:
+                            for wp in _MODELOPT_WRAPPER_PREFIXES:
+                                if entry.startswith(wp):
+                                    entry = entry[len(wp) :]
+                                    break
+                            cleaned.append(entry)
+                        qc["ignore"] = cleaned
+                    pretrained_config.quantization_config = qc
+            else:
+                raise ValueError(
+                    f"Config not found at {checkpoint_dir}. "
+                    "Expected model_index.json (diffusers) or "
+                    "safetensors with embedded config metadata."
+                )
 
-        # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
-        if not getattr(pretrained_config, "_name_or_path", None):
-            pretrained_config._name_or_path = str(checkpoint_path)
-
-        model_index_path = checkpoint_path / "model_index.json"
-        if model_index_path.exists():
-            with open(model_index_path) as f:
-                model_index = json.load(f)
-            if "boundary_ratio" in model_index and "transformer_2" in model_index:
-                transformer_2_spec = model_index.get("transformer_2")
-                if transformer_2_spec and transformer_2_spec[0] is not None:
-                    pretrained_config.boundary_ratio = model_index["boundary_ratio"]
-
-        # Resolve quant config: use args if user set quant (QuantConfig from dict), else checkpoint
+        # Resolve quant config
         if args and args.quant_config.quant_algo is not None:
             quant_config = args.quant_config
             quant_config_dict = (
@@ -612,7 +778,7 @@ class DiffusionModelConfig(BaseModel):
             attention=attention_cfg,
             parallel=parallel_cfg,
             teacache=teacache_cfg,
-            # Delay weight creation after apply_quant_config_exclude_modules() in __post_init__
             skip_create_weights_in_init=True,
+            extra_attrs=extra_attrs,
             **kwargs,
         )

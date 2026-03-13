@@ -26,8 +26,7 @@ from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .checkpoints import WeightLoader
-from .config import DiffusionModelConfig, PipelineComponent, VisualGenArgs
+from .config import DiffusionModelConfig, VisualGenArgs
 from .models import AutoPipeline
 
 if TYPE_CHECKING:
@@ -121,8 +120,8 @@ class PipelineLoader:
         1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID)
         2. Load config via DiffusionModelConfig.from_pretrained()
         3. Create pipeline via AutoPipeline.from_config() with MetaInit
-        4. Load transformer weights via pipeline.load_weights()
-        5. Load auxiliary components (VAE, text_encoder) via diffusers
+        4. Load transformer weights via pipeline.load_transformer_weights()
+        5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
 
         Args:
@@ -142,6 +141,7 @@ class PipelineLoader:
         skip_components = self.args.skip_components if self.args else []
 
         load_start = time.time()
+        text_encoder_path = self.args.text_encoder_path if self.args else ""
 
         # =====================================================================
         # STEP 1: Load Config (includes quant config parsing)
@@ -175,36 +175,30 @@ class PipelineLoader:
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
+        # Each pipeline implements load_transformer_weights() for its own
+        # checkpoint format.  The default (BasePipeline) uses WeightLoader
+        # for diffusers-compatible checkpoints with a transformer/ subdir.
         # If dynamic_weight_quant=True:
         #   - BF16 checkpoint weights are loaded
         #   - Quantized on-the-fly to FP8/NVFP4 by DynamicLinearWeightLoader
         #   - Copied into model's quantized buffers
         # =====================================================================
-        if pipeline.transformer is None:
-            raise ValueError("Pipeline has no transformer component")
-
-        transformer_components = pipeline.transformer_components
-        logger.info(f"Transformer components: {transformer_components}")
-
-        transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
-        if not os.path.exists(transformer_path):
-            raise FileNotFoundError(
-                f"Transformer path does not exist: {transformer_path}. "
-                f"Checkpoint directory must contain a 'transformer' subdirectory."
-            )
-
-        weight_loader = WeightLoader(components=transformer_components)
-        # TODO: accelerate the cpu loading w/ multiprocessing
-        weights = weight_loader.load_weights(checkpoint_dir, self.mapping)
-
-        # Load weights into pipeline
+        weights = pipeline.load_transformer_weights(checkpoint_dir)
         pipeline.load_weights(weights)
 
         # =====================================================================
-        # STEP 4: Load Standard Components (VAE, TextEncoder via diffusers)
+        # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
         # These are NOT quantized - loaded as-is from checkpoint
         # =====================================================================
-        pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
+        extra_kwargs = {}
+        if text_encoder_path:
+            extra_kwargs["text_encoder_path"] = text_encoder_path
+        pipeline.load_standard_components(
+            checkpoint_dir,
+            self.device,
+            skip_components,
+            **extra_kwargs,
+        )
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================
@@ -242,7 +236,7 @@ class PipelineLoader:
 
             marker = LayerwiseNvtxMarker()
             module_prefix = pipeline.__class__.__name__
-            for transformer_component in transformer_components:
+            for transformer_component in pipeline.transformer_components:
                 logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
                 marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 

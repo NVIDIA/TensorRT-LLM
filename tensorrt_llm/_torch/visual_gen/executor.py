@@ -41,8 +41,19 @@ class DiffusionRequest:
     guidance_rescale: float = 0.0
     output_type: str = "pt"
 
-    # Wan-specific parameters
+    # LTX-2 multi-modal guidance (STG / modality guidance)
+    stg_scale: float = 0.0
+    stg_blocks: Optional[List[int]] = None
+    modality_scale: float = 1.0
+    rescale_scale: float = 0.0
+    guidance_skip_step: int = 0
+    enhance_prompt: bool = False
+
+    # Image-to-video parameters
     image: Optional[Union[str, List[str]]] = None
+    image_cond_strength: float = 1.0
+
+    # Wan-specific parameters
     guidance_scale_2: Optional[float] = None
     boundary_ratio: Optional[float] = None
     last_image: Optional[Union[str, List[str]]] = None
