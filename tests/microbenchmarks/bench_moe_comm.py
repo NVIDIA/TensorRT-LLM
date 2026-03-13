@@ -25,6 +25,7 @@ Launch (examples):
 
 ```bash
 # Minimal: sweep batch sizes 1..1024 (powers of 2) on ep=8.
+# --profile means a pre-defined combo of hidden_size, top_k, and num_experts
 python tests/microbenchmarks/bench_moe_comm.py \
     --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3 -b 1 -e 1024 -f 2
 
@@ -89,16 +90,13 @@ class Profile:
 
 
 PROFILES: Dict[str, Profile] = {
-    # DeepSeek-V3: hidden_size 7168, router_topk 8 (public config)
     "deepseek_v3": Profile(
         name="deepseek_v3",
         hidden_size=7168,
         top_k=8,
-        # Previously: experts_per_rank=32 with recommended ep_size=8 => 256 total experts.
         num_experts=256,
         quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
     ),
-    # Repo already references "gpt-oss" hidden_size=2880 in the MoE A2A unit test.
     "gpt_oss": Profile(
         name="gpt_oss",
         hidden_size=2880,
@@ -617,8 +615,8 @@ def _time_dispatch_and_combine_cuda_graph(
       5. Sync, read per-iter timings from events.
       6. Profiler pass (two small graphs) for kernel breakdown.
 
-    No L2 flush between iterations inside the graph; consecutive iters share cache state,
-    which matches real inference behaviour.
+    L2 cache is flushed before each iteration inside the graph (including warmup),
+    matching the eager-mode behaviour.
 
     Returns same types as _time_dispatch_and_combine.
     """
@@ -818,9 +816,30 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="deepseek_v3",
         choices=sorted(PROFILES.keys()),
-        help="Optional named profile to provide defaults for hidden_size/top_k/num_experts.",
+        help=(
+            "Named model profile supplying defaults for hidden_size, top_k, and num_experts. "
+            "Any of these can be overridden individually via their own flags."
+        ),
     )
-    parser.add_argument("--hidden_size", type=int, default=None, help="Custom hidden size.")
+    parser.add_argument(
+        "--hidden_size", type=int, default=None, help="Hidden dimension of the model."
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=None, help="Number of experts each token is routed to."
+    )
+    parser.add_argument(
+        "--num_experts",
+        type=int,
+        default=None,
+        help="Total number of experts of the model across all EP ranks.",
+    )
+    parser.add_argument(
+        "--quant",
+        type=lambda s: QuantAlgo[str(s).upper()] if s is not None else None,
+        default=None,
+        choices=[q.name for q in QuantAlgo],
+        help="Quantization recipe of the model.",
+    )
     # Sizes to scan (NCCL-tests style, adapted from bytes -> local_batch_size in tokens).
     parser.add_argument(
         "-b",
@@ -850,20 +869,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Multiplication factor between local_batch_size values. Default: disabled.",
-    )
-    parser.add_argument("--top_k", type=int, default=None, help="Custom router top-k.")
-    parser.add_argument(
-        "--num_experts",
-        type=int,
-        default=None,
-        help="Total number of experts.",
-    )
-    parser.add_argument(
-        "--quant",
-        type=lambda s: str(s).upper(),
-        default=None,
-        choices=[q.name for q in QuantAlgo],
-        help="Override quantization algo (defaults to profile.quant_algo).",
     )
     parser.add_argument("--iters", type=int, default=200, help="Timed iterations.")
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
@@ -915,12 +920,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def _iter_local_batch_sizes(args: argparse.Namespace) -> List[int]:
-    scanning_enabled = any(
-        x is not None for x in (args.minbatch, args.maxbatch, args.stepbatch, args.stepfactor)
-    )
-    if not scanning_enabled:
-        raise ValueError("Must specify -b/--minbatch and/or -e/--maxbatch (tokens).")
-
     if args.stepbatch is not None and args.stepfactor is not None:
         raise ValueError("Only one of -i/--stepbatch or -f/--stepfactor should be used.")
 
@@ -957,28 +956,23 @@ def _iter_local_batch_sizes(args: argparse.Namespace) -> List[int]:
     return list(range(minb, maxb + 1, step))
 
 
-def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int, QuantAlgo]:
-    """Returns (hidden_size, local_num_tokens, top_k, num_experts_total, quant_algo)."""
-    local_num_tokens = _iter_local_batch_sizes(args)[0]
-
-    # If a profile is provided, it supplies defaults; any explicit CLI values override.
-    if args.profile is not None:
-        prof = PROFILES[args.profile]
-        hidden_size = int(args.hidden_size or prof.hidden_size)
-        top_k = int(args.top_k or prof.top_k)
-        num_experts_total = int(args.num_experts or prof.num_experts)
-        quant_algo = prof.quant_algo
-        return hidden_size, local_num_tokens, top_k, num_experts_total, quant_algo
-
-    # No profile: all fields must be provided explicitly.
-    if args.hidden_size is None or args.top_k is None or args.num_experts is None:
+def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, QuantAlgo]:
+    """Returns (hidden_size, top_k, num_experts_total, quant_algo)."""
+    prof = PROFILES.get(args.profile) if args.profile is not None else None
+    if prof is None and (
+        args.hidden_size is None
+        or args.top_k is None
+        or args.num_experts is None
+        or args.quant is None
+    ):
         raise ValueError(
-            "No --profile specified; must provide --hidden_size, --top_k, --num_experts."
+            "No --profile specified; must provide --hidden_size, --top_k, --num_experts, and --quant."
         )
-    hidden_size = int(args.hidden_size)
-    top_k = int(args.top_k)
-    num_experts_total = int(args.num_experts)
-    return hidden_size, local_num_tokens, top_k, num_experts_total, QuantAlgo.NO_QUANT
+    hidden_size = int(args.hidden_size or prof.hidden_size)
+    top_k = int(args.top_k or prof.top_k)
+    num_experts_total = int(args.num_experts or prof.num_experts)
+    quant_algo = args.quant or prof.quant_algo
+    return hidden_size, top_k, num_experts_total, quant_algo
 
 
 _WORKER_ENV = {
@@ -1013,10 +1007,9 @@ def _run_benchmark_worker_under_current_mpi(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    hidden_size, _, top_k, num_experts_total, profile_quant_algo = _resolve_profile_args(args)
+    hidden_size, top_k, num_experts_total, quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
     act_dtype = torch.bfloat16
-    quant_algo = QuantAlgo[args.quant] if args.quant is not None else profile_quant_algo
     quant_config = (
         QuantConfig(quant_algo=None)
         if quant_algo == QuantAlgo.NO_QUANT
