@@ -519,6 +519,8 @@ class PyExecutor:
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
+                                    and self.kv_cache_transceiver is not None)
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -1766,32 +1768,6 @@ class PyExecutor:
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
 
-        # In benchmark disagg mode, fetch requests in batches to avoid
-        # blocking the CTX→GEN KV cache pipeline. With ADP, fetch tp_size
-        # requests per batch (one per rank) for even distribution; without
-        # ADP, fetch 1 request per batch.
-        if not self.is_warmup and self.benchmark_req_queues_size > 0 \
-                and self.kv_cache_transceiver \
-                and self.num_fetch_requests < self.benchmark_req_queues_size:
-            batch_size = min(
-                self.dist.tp_size if self.enable_attention_dp else 1,
-                self.benchmark_req_queues_size)
-            fill_target = min(self.num_fetch_requests + batch_size,
-                              self.benchmark_req_queues_size)
-            if self.dist.rank == 0:
-                logger.info(f"Starting benchmark fill loop, "
-                            f"num_fetch_requests={self.num_fetch_requests}/"
-                            f"{fill_target}, "
-                            f"len(active_requests)={len(self.active_requests)}")
-            while self.num_fetch_requests < fill_target:
-                iter_requests = self._fetch_and_activate_new_requests()
-                if self.should_stop_processing:
-                    return None, None
-                new_requests += iter_requests
-                self.hang_detector.checkpoint()
-                if self.num_fetch_requests < fill_target:
-                    time.sleep(1)
-
         iter_stats = None
         if self.enable_iter_perf_stats:
             iter_stats = self._get_init_iter_stats(
@@ -1927,6 +1903,38 @@ class PyExecutor:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
 
+    def _is_benchmark_disagg_fill_complete(
+            self, scheduled_batch: ScheduledRequests) -> bool:
+        """Check whether all benchmark disagg requests have completed KV transfer.
+
+        With ADP, generation requests are distributed across TP ranks, so an
+        allgather is needed to obtain the global count.  Without ADP every
+        request is local, and we can compare directly.
+
+        Args:
+            scheduled_batch: The current iteration's scheduled requests,
+                used to count generation requests that have completed
+                KV transfer.
+
+        Returns:
+            True when the total number of generation-ready requests
+            reaches ``benchmark_req_queues_size``.
+        """
+        local_gen_count = len(scheduled_batch.generation_requests)
+        if self.enable_attention_dp:
+            total_gen_count = sum(self.dist.tp_allgather(local_gen_count))
+        else:
+            total_gen_count = local_gen_count
+
+        if total_gen_count >= self.benchmark_req_queues_size:
+            return True
+        if self.dist.rank == 0:
+            logger.info(
+                f"Benchmark disagg fill in progress: "
+                f"num_fetched={self.num_fetch_requests}, "
+                f"total_gen_count={total_gen_count} (local={local_gen_count})")
+        return False
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -1935,6 +1943,7 @@ class PyExecutor:
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
+            can_forward = not self.is_benchmark_disagg
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
@@ -1946,6 +1955,13 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
+
+                if not self.is_warmup and not can_forward:
+                    can_forward = self._is_benchmark_disagg_fill_complete(
+                        scheduled_batch)
+                    if not can_forward:
+                        time.sleep(1)
+                        continue
 
                 if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -2168,7 +2184,7 @@ class PyExecutor:
             iter_stats = None
             target_inputs = None
             previous_tensors_device = None
-            can_forward = False if self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver else True
+            can_forward = not self.is_benchmark_disagg
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
@@ -2180,40 +2196,13 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
-                # In gen-only benchmarking mode, wait until the number of scheduled generation
-                # requests reaches the required threshold before starting forward pass,
-                # to ensure consistent batch sizes for accurate performance measurement.
+
                 if not self.is_warmup and not can_forward:
-                    if self.enable_attention_dp:
-                        # Allgather per-rank TRANS_COMPLETE generation counts to get the global total.
-                        # num_fetch_requests is not used here because it counts requests dispatched into
-                        # INIT state (before KV transfer), so it reaches the threshold while all requests
-                        # are still waiting for KV transfer and not yet ready for the forward pass.
-                        local_gen_count = len(
-                            scheduled_batch.generation_requests)
-                        all_gen_counts = self.dist.tp_allgather(local_gen_count)
-                        total_gen_count = sum(all_gen_counts)
-                        if total_gen_count >= self.benchmark_req_queues_size:
-                            can_forward = True
-                            time.sleep(10)
-                        else:
-                            if self.dist.rank == 0:
-                                logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
-                                    f"total_gen_count: {total_gen_count}, "
-                                    f"scheduled_gen_batch: {local_gen_count}")
-                            time.sleep(10)
-                            continue
-                    else:
-                        if scheduled_batch.num_generation_requests < self.benchmark_req_queues_size:
-                            if self.dist.rank == 0:
-                                logger.info(
-                                    f"sleep 10 seconds, scheduled_gen_batch: {scheduled_batch.num_generation_requests}"
-                                )
-                            time.sleep(10)
-                            continue
-                        else:
-                            can_forward = True
+                    can_forward = self._is_benchmark_disagg_fill_complete(
+                        scheduled_batch)
+                    if not can_forward:
+                        time.sleep(1)
+                        continue
 
                 if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -2658,7 +2647,7 @@ class PyExecutor:
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             self._update_new_active_requests_queue_latency(new_requests)
 
-        # 5. Update total fetch counter (used by benchmark fill loop)
+        # 5. Update total fetch counter (used by benchmark disagg gating)
         self.num_fetch_requests += len(new_requests)
 
         # 6. Schedule requests across ranks (DP only)
@@ -2945,12 +2934,10 @@ class PyExecutor:
                         or req.is_disagg_generation_transmission_in_progress)
             ])
 
-        # In benchmark disagg mode the fill loop saturates all slots with INIT
-        # requests simultaneously. Skip dummy addition until KV transfers
-        # complete and real requests become active (num_active_request > 0).
-        if (self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver
-                and not self.is_warmup and len(self.active_requests) > 0
-                and num_active_request == 0):
+        # In benchmark disagg mode, skip dummy addition while requests are
+        # still in INIT/transfer state (waiting for KV cache transfer).
+        if (self.is_benchmark_disagg and not self.is_warmup
+                and len(self.active_requests) > 0 and num_active_request == 0):
             logger.info(
                 f"Skipped adding dummy requests: num_fetch_requests={self.num_fetch_requests}, {num_active_request=}"
             )
