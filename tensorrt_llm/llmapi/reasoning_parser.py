@@ -208,17 +208,18 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return result
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        """Wraps the parent parse_delta to track accumulated reasoning and
-        detect the closing tag. When the closing tag is found (in_reasoning
-        transitions from True to False), the accumulation is cleared to
-        free memory."""
+        """Wraps the parent parse_delta to track accumulated reasoning when
+        force_nonempty_content is set. When the closing tag is found
+        (in_reasoning transitions from True to False), the accumulation
+        is cleared to free memory."""
         was_in_reasoning = self.in_reasoning
         result = super().parse_delta(delta_text)
-        if result.reasoning_content:
-            self._accumulated_reasoning += result.reasoning_content
-        if was_in_reasoning and not self.in_reasoning:
-            self._found_closing_tag = True
-            self._accumulated_reasoning = ""
+        if self._force_nonempty_content:
+            if result.reasoning_content:
+                self._accumulated_reasoning += result.reasoning_content
+            if was_in_reasoning and not self.in_reasoning:
+                self._found_closing_tag = True
+                self._accumulated_reasoning = ""
         return result
 
     def finish(self) -> ReasoningParserResult:
