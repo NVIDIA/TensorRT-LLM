@@ -1,0 +1,6 @@
+# Configuration for GLM-5 (zai-org/GLM-5)
+# Workaround: extra_special_tokens is a list in the GLM-5 tokenizer config but
+# transformers 4.57.x expects a dict in _set_model_specific_special_tokens.
+# Passing extra_special_tokens={} overrides the problematic list with an empty dict.
+tokenizer_kwargs:
+  extra_special_tokens: {}
