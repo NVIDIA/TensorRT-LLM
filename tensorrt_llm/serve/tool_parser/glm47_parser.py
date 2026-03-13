@@ -32,6 +32,7 @@ class Glm47ToolParser(Glm4ToolParser):
     """
 
     def __init__(self):
+        """Initialize the GLM-4.7 tool parser with optional-argument regex."""
         super().__init__()
         # Override regex to make arguments optional
         self.func_detail_regex = re.compile(
@@ -222,7 +223,9 @@ class Glm47ToolParser(Glm4ToolParser):
             return StreamingParseResult(normal_text=current_text)
 
     def supports_structural_tag(self) -> bool:
+        """Return whether this parser supports structural tag guided decoding."""
         return False
 
     def structure_info(self) -> _GetInfoFunc:
+        """Return structure info for guided decoding (not supported)."""
         raise NotImplementedError()

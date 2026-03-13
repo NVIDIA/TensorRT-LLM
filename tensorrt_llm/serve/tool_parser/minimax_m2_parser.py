@@ -76,6 +76,7 @@ class MiniMaxM2ToolParser(BaseToolParser):
     """
 
     def __init__(self):
+        """Initialize the MiniMax-M2 tool parser with XML tag patterns."""
         super().__init__()
         self.bot_token = "<minimax:tool_call>"  # nosec B105
         self.eot_token = "</minimax:tool_call>"  # nosec B105
@@ -97,6 +98,7 @@ class MiniMaxM2ToolParser(BaseToolParser):
         self._json_buffers: Dict[int, str] = {}
 
     def has_tool_call(self, text: str) -> bool:
+        """Check whether the text contains a MiniMax-M2 tool call tag."""
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -270,7 +272,9 @@ class MiniMaxM2ToolParser(BaseToolParser):
             return StreamingParseResult(normal_text=current_text)
 
     def supports_structural_tag(self) -> bool:
+        """Return whether this parser supports structural tag guided decoding."""
         return False
 
     def structure_info(self) -> _GetInfoFunc:
+        """Return structure info for guided decoding (not supported)."""
         raise NotImplementedError()
