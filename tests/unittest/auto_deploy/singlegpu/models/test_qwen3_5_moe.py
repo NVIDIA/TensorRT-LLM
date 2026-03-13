@@ -1376,9 +1376,10 @@ def test_export_text_model_with_rope_cos_sin():
 
 @torch.no_grad()
 def test_vlm_wrapper_text_only_position_ids():
-    """Test that the VLM wrapper correctly uses executor-provided 2D position_ids
-    for text-only inputs, expanding them to 3D and producing the same result as
-    the text model with equivalent 3D position_ids.
+    """Test VLM wrapper uses executor-provided 2D position_ids for text-only inputs.
+
+    Expanding them to 3D and producing the same result as the text model with
+    equivalent 3D position_ids.
 
     This simulates the AD executor flow: the executor provides 2D position_ids
     with correct offsets for chunked prefill, and the VLM wrapper expands them
@@ -1647,8 +1648,10 @@ def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
 
 @torch.no_grad()
 def test_vlm_wrapper_decode_after_image_uses_delta():
-    """Branch C: text-only decode with provided mrope_position_deltas should
-    adjust position_ids by that request-scoped delta."""
+    """Branch C: text-only decode with mrope_position_deltas adjusts position_ids.
+
+    The request-scoped delta should be applied to position_ids.
+    """
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -1745,8 +1748,11 @@ def test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage():
 
 @torch.no_grad()
 def test_vlm_wrapper_no_delta_without_images():
-    """Branch A: when rope_deltas is None (no images ever), position_ids should
-    be expanded to 3D without any adjustment (same as before)."""
+    """Branch A: no rope_deltas means position_ids expand to 3D without adjustment.
+
+    When rope_deltas is None (no images ever), position_ids should be expanded
+    to 3D without any adjustment (same as before).
+    """
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -1793,8 +1799,11 @@ def test_vlm_wrapper_requires_position_ids_for_text_only():
 
 @torch.no_grad()
 def test_vlm_wrapper_prefill_only_with_images():
-    """Prefill-only with images: the model forward should compute 3D mRoPE
-    positions from input_ids + image_grid_thw, matching compute_mrope_positions."""
+    """Prefill-only with images computes 3D mRoPE matching compute_mrope_positions.
+
+    The model forward should compute 3D mRoPE positions from input_ids +
+    image_grid_thw.
+    """
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -1851,8 +1860,11 @@ def test_vlm_wrapper_prefill_only_with_images():
 
 @torch.no_grad()
 def test_vlm_wrapper_mixed_prefill_decode_with_images():
-    """Mixed prefill+decode batch with images in prefill: the model forward
-    should compute 3D positions per prefill request and stitch with decode."""
+    """Mixed prefill+decode batch with images computes and stitches 3D positions.
+
+    The model forward should compute 3D positions per prefill request and
+    stitch with decode.
+    """
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -1935,9 +1947,11 @@ def test_vlm_wrapper_mixed_prefill_decode_with_images():
 
 @torch.no_grad()
 def test_vlm_wrapper_mixed_multimodal_text_prefill():
-    """Mixed prefill batch: 1 multimodal request + 1 text-only request.
+    """Mixed prefill batch with 1 multimodal and 1 text-only request.
+
     The model forward should compute 3D positions for the image request
-    and trivially expand positions for the text-only request."""
+    and trivially expand positions for the text-only request.
+    """
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -2016,8 +2030,10 @@ def test_vlm_wrapper_mixed_multimodal_text_prefill():
 
 @torch.no_grad()
 def test_vlm_wrapper_chunked_prefill_inside_image_span():
-    """Chunked multimodal prefill should compute mRoPE from request metadata, even
-    when the chunk starts inside the image-token span."""
+    """Chunked multimodal prefill computes mRoPE from request metadata.
+
+    Even when the chunk starts inside the image-token span.
+    """
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -2108,8 +2124,10 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
 
 @torch.no_grad()
 def test_vlm_wrapper_decode_only_with_delta():
-    """Case 3: decode-only batch with deltas (no mrope_position_ids_3d) should
-    apply delta to all positions uniformly."""
+    """Case 3: decode-only batch with deltas applies delta to all positions.
+
+    No mrope_position_ids_3d; delta should be applied uniformly.
+    """
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
