@@ -879,8 +879,16 @@ class LinearHybridCacheManager(KVCacheManager):
             self.fake_ssm_states = torch.empty([self.num_linear_layers, block_num, *self.ssm_state_shape], dtype=self.ssm_state_dtype, device="cuda")
             self.fake_conv_states = torch.empty([self.num_linear_layers, block_num, *self.conv_state_shape], dtype=self.conv_state_dtype, device="cuda")
 
-        pool = self.impl.get_recurrent_states_pool()
-        print(f"address range of linear pool: {hex(pool.data_ptr())} to {hex(pool.data_ptr() + pool.numel() * pool.itemsize)}")
+        self.pool = self.impl.get_recurrent_states_pool().view(torch.uint8).view(
+            [-1, self.ssm_bytes + self.conv_bytes])
+        self.ssm_states_mapping = {}
+        self.conv_states_mapping = {}
+        for layer_id in self.linear_pp_layers:
+            ssm_states = self._get_ssm_states(layer_id)
+            conv_states = self._get_conv_states(layer_id)
+            self.ssm_states_mapping[layer_id] = ssm_states
+            self.conv_states_mapping[layer_id] = conv_states
+        print(f"address range of linear pool: {hex(self.pool.data_ptr())} to {hex(self.pool.data_ptr() + self.pool.numel() * self.pool.itemsize)}")
 
         self._request_block_ids = {}
         self._previous_ssm_states = {}
@@ -963,6 +971,12 @@ class LinearHybridCacheManager(KVCacheManager):
             self._setup_fake_states()
         else:
             self._setup_state_indices()
+
+    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        return self.ssm_states_mapping[layer_idx]
+
+    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        return self.conv_states_mapping[layer_idx]
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # print(f"free_resources for request {request.py_request_id}")
@@ -1056,6 +1070,9 @@ class LinearHybridCacheManager(KVCacheManager):
         current = request.context_current_position
         if current >= prompt_len:
             return 0
+        if not self.kv_cache_config.enable_block_reuse:
+            assert current == 0, f"Expected context_current_position to be 0 when block reuse is disabled, but got {current}"
+            return prompt_len - current
         step = self.linear_attention_metadata.states_snapshot_interval
         stop_positions = calc_context_stop_positions(
             prompt_len, self.tokens_per_block, step
@@ -1067,7 +1084,7 @@ class LinearHybridCacheManager(KVCacheManager):
         return prompt_len - current
 
     # [total_block_num, *ssm_state_shape] (one block for one layer)
-    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+    def _get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         if self.use_fake_pool:
             return self.fake_ssm_states[self.linear_layer_offsets[layer_idx]]
         # return self.temp_ssm_states[layer_idx]
@@ -1101,7 +1118,7 @@ class LinearHybridCacheManager(KVCacheManager):
         # assert not my_ssm_states.is_contiguous()
         return my_ssm_states
 
-    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+    def _get_conv_states(self, layer_idx: int) -> torch.Tensor:
         if self.use_fake_pool:
             return self.fake_conv_states[self.linear_layer_offsets[layer_idx]]
         # return self.temp_conv_states[layer_idx]
