@@ -210,8 +210,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Build the model on the desired device."""
         model_config, unused_kwargs = self._get_model_config()
 
-        config_cls_name = type(model_config).__name__
-        custom_model_cls = self._custom_model_mapping.get(config_cls_name, None)
+        custom_model_cls = self._get_custom_model_cls(model_config)
         with (init_empty_weights if device == "meta" else nullcontext)():
             if custom_model_cls is not None:
                 # `_from_config` has some behavior we would like to use where possible. It is
@@ -250,6 +249,23 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             model = self._quant_config_reader.post_process_model(model, model_config)
 
         return model
+
+    def _get_custom_model_cls(
+        self, model_config: PretrainedConfig
+    ) -> Optional[Type[AutoModelForCausalLM]]:
+        """Resolve a registered custom model implementation for ``model_config`` if supported."""
+        config_cls_name = type(model_config).__name__
+        custom_model_cls = self._custom_model_mapping.get(config_cls_name, None)
+        if custom_model_cls is None:
+            return None
+
+        supports_model_config = getattr(custom_model_cls, "supports_model_config", None)
+        if supports_model_config is not None and not supports_model_config(
+            model_config, model_name_or_path=self.model
+        ):
+            return None
+
+        return custom_model_cls
 
     def _set_sharding_config(self, model_config: PretrainedConfig):
         """Set the sharding config for the model."""

@@ -722,6 +722,16 @@ def _optimize_explicit(
         return
 
     head_dim = cos_node.meta["val"].shape[-1]
+    q_head_dim = q_fake.shape[-1] if q_fake is not None else None
+    k_fake = k_node.meta.get("val", None)
+    k_head_dim = k_fake.shape[-1] if k_fake is not None else None
+
+    # FlashInfer's explicit-rope kernel expects q/k head_dim to match the
+    # cos/sin cache width. Skip Phi-4-style partial RoPE on full-width q/k
+    # tensors and keep the safe torch-reference rope op in the graph.
+    if head_dim != q_head_dim or head_dim != k_head_dim:
+        return
+
     half_head_dim = head_dim // 2
 
     # Try trace-back to find full cos/sin tables and real position_ids.
