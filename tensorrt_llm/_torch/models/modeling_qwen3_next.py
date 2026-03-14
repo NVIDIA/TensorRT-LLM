@@ -803,6 +803,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             has_initial_states_p = has_initial_states[:num_prefills]
             # state_indices_p = state_indices_p[~has_initial_states_p]
             # print(f"has_initial_states_p: {has_initial_states_p}")
+            # if self.layer_idx == 0:
+            #     print(f"resetting ssm_states for prefill requests, block id={state_indices_p[~has_initial_states_p]}")
             ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros((),
                                                       dtype=ssm_states.dtype,
                                                       device=ssm_states.device)

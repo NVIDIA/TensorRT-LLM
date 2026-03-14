@@ -586,6 +586,10 @@ class KVCacheManager(BaseResourceManager):
             return (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
         return self.blocks_per_window[window_size]
 
+    def get_num_tokens(self, request: LlmRequest) -> int:
+        # LlmRequest.get_num_tokens is out of sync with GenerationRequest when overlap scheduler is enabled.
+        return self.impl.get_token_count(request.py_request_id)
+
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # TODO: the C++ implementation of this method can be used, but the
         # Python and C++ schedulers currently do not agree on what "needed
@@ -654,6 +658,7 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
+                # print(f"request {req.py_request_id} get_num_tokens: {req.get_num_tokens(0)}")
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)

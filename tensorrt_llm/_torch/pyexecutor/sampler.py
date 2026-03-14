@@ -3232,11 +3232,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.state == LlmRequestState.GENERATION_COMPLETE
                 or req.context_remaining_length != 0
             ):
+                # print(f"context request {req.py_request_id} {"is completed" if req.state == LlmRequestState.GENERATION_COMPLETE else f"has context remaining length {req.context_remaining_length}"}")
                 continue
             if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
+                # print(f"context request {req.py_request_id} finalize beam")
                 self._finalize_beam(req, beam_history)
             else:
                 for beam_idx in range(req.sampling_config.beam_width):
+                    # print(f"context request {req.py_request_id}add token")
                     add_token(req, new_tokens_list, beam_idx=beam_idx)
                 self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1)
             self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)

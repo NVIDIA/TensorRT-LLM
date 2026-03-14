@@ -130,15 +130,19 @@ class LmEvalWrapper(TemplateLM):
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         profiler.start("trtllm exec")
+        submit_twice = os.environ.get("DBG_SUBMIT_TWICE", "0") == "1"
         results = []
+        throwaway_outputs = []
         for request in tqdm(requests,
                             desc="Submitting requests",
                             disable=disable_tqdm):
             prompt, gen_kwargs = request.args
             sampling_params = self._get_sampling_params(gen_kwargs)
-            output = self.llm.generate_async(prompt,
-                                             sampling_params=sampling_params,
-                                             streaming=self.streaming)
+            if submit_twice:
+                output = self.llm.generate_async(prompt,
+                                                sampling_params=sampling_params,
+                                                streaming=self.streaming)
+                throwaway_outputs.append(output)
             output2 = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
@@ -150,6 +154,9 @@ class LmEvalWrapper(TemplateLM):
                            desc="Fetching responses",
                            disable=disable_tqdm):
             outputs.append(output.result())
+
+        for output in throwaway_outputs:
+            output.result()
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
@@ -495,6 +502,13 @@ class LmEvalEvaluator(Evaluator):
 
         # Normalize scores to range 0~100
         scores = results["results"][self.task_name]
+        log_samples = results["samples"][self.task_name]
+        for idx, sample in enumerate(log_samples):
+            str = f"sample {idx}: "
+            for metric in sample["metrics"]:
+                str += f"{metric}: {sample[metric]} "
+            print(str)
+
         for metric in scores.keys():
             if isinstance(scores[metric], (float, int)):
                 scores[metric] *= 100

@@ -1038,7 +1038,7 @@ public:
     //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,OptionalRef<LlmRequest const> llmRequest,
         bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity();
@@ -1370,7 +1370,7 @@ public:
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize, bool pinBlocks = false)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, std::nullopt, pinBlocks);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
@@ -1785,6 +1785,9 @@ public:
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
 
+    /// @brief Get the number of tokens for a request at KVCacheManager's sight. Sometimes it is different from LlmRequest::getNumTokens.
+    [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;
+
     /// @brief Add new request to the KV cache manager.
     /// @param inputLength Input length for which KV cache need to be allocated.
     /// @param beamWidth Beam width for which KV cache need to be allocated.
@@ -2154,6 +2157,10 @@ public:
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;
+
+    /// @brief LlmRequest::getNumTokens is out of sync with GenerationRequest when overlap scheduler is enabled.
+    /// This function returns the correct number of tokens from GenerationRequest to keep the behavior consistent.
+    [[nodiscard]] SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const override;
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
