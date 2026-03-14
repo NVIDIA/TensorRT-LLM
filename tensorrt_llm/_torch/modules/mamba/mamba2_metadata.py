@@ -257,6 +257,8 @@ class Mamba2Metadata:
             initial_states = [
                 num_cached_tokens_per_seq[i] > 0 for i in range(num_contexts)
             ]
+            self.has_initial_states[:num_contexts] = torch.tensor(
+                initial_states, dtype=torch.bool)
             self.use_initial_states = any(initial_states)
             # Always set has_initial_states for current context slots (avoids stale values from previous batch)
             self.has_initial_states[:num_contexts] = torch.tensor(
