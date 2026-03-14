@@ -1,5 +1,5 @@
 import copy
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
@@ -186,6 +186,38 @@ def test_build_model_uses_custom_model_cls_from_config(mock_factory):
         pytest.raises(MyError),
     ):
         mock_factory.build_model(device="meta")
+
+
+def test_build_model_skips_custom_model_cls_when_config_is_not_supported(mock_factory):
+    custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
+    custom_model_cls.configure_mock(
+        supports_model_config=MagicMock(return_value=False),
+        _from_config=MagicMock(side_effect=MyError),
+    )
+    AutoModelForCausalLMFactory.register_custom_model_cls(
+        config_cls_name=FooConfig.__name__, custom_model_cls=custom_model_cls
+    )
+
+    default_model = MagicMock(spec=nn.Module)
+    default_model.config = FooConfig()
+
+    with (
+        patch.object(
+            AutoModelForCausalLMFactory,
+            "_get_model_config",
+            return_value=(FooConfig(), {}),
+        ),
+        patch.object(
+            AutoModelForCausalLM, "from_config", return_value=default_model
+        ) as from_config,
+    ):
+        assert mock_factory.build_model(device="meta") is default_model
+
+    custom_model_cls.supports_model_config.assert_called_once_with(
+        ANY, model_name_or_path="/dummy/path"
+    )
+    custom_model_cls._from_config.assert_not_called()
+    from_config.assert_called_once()
 
 
 def test_custom_model_mapping_in_parent_does_not_affect_children():

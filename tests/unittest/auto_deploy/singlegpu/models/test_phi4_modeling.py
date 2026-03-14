@@ -162,6 +162,27 @@ def test_phi4_config_uses_phi3():
     assert hasattr(config, "partial_rotary_factor")
 
 
+def test_phi4_custom_model_only_claims_mini_family_configs():
+    """Test that the custom Phi-4 wrapper opts out of larger Phi-4 text configs."""
+    mini_config = _create_small_config()
+    mini_config.hidden_size = 3072
+    mini_config.intermediate_size = 8192
+    mini_config.num_hidden_layers = 32
+    mini_config.num_attention_heads = 24
+    mini_config.num_key_value_heads = 8
+    mini_config.partial_rotary_factor = 0.75
+    assert Phi4ForCausalLM.supports_model_config(mini_config)
+
+    large_config = _create_small_config()
+    large_config.hidden_size = 5120
+    large_config.intermediate_size = 17920
+    large_config.num_hidden_layers = 40
+    large_config.num_attention_heads = 40
+    large_config.num_key_value_heads = 10
+    large_config.partial_rotary_factor = 1.0
+    assert not Phi4ForCausalLM.supports_model_config(large_config)
+
+
 def test_phi4_gqa_structure():
     """Test that GQA is set up correctly (fewer KV heads than Q heads)."""
     config = _create_small_config()

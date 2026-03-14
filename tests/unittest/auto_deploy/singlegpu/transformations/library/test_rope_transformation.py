@@ -143,6 +143,45 @@ class RoPEModel(torch.nn.Module):
         return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
+class PartialRotaryRoPEModel(torch.nn.Module):
+    """Phi4-style partial rotary model.
+
+    Applies RoPE to full-width q/k tensors while the cos/sin cache only covers
+    the rotary prefix. optimize_rope must not rewrite this into flashinfer_rope.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        partial_rotary_factor: float,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden_size // num_heads
+        self.rotary_dim = int(self.head_dim * partial_rotary_factor)
+        self.linear_q = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.linear_k = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+        q = self.linear_q(x).view(b, s, self.num_heads, self.head_dim)
+        k = self.linear_k(x).view(b, s, self.num_kv_heads, self.head_dim)
+        cos, sin = _precompute_freqs_cis_explicit(
+            s, self.rotary_dim, rope_theta=10000, dtype=x.dtype
+        )
+        cos = cos.to(x.device).unsqueeze(0).expand(b, -1, -1)
+        sin = sin.to(x.device).unsqueeze(0).expand(b, -1, -1)
+        q_out, k_out = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
+        return torch.cat([q_out.reshape(b, s, -1), k_out.reshape(b, s, -1)], dim=-1)
+
+    def get_dynamic_shapes(self):
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
+
+
 @pytest.mark.parametrize(
     "transformation,variant,layout,batch_size,seq_len,num_heads,num_kv_heads,atol,rtol, target_layout",
     [
@@ -556,6 +595,47 @@ def test_optimize_interleaved_rope(num_heads, num_kv_heads):
         None,  # check_num_matches
         False,  # skip_output_assert
     )
+
+
+@torch.inference_mode()
+def test_optimize_rope_skips_partial_rotary_full_width_qk():
+    hidden_size = 3072
+    num_heads = 24
+    num_kv_heads = 8
+    partial_rotary_factor = 0.75
+    batch, seq = 2, 12
+    model = PartialRotaryRoPEModel(
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        partial_rotary_factor=partial_rotary_factor,
+    ).to("cuda", torch.float16)
+
+    x = torch.randn(batch, seq, hidden_size, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    assert any(
+        is_op(n, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin) for n in gm.graph.nodes
+    ), "Expected explicit rope op in graph before optimization"
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {"optimize_rope": {"stage": "pattern_matcher"}},
+    )(None, gm)
+    gm_transformed.to("cuda")
+
+    assert not any(
+        is_op(n, torch.ops.auto_deploy.flashinfer_rope) for n in gm_transformed.graph.nodes
+    ), "optimize_rope should skip flashinfer_rope for partial-rotary full-width q/k"
+    assert any(
+        is_op(n, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin)
+        for n in gm_transformed.graph.nodes
+    ), "Expected explicit rope op to remain after optimization"
+
+    y_ref = model(x)
+    y_opt = gm_transformed(x)
+    torch.testing.assert_close(y_opt, y_ref, atol=1e-3, rtol=1e-3)
 
 
 class DSExplicitRotaryEmbedding(torch.nn.Module):

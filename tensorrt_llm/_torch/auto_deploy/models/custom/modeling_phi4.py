@@ -346,6 +346,25 @@ class Phi4ForCausalLM(Phi4PreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
+    @classmethod
+    def supports_model_config(
+        cls, config: Phi3Config, model_name_or_path: Optional[str] = None
+    ) -> bool:
+        """Limit this custom path to the Phi-4 mini text-family geometry.
+
+        The larger Phi-4 text models also use ``Phi3Config``, but they have a different attention
+        projection layout in the checkpoint and must continue through the upstream HF
+        ``Phi3ForCausalLM`` implementation instead of this slimmed-down mini wrapper.
+        """
+        return (
+            getattr(config, "hidden_size", None) == 3072
+            and getattr(config, "intermediate_size", None) == 8192
+            and getattr(config, "num_hidden_layers", None) == 32
+            and getattr(config, "num_attention_heads", None) == 24
+            and getattr(config, "num_key_value_heads", None) == 8
+            and getattr(config, "partial_rotary_factor", None) == 0.75
+        )
+
     def __init__(self, config: Phi3Config, **kwargs):
         super().__init__(config)
         self.model = Phi4Model(config)
