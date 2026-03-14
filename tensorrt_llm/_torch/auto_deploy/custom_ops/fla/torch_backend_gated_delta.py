@@ -198,7 +198,7 @@ def _preprocess_raw_inputs(
 
 
 @torch.library.custom_op(
-    "auto_deploy::torch_cached_gated_delta_rule", mutates_args=("delta_cache", "out")
+    "auto_deploy::torch_cached_gated_delta_rule", mutates_args=("delta_cache",)
 )
 def torch_cached_gated_delta_rule(
     # INPUTS (raw, un-normalized, un-expanded)
@@ -324,9 +324,9 @@ def torch_cached_gated_delta_rule(
             delta_cache[slot] = new_state.squeeze(0).to(delta_cache.dtype)
 
     if out is not None:
-        out_flat = out.reshape(b * s, num_heads, -1)
+        out_flat = out.reshape(bsz * s, HV, -1)
         out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
-        if num_total_tokens < b * s:
+        if num_total_tokens < bsz * s:
             out_flat[num_total_tokens:].zero_()
         return out.new_empty(0)
 

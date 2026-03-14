@@ -321,7 +321,7 @@ def _torch_mla_context_with_expansion(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=("out",))
+@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=("mla_cache",))
 def torch_backend_mla_with_cache(
     # 5 tensor args (get_num_qkv_args = 5)
     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]

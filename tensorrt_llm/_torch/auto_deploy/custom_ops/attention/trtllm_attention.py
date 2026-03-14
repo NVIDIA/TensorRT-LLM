@@ -297,9 +297,7 @@ def prepare_trtllm_metadata_fake(
 # =============================================================================
 
 
-@torch.library.custom_op(
-    "auto_deploy::trtllm_attention_mha_with_cache", mutates_args=("kv_cache", "out")
-)
+@torch.library.custom_op("auto_deploy::trtllm_attention_mha_with_cache", mutates_args=("kv_cache",))
 def trtllm_mha_with_cache(
     # Q, K, V inputs
     q: torch.Tensor,

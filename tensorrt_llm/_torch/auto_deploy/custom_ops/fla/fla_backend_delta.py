@@ -41,7 +41,7 @@ from .delta_rule.chunk import chunk_delta_rule_fwd
 from .delta_rule.fused_recurrent import fused_recurrent_delta_rule_fwd
 
 
-@torch.library.custom_op("auto_deploy::fla_cached_delta_rule", mutates_args=("out",))
+@torch.library.custom_op("auto_deploy::fla_cached_delta_rule", mutates_args=("delta_cache",))
 def fla_cached_delta_rule(
     # INPUTS (dense but may be flattened across sequences)
     q: torch.Tensor,

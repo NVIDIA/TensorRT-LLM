@@ -124,7 +124,7 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
 # ---------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args=("out",))
+@torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args=("ssm_state_cache",))
 def _torch_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]

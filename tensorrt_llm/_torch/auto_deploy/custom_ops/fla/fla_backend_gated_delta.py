@@ -48,9 +48,7 @@ from ..attention_interface import (
 )
 
 
-@torch.library.custom_op(
-    "auto_deploy::fla_cached_gated_delta_rule", mutates_args=("delta_cache", "out")
-)
+@torch.library.custom_op("auto_deploy::fla_cached_gated_delta_rule", mutates_args=("delta_cache",))
 def fla_cached_gated_delta_rule(
     # INPUTS (raw, un-normalized, un-expanded)
     q: torch.Tensor,
@@ -166,9 +164,9 @@ def fla_cached_gated_delta_rule(
         del y_decode
 
     if out is not None:
-        out_flat = out.view(b * s, num_heads, -1)
+        out_flat = out.view(bsz * s, HV, -1)
         out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
-        if num_total_tokens < b * s:
+        if num_total_tokens < bsz * s:
             out_flat[num_total_tokens:].zero_()
         return out.new_empty(0)
 

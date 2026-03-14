@@ -198,7 +198,8 @@ def _prefill_attention(
 
 
 @torch.library.custom_op(
-    "auto_deploy::triton_attention_flattened_mha_with_cache", mutates_args=("out",)
+    "auto_deploy::triton_attention_flattened_mha_with_cache",
+    mutates_args=("k_cache", "v_cache"),
 )
 def flattened_mha_with_cache(
     # Q, K, V

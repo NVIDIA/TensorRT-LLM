@@ -28,7 +28,7 @@ from .mamba_backend_common import (
 )
 
 
-@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args=("out",))
+@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args=("ssm_state_cache",))
 def _triton_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]

@@ -284,7 +284,9 @@ def _torch_context_mha(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=("out",))
+@torch.library.custom_op(
+    "auto_deploy::torch_cached_attention_with_cache", mutates_args=("k_cache", "v_cache")
+)
 def torch_backend_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,

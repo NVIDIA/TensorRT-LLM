@@ -315,7 +315,9 @@ def prepare_flashinfer_metadata_host(
         )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=("out",))
+@torch.library.custom_op(
+    "auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=("kv_cache",)
+)
 def flashinfer_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
