@@ -22,10 +22,13 @@ from tensorrt_llm.logger import logger
 from .transformer_flux import FluxTransformer2DModel
 
 # TeaCache coefficients for FLUX.1 variants
+# Source: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4FLUX/teacache_flux.py
+# Official default threshold: 0.6 (~2x speedup), range: 0.25 (~1.5x) to 0.8 (~2.25x)
 FLUX_TEACACHE_COEFFICIENTS = {
     "dev": {
-        "ret_steps": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
-        "standard": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
+        "ret_steps": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "standard": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "default_thresh": 0.6,
     },
     "schnell": {
         "ret_steps": [1.0, 0.0],  # Schnell is already fast, minimal caching
@@ -96,29 +99,29 @@ class FluxPipeline(BasePipeline):
         return torch.device("cuda:0")
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes (height, width, num_frames)."""
-        return [(1024, 1024, 1)]
+    def default_warmup_resolutions(self):
+        return [(1024, 1024)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [1]
 
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
         logger.info("Creating FLUX transformer with quantization support...")
         self.transformer = FluxTransformer2DModel(model_config=self.model_config)
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init."""
-        for height, width, _ in self.common_warmup_shapes:
-            logger.info(f"Warmup: FLUX.1 {height}x{width}, {warmup_steps} steps")
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    height=height,
-                    width=width,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=3.5,
-                    seed=0,
-                    max_sequence_length=512,
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=3.5,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def load_standard_components(
         self,
