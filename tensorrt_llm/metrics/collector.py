@@ -64,8 +64,8 @@ class MetricsCollector:
             trtllm_num_scheduled_requests
             trtllm_total_context_tokens
             trtllm_avg_decoded_tokens_per_iter
-            trtllm_spec_decode_num_draft_tokens
-            trtllm_spec_decode_num_accepted_tokens
+            trtllm_spec_decode_num_draft_tokens_total
+            trtllm_spec_decode_num_accepted_tokens_total
             trtllm_spec_decode_acceptance_length
             trtllm_spec_decode_draft_overhead
 
@@ -254,14 +254,16 @@ class MetricsCollector:
             labelnames=self.labels.keys())
 
         # Speculative decoding metrics
-        self.spec_decode_num_draft_tokens = Gauge(
-            name=self.metric_prefix + "spec_decode_num_draft_tokens",
-            documentation="Number of draft tokens in speculative decoding",
-            labelnames=self.labels.keys())
-        self.spec_decode_num_accepted_tokens = Gauge(
-            name=self.metric_prefix + "spec_decode_num_accepted_tokens",
+        self.counter_spec_decode_num_draft_tokens = Counter(
+            name=self.metric_prefix + "spec_decode_num_draft_tokens_total",
             documentation=
-            "Number of accepted tokens in speculative decoding",
+            "Total number of draft tokens in speculative decoding",
+            labelnames=self.labels.keys())
+        self.counter_spec_decode_num_accepted_tokens = Counter(
+            name=self.metric_prefix +
+            "spec_decode_num_accepted_tokens_total",
+            documentation=
+            "Total number of accepted tokens in speculative decoding",
             labelnames=self.labels.keys())
         self.spec_decode_acceptance_length = Gauge(
             name=self.metric_prefix + "spec_decode_acceptance_length",
@@ -510,11 +512,17 @@ class MetricsCollector:
         # Speculative decoding stats
         if spec_stats := iteration_stats.get("specDecodingStats"):
             if "numDraftTokens" in spec_stats:
-                self._log_gauge(self.spec_decode_num_draft_tokens,
-                                spec_stats["numDraftTokens"])
+                draft_tokens = spec_stats["numDraftTokens"]
+                if draft_tokens > 0:
+                    self._log_counter(
+                        self.counter_spec_decode_num_draft_tokens,
+                        {}, draft_tokens)
             if "numAcceptedTokens" in spec_stats:
-                self._log_gauge(self.spec_decode_num_accepted_tokens,
-                                spec_stats["numAcceptedTokens"])
+                accepted_tokens = spec_stats["numAcceptedTokens"]
+                if accepted_tokens > 0:
+                    self._log_counter(
+                        self.counter_spec_decode_num_accepted_tokens,
+                        {}, accepted_tokens)
             if "acceptanceLength" in spec_stats:
                 self._log_gauge(self.spec_decode_acceptance_length,
                                 spec_stats["acceptanceLength"])

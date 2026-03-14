@@ -193,14 +193,16 @@ class TestInflightBatchingStats:
 class TestSpecDecodingStats:
     """Test speculative decoding stats are correctly exposed."""
 
-    def test_spec_decoding_gauges(self, collector):
+    def test_spec_decoding_metrics(self, collector):
         labels = {"model_name": "test_model"}
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
 
-        assert _get_gauge_value(collector.spec_decode_num_draft_tokens,
-                                labels) == 20
-        assert _get_gauge_value(collector.spec_decode_num_accepted_tokens,
-                                labels) == 15
+        assert _get_counter_value(
+            collector.counter_spec_decode_num_draft_tokens,
+            labels) == 20
+        assert _get_counter_value(
+            collector.counter_spec_decode_num_accepted_tokens,
+            labels) == 15
         assert _get_gauge_value(collector.spec_decode_acceptance_length,
                                 labels) == pytest.approx(3.75)
         assert _get_gauge_value(collector.spec_decode_draft_overhead,
