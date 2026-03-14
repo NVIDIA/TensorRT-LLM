@@ -374,3 +374,4 @@ stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-str
 stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test] SKIP (https://nvbugs/5955927)
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-4-attn_dp_on-trtllm] SKIP (https://nvbugs/5973199)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_trtllm_attention_dp] SKIP (https://nvbugs/5973214)
+unittest/disaggregated/test_agent_multi_backends.py::test_run_with_different_env[1] SKIP (https://nvbugs/5979673)
