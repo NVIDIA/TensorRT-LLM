@@ -303,8 +303,12 @@ def test_torch_gated_delta_rule_op_bfloat16():
 
     with torch.no_grad():
         ref_output, _ = hf_torch_chunk_gated_delta_rule(
-            q_norm, k_norm, v, g=g.to(torch.bfloat16), beta=beta.to(torch.bfloat16),
-            use_qk_l2norm_in_kernel=False
+            q_norm,
+            k_norm,
+            v,
+            g=g.to(torch.bfloat16),
+            beta=beta.to(torch.bfloat16),
+            use_qk_l2norm_in_kernel=False,
         )
 
     with torch.no_grad():
