@@ -526,3 +526,192 @@ def test_fp4_fused_moe_with_same_weight_scales(dtype):
     torch.cuda.synchronize()
     rtol, atol = 1.5, 1.0
     torch.testing.assert_close(fused_output, ref_output, rtol=rtol, atol=atol)
+
+
+def _build_nvfp4_moe_graph_module(x, selected_experts, final_scales, w1_weight,
+                                   w2_weight, w3_weight, num_experts):
+    """Build an FX GraphModule with a torch_quant_nvfp4_moe node and real quantized weights.
+
+    This constructs the same graph structure that quantize_nvfp4_moe produces so
+    that _stack_nvfp4_moe_weights can be called on it directly.
+
+    Returns:
+        (gm, ref_output): the unfused GraphModule and its reference output.
+    """
+    import torch.fx as fx
+
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
+        TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+    )
+    from tensorrt_llm._torch.utils import ActivationType
+
+    sv = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+
+    # Quantize per-expert weights
+    root = torch.nn.Module()
+    w1_fp4, w2_fp4, w3_fp4 = [], [], []
+    w1_is, w2_is, w3_is = [], [], []
+    w1_ws, w2_ws, w3_ws = [], [], []
+    w1_al, w2_al, w3_al = [], [], []
+
+    for i in range(num_experts):
+        inp_s = fp4_global_scale(x)
+        s2_w1 = fp4_global_scale(w1_weight[i])
+        s2_w2 = fp4_global_scale(w2_weight[i])
+        s2_w3 = fp4_global_scale(w3_weight[i])
+
+        fp4_1, sc_1 = torch.ops.trtllm.fp4_quantize(w1_weight[i], s2_w1, sv, False)
+        fp4_2, sc_2 = torch.ops.trtllm.fp4_quantize(w2_weight[i], s2_w2, sv, False)
+        fp4_3, sc_3 = torch.ops.trtllm.fp4_quantize(w3_weight[i], s2_w3, sv, False)
+
+        w1_fp4.append(fp4_1); w2_fp4.append(fp4_2); w3_fp4.append(fp4_3)
+        w1_is.append(inp_s); w2_is.append(inp_s); w3_is.append(inp_s)
+        w1_ws.append(sc_1); w2_ws.append(sc_2); w3_ws.append(sc_3)
+        w1_al.append(1 / (inp_s * s2_w1))
+        w2_al.append(1 / (inp_s * s2_w2))
+        w3_al.append(1 / (inp_s * s2_w3))
+
+    # Register everything on root module
+    for i in range(num_experts):
+        root.register_parameter(f"w1_{i}", torch.nn.Parameter(w1_fp4[i], requires_grad=False))
+        root.register_parameter(f"w2_{i}", torch.nn.Parameter(w2_fp4[i], requires_grad=False))
+        root.register_parameter(f"w3_{i}", torch.nn.Parameter(w3_fp4[i], requires_grad=False))
+        root.register_buffer(f"w1_is_{i}", w1_is[i])
+        root.register_buffer(f"w2_is_{i}", w2_is[i])
+        root.register_buffer(f"w3_is_{i}", w3_is[i])
+        root.register_buffer(f"w1_ws_{i}", w1_ws[i])
+        root.register_buffer(f"w2_ws_{i}", w2_ws[i])
+        root.register_buffer(f"w3_ws_{i}", w3_ws[i])
+        root.register_buffer(f"w1_al_{i}", w1_al[i])
+        root.register_buffer(f"w2_al_{i}", w2_al[i])
+        root.register_buffer(f"w3_al_{i}", w3_al[i])
+
+    # Build FX graph with the same node layout as quantize_nvfp4_moe produces
+    graph = fx.Graph()
+    x_n = graph.placeholder("x")
+    se_n = graph.placeholder("selected_experts")
+    rw_n = graph.placeholder("routing_weights")
+
+    def _attrs(prefix):
+        return [graph.get_attr(f"{prefix}_{i}") for i in range(num_experts)]
+
+    moe_node = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_moe.default,
+        args=(
+            x_n, se_n, rw_n,
+            _attrs("w1"), _attrs("w2"), _attrs("w3"),
+            _attrs("w1_is"), _attrs("w2_is"), _attrs("w3_is"),
+            _attrs("w1_ws"), _attrs("w2_ws"), _attrs("w3_ws"),
+            _attrs("w1_al"), _attrs("w2_al"), _attrs("w3_al"),
+        ),
+        kwargs={"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)},
+    )
+    graph.output(moe_node)
+
+    gm = fx.GraphModule(root, graph)
+
+    with torch.inference_mode():
+        ref_output = gm(x, selected_experts, final_scales)
+
+    return gm, ref_output
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires fp4 and trtllm support",
+)
+def test_fuse_nvfp4_moe_end_to_end_different_w3_alpha(dtype):
+    """End-to-end test through _stack_nvfp4_moe_weights with different w1/w3 alphas.
+
+    Unlike the kernel-level tests above, this builds an FX graph containing a
+    torch_quant_nvfp4_moe node with real quantized weights, runs the actual
+    fusion pass (_stack_nvfp4_moe_weights), and executes the rewritten graph.
+    This exercises the code path that extracts w3_alpha and adjusts block scales.
+    """
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
+        _stack_nvfp4_moe_weights,
+    )
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+    num_experts = 3
+    (
+        x, selected_experts, final_scales,
+        w1_weight, w2_weight, w3_weight,
+        weights, _, _,
+    ) = setup_moe_test(dtype, num_experts)
+
+    # Scale w3 per expert so w1_alpha != w3_alpha
+    for i in range(num_experts):
+        w3_weight[i] = w3_weight[i] * (2.0 + i * 0.5)
+
+    gm, ref_output = _build_nvfp4_moe_graph_module(
+        x, selected_experts, final_scales,
+        w1_weight, w2_weight, w3_weight, num_experts,
+    )
+
+    # Verify unfused op present before fusion
+    assert any(
+        is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe)
+        for n in gm.graph.nodes
+    )
+
+    # Run the actual fusion pass
+    count = _stack_nvfp4_moe_weights(gm)
+    assert count == 1, f"Expected 1 fused node, got {count}"
+
+    # Verify graph was rewritten
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused)
+        for n in gm.graph.nodes
+    ), "Fused op not found after _stack_nvfp4_moe_weights"
+    assert not any(
+        is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe)
+        for n in gm.graph.nodes
+    ), "Unfused op still present after fusion"
+
+    # Execute the fused graph
+    with torch.inference_mode():
+        fused_output = gm(x, selected_experts, final_scales)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(fused_output, ref_output, rtol=2.0, atol=1.5)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires fp4 and trtllm support",
+)
+def test_fuse_nvfp4_moe_end_to_end_same_alpha(dtype):
+    """End-to-end fusion test with identical w1/w3 alphas (common case, no adjustment)."""
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
+        _stack_nvfp4_moe_weights,
+    )
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+    num_experts = 3
+    (
+        x, selected_experts, final_scales,
+        w1_weight, w2_weight, w3_weight,
+        weights, _, _,
+    ) = setup_moe_test(dtype, num_experts)
+
+    gm, ref_output = _build_nvfp4_moe_graph_module(
+        x, selected_experts, final_scales,
+        w1_weight, w2_weight, w3_weight, num_experts,
+    )
+
+    count = _stack_nvfp4_moe_weights(gm)
+    assert count == 1
+
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused)
+        for n in gm.graph.nodes
+    )
+
+    with torch.inference_mode():
+        fused_output = gm(x, selected_experts, final_scales)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(fused_output, ref_output, rtol=1.5, atol=1.0)
