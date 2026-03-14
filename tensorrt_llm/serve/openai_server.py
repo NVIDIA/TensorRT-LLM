@@ -373,10 +373,88 @@ class OpenAIServer:
                 "model_name": "undefined",
                 "engine_type": "undefined"
             })
+            self._log_config_info_metrics()
             max_perf_metrics = self.generator.args.perf_metrics_max_requests
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    def _log_config_info_metrics(self) -> None:
+        """Extract configuration from generator args and log as Prometheus info gauges."""
+        args = self.generator.args
+
+        # Model config
+        model_config = {
+            "model": str(args.model),
+            "served_model_name": self.model,
+            "dtype": str(args.dtype),
+        }
+        quant_config = getattr(args, "quant_config", None)
+        if quant_config is not None:
+            model_config["quantization"] = str(
+                quant_config.quant_algo) if quant_config.quant_algo else "none"
+        else:
+            model_config["quantization"] = "none"
+        max_seq_len = getattr(args, "max_seq_len", None)
+        if max_seq_len is not None:
+            model_config["max_model_len"] = str(max_seq_len)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                model_config["gpu_type"] = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+
+        # Parallel config
+        tp_size = getattr(args, "tensor_parallel_size", 1) or 1
+        pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+        parallel_config = {
+            "tensor_parallel_size": str(tp_size),
+            "pipeline_parallel_size": str(pp_size),
+            "gpu_count": str(tp_size * pp_size),
+        }
+        ep_size = getattr(args, "moe_expert_parallel_size", None)
+        if ep_size is not None:
+            parallel_config["expert_parallel_size"] = str(ep_size)
+
+        # Speculative decoding config
+        spec_config_obj = getattr(args, "speculative_config",
+                                  None) or getattr(args, "decoding_config",
+                                                   None)
+        speculative_config = None
+        if spec_config_obj is not None:
+            speculative_config = {"spec_enabled": "true"}
+            decoding_type = getattr(spec_config_obj, "decoding_type", None)
+            if decoding_type is not None:
+                speculative_config["spec_method"] = str(decoding_type)
+            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+            if max_draft_len is not None:
+                speculative_config["spec_num_tokens"] = str(max_draft_len)
+            draft_model = getattr(spec_config_obj, "speculative_model", None)
+            if draft_model is not None:
+                speculative_config["spec_draft_model"] = str(draft_model)
+
+        # KV cache config
+        kv_cache_config = getattr(args, "kv_cache_config", None)
+        cache_config = None
+        if kv_cache_config is not None:
+            cache_config = {}
+            for field in ("page_size", "enable_block_reuse",
+                          "enable_partial_reuse", "free_gpu_memory_fraction"):
+                val = getattr(kv_cache_config, field, None)
+                if val is not None:
+                    cache_config[field] = str(val)
+            kv_dtype = getattr(kv_cache_config, "dtype", None)
+            if kv_dtype is not None:
+                cache_config["cache_dtype"] = str(kv_dtype)
+
+        self.metrics_collector.log_config_info(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            cache_config=cache_config if cache_config else None,
+        )
+
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:

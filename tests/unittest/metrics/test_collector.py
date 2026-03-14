@@ -229,3 +229,65 @@ class TestPartialStats:
         labels = {"model_name": "test_model"}
         assert _get_gauge_value(collector.kv_cache_max_blocks, labels) == 100
         assert _get_gauge_value(collector.kv_cache_used_blocks, labels) == 50
+
+
+class TestConfigInfoMetrics:
+    """Test config info gauges are correctly exposed."""
+
+    def test_model_config_info(self, collector):
+        model_config = {
+            "model": "meta-llama/Llama-3-8B",
+            "served_model_name": "Llama-3-8B",
+            "dtype": "float16",
+            "quantization": "none",
+            "max_model_len": "4096",
+            "gpu_type": "NVIDIA H100",
+        }
+        collector.log_config_info(model_config=model_config)
+
+        from prometheus_client import REGISTRY
+        # Verify the metric was registered
+        assert "trtllm_model_config_info" in REGISTRY._names_to_collectors
+
+    def test_parallel_config_info(self, collector):
+        parallel_config = {
+            "tensor_parallel_size": "4",
+            "pipeline_parallel_size": "2",
+            "gpu_count": "8",
+        }
+        collector.log_config_info(parallel_config=parallel_config)
+
+        from prometheus_client import REGISTRY
+        assert "trtllm_parallel_config_info" in REGISTRY._names_to_collectors
+
+    def test_speculative_config_info(self, collector):
+        spec_config = {
+            "spec_enabled": "true",
+            "spec_method": "Eagle",
+            "spec_num_tokens": "5",
+            "spec_draft_model": "eagle-model",
+        }
+        collector.log_config_info(speculative_config=spec_config)
+
+        from prometheus_client import REGISTRY
+        assert "trtllm_speculative_config_info" in REGISTRY._names_to_collectors
+
+    def test_cache_config_info(self, collector):
+        cache_config = {
+            "page_size": "64",
+            "enable_block_reuse": "True",
+            "cache_dtype": "auto",
+        }
+        collector.log_config_info(cache_config=cache_config)
+
+        from prometheus_client import REGISTRY
+        assert "trtllm_cache_config_info" in REGISTRY._names_to_collectors
+
+    def test_no_config_no_error(self, collector):
+        """No error when all configs are None."""
+        collector.log_config_info()
+
+    def test_partial_config(self, collector):
+        """Only model config provided, others None."""
+        collector.log_config_info(
+            model_config={"model": "test", "dtype": "auto"})

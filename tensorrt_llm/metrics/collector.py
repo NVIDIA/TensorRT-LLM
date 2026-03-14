@@ -68,6 +68,12 @@ class MetricsCollector:
             trtllm_spec_decode_num_accepted_tokens
             trtllm_spec_decode_acceptance_length
             trtllm_spec_decode_draft_overhead
+
+        Config info metrics (logged once at startup via log_config_info):
+            trtllm_model_config_info
+            trtllm_parallel_config_info
+            trtllm_speculative_config_info
+            trtllm_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
 
@@ -266,6 +272,57 @@ class MetricsCollector:
             name=self.metric_prefix + "spec_decode_draft_overhead",
             documentation="Draft overhead in speculative decoding",
             labelnames=self.labels.keys())
+
+    def log_config_info(self,
+                        model_config: Dict[str, str] = None,
+                        parallel_config: Dict[str, str] = None,
+                        speculative_config: Dict[str, str] = None,
+                        cache_config: Dict[str, str] = None) -> None:
+        """
+        Log static configuration as Prometheus info-style gauges (set to 1 with config labels).
+
+        Should be called once at startup. Each config dict's keys become Prometheus labels.
+        Follows the same pattern as vLLM/SGLang config info metrics.
+
+        Args:
+            model_config: Model configuration labels (model, dtype, quantization, gpu_type, etc.)
+            parallel_config: Parallelism configuration labels (tp_size, pp_size, etc.)
+            speculative_config: Speculative decoding configuration labels (method, draft_model, etc.)
+            cache_config: KV cache configuration labels (page_size, enable_block_reuse, etc.)
+        """
+        from prometheus_client import Gauge
+
+        if model_config:
+            info_labels = {**self.labels, **model_config}
+            gauge = Gauge(
+                name=self.metric_prefix + "model_config_info",
+                documentation="Model configuration info",
+                labelnames=info_labels.keys())
+            gauge.labels(**info_labels).set(1)
+
+        if parallel_config:
+            info_labels = {**self.labels, **parallel_config}
+            gauge = Gauge(
+                name=self.metric_prefix + "parallel_config_info",
+                documentation="Parallelism configuration info",
+                labelnames=info_labels.keys())
+            gauge.labels(**info_labels).set(1)
+
+        if speculative_config:
+            info_labels = {**self.labels, **speculative_config}
+            gauge = Gauge(
+                name=self.metric_prefix + "speculative_config_info",
+                documentation="Speculative decoding configuration info",
+                labelnames=info_labels.keys())
+            gauge.labels(**info_labels).set(1)
+
+        if cache_config:
+            info_labels = {**self.labels, **cache_config}
+            gauge = Gauge(
+                name=self.metric_prefix + "cache_config_info",
+                documentation="KV cache configuration info",
+                labelnames=info_labels.keys())
+            gauge.labels(**info_labels).set(1)
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
