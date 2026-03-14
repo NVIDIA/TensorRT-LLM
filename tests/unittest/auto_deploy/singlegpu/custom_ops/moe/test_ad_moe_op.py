@@ -313,3 +313,216 @@ def test_fp4_moe_op_run(dtype):
     rtol, atol = 1.5, 1.0
     torch.testing.assert_close(output_torch_fp4_moe, output_torch_moe, rtol=rtol, atol=atol)
     torch.testing.assert_close(output_torch_fp4_moe, ref_output, rtol=rtol, atol=atol)
+
+
+def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, w2_weight,
+                                   w3_weight, num_experts):
+    """Quantize per-expert weights and prepare stacked args for trtllm_quant_nvfp4_moe_fused.
+
+    Returns the fused kernel arguments and the per-expert reference op output.
+    """
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
+        TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+    )
+
+    scaling_vector_size = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+
+    w1_fp4_list, w2_fp4_list, w3_fp4_list = [], [], []
+    w1_is, w2_is, w3_is = [], [], []
+    w1_ws, w2_ws, w3_ws = [], [], []
+    w1_al, w2_al, w3_al = [], [], []
+
+    for i in range(num_experts):
+        inp_scale = fp4_global_scale(x)
+        wt_s2_w1 = fp4_global_scale(w1_weight[i])
+        wt_s2_w2 = fp4_global_scale(w2_weight[i])
+        wt_s2_w3 = fp4_global_scale(w3_weight[i])
+
+        w1_fp4, w1_sc = torch.ops.trtllm.fp4_quantize(w1_weight[i], wt_s2_w1, scaling_vector_size, False)
+        w2_fp4, w2_sc = torch.ops.trtllm.fp4_quantize(w2_weight[i], wt_s2_w2, scaling_vector_size, False)
+        w3_fp4, w3_sc = torch.ops.trtllm.fp4_quantize(w3_weight[i], wt_s2_w3, scaling_vector_size, False)
+
+        w1_fp4_list.append(w1_fp4)
+        w2_fp4_list.append(w2_fp4)
+        w3_fp4_list.append(w3_fp4)
+        w1_is.append(inp_scale)
+        w2_is.append(inp_scale)
+        w3_is.append(inp_scale)
+        w1_ws.append(w1_sc)
+        w2_ws.append(w2_sc)
+        w3_ws.append(w3_sc)
+        w1_al.append(1 / (inp_scale * wt_s2_w1))
+        w2_al.append(1 / (inp_scale * wt_s2_w2))
+        w3_al.append(1 / (inp_scale * wt_s2_w3))
+
+    # Get reference output from the per-expert op (known correct)
+    with torch.inference_mode():
+        ref_output = torch.ops.auto_deploy.torch_quant_nvfp4_moe(
+            x, selected_experts, final_scales,
+            w1_fp4_list, w2_fp4_list, w3_fp4_list,
+            w1_is, w2_is, w3_is,
+            w1_ws, w2_ws, w3_ws,
+            w1_al, w2_al, w3_al,
+        )
+
+    # Prepare stacked tensors for the fused kernel (mimics _stack_nvfp4_moe_weights)
+    w1_stacked = torch.stack(w1_fp4_list, dim=0)
+    w2_stacked = torch.stack(w2_fp4_list, dim=0)
+    w3_stacked = torch.stack(w3_fp4_list, dim=0)
+
+    w1_is_t = torch.stack(w1_is)
+    w2_is_t = torch.stack(w2_is)
+    w3_is_t = torch.stack(w3_is)
+
+    w1_ws_t = torch.stack(w1_ws).view(torch.float8_e4m3fn)
+    w2_ws_t = torch.stack(w2_ws).view(torch.float8_e4m3fn)
+    w3_ws_t = torch.stack(w3_ws).view(torch.float8_e4m3fn)
+
+    w1_al_t = torch.stack(w1_al)
+    w2_al_t = torch.stack(w2_al)
+    w3_al_t = torch.stack(w3_al)
+
+    # Check if w1/w3 alphas differ and adjust w3 block scales if needed
+    alpha_ratio = w3_al_t / w1_al_t
+    if not torch.allclose(alpha_ratio, torch.ones_like(alpha_ratio), rtol=1e-3, atol=1e-6):
+        # Unswizzle → adjust → reswizzle (same as _adjust_w3_blockscales_for_alpha_diff)
+        w3_bs_uint8 = w3_ws_t.view(torch.uint8)
+        w3_bs_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(w3_bs_uint8)
+        w3_bs_float = w3_bs_unswizzled.view(torch.float8_e4m3fn).float()
+        w3_bs_float = w3_bs_float * alpha_ratio.view(-1, *([1] * (w3_bs_float.ndim - 1)))
+        w3_bs_fp8 = w3_bs_float.to(torch.float8_e4m3fn)
+        w3_ws_t = torch.ops.trtllm.block_scale_interleave(
+            w3_bs_fp8.view(torch.uint8)
+        ).view(torch.float8_e4m3fn).reshape(w3_ws_t.shape)
+
+    # Concatenate for gated MLP: FC1 = [w3, w1]
+    fc1_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
+    fc1_blockscale = torch.cat([w3_ws_t, w1_ws_t], dim=1).contiguous()
+
+    # FC1 uses a single input scale (all experts share input)
+    fc1_act_scale = w1_is_t[0]
+
+    # FC1 alpha: use w1's alpha (w3 block scales already compensated)
+    fc1_alpha = w1_al_t
+
+    # FC2
+    fc2_weights = w2_stacked
+    fc2_act_scale = w2_is_t
+    fc2_alpha = w2_al_t
+    fc2_blockscale = w2_ws_t
+
+    return (
+        fc1_weights, fc2_weights, fc1_blockscale, fc2_blockscale,
+        fc1_act_scale, fc2_act_scale, fc1_alpha, fc2_alpha,
+        ref_output,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires fp4 and trtllm support",
+)
+def test_fp4_fused_moe_with_different_weight_scales(dtype):
+    """Test that the fused NVFP4 MoE kernel produces correct output when
+    w1 and w3 have different per-expert weight global scales (weight_scale_2).
+
+    This is a regression test for the bug where _stack_nvfp4_moe_weights
+    ignored w3_alpha, causing incorrect dequantization of the w3 (up-projection)
+    part of FC1 in the fused CUTLASS kernel.
+    """
+    num_experts = 3
+    (
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        _,
+        _,
+    ) = setup_moe_test(dtype, num_experts)
+
+    # Deliberately scale w3 weights to create different weight_scale_2 per expert
+    # This simulates checkpoints where per-expert weight scales are not synced
+    for i in range(num_experts):
+        w3_weight[i] = w3_weight[i] * (2.0 + i * 0.5)
+
+    (
+        fc1_weights, fc2_weights, fc1_blockscale, fc2_blockscale,
+        fc1_act_scale, fc2_act_scale, fc1_alpha, fc2_alpha,
+        ref_output,
+    ) = _prepare_nvfp4_moe_fused_args(
+        x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
+    )
+
+    with torch.inference_mode():
+        fused_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
+            x,
+            selected_experts,
+            final_scales,
+            fc1_weights,
+            fc2_weights,
+            fc1_blockscale,
+            fc2_blockscale,
+            fc1_act_scale,
+            fc2_act_scale,
+            fc1_alpha,
+            fc2_alpha,
+        )
+
+    torch.cuda.synchronize()
+    # Tolerance is higher for fused kernel due to FP8 block scale rounding from adjustment
+    rtol, atol = 2.0, 1.5
+    torch.testing.assert_close(fused_output, ref_output, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires fp4 and trtllm support",
+)
+def test_fp4_fused_moe_with_same_weight_scales(dtype):
+    """Test that the fused NVFP4 MoE kernel produces correct output when
+    w1 and w3 have the same weight scales (common case, no adjustment needed).
+    """
+    num_experts = 3
+    (
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        _,
+        _,
+    ) = setup_moe_test(dtype, num_experts)
+
+    (
+        fc1_weights, fc2_weights, fc1_blockscale, fc2_blockscale,
+        fc1_act_scale, fc2_act_scale, fc1_alpha, fc2_alpha,
+        ref_output,
+    ) = _prepare_nvfp4_moe_fused_args(
+        x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
+    )
+
+    with torch.inference_mode():
+        fused_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
+            x,
+            selected_experts,
+            final_scales,
+            fc1_weights,
+            fc2_weights,
+            fc1_blockscale,
+            fc2_blockscale,
+            fc1_act_scale,
+            fc2_act_scale,
+            fc1_alpha,
+            fc2_alpha,
+        )
+
+    torch.cuda.synchronize()
+    rtol, atol = 1.5, 1.0
+    torch.testing.assert_close(fused_output, ref_output, rtol=rtol, atol=atol)

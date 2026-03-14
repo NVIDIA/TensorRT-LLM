@@ -2011,6 +2011,7 @@ def _stack_nvfp4_cutlass_moe_weights(
             "w3_weight_scale",
             "w1_alpha",
             "w2_alpha",
+            "w3_alpha",
             "is_gated_mlp",
             "act_fn",
         )
@@ -2023,14 +2024,56 @@ def _stack_nvfp4_cutlass_moe_weights(
         else:
             return torch.empty(0, device=device, dtype=dtype)
 
-    def _prepare_args_cutlass_format_nvfp4():
-        if is_gated_mlp:
-            # For gated MLP, concatenate w1 and w3 as [w3, w1]
-            fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
-            fc1_weight_blockscale_fp8_stacked = torch.cat(
-                [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
-            ).contiguous()
+    def _adjust_w3_blockscales_for_alpha_diff(
+        w3_blockscale_fp8, w1_alpha, w3_alpha
+    ):
+        """Adjust w3 block scales when w1 and w3 have different alpha (weight global scales).
 
+        The CUTLASS fused MoE kernel uses a single fc1_alpha per expert for both
+        the w1 and w3 GEMM outputs. When w1_alpha != w3_alpha (due to different
+        per-expert weight_scale_2), the w3 output would be incorrectly scaled.
+
+        Fix: bake the alpha ratio into w3's per-block scales so that using w1_alpha
+        for both produces correct dequantization:
+            adjusted_w3_bs = original_w3_bs * (w3_alpha / w1_alpha)
+
+        Args:
+            w3_blockscale_fp8: Stacked w3 block scales [E, M, N_blocks] as float8_e4m3fn
+            w1_alpha: Per-expert alpha for w1 [E]
+            w3_alpha: Per-expert alpha for w3 [E]
+
+        Returns:
+            Adjusted w3 block scales with same shape and dtype.
+        """
+        alpha_ratio = w3_alpha / w1_alpha  # [E]
+
+        if torch.allclose(alpha_ratio, torch.ones_like(alpha_ratio), rtol=1e-3, atol=1e-6):
+            return w3_blockscale_fp8
+
+        ad_logger.warning_once(
+            "NVFP4 MoE: w3 alpha differs from w1 alpha (different per-expert weight global "
+            "scales). Adjusting w3 block scales to compensate. This is expected for checkpoints "
+            "with per-expert weight scales not synced across experts.",
+            key="nvfp4_moe_w3_alpha_adjustment",
+        )
+
+        original_shape = w3_blockscale_fp8.shape
+        # Unswizzle → float → scale → float8 → reswizzle
+        w3_bs_uint8 = w3_blockscale_fp8.view(torch.uint8)
+        w3_bs_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(w3_bs_uint8)
+        w3_bs_float = w3_bs_unswizzled.view(torch.float8_e4m3fn).float()
+        # Broadcast ratio [E] → [E, 1, 1] over block dimensions
+        w3_bs_float = w3_bs_float * alpha_ratio.view(-1, *([1] * (w3_bs_float.ndim - 1)))
+        w3_bs_fp8 = w3_bs_float.to(torch.float8_e4m3fn)
+        w3_bs_swizzled = torch.ops.trtllm.block_scale_interleave(
+            w3_bs_fp8.view(torch.uint8)
+        )
+        return w3_bs_swizzled.view(torch.float8_e4m3fn).reshape(original_shape)
+
+    def _prepare_args_cutlass_format_nvfp4():
+        nonlocal w3_weight_blockscale_fp8_stacked
+
+        if is_gated_mlp:
             # Check if all w1 and w3 input scales are identical across experts
             all_scales_equal = (
                 torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0])
@@ -2065,6 +2108,31 @@ def _stack_nvfp4_cutlass_moe_weights(
                 # Formula: new_alpha = old_alpha * per_expert_input_scale / global_input_scale
                 # This ensures alpha is consistent with the global fc1_act_scale used by the kernel.
                 fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
+
+            # The fused CUTLASS kernel uses a single fc1_alpha for both w1 and w3.
+            # When w1 and w3 have different weight global scales (weight_scale_2),
+            # their alphas differ. Compensate by adjusting w3's block scales so that
+            # using fc1_alpha (based on w1) still produces correct dequantization for w3.
+            #
+            # Compute the effective w3 alpha that SHOULD be used (accounting for any
+            # input_scale recomputation), then compare against the actual fc1_alpha.
+            if w3_alpha_stacked.numel() > 0:
+                if all_scales_equal:
+                    effective_w3_alpha = w3_alpha_stacked
+                else:
+                    # Recompute w3 alpha with the global input scale, same formula as w1
+                    effective_w3_alpha = (
+                        w3_alpha_stacked * w3_input_scale_stacked / fc1_act_scale
+                    )
+                w3_weight_blockscale_fp8_stacked = _adjust_w3_blockscales_for_alpha_diff(
+                    w3_weight_blockscale_fp8_stacked, fc1_alpha_stacked, effective_w3_alpha
+                )
+
+            # For gated MLP, concatenate w1 and w3 as [w3, w1]
+            fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
+            fc1_weight_blockscale_fp8_stacked = torch.cat(
+                [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
+            ).contiguous()
         else:
             fc1_expert_weights = w1_stacked
             fc1_weight_blockscale_fp8_stacked = w1_weight_blockscale_fp8_stacked
@@ -2220,6 +2288,7 @@ def _stack_nvfp4_cutlass_moe_weights(
             w3_weight_scale,
             w1_alpha,
             w2_alpha,
+            w3_alpha,
             is_gated_mlp,
             act_fn,
         ) = _extract_op_args(node)
@@ -2251,6 +2320,12 @@ def _stack_nvfp4_cutlass_moe_weights(
 
         w1_alpha_stacked = _stack(w1_alpha, dim=0)
         w2_alpha_stacked = _stack(w2_alpha, dim=0)
+        w3_alpha_stacked = _stack(
+            w3_alpha,
+            dim=0,
+            device=w1_alpha_stacked.device,
+            dtype=w1_alpha_stacked.dtype,
+        )
 
         args, kwargs = _prepare_args_cutlass_format_nvfp4()
 
