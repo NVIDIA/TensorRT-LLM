@@ -12,7 +12,8 @@ from ..executor.postproc_worker import PostprocArgs
 from ..executor.result import Logprob, TokenLogprobs
 from ..llmapi import SamplingParams
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
-                                       ReasoningParserFactory)
+                                       ReasoningParserFactory,
+                                       ReasoningParserResult)
 from ..llmapi.tokenizer import TransformersTokenizer
 # yapf: disable
 from .chat_utils import make_tool_call_id
@@ -111,8 +112,11 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
     return chat_logprobs
 
 
-def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                           streaming: bool) -> Tuple[str, str]:
+def apply_reasoning_parser(args: ChatPostprocArgs,
+                           output_index: int,
+                           text: str,
+                           streaming: bool,
+                           finished: bool = False) -> Tuple[str, str]:
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
@@ -127,6 +131,13 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
+            if finished:
+                finish_result = reasoning_parser.finish()
+                result = ReasoningParserResult(
+                    content=result.content + finish_result.content,
+                    reasoning_content=result.reasoning_content +
+                    finish_result.reasoning_content,
+                )
         content, reasoning_content = result.content, result.reasoning_content
     else:
         content, reasoning_content = text, ""
@@ -214,7 +225,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         delta_text = output.text_diff
 
         delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args, i, delta_text, True)
+            args,
+            i,
+            delta_text,
+            True,
+            finished=(output.finish_reason is not None))
 
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
