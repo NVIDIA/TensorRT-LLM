@@ -2086,6 +2086,7 @@ class Fp8RowwiseAttention(Module):
 
 
 class FP4Linear(Linear):
+    """Column-parallel linear layer with NVFP4 weight quantization."""
 
     def __init__(
         self,
@@ -2099,6 +2100,7 @@ class FP4Linear(Linear):
         prefer_managed_weight=True,
         is_qkv=False,
     ):
+        """Initialize FP4Linear with weight/activation quantization parameters."""
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -2220,6 +2222,7 @@ class FP4Linear(Linear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
+        """Transform checkpoint weights into the format required by FP4Linear."""
         if not any([
                 tllm_key.endswith(suffix)
                 for suffix in self.tllm_to_externel_key_dict
@@ -2281,6 +2284,7 @@ class FP4Linear(Linear):
 
 
 class FP4RowLinear(RowLinear):
+    """Row-parallel linear layer with NVFP4 weight quantization."""
 
     def __init__(
         self,
@@ -2291,6 +2295,7 @@ class FP4RowLinear(RowLinear):
         tp_group=None,
         tp_size=1,
     ):
+        """Initialize FP4RowLinear with weight/activation quantization parameters."""
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -2432,6 +2437,7 @@ class FP4RowLinear(RowLinear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
+        """Transform checkpoint weights into the format required by FP4RowLinear."""
         if not any([
                 tllm_key.endswith(suffix)
                 for suffix in self.tllm_to_externel_key_dict
