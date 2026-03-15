@@ -935,19 +935,54 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-        mamba_layer_mask = [
-            True if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else False for i in range(num_hidden_layers)
-        ]
-        hybrid_layer_mask = [
-            False if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else True for i in range(num_hidden_layers)
-        ]
-        num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
-            config.full_attention_interval - 1)
-        num_layers = num_hidden_layers - num_mamba_layers
+        if layer_mask is not None:
+            # When layer_mask is provided (e.g., for one-model speculative
+            # decoding with a separate draft KV cache), classify each layer
+            # using its position in the full combined model.  Draft layers
+            # appended beyond the base model's pattern are full-attention
+            # (no linear/mamba states).
+            base_num_layers = config.num_hidden_layers
+            hybrid_layer_mask = []
+            mamba_layer_mask = []
+            for i, include in enumerate(layer_mask):
+                if i < base_num_layers:
+                    is_attn = (i % config.full_attention_interval ==
+                               config.full_attention_interval - 1)
+                    is_mamba = not is_attn
+                else:
+                    # MTP draft layers beyond the base pattern are full attention
+                    is_attn = True
+                    is_mamba = False
+                hybrid_layer_mask.append(is_attn and include)
+                mamba_layer_mask.append(is_mamba and include)
+            num_mamba_layers = sum(mamba_layer_mask)
+            num_layers = sum(hybrid_layer_mask)
+        else:
+            mamba_layer_mask = [
+                True if i % config.full_attention_interval
+                != config.full_attention_interval - 1 else False
+                for i in range(num_hidden_layers)
+            ]
+            hybrid_layer_mask = [
+                False if i % config.full_attention_interval
+                != config.full_attention_interval - 1 else True
+                for i in range(num_hidden_layers)
+            ]
+            num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
+                config.full_attention_interval - 1)
+            num_layers = num_hidden_layers - num_mamba_layers
+            # For hybrid models, hybrid_layer_mask is always passed as
+            # layer_mask to KVCacheManager, which means get_pp_layers
+            # sees a non-None layer_mask and won't auto-add spec layers.
+            # Extend the masks here to include MTP spec layers (full
+            # attention, no linear states) so they get KV cache entries.
+            if spec_config is not None:
+                from ..speculative.utils import get_num_spec_layers
+                num_spec_layers = get_num_spec_layers(spec_config)
+                if num_spec_layers > 0:
+                    hybrid_layer_mask.extend([True] * num_spec_layers)
+                    mamba_layer_mask.extend([False] * num_spec_layers)
+                    num_layers += num_spec_layers
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.linear_key_head_dim,

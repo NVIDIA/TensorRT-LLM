@@ -105,3 +105,8 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
+
+# Experiments
+examples/disaggregated/slurm/benchmark/20*/
+examples/disaggregated/slurm/benchmark/saved_configs/
+examples/disaggregated/slurm/benchmark/helix_robustness/results/

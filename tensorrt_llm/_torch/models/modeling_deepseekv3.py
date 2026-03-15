@@ -50,7 +50,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather,
+                           cp_allgather)
 from ..model_config import ModelConfig
 from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
@@ -1421,12 +1422,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states = self.self_attn(
+        hidden_states, residual = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
+            residual=residual,
             **kwargs,
         )
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
@@ -1691,12 +1693,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states = self.self_attn(
+        hidden_states, residual = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
+            residual=residual,
             **kwargs,
         )
 
@@ -1926,7 +1929,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
-
 
 @register_auto_model("KimiK25ForConditionalGeneration")
 class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
