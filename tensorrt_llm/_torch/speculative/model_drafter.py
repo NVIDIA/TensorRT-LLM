@@ -960,11 +960,8 @@ class ModelDrafter(Drafter):
         self.last_draft_latency_ms = (draft_end_time - draft_start_time) * 1e3
 
     @nvtx_range("prepare_draft_tokens")
-    def prepare_draft_tokens(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
+    def prepare_draft_tokens(self, scheduled_requests: ScheduledRequests,
+                             resource_manager: ResourceManager) -> None:
         """
         Prepare draft tokens for the scheduled requests.
 

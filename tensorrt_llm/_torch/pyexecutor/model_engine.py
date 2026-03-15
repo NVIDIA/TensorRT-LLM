@@ -56,7 +56,6 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
-from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -3653,7 +3652,6 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
-                spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -3667,7 +3665,8 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             spec_tree_manager = None
-            if isinstance(spec_resource_manager, Eagle3ResourceManager):
+            if spec_resource_manager is not None and hasattr(
+                    spec_resource_manager, 'spec_tree_manager'):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
@@ -3697,10 +3696,9 @@ class PyTorchModelEngine(ModelEngine):
                 is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
                 max_draft_len=sd_max_draft_len,
                 max_total_draft_tokens=sd_max_total,
+                is_target_model=not self.is_draft_model,
                 model_is_wrapped=self.model_is_wrapped,
-                spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager,
-                spec_decoding_tensor=spec_decoding_tensor)
+                spec_tree_manager=spec_tree_manager)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -3796,6 +3794,31 @@ class PyTorchModelEngine(ModelEngine):
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
+
+            # Sync CUDA graph attn_metadata back to persistent attn_metadata
+            # for dynamic tree spec decoding.  The CUDA graph uses its own
+            # attn_metadata with independently allocated kv_lens_cuda and
+            # kv_cache_block_offsets.  After graph replay, the KV cache
+            # relocation kernel (_update_kv_cache_draft_token_location) reads
+            # from the persistent self.attn_metadata.  Without this sync the
+            # kernel would use stale values, causing either illegal memory
+            # access (wrong kv_lens) or KV cache data corruption (wrong
+            # block offsets).
+            if (can_run_graph and attn_metadata is not self.attn_metadata
+                    and self.spec_config is not None
+                    and getattr(self.spec_config, 'use_dynamic_tree', False)):
+                batch_size = scheduled_requests.batch_size
+                if hasattr(attn_metadata, 'kv_lens_cuda') and hasattr(
+                        self.attn_metadata, 'kv_lens_cuda'):
+                    self.attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                        attn_metadata.kv_lens_cuda[:batch_size])
+                if hasattr(
+                        attn_metadata, 'kv_cache_block_offsets'
+                ) and attn_metadata.kv_cache_block_offsets is not None and hasattr(
+                        self.attn_metadata, 'kv_cache_block_offsets'
+                ) and self.attn_metadata.kv_cache_block_offsets is not None:
+                    self.attn_metadata.kv_cache_block_offsets[:, :batch_size].copy_(
+                        attn_metadata.kv_cache_block_offsets[:, :batch_size])
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

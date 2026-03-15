@@ -2488,7 +2488,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         request: LlmRequest,
         new_tokens: list[list[list[int]]],
         finish_reasons: FinishReasonsList,
-    ) -> int:
+    ) -> int:  # new_tokens.shape = [max_total_draft_tokens + 1, max_num_sequences, max_beam_width]
         new_token = add_token(request, new_tokens, beam_idx=DEFAULT_BEAM_IDX)
         stop = self.finish_if_reason(request, finish_reasons, step=0, beam_idx=DEFAULT_BEAM_IDX)
         if stop or get_draft_token_length(request) == 0:
@@ -3298,7 +3298,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
                 if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
-                    req.py_rewind_len = actual_draft_len - num_accepted
+                    actual_draft_len = get_draft_token_length(req)
+                    req.py_rewind_len = (
+                        actual_draft_len - num_accepted
+                    )  # num_accepted only counts accepted draft tokens
                 else:
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0

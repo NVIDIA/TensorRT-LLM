@@ -98,12 +98,13 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
         seq_slots = args.max_num_sequences
         max_tokens = self._get_max_tokens(args, draft_len)
+        max_new_tokens = self._get_max_new_tokens(args, draft_len)
         draft_tokens_size = self._get_draft_tokens_storage_size(args, draft_len)
         self.max_beam_width = args.max_beam_width
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
         self.store = self.Store(
-            new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
+            new_tokens=int_tensor((max_new_tokens, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
             next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
             new_tokens_lens=int_tensor((seq_slots,)),
@@ -117,6 +118,15 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         MTP uses args.max_total_draft_tokens + 1 for tree-based speculation.
         """
         return draft_len + 1
+
+    def _get_max_new_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
+        """Max depth of accepted token path for new_tokens buffer.
+
+        Defaults to _get_max_tokens (same size as next_new_tokens).
+        Override when accepted path depth differs from total draft tokens,
+        e.g. dynamic tree where max_draft_len < max_total_draft_tokens.
+        """
+        return self._get_max_tokens(args, draft_len)
 
     def _get_draft_tokens_storage_size(self, args: TorchSampler.Args, draft_len: int) -> int:
         """
