@@ -183,6 +183,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size, max_path_len, dtype=torch.int32, device="cuda"
         )
         self._num_accepted_tokens_buf = torch.ones(max_batch_size, dtype=torch.int32, device="cuda")
+        self._target_tokens_buf = torch.zeros(
+            max_batch_size * tokens_per_gen_step, dtype=torch.int64, device="cuda"
+        )
         self._candidates_buf = torch.zeros(
             max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
         )
@@ -663,10 +666,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Reset pre-allocated accepted draft indices buffer
         self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
-        # Sample target tokens (supports greedy + non-greedy via allow_advanced_sampling)
-        target_tokens = self._sample_tokens_for_batch(
-            logits, spec_metadata, num_contexts, batch_size
-        )
+        # Sample all target tokens into pre-allocated buffer
+        num_flat_tokens = logits.shape[0]
+        torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
+        target_tokens = self._target_tokens_buf[:num_flat_tokens]
 
         # Context requests: accept sampled token
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
