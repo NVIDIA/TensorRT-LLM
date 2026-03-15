@@ -422,13 +422,14 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("moe_backend", ["trtllm", "trtllm_gen"])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("enable_attention_dp", [False, True],
                              ids=["attn_dp_off", "attn_dp_on"])
     @pytest.mark.parametrize("world_size", [1, 4, 8])
     @pytest.mark.parametrize("model_id", ["bf16", "fp8", "nvfp4"])
     def test_accuracy(self, model_id, world_size, enable_attention_dp,
-                      attn_backend):
+                      attn_backend, moe_backend):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
         # bf16 120B model requires at least 4 GPUs
@@ -444,6 +445,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             kwargs.setdefault("transforms", {})["detect_sharding"] = {
                 "enable_attention_dp": True
             }
+        kwargs.setdefault("transforms", {})
+        kwargs["transforms"].setdefault("fuse_nvfp4_moe",
+                                        {})["backend"] = moe_backend
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,

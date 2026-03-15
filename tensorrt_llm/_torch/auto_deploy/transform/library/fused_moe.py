@@ -2678,6 +2678,7 @@ class FuseNVFP4Moe(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        ad_logger.info(f"FuseNVFP4Moe: backend={self.config.backend}")
         with cuda_memory_tracker():
             if self.config.backend == "trtllm":
                 fused_key_counter = _stack_nvfp4_cutlass_moe_weights(
