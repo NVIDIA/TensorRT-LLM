@@ -899,15 +899,15 @@ def create_aiperf_command(model_name,
                           input_len_mean=PerformanceParams.input_len_mean,
                           input_len_std=PerformanceParams.input_len_std,
                           output_len_mean=PerformanceParams.output_len_mean,
-                          output_len_std=PerformanceParams.output_len_std,
-                          warmup_request_count=2):
+                          output_len_std=PerformanceParams.output_len_std):
     """
     Create a command list for aiperf with standardized parameters.
 
     The server should already be inference-warmed via warmup_inference()
-    before this command is run.  We keep a small warmup_request_count
-    (default 2) at concurrency 1 so aiperf can verify connectivity
-    without hitting its internal startup timeout.
+    before this command is run, so aiperf's own warmup phase is skipped
+    (no --warmup-request-count).  This avoids hitting aiperf's fixed
+    internal startup timeout on memory-constrained GPUs where warmup
+    requests at full profiling concurrency are too slow.
 
     Args:
         model_name: Name of the model
@@ -919,7 +919,6 @@ def create_aiperf_command(model_name,
         input_len_std: Standard deviation of input length
         output_len_mean: Mean output length
         output_len_std: Standard deviation of output length
-        warmup_request_count: Number of warmup requests for aiperf
 
     Returns:
         List of command-line arguments for aiperf
@@ -949,8 +948,6 @@ def create_aiperf_command(model_name,
         str(request_count),
         "--concurrency",
         str(concurrency),
-        "--warmup-request-count",
-        str(warmup_request_count),
         # "--verbose",
     ]
 
