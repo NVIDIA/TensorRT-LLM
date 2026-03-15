@@ -71,7 +71,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
         return;
     }
 
-    heuristicTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem);
+    int const preIdxOffset = rowIdx % next_n;
+    heuristicTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
 }
 
 } // anonymous namespace
