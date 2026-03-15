@@ -245,6 +245,15 @@ class FuseRMSNormQuantFP8(BaseTransform):
             )
             if not fp8_linear_users:
                 continue
+            # Safety: only fuse when all terminal consumers on the norm data path
+            # are FP8 linears in this group. Mixed-consumer patterns can otherwise
+            # split one logical norm into mismatched producer paths.
+            terminal_users, traversal_ok = collect_terminal_users_through_passthrough(norm_node)
+            if not traversal_ok:
+                continue
+            fp8_user_set = set(fp8_linear_users)
+            if any(user not in fp8_user_set for user in terminal_users):
+                continue
 
             out_dtype_str = _get_out_dtype_str(norm_node)
             if out_dtype_str is None:
@@ -255,7 +264,6 @@ class FuseRMSNormQuantFP8(BaseTransform):
                 continue
             _, _, _, earliest_scale, _ = _extract_fp8_linear_args(earliest_fp8_user)
 
-            fp8_user_set = set(fp8_linear_users)
             has_other_consumer_before_fp8 = any(
                 u not in fp8_user_set
                 and not is_trivial_passthrough_user(u)
