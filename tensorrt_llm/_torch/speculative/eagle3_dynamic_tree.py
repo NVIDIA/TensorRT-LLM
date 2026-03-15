@@ -717,7 +717,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 accept_index[:num_gens, 1:max_path_len] - 1
             ).to(torch.int32)
 
-        num_accepted_tokens = self._apply_force_accepted_tokens(num_accepted_tokens, num_contexts, self.max_draft_len)
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, self.max_draft_len
+        )
         self._last_num_accepted = num_accepted_tokens
 
         return accepted_tokens, num_accepted_tokens
@@ -727,8 +729,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def sample(
         self, logits: torch.Tensor, max_top_k: int, draft_model=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """TopK sampling with log softmax for dynamic tree."""
-        last_p = torch.log_softmax(logits, dim=-1)
+        """TopK sampling with softmax for dynamic tree."""
+        last_p = torch.softmax(logits, dim=-1)
         topk_values, topk_indices = torch.topk(last_p, k=max_top_k, dim=-1)
         # Apply draft-to-target vocab mapping if the draft model has it
         if draft_model is not None and hasattr(draft_model.model, "d2t"):
@@ -769,8 +771,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         else:
             new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K * self.K)
 
-            # Accumulate scores from previous layer
-            new_draft_scores = new_draft_scores + previous_draft_scores.unsqueeze(2)
+            # Accumulate scores from previous layer (probability space)
+            new_draft_scores = new_draft_scores * previous_draft_scores.unsqueeze(2)
             new_draft_scores = new_draft_scores.reshape(batch_size, self.K * self.K)
 
             # Select best K from K*K candidates

@@ -38,8 +38,6 @@ enum class TreeMaskMode : int32_t
 //! Parent indices for each token in the tree (layer-local relative indices).
 //! \param selectedIndex [batchSize, numDraftTokens - 1], on GPU. int64.
 //! Selected token indices (excluding root node).
-//! \param verifiedSeqLen [batchSize], on GPU.
-//! Verified sequence length for each request.
 //! \param treeMask output buffer [varies by mode], on GPU. int32.
 //! Attention mask for tree structure. Shape depends on treeMaskMode.
 //! \param positions output buffer [batchSize * numDraftTokens], on GPU. int32.
@@ -56,10 +54,10 @@ enum class TreeMaskMode : int32_t
 //! \param numDraftTokens runtime::SizeType32. Total number of draft tokens.
 //! \param treeMaskMode TreeMaskMode. Attention mask mode.
 //! \param stream cuda stream
-void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIndex,
-    runtime::SizeType32 const* verifiedSeqLen, void* treeMask, int32_t* positions, int32_t* retrieveIndex,
-    int32_t* retrieveNextToken, int32_t* retrieveNextSibling, runtime::SizeType32 batchSize, runtime::SizeType32 topK,
-    runtime::SizeType32 depth, runtime::SizeType32 numDraftTokens, TreeMaskMode treeMaskMode, cudaStream_t stream);
+void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIndex, void* treeMask, int32_t* positions,
+    int32_t* retrieveIndex, int32_t* retrieveNextToken, int32_t* retrieveNextSibling, runtime::SizeType32 batchSize,
+    runtime::SizeType32 topK, runtime::SizeType32 depth, runtime::SizeType32 numDraftTokens, TreeMaskMode treeMaskMode,
+    cudaStream_t stream);
 
 //! \brief Verify dynamic tree using greedy strategy
 //! Verifies draft tokens against target model predictions using tree traversal.

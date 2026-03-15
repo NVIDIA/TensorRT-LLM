@@ -57,9 +57,6 @@ class DynamicTreeOpsConverter:
         self.max_batch_size = max_batch_size
         self.device = device
 
-        # Pre-allocated buffer for build_dynamic_tree_op's verifiedSeqLen param
-        self._verified_seq_len_buf = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
-
         # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_op
         N = max_total_draft_tokens + 1  # tokens_per_gen_step (includes root)
         max_path_len = max_draft_len + 1
@@ -133,7 +130,6 @@ class DynamicTreeOpsConverter:
                 retrieve_index,
                 retrieve_next_token,
                 retrieve_next_sibling,
-                self._verified_seq_len_buf[:bs],
                 self.K,
                 self.depth,
                 num_draft_tokens,

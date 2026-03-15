@@ -28,7 +28,6 @@ namespace kernels::speculative_decoding
 
 //! \param parentList           [in]  layer-wise parent indices [bs, topK*(depth-1)+1]
 //! \param selectedIndex        [in]  resampled history buffer indices [bs, draftTokenNum-1]
-//! \param verifiedSeqLen       [in]  verified sequence length per batch [bs]
 //! \param treeMask             [out] attention mask (which nodes each node can see)
 //! \param positions            [out] position id per node [bs, draftTokenNum]
 //! \param retrieveIndex        [out] tree node -> local index mapping [bs, draftTokenNum]
@@ -37,10 +36,9 @@ namespace kernels::speculative_decoding
 //! \param topK                 top-K value per layer
 //! \param depth                max tree depth (number of draft layers)
 //! \param draftTokenNum        total tree nodes per batch (including root)
-__global__ void buildDynamicTreeKernel(int64_t const* parentList, int64_t const* selectedIndex,
-    SizeType32 const* verifiedSeqLen, int32_t* treeMask, int32_t* positions, int32_t* retrieveIndex,
-    int32_t* retrieveNextToken, int32_t* retrieveNextSibling, SizeType32 topK, SizeType32 depth,
-    SizeType32 draftTokenNum)
+__global__ void buildDynamicTreeKernel(int64_t const* parentList, int64_t const* selectedIndex, int32_t* treeMask,
+    int32_t* positions, int32_t* retrieveIndex, int32_t* retrieveNextToken, int32_t* retrieveNextSibling,
+    SizeType32 topK, SizeType32 depth, SizeType32 draftTokenNum)
 {
     int32_t bid = blockIdx.x;
     int32_t tid = threadIdx.x;
@@ -51,7 +49,6 @@ __global__ void buildDynamicTreeKernel(int64_t const* parentList, int64_t const*
     }
 
     // treeMask layout: [batchSize, draftTokenNum, draftTokenNum] (QLEN_ONLY mode)
-    int32_t seqLen = verifiedSeqLen[bid];
     int32_t tokenTreeIdx = draftTokenNum * draftTokenNum * bid + draftTokenNum * tid + 1;
 
     treeMask[tokenTreeIdx - 1] = 1; // self-attention diagonal
@@ -64,7 +61,7 @@ __global__ void buildDynamicTreeKernel(int64_t const* parentList, int64_t const*
 
     if (tid == 0)
     {
-        positions[bid * draftTokenNum] = seqLen;
+        positions[bid * draftTokenNum] = 0;
 
         // Reverse iteration: inserting at list head produces forward sibling order
         for (int32_t i = draftTokenNum - 1; i > 0; --i)
@@ -136,16 +133,15 @@ __global__ void buildDynamicTreeKernel(int64_t const* parentList, int64_t const*
                 break;
             }
         }
-        positions[bid * draftTokenNum + tid] = position + seqLen;
+        positions[bid * draftTokenNum + tid] = position;
     }
 }
 
 //! Bit-packed variant of buildDynamicTreeKernel.
 //! \param numInt32PerRow  number of int32s per treeMask row = ceil(draftTokenNum / 32)
-__global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t const* selectedIndex,
-    SizeType32 const* verifiedSeqLen, int32_t* treeMask, int32_t* positions, int32_t* retrieveIndex,
-    int32_t* retrieveNextToken, int32_t* retrieveNextSibling, SizeType32 topK, SizeType32 depth,
-    SizeType32 draftTokenNum, SizeType32 numInt32PerRow)
+__global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t const* selectedIndex, int32_t* treeMask,
+    int32_t* positions, int32_t* retrieveIndex, int32_t* retrieveNextToken, int32_t* retrieveNextSibling,
+    SizeType32 topK, SizeType32 depth, SizeType32 draftTokenNum, SizeType32 numInt32PerRow)
 {
     int32_t bid = blockIdx.x;
     int32_t tid = threadIdx.x;
@@ -155,7 +151,6 @@ __global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t 
         return;
     }
 
-    int32_t seqLen = verifiedSeqLen[bid];
     int32_t rowBaseIdx = (bid * draftTokenNum + tid) * numInt32PerRow;
 
     treeMask[rowBaseIdx] = 1; // bit 0 = root, always visible
@@ -164,7 +159,7 @@ __global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t 
 
     if (tid == 0)
     {
-        positions[bid * draftTokenNum] = seqLen;
+        positions[bid * draftTokenNum] = 0;
 
         for (int32_t i = draftTokenNum - 1; i > 0; --i)
         {
@@ -240,14 +235,13 @@ __global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t 
                 break;
             }
         }
-        positions[bid * draftTokenNum + tid] = position + seqLen;
+        positions[bid * draftTokenNum + tid] = position;
     }
 }
 
-void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIndex, SizeType32 const* verifiedSeqLen,
-    void* treeMask, int32_t* positions, int32_t* retrieveIndex, int32_t* retrieveNextToken,
-    int32_t* retrieveNextSibling, SizeType32 batchSize, SizeType32 topK, SizeType32 depth, SizeType32 numDraftTokens,
-    TreeMaskMode treeMaskMode, cudaStream_t stream)
+void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIndex, void* treeMask, int32_t* positions,
+    int32_t* retrieveIndex, int32_t* retrieveNextToken, int32_t* retrieveNextSibling, SizeType32 batchSize,
+    SizeType32 topK, SizeType32 depth, SizeType32 numDraftTokens, TreeMaskMode treeMaskMode, cudaStream_t stream)
 {
     dim3 grid(batchSize);
     dim3 block(numDraftTokens);
@@ -256,15 +250,14 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
     {
         SizeType32 numInt32PerRow = (numDraftTokens + 31) / 32;
 
-        buildDynamicTreeKernelPacked<<<grid, block, 0, stream>>>(parentList, selectedIndex, verifiedSeqLen,
+        buildDynamicTreeKernelPacked<<<grid, block, 0, stream>>>(parentList, selectedIndex,
             static_cast<int32_t*>(treeMask), positions, retrieveIndex, retrieveNextToken, retrieveNextSibling, topK,
             depth, numDraftTokens, numInt32PerRow);
     }
     else
     {
-        buildDynamicTreeKernel<<<grid, block, 0, stream>>>(parentList, selectedIndex, verifiedSeqLen,
-            static_cast<int32_t*>(treeMask), positions, retrieveIndex, retrieveNextToken, retrieveNextSibling, topK,
-            depth, numDraftTokens);
+        buildDynamicTreeKernel<<<grid, block, 0, stream>>>(parentList, selectedIndex, static_cast<int32_t*>(treeMask),
+            positions, retrieveIndex, retrieveNextToken, retrieveNextSibling, topK, depth, numDraftTokens);
     }
 
     sync_check_cuda_error(stream);
