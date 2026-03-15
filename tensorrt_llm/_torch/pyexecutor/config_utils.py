@@ -249,8 +249,11 @@ def load_pretrained_config(model_name_or_path: str,
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
-    elif model_type == "qwen3_5_moe" or (architectures and architectures[0]
-                                         == "Qwen3_5MoeForCausalLM"):
+    elif model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or (
+            architectures and architectures[0] in (
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5MoeForConditionalGeneration",
+            )):
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
     elif checkpoint_format in ("mistral", "mistral_large_3"):
