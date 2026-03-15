@@ -10,7 +10,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -43,7 +43,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -77,7 +77,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -114,7 +114,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -147,7 +147,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -180,7 +180,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -217,7 +217,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -251,7 +251,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.7
+    free_gpu_memory_fraction: 0.5
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -289,7 +289,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.7
+    free_gpu_memory_fraction: 0.5
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -326,7 +326,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -358,7 +358,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -392,7 +392,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -425,7 +425,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -458,7 +458,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -492,7 +492,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -529,7 +529,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -565,7 +565,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -598,7 +598,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -630,7 +630,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -668,7 +668,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -706,7 +706,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -746,7 +746,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -780,7 +780,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -814,7 +814,7 @@ server_configs:
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -850,7 +850,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -884,7 +884,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -918,7 +918,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -952,7 +952,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -986,7 +986,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1020,7 +1020,7 @@ server_configs:
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1056,7 +1056,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1090,7 +1090,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1124,7 +1124,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1157,7 +1157,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1191,7 +1191,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1225,7 +1225,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1259,7 +1259,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1293,7 +1293,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1327,7 +1327,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1360,7 +1360,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1393,7 +1393,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1428,7 +1428,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -1465,7 +1465,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
