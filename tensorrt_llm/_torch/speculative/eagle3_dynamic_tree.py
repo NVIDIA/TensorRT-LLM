@@ -110,9 +110,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self.draft_tokens_buffer = torch.zeros(
             max_batch_size, max_total_draft_tokens, dtype=torch.int64, device="cuda"
         )
-        tokens_per_gen_step = self.tokens_per_gen_step
         self.position_ids_buffer = torch.zeros(
-            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+            max_batch_size, self.tokens_per_gen_step, dtype=torch.int64, device="cuda"
         )
         self.history_draft_tokens_buffer = torch.zeros(
             (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int64, device="cuda"
@@ -124,7 +123,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             (max_batch_size, K * (max_draft_len - 1) + 1), dtype=torch.int64, device="cuda"
         )
         self.tree_mask_buffer = torch.zeros(
-            (max_batch_size * tokens_per_gen_step * tokens_per_gen_step),
+            (max_batch_size * self.tokens_per_gen_step * self.tokens_per_gen_step),
             dtype=torch.int32,
             device="cuda",
         )
@@ -178,18 +177,24 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._parent_init_arange = torch.arange(-1, K, device="cuda", dtype=torch.int32)
 
         # Pre-allocated buffers for _sample_and_accept_dynamic_tree
-        N = tokens_per_gen_step  # includes root
         max_path_len = max_draft_len + 1
+        tokens_per_gen_step = self.tokens_per_gen_step
         self._accepted_tokens_buf = torch.zeros(
             max_batch_size, max_path_len, dtype=torch.int32, device="cuda"
         )
         self._num_accepted_tokens_buf = torch.ones(max_batch_size, dtype=torch.int32, device="cuda")
-        self._target_tokens_buf = torch.zeros(max_batch_size * N, dtype=torch.int64, device="cuda")
-        self._candidates_buf = torch.zeros(max_batch_size, N, dtype=torch.int64, device="cuda")
-        self._target_predict_buf = torch.zeros(max_batch_size, N, dtype=torch.int64, device="cuda")
+        self._target_tokens_buf = torch.zeros(
+            max_batch_size * tokens_per_gen_step, dtype=torch.int64, device="cuda"
+        )
+        self._candidates_buf = torch.zeros(
+            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+        )
+        self._target_predict_buf = torch.zeros(
+            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+        )
 
         # Pre-allocated buffers for prepare_1st_drafter_inputs torch.cat replacements
-        max_total_tokens = max_batch_size * N  # conservative upper bound
+        max_total_tokens = max_batch_size * tokens_per_gen_step
         self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int64, device="cuda")
         self._step0_position_ids_buf = torch.zeros(
             max_total_tokens, dtype=torch.int64, device="cuda"
@@ -748,7 +753,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         spec_tree_manager: "SpecTreeManager",
     ):
         """Update draft tokens and scores, write contiguously to buffer."""
-        return_draft_scores = None
         batch_size = attn_metadata.num_seqs
         if cur_draft_idx == 0:
             new_draft_scores = new_draft_scores.reshape(batch_size, self.K)
@@ -767,7 +771,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 cur_draft_idx, attn_metadata, spec_tree_manager, None
             )
 
-            return_draft_scores = new_draft_scores
+            return new_draft_scores
         else:
             new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K * self.K)
 
@@ -810,8 +814,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     :batch_size, next_layer_start:next_layer_end
                 ] = parents_relative_indices
 
-            return_draft_scores = topk_values
-        return return_draft_scores
+            return topk_values
 
     def resampling_final_draft_tokens(self, batch_size: int):
         """Reconstruct the tree based on history buffers."""

@@ -21,7 +21,6 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 namespace th = torch;
-namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels::speculative_decoding;
 
 TRTLLM_NAMESPACE_BEGIN

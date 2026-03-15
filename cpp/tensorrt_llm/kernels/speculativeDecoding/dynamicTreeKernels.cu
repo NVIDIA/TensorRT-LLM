@@ -17,7 +17,6 @@
 
 #include "dynamicTreeKernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
 

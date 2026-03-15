@@ -53,9 +53,6 @@ class DynamicTreeOpsConverter:
     ):
         self.K = dynamic_tree_max_topK
         self.depth = max_draft_len
-        self.max_total_draft_tokens = max_total_draft_tokens
-        self.max_batch_size = max_batch_size
-        self.device = device
 
         # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_op
         N = max_total_draft_tokens + 1  # tokens_per_gen_step (includes root)
@@ -110,21 +107,13 @@ class DynamicTreeOpsConverter:
         bs = topk_score_indices.shape[0]
         # +1 because num_draft_tokens includes root node in SGLang's convention
         num_draft_tokens = topk_score_indices.shape[1] + 1
-
-        parent_list = history_draft_tokens_parent_buffer[:bs]
-        selected_index = topk_score_indices
-
-        # Determine tree mask mode
-        if use_packed_mask:
-            tree_mask_mode = 2  # QLEN_ONLY_BITPACKING
-        else:
-            tree_mask_mode = 1  # QLEN_ONLY
+        tree_mask_mode = 2 if use_packed_mask else 1  # QLEN_ONLY_BITPACKING / QLEN_ONLY
 
         # Call CUDA kernel in-place
         try:
             torch.ops.trtllm.build_dynamic_tree_op(
-                parent_list,
-                selected_index,
+                history_draft_tokens_parent_buffer[:bs],
+                topk_score_indices,
                 tree_mask,
                 positions,
                 retrieve_index,
