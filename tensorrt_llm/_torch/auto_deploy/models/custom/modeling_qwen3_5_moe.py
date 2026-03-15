@@ -1941,7 +1941,6 @@ class Qwen3_5MoeModel(nn.Module):
 
         for key in (
             "input_pos",
-            "seq_len",
             "mm_chunk_flat_start",
             "mm_chunk_count",
             "mm_item_cu_seqlen",
