@@ -768,9 +768,7 @@ def test_fuse_nvfp4_moe_end_to_end_same_alpha(dtype):
     count = _stack_nvfp4_moe_weights(gm)
     assert count == 1
 
-    assert any(
-        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused) for n in gm.graph.nodes
-    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused) for n in gm.graph.nodes)
 
     with torch.inference_mode():
         fused_output = gm(x, selected_experts, final_scales)
