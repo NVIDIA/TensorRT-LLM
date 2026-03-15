@@ -337,13 +337,9 @@ def should_skip_trtllm(
     # DeepEP mode. the crash is specific to EP with DeepEP.
     # Verified on 4 GPUs with DEP + DEEPEP + TRTLLM (e60_k4_h2048_i1408):
     #   - FP8_BLOCK_SCALES:  CRASH   (fp8_block_scale_moe_runner -> CUDA_ERROR_INVALID_HANDLE)
-    #   - W4A16_MXFP4:       CRASH   (bf16_mxe2m1_block_scale_moe_runner -> illegal memory access)
-    #   - W4A8_MXFP4_MXFP8:  likely crash (same mxe2m1 kernel family as W4A16_MXFP4)
     if comm_method in ("DEEPEP", "DEEPEPLOWLATENCY"):
         deepep_crash_quant_algos = {
             QuantAlgo.FP8_BLOCK_SCALES,
-            QuantAlgo.W4A16_MXFP4,
-            QuantAlgo.W4A8_MXFP4_MXFP8,
         }
         if quant_algo in deepep_crash_quant_algos:
             return (
