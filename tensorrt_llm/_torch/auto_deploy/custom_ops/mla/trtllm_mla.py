@@ -80,21 +80,6 @@ from ..attention_interface import (
 # =============================================================================
 
 
-def _mla_padded_num_heads(num_heads: int, num_kv_heads: int) -> int:
-    """Return padded num_heads so that the Q/KV ratio is a power of 2.
-
-    The trtllm-gen FMHA MLA decode kernel on SM100 (Blackwell) requires that
-    ``num_heads // num_kv_heads`` is a power of two.  If it already is, this
-    returns ``num_heads`` unchanged.  Otherwise it rounds the ratio up to the
-    next power of two and returns ``rounded_ratio * num_kv_heads``.
-    """
-    ratio = num_heads // num_kv_heads
-    if ratio > 0 and (ratio & (ratio - 1)) == 0:
-        return num_heads
-    padded_ratio = 1 << (ratio - 1).bit_length()
-    return padded_ratio * num_kv_heads
-
-
 # =============================================================================
 # Module-level planner
 # =============================================================================
@@ -139,7 +124,6 @@ class _TrtllmMLAPlanner:
         self.fmha_scheduler_counter_decode: Optional[torch.Tensor] = None
         self.output_latent: Optional[torch.Tensor] = None
         self.fused_q_flat: Optional[torch.Tensor] = None
-        self.q_pe_padded_buf: Optional[torch.Tensor] = None
         self.latent_cache_buf: Optional[torch.Tensor] = None
         self._cu_kv_decode_host: Optional[torch.Tensor] = None
         self._decode_buf_max_tokens: int = 0
@@ -147,7 +131,6 @@ class _TrtllmMLAPlanner:
         self._decode_buf_kv_lora_rank: int = 0
         self._decode_buf_rope_dim: int = 0
         self._decode_buf_dtype: Optional[torch.dtype] = None
-        self._decode_padded_num_heads: int = 0
 
         # Pre-computed cache write indices (host→GPU, computed in plan())
         self.decode_page_idx: Optional[torch.Tensor] = None
@@ -237,12 +220,7 @@ class _TrtllmMLAPlanner:
         v_head_dim: int,
         dtype: torch.dtype,
     ) -> None:
-        """Allocate or grow decode-path scratch buffers (once, then reused).
-
-        On SM100+ the FMHA MLA decode kernel requires a power-of-2 Q/KV head
-        ratio.  Buffers are sized for the *padded* head count so that padding
-        inside ``_handle_decode`` is a zero-copy view.
-        """
+        """Allocate or grow decode-path scratch buffers (once, then reused)."""
         need_alloc = (
             self.cu_q_decode is None
             or max_tokens > self._decode_buf_max_tokens
@@ -254,31 +232,22 @@ class _TrtllmMLAPlanner:
         if not need_alloc:
             return
 
-        sm = get_sm_version()
-        padded = _mla_padded_num_heads(num_heads, num_kv_heads) if sm >= 100 else num_heads
-
         self._decode_buf_max_tokens = max_tokens
         self._decode_buf_num_heads = num_heads
         self._decode_buf_kv_lora_rank = kv_lora_rank
         self._decode_buf_rope_dim = qk_rope_head_dim
         self._decode_buf_dtype = dtype
-        self._decode_padded_num_heads = padded
         gen_head_size = kv_lora_rank + qk_rope_head_dim
 
-        self.cu_q_decode = torch.arange(max_tokens + 1, dtype=torch.int32, device=device) * padded
-        self.output_latent = torch.empty(
-            max_tokens, padded * kv_lora_rank, dtype=dtype, device=device
+        self.cu_q_decode = (
+            torch.arange(max_tokens + 1, dtype=torch.int32, device=device) * num_heads
         )
-        # Pre-zero when head padding is active so the padding region stays zero
-        # across steps without per-layer zero_() calls.
-        alloc_fn = torch.zeros if padded != num_heads else torch.empty
-        self.fused_q_flat = alloc_fn(max_tokens, padded * gen_head_size, dtype=dtype, device=device)
-        if padded != num_heads:
-            self.q_pe_padded_buf = torch.zeros(
-                max_tokens, padded, qk_rope_head_dim, dtype=dtype, device=device
-            )
-        else:
-            self.q_pe_padded_buf = None
+        self.output_latent = torch.empty(
+            max_tokens, num_heads * kv_lora_rank, dtype=dtype, device=device
+        )
+        self.fused_q_flat = torch.empty(
+            max_tokens, num_heads * gen_head_size, dtype=dtype, device=device
+        )
         self.latent_cache_buf = torch.empty(max_tokens, gen_head_size, dtype=dtype, device=device)
         self.v_proj_output = torch.empty(
             max_tokens, num_heads, v_head_dim, dtype=dtype, device=device
@@ -1187,8 +1156,6 @@ def _handle_fused_rope_decode(
     """
     planner = _GlobalTrtllmMLAPlanner
     gen_head_size = kv_lora_rank + qk_rope_head_dim
-    padded_num_heads = planner._decode_padded_num_heads
-    needs_head_padding = padded_num_heads != num_heads
 
     w_kn, w_v_t = planner.get_weight_matrices(
         kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
@@ -1196,14 +1163,10 @@ def _handle_fused_rope_decode(
 
     # Build fused_q — Q absorption via bmm_out into the left slice.
     fused_q_flat = planner.fused_q_flat[:num_tokens]
-    fused_q_view = fused_q_flat.view(
-        num_tokens,
-        padded_num_heads if needs_head_padding else num_heads,
-        gen_head_size,
-    )
+    fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
 
     q_nope_t = q_nope_flat.transpose(0, 1)
-    q_absorbed_target = fused_q_view[:, :num_heads, :kv_lora_rank].transpose(0, 1)
+    q_absorbed_target = fused_q_view[:, :, :kv_lora_rank].transpose(0, 1)
     torch.ops.trtllm.bmm_out(q_nope_t, w_kn, q_absorbed_target)
 
     # mla_rope_generation fills the right slice of fused_q with RoPE'd q_pe,
@@ -1212,19 +1175,9 @@ def _handle_fused_rope_decode(
     cu_q = planner.cu_q_decode[: num_tokens + 1]
     cu_kv = planner.cu_kv_decode[: num_tokens + 1]
 
-    # q_pe for mla_rope_generation: must have padded heads if needed.
-    if needs_head_padding:
-        q_pe_padded = planner.q_pe_padded_buf[:num_tokens]
-        q_pe_padded[:, :num_heads, :] = q_pe_flat
-        q_pe_for_kernel = q_pe_padded
-    else:
-        q_pe_for_kernel = q_pe_flat
-
-    fused_q_3d = fused_q_view
-
     torch.ops.trtllm.mla_rope_generation(
-        fused_q_3d,
-        q_pe_for_kernel,
+        fused_q_view,
+        q_pe_flat,
         latent_cache,
         rotary_cos_sin,
         cu_q,
@@ -1247,7 +1200,7 @@ def _handle_fused_rope_decode(
         [None, None],  # mla_tensor_params (helix)
         1,  # predicted_tokens_per_seq
         0,  # layer_idx
-        padded_num_heads,
+        num_heads,
         num_kv_heads,
         gen_head_size,
         tokens_per_block,
@@ -1271,10 +1224,10 @@ def _handle_fused_rope_decode(
         None,
         output_latent,
         latent_cache,
-        q_pe_for_kernel,
+        q_pe_flat,
         True,
         2,  # attention_input_type = generation_only
-        padded_num_heads,
+        num_heads,
         num_kv_heads,
         gen_head_size,
         tokens_per_block,
@@ -1301,9 +1254,7 @@ def _handle_fused_rope_decode(
     )
 
     # V projection
-    output_reshaped = output_latent.view(num_tokens, padded_num_heads, kv_lora_rank)
-    if needs_head_padding:
-        output_reshaped = output_reshaped[:, :num_heads, :].contiguous()
+    output_reshaped = output_latent.view(num_tokens, num_heads, kv_lora_rank)
     v_proj_out = planner.v_proj_output[:num_tokens]
     torch.ops.trtllm.bmm_out(
         output_reshaped.transpose(0, 1),
@@ -1350,16 +1301,9 @@ def _handle_decode(
     result directly into a pre-allocated ``fused_q`` slice (no intermediate
     tensor, no ``torch.cat``), and the V projection also uses ``bmm_out`` into
     a pre-allocated buffer.
-
-    On SM100+ the FMHA MLA decode kernel requires a power-of-2 Q/KV head ratio.
-    When ``num_heads / num_kv_heads`` is not a power of two (e.g. GLM-4.7-Flash
-    with 20 heads), the Q tensor is zero-padded to the next valid head count and
-    the attention output is sliced back before the V projection.
     """
     planner = _GlobalTrtllmMLAPlanner
     gen_head_size = kv_lora_rank + qk_rope_head_dim
-    padded_num_heads = planner._decode_padded_num_heads
-    needs_head_padding = padded_num_heads != num_heads
 
     w_kn, w_v_t = planner.get_weight_matrices(
         kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
@@ -1369,30 +1313,13 @@ def _handle_decode(
     # bmm_out writes q_absorbed directly into the left slice of fused_q,
     # then q_pe is copied into the right slice — no torch.cat needed.
     fused_q_flat = planner.fused_q_flat[:num_tokens]
-    fused_q_view = fused_q_flat.view(
-        num_tokens,
-        padded_num_heads if needs_head_padding else num_heads,
-        gen_head_size,
-    )
+    fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
 
-    # q_nope_flat: [T, H, D]  → transpose → [H, T, D]
-    # w_kn:        [H, D, K]
-    # target:      fused_q_view[:, :H, :K] transposed → [H, T, K]
     q_nope_t = q_nope_flat.transpose(0, 1)
-    q_absorbed_target = fused_q_view[:, :num_heads, :kv_lora_rank].transpose(0, 1)
+    q_absorbed_target = fused_q_view[:, :, :kv_lora_rank].transpose(0, 1)
     torch.ops.trtllm.bmm_out(q_nope_t, w_kn, q_absorbed_target)
 
-    # Copy q_pe into the rope portion of fused_q.
-    fused_q_view[:, :num_heads, kv_lora_rank:] = q_pe_flat
-
-    # q_pe is also passed separately to thop.attention for MLA generation;
-    # it must match the padded head count.  Padding buffer was pre-zeroed at
-    # allocation so only 1 copy kernel is needed (no per-step zero_()).
-    if needs_head_padding:
-        q_pe_padded = planner.q_pe_padded_buf[:num_tokens]
-        q_pe_padded[:, :num_heads, :] = q_pe_flat
-    else:
-        q_pe_padded = q_pe_flat
+    fused_q_view[:, :, kv_lora_rank:] = q_pe_flat
 
     output_latent = planner.output_latent[:num_tokens]
 
@@ -1407,10 +1334,10 @@ def _handle_decode(
         None,
         output_latent,
         latent_cache,
-        q_pe_padded,
+        q_pe_flat,
         True,
         2,  # attention_input_type = generation_only
-        padded_num_heads,
+        num_heads,
         num_kv_heads,
         head_size,
         tokens_per_block,
@@ -1438,12 +1365,7 @@ def _handle_decode(
 
     # Project from latent space back to v_head_dim using bmm_out into
     # a pre-allocated buffer (matching the PT backend pattern).
-    # output_reshaped: [T, H, K] → transpose → [H, T, K]
-    # w_v_t:           [H, K, V]
-    # v_proj_out:      [T, H, V] → transpose → [H, T, V]
-    output_reshaped = output_latent.view(num_tokens, padded_num_heads, kv_lora_rank)
-    if needs_head_padding:
-        output_reshaped = output_reshaped[:, :num_heads, :].contiguous()
+    output_reshaped = output_latent.view(num_tokens, num_heads, kv_lora_rank)
     v_proj_out = planner.v_proj_output[:num_tokens]
     torch.ops.trtllm.bmm_out(
         output_reshaped.transpose(0, 1),
