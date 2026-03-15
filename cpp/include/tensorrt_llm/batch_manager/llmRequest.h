@@ -333,10 +333,14 @@ public:
 
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnGenerationLogits)
         {
+            // In streaming mode with beam search, intermediate logits are returned before finalization,
+            // so they cannot be reordered to match the final beam paths. Non-streaming mode handles
+            // reordering in postProcessRequest() after gatherTree finalization.
             TLLM_LOG_WARNING(
                 "Returning generation logits when streaming is enabled and beamWidth > 1 is not allowed. "
-                "This is because the logits may appear in irrelevant order when the beams are gathered, "
-                "since logits are not. Disabling returnGenerationLogits.");
+                "This is because intermediate logits cannot be reordered to match the final beam paths "
+                "until finalization. Use non-streaming mode for correct generation logits with beam search. "
+                "Disabling returnGenerationLogits.");
             mReturnGenerationLogits = false;
         }
 
