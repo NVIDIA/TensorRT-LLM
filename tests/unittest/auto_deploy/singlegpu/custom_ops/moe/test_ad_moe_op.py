@@ -329,38 +329,38 @@ def _prepare_nvfp4_moe_fused_args(
     scaling_vector_size = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
     w1_fp4_list, w2_fp4_list, w3_fp4_list = [], [], []
-    w1_is, w2_is, w3_is = [], [], []
-    w1_ws, w2_ws, w3_ws = [], [], []
-    w1_al, w2_al, w3_al = [], [], []
+    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
+    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+    w1_alpha, w2_alpha, w3_alpha = [], [], []
 
     for i in range(num_experts):
         inp_scale = fp4_global_scale(x)
-        wt_s2_w1 = fp4_global_scale(w1_weight[i])
-        wt_s2_w2 = fp4_global_scale(w2_weight[i])
-        wt_s2_w3 = fp4_global_scale(w3_weight[i])
+        wt_global_w1 = fp4_global_scale(w1_weight[i])
+        wt_global_w2 = fp4_global_scale(w2_weight[i])
+        wt_global_w3 = fp4_global_scale(w3_weight[i])
 
         w1_fp4, w1_sc = torch.ops.trtllm.fp4_quantize(
-            w1_weight[i], wt_s2_w1, scaling_vector_size, False
+            w1_weight[i], wt_global_w1, scaling_vector_size, False
         )
         w2_fp4, w2_sc = torch.ops.trtllm.fp4_quantize(
-            w2_weight[i], wt_s2_w2, scaling_vector_size, False
+            w2_weight[i], wt_global_w2, scaling_vector_size, False
         )
         w3_fp4, w3_sc = torch.ops.trtllm.fp4_quantize(
-            w3_weight[i], wt_s2_w3, scaling_vector_size, False
+            w3_weight[i], wt_global_w3, scaling_vector_size, False
         )
 
         w1_fp4_list.append(w1_fp4)
         w2_fp4_list.append(w2_fp4)
         w3_fp4_list.append(w3_fp4)
-        w1_is.append(inp_scale)
-        w2_is.append(inp_scale)
-        w3_is.append(inp_scale)
-        w1_ws.append(w1_sc)
-        w2_ws.append(w2_sc)
-        w3_ws.append(w3_sc)
-        w1_al.append(1 / (inp_scale * wt_s2_w1))
-        w2_al.append(1 / (inp_scale * wt_s2_w2))
-        w3_al.append(1 / (inp_scale * wt_s2_w3))
+        w1_input_scale.append(inp_scale)
+        w2_input_scale.append(inp_scale)
+        w3_input_scale.append(inp_scale)
+        w1_weight_scale.append(w1_sc)
+        w2_weight_scale.append(w2_sc)
+        w3_weight_scale.append(w3_sc)
+        w1_alpha.append(1 / (inp_scale * wt_global_w1))
+        w2_alpha.append(1 / (inp_scale * wt_global_w2))
+        w3_alpha.append(1 / (inp_scale * wt_global_w3))
 
     # Get reference output from the per-expert op (known correct)
     with torch.inference_mode():
@@ -371,15 +371,15 @@ def _prepare_nvfp4_moe_fused_args(
             w1_fp4_list,
             w2_fp4_list,
             w3_fp4_list,
-            w1_is,
-            w2_is,
-            w3_is,
-            w1_ws,
-            w2_ws,
-            w3_ws,
-            w1_al,
-            w2_al,
-            w3_al,
+            w1_input_scale,
+            w2_input_scale,
+            w3_input_scale,
+            w1_weight_scale,
+            w2_weight_scale,
+            w3_weight_scale,
+            w1_alpha,
+            w2_alpha,
+            w3_alpha,
         )
 
     # Prepare stacked tensors for the fused kernel (mimics _stack_nvfp4_moe_weights)
@@ -387,47 +387,47 @@ def _prepare_nvfp4_moe_fused_args(
     w2_stacked = torch.stack(w2_fp4_list, dim=0)
     w3_stacked = torch.stack(w3_fp4_list, dim=0)
 
-    w1_is_t = torch.stack(w1_is)
-    w2_is_t = torch.stack(w2_is)
+    w1_input_scale_t = torch.stack(w1_input_scale)
+    w2_input_scale_t = torch.stack(w2_input_scale)
 
-    w1_ws_t = torch.stack(w1_ws).view(torch.float8_e4m3fn)
-    w2_ws_t = torch.stack(w2_ws).view(torch.float8_e4m3fn)
-    w3_ws_t = torch.stack(w3_ws).view(torch.float8_e4m3fn)
+    w1_weight_scale_t = torch.stack(w1_weight_scale).view(torch.float8_e4m3fn)
+    w2_weight_scale_t = torch.stack(w2_weight_scale).view(torch.float8_e4m3fn)
+    w3_weight_scale_t = torch.stack(w3_weight_scale).view(torch.float8_e4m3fn)
 
-    w1_al_t = torch.stack(w1_al)
-    w2_al_t = torch.stack(w2_al)
-    w3_al_t = torch.stack(w3_al)
+    w1_alpha_t = torch.stack(w1_alpha)
+    w2_alpha_t = torch.stack(w2_alpha)
+    w3_alpha_t = torch.stack(w3_alpha)
 
     # Check if w1/w3 alphas differ and adjust w3 block scales if needed
-    alpha_ratio = w3_al_t / w1_al_t
+    alpha_ratio = w3_alpha_t / w1_alpha_t
     if not torch.allclose(alpha_ratio, torch.ones_like(alpha_ratio), rtol=1e-3, atol=1e-6):
         # Unswizzle -> adjust -> reswizzle (same as _adjust_w3_blockscales_for_alpha_diff)
-        w3_bs_uint8 = w3_ws_t.view(torch.uint8)
+        w3_bs_uint8 = w3_weight_scale_t.view(torch.uint8)
         w3_bs_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(w3_bs_uint8)
         w3_bs_float = w3_bs_unswizzled.view(torch.float8_e4m3fn).float()
         w3_bs_float = w3_bs_float * alpha_ratio.view(-1, *([1] * (w3_bs_float.ndim - 1)))
         w3_bs_fp8 = w3_bs_float.to(torch.float8_e4m3fn)
-        w3_ws_t = (
+        w3_weight_scale_t = (
             torch.ops.trtllm.block_scale_interleave(w3_bs_fp8.view(torch.uint8))
             .view(torch.float8_e4m3fn)
-            .reshape(w3_ws_t.shape)
+            .reshape(w3_weight_scale_t.shape)
         )
 
     # Concatenate for gated MLP: FC1 = [w3, w1]
     fc1_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
-    fc1_blockscale = torch.cat([w3_ws_t, w1_ws_t], dim=1).contiguous()
+    fc1_blockscale = torch.cat([w3_weight_scale_t, w1_weight_scale_t], dim=1).contiguous()
 
     # FC1 uses a single input scale (all experts share input)
-    fc1_act_scale = w1_is_t[0]
+    fc1_act_scale = w1_input_scale_t[0]
 
     # FC1 alpha: use w1's alpha (w3 block scales already compensated)
-    fc1_alpha = w1_al_t
+    fc1_alpha_stacked = w1_alpha_t
 
     # FC2
     fc2_weights = w2_stacked
-    fc2_act_scale = w2_is_t
-    fc2_alpha = w2_al_t
-    fc2_blockscale = w2_ws_t
+    fc2_act_scale = w2_input_scale_t
+    fc2_alpha_stacked = w2_alpha_t
+    fc2_blockscale = w2_weight_scale_t
 
     return (
         fc1_weights,
@@ -436,8 +436,8 @@ def _prepare_nvfp4_moe_fused_args(
         fc2_blockscale,
         fc1_act_scale,
         fc2_act_scale,
-        fc1_alpha,
-        fc2_alpha,
+        fc1_alpha_stacked,
+        fc2_alpha_stacked,
         ref_output,
     )
 
@@ -479,8 +479,8 @@ def test_fp4_fused_moe_with_different_weight_scales(dtype):
         fc2_blockscale,
         fc1_act_scale,
         fc2_act_scale,
-        fc1_alpha,
-        fc2_alpha,
+        fc1_alpha_stacked,
+        fc2_alpha_stacked,
         ref_output,
     ) = _prepare_nvfp4_moe_fused_args(
         x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
@@ -497,8 +497,8 @@ def test_fp4_fused_moe_with_different_weight_scales(dtype):
             fc2_blockscale,
             fc1_act_scale,
             fc2_act_scale,
-            fc1_alpha,
-            fc2_alpha,
+            fc1_alpha_stacked,
+            fc2_alpha_stacked,
         )
 
     torch.cuda.synchronize()
@@ -534,8 +534,8 @@ def test_fp4_fused_moe_with_same_weight_scales(dtype):
         fc2_blockscale,
         fc1_act_scale,
         fc2_act_scale,
-        fc1_alpha,
-        fc2_alpha,
+        fc1_alpha_stacked,
+        fc2_alpha_stacked,
         ref_output,
     ) = _prepare_nvfp4_moe_fused_args(
         x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
@@ -552,8 +552,8 @@ def test_fp4_fused_moe_with_same_weight_scales(dtype):
             fc2_blockscale,
             fc1_act_scale,
             fc2_act_scale,
-            fc1_alpha,
-            fc2_alpha,
+            fc1_alpha_stacked,
+            fc2_alpha_stacked,
         )
 
     torch.cuda.synchronize()
@@ -584,47 +584,47 @@ def _build_nvfp4_moe_graph_module(
     # Quantize per-expert weights
     root = torch.nn.Module()
     w1_fp4, w2_fp4, w3_fp4 = [], [], []
-    w1_is, w2_is, w3_is = [], [], []
-    w1_ws, w2_ws, w3_ws = [], [], []
-    w1_al, w2_al, w3_al = [], [], []
+    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
+    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+    w1_alpha, w2_alpha, w3_alpha = [], [], []
 
     for i in range(num_experts):
-        inp_s = fp4_global_scale(x)
-        s2_w1 = fp4_global_scale(w1_weight[i])
-        s2_w2 = fp4_global_scale(w2_weight[i])
-        s2_w3 = fp4_global_scale(w3_weight[i])
+        inp_scale = fp4_global_scale(x)
+        wt_global_w1 = fp4_global_scale(w1_weight[i])
+        wt_global_w2 = fp4_global_scale(w2_weight[i])
+        wt_global_w3 = fp4_global_scale(w3_weight[i])
 
-        fp4_1, sc_1 = torch.ops.trtllm.fp4_quantize(w1_weight[i], s2_w1, sv, False)
-        fp4_2, sc_2 = torch.ops.trtllm.fp4_quantize(w2_weight[i], s2_w2, sv, False)
-        fp4_3, sc_3 = torch.ops.trtllm.fp4_quantize(w3_weight[i], s2_w3, sv, False)
+        fp4_1, sc_1 = torch.ops.trtllm.fp4_quantize(w1_weight[i], wt_global_w1, sv, False)
+        fp4_2, sc_2 = torch.ops.trtllm.fp4_quantize(w2_weight[i], wt_global_w2, sv, False)
+        fp4_3, sc_3 = torch.ops.trtllm.fp4_quantize(w3_weight[i], wt_global_w3, sv, False)
 
         w1_fp4.append(fp4_1)
         w2_fp4.append(fp4_2)
         w3_fp4.append(fp4_3)
-        w1_is.append(inp_s)
-        w2_is.append(inp_s)
-        w3_is.append(inp_s)
-        w1_ws.append(sc_1)
-        w2_ws.append(sc_2)
-        w3_ws.append(sc_3)
-        w1_al.append(1 / (inp_s * s2_w1))
-        w2_al.append(1 / (inp_s * s2_w2))
-        w3_al.append(1 / (inp_s * s2_w3))
+        w1_input_scale.append(inp_scale)
+        w2_input_scale.append(inp_scale)
+        w3_input_scale.append(inp_scale)
+        w1_weight_scale.append(sc_1)
+        w2_weight_scale.append(sc_2)
+        w3_weight_scale.append(sc_3)
+        w1_alpha.append(1 / (inp_scale * wt_global_w1))
+        w2_alpha.append(1 / (inp_scale * wt_global_w2))
+        w3_alpha.append(1 / (inp_scale * wt_global_w3))
 
     # Register everything on root module
     for i in range(num_experts):
         root.register_parameter(f"w1_{i}", torch.nn.Parameter(w1_fp4[i], requires_grad=False))
         root.register_parameter(f"w2_{i}", torch.nn.Parameter(w2_fp4[i], requires_grad=False))
         root.register_parameter(f"w3_{i}", torch.nn.Parameter(w3_fp4[i], requires_grad=False))
-        root.register_buffer(f"w1_is_{i}", w1_is[i])
-        root.register_buffer(f"w2_is_{i}", w2_is[i])
-        root.register_buffer(f"w3_is_{i}", w3_is[i])
-        root.register_buffer(f"w1_ws_{i}", w1_ws[i])
-        root.register_buffer(f"w2_ws_{i}", w2_ws[i])
-        root.register_buffer(f"w3_ws_{i}", w3_ws[i])
-        root.register_buffer(f"w1_al_{i}", w1_al[i])
-        root.register_buffer(f"w2_al_{i}", w2_al[i])
-        root.register_buffer(f"w3_al_{i}", w3_al[i])
+        root.register_buffer(f"w1_input_scale_{i}", w1_input_scale[i])
+        root.register_buffer(f"w2_input_scale_{i}", w2_input_scale[i])
+        root.register_buffer(f"w3_input_scale_{i}", w3_input_scale[i])
+        root.register_buffer(f"w1_weight_scale_{i}", w1_weight_scale[i])
+        root.register_buffer(f"w2_weight_scale_{i}", w2_weight_scale[i])
+        root.register_buffer(f"w3_weight_scale_{i}", w3_weight_scale[i])
+        root.register_buffer(f"w1_alpha_{i}", w1_alpha[i])
+        root.register_buffer(f"w2_alpha_{i}", w2_alpha[i])
+        root.register_buffer(f"w3_alpha_{i}", w3_alpha[i])
 
     # Build FX graph with the same node layout as quantize_nvfp4_moe produces
     graph = fx.Graph()
@@ -644,15 +644,15 @@ def _build_nvfp4_moe_graph_module(
             _attrs("w1"),
             _attrs("w2"),
             _attrs("w3"),
-            _attrs("w1_is"),
-            _attrs("w2_is"),
-            _attrs("w3_is"),
-            _attrs("w1_ws"),
-            _attrs("w2_ws"),
-            _attrs("w3_ws"),
-            _attrs("w1_al"),
-            _attrs("w2_al"),
-            _attrs("w3_al"),
+            _attrs("w1_input_scale"),
+            _attrs("w2_input_scale"),
+            _attrs("w3_input_scale"),
+            _attrs("w1_weight_scale"),
+            _attrs("w2_weight_scale"),
+            _attrs("w3_weight_scale"),
+            _attrs("w1_alpha"),
+            _attrs("w2_alpha"),
+            _attrs("w3_alpha"),
         ),
         kwargs={"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)},
     )
