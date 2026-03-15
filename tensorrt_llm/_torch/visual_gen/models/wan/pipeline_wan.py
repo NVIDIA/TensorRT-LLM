@@ -124,9 +124,28 @@ class WanPipeline(BasePipeline):
         return ["transformer"]
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes for the pipeline."""
-        return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
+    def default_warmup_resolutions(self):
+        return [(480, 832), (720, 1280)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [33, 81]
+
+    @property
+    def default_warmup_steps(self):
+        return 4 if self.is_wan22 else 2
+
+    @property
+    def resolution_multiple_of(self):
+        patch_size = (
+            self.transformer.config.patch_size
+            if self.transformer is not None
+            else self.transformer_2.config.patch_size
+        )
+        return (
+            self.vae_scale_factor_spatial * patch_size[1],
+            self.vae_scale_factor_spatial * patch_size[2],
+        )
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
@@ -268,31 +287,19 @@ class WanPipeline(BasePipeline):
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init.
-
-        Runs warmup inference with common shapes for Wan models.
-        """
-
-        if self.is_wan22:
-            # Double warmup steps to also warmup the 2nd transformer
-            warmup_steps = warmup_steps * 2
-
-        for height, width, num_frames in self.common_warmup_shapes:
-            logger.info(f"Warmup: Wan {height}x{width}, {num_frames} frames {warmup_steps} steps")
-
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    negative_prompt="",
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=5.0,
-                    seed=0,
-                    max_sequence_length=512,  # should match DiffusionRequest.max_sequence_length
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                negative_prompt="",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                num_inference_steps=steps,
+                guidance_scale=5.0,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def infer(self, req):
         """Run inference with request parameters."""
@@ -328,6 +335,8 @@ class WanPipeline(BasePipeline):
     ):
         pipeline_start = time.time()
         generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        self.validate_resolution(height, width, num_frames)
 
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
         boundary_ratio = boundary_ratio if boundary_ratio is not None else self.boundary_ratio
