@@ -60,7 +60,7 @@ worker_config:
       max_batch_size: 128
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.9
+      free_gpu_memory_fraction: 0.7
       dtype: fp8
     moe_config:
       backend: CUTEDSL
@@ -82,7 +82,7 @@ worker_config:
     cuda_graph_config: null
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.6
+      free_gpu_memory_fraction: 0.5
       dtype: fp8
     moe_config:
       backend: CUTEDSL
