@@ -57,11 +57,6 @@ class Eagle3OneModelDynamicTreeSampler(MTPSampler):
             (seq_slots, max_draft_len), -1, dtype=torch.int32, device="cuda"
         )
 
-    @override
-    def _get_max_new_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """Dynamic tree accepted path depth = max_draft_len + 1."""
-        return args.max_draft_len + 1
-
     def sample_async(self, scheduled_requests, outputs, num_context_logits_prefix_sum):
         if "accepted_draft_tokens_indices" in outputs:
             requests = scheduled_requests.all_requests()
@@ -722,7 +717,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 accept_index[:num_gens, 1:max_path_len] - 1
             ).to(torch.int32)
 
-        num_accepted_tokens = self._apply_force_accepted_tokens(num_accepted_tokens, num_contexts)
+        num_accepted_tokens = self._apply_force_accepted_tokens(num_accepted_tokens, num_contexts, self.max_draft_len)
         self._last_num_accepted = num_accepted_tokens
 
         return accepted_tokens, num_accepted_tokens
