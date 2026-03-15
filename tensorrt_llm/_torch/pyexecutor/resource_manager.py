@@ -1951,7 +1951,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
-        new_capacity = kv_cache.capacity + 1 + get_draft_token_length(req)
+        draft_len = get_draft_token_length(req)
+        new_capacity = kv_cache.capacity + 1 + draft_len
+        # Ensure capacity covers kv_lens used by the attention kernel,
+        # which adds num_extra_kv_tokens (for one-model MTP).  After
+        # update_resources rewinds rejected draft tokens, capacity may
+        # drop below max_beam_num_tokens + num_extra_kv_tokens.
+        min_required = (req.max_beam_num_tokens + 1 + draft_len +
+                        self.num_extra_kv_tokens)
+        if new_capacity < min_required:
+            new_capacity = min_required
         return kv_cache.resize(new_capacity)
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
@@ -2031,10 +2040,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        # Target: enough capacity to hold all tokens up to the end of
-        # this chunk. Using max() ensures we never shrink below current
-        # capacity (which may include a partial reused block).
-        target = req.context_current_position + num_tokens
+        target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
 
         # Align to block boundary
