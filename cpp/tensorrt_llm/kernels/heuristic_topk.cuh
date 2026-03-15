@@ -64,8 +64,8 @@ struct KernelSmem
     alignas(16) float keys[MAX_CANDIDATES]; // 12 KB
     alignas(16) int vals[MAX_CANDIDATES];   // 12 KB
 
-    int warp_counts[NUM_WARPS]; // 64 B
-    int histogram[NUM_BINS];    // 1 KB
+    int warp_counts[NUM_WARPS];             // 64 B
+    int histogram[NUM_BINS];                // 1 KB
 
     float threshold;
     int cand_count;
@@ -246,7 +246,7 @@ __device__ __forceinline__ void blockFusedSnapIter(KernelSmem* smem, int count, 
 
 __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, int const N,
     int const* __restrict__ preIdx, int const M, int const topK, float* __restrict__ outputValues,
-    int* __restrict__ outputIndices, KernelSmem* smem)
+    int* __restrict__ outputIndices, KernelSmem* smem, int const preIdxOffset = 0)
 {
     int const tid = threadIdx.x;
     int const warp_id = tid / WARP_SIZE;
@@ -263,7 +263,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
     int local_cnt = 0;
     for (int i = tid; i < M; i += BLOCK_SIZE)
     {
-        int idx = __ldg(&preIdx[i]);
+        int idx = __ldg(&preIdx[i]) + preIdxOffset;
         if (idx >= 0 && idx < N)
         {
             float v = __ldg(&input[idx]);
@@ -697,7 +697,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 
     heuristicTopKJob(input, N, preIdx, M, topK, outputValues, outputIndices, smem);
 }
-
 
 // ============================================================================
 // Launch Wrapper
