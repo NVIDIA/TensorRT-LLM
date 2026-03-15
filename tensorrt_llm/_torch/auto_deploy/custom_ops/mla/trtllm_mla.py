@@ -57,7 +57,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
@@ -170,19 +170,23 @@ class _TrtllmMLAPlanner:
             return
 
         self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-        self.host_pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu", pin_memory=True)
-        self.host_total_kv_lens = torch.zeros(2, dtype=torch.int64, device="cpu", pin_memory=True)
+        self.host_pool_mapping = torch.zeros(
+            1, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.host_total_kv_lens = torch.zeros(
+            2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
         self.host_request_types = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.block_offsets = torch.zeros(
             1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
         )
         self.host_past_kv_lengths = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.host_context_lengths = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.block_ids_per_seq = torch.zeros(
             max_batch, max_blocks_per_seq, dtype=torch.int32, device=device
@@ -194,10 +198,10 @@ class _TrtllmMLAPlanner:
         self.decode_page_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
         self.decode_slot_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
         self._decode_page_idx_host = torch.zeros(
-            max_batch, dtype=torch.int64, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
         self._decode_slot_idx_host = torch.zeros(
-            max_batch, dtype=torch.int64, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
         self.decode_cache_page_ids = torch.zeros(max_batch, dtype=torch.int32, device=device)
         self.decode_flat_write_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
@@ -205,7 +209,7 @@ class _TrtllmMLAPlanner:
 
         self.cu_kv_decode = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
         self._cu_kv_decode_host = torch.zeros(
-            max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=True
+            max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.fmha_scheduler_counter_decode = torch.zeros(1, dtype=torch.uint32, device=device)
 
@@ -289,8 +293,6 @@ class _TrtllmMLAPlanner:
         seq_len_with_cache_host: torch.Tensor,
         cu_num_pages_host: torch.Tensor,
         cache_loc: torch.Tensor,
-        page_seq_indices: torch.Tensor,
-        page_in_seq: torch.Tensor,
         input_pos_host: torch.Tensor,
         seq_len_host: torch.Tensor,
     ) -> None:
@@ -306,14 +308,21 @@ class _TrtllmMLAPlanner:
 
         if self.host_pool_mapping.size(0) != block_offset_multiplier:
             self.host_pool_mapping = torch.zeros(
-                block_offset_multiplier, 2, dtype=torch.int32, device="cpu", pin_memory=True
+                block_offset_multiplier,
+                2,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=prefer_pinned(),
             )
 
         block_offsets = self.block_offsets
         total_pages = int(cu_num_pages_host[num_seq])
         base_offsets = cache_loc[:total_pages] * block_offset_multiplier
-        seq_idx = page_seq_indices[:total_pages]
-        pg_idx = page_in_seq[:total_pages]
+
+        pages_per_seq = cu_num_pages_host[1 : num_seq + 1] - cu_num_pages_host[:num_seq]
+        seq_idx = torch.repeat_interleave(torch.arange(num_seq, dtype=torch.int), pages_per_seq)
+        pg_idx = torch.cat([torch.arange(n, dtype=torch.int) for n in pages_per_seq.tolist()])
+
         block_offsets[0, seq_idx, 0, pg_idx] = base_offsets
         block_offsets[0, seq_idx, 1, pg_idx] = base_offsets
 
@@ -391,7 +400,7 @@ class _TrtllmMLAPlanner:
         t = self._per_layer_pool_ptrs.get(ptr)
         if t is not None:
             return t
-        t = torch.zeros(1, 2, dtype=torch.int64, device="cpu", pin_memory=True)
+        t = torch.zeros(1, 2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned())
         t[0, 0] = ptr
         self._per_layer_pool_ptrs[ptr] = t
         return t
@@ -411,8 +420,6 @@ def prepare_trtllm_mla_metadata_host(
     seq_len_with_cache_host: torch.Tensor,
     cu_num_pages_host: torch.Tensor,
     cache_loc: torch.Tensor,
-    page_seq_indices: torch.Tensor,
-    page_in_seq: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_host: torch.Tensor,
 ) -> None:
@@ -436,8 +443,6 @@ def prepare_trtllm_mla_metadata_host(
         seq_len_with_cache_host=seq_len_with_cache_host,
         cu_num_pages_host=cu_num_pages_host,
         cache_loc=cache_loc,
-        page_seq_indices=page_seq_indices,
-        page_in_seq=page_in_seq,
         input_pos_host=input_pos_host,
         seq_len_host=seq_len_host,
     )
@@ -772,7 +777,7 @@ def _handle_prefill(
             t_end = token_offset + seq_len
 
             seq_host_total_kv_lens = torch.zeros(
-                2, dtype=torch.int64, device="cpu", pin_memory=True
+                2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
             )
             seq_host_total_kv_lens[0] = seq_kv_len
 
