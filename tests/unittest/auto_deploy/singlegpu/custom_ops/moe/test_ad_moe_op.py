@@ -315,8 +315,9 @@ def test_fp4_moe_op_run(dtype):
     torch.testing.assert_close(output_torch_fp4_moe, ref_output, rtol=rtol, atol=atol)
 
 
-def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, w2_weight,
-                                   w3_weight, num_experts):
+def _prepare_nvfp4_moe_fused_args(
+    x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
+):
     """Quantize per-expert weights and prepare stacked args for trtllm_quant_nvfp4_moe_fused.
 
     Returns the fused kernel arguments and the per-expert reference op output.
@@ -338,9 +339,15 @@ def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, 
         wt_s2_w2 = fp4_global_scale(w2_weight[i])
         wt_s2_w3 = fp4_global_scale(w3_weight[i])
 
-        w1_fp4, w1_sc = torch.ops.trtllm.fp4_quantize(w1_weight[i], wt_s2_w1, scaling_vector_size, False)
-        w2_fp4, w2_sc = torch.ops.trtllm.fp4_quantize(w2_weight[i], wt_s2_w2, scaling_vector_size, False)
-        w3_fp4, w3_sc = torch.ops.trtllm.fp4_quantize(w3_weight[i], wt_s2_w3, scaling_vector_size, False)
+        w1_fp4, w1_sc = torch.ops.trtllm.fp4_quantize(
+            w1_weight[i], wt_s2_w1, scaling_vector_size, False
+        )
+        w2_fp4, w2_sc = torch.ops.trtllm.fp4_quantize(
+            w2_weight[i], wt_s2_w2, scaling_vector_size, False
+        )
+        w3_fp4, w3_sc = torch.ops.trtllm.fp4_quantize(
+            w3_weight[i], wt_s2_w3, scaling_vector_size, False
+        )
 
         w1_fp4_list.append(w1_fp4)
         w2_fp4_list.append(w2_fp4)
@@ -358,11 +365,21 @@ def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, 
     # Get reference output from the per-expert op (known correct)
     with torch.inference_mode():
         ref_output = torch.ops.auto_deploy.torch_quant_nvfp4_moe(
-            x, selected_experts, final_scales,
-            w1_fp4_list, w2_fp4_list, w3_fp4_list,
-            w1_is, w2_is, w3_is,
-            w1_ws, w2_ws, w3_ws,
-            w1_al, w2_al, w3_al,
+            x,
+            selected_experts,
+            final_scales,
+            w1_fp4_list,
+            w2_fp4_list,
+            w3_fp4_list,
+            w1_is,
+            w2_is,
+            w3_is,
+            w1_ws,
+            w2_ws,
+            w3_ws,
+            w1_al,
+            w2_al,
+            w3_al,
         )
 
     # Prepare stacked tensors for the fused kernel (mimics _stack_nvfp4_moe_weights)
@@ -372,7 +389,6 @@ def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, 
 
     w1_is_t = torch.stack(w1_is)
     w2_is_t = torch.stack(w2_is)
-    w3_is_t = torch.stack(w3_is)
 
     w1_ws_t = torch.stack(w1_ws).view(torch.float8_e4m3fn)
     w2_ws_t = torch.stack(w2_ws).view(torch.float8_e4m3fn)
@@ -385,15 +401,17 @@ def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, 
     # Check if w1/w3 alphas differ and adjust w3 block scales if needed
     alpha_ratio = w3_al_t / w1_al_t
     if not torch.allclose(alpha_ratio, torch.ones_like(alpha_ratio), rtol=1e-3, atol=1e-6):
-        # Unswizzle → adjust → reswizzle (same as _adjust_w3_blockscales_for_alpha_diff)
+        # Unswizzle -> adjust -> reswizzle (same as _adjust_w3_blockscales_for_alpha_diff)
         w3_bs_uint8 = w3_ws_t.view(torch.uint8)
         w3_bs_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(w3_bs_uint8)
         w3_bs_float = w3_bs_unswizzled.view(torch.float8_e4m3fn).float()
         w3_bs_float = w3_bs_float * alpha_ratio.view(-1, *([1] * (w3_bs_float.ndim - 1)))
         w3_bs_fp8 = w3_bs_float.to(torch.float8_e4m3fn)
-        w3_ws_t = torch.ops.trtllm.block_scale_interleave(
-            w3_bs_fp8.view(torch.uint8)
-        ).view(torch.float8_e4m3fn).reshape(w3_ws_t.shape)
+        w3_ws_t = (
+            torch.ops.trtllm.block_scale_interleave(w3_bs_fp8.view(torch.uint8))
+            .view(torch.float8_e4m3fn)
+            .reshape(w3_ws_t.shape)
+        )
 
     # Concatenate for gated MLP: FC1 = [w3, w1]
     fc1_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
@@ -412,8 +430,14 @@ def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, 
     fc2_blockscale = w2_ws_t
 
     return (
-        fc1_weights, fc2_weights, fc1_blockscale, fc2_blockscale,
-        fc1_act_scale, fc2_act_scale, fc1_alpha, fc2_alpha,
+        fc1_weights,
+        fc2_weights,
+        fc1_blockscale,
+        fc2_blockscale,
+        fc1_act_scale,
+        fc2_act_scale,
+        fc1_alpha,
+        fc2_alpha,
         ref_output,
     )
 
@@ -424,8 +448,7 @@ def _prepare_nvfp4_moe_fused_args(x, selected_experts, final_scales, w1_weight, 
     reason="Requires fp4 and trtllm support",
 )
 def test_fp4_fused_moe_with_different_weight_scales(dtype):
-    """Test that the fused NVFP4 MoE kernel produces correct output when
-    w1 and w3 have different per-expert weight global scales (weight_scale_2).
+    """Test fused NVFP4 MoE kernel with different per-expert weight global scales.
 
     This is a regression test for the bug where _stack_nvfp4_moe_weights
     ignored w3_alpha, causing incorrect dequantization of the w3 (up-projection)
@@ -450,8 +473,14 @@ def test_fp4_fused_moe_with_different_weight_scales(dtype):
         w3_weight[i] = w3_weight[i] * (2.0 + i * 0.5)
 
     (
-        fc1_weights, fc2_weights, fc1_blockscale, fc2_blockscale,
-        fc1_act_scale, fc2_act_scale, fc1_alpha, fc2_alpha,
+        fc1_weights,
+        fc2_weights,
+        fc1_blockscale,
+        fc2_blockscale,
+        fc1_act_scale,
+        fc2_act_scale,
+        fc1_alpha,
+        fc2_alpha,
         ref_output,
     ) = _prepare_nvfp4_moe_fused_args(
         x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
@@ -484,9 +513,7 @@ def test_fp4_fused_moe_with_different_weight_scales(dtype):
     reason="Requires fp4 and trtllm support",
 )
 def test_fp4_fused_moe_with_same_weight_scales(dtype):
-    """Test that the fused NVFP4 MoE kernel produces correct output when
-    w1 and w3 have the same weight scales (common case, no adjustment needed).
-    """
+    """Test fused NVFP4 MoE kernel with same weight scales (no adjustment needed)."""
     num_experts = 3
     (
         x,
@@ -501,8 +528,14 @@ def test_fp4_fused_moe_with_same_weight_scales(dtype):
     ) = setup_moe_test(dtype, num_experts)
 
     (
-        fc1_weights, fc2_weights, fc1_blockscale, fc2_blockscale,
-        fc1_act_scale, fc2_act_scale, fc1_alpha, fc2_alpha,
+        fc1_weights,
+        fc2_weights,
+        fc1_blockscale,
+        fc2_blockscale,
+        fc1_act_scale,
+        fc2_act_scale,
+        fc1_alpha,
+        fc2_alpha,
         ref_output,
     ) = _prepare_nvfp4_moe_fused_args(
         x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
@@ -528,8 +561,9 @@ def test_fp4_fused_moe_with_same_weight_scales(dtype):
     torch.testing.assert_close(fused_output, ref_output, rtol=rtol, atol=atol)
 
 
-def _build_nvfp4_moe_graph_module(x, selected_experts, final_scales, w1_weight,
-                                   w2_weight, w3_weight, num_experts):
+def _build_nvfp4_moe_graph_module(
+    x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight, num_experts
+):
     """Build an FX GraphModule with a torch_quant_nvfp4_moe node and real quantized weights.
 
     This constructs the same graph structure that quantize_nvfp4_moe produces so
@@ -564,9 +598,15 @@ def _build_nvfp4_moe_graph_module(x, selected_experts, final_scales, w1_weight,
         fp4_2, sc_2 = torch.ops.trtllm.fp4_quantize(w2_weight[i], s2_w2, sv, False)
         fp4_3, sc_3 = torch.ops.trtllm.fp4_quantize(w3_weight[i], s2_w3, sv, False)
 
-        w1_fp4.append(fp4_1); w2_fp4.append(fp4_2); w3_fp4.append(fp4_3)
-        w1_is.append(inp_s); w2_is.append(inp_s); w3_is.append(inp_s)
-        w1_ws.append(sc_1); w2_ws.append(sc_2); w3_ws.append(sc_3)
+        w1_fp4.append(fp4_1)
+        w2_fp4.append(fp4_2)
+        w3_fp4.append(fp4_3)
+        w1_is.append(inp_s)
+        w2_is.append(inp_s)
+        w3_is.append(inp_s)
+        w1_ws.append(sc_1)
+        w2_ws.append(sc_2)
+        w3_ws.append(sc_3)
         w1_al.append(1 / (inp_s * s2_w1))
         w2_al.append(1 / (inp_s * s2_w2))
         w3_al.append(1 / (inp_s * s2_w3))
@@ -598,11 +638,21 @@ def _build_nvfp4_moe_graph_module(x, selected_experts, final_scales, w1_weight,
     moe_node = graph.call_function(
         torch.ops.auto_deploy.torch_quant_nvfp4_moe.default,
         args=(
-            x_n, se_n, rw_n,
-            _attrs("w1"), _attrs("w2"), _attrs("w3"),
-            _attrs("w1_is"), _attrs("w2_is"), _attrs("w3_is"),
-            _attrs("w1_ws"), _attrs("w2_ws"), _attrs("w3_ws"),
-            _attrs("w1_al"), _attrs("w2_al"), _attrs("w3_al"),
+            x_n,
+            se_n,
+            rw_n,
+            _attrs("w1"),
+            _attrs("w2"),
+            _attrs("w3"),
+            _attrs("w1_is"),
+            _attrs("w2_is"),
+            _attrs("w3_is"),
+            _attrs("w1_ws"),
+            _attrs("w2_ws"),
+            _attrs("w3_ws"),
+            _attrs("w1_al"),
+            _attrs("w2_al"),
+            _attrs("w3_al"),
         ),
         kwargs={"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)},
     )
@@ -629,16 +679,20 @@ def test_fuse_nvfp4_moe_end_to_end_different_w3_alpha(dtype):
     fusion pass (_stack_nvfp4_moe_weights), and executes the rewritten graph.
     This exercises the code path that extracts w3_alpha and adjusts block scales.
     """
-    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
-        _stack_nvfp4_moe_weights,
-    )
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_nvfp4_moe_weights
     from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
     num_experts = 3
     (
-        x, selected_experts, final_scales,
-        w1_weight, w2_weight, w3_weight,
-        weights, _, _,
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        _,
+        _,
     ) = setup_moe_test(dtype, num_experts)
 
     # Scale w3 per expert so w1_alpha != w3_alpha
@@ -646,15 +700,17 @@ def test_fuse_nvfp4_moe_end_to_end_different_w3_alpha(dtype):
         w3_weight[i] = w3_weight[i] * (2.0 + i * 0.5)
 
     gm, ref_output = _build_nvfp4_moe_graph_module(
-        x, selected_experts, final_scales,
-        w1_weight, w2_weight, w3_weight, num_experts,
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        num_experts,
     )
 
     # Verify unfused op present before fusion
-    assert any(
-        is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe)
-        for n in gm.graph.nodes
-    )
+    assert any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe) for n in gm.graph.nodes)
 
     # Run the actual fusion pass
     count = _stack_nvfp4_moe_weights(gm)
@@ -662,13 +718,11 @@ def test_fuse_nvfp4_moe_end_to_end_different_w3_alpha(dtype):
 
     # Verify graph was rewritten
     assert any(
-        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused)
-        for n in gm.graph.nodes
+        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused) for n in gm.graph.nodes
     ), "Fused op not found after _stack_nvfp4_moe_weights"
-    assert not any(
-        is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe)
-        for n in gm.graph.nodes
-    ), "Unfused op still present after fusion"
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe) for n in gm.graph.nodes), (
+        "Unfused op still present after fusion"
+    )
 
     # Execute the fused graph
     with torch.inference_mode():
@@ -685,29 +739,37 @@ def test_fuse_nvfp4_moe_end_to_end_different_w3_alpha(dtype):
 )
 def test_fuse_nvfp4_moe_end_to_end_same_alpha(dtype):
     """End-to-end fusion test with identical w1/w3 alphas (common case, no adjustment)."""
-    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
-        _stack_nvfp4_moe_weights,
-    )
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_nvfp4_moe_weights
     from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
     num_experts = 3
     (
-        x, selected_experts, final_scales,
-        w1_weight, w2_weight, w3_weight,
-        weights, _, _,
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        _,
+        _,
     ) = setup_moe_test(dtype, num_experts)
 
     gm, ref_output = _build_nvfp4_moe_graph_module(
-        x, selected_experts, final_scales,
-        w1_weight, w2_weight, w3_weight, num_experts,
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        num_experts,
     )
 
     count = _stack_nvfp4_moe_weights(gm)
     assert count == 1
 
     assert any(
-        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused)
-        for n in gm.graph.nodes
+        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused) for n in gm.graph.nodes
     )
 
     with torch.inference_mode():

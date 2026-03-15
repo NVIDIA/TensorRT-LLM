@@ -2024,9 +2024,7 @@ def _stack_nvfp4_cutlass_moe_weights(
         else:
             return torch.empty(0, device=device, dtype=dtype)
 
-    def _adjust_w3_blockscales_for_alpha_diff(
-        w3_blockscale_fp8, w1_alpha, w3_alpha
-    ):
+    def _adjust_w3_blockscales_for_alpha_diff(w3_blockscale_fp8, w1_alpha, w3_alpha):
         """Adjust w3 block scales when w1 and w3 have different alpha (weight global scales).
 
         The CUTLASS fused MoE kernel uses a single fc1_alpha per expert for both
@@ -2065,9 +2063,7 @@ def _stack_nvfp4_cutlass_moe_weights(
         # Broadcast ratio [E] → [E, 1, 1] over block dimensions
         w3_bs_float = w3_bs_float * alpha_ratio.view(-1, *([1] * (w3_bs_float.ndim - 1)))
         w3_bs_fp8 = w3_bs_float.to(torch.float8_e4m3fn)
-        w3_bs_swizzled = torch.ops.trtllm.block_scale_interleave(
-            w3_bs_fp8.view(torch.uint8)
-        )
+        w3_bs_swizzled = torch.ops.trtllm.block_scale_interleave(w3_bs_fp8.view(torch.uint8))
         return w3_bs_swizzled.view(torch.float8_e4m3fn).reshape(original_shape)
 
     def _prepare_args_cutlass_format_nvfp4():
@@ -2121,9 +2117,7 @@ def _stack_nvfp4_cutlass_moe_weights(
                     effective_w3_alpha = w3_alpha_stacked
                 else:
                     # Recompute w3 alpha with the global input scale, same formula as w1
-                    effective_w3_alpha = (
-                        w3_alpha_stacked * w3_input_scale_stacked / fc1_act_scale
-                    )
+                    effective_w3_alpha = w3_alpha_stacked * w3_input_scale_stacked / fc1_act_scale
                 w3_weight_blockscale_fp8_stacked = _adjust_w3_blockscales_for_alpha_diff(
                     w3_weight_blockscale_fp8_stacked, fc1_alpha_stacked, effective_w3_alpha
                 )
