@@ -179,7 +179,7 @@ def test_fuse_trtllm_attention_quant_fp8_negative_no_contract_no_out_dtype(model
         None,
         {
             "fuse_trtllm_attn_quant_fp8": {
-                "stage": "pattern_matcher",
+                "stage": "post_load_fusion",
                 "enabled": True,
             },
         },
@@ -205,7 +205,7 @@ def test_fuse_trtllm_attention_quant_fp8_sets_input_scale_contract_only():
         None,
         {
             "fuse_trtllm_attn_quant_fp8": {
-                "stage": "pattern_matcher",
+                "stage": "post_load_fusion",
                 "enabled": True,
             },
         },
@@ -228,7 +228,7 @@ def test_insert_cached_attention_trtllm_materializes_out_scale_reciprocal():
         None,
         {
             "fuse_trtllm_attn_quant_fp8": {
-                "stage": "pattern_matcher",
+                "stage": "post_load_fusion",
                 "enabled": True,
             },
         },
