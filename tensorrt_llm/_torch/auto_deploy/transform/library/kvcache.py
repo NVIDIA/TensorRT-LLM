@@ -30,7 +30,6 @@ from ...custom_ops.attention_interface import (
     AttentionRegistry,
     Constant,
     PrepareMetadataCallable,
-    get_trtllm_attention_fp8_input_scale,
 )
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -205,18 +204,11 @@ class _InsertCachedOperator(BaseTransform):
                 cm.add_resource(k_indexed, resource_handler)
                 cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
 
+            # allow backend-specific prep before constants are extracted
+            attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
+
             # retrieve constants for attention_op
-            out_scale = None
-            if self.config.backend == "trtllm":
-                input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
-                if input_scale is not None:
-                    with gm.graph.inserting_before(attn_node):
-                        out_scale = gm.graph.call_function(
-                            torch.ops.aten.reciprocal.default, args=(input_scale,)
-                        )
             constants = attn_descriptor.get_constants(attn_node)
-            if self.config.backend == "trtllm":
-                constants[-1] = out_scale
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(

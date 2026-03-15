@@ -25,7 +25,7 @@ from typing import Tuple, Type
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.attention_interface import (
+from ...custom_ops.attention.trtllm_attention import (
     clear_trtllm_attention_fp8_input_scale,
     set_trtllm_attention_fp8_input_scale,
 )

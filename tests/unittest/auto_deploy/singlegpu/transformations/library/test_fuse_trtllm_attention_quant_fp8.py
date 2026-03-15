@@ -4,7 +4,7 @@ import torch.nn as nn
 from _torch_test_utils import fp8_compatible
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention import (
     get_trtllm_attention_fp8_input_scale,
 )
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm

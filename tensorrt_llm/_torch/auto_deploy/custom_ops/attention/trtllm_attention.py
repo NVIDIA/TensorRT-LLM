@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
-from torch.fx import Node
+from torch.fx import GraphModule, Node
 
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
@@ -207,6 +207,21 @@ class _TrtllmPlanner:
 
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
+_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
+_TRTLLM_ATTN_OUT_SCALE_KEY = "trtllm_attention_out_scale"
+
+
+def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
+    attn_node.meta[_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY] = input_scale
+
+
+def get_trtllm_attention_fp8_input_scale(attn_node: Node) -> Optional[Node]:
+    scale = attn_node.meta.get(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY)
+    return scale if isinstance(scale, Node) else None
+
+
+def clear_trtllm_attention_fp8_input_scale(attn_node: Node) -> None:
+    attn_node.meta.pop(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY, None)
 
 
 # =============================================================================
@@ -585,6 +600,24 @@ class TrtllmAttention(AttentionDescriptor):
         return prepare_trtllm_metadata_host
 
     @classmethod
+    def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
+        """Materialize optional out_scale node for FP8 output path if contract exists."""
+        input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
+        if input_scale is None:
+            attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
+            return
+
+        existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+        if isinstance(existing_out_scale, Node):
+            return
+
+        with gm.graph.inserting_before(attn_node):
+            out_scale = gm.graph.call_function(
+                torch.ops.aten.reciprocal.default, args=(input_scale,)
+            )
+        attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
+
+    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Extract constants from the source attention node.
 
@@ -625,8 +658,10 @@ class TrtllmAttention(AttentionDescriptor):
         # Get sliding_window from source attention node
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
-        # Optional out_scale is injected by cache-init stage when available.
-        out_scale = None
+        # Optional out_scale is injected by prepare_node_for_cache_insertion when available.
+        out_scale = source_attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+        if not isinstance(out_scale, Node):
+            out_scale = None
 
         return [
             scale,
