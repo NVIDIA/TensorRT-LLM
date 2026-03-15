@@ -492,8 +492,8 @@ void initConfigBindings(nb::module_& m)
             c.getEnableChunkedContext(), c.getNormalizeLogProbs(), c.getIterStatsMaxIterations(),
             c.getRequestStatsMaxIterations(), c.getBatchingType(), c.getMaxBatchSize(), c.getMaxNumTokens(),
             c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
-            c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getMaxQueueSize(),
-            c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
+            c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getAliasManagedWeightsFromGpu(),
+            c.getMaxQueueSize(), c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
             c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
             c.getPromptTableOffloading(), c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
@@ -509,7 +509,7 @@ void initConfigBindings(nb::module_& m)
         }
 
         auto cpp_states = nb::cast<nb::tuple>(state[0]);
-        if (cpp_states.size() != 29)
+        if (cpp_states.size() != 30)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -533,19 +533,20 @@ void initConfigBindings(nb::module_& m)
             nb::cast<std::optional<tle::DecodingConfig>>(cpp_states[13]),            // DecodingConfig
             nb::cast<bool>(cpp_states[14]),                                          // UseGpuDirectStorage
             nb::cast<float>(cpp_states[15]),                                         // GpuWeightsPercent
-            nb::cast<std::optional<SizeType32>>(cpp_states[16]),                     // MaxQueueSize
-            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[17]),            // ExtendedRuntimePerfKnobConfig
-            nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),               // DebugConfig
-            nb::cast<SizeType32>(cpp_states[19]),                                    // RecvPollPeriodMs
-            nb::cast<uint64_t>(cpp_states[20]),                                      // MaxSeqIdleMicroseconds
-            nb::cast<std::optional<tle::SpeculativeDecodingConfig>>(cpp_states[21]), // SpecDecConfig
-            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[22]),      // GuidedDecodingConfig
-            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[23]), // AdditionalModelOutputs
-            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),             // CacheTransceiverConfig
-            nb::cast<bool>(cpp_states[25]),                                                   // GatherGenerationLogits
-            nb::cast<bool>(cpp_states[26]),                                                   // PromptTableOffloading
-            nb::cast<bool>(cpp_states[27]),                                                   // EnableTrtOverlap
-            nb::cast<bool>(cpp_states[28]) // FailFastOnAttentionWindowTooLarge
+            nb::cast<bool>(cpp_states[16]),                                          // AliasManagedWeightsFromGpu
+            nb::cast<std::optional<SizeType32>>(cpp_states[17]),                     // MaxQueueSize
+            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[18]),            // ExtendedRuntimePerfKnobConfig
+            nb::cast<std::optional<tle::DebugConfig>>(cpp_states[19]),               // DebugConfig
+            nb::cast<SizeType32>(cpp_states[20]),                                    // RecvPollPeriodMs
+            nb::cast<uint64_t>(cpp_states[21]),                                      // MaxSeqIdleMicroseconds
+            nb::cast<std::optional<tle::SpeculativeDecodingConfig>>(cpp_states[22]), // SpecDecConfig
+            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[23]),      // GuidedDecodingConfig
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[24]), // AdditionalModelOutputs
+            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[25]),             // CacheTransceiverConfig
+            nb::cast<bool>(cpp_states[26]),                                                   // GatherGenerationLogits
+            nb::cast<bool>(cpp_states[27]),                                                   // PromptTableOffloading
+            nb::cast<bool>(cpp_states[28]),                                                   // EnableTrtOverlap
+            nb::cast<bool>(cpp_states[29]) // FailFastOnAttentionWindowTooLarge
         );
 
         // Restore Python data
@@ -573,6 +574,7 @@ void initConfigBindings(nb::module_& m)
                  std::optional<tle::DecodingConfig>,                     // DecodingConfig
                  bool,                                                   // UseGpuDirectStorage
                  float,                                                  // GpuWeightsPercent
+                 bool,                                                   // AliasManagedWeightsFromGpu
                  std::optional<SizeType32>,                              // MaxQueueSize
                  tle::ExtendedRuntimePerfKnobConfig const&,              // ExtendedRuntimePerfKnobConfig
                  std::optional<tle::DebugConfig>,                        // DebugConfig
@@ -596,7 +598,8 @@ void initConfigBindings(nb::module_& m)
             nb::arg("max_num_tokens") = nb::none(), nb::arg("parallel_config") = nb::none(),
             nb::arg("peft_cache_config") = tle::PeftCacheConfig(), nb::arg("logits_post_processor_config") = nb::none(),
             nb::arg("decoding_config") = nb::none(), nb::arg("use_gpu_direct_storage") = false,
-            nb::arg("gpu_weights_percent") = 1.0, nb::arg("max_queue_size") = nb::none(),
+            nb::arg("gpu_weights_percent") = 1.0, nb::arg("alias_managed_weights_from_gpu") = false,
+            nb::arg("max_queue_size") = nb::none(),
             nb::arg("extended_runtime_perf_knob_config") = tle::ExtendedRuntimePerfKnobConfig(),
             nb::arg("debug_config") = nb::none(), nb::arg("recv_poll_period_ms") = 0,
             nb::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
@@ -632,6 +635,8 @@ void initConfigBindings(nb::module_& m)
             &tle::ExecutorConfig::setUseGpuDirectStorage)
         .def_prop_rw("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
             &tle::ExecutorConfig::setGpuWeightsPercent)
+        .def_prop_rw("alias_managed_weights_from_gpu", &tle::ExecutorConfig::getAliasManagedWeightsFromGpu,
+            &tle::ExecutorConfig::setAliasManagedWeightsFromGpu)
         .def_prop_rw("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
         .def_prop_rw("extended_runtime_perf_knob_config", &tle::ExecutorConfig::getExtendedRuntimePerfKnobConfig,
             &tle::ExecutorConfig::setExtendedRuntimePerfKnobConfig)

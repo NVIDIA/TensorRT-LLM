@@ -76,7 +76,7 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
-                             register_auto_model)
+                             maybe_alias_or_copy_tensor, register_auto_model)
 
 
 @triton.jit
@@ -592,7 +592,7 @@ class DeepseekV3WeightLoader:
                         module.load_weights(weights=[module_weights])
                     else:
                         for n, p in module.named_parameters():
-                            p.data.copy_(module_weights[n][:])
+                            maybe_alias_or_copy_tensor(p, module_weights[n][:])
                     # Mark consumed weights
                     if can_mark_consumed:
                         weights.mark_consumed(name)
@@ -887,9 +887,10 @@ class DeepseekV3Gate(nn.Module):
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
 
-        self.weight.copy_(weights[0]["weight"][:])
+        maybe_alias_or_copy_tensor(self.weight, weights[0]["weight"][:])
 
-        self.e_score_correction_bias.copy_(
+        maybe_alias_or_copy_tensor(
+            self.e_score_correction_bias,
             weights[0]["e_score_correction_bias"][:].to(
                 self.e_score_correction_bias.dtype))
 

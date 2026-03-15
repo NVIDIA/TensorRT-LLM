@@ -15,7 +15,9 @@ def get_env_enable_pdl():
     return enabled
 
 
-if platform.system() != "Windows":
+if os.environ.get("TRTLLM_DISABLE_FLASHINFER", "0") == "1":
+    logger.info("flashinfer disabled by TRTLLM_DISABLE_FLASHINFER=1")
+elif platform.system() != "Windows":
     try:
         import flashinfer
         logger.info(f"flashinfer is available: {flashinfer.__version__}")

@@ -9,9 +9,9 @@ from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
-                                                       DecoderModelForCausalLM,
-                                                       register_auto_model)
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModel, DecoderModelForCausalLM, maybe_alias_or_copy_tensor,
+    register_auto_model)
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
@@ -300,4 +300,4 @@ class Phi3ForCausalLM(DecoderModelForCausalLM[Phi3Model, Phi3Config]):
                 else:
                     for n, p in module._parameters.items():
                         if p is not None:
-                            p.data.copy_(module_weights[n][:])
+                            maybe_alias_or_copy_tensor(p, module_weights[n][:])

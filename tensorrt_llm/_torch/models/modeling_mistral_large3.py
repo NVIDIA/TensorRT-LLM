@@ -6,7 +6,10 @@ from torch import nn
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import MistralLarge3WeightMapper
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import register_auto_model
+from tensorrt_llm._torch.models.modeling_utils import (
+    maybe_alias_or_copy_tensor,
+    register_auto_model,
+)
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -37,7 +40,7 @@ class Mistral3Gate(nn.Module):
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
 
-        self.weight.copy_(weights[0]["weight"][:])
+        maybe_alias_or_copy_tensor(self.weight, weights[0]["weight"][:])
 
 
 @register_auto_model("MistralLarge3ForCausalLM")

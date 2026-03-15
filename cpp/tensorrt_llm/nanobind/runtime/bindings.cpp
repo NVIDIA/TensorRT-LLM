@@ -132,8 +132,8 @@ void initBindings(nb::module_& m)
                 bool use_shape_inference = true)
             {
                 // Using default logger by passing nullptr
-                new (self)
-                    tr::TllmRuntime(tr::RawEngine(engine_path), nullptr, gpu_weights_percent, use_shape_inference);
+                new (self) tr::TllmRuntime(
+                    tr::RawEngine(engine_path), nullptr, false, gpu_weights_percent, false, use_shape_inference);
             },
             nb::arg("engine_path"), nb::arg("gpu_weights_percent") = 1.0f, nb::arg("use_shape_inference") = true)
         .def(
@@ -143,8 +143,8 @@ void initBindings(nb::module_& m)
             {
                 if (engine_buffer.ndim() != 1)
                     throw std::runtime_error("Expected 1-D array for engine buffer");
-                new (self) tr::TllmRuntime(tr::RawEngine(engine_buffer.data(), engine_buffer.size()), nullptr,
-                    gpu_weights_percent, use_shape_inference);
+                new (self) tr::TllmRuntime(tr::RawEngine(engine_buffer.data(), engine_buffer.size()), nullptr, false,
+                    gpu_weights_percent, false, use_shape_inference);
             },
             nb::arg("engine_buffer"), nb::arg("gpu_weights_percent") = 1.0f, nb::arg("use_shape_inference") = true)
         .def_prop_ro("num_contexts", &tr::TllmRuntime::getNbContexts)

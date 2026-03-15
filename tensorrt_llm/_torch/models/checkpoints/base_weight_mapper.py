@@ -4,7 +4,8 @@ from typing import Callable, List, Union
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModelForCausalLM, maybe_alias_or_copy_tensor)
 
 
 class BaseWeightMapper(ABC):
@@ -129,7 +130,7 @@ class BaseWeightMapper(ABC):
         if not allow_partial_loading:
             assert n in module_weights
         if n in module_weights:
-            p.data.copy_(module_weights[n][:])
+            maybe_alias_or_copy_tensor(p, module_weights[n][:])
 
     def does_require_special_handling(self, module_name: str) -> bool:
         return module_name in self.mapping

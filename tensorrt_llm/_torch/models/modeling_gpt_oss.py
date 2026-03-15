@@ -34,7 +34,8 @@ from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, filter_weights, register_auto_model
+from .modeling_utils import (DecoderModel, filter_weights,
+                             maybe_alias_or_copy_tensor, register_auto_model)
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
@@ -816,7 +817,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
                 for n, p in module._parameters.items():
                     if p is not None:
-                        p.data.copy_(module_weights[n][:])
+                        maybe_alias_or_copy_tensor(p, module_weights[n][:])
 
     def load_nvfp4_weights(self, weights: Dict):
         num_expert = self.config.num_local_experts
@@ -921,4 +922,4 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
                 for n, p in module._parameters.items():
                     if p is not None:
-                        p.data.copy_(module_weights[n][:])
+                        maybe_alias_or_copy_tensor(p, module_weights[n][:])

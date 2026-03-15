@@ -38,7 +38,7 @@ public:
     using TensorMap = StringPtrMap<ITensor>;
 
     explicit TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, bool useGpuDirectStorage = false,
-        float gpuWeightsPercent = 1.0f, bool useShapeInference = true);
+        float gpuWeightsPercent = 1.0f, bool aliasManagedWeightsFromGpu = false, bool useShapeInference = true);
 
     SizeType32 getNbContexts() const
     {
@@ -230,6 +230,7 @@ private:
     std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
     std::unique_ptr<LayerProfiler> mLayerProfiler;
     bool mUseShapeInference;
+    bool mAliasManagedWeightsFromGpu;
     TensorMap mManagedWeightsMap;
     // List of input tensor names.
     // Names of static tensors are removed from this list when setStaticInputTensors is called.

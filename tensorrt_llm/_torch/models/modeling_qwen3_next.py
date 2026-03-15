@@ -59,7 +59,8 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             maybe_alias_or_copy_tensor, register_auto_model)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -107,7 +108,7 @@ class Qwen3NextGate(nn.Module):
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
 
-        self.weight.copy_(weights[0]["weight"][:])
+        maybe_alias_or_copy_tensor(self.weight, weights[0]["weight"][:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
