@@ -681,8 +681,8 @@ def add_and_verify_request(
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
         send_aux_tasks = []
-        for ctx_transfer_worker, sender_session in zip(valid_ctx_transfer_workers, sender_sessions):
-            ctx_transfer_worker.pack_aux(sender_session, ctx_request)
+        for sender_session in sender_sessions:
+            sender_session.pack_aux()
             send_aux_tasks.append(sender_session.send_aux())
 
     for send_slice_task in send_slice_tasks:
@@ -817,9 +817,9 @@ def add_and_verify_request(
             for tp_rank in range(valid_gen_tp):
                 transfer_worker = valid_gen_transfer_workers[pp_rank * valid_gen_tp + tp_rank]
                 recv_session = receiver_sessions[pp_rank * valid_gen_tp + tp_rank]
-                transfer_worker.unpack_aux(recv_session, gen_request)
+                recv_session.unpack_aux()
 
-                assert gen_request.py_first_gen_tokens == [8 + ctx_request_id]
+                assert gen_request.context_phase_params.first_gen_tokens == [8 + ctx_request_id]
                 assert gen_request.py_draft_tokens == [
                     9 + ctx_request_id,
                     10 + ctx_request_id,
@@ -889,9 +889,15 @@ def test_transfer_worker_v1(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
     )
 
     request_len = setup["request_len"]
-    add_and_verify_request(setup, 0, 1, request_len, send_first=True)
-    add_and_verify_request(setup, 2, 3, request_len, send_first=True)
-    add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
+    try:
+        add_and_verify_request(setup, 0, 1, request_len, send_first=True)
+        add_and_verify_request(setup, 2, 3, request_len, send_first=True)
+        add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 
 @pytest.mark.timeout(120)
@@ -917,9 +923,15 @@ def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
     )
 
     request_len = setup["request_len"]
-    add_and_verify_request(setup, 0, 1, request_len, send_first=True)
-    add_and_verify_request(setup, 2, 3, request_len, send_first=True)
-    add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
+    try:
+        add_and_verify_request(setup, 0, 1, request_len, send_first=True)
+        add_and_verify_request(setup, 2, 3, request_len, send_first=True)
+        add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 
 @pytest.mark.timeout(120)
@@ -947,9 +959,15 @@ def test_transfer_worker_v2_with_window(
         max_attention_window_vec=max_attention_window_vec,
     )
 
-    add_and_verify_request(setup, 0, 1, request_len=16, send_first=True)
-    add_and_verify_request(setup, 2, 3, request_len=32, send_first=True)
-    add_and_verify_request(setup, 4, 5, request_len=64, send_first=False)
+    try:
+        add_and_verify_request(setup, 0, 1, request_len=16, send_first=True)
+        add_and_verify_request(setup, 2, 3, request_len=32, send_first=True)
+        add_and_verify_request(setup, 4, 5, request_len=64, send_first=False)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 
 if __name__ == "__main__":

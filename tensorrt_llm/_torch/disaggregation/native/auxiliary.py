@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import deque, namedtuple
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,13 +33,16 @@ class AuxBufferMeta:
         )
 
 
+AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
+
+
 class AuxBufferBase(ABC):
     """
     Abstract base class defining the interface for auxiliary buffer management.
     """
 
     @abstractmethod
-    def alloc_slot(self) -> int:
+    def alloc_slot(self) -> AuxSlot:
         """
         Allocate a free slot and return its index.
         """
@@ -124,7 +127,7 @@ class AuxBuffer(AuxBufferBase):
             device=self._device,
         )
 
-    def alloc_slot(self) -> int:
+    def alloc_slot(self) -> AuxSlot:
         if not self._free_slots:
             raise ValueError(
                 f"No free auxiliary buffer slots available (max slots = {self._max_slot_num}). "
@@ -139,7 +142,7 @@ class AuxBuffer(AuxBufferBase):
             )
         self._occupied_slots.add(slot_id)
         self._slot_token_counts[slot_id] = (0, 0)
-        return slot_id
+        return AuxSlot(slot_id, self)
 
     def free_slot(self, slot: int) -> None:
         if slot not in self._occupied_slots:
