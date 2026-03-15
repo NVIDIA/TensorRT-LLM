@@ -1036,15 +1036,7 @@ class Indexer(nn.Module):
                                   and IS_CUTLASS_DSL_AVAILABLE)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
-        # Heuristic TopK: per-layer buffer and slot management.
-        # Buffers are lazily allocated on first use since max_num_sequences
-        # is only known at runtime from metadata.
         self._enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
-        self._prev_decode_topk: Optional[torch.Tensor] = None
-        self._prev_topk_valid: Optional[torch.Tensor] = None
-        self._prev_topk_slots: dict[int, int] = {}
-        self._prev_topk_free_slots: list[int] = []
-        self._prev_topk_max_slots: int = 0
 
         if self.use_cute_dsl_topk and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
@@ -1060,43 +1052,6 @@ class Indexer(nn.Module):
         # → fused: [head_dim + n_heads, hidden_size]
         self._fused_wk_wp_weight = torch.cat(
             [self.wk.weight.data, self.weights_proj.weight.data], dim=0)
-
-    def _alloc_topk_slot(self, request_id: int, max_slots: int) -> int:
-        """Allocate a slot in prev_decode_topk for a request."""
-        if request_id in self._prev_topk_slots:
-            return self._prev_topk_slots[request_id]
-        if self._prev_topk_free_slots:
-            slot = self._prev_topk_free_slots.pop()
-        else:
-            slot = self._prev_topk_max_slots
-            self._prev_topk_max_slots = min(self._prev_topk_max_slots + 1,
-                                            max_slots)
-        self._prev_topk_slots[request_id] = slot
-        return slot
-
-    def _ensure_heuristic_buffers(self, max_num_sequences: int,
-                                  device: torch.device) -> None:
-        """Lazily allocate per-layer heuristic TopK buffers on first use."""
-        if self._prev_decode_topk is not None:
-            return
-        self._prev_decode_topk = torch.empty(
-            (max_num_sequences, self.index_topk),
-            dtype=torch.int32,
-            device=device)
-        self._prev_topk_valid = torch.zeros(max_num_sequences,
-                                            dtype=torch.bool,
-                                            device=device)
-
-    def _free_stale_topk_slots(self, active_request_ids: set[int]) -> None:
-        """Release slots for requests that are no longer active."""
-        stale = [
-            rid for rid in self._prev_topk_slots
-            if rid not in active_request_ids
-        ]
-        for rid in stale:
-            slot = self._prev_topk_slots.pop(rid)
-            self._prev_topk_valid[slot] = False
-            self._prev_topk_free_slots.append(slot)
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1474,12 +1429,6 @@ class Indexer(nn.Module):
         has_prefill = num_contexts > 0
         num_gen_tokens = num_tokens - num_ctx_tokens
 
-        if self._enable_heuristic_topk:
-            self._ensure_heuristic_buffers(metadata.max_num_sequences,
-                                           hidden_states.device)
-            active_ids = set(metadata.request_ids[:metadata.num_seqs])
-            self._free_stale_topk_slots(active_ids)
-
         topk_indices_buffer = torch.empty(
             (hidden_states.shape[0], self.index_topk),
             dtype=torch.int32,
@@ -1611,19 +1560,6 @@ class Indexer(nn.Module):
             topk_indices_buffer[:num_ctx_tokens, :] = \
                 metadata.topk_indices_buffer[:num_ctx_tokens, :]
 
-        # Save prefill's last-token TopK per context request as seed for first decode
-        if self._enable_heuristic_topk and has_prefill and num_ctx_tokens > 0:
-            ctx_seq_lens = metadata.seq_lens_cuda[:num_contexts]
-            last_ctx_token_idx = torch.cumsum(ctx_seq_lens, dim=0) - 1
-            last_prefill_topk = topk_indices_buffer[last_ctx_token_idx]
-            max_slots = self._prev_decode_topk.shape[0]
-            for i in range(num_contexts):
-                rid = metadata.request_ids[i]
-                slot = self._alloc_topk_slot(rid, max_slots)
-                self._prev_decode_topk[slot].copy_(last_prefill_topk[i],
-                                                   non_blocking=True)
-                self._prev_topk_valid[slot] = True
-
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
             # Get decode lengths per request (from seq_lens) for validation
@@ -1681,8 +1617,14 @@ class Indexer(nn.Module):
 
                 pre_idx = None
                 if self._enable_heuristic_topk:
-                    pre_idx = self._gather_prev_topk_for_decode(
-                        metadata, num_contexts, num_generations)
+                    local_layer = metadata.kv_cache_manager.layer_offsets[
+                        self.layer_idx]
+                    staging = metadata.heuristic_pre_idx_staging
+                    staging[:num_generations].copy_(
+                        metadata.heuristic_prev_topk[
+                            local_layer, :num_generations])
+                    staging[:num_generations] += 1
+                    pre_idx = staging[:num_generations]
 
                 # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
                 # memory. Beyond 256 tokens the extra memory becomes significant,
@@ -1735,73 +1677,19 @@ class Indexer(nn.Module):
                                         dtype=torch.int32)
 
             if self._enable_heuristic_topk:
-                self._save_decode_topk(metadata, topk_indices_buffer,
-                                       num_ctx_tokens, num_gen_tokens,
-                                       num_contexts, num_generations, next_n)
+                local_layer = metadata.kv_cache_manager.layer_offsets[
+                    self.layer_idx]
+                decode_topk = topk_indices_buffer[
+                    num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
+                last_mtp_topk = decode_topk[next_n - 1::next_n]
+                metadata.heuristic_prev_topk[
+                    local_layer, :num_generations].copy_(last_mtp_topk)
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
         return topk_indices_buffer
-
-    def _gather_prev_topk_for_decode(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        num_contexts: int,
-        num_generations: int,
-    ) -> Optional[torch.Tensor]:
-        """Gather previous TopK indices for generation requests as pre_idx.
-
-        Returns a contiguous [num_generations, index_topk] int32 tensor,
-        or None if any generation request lacks valid previous indices.
-
-        Adds +1 offset to all indices: the saved TopK came from a query at
-        position P (last MTP pos of previous step), while the current step's
-        first query is at position P+1. Shifting by +1 preserves relative
-        distances under RoPE, giving the heuristic kernel a more accurate
-        initial threshold. The kernel validates idx < N, so any overshoot
-        is safely ignored.
-        """
-        if self._prev_decode_topk is None:
-            return None
-        gen_request_ids = metadata.request_ids[num_contexts:num_contexts +
-                                               num_generations]
-        slots = []
-        for rid in gen_request_ids:
-            slot = self._prev_topk_slots.get(rid)
-            if slot is None or not self._prev_topk_valid[slot].item():
-                return None
-            slots.append(slot)
-        slot_tensor = torch.tensor(slots,
-                                   device=self._prev_decode_topk.device,
-                                   dtype=torch.long)
-        pre_idx = self._prev_decode_topk[slot_tensor].contiguous()
-        pre_idx = pre_idx + 1
-        return pre_idx
-
-    def _save_decode_topk(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        topk_indices_buffer: torch.Tensor,
-        num_ctx_tokens: int,
-        num_gen_tokens: int,
-        num_contexts: int,
-        num_generations: int,
-        next_n: int,
-    ) -> None:
-        """Save last MTP position's TopK per generation request for next step."""
-        decode_topk = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                          num_gen_tokens]
-        last_mtp_topk = decode_topk[next_n - 1::next_n]  # [B, K]
-        max_slots = self._prev_decode_topk.shape[0]
-        gen_request_ids = metadata.request_ids[num_contexts:num_contexts +
-                                               num_generations]
-        for i, rid in enumerate(gen_request_ids):
-            slot = self._alloc_topk_slot(rid, max_slots)
-            self._prev_decode_topk[slot].copy_(last_mtp_topk[i],
-                                               non_blocking=True)
-            self._prev_topk_valid[slot] = True
 
     def _weight_scale(self, weights: torch.Tensor,
                       q_scale: torch.Tensor) -> torch.Tensor:
