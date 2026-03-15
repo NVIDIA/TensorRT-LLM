@@ -371,7 +371,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         else:
             # Context-only (warmup). No gen tokens.
             input_ids = input_ids_ctx
-            self._step0_gather_ids = torch.empty(0, dtype=torch.long, device="cuda")
+            self._step0_gather_ids = self._gather_ids_buf[:0]
 
         return {
             "input_ids": input_ids,
@@ -655,7 +655,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         to avoid GPU-CPU sync overhead from per-request .item() calls.
         Uses pre-allocated buffers for CUDA graph compatibility.
         """
-        max_total = self.max_total_draft_tokens
         N = self.tokens_per_gen_step  # includes root
         max_path_len = self.max_draft_len + 1  # max accepted path (tree depth + root)
 
@@ -685,10 +684,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             # Build candidates into pre-allocated buffer: [num_gens, N]
             candidates = self._candidates_buf[:num_gens]
-            candidates.zero_()
-            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, max_total).to(
-                torch.int64
-            )
+            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(torch.int64)
             candidates[:, 0] = target_predict[:, 0]
 
             # Call in-place verification kernel with pre-allocated output buffers
@@ -1028,11 +1024,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ] = parent_offset + selected_parents
 
             # 3) Reconstruct accumulated_hs in pre-allocated buffer:
-            #    first K = step0_hs, rest gathered from write_buffer
+            #    first K slots keep step0_hs from step 0 (unchanged), gather rest from write_buffer
             num_tokens_next = (cur_draft_idx + 1) * self.K
-            self._accumulated_hs[:batch_size, : self.K] = self._step0_hs.unsqueeze(1).expand(
-                -1, self.K, -1
-            )
             if num_tokens_next > self.K:
                 read_idx = self._hs_read_map[:batch_size, self.K : num_tokens_next]
                 gathered = torch.gather(
