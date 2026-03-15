@@ -783,7 +783,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4,
+                "free_gpu_memory_fraction": 0.3,
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
@@ -795,7 +795,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": not eagle3_one_model,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4,
+                "free_gpu_memory_fraction": 0.3,
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
