@@ -2500,8 +2500,8 @@ void KVCacheManager::addSequence(
         ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
         : executor::KvCacheRetentionConfig();
 
-    auto seq = std::make_shared<GenerationRequest>(requestId, inputLength, beamWidth,
-        mBlockManager.getWindowSizesMetadata(), std::move(kvCacheRetentionConfig));
+    auto seq = std::make_shared<GenerationRequest>(
+        requestId, inputLength, beamWidth, mBlockManager.getWindowSizesMetadata(), std::move(kvCacheRetentionConfig));
     {
         auto lck = std::scoped_lock(mSequencesMtx);
         auto const [_, emplaceDone] = mSequences.emplace(requestId, seq);
@@ -3084,6 +3084,7 @@ void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLen
         removeToken(requestId);
     }
 }
+
 std::shared_ptr<GenerationRequest> KVCacheManager::getSequence(RequestIdType requestId) const
 {
     auto lck = std::scoped_lock(mSequencesMtx);

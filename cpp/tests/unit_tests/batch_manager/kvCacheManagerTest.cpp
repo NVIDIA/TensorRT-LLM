@@ -2795,7 +2795,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
 
-    auto & seq1 = *kvCacheManager.getSequence(1);
+    auto& seq1 = *kvCacheManager.getSequence(1);
     EXPECT_EQ(llmRequest1->getContextCurrentPosition(), 0);
     // Block 1 should NOT be reused. It was not freed even if partial.
     EXPECT_THAT(seq1.getCacheBlockIds(maxAttentionWindow).at(0), ::testing::ElementsAreArray({2}));
@@ -2866,7 +2866,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
         = std::make_shared<LlmRequest>(requestId0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId0, inputLength0, beamWidth, llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
-    auto & seq0 = *kvCacheManager.getSequence(requestId0);
+    auto& seq0 = *kvCacheManager.getSequence(requestId0);
 
     // Add two more blocks of generated tokens
     for (int i = tokensPerBlock; i < 3 * tokensPerBlock; ++i)
@@ -2893,7 +2893,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
         = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId1, inputLength1, beamWidth, llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
-    auto & seq1 = *kvCacheManager.getSequence(requestId1);
+    auto& seq1 = *kvCacheManager.getSequence(requestId1);
 
     // Verify that all primary blocks are in use
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
@@ -3418,7 +3418,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
     auto constexpr beamIdx = 0;
 
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    auto & seq0 = *kvCacheManager.getSequence(requestId);
+    auto& seq0 = *kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
     EXPECT_THAT(seq0.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0}));
 
@@ -3688,7 +3688,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     auto constexpr beamIdx = 0;
 
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    auto & seq0 = *kvCacheManager.getSequence(requestId);
+    auto& seq0 = *kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
     EXPECT_THAT(seq0.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3}));
 
@@ -3719,7 +3719,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     inputTokens->resize(inputLength);
     llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    auto & seq1 = *kvCacheManager.getSequence(requestId);
+    auto& seq1 = *kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 6);
     EXPECT_THAT(seq1.getCacheBlockIds(onlyWindowSize).at(beamIdx),
         ::testing::ElementsAreArray(
@@ -3742,7 +3742,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
     llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    auto & seq2 = *kvCacheManager.getSequence(requestId);
+    auto& seq2 = *kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 9);
     EXPECT_THAT(seq2.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 7}));
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
@@ -3757,7 +3757,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
     llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    auto & seq3 = *kvCacheManager.getSequence(requestId);
+    auto& seq3 = *kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 14);
     EXPECT_THAT(seq3.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 8}));
 
@@ -3821,7 +3821,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSWAInvalidateReuseTest)
         = std::make_shared<LlmRequest>(/*requestId=*/0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
 
     kvCacheManager.addSequence(/*requestId=*/0, inputLength, beamWidth, llmRequest0);
-    auto & seq0 = *kvCacheManager.getSequence(/*requestId=*/0);
+    auto& seq0 = *kvCacheManager.getSequence(/*requestId=*/0);
 
     // Block 0 goes out-of-window and is detached
     llmRequest0->addNewToken(1011, beamIdx);
@@ -3839,7 +3839,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSWAInvalidateReuseTest)
     auto llmRequest1
         = std::make_shared<LlmRequest>(/*requestId=*/1, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     kvCacheManager.addSequence(/*requestId=*/1, inputLength, beamWidth, llmRequest1);
-    auto & seq1 = *kvCacheManager.getSequence(/*requestId=*/1);
+    auto& seq1 = *kvCacheManager.getSequence(/*requestId=*/1);
 
     auto const onlyWindowSize = theOnlyWindowSize(kvCacheManager);
     EXPECT_FALSE(blockManager.isSequenceValidForStoreForReuse(seq0.getRequestId(), onlyWindowSize));
@@ -3920,7 +3920,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
 
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    auto & seq0 = *kvCacheManager.getSequence(requestId);
+    auto& seq0 = *kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
     assertBlocks(seq0, {0, 1}, {0, 1});
 
@@ -3952,7 +3952,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
     llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    auto & seq1 = *kvCacheManager.getSequence(requestId);
+    auto& seq1 = *kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 6);
     assertBlocks(seq1, {0, 3}, {0, 3});
 
@@ -4137,7 +4137,7 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
     kvCacheManager.storeContextBlocks(*llmRequest);
 
     // Get block IDs for the sequence
-    auto & seq = *kvCacheManager.getSequence(0);
+    auto& seq = *kvCacheManager.getSequence(0);
     auto cacheBlockIds = seq.getCacheBlockIds(maxAttentionWindow).at(0);
     ASSERT_GE(cacheBlockIds.size(), 1);
 
