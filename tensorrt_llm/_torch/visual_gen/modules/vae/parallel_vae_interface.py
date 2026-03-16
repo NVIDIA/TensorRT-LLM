@@ -44,11 +44,39 @@ class ParallelVAEBase(nn.Module):
     # Public API
     # ------------------------------------------------------------------
 
-    def encode(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self._encode_impl(x, **kwargs)
+    def encode(self, x: torch.Tensor, **kwargs) -> Tuple[torch.Tensor]:
+        if kwargs.get("return_dict", True):
+            raise NotImplementedError(
+                "ParallelVAEBase does not support return_dict=True. Pass return_dict=False."
+            )
 
-    def decode(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self._decode_impl(z, **kwargs)
+        result = self._encode_impl(x, **kwargs)
+
+        if not isinstance(result, torch.Tensor):
+            raise TypeError(f"_encode_impl must return a torch.Tensor, got {type(result).__name__}")
+        if result.ndim != x.ndim:
+            raise ValueError(
+                f"_encode_impl changed tensor rank: input {x.ndim}D, output {result.ndim}D"
+            )
+
+        return (result,)
+
+    def decode(self, z: torch.Tensor, **kwargs) -> Tuple[torch.Tensor]:
+        if kwargs.get("return_dict", True):
+            raise NotImplementedError(
+                "ParallelVAEBase does not support return_dict=True. Pass return_dict=False."
+            )
+
+        result = self._decode_impl(z, **kwargs)
+
+        if not isinstance(result, torch.Tensor):
+            raise TypeError(f"_decode_impl must return a torch.Tensor, got {type(result).__name__}")
+        if result.ndim != z.ndim:
+            raise ValueError(
+                f"_decode_impl changed tensor rank: input {z.ndim}D, output {result.ndim}D"
+            )
+
+        return (result,)
 
     # ------------------------------------------------------------------
     # Subclass hooks
