@@ -289,13 +289,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 else:
                     # Self-eviction: suspend this gen request to free its
                     # GPU pages so other requests can resume().
-                    logger.debug(
-                        "[V2Scheduler] Self-evicting request %s (state=%s) to free GPU pages",
-                        req.py_request_id,
-                        req.state,
-                    )
-                    self._suspend_request(req)
-                    evicted.append(req)
+                    # Skip if already suspended — suspending again is a no-op
+                    # that frees no pages.
+                    if self.kv_cache_manager.is_request_active(req.py_request_id):
+                        logger.debug(
+                            "[V2Scheduler] Self-evicting request %s (state=%s) to free GPU pages",
+                            req.py_request_id,
+                            req.state,
+                        )
+                        self._suspend_request(req)
+                        evicted.append(req)
 
             if scheduled:
                 req_it += 1

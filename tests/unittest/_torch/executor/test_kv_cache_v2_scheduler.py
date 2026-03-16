@@ -147,6 +147,7 @@ def make_kv_cache_manager(
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
+    mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     return mgr
 
 
