@@ -2,7 +2,7 @@ runtime: trtllm
 compile_backend: torch-cudagraph
 attn_backend: trtllm
 max_seq_len: 262144
-max_num_tokens: 8192
+max_num_tokens: 16000
 max_batch_size: 32
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 enable_chunked_prefill: true
@@ -20,7 +20,10 @@ transforms:
     num_moe_experts_for_export: 2
   fuse_gemms_mixed_children:
     enabled: true
+  fuse_nvfp4_moe:
+    backend: trtllm_gen
   detect_sharding:
+    dist_mapping: {moe_tp: 8, moe_ep: 1}
     allreduce_strategy: SYMM_MEM
     shard_all_unprocessed: true
     simple_shard_filter: "lm_head"
