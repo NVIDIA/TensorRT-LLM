@@ -60,6 +60,7 @@ G. Test File Hierarchical Levels
 - G2: Layer equivalence tests exist and use assert_rmse_close with rmse_ratio_tol=0.05.
 - G3: Full model equivalence tests exist, run on CPU, and use assert_rmse_close with rmse_ratio_tol=0.05.
 - G4: Export test uses torch_export_to_gm with Dim.DYNAMIC for batch and sequence dims.
+- G5: Number intentionally omitted to preserve compatibility with prior reviewer references.
 - G6: Export test runs a second forward with a different shape to validate dynamic dims.
 
 H. Test File Weight Conversion

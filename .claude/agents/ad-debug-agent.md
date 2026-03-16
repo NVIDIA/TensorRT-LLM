@@ -36,7 +36,7 @@ Look up the model in `examples/auto_deploy/model_registry/models.yaml` and find 
 
 **Step 2 — Check GPU availability via `nvidia-smi`:**
 
-Run via gpu-shell:
+Run in Bash:
 ```bash
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits
 ```

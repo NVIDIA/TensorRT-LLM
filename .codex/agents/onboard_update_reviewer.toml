@@ -95,5 +95,5 @@ Outcome C: PR created or updated
 - State the PR number and URL if the caller provided them.
 - State what summary was posted.
 - State what test evidence was included.
-- State that generated e2e text was included when available.
+- State that generated end-to-end (E2E) test output was included when available.
 """

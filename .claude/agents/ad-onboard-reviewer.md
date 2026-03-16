@@ -33,7 +33,7 @@ Read the actual source code for each check. Cite `file:line_number` for every PA
 
 ### BA Checkpoint compatibility
 | BA1 | Make sure the custom modeling code nn.module hierarchy matches the model hierarchy that is expected in the checkpoint safetensor json. |
-| BA2 | If our modeling code has expert-list style moe experts and the checkpoint has fused moe experts, add a load hook to load the safetensors correctly into our expert list weights.
+| BA2 | If our modeling code has expert-list-style MoE experts and the checkpoint has fused MoE experts, add a load hook to load the safetensors correctly into our expert-list-style weights.
 
 ### BB. Vision / Multi-Modal Support
 

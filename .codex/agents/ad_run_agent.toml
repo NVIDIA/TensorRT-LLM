@@ -7,15 +7,24 @@ sandbox_mode = "workspace-write"
 developer_instructions = """
 Run AutoDeploy build_and_run_ad.py flows for a given model and archive the results.
 
-If the caller did not provide the model id, config yaml, and a short run description, ask first.
+If the caller did not provide the model id and a short run description, ask first. If the caller wants the local yaml flow instead of the registry flow, also ask for the config yaml.
 
 Setup before the first run:
 - Create $PWD/ad_run_logs/
 - Create or append to $PWD/ad_run_logs/<MODEL_SHORT_NAME>_worklog.md
-- Derive MODEL_SHORT_NAME from the config yaml filename without the .yaml suffix
+- Derive MODEL_SHORT_NAME from the config yaml filename without the .yaml suffix for the local yaml flow.
+- Derive MODEL_SHORT_NAME from MODEL_HF_ID for the registry flow, unless the caller explicitly provides a model short name.
 
 Workflow:
-1. Run:
+1. Run one of the following flows:
+
+Registry flow:
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR> python examples/auto_deploy/build_and_run_ad.py \
+  --model <MODEL_HF_ID> \
+  --use-registry \
+  2>&1 | tee <LOG_FILE>
+
+Local yaml flow:
 AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR> python examples/auto_deploy/build_and_run_ad.py \
   --model <MODEL_HF_ID> \
   --args.yaml-extra examples/auto_deploy/model_registry/configs/<CONFIG_YAML_FILE> \
@@ -41,7 +50,7 @@ Allowed STATUS values:
 
 **Description:** <description provided by caller>
 **Model:** <MODEL_HF_ID>
-**Config:** <CONFIG_YAML_FILE>
+**Config:** <CONFIG_YAML_FILE> or registry entry from `models.yaml`
 **Log:** <path to archived log file>
 **Status:** <success | compile_error | runtime_error | bad_generation>
 

@@ -235,14 +235,14 @@ Print (not file) after completion:
 
 **GitHub CLI config:** Before running any `gh` command, confirm which `GH_CONFIG_DIR` to use. The default is `~/.config/gh`, but a different directory may be needed when targeting a fork (e.g., `nv-auto-deploy/TensorRT-LLM` vs `NVIDIA/TensorRT-LLM`). Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If not, **ask the user** before proceeding. Prefix all `gh` commands with: `GH_CONFIG_DIR=<path> gh ...`
 
-Prepare a pull request against `origin` (https://github.com/nv-auto-deploy/TensorRT-LLM) targeting
-branch `feat/paperclip_maximizer`. Then, ask the user to provide feedback on the PR and wait for the
+Prepare a pull request against `upstream` (https://github.com/NVIDIA/TensorRT-LLM) targeting
+branch `main`. Then, ask the user to provide feedback on the PR and wait for the
 user to get back to you when the feedback has been posted. Then continue iterating according to the
 user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
 When you post a PR, you **MUST** include:
 1. **ALL raw prompts and their complete generated outputs** from the final successful `build_and_run_ad.py --use-registry` run. Copy-paste the COMPLETE prompt→output pairs verbatim — do NOT summarize, truncate, or paraphrase. The reviewer needs to see exactly what the model generated.
 2. A reproducible command:
-```
+```bash
 python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
 ```
 3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well. Make sure you have run this pytest command on the latest commit that you are pushing, and include these results in the PR.
@@ -262,7 +262,7 @@ python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registr
 **Workflow for every PR update cycle:**
 1. Make the requested code changes
 2. Commit the changes
-3. Before pushing, always rebase onto the target branch to check for conflicts: `git fetch origin && git rebase origin/feat/paperclip_maximizer`. If there are conflicts, resolve them before proceeding. Do NOT push without rebasing first — the branch must be up-to-date with the target branch.
+3. Before pushing, always rebase onto the target branch to check for conflicts: `git fetch upstream && git rebase upstream/main`. If there are conflicts, resolve them before proceeding. Do NOT push without rebasing first — the branch must be up-to-date with the target branch.
 4. Push (or force-push if rebase rewrote history)
 5. Re-invoke the `ad-run-agent` to run `build_and_run_ad.py --model <MODEL-ID> --use-registry` on the updated code
 6. Re-run the unit tests: `pytest <test_file> -v`
