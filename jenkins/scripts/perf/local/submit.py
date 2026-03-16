@@ -646,7 +646,10 @@ def main():
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
-                'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
+                (
+                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
+                ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",
                 f"export numGenServers={hardware_config.get('num_gen_servers', '')}",
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",
