@@ -7,7 +7,6 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  dataset_file: disagg_datasets/kimi-k2-1024-1024-20000-ratio-1_for_serve.json
   accuracy:
     datasets:
     - dataset_name: gpqa_diamond_local
@@ -32,7 +31,7 @@ benchmark:
   concurrency_list: '8192'
   input_length: 1024
   output_length: 1024
-  dataset_file: <dataset_file>
+  dataset_file: datasets/perf-ci/k2_thinking-1k1k-20480-ratio-1_for_serve.json
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 3
@@ -57,7 +56,7 @@ accuracy:
       extra_kwargs:
         apply_chat_template: true
         trust_remote_code: true
-        custom_config: <repo_path>/tests/integration/lm_eval_configs/gpqa_diamond_local.yaml
+        custom_config: tests/integration/lm_eval_configs/gpqa_diamond_local.yaml
 worker_config:
   gen:
     enable_layerwise_nvtx_marker: true
