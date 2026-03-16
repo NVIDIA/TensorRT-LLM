@@ -275,17 +275,17 @@ public:
         return dTypeSize * 8;
     }
 
-    struct KvCacheBlockArrays
+    struct KvCacheBuffers
     {
         kernels::KVBlockArray kvCacheBuffer;
         kernels::KVBlockArray kvScaleCacheBuffer;
     };
 
-    static KvCacheBlockArrays buildKvCacheBlockArrays(int32_t batchSize, int32_t maxBlocksPerSeq,
-        int32_t tokensPerBlock, int32_t sizePerToken, int32_t cyclicAttentionWindowSize,
-        int32_t maxCyclicAttentionWindowSize, int32_t sinkTokenLen, bool canUseOneMoreBlock, void* primaryPoolPtr,
-        void* secondaryPoolPtr, void* primaryBlockScalePoolPtr, void* secondaryBlockScalePoolPtr,
-        kernels::KVBlockArray::DataType* blockOffsets, bool hasFp4KvCache);
+    static KvCacheBuffers buildKvCacheBlockArrays(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock,
+        int32_t sizePerToken, int32_t cyclicAttentionWindowSize, int32_t maxCyclicAttentionWindowSize,
+        int32_t sinkTokenLen, bool canUseOneMoreBlock, void* primaryPoolPtr, void* secondaryPoolPtr,
+        void* primaryBlockScalePoolPtr, void* secondaryBlockScalePoolPtr, kernels::KVBlockArray::DataType* blockOffsets,
+        bool hasFp4KvCache);
 
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>

@@ -2563,13 +2563,13 @@ template void AttentionOp::prepareEnqueueGeneration<__nv_bfloat16, KVBlockArray>
     EnqueueGenerationParams<__nv_bfloat16> const& params);
 #endif
 
-AttentionOp::KvCacheBlockArrays AttentionOp::buildKvCacheBlockArrays(int32_t batchSize, int32_t maxBlocksPerSeq,
+AttentionOp::KvCacheBuffers AttentionOp::buildKvCacheBlockArrays(int32_t batchSize, int32_t maxBlocksPerSeq,
     int32_t tokensPerBlock, int32_t sizePerToken, int32_t cyclicAttentionWindowSize,
     int32_t maxCyclicAttentionWindowSize, int32_t sinkTokenLen, bool canUseOneMoreBlock, void* primaryPoolPtr,
     void* secondaryPoolPtr, void* primaryBlockScalePoolPtr, void* secondaryBlockScalePoolPtr,
     KVBlockArray::DataType* blockOffsets, bool hasFp4KvCache)
 {
-    KvCacheBlockArrays result;
+    KvCacheBuffers result;
     result.kvCacheBuffer = KVBlockArray(batchSize, maxBlocksPerSeq, tokensPerBlock, sizePerToken,
         cyclicAttentionWindowSize, maxCyclicAttentionWindowSize, sinkTokenLen, canUseOneMoreBlock, primaryPoolPtr,
         secondaryPoolPtr, blockOffsets);
