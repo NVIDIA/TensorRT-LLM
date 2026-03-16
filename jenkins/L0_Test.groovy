@@ -3447,7 +3447,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX2-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx2_node1_gpu4_gen1_node4_gpu16",
-        5,
+        4,
         24,
         6
     )
