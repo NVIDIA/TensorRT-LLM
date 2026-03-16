@@ -1252,6 +1252,19 @@ class SequenceInfo:
 
     @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
+        """Inverse of nest_sequences: split logits back into per-sequence tensors.
+
+        Automatically consistent with how tokens were gathered in nest_sequences():
+        - If gather was required (gather_context_logits=False), t_nested has shape
+          [num_seqs, *other_dims] and each returned tensor has shape [1, *other_dims].
+        - Otherwise (gather_context_logits=True), t_nested has shape [total_tokens, *other_dims]
+          and each returned tensor has shape [seq_len_i, *other_dims].
+
+        Returns:
+            List of per-sequence tensors.
+        """
+        if self.batch_info.is_gather_required():
+            return list(t_nested.unsqueeze(1).unbind(0))
         t_squeezed = self.flatten(t_nested)
         seq_len_list = self.get_arg("seq_len_host", truncate=True).tolist()
         return list(torch.split(t_squeezed, seq_len_list))

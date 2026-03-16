@@ -77,6 +77,7 @@ def test_engine(engine_cls: Type[ADEngine], tokens_per_block: int):
             input_ids=input_ids_list,
             cu_seqlen=[0, len(input_ids_list)],
             input_pos=[0],
+            gather_context_logits=True,
         )
         logits = engine._run_forward()["logits"]
         assert logits is not None, "Logits are None"
