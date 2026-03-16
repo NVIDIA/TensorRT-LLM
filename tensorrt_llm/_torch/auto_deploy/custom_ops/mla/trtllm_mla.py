@@ -245,7 +245,7 @@ class _TrtllmMLAPlanner:
 
         On SM100+ the FMHA MLA decode kernel requires a power-of-2 Q/KV head
         ratio.  Buffers are sized for the *padded* head count so that padding
-        inside ``_handle_decode`` is a zero-copy view.
+        inside ``_handle_decode_impl`` is a zero-copy view.
         """
         need_alloc = (
             self.cu_q_decode is None
@@ -1146,177 +1146,7 @@ def _apply_rope_from_table(
     return q_pe_rotated, kpe_rotated
 
 
-def _handle_fused_rope_decode(
-    q_nope_flat: torch.Tensor,
-    q_pe_flat: torch.Tensor,
-    kv_b_proj_weight: torch.Tensor,
-    latent_cache: torch.Tensor,
-    kv_cache: torch.Tensor,
-    rotary_cos_sin: torch.Tensor,
-    num_tokens: int,
-    num_prefill: int,
-    num_heads: int,
-    num_kv_heads: int,
-    qk_nope_head_dim: int,
-    qk_rope_head_dim: int,
-    qk_head_dim: int,
-    v_head_dim: int,
-    kv_lora_rank: int,
-    head_size: int,
-    tokens_per_block: int,
-    max_num_requests: int,
-    max_context_length: int,
-    scale: float,
-    quant_mode: int,
-    sequence_length: torch.Tensor,
-    context_lengths: torch.Tensor,
-    host_past_kv_lengths: torch.Tensor,
-    host_context_lengths: torch.Tensor,
-    host_request_types: torch.Tensor,
-    host_total_kv_lens: torch.Tensor,
-    kv_cache_block_offsets: torch.Tensor,
-    host_kv_cache_pool_pointers: torch.Tensor,
-    host_kv_cache_pool_mapping: torch.Tensor,
-) -> torch.Tensor:
-    """Decode with fused mla_rope_generation kernel.
-
-    Replaces _handle_decode's 3 separate kernels (q_pe copy, cache write,
-    scheduler fill) with a single ``mla_rope_generation`` call, then runs
-    the same Q absorption + thop.attention + V projection pipeline.
-
-    Note: thop.attention with update_kv_cache=True also writes the cache
-    (required by C++ assertion), so the cache is written twice.  This benign
-    double-write is cheaper than the alternative of separate Python kernels.
-    """
-    planner = _GlobalTrtllmMLAPlanner
-    gen_head_size = kv_lora_rank + qk_rope_head_dim
-    padded_num_heads = planner._decode_padded_num_heads
-    needs_head_padding = padded_num_heads != num_heads
-
-    w_kn, w_v_t = planner.get_weight_matrices(
-        kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
-    )
-
-    # Build fused_q — Q absorption via bmm_out into the left slice.
-    fused_q_flat = planner.fused_q_flat[:num_tokens]
-    fused_q_view = fused_q_flat.view(
-        num_tokens,
-        padded_num_heads if needs_head_padding else num_heads,
-        gen_head_size,
-    )
-
-    q_nope_t = q_nope_flat.transpose(0, 1)
-    q_absorbed_target = fused_q_view[:, :num_heads, :kv_lora_rank].transpose(0, 1)
-    torch.ops.trtllm.bmm_out(q_nope_t, w_kn, q_absorbed_target)
-
-    # mla_rope_generation fills the right slice of fused_q with RoPE'd q_pe,
-    # writes latent_cache to the paged KV cache with RoPE on kpe, and fills
-    # cu_q_seqlens / cu_kv_seqlens / fmha_scheduler_counter.
-    cu_q = planner.cu_q_decode[: num_tokens + 1]
-    cu_kv = planner.cu_kv_decode[: num_tokens + 1]
-
-    # q_pe for mla_rope_generation: must have padded heads if needed.
-    if needs_head_padding:
-        q_pe_padded = planner.q_pe_padded_buf[:num_tokens]
-        q_pe_padded[:, :num_heads, :] = q_pe_flat
-        q_pe_for_kernel = q_pe_padded
-    else:
-        q_pe_for_kernel = q_pe_flat
-
-    fused_q_3d = fused_q_view
-
-    torch.ops.trtllm.mla_rope_generation(
-        fused_q_3d,
-        q_pe_for_kernel,
-        latent_cache,
-        rotary_cos_sin,
-        cu_q,
-        cu_kv,
-        planner.fmha_scheduler_counter_decode,
-        None,  # mla_bmm1_scale (non-FP8)
-        None,  # mla_bmm2_scale (non-FP8)
-        None,  # quant_q_buffer (non-FP8)
-        sequence_length,
-        host_past_kv_lengths,
-        host_context_lengths,
-        num_prefill,  # num_contexts
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        planner.kv_scale_orig_quant,
-        planner.kv_scale_quant_orig,
-        None,  # out_scale
-        planner.block_ids_per_seq,
-        [None, None],  # mla_tensor_params (helix)
-        1,  # predicted_tokens_per_seq
-        0,  # layer_idx
-        padded_num_heads,
-        num_kv_heads,
-        gen_head_size,
-        tokens_per_block,
-        max_context_length,  # attention_window_size
-        0,  # sink_token_length
-        1,  # beam_width
-        quant_mode,
-        scale,  # q_scaling
-        0,  # q_lora_rank
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        kv_lora_rank,  # v_head_dim (in latent space = kv_lora_rank)
-    )
-
-    output_latent = planner.output_latent[:num_tokens]
-
-    _call_thop_attention_mla(
-        fused_q_flat,
-        None,
-        None,
-        output_latent,
-        latent_cache,
-        q_pe_for_kernel,
-        True,
-        2,  # attention_input_type = generation_only
-        padded_num_heads,
-        num_kv_heads,
-        gen_head_size,
-        tokens_per_block,
-        max_num_requests,
-        max_context_length,
-        scale,
-        quant_mode,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        kv_lora_rank,
-        sequence_length,
-        context_lengths,
-        host_past_kv_lengths,
-        host_context_lengths,
-        host_request_types,
-        host_total_kv_lens,
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        cu_q_seqlens=cu_q,
-        cu_kv_seqlens=cu_kv,
-        fmha_scheduler_counter=planner.fmha_scheduler_counter_decode,
-    )
-
-    # V projection
-    output_reshaped = output_latent.view(num_tokens, padded_num_heads, kv_lora_rank)
-    if needs_head_padding:
-        output_reshaped = output_reshaped[:, :num_heads, :].contiguous()
-    v_proj_out = planner.v_proj_output[:num_tokens]
-    torch.ops.trtllm.bmm_out(
-        output_reshaped.transpose(0, 1),
-        w_v_t,
-        v_proj_out.transpose(0, 1),
-    )
-    return v_proj_out.reshape(num_tokens, num_heads * v_head_dim)
-
-
-def _handle_decode(
+def _handle_decode_impl(
     q_nope_flat: torch.Tensor,
     q_pe_flat: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
@@ -1346,6 +1176,8 @@ def _handle_decode(
     kv_cache_block_offsets: torch.Tensor,
     host_kv_cache_pool_pointers: torch.Tensor,
     host_kv_cache_pool_mapping: torch.Tensor,
+    *,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Handle decode: weight absorption + latent-space attention + output projection.
 
@@ -1358,6 +1190,10 @@ def _handle_decode(
     When ``num_heads / num_kv_heads`` is not a power of two (e.g. GLM-4.7-Flash
     with 20 heads), the Q tensor is zero-padded to the next valid head count and
     the attention output is sliced back before the V projection.
+
+    When ``rotary_cos_sin`` is provided, uses ``mla_rope_generation`` to fuse
+    cache write + RoPE + q_pe copy + scheduler fill into one kernel.  Otherwise
+    copies q_pe manually and zeros the scheduler counter.
     """
     planner = _GlobalTrtllmMLAPlanner
     gen_head_size = kv_lora_rank + qk_rope_head_dim
@@ -1369,8 +1205,7 @@ def _handle_decode(
     )
 
     # Build fused_q = [q_absorbed | q_pe] into pre-allocated buffer.
-    # bmm_out writes q_absorbed directly into the left slice of fused_q,
-    # then q_pe is copied into the right slice — no torch.cat needed.
+    # bmm_out writes q_absorbed directly into the left slice of fused_q.
     fused_q_flat = planner.fused_q_flat[:num_tokens]
     fused_q_view = fused_q_flat.view(
         num_tokens,
@@ -1378,31 +1213,72 @@ def _handle_decode(
         gen_head_size,
     )
 
-    # q_nope_flat: [T, H, D]  → transpose → [H, T, D]
-    # w_kn:        [H, D, K]
-    # target:      fused_q_view[:, :H, :K] transposed → [H, T, K]
     q_nope_t = q_nope_flat.transpose(0, 1)
     q_absorbed_target = fused_q_view[:, :num_heads, :kv_lora_rank].transpose(0, 1)
     torch.ops.trtllm.bmm_out(q_nope_t, w_kn, q_absorbed_target)
 
-    # Copy q_pe into the rope portion of fused_q.
-    fused_q_view[:, :num_heads, kv_lora_rank:] = q_pe_flat
+    cu_q = planner.cu_q_decode[: num_tokens + 1]
+    cu_kv = planner.cu_kv_decode[: num_tokens + 1]
 
-    # q_pe is also passed separately to thop.attention for MLA generation;
-    # it must match the padded head count.  Padding buffer was pre-zeroed at
-    # allocation so only 1 copy kernel is needed (no per-step zero_()).
     if needs_head_padding:
         q_pe_padded = planner.q_pe_padded_buf[:num_tokens]
         q_pe_padded[:, :num_heads, :] = q_pe_flat
     else:
         q_pe_padded = q_pe_flat
 
+    if rotary_cos_sin is not None:
+        # Fused path: mla_rope_generation fills q_pe in fused_q, writes cache
+        # with RoPE on kpe, and fills cu_q/cu_kv/scheduler in one kernel.
+        # thop.attention with update_kv_cache=True also writes the cache
+        # (required by C++ assertion), so the cache is written twice — this
+        # benign double-write is cheaper than separate Python kernels.
+        torch.ops.trtllm.mla_rope_generation(
+            fused_q_view,
+            q_pe_padded,
+            latent_cache,
+            rotary_cos_sin,
+            cu_q,
+            cu_kv,
+            planner.fmha_scheduler_counter_decode,
+            None,  # mla_bmm1_scale (non-FP8)
+            None,  # mla_bmm2_scale (non-FP8)
+            None,  # quant_q_buffer (non-FP8)
+            sequence_length,
+            host_past_kv_lengths,
+            host_context_lengths,
+            num_prefill,  # num_contexts
+            kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            planner.kv_scale_orig_quant,
+            planner.kv_scale_quant_orig,
+            None,  # out_scale
+            planner.block_ids_per_seq,
+            [None, None],  # mla_tensor_params (helix)
+            1,  # predicted_tokens_per_seq
+            0,  # layer_idx
+            padded_num_heads,
+            num_kv_heads,
+            gen_head_size,
+            tokens_per_block,
+            max_context_length,  # attention_window_size
+            0,  # sink_token_length
+            1,  # beam_width
+            quant_mode,
+            scale,  # q_scaling
+            0,  # q_lora_rank
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,  # v_head_dim (in latent space = kv_lora_rank)
+        )
+    else:
+        # Non-fused path: copy q_pe into the rope portion of fused_q and
+        # zero the scheduler counter manually.
+        fused_q_view[:, :num_heads, kv_lora_rank:] = q_pe_flat
+        planner.fmha_scheduler_counter_decode.fill_(0)
+
     output_latent = planner.output_latent[:num_tokens]
-
-    cu_q = planner.cu_q_decode[: num_tokens + 1]
-    cu_kv = planner.cu_kv_decode[: num_tokens + 1]
-
-    planner.fmha_scheduler_counter_decode.fill_(0)
 
     _call_thop_attention_mla(
         fused_q_flat,
@@ -1415,7 +1291,7 @@ def _handle_decode(
         2,  # attention_input_type = generation_only
         padded_num_heads,
         num_kv_heads,
-        head_size,
+        gen_head_size,
         tokens_per_block,
         max_num_requests,
         max_context_length,
@@ -1439,11 +1315,7 @@ def _handle_decode(
         fmha_scheduler_counter=planner.fmha_scheduler_counter_decode,
     )
 
-    # Project from latent space back to v_head_dim using bmm_out into
-    # a pre-allocated buffer (matching the PT backend pattern).
-    # output_reshaped: [T, H, K] → transpose → [H, T, K]
-    # w_v_t:           [H, K, V]
-    # v_proj_out:      [T, H, V] → transpose → [H, T, V]
+    # V projection: project from latent space back to v_head_dim.
     output_reshaped = output_latent.view(num_tokens, padded_num_heads, kv_lora_rank)
     if needs_head_padding:
         output_reshaped = output_reshaped[:, :num_heads, :].contiguous()
@@ -1457,40 +1329,36 @@ def _handle_decode(
 
 
 # =============================================================================
-# Cached MLA attention op
+# Shared MLA attention implementation
 # =============================================================================
 
 
-@torch.library.custom_op("auto_deploy::trtllm_mla_with_cache", mutates_args=("kv_cache",))
-def trtllm_mla_with_cache(
-    # 5 MLA tensor args (matching torch_mla source op)
+def _mla_with_cache_impl(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
     compressed_kv: torch.Tensor,
     kpe: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
-    # Standard metadata (SequenceInfo fields)
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_host: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
     max_seq_info_host: torch.Tensor,
-    # Cache
     kv_cache: torch.Tensor,
-    # Constants
     scale: Optional[float],
     kv_lora_rank: int,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """TRT-LLM MLA attention with paged latent cache for Auto-Deploy.
+    """Shared implementation for both MLA attention ops (with and without fused RoPE).
 
-    Prefill: expands compressed KV to separate Q, K, V and calls thop.attention with
-    is_fused_qkv=False and attention_input_type=context_only.
-
-    Decode: uses weight absorption (q_absorbed = q_nope @ W_kn) and calls thop.attention
-    with is_fused_qkv=True and attention_input_type=generation_only, then projects output
-    from latent space back to v_head_dim via W_v.
+    When ``rotary_cos_sin`` is None, q_pe/kpe arrive post-RoPE and latent_cache
+    is written to the paged KV cache as-is.  When provided, q_pe/kpe are pre-RoPE:
+    prefill applies RoPE in Python; decode uses ``mla_rope_generation`` to fuse
+    cache write + RoPE + q_pe copy + scheduler fill into one kernel.
     """
+    fused_rope = rotary_cos_sin is not None
+
     b, s = q_nope.shape[:2]
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[3]
@@ -1546,7 +1414,6 @@ def trtllm_mla_with_cache(
     compressed_kv_flat = compressed_kv_c.view(bs, kv_lora_rank)
     kpe_flat = kpe_c.view(bs, qk_rope_head_dim)
 
-    # Ensure decode-path scratch buffers are allocated
     if num_decode > 0:
         planner.ensure_decode_buffers(
             q_nope.device,
@@ -1571,7 +1438,6 @@ def trtllm_mla_with_cache(
             [compressed_kv_flat[:num_tokens], kpe_flat[:num_tokens]], dim=-1
         ).contiguous()
 
-    # Metadata from planner
     sequence_length = seq_len_with_cache[:num_seq]
     context_lengths = seq_len[:num_seq]
     host_past_kv_lengths = planner.host_past_kv_lengths[:num_seq]
@@ -1615,22 +1481,46 @@ def trtllm_mla_with_cache(
             host_kv_cache_pool_mapping,
         )
 
-    # Always use SDPA for MLA prefill.  The AD thop.attention context call
+    # -- Prefill helper -------------------------------------------------------
+    # Always uses SDPA for MLA prefill.  The AD thop.attention context call
     # has a parameter mismatch vs the PyTorch backend's TrtllmAttention
-    # wrapper that causes an illegal memory access on both SM90 and SM100.
-    # Root-cause TBD — known differences already fixed (latent_cache,
-    # num_kv_heads=num_heads) but the kernel still crashes.  The thop MLA
-    # *decode* kernel (weight-absorption path) works correctly.
-    # SDPA avoids the issue: attention is computed via PyTorch and the
-    # latent cache is written separately by _write_latent_cache_to_paged_kv.
+    # wrapper that causes an illegal memory access on both SM90 and SM100
+    # (root-cause TBD).  The thop MLA *decode* kernel works correctly.
 
-    def _do_prefill(q_n, q_p, lc, n_tok, n_pf):
-        """Dispatch prefill via SDPA (handles both fresh and chunked prefill)."""
+    def _prefill_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
+        """Apply optional RoPE, write cache, and run SDPA prefill."""
+        if fused_rope:
+            positions = torch.arange(n_tok, device=q_n.device, dtype=torch.int32)
+            offset = 0
+            for i in range(n_pf):
+                slen = int(seq_len_host[i])
+                ipos = int(input_pos_host[i])
+                positions[offset : offset + slen] = torch.arange(
+                    ipos, ipos + slen, device=q_n.device, dtype=torch.int32
+                )
+                offset += slen
+            q_pe_sdpa, kpe_sdpa = _apply_rope_from_table(
+                q_p, kpe_pre, rotary_cos_sin, positions, qk_rope_head_dim
+            )
+            latent_for_cache = torch.cat([ckv, kpe_sdpa], dim=-1)
+        else:
+            q_pe_sdpa, kpe_sdpa = q_p, kpe_pre
+            latent_for_cache = lc
+
+        _write_latent_cache_to_paged_kv(
+            latent_for_cache,
+            kv_cache,
+            planner.block_ids_per_seq,
+            seq_len_host,
+            input_pos_host,
+            n_pf,
+            tokens_per_block,
+        )
         return _handle_chunked_prefill(
             q_n,
-            q_p,
-            compressed_kv_flat[:n_tok],
-            kpe_flat[:n_tok],
+            q_pe_sdpa,
+            ckv,
+            kpe_sdpa,
             kv_b_proj_weight,
             num_heads,
             qk_nope_head_dim,
@@ -1646,77 +1536,125 @@ def trtllm_mla_with_cache(
             n_pf,
         )
 
+    # -- Decode helper --------------------------------------------------------
+
+    def _do_decode(q_n, q_p, lc, n_tok, n_pf):
+        """Write cache (non-fused only) and run decode attention."""
+        if not fused_rope:
+            _write_decode_latent_to_cache(lc, kv_cache, n_tok)
+        return _handle_decode_impl(
+            q_n,
+            q_p,
+            kv_b_proj_weight,
+            lc,
+            kv_cache,
+            n_tok,
+            n_pf,
+            *_make_shared_metadata(),
+            rotary_cos_sin=rotary_cos_sin,
+        )
+
+    # -- 3-way dispatch -------------------------------------------------------
     # Allocate output with bs rows (may include CG padding); only real-token
     # positions are filled — padding stays zero, matching the FI MLA pattern.
     y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
 
     if num_prefill > 0 and num_decode > 0:
-        _write_latent_cache_to_paged_kv(
-            latent_cache[:num_prefill_tokens],
-            kv_cache,
-            planner.block_ids_per_seq,
-            seq_len_host,
-            input_pos_host,
-            num_prefill,
-            tokens_per_block,
-        )
-        y[:num_prefill_tokens] = _do_prefill(
+        y[:num_prefill_tokens] = _prefill_with_cache_write(
             q_nope_flat[:num_prefill_tokens],
             q_pe_flat[:num_prefill_tokens],
+            compressed_kv_flat[:num_prefill_tokens],
+            kpe_flat[:num_prefill_tokens],
             latent_cache[:num_prefill_tokens],
             num_prefill_tokens,
             num_prefill,
         )
-        _write_decode_latent_to_cache(
-            latent_cache[num_prefill_tokens:num_tokens],
-            kv_cache,
-            num_decode,
-        )
-        y[num_prefill_tokens:num_tokens] = _handle_decode(
+        y[num_prefill_tokens:num_tokens] = _do_decode(
             q_nope_flat[num_prefill_tokens:num_tokens],
             q_pe_flat[num_prefill_tokens:num_tokens],
-            kv_b_proj_weight,
             latent_cache[num_prefill_tokens:num_tokens],
-            kv_cache,
             num_decode,
             num_prefill,
-            *_make_shared_metadata(),
         )
     elif num_prefill > 0:
-        _write_latent_cache_to_paged_kv(
-            latent_cache,
-            kv_cache,
-            planner.block_ids_per_seq,
-            seq_len_host,
-            input_pos_host,
-            num_prefill,
-            tokens_per_block,
-        )
-        y[:num_tokens] = _do_prefill(
+        y[:num_tokens] = _prefill_with_cache_write(
             q_nope_flat[:num_tokens],
             q_pe_flat[:num_tokens],
+            compressed_kv_flat[:num_tokens],
+            kpe_flat[:num_tokens],
             latent_cache,
             num_prefill_tokens,
             num_prefill,
         )
     else:
-        _write_decode_latent_to_cache(
-            latent_cache,
-            kv_cache,
-            num_tokens,
-        )
-        y[:num_tokens] = _handle_decode(
+        y[:num_tokens] = _do_decode(
             q_nope_flat[:num_tokens],
             q_pe_flat[:num_tokens],
-            kv_b_proj_weight,
             latent_cache,
-            kv_cache,
             num_tokens,
             0,
-            *_make_shared_metadata(),
         )
 
     return y.view(b, s, num_heads, v_head_dim)
+
+
+def _mla_with_cache_fake_impl(
+    q_nope: torch.Tensor,
+    kv_b_proj_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Shared fake implementation for torch.compile tracing."""
+    num_heads = q_nope.shape[2]
+    qk_nope_head_dim = q_nope.shape[-1]
+    out_features = kv_b_proj_weight.shape[0]
+    kv_head_dim = out_features // num_heads
+    v_head_dim = kv_head_dim - qk_nope_head_dim
+    return q_nope.new_empty(
+        q_nope.shape[0],
+        q_nope.shape[1],
+        q_nope.shape[2],
+        v_head_dim,
+    ).contiguous()
+
+
+# =============================================================================
+# Cached MLA attention ops (thin wrappers around _mla_with_cache_impl)
+# =============================================================================
+
+
+@torch.library.custom_op("auto_deploy::trtllm_mla_with_cache", mutates_args=("kv_cache",))
+def trtllm_mla_with_cache(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    kpe: torch.Tensor,
+    kv_b_proj_weight: torch.Tensor,
+    batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
+    seq_len_host: torch.Tensor,
+    input_pos_host: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
+    max_seq_info_host: torch.Tensor,
+    kv_cache: torch.Tensor,
+    scale: Optional[float],
+    kv_lora_rank: int,
+) -> torch.Tensor:
+    """TRT-LLM MLA attention with paged latent cache (post-RoPE inputs)."""
+    return _mla_with_cache_impl(
+        q_nope,
+        q_pe,
+        compressed_kv,
+        kpe,
+        kv_b_proj_weight,
+        batch_info_host,
+        seq_len,
+        seq_len_host,
+        input_pos_host,
+        seq_len_with_cache,
+        max_seq_info_host,
+        kv_cache,
+        scale,
+        kv_lora_rank,
+    )
 
 
 @trtllm_mla_with_cache.register_fake
@@ -1737,22 +1675,7 @@ def trtllm_mla_with_cache_fake(
     kv_lora_rank: int,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
-    num_heads = q_nope.shape[2]
-    qk_nope_head_dim = q_nope.shape[-1]
-    out_features = kv_b_proj_weight.shape[0]
-    kv_head_dim = out_features // num_heads
-    v_head_dim = kv_head_dim - qk_nope_head_dim
-    return q_nope.new_empty(
-        q_nope.shape[0],
-        q_nope.shape[1],
-        q_nope.shape[2],
-        v_head_dim,
-    ).contiguous()
-
-
-# =============================================================================
-# Fused RoPE + MLA cached attention op
-# =============================================================================
+    return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
 
 
 @torch.library.custom_op(
@@ -1775,245 +1698,24 @@ def trtllm_mla_fused_rope_with_cache(
     scale: Optional[float],
     kv_lora_rank: int,
 ) -> torch.Tensor:
-    """TRT-LLM MLA attention with fused RoPE, cache write, and paged latent cache.
-
-    Same as ``trtllm_mla_with_cache`` but receives **pre-RoPE** q_pe/kpe and a
-    ``rotary_cos_sin`` table.  For decode, calls ``mla_rope_generation`` which
-    fuses cache write + RoPE + q_pe copy + scheduler fill into one kernel.
-    For prefill, applies RoPE in Python before SDPA.
-    """
-    b, s = q_nope.shape[:2]
-    num_heads = q_nope.shape[2]
-    qk_nope_head_dim = q_nope.shape[3]
-    qk_rope_head_dim = q_pe.shape[3]
-    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-
-    out_features = kv_b_proj_weight.shape[0]
-    kv_head_dim = out_features // num_heads
-    v_head_dim = kv_head_dim - qk_nope_head_dim
-
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
-    num_tokens = num_prefill_tokens + num_decode
-    max_context_length = int(max_seq_info_host[0])
-    max_num_requests = int(max_seq_info_host[3])
-
-    if scale is None:
-        scale = 1.0 / math.sqrt(qk_head_dim)
-
-    num_kv_heads = 1
-    tokens_per_block = kv_cache.shape[3]
-
-    gen_head_size = kv_lora_rank + qk_rope_head_dim
-
-    planner = _GlobalTrtllmMLAPlanner
-    if planner._tokens_per_block != tokens_per_block:
-        planner._tokens_per_block = tokens_per_block
-    host_kv_cache_pool_pointers = planner.get_pool_pointers_for_layer(kv_cache)
-
-    quant_mode = 0
-    if kv_cache.dtype == torch.float8_e4m3fn:
-        if planner.kv_scale_orig_quant is None:
-            planner.kv_scale_orig_quant = torch.tensor(
-                [1.0], dtype=torch.float32, device=q_nope.device
-            )
-            planner.kv_scale_quant_orig = torch.tensor(
-                [1.0], dtype=torch.float32, device=q_nope.device
-            )
-        quant_mode = int(QuantMode.FP8_KV_CACHE)
-
-    # Flatten using actual tensor dims (see trtllm_mla_with_cache for rationale).
-    bs = b * s
-    q_nope_c = q_nope if q_nope.is_contiguous() else q_nope.contiguous()
-    q_pe_c = q_pe if q_pe.is_contiguous() else q_pe.contiguous()
-    compressed_kv_c = compressed_kv if compressed_kv.is_contiguous() else compressed_kv.contiguous()
-    kpe_c = kpe if kpe.is_contiguous() else kpe.contiguous()
-
-    q_nope_flat = q_nope_c.view(bs, num_heads, qk_nope_head_dim)
-    q_pe_flat = q_pe_c.view(bs, num_heads, qk_rope_head_dim)
-    compressed_kv_flat = compressed_kv_c.view(bs, kv_lora_rank)
-    kpe_flat = kpe_c.view(bs, qk_rope_head_dim)
-
-    if num_decode > 0:
-        planner.ensure_decode_buffers(
-            q_nope.device,
-            max_num_requests,
-            num_heads,
-            num_kv_heads,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            v_head_dim,
-            q_nope.dtype,
-        )
-
-    # Build latent_cache: [num_tokens, kv_lora_rank + qk_rope_head_dim]
-    # For the fused op, kpe is pre-RoPE — mla_rope_generation applies RoPE
-    # to the kpe portion of latent_cache during the cache write.
-    if num_prefill == 0:
-        latent_buf = planner.latent_cache_buf[:num_tokens]
-        torch.cat([compressed_kv_flat[:num_tokens], kpe_flat[:num_tokens]], dim=-1, out=latent_buf)
-        latent_cache = latent_buf
-    else:
-        latent_cache = torch.cat(
-            [compressed_kv_flat[:num_tokens], kpe_flat[:num_tokens]], dim=-1
-        ).contiguous()
-
-    sequence_length = seq_len_with_cache[:num_seq]
-    context_lengths = seq_len[:num_seq]
-    host_past_kv_lengths = planner.host_past_kv_lengths[:num_seq]
-    host_context_lengths = planner.host_context_lengths[:num_seq]
-    host_request_types = planner.host_request_types[:num_seq]
-    host_total_kv_lens = planner.host_total_kv_lens
-    kv_cache_block_offsets = planner.block_offsets
-    host_kv_cache_pool_mapping = planner.host_pool_mapping
-
-    thop_q_scaling = 1.0 / (scale * math.sqrt(qk_head_dim))
-
-    def _make_shared_metadata():
-        return (
-            num_heads,
-            num_kv_heads,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            qk_head_dim,
-            v_head_dim,
-            kv_lora_rank,
-            gen_head_size,
-            tokens_per_block,
-            max_num_requests,
-            max_context_length,
-            thop_q_scaling,
-            quant_mode,
-            sequence_length,
-            context_lengths,
-            host_past_kv_lengths,
-            host_context_lengths,
-            host_request_types,
-            host_total_kv_lens,
-            kv_cache_block_offsets,
-            host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping,
-        )
-
-    def _apply_prefill_rope(q_p, kpe_pre, n_tok, n_pf):
-        """Compute RoPE for prefill tokens; returns (q_pe_rot, kpe_rot)."""
-        positions = torch.arange(n_tok, device=q_p.device, dtype=torch.int32)
-        offset = 0
-        for i in range(n_pf):
-            slen = int(seq_len_host[i])
-            ipos = int(input_pos_host[i])
-            positions[offset : offset + slen] = torch.arange(
-                ipos, ipos + slen, device=q_p.device, dtype=torch.int32
-            )
-            offset += slen
-        return _apply_rope_from_table(q_p, kpe_pre, rotary_cos_sin, positions, qk_rope_head_dim)
-
-    def _do_prefill(q_n, q_p_rot, ckv_pre, kpe_rot, n_pf):
-        """Prefill with already-rotated inputs: dispatch to SDPA."""
-        return _handle_chunked_prefill(
-            q_n,
-            q_p_rot,
-            ckv_pre,
-            kpe_rot,
-            kv_b_proj_weight,
-            num_heads,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            v_head_dim,
-            kv_lora_rank,
-            scale,
-            seq_len_host,
-            input_pos_host,
-            kv_cache,
-            planner.block_ids_per_seq,
-            tokens_per_block,
-            n_pf,
-        )
-
-    def _do_decode(q_n, q_p, lc, n_tok, n_pf):
-        """Decode with fused mla_rope_generation."""
-        return _handle_fused_rope_decode(
-            q_n,
-            q_p,
-            kv_b_proj_weight,
-            lc,
-            kv_cache,
-            rotary_cos_sin,
-            n_tok,
-            n_pf,
-            *_make_shared_metadata(),
-        )
-
-    # Allocate output with bs rows (may include CG padding); only real-token
-    # positions are filled — padding stays zero, matching the FI MLA pattern.
-    y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
-
-    if num_prefill > 0 and num_decode > 0:
-        # Apply RoPE for prefill tokens to get rotated kpe for cache write.
-        q_pe_rot_pf, kpe_rot_pf = _apply_prefill_rope(
-            q_pe_flat[:num_prefill_tokens],
-            kpe_flat[:num_prefill_tokens],
-            num_prefill_tokens,
-            num_prefill,
-        )
-        # Write [compressed_kv | kpe_rotated] to the paged cache so that
-        # decode steps (which read raw cached kpe) see consistent RoPE.
-        latent_for_cache = torch.cat([compressed_kv_flat[:num_prefill_tokens], kpe_rot_pf], dim=-1)
-        _write_latent_cache_to_paged_kv(
-            latent_for_cache,
-            kv_cache,
-            planner.block_ids_per_seq,
-            seq_len_host,
-            input_pos_host,
-            num_prefill,
-            tokens_per_block,
-        )
-        y[:num_prefill_tokens] = _do_prefill(
-            q_nope_flat[:num_prefill_tokens],
-            q_pe_rot_pf,
-            compressed_kv_flat[:num_prefill_tokens],
-            kpe_rot_pf,
-            num_prefill,
-        )
-        y[num_prefill_tokens:num_tokens] = _do_decode(
-            q_nope_flat[num_prefill_tokens:num_tokens],
-            q_pe_flat[num_prefill_tokens:num_tokens],
-            latent_cache[num_prefill_tokens:num_tokens],
-            num_decode,
-            num_prefill,
-        )
-    elif num_prefill > 0:
-        # Apply RoPE for prefill tokens.
-        q_pe_rot_pf, kpe_rot_pf = _apply_prefill_rope(
-            q_pe_flat[:num_tokens], kpe_flat[:num_tokens], num_prefill_tokens, num_prefill
-        )
-        latent_for_cache = torch.cat([compressed_kv_flat[:num_tokens], kpe_rot_pf], dim=-1)
-        _write_latent_cache_to_paged_kv(
-            latent_for_cache,
-            kv_cache,
-            planner.block_ids_per_seq,
-            seq_len_host,
-            input_pos_host,
-            num_prefill,
-            tokens_per_block,
-        )
-        y[:num_tokens] = _do_prefill(
-            q_nope_flat[:num_tokens],
-            q_pe_rot_pf,
-            compressed_kv_flat[:num_tokens],
-            kpe_rot_pf,
-            num_prefill,
-        )
-    else:
-        y[:num_tokens] = _do_decode(
-            q_nope_flat[:num_tokens],
-            q_pe_flat[:num_tokens],
-            latent_cache,
-            num_tokens,
-            0,
-        )
-
-    return y.view(b, s, num_heads, v_head_dim)
+    """TRT-LLM MLA attention with fused RoPE and paged latent cache (pre-RoPE inputs)."""
+    return _mla_with_cache_impl(
+        q_nope,
+        q_pe,
+        compressed_kv,
+        kpe,
+        kv_b_proj_weight,
+        batch_info_host,
+        seq_len,
+        seq_len_host,
+        input_pos_host,
+        seq_len_with_cache,
+        max_seq_info_host,
+        kv_cache,
+        scale,
+        kv_lora_rank,
+        rotary_cos_sin=rotary_cos_sin,
+    )
 
 
 @trtllm_mla_fused_rope_with_cache.register_fake
@@ -2035,17 +1737,7 @@ def trtllm_mla_fused_rope_with_cache_fake(
     kv_lora_rank: int,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
-    num_heads = q_nope.shape[2]
-    qk_nope_head_dim = q_nope.shape[-1]
-    out_features = kv_b_proj_weight.shape[0]
-    kv_head_dim = out_features // num_heads
-    v_head_dim = kv_head_dim - qk_nope_head_dim
-    return q_nope.new_empty(
-        q_nope.shape[0],
-        q_nope.shape[1],
-        q_nope.shape[2],
-        v_head_dim,
-    ).contiguous()
+    return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
 
 
 # =============================================================================
