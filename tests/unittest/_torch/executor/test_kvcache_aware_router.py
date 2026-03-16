@@ -235,8 +235,9 @@ class TestKVCacheAwareADPRouter:
         req = _make_request_item(1, num_tokens=100)
 
         result, _ = router.route_requests(states, [req], max_num_active_requests=10)
-        # score(rank0) = (100-80) + 10*5000 = 50020
-        # score(rank1) = (100-0) + 10*0 = 100
+        # total_load=5000, load_denom=max(5000, 100)=5000
+        # score(rank0) = (100-80) + 10 * (5000/5000 * 100) = 20 + 1000 = 1020
+        # score(rank1) = (100-0)  + 10 * (0/5000 * 100)    = 100 + 0   = 100
         assert len(result[1]) == 1
         assert len(result[0]) == 0
 
@@ -291,10 +292,12 @@ class TestKVCacheAwareADPRouter:
             states, [req_a, req_b, req_c, req_d], max_num_active_requests=10
         )
         # expected_num_active_requests = max((0+4+1)//2, 0) = 2
-        # req_a → rank 0: score(0)=(100-80)+0=20, score(1)=100+0=100
-        #   active_tokens[0] += 20
-        # req_b → rank 0: score(0)=(100-80)+20=40, score(1)=100+0=100
-        #   active_tokens[0] += 20 → 40; rank 0 at capacity (2), removed
+        # req_a → rank 0: total_load=0, load_denom=max(0,100)=100
+        #   score(0)=(100-80)+1.0*(0/100*100)=20, score(1)=100+0=100 → rank0
+        #   active_tokens[0] += 20 → [20, 0]
+        # req_b → rank 0: total_load=20, load_denom=max(20,100)=100
+        #   score(0)=(100-80)+1.0*(20/100*100)=40, score(1)=100+0=100 → rank0
+        #   active_tokens[0] += 20 → [40, 0]; rank0 at capacity (2), removed
         # req_c → rank 1 (only eligible): active_tokens[1] += 100
         # req_d → rank 1: active_tokens[1] += 100
         assert len(result[0]) == 2  # cached requests on rank 0
@@ -373,10 +376,12 @@ class TestKVCacheAwareADPRouter:
         req_b = _make_request_item(2, num_tokens=100)  # no cache
 
         result, _ = router.route_requests(states, [req_a, req_b], max_num_active_requests=10)
-        # req_a → rank 0 (cache hit: 20 effective vs 100)
-        # req_b → rank 1 (rank 0 has 20 tokens, rank 1 has 0; both need 100 prefill)
-        #   score(0) = 100 + 1.0*20 = 120
-        #   score(1) = 100 + 1.0*0 = 100
+        # req_a → rank 0 (cache hit: effective=20 vs 100)
+        #   active_tokens → [20, 0]
+        # req_b → rank 1 (both ranks have 0 cache; rank 0 carries 20 tokens)
+        #   total_load=20, load_denom=max(20,100)=100
+        #   score(rank0) = 100 + 1.0*(20/100*100) = 120
+        #   score(rank1) = 100 + 1.0*(0/100*100)  = 100
         assert len(result[0]) == 1
         assert result[0][0].id == 1
         assert len(result[1]) == 1

@@ -18,10 +18,14 @@ Includes:
 from __future__ import annotations
 
 import heapq
+import logging
+import os
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
@@ -286,9 +290,15 @@ class KVCacheAwareADPRouter(ADPRouter):
     length on each rank. When a request's prefix is already cached on a rank,
     that rank is preferred to avoid redundant prefill computation.
 
-    Scoring: score(rank, request) = effective_tokens + β * rank_active_tokens
-    where effective_tokens = input_tokens - prefix_match_length.
+    Scoring: score(rank, request) = effective_tokens + β * normalized_load
+    where:
+        effective_tokens  = input_tokens - prefix_match_length
+        normalized_load   = rank_active_tokens / max(total_active_tokens, req_tokens) * req_tokens
     Lower score = better rank.
+
+    The load term is normalized by the total active tokens across eligible
+    ranks (floored at req_tokens) so that both terms remain on the same
+    scale regardless of absolute load levels.
 
     Requires a KV cache manager with enable_block_reuse=True and
     probe_prefix_match_length() support (both v1 and v2 managers).
@@ -296,11 +306,21 @@ class KVCacheAwareADPRouter(ADPRouter):
     """
 
     def __init__(self, dist: "Distributed", kv_cache_manager,
-                 load_balance_weight: float = 1.0):
+                 load_balance_weight: float | None = None):
         super().__init__(dist)
         self.kv_cache_manager = kv_cache_manager
-        self.load_balance_weight = load_balance_weight
+        if load_balance_weight is not None:
+            self.load_balance_weight = load_balance_weight
+        else:
+            self.load_balance_weight = float(
+                os.environ.get("TRTLLM_CACHE_ROUTER_BETA", "1.0"))
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+        self._debug = os.environ.get("TRTLLM_CACHE_ROUTER_DEBUG", "0") == "1"
+        self._route_count = 0
+        if self._debug:
+            logger.info(
+                "KVCacheAwareADPRouter: beta=%.3f, debug=True",
+                self.load_balance_weight)
 
     def create_rank_state(
         self,
@@ -351,6 +371,18 @@ class KVCacheAwareADPRouter(ADPRouter):
                 matches[req_id] = rank_data[i + 1]
             self._all_ranks_prefix_matches.append(matches)
 
+    @staticmethod
+    def _prefix_fingerprint(token_ids, num_tokens: int = 64) -> tuple:
+        """Return a hashable fingerprint from the first num_tokens tokens.
+
+        Requests sharing the same fingerprint likely belong to the same
+        conversation / prefix group and benefit from being routed to the
+        same rank.
+        """
+        if not token_ids:
+            return ()
+        return tuple(token_ids[:num_tokens])
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -396,11 +428,19 @@ class KVCacheAwareADPRouter(ADPRouter):
             max(all_ranks_num_active_requests),
         )
 
-        remaining_unscheduled = sorted(
-            remaining_unscheduled,
-            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
-            reverse=True,
-        )
+        # --- Prefix-affinity sorting ---
+        # Sort by prefix fingerprint first (group related requests together),
+        # then by ISL descending within each group.  This ensures that when
+        # request A (conv X, turn 5) is routed to rank R, request B (conv X,
+        # turn 3) is processed next and the load tracker still favours rank R.
+        def _sort_key(req_item):
+            tokens = (getattr(req_item.request, "input_token_ids", [])
+                      if req_item.request else [])
+            fp = self._prefix_fingerprint(tokens)
+            # Negate length so longer requests come first within each group
+            return (fp, -len(tokens))
+
+        remaining_unscheduled = sorted(remaining_unscheduled, key=_sort_key)
 
         eligible_ranks = [
             rank for rank in range(tp_size)
@@ -409,6 +449,10 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         beta = self.load_balance_weight
         prefix_matches = self._all_ranks_prefix_matches
+
+        cache_routed = 0  # requests where cache match influenced routing
+        total_routed = 0
+        total_cache_tokens_saved = 0
 
         for req_item in remaining_unscheduled:
             if not eligible_ranks:
@@ -422,23 +466,61 @@ class KVCacheAwareADPRouter(ADPRouter):
 
             best_rank = eligible_ranks[0]
             best_score = float('inf')
+            best_match = 0
+            max_match = 0
+
+            # --- Normalize load term ---
+            # Normalize each rank's active_tokens by the total load across all
+            # eligible ranks (floored to req_tokens to avoid dividing by ~0).
+            # This makes the load term scale-invariant: a rank carrying 2x the
+            # average load gets a normalized penalty of ~req_tokens regardless
+            # of whether total load is 100 tokens or 100 000 tokens.
+            # Using load_range (max-min) instead caused the penalty to blow up
+            # when all ranks were near-idle (small range, large relative fraction).
+            total_load = sum(all_ranks_num_active_tokens[r] for r in eligible_ranks)
+            load_denom = max(total_load, float(req_tokens))
+
             for rank in eligible_ranks:
                 match_len = (prefix_matches[rank].get(req_id, 0)
                              if rank < len(prefix_matches) else 0)
                 effective = req_tokens - match_len
-                score = effective + beta * all_ranks_num_active_tokens[rank]
+                # Normalized load: maps rank's share of total load to [0, req_tokens]
+                normalized_load = (
+                    all_ranks_num_active_tokens[rank] / load_denom * req_tokens
+                )
+                score = effective + beta * normalized_load
                 if score < best_score:
                     best_score = score
                     best_rank = rank
+                    best_match = match_len
+                if match_len > max_match:
+                    max_match = match_len
+
+            if best_match > 0:
+                cache_routed += 1
+                total_cache_tokens_saved += best_match
+            total_routed += 1
 
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
 
             match_len = (prefix_matches[best_rank].get(req_id, 0)
                          if best_rank < len(prefix_matches) else 0)
-            all_ranks_num_active_tokens[best_rank] += req_tokens - match_len
+            effective_added = req_tokens - match_len
+            all_ranks_num_active_tokens[best_rank] += effective_added
 
             if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
                 eligible_ranks.remove(best_rank)
+
+        if self._debug and total_routed > 0:
+            self._route_count += 1
+            if self._route_count <= 20 or self._route_count % 50 == 0:
+                per_rank_counts = {r: len(reqs)
+                                   for r, reqs in all_ranks_new_requests.items()}
+                logger.info(
+                    "CacheRouter iter=%d: routed=%d cache_influenced=%d "
+                    "cache_tokens_saved=%d per_rank=%s beta=%.3f",
+                    self._route_count, total_routed, cache_routed,
+                    total_cache_tokens_saved, per_rank_counts, beta)
 
         return all_ranks_new_requests, expected_num_active_requests
