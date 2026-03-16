@@ -46,7 +46,8 @@ from tensorrt_llm.inputs.utils import apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
-                                                  ReasoningParserFactory)
+                                                  ReasoningParserFactory,
+                                                  ReasoningParserResult)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
@@ -927,6 +928,7 @@ def _apply_reasoning_parser(
     text: str,
     streaming: bool,
     reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
+    finished: bool = False,
 ) -> Tuple[str, str]:
     reasoning_parser: Optional[BaseReasoningParser] = None
     if reasoning_parser_id is not None:
@@ -946,6 +948,13 @@ def _apply_reasoning_parser(
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
+            if finished:
+                finish_result = reasoning_parser.finish()
+                result = ReasoningParserResult(
+                    content=result.content + finish_result.content,
+                    reasoning_content=result.reasoning_content +
+                    finish_result.reasoning_content,
+                )
         content, reasoning_content = result.content, result.reasoning_content
     else:
         content, reasoning_content = text, ""
@@ -1490,6 +1499,14 @@ def _should_send_done_events(
             should_send_reasoning_done = True
             reasoning_content = full_reasoning
 
+    # No closing tag: reasoning was streamed but re-parse shows everything as
+    # content (no </think> found). Close the reasoning section so the text
+    # section can be properly opened and closed.
+    if not full_reasoning and full_text and finished_generation:
+        if streaming_events_helper and streaming_events_helper.is_reasoning_sent:
+            should_send_reasoning_done = True
+            reasoning_content = full_text
+
     return should_send_reasoning_done, should_send_text_done, reasoning_content, text_content
 
 
@@ -1525,6 +1542,7 @@ def _generate_streaming_event(
         text=delta_text,
         streaming=True,
         reasoning_parser_dict=reasoning_parser_dict,
+        finished=finished_generation,
     )
 
     if delta_text:
@@ -1594,6 +1612,37 @@ def _generate_streaming_event(
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
         streaming_events_helper.is_text_sent = False
+
+    # Handle no-closing-tag case: reasoning was streamed but finish() moved
+    # all accumulated reasoning to content. Emit the full text section
+    # lifecycle (added → delta → done) since the reasoning section was just
+    # closed and generation is finished.
+    if (finished_generation and delta_text and should_send_reasoning_done
+            and not should_send_text_done):
+        streaming_events_helper.is_text_sent = True
+        yield from streaming_events_helper.get_message_output_added_events()
+        yield streaming_events_helper.get_text_delta_event(delta_text, [])
+        text_content_obj = ResponseOutputText(
+            text=delta_text,
+            annotations=[],
+            type="output_text",
+            logprobs=None,
+        )
+        text_item = ResponseOutputMessage(
+            id=streaming_events_helper.item_id,
+            content=[text_content_obj],
+            role="assistant",
+            status="completed",
+            type="message",
+        )
+        yield streaming_events_helper.get_text_done_event(delta_text, [])
+        yield streaming_events_helper.get_content_part_done_event(
+            text_content_obj)
+        yield streaming_events_helper.get_output_item_done_event(text_item)
+        streaming_events_helper.output_index_increment()
+        streaming_events_helper.is_output_item_added_sent = False
+        streaming_events_helper.is_text_sent = False
+        delta_text = ""
 
     # Send delta events for ongoing content
     if delta_text:
