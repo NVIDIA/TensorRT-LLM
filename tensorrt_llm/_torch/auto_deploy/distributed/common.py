@@ -367,9 +367,7 @@ def _join_multiprocess_job(processes, timeout=None):
         p.join(timeout=timeout)
 
         if p.is_alive():
-            ad_logger.warning(
-                f"Process {p.pid} did not exit within {timeout}s, terminating..."
-            )
+            ad_logger.warning(f"Process {p.pid} did not exit within {timeout}s, terminating...")
             p.terminate()
             p.join(timeout=5)
             if p.is_alive():
