@@ -1610,8 +1610,7 @@ public:
     // void removeToken(SizeType32 seqSlotIdx);
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
 
-    [[nodiscard]] virtual GenerationRequest const& getSequence(LlmRequest::RequestIdType requestId) const = 0;
-    [[nodiscard]] virtual GenerationRequest& getSequence(LlmRequest::RequestIdType requestId) = 0;
+    [[nodiscard]] virtual std::shared_ptr<GenerationRequest> getSequence(LlmRequest::RequestIdType requestId) const = 0;
 
     [[nodiscard]] virtual bool isCrossKv() const = 0;
 
@@ -1986,8 +1985,7 @@ public:
     void removeToken(LlmRequest::RequestIdType requestId);
     void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override;
 
-    [[nodiscard]] GenerationRequest const& getSequence(LlmRequest::RequestIdType requestId) const override;
-    [[nodiscard]] GenerationRequest& getSequence(LlmRequest::RequestIdType requestId) override;
+    [[nodiscard]] std::shared_ptr<GenerationRequest> getSequence(LlmRequest::RequestIdType requestId) const override;
 
     [[nodiscard]] bool isCrossKv() const override
     {
@@ -2124,7 +2122,7 @@ private:
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences
-    std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<GenerationRequest>> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
     // Mutex to protect access to mSequences
