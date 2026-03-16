@@ -630,10 +630,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                            tokenizer=self.MODEL_PATH_BF16,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
-            task.NUM_SAMPLES = 100
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
-            task.NUM_SAMPLES = 100
             task.evaluate(llm)
 
     @skip_pre_blackwell
