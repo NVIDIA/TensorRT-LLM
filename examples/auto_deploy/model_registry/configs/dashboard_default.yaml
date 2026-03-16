@@ -13,7 +13,7 @@ transforms:
     stage: post_load_fusion
   insert_cached_mla_attention:
     stage: cache_init
-    backend: trtllm_mla
+    backend: flashinfer_mla
   fuse_rope_into_trtllm_mla:
     stage: cache_init
     enabled: true

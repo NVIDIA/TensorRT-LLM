@@ -608,7 +608,10 @@ class DualModeCapturedGraph(nn.Module):
             result = self.piecewise(*args, num_tokens=bucket, **kwargs)
             ADPiecewiseRunner.set_current_num_tokens(None)
             if bucket > num_tokens:
-                result = tuple(r[:, :num_tokens] if r.ndim >= 2 else r for r in result)
+                result = tuple(
+                    r[:, :num_tokens] if isinstance(r, torch.Tensor) and r.ndim >= 2 else r
+                    for r in result
+                )
             return result
 
         # No bucket large enough -- eager fallback
