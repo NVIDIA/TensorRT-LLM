@@ -358,13 +358,25 @@ def _start_multiprocess_job(
     return processes
 
 
-def _join_multiprocess_job(processes):
+def _join_multiprocess_job(processes, timeout=None):
     if not processes:
         ad_logger.warning("No valid processes")
         return
 
     for p in processes:
-        p.join()
+        p.join(timeout=timeout)
+
+        if p.is_alive():
+            ad_logger.warning(
+                f"Process {p.pid} did not exit within {timeout}s, terminating..."
+            )
+            p.terminate()
+            p.join(timeout=5)
+            if p.is_alive():
+                ad_logger.warning(f"Process {p.pid} still alive after SIGTERM, killing...")
+                p.kill()
+                p.join(timeout=5)
+            continue
 
         # Ensure that all processes have exited successfully.
         # Check exitcode via hasattr rather than isinstance(p, mp.Process), because
@@ -444,8 +456,17 @@ class MultiProcessExecutor:
 
         for i in range(self.world_size):
             self.input_queues[i].put(None)
-        _join_multiprocess_job(self.processes)
+        _join_multiprocess_job(self.processes, timeout=30)
         self.processes = None
+
+        # Drain the output queue before closing to prevent join_thread() from
+        # blocking when the internal buffer feeder thread still holds data.
+        try:
+            while not self.output_queue.empty():
+                self.output_queue.get_nowait()
+        except Exception:
+            pass
+
         for q in self.input_queues:
             q.close()
             q.join_thread()
