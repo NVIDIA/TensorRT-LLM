@@ -343,10 +343,10 @@ TRTLLM_NAMESPACE_END
 // Schema string shared by qkv_preprocessing and kv_cache_postprocessing.
 // clang-format off
 #define QKV_PROCESSING_SCHEMA                          \
-    "Tensor(a!)? qkv_input, "                           \
-    "Tensor? cross_kv_input, "                         \
-    "Tensor(a!)? quantized_qkv_output, "                \
-    "Tensor(a!)? q_output, "                            \
+    "Tensor(a!)? qkv_input, "                          \
+    "Tensor(b!)? cross_kv_input, "                     \
+    "Tensor(c!)? quantized_qkv_output, "               \
+    "Tensor(d!)? q_output, "                           \
     "Tensor? kv_cache_block_offsets, "                 \
     "Tensor? host_kv_cache_pool_pointers, "            \
     "Tensor? host_kv_cache_pool_mapping, "             \
@@ -354,9 +354,9 @@ TRTLLM_NAMESPACE_END
     "Tensor? qkv_scale_quant_orig, "                   \
     "Tensor? qkv_scale_orig_quant, "                   \
     "Tensor? o_scale_orig_quant, "                     \
-    "Tensor(a!)? fmha_bmm1_scale, "                    \
-    "Tensor(a!)? fmha_bmm2_scale, "                    \
-    "Tensor(a!)? fmha_tile_counter, "                   \
+    "Tensor(e!)? fmha_bmm1_scale, "                    \
+    "Tensor(f!)? fmha_bmm2_scale, "                    \
+    "Tensor(g!)? fmha_tile_counter, "                  \
     "Tensor? logn_scaling, "                           \
     "Tensor? tokens_info, "                            \
     "Tensor? seq_lens, "                               \
@@ -415,21 +415,21 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "build_decoder_info("
         "Tensor(a!)? seq_q_offsets, "
-        "Tensor(a!)? seq_kv_offsets, "
-        "Tensor(a!)? padding_offsets, "
-        "Tensor(a!)? tokens_info, "
-        "Tensor(a!)? encoder_padding_offsets, "
-        "Tensor(a!)? packed_mask_row_offsets, "
-        "Tensor(a!)? seq_cp_partial_offsets, "
-        "Tensor(a!)? attention_mask, "
+        "Tensor(b!)? seq_kv_offsets, "
+        "Tensor(c!)? padding_offsets, "
+        "Tensor(d!)? tokens_info, "
+        "Tensor(e!)? encoder_padding_offsets, "
+        "Tensor(f!)? packed_mask_row_offsets, "
+        "Tensor(g!)? seq_cp_partial_offsets, "
+        "Tensor(h!)? attention_mask, "
         "Tensor? seq_q_lengths, "
         "Tensor? seq_kv_lengths, "
-        "Tensor(a!)? fmha_tile_counter, "
+        "Tensor(i!)? fmha_tile_counter, "
         "Tensor? dequant_scale_qkv, "
         "Tensor? quant_scale_o, "
-        "Tensor(a!)? fmha_bmm1_scale, "
-        "Tensor(a!)? fmha_bmm2_scale, "
-        "Tensor(a!)? rotary_embedding_inv_freq, "
+        "Tensor(j!)? fmha_bmm1_scale, "
+        "Tensor(k!)? fmha_bmm2_scale, "
+        "Tensor(l!)? rotary_embedding_inv_freq, "
         "Tensor? rotary_embedding_inv_freq_cache, "
         "int cp_size, "
         "bool separate_qkv_scales, "
