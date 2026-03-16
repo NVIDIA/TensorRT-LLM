@@ -493,6 +493,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         spec_config = SADecodingConfig(
             max_draft_len=4,
             max_matching_ngram_size=-1,  # longest match via suffix automaton
+            enable_global_pool=True,
         )
 
         with LLM(model=self.MODEL_PATH,

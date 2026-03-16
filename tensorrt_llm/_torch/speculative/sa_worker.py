@@ -298,6 +298,11 @@ class SAWorker(SpecWorkerBase):
                 max_ngram_size=self._max_matching_ngram_size,
             )
 
+        # Gate draft tokens by match_len: zero out rows where no match was found,
+        # so stale or uninitialized draft tokens are never used (CUDA graph safe).
+        mask = (match_len > 0).unsqueeze(1).to(draft_tokens.dtype)
+        draft_tokens = draft_tokens * mask
+
         return draft_tokens  # [batch_size, max_draft_len] GPU tensor
 
 

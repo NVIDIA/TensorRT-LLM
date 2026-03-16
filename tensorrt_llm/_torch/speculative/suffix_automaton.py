@@ -18,6 +18,7 @@ compatible operations.
 """
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
@@ -31,6 +32,9 @@ from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 
 logger = logging.getLogger(__name__)
+
+
+_DEFAULT_POOL_SIZE = 64
 
 
 @dataclass
@@ -48,6 +52,24 @@ class SAConfig:
 
     # Enable global pool search across all active SA states
     enable_global_pool: bool = False
+
+    # Explicit global pool size (None = use default heuristic)
+    global_pool_size: Optional[int] = None
+
+    @property
+    def effective_pool_size(self) -> int:
+        """Actual number of SA slots to allocate.
+
+        When global pool is enabled but no explicit size is given,
+        defaults to max(_DEFAULT_POOL_SIZE, max_slots) — a fixed-size
+        pool independent of batch size, floored to at least max_slots
+        so there's always room for the full batch.
+        """
+        if self.global_pool_size is not None:
+            return self.global_pool_size
+        if self.enable_global_pool:
+            return max(_DEFAULT_POOL_SIZE, self.max_slots)
+        return self.max_slots
 
 
 class SuffixAutomatonManager(BaseResourceManager):
@@ -88,6 +110,7 @@ class SuffixAutomatonManager(BaseResourceManager):
                 max_slots=max_num_requests,
                 threshold=getattr(config, "sa_spec_threshold", 4),
                 enable_global_pool=getattr(config, "enable_global_pool", False),
+                global_pool_size=getattr(config, "global_pool_size", None),
             )
         )
 
@@ -96,21 +119,28 @@ class SuffixAutomatonManager(BaseResourceManager):
         self.max_seq_len = sa_config.max_seq_len
         self.enable_global_pool = sa_config.enable_global_pool
 
+        # Pool sizing: effective_pool_size returns max_num_requests when
+        # global pool is off, or max(64, max_num_requests) / explicit
+        # value when on. All slot-indexed sizing uses pool_size.
+        self.pool_size = sa_config.effective_pool_size
+        assert self.pool_size >= max_num_requests, (
+            f"global_pool_size ({self.pool_size}) must be >= max_batch_size ({max_num_requests})"
+        )
+
         # Calculate per-state size based on max_seq_len
         self.state_size = _sa_native.get_state_size(self.max_seq_len)
 
-        # Log memory usage
-        total_memory_mb = max_num_requests * self.state_size / 1024 / 1024
         logger.info(
-            f"Allocating {max_num_requests} SA slots with max_seq_len={self.max_seq_len} "
-            f"({self.state_size / 1024 / 1024:.1f} MB/slot, {total_memory_mb:.1f} MB total)"
+            f"SA pool: {self.pool_size} slots "
+            f"({self.pool_size - max_num_requests} retained capacity, "
+            f"{self.pool_size * self.state_size / 1024 / 1024:.1f} MB total)"
         )
 
         # Request ID -> slot index mapping
         self._request_to_slot: Dict[int, int] = {}
 
-        # Free slots for reuse
-        self._free_slots: List[int] = list(range(max_num_requests))
+        # Free slots now range over the full pool
+        self._free_slots: List[int] = list(range(self.pool_size))
 
         # Host-side SA states as pinned memory tensors
         self._host_states_native: Dict[int, torch.Tensor] = {}
@@ -136,10 +166,20 @@ class SuffixAutomatonManager(BaseResourceManager):
         # Track which requests have been initialized (for prepare_resources)
         self._initialized_requests: Set[int] = set()
 
-        # Reserved slot for CUDA graph dummy requests — shared by all dummies
-        # so they never consume slots from the real pool.
-        self._dummy_slot_index: int = max_num_requests
+        # Dummy slot lives right after the pool — always use pool_size,
+        # not max_num_requests, so dummies never collide with pool slots.
+        self._dummy_slot_index: int = self.pool_size
         self._dummy_request_ids: Set[int] = set()
+
+        # Retained slots: completed requests whose SA states remain in the
+        # pool for cross-request search. OrderedDict preserves insertion
+        # (completion) order for FIFO eviction.
+        #   key: slot index
+        #   value: original request_id (for debugging/logging)
+        self._retained_slots: OrderedDict[int, int] = OrderedDict()
+
+        # Track which slots have active (in-flight) requests.
+        self._active_slots: Set[int] = set()
 
     def _ensure_workspace(self, max_draft_len: int):
         """Ensure GPU workspace is allocated with sufficient capacity.
@@ -151,7 +191,7 @@ class SuffixAutomatonManager(BaseResourceManager):
             ValueError: If called with max_draft_len larger than previously allocated.
         """
         if not self._workspace_allocated:
-            # First allocation - create all buffers
+            # Batch-indexed buffers: sized to max_num_requests (max batch size)
             self._gpu_match_len = torch.zeros(
                 (self.max_num_requests,), dtype=torch.int32, device="cuda"
             )
@@ -169,16 +209,14 @@ class SuffixAutomatonManager(BaseResourceManager):
                 (self.max_num_requests,), dtype=torch.int32, device="cuda"
             )
 
-            # Allocate one extra slot beyond max_num_requests for the shared
-            # CUDA graph dummy (slot index = max_num_requests).
-            self._gpu_slots = _sa_native.allocate_workspace(
-                self.max_num_requests + 1, self.max_seq_len
-            )
+            # Slot-indexed buffers: pool_size + 1 (pool slots + dummy slot).
+            # When global pool is off, pool_size == max_num_requests.
+            self._gpu_slots = _sa_native.allocate_workspace(self.pool_size + 1, self.max_seq_len)
 
             # Global pool buffers
             if self.enable_global_pool:
                 self._gpu_active_slot_mask = torch.zeros(
-                    (self.max_num_requests + 1,), dtype=torch.int32, device="cuda"
+                    (self.pool_size + 1,), dtype=torch.int32, device="cuda"
                 )
                 self._gpu_match_slot = torch.zeros(
                     (self.max_num_requests,), dtype=torch.int32, device="cuda"
@@ -359,7 +397,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         _sa_native.invoke_extend(
             batch_size,
             max_draft_len,
-            self.max_num_requests + 1,
+            self.pool_size + 1,
             self.max_seq_len,
             self._gpu_slots,
             self._gpu_batch_indices[:batch_size],
@@ -419,7 +457,7 @@ class SuffixAutomatonManager(BaseResourceManager):
             batch_size,
             max_draft_len,
             max_ngram_size,
-            self.max_num_requests + 1,
+            self.pool_size + 1,
             self.max_seq_len,
             self._gpu_slots,
             self._gpu_batch_indices[:batch_size],
@@ -476,7 +514,7 @@ class SuffixAutomatonManager(BaseResourceManager):
             batch_size,
             max_draft_len,
             max_ngram_size,
-            self.max_num_requests + 1,
+            self.pool_size + 1,
             self.max_seq_len,
             self._gpu_slots,
             self._gpu_batch_indices[:batch_size],
@@ -513,7 +551,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         """Add dummy requests for CUDA graph padding.
 
         Dummy requests are mapped to a single reserved slot
-        (index = max_num_requests) that lives outside the real slot pool.
+        (index = pool_size) that lives outside the real slot pool.
         This prevents CUDA graph padding from exhausting slots that real
         requests need.
 
@@ -533,8 +571,10 @@ class SuffixAutomatonManager(BaseResourceManager):
             torch.cuda.synchronize()
 
         self._request_to_slot.clear()
-        self._free_slots = list(range(self.max_num_requests))
+        self._free_slots = list(range(self.pool_size))
         self._dummy_request_ids.clear()
+        self._retained_slots.clear()
+        self._active_slots.clear()
 
         self._host_states_native.clear()
         self._pending_copies.clear()

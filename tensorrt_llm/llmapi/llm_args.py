@@ -1209,14 +1209,37 @@ class SADecodingConfig(DecodingBaseConfig):
         "Limitations: at most 1024 concurrent slots; suffix matching is "
         "capped at 64 tokens per request.")
 
+    global_pool_size: Optional[int] = Field(
+        default=None,
+        description="Number of SA slots in the global pool. "
+        "When None and enable_global_pool=True, defaults to "
+        "max(64, max_batch_size) — a fixed-size pool independent of batch size. "
+        "When set explicitly, must be >= max_batch_size. "
+        "Completed requests' SA states are retained in the pool for "
+        "cross-request search until the pool is full, at which point "
+        "the oldest completed request is evicted. "
+        "Only effective when enable_global_pool=True.")
+
     @model_validator(mode='after')
     def validate_sa_config(self):
         if self.max_matching_ngram_size == 0:
             raise ValueError(
                 "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
                 "Got 0.")
+        if self.enable_global_pool and self.max_matching_ngram_size not in (
+                -1, ) and not (1 <= self.max_matching_ngram_size <= 64):
+            raise ValueError(
+                "max_matching_ngram_size must be -1 (longest match) or in [1, 64] "
+                "when enable_global_pool is True. "
+                f"Got {self.max_matching_ngram_size}.")
         if self.max_draft_len is None or self.max_draft_len <= 0:
             raise ValueError("max_draft_len must be > 0 for SA")
+        if self.global_pool_size is not None:
+            if self.global_pool_size < 1:
+                raise ValueError("global_pool_size must be >= 1")
+            if not self.enable_global_pool:
+                raise ValueError(
+                    "global_pool_size requires enable_global_pool=True")
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
