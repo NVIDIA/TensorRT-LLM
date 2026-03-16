@@ -185,7 +185,7 @@ class TestVisualGenArgsPickle:
 
 
 # =============================================================================
-# Batch Generation Input Parsing (TRTLLM-11362)
+# Batch Generation Input Parsing
 # =============================================================================
 
 
