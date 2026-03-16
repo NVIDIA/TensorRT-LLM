@@ -1,18 +1,18 @@
 from torch import nn
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
-
+from tensorrt_llm.logger import logger
 
 # Register Qwen3_5Moe configs, TODO: Remove this once we have a proper transformers package
 from transformers import AutoConfig, PretrainedConfig  # isort: skip
 
+
 class Qwen3_5MoeTextConfig(PretrainedConfig):
     model_type = "qwen3_5_moe_text"
     base_config_key = "text_config"
-    
+
     def __init__(
         self,
         tie_word_embeddings=False,
@@ -20,14 +20,16 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
+
 class Qwen3_5MoeVisionConfig(PretrainedConfig):
     model_type = "qwen3_5_moe"
     base_config_key = "vision_config"
 
+
 class Qwen3_5MoeConfig(PretrainedConfig):
     model_type = "qwen3_5_moe"
     sub_configs = {"vision_config": Qwen3_5MoeVisionConfig, "text_config": Qwen3_5MoeTextConfig}
-    
+
     def __init__(
         self,
         text_config=None,
@@ -47,10 +49,11 @@ class Qwen3_5MoeConfig(PretrainedConfig):
 
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
+
 logger.warning_once(
     "transformers version below 5.1.0 does not support 'Qwen3_5MoeConfig'. "
     "Register Qwen3_5MoeConfig to mimic the Qwen3_5Moe model.",
-    key="QWEN3_5_MOE_REGISTER_WARNING"
+    key="QWEN3_5_MOE_REGISTER_WARNING",
 )
 AutoConfig.register(Qwen3_5MoeTextConfig.model_type, Qwen3_5MoeTextConfig)
 AutoConfig.register(Qwen3_5MoeConfig.model_type, Qwen3_5MoeConfig)
@@ -61,7 +64,7 @@ AutoConfig.register(Qwen3_5MoeConfig.model_type, Qwen3_5MoeConfig)
 class Qwen3_5MoeHfWeightMapper(Qwen3_5HfWeightMapper):
     def is_special_instance_module(self, module: nn.Module) -> bool:
         return isinstance(module, MoE)
-    
+
     def handle_special_instance_module(
         self,
         module: nn.Module,
@@ -77,19 +80,22 @@ class Qwen3_5MoeHfWeightMapper(Qwen3_5HfWeightMapper):
                     weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
                     break
             module.weight_loading_mode = weight_loading_mode
-            
+
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
                 if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                    new_weight_name = weight_name.replace(
-                        "gate_proj", "w1").replace("up_proj",
-                                                "w3").replace("down_proj", "w2")
+                    new_weight_name = (
+                        weight_name.replace("gate_proj", "w1")
+                        .replace("up_proj", "w3")
+                        .replace("down_proj", "w2")
+                    )
                     new_weight_value = weight_value
                 elif weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                     new_weight_name = weight_name
-                    # NOTE: transpose the weights, check the FusedMoEMethodBase in fused_moe/quantization.py, 
-                    #   the load_expert_weights_to_dst function, "elif weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ" line
-                    # Note that Qwen3VLMoE has the same weight loading mode, but the weights are not transposed, 
+                    # NOTE: transpose the weights, check the FusedMoEMethodBase in fused_moe/quantization.py,
+                    #   the load_expert_weights_to_dst function,
+                    #   "elif weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ" line
+                    # Note that Qwen3VLMoE has the same weight loading mode, but the weights are not transposed,
                     #   because the HF weights layout are different
                     new_weight_value = weight_value.transpose(-2, -1).contiguous()
                 else:
@@ -97,7 +103,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3_5HfWeightMapper):
                         f"Unsupported weight loading mode in MoE: {weight_loading_mode}"
                     )
                 updated_module_weights[new_weight_name] = new_weight_value
-            
+
             module.load_weights(
                 weights=[updated_module_weights], allow_partial_loading=allow_partial_loading
             )

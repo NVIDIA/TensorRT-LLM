@@ -25,8 +25,8 @@ from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_mla,
     is_nemotron_hybrid,
-    is_qwen3_next,
     is_qwen3_5,
+    is_qwen3_next,
     load_pretrained_config,
 )
 from tensorrt_llm._torch.pyexecutor.model_loader import (
@@ -649,7 +649,11 @@ class Runner:
         )
         kwargs = {}
 
-        if is_nemotron_hybrid(pretrained_config) or is_qwen3_next(pretrained_config) or is_qwen3_5(pretrained_config):
+        if (
+            is_nemotron_hybrid(pretrained_config)
+            or is_qwen3_next(pretrained_config)
+            or is_qwen3_5(pretrained_config)
+        ):
             # Please refer to `tensorrt_llm/_torch/models/modeling_qwen3_next.py` for the magic number chunk_size=128
             mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests,

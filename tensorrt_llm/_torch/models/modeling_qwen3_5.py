@@ -1,11 +1,10 @@
 import copy
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
-import os
 
 import torch
 import torch.nn as nn
-import triton
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN as HF_ACT2FN
 
@@ -30,16 +29,16 @@ except (ImportError, ModuleNotFoundError):
     )
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
-from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import \
-    fused_sigmoid_gating_delta_rule_update
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
+from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import use_cpp_mamba_cache_manager
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import nvtx_range, nvtx_range_debug
+from ..._utils import nvtx_range, nvtx_range_debug, prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -56,22 +55,27 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
-from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams)
+from ..distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    MoEAllReduce,
+    MoEAllReduceParams,
+)
+from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
+from ..modules.gated_mlp import GatedMLP
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
-from ..modules.mlp import MLP
-from ..modules.gated_mlp import GatedMLP
-from ..modules.rotary_embedding import MRotaryEmbedding
-from ..modules.decoder_layer import DecoderLayer
 from ..modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from ..modules.mamba.layernorm_gated import RMSNorm as RMSNormGated
+from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.embedding import Embedding
+from ..modules.rotary_embedding import MRotaryEmbedding
+from ..utils import EventType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5HfWeightMapper, Qwen3_5TextConfig
-from ..utils import EventType
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
@@ -80,27 +84,28 @@ from .modeling_multimodal_utils import (
 )
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
 from .modeling_qwen3 import Qwen3Attention
-from .modeling_qwen3_next import divide, fused_gdn_gating, fused_qkvzba_split_reshape_cat
+from .modeling_qwen3_next import divide, fused_gdn_gating
+from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
+    DecoderModel,
+    EagerFusionConfig,
     ModelConfig,
     QuantConfig,
+    SpecMetadata,
     _load_weights_impl,
     filter_weights,
     register_auto_model,
     register_vision_encoder,
-    EagerFusionConfig,
-    DecoderModel,
-    SpecMetadata,
 )
-from .modeling_speculative import SpecDecOneEngineForCausalLM
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
-
-    def __init__(self,
-                 model_config: ModelConfig[Qwen3_5TextConfig],
-                 aux_stream: torch.cuda.Stream,
-                 layer_idx: Optional[int] = None):
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3_5TextConfig],
+        aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
+    ):
         super().__init__()
         config = model_config.pretrained_config
         self.model_config = model_config
@@ -148,11 +153,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=model_config.get_quant_config(),
             reduce_output=False,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False)
+            use_cute_dsl_blockscaling_mm=False,
+        )
 
         self.in_proj_qkv = Linear(
             self.hidden_size,
@@ -163,11 +168,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=model_config.get_quant_config(),
             reduce_output=False,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False)
+            use_cute_dsl_blockscaling_mm=False,
+        )
         self.in_proj_z = Linear(
             self.hidden_size,
             self.value_dim,
@@ -177,11 +182,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=model_config.get_quant_config(),
             reduce_output=False,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False)
+            use_cute_dsl_blockscaling_mm=False,
+        )
         self.in_proj_b = Linear(
             self.hidden_size,
             self.num_v_heads,
@@ -191,11 +196,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=model_config.get_quant_config(),
             reduce_output=False,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False)
+            use_cute_dsl_blockscaling_mm=False,
+        )
         self.in_proj_a = Linear(
             self.hidden_size,
             self.num_v_heads,
@@ -205,11 +210,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=model_config.get_quant_config(),
             reduce_output=False,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False)
+            use_cute_dsl_blockscaling_mm=False,
+        )
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
@@ -221,8 +226,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             requires_grad=False,
         )
 
-        A = torch.empty(divide(self.num_v_heads, self.attn_tp_size),
-                        dtype=torch.float32).uniform_(0, 16)
+        A = torch.empty(divide(self.num_v_heads, self.attn_tp_size), dtype=torch.float32).uniform_(
+            0, 16
+        )
         self.A_log = nn.Parameter(
             torch.log(A),
             requires_grad=False,
@@ -249,16 +255,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=model_config.get_quant_config(),
             reduce_output=True,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False)
+            use_cute_dsl_blockscaling_mm=False,
+        )
 
-        self.event_dict = {
-            key: torch.cuda.Event()
-            for key in [EventType.Main, EventType.Attention]
-        }
+        self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
         self.aux_stream = aux_stream
 
     def forward_decode(
@@ -285,15 +288,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Direct slicing instead of torch.split for better performance
         key_size = self.key_dim // self.attn_tp_size
         query = mixed_qkv[..., :key_size]
-        key = mixed_qkv[..., key_size:key_size * 2]
-        value = mixed_qkv[..., key_size * 2:]
+        key = mixed_qkv[..., key_size : key_size * 2]
+        value = mixed_qkv[..., key_size * 2 :]
         # Reshape from [l, h*d] to [1, l, h, d]
         seq_len = query.shape[0]
         num_heads = query.shape[1] // self.head_k_dim
         query = query.view(1, seq_len, num_heads, self.head_k_dim)
         key = key.view(1, seq_len, num_heads, self.head_k_dim)
-        value = value.view(1, seq_len, value.shape[1] // self.head_v_dim,
-                           self.head_v_dim)
+        value = value.view(1, seq_len, value.shape[1] // self.head_v_dim, self.head_v_dim)
 
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
@@ -337,10 +339,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         if num_decode_tokens > 0:
-            mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv,
-                                                   seqlen_split_size,
-                                                   dim=0)
-            query_start_loc_p = query_start_loc[:num_prefill + 1]
+            mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv, seqlen_split_size, dim=0)
+            query_start_loc_p = query_start_loc[: num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
 
             mixed_qkv_p = causal_conv1d_fn(
@@ -372,7 +372,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 conv_states=conv_states_to_use,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
-                query_start_loc=query_start_loc).transpose(0, 1)
+                query_start_loc=query_start_loc,
+            ).transpose(0, 1)
 
         key_split_dim = self.key_dim // self.attn_tp_size
         value_split_dim = self.value_dim // self.attn_tp_size
@@ -411,8 +412,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
-        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype,
-                                                       copy=False)
+        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
         ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
@@ -431,7 +431,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # # Set up dimensions for reshapes later
         seq_len, _ = hidden_states.shape
-        conv_state, recurrent_state = None, None
+        # conv_state, recurrent_state = None, None
 
         ### mamba2_mixer layer
         # calculate split size
@@ -446,32 +446,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if use_cpp_mamba_cache_manager():
             state_indices = mamba_metadata.state_indices[:batch_size]
         else:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-            )[:batch_size]
+            state_indices = attn_metadata.kv_cache_manager.get_state_indices()[:batch_size]
 
-        state_indices_p, state_indices_d = torch.split(state_indices,
-                                                       batch_split_size)
-        conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-            self.layer_idx)
-        ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-            self.layer_idx)
+        state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
+        conv_states = attn_metadata.kv_cache_manager.get_conv_states(self.layer_idx)
+        ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(self.layer_idx)
         if num_prefills > 0:
-            ssm_states[state_indices_p] = torch.zeros((),
-                                                      dtype=ssm_states.dtype,
-                                                      device=ssm_states.device)
-        
+            ssm_states[state_indices_p] = torch.zeros(
+                (), dtype=ssm_states.dtype, device=ssm_states.device
+            )
+
         def _compute_projected_states_qkv():
             return self.in_proj_qkv(hidden_states)
 
         def _compute_projected_states_z():
             return self.in_proj_z(hidden_states)
-        
+
         def _compute_projected_states_b():
             return self.in_proj_b(hidden_states)
 
         def _compute_projected_states_a():
             return self.in_proj_a(hidden_states)
-        
+
         mixed_qkv, z = maybe_execute_in_parallel(
             _compute_projected_states_qkv,
             _compute_projected_states_z,
@@ -522,7 +518,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
 
 class Qwen3_5LinearDecoderLayer(DecoderLayer):
-
     def __init__(
         self,
         model_config: ModelConfig[Qwen3_5TextConfig],
@@ -532,8 +527,7 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
-        self.linear_attn = Qwen3_5GatedDeltaNet(model_config, aux_stream,
-                                                  layer_idx)
+        self.linear_attn = Qwen3_5GatedDeltaNet(model_config, aux_stream, layer_idx)
 
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
@@ -547,36 +541,44 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
             config=model_config,
         )
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype,
-                                       use_gemma=True)
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
 
-        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                                eps=config.rms_norm_eps,
-                                                dtype=config.torch_dtype,
-                                                use_gemma=True)
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = AllReduce(
+            mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+        )
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
         ### TODO: enable eager_fusion by default
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_5_EAGER_FUSION_DISABLED", "1") == "0"
+        self.enable_fusion = os.environ.get("TRTLLM_QWEN3_5_EAGER_FUSION_DISABLED", "1") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
-        self.fusion_config.PRE_MOE_FUSION = False  # the fusion kernel does not support gemmaNorm yet
+        self.fusion_config.PRE_MOE_FUSION = (
+            False  # the fusion kernel does not support gemmaNorm yet
+        )
         self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
-        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
-                                       or self.mapping.tp_size == 1
-                                       or self.enable_attention_dp)
+        self.disable_attn_allreduce = (
+            self.fusion_config.PRE_MOE_FUSION
+            or self.mapping.tp_size == 1
+            or self.enable_attention_dp
+        )
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
@@ -591,8 +593,7 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        if spec_metadata is not None and spec_metadata.is_layer_capture(
-                self.layer_idx):
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
         # Linear Attention
         ### FIXME: 1. forward_batch; 2. allreduce
@@ -600,9 +601,9 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
             hidden_states = self.linear_attn(
                 hidden_states,
                 attn_metadata,
-                all_reduce_params=AllReduceParams(
-                    enable_allreduce=not self.disable_attn_allreduce),
-                **kwargs)
+                all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
+                **kwargs,
+            )
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -611,27 +612,31 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                    enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
-                                          or self.mapping.tp_size == 1),
-                ))
+                    enable_allreduce=not (
+                        self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
+                    ),
+                ),
+            )
         else:
             # No fusion
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        do_finalize = not (
+            hidden_states.shape[0] <= self.moe_allreduce.max_token
+            and self.fusion_config.POST_MOE_FUSION
+            and self.model_config.moe_backend == "TRTLLM"
+            and self.mlp.experts.has_nvfp4
+        )
 
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
+                enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                )
+            ),
             do_finalize=do_finalize,
         )
         if self.fusion_config.POST_MOE_FUSION:
@@ -643,11 +648,12 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+                    ),
+                )
             else:
-                assert len(
-                    hidden_states
-                ) == 3, f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                assert len(hidden_states) == 3, (
+                    f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                )
 
                 fc2_output = hidden_states[0]
                 expert_scale_factor = hidden_states[1]
@@ -663,33 +669,37 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
                     is_cutlass_min_latency=False,
                 )
                 hidden_states, residual = self.moe_allreduce(
-                    fc2_output, all_reduce_params=moe_all_reduce_params)
+                    fc2_output, all_reduce_params=moe_all_reduce_params
+                )
 
         else:
             if spec_metadata and spec_metadata.is_layer_capture(self.layer_idx):
-                spec_metadata.maybe_capture_hidden_states(
-                    self.layer_idx, hidden_states, residual)
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+                hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
         return hidden_states, residual
 
 
 class Qwen3_5Attention(Qwen3Attention):
-
-    def __init__(self, model_config: ModelConfig[Qwen3_5TextConfig],
-                 layer_idx: int, fuse_qk_norm_rope: bool):
-        super().__init__(model_config,
-                         layer_idx,
-                         fuse_qk_norm_rope=fuse_qk_norm_rope,
-                         attn_output_gate=True,
-                         use_gemma_rms_norm=True)
+    def __init__(
+        self, model_config: ModelConfig[Qwen3_5TextConfig], layer_idx: int, fuse_qk_norm_rope: bool
+    ):
+        super().__init__(
+            model_config,
+            layer_idx,
+            fuse_qk_norm_rope=fuse_qk_norm_rope,
+            attn_output_gate=True,
+            use_gemma_rms_norm=True,
+        )
 
 
 class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
-
-    def __init__(self, model_config: ModelConfig[Qwen3_5TextConfig],
-                 layer_idx: int, aux_stream: torch.cuda.Stream):
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3_5TextConfig],
+        layer_idx: int,
+        aux_stream: torch.cuda.Stream,
+    ):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
@@ -711,24 +721,28 @@ class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
             config=model_config,
         )
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype,
-                                       use_gemma=True)
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
 
-        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                                eps=config.rms_norm_eps,
-                                                dtype=config.torch_dtype,
-                                                use_gemma=True)
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = AllReduce(
+            mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+        )
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()
@@ -737,9 +751,11 @@ class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
-        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
-                                       or self.mapping.tp_size == 1
-                                       or self.enable_attention_dp)
+        self.disable_attn_allreduce = (
+            self.fusion_config.PRE_MOE_FUSION
+            or self.mapping.tp_size == 1
+            or self.enable_attention_dp
+        )
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
@@ -751,12 +767,10 @@ class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        if spec_metadata is not None and spec_metadata.is_layer_capture(
-                self.layer_idx):
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
 
         # Self Attention
@@ -764,8 +778,7 @@ class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_attn_allreduce),
+            all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
 
@@ -777,25 +790,28 @@ class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                ))
+                ),
+            )
         else:
             # No fusion
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        do_finalize = not (
+            hidden_states.shape[0] <= self.moe_allreduce.max_token
+            and self.fusion_config.POST_MOE_FUSION
+            and self.model_config.moe_backend == "TRTLLM"
+            and self.mlp.experts.has_nvfp4
+        )
 
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
+                enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                )
+            ),
             do_finalize=do_finalize,
         )
 
@@ -808,11 +824,12 @@ class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+                    ),
+                )
             else:
-                assert len(
-                    hidden_states
-                ) == 3, f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                assert len(hidden_states) == 3, (
+                    f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                )
 
                 fc2_output = hidden_states[0]
                 expert_scale_factor = hidden_states[1]
@@ -828,15 +845,14 @@ class Qwen3_5FullAttentionDecoderLayer(DecoderLayer):
                     is_cutlass_min_latency=False,
                 )
                 hidden_states, residual = self.moe_allreduce(
-                    fc2_output, all_reduce_params=moe_all_reduce_params)
+                    fc2_output, all_reduce_params=moe_all_reduce_params
+                )
 
         else:
             if spec_metadata and spec_metadata.is_layer_capture(self.layer_idx):
-                spec_metadata.maybe_capture_hidden_states(
-                    self.layer_idx, hidden_states, residual)
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+                hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -848,7 +864,6 @@ ALL_DECODER_LAYER_TYPES = {
 
 
 class Qwen3_5TextModel(DecoderModel):
-
     def __init__(self, model_config: ModelConfig[Qwen3_5TextConfig]):
         super().__init__(model_config)
         config = self.model_config
@@ -866,9 +881,11 @@ class Qwen3_5TextModel(DecoderModel):
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
             # So, we don't do parallelism here.
-            self.embed_tokens = Embedding(pretrained_config.vocab_size,
-                                          pretrained_config.hidden_size,
-                                          dtype=pretrained_config.torch_dtype)
+            self.embed_tokens = Embedding(
+                pretrained_config.vocab_size,
+                pretrained_config.hidden_size,
+                dtype=pretrained_config.torch_dtype,
+            )
         else:
             self.embed_tokens = Embedding(
                 pretrained_config.vocab_size,
@@ -879,13 +896,16 @@ class Qwen3_5TextModel(DecoderModel):
                 gather_output=True,
             )
 
-        self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[pretrained_config.layer_types[layer_idx]](
-                model_config,
-                layer_idx,
-                self.aux_stream,
-            ) for layer_idx in range(pretrained_config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                ALL_DECODER_LAYER_TYPES[pretrained_config.layer_types[layer_idx]](
+                    model_config,
+                    layer_idx,
+                    self.aux_stream,
+                )
+                for layer_idx in range(pretrained_config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
@@ -911,7 +931,8 @@ class Qwen3_5TextModel(DecoderModel):
         mamba_metadata = attn_metadata.mamba_metadata
         if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
             attn_metadata.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests, chunk_size=128)
+                attn_metadata.max_num_requests, chunk_size=128
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -925,14 +946,13 @@ class Qwen3_5TextModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
-                mamba_metadata=mamba_metadata)
+                mamba_metadata=mamba_metadata,
+            )
         return hidden_states
 
 
 @register_auto_model("Qwen3_5ForCausalLM")
-class Qwen3_5ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3_5TextModel,
-                                                       Qwen3_5TextConfig]):
-
+class Qwen3_5ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3_5TextModel, Qwen3_5TextConfig]):
     def __init__(
         self,
         model_config: ModelConfig[Qwen3_5TextConfig],
@@ -943,18 +963,22 @@ class Qwen3_5ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3_5TextModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper, params_map: Optional[Dict[str, str]] = None):
+    def load_weights(
+        self,
+        weights: dict,
+        weight_mapper: BaseWeightMapper,
+        params_map: Optional[Dict[str, str]] = None,
+    ):
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(new_weights, weight_mapper, params_map=params_map)
 
     def post_load_weights(self):
-        for idx, layer in enumerate(
-                self.model.layers[:self.config.num_hidden_layers]):
+        for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
             else:
-                layer.next_layer_layernorm = self.model.layers[
-                    idx + 1].input_layernorm
+                layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
+
 
 class Qwen3_5InputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     def __init__(
@@ -1615,7 +1639,7 @@ class Qwen3_5VisionModel(torch.nn.Module):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
         batch_size = len(seq_lens)
         prompt_lens = seq_lens
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.num_contexts = batch_size
@@ -1812,11 +1836,14 @@ class Qwen3_5ModelBase(PreTrainedModel):
         disable_fuse_rope = kwargs.get("disable_fuse_rope", False)
         model_config.pretrained_config.text_config.disable_fuse_rope = disable_fuse_rope
         # Be compatible with transformers version 4.xx, need to set rope_scaling
-        # TODO: May need to remove this once we have a proper transformers package, and correectly deal with rope_scaling & rope_parameters
+        # TODO: May need to remove this once we have a proper transformers package,
+        #   and correctly deal with rope_scaling & rope_parameters
         if not hasattr(model_config.pretrained_config.text_config, "rope_scaling"):
             if not hasattr(model_config.pretrained_config.text_config, "rope_parameters"):
                 raise ValueError("rope_scaling or rope_parameters must be set")
-            model_config.pretrained_config.text_config.rope_scaling = model_config.pretrained_config.text_config.rope_parameters
+            model_config.pretrained_config.text_config.rope_scaling = (
+                model_config.pretrained_config.text_config.rope_parameters
+            )
         model_config.pretrained_config.text_config.rope_scaling["type"] = "mrope"
         config = model_config.pretrained_config
 
@@ -1837,15 +1864,17 @@ class Qwen3_5ModelBase(PreTrainedModel):
         else:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
         # Qwen3_5ForCausalLM.
-        # NOTE: correcting module names for quantization exclude modules, 
+        # NOTE: correcting module names for quantization exclude modules,
         # otherwise the weights will not be loaded correctly with expected dtype
         if llm_model_config.quant_config.exclude_modules:
-            exclude_modules = [name.replace("model.language_model.", "model.").replace("model.visual.", "") \
-                for name in llm_model_config.quant_config.exclude_modules]
+            exclude_modules = [
+                name.replace("model.language_model.", "model.").replace("model.visual.", "")
+                for name in llm_model_config.quant_config.exclude_modules
+            ]
             llm_model_config.quant_config.exclude_modules = exclude_modules
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        # NOTE: need to use deepcopy to avoid modifying the original model_config, 
+        # NOTE: need to use deepcopy to avoid modifying the original model_config,
         # e.g. we reset self.model_config.quant_config in Qwen3_5VisionModelBase __init__
         vison_model_config = copy.deepcopy(model_config)
         if not _is_disagg():

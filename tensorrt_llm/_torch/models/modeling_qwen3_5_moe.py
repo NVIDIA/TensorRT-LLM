@@ -1,5 +1,5 @@
-from typing import Dict, List, Optional
 import os
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,6 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
-
 from ...inputs import (
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
@@ -17,36 +16,42 @@ from ...inputs import (
     support_multimodal_disaggregated,
 )
 from ..attention_backend import AttentionMetadata
-from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+from ..distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    MoEAllReduce,
+    MoEAllReduceParams,
+    allgather,
+)
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.rms_norm import RMSNorm
 from ..modules.embedding import Embedding
-from ..modules.linear import Linear, TensorParallelMode
 from ..modules.fused_moe import RoutingMethodType, TRTLLMGenFusedMoE, create_moe
 from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.rms_norm import RMSNorm
+from ..utils import AuxStreamType, EventType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_moe_weight_mapper import Qwen3_5MoeHfWeightMapper, Qwen3_5MoeTextConfig
-from ..utils import AuxStreamType, EventType
 from .modeling_qwen3_5 import (
     Qwen3_5Attention,
     Qwen3_5GatedDeltaNet,
-    Qwen3_5VisionModel,
-    Qwen3_5VisionModelBase,
     Qwen3_5InputProcessorBase,
     Qwen3_5ModelBase,
+    Qwen3_5VisionModel,
+    Qwen3_5VisionModelBase,
 )
 from .modeling_qwen3_next import Qwen3NextGate
-from .modeling_utils import (
-    ModelConfig, 
-    register_auto_model, 
-    register_vision_encoder, 
-    DecoderModel, 
-    SpecMetadata,
-    EagerFusionConfig,
-)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import (
+    DecoderModel,
+    EagerFusionConfig,
+    ModelConfig,
+    SpecMetadata,
+    register_auto_model,
+    register_vision_encoder,
+)
 
 
 class Qwen3_5MoeGate(Qwen3NextGate):
@@ -54,7 +59,6 @@ class Qwen3_5MoeGate(Qwen3NextGate):
 
 
 class Qwen3_5SparseMoeBlock(nn.Module):
-
     def __init__(
         self,
         model_config: ModelConfig[Qwen3_5MoeTextConfig],
@@ -70,8 +74,9 @@ class Qwen3_5SparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = AllReduce(
+            mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+        )
         self.aux_stream = aux_stream
 
         self.gate = Qwen3_5MoeGate(
@@ -95,26 +100,21 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
         )
-        
+
         self.shared_expert = GatedMLP(
             hidden_size=self.hidden_dim,
             intermediate_size=config.shared_expert_intermediate_size,
-            bias=config.mlp_bias if hasattr(config, 'mlp_bias') else False,
+            bias=config.mlp_bias if hasattr(config, "mlp_bias") else False,
             dtype=config.torch_dtype,
             config=model_config,
             reduce_output=False,
         )
 
-        self.shared_expert_gate = Linear(self.hidden_dim,
-                                         1,
-                                         bias=False,
-                                         dtype=config.torch_dtype,
-                                         quant_config=None)
+        self.shared_expert_gate = Linear(
+            self.hidden_dim, 1, bias=False, dtype=config.torch_dtype, quant_config=None
+        )
 
-        self.event_dict = {
-            key: torch.cuda.Event()
-            for key in [EventType.Main, EventType.MoeShared]
-        }
+        self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
 
     def forward(
         self,
@@ -131,15 +131,13 @@ class Qwen3_5SparseMoeBlock(nn.Module):
 
         if not do_finalize:
             # TODO: support do_finalize == False
-            raise NotImplementedError(
-                "do_finalize == False is not supported yet")
+            raise NotImplementedError("do_finalize == False is not supported yet")
 
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             if isinstance(self.experts, TRTLLMGenFusedMoE):
-                hidden_states = allgather(hidden_states,
-                                          self.mapping,
-                                          dim=0,
-                                          sizes=all_rank_num_tokens)
+                hidden_states = allgather(
+                    hidden_states, self.mapping, dim=0, sizes=all_rank_num_tokens
+                )
 
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
@@ -154,8 +152,9 @@ class Qwen3_5SparseMoeBlock(nn.Module):
 
         def _compute_shared_output():
             shared_expert_output = self.shared_expert(hidden_states)
-            shared_expert_output = F.sigmoid(
-                self.shared_expert_gate(hidden_states)) * shared_expert_output
+            shared_expert_output = (
+                F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+            )
             return shared_expert_output
 
         final_hidden_states, shared_expert_output = maybe_execute_in_parallel(
@@ -172,13 +171,13 @@ class Qwen3_5SparseMoeBlock(nn.Module):
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(
-                final_hidden_states, all_reduce_params=all_reduce_params)
+                final_hidden_states, all_reduce_params=all_reduce_params
+            )
 
         return final_hidden_states.view(orig_shape)
 
 
 class Qwen3_5MoeLinearDecoderLayer(DecoderLayer):
-
     def __init__(
         self,
         model_config: ModelConfig[Qwen3_5MoeTextConfig],
@@ -188,46 +187,51 @@ class Qwen3_5MoeLinearDecoderLayer(DecoderLayer):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
-        self.linear_attn = Qwen3_5GatedDeltaNet(model_config, aux_stream,
-                                                  layer_idx)
+        self.linear_attn = Qwen3_5GatedDeltaNet(model_config, aux_stream, layer_idx)
 
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3_5SparseMoeBlock(model_config,
-                                           aux_stream,
-                                           layer_idx=layer_idx)
+        self.mlp = Qwen3_5SparseMoeBlock(model_config, aux_stream, layer_idx=layer_idx)
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype,
-                                       use_gemma=True)
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
 
-        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                                eps=config.rms_norm_eps,
-                                                dtype=config.torch_dtype,
-                                                use_gemma=True)
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = AllReduce(
+            mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+        )
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
         ### TODO: enable eager_fusion by default
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_5_EAGER_FUSION_DISABLED", "1") == "0"
+        self.enable_fusion = os.environ.get("TRTLLM_QWEN3_5_EAGER_FUSION_DISABLED", "1") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
-        self.fusion_config.PRE_MOE_FUSION = False  # the fusion kernel does not support gemmaNorm yet
+        self.fusion_config.PRE_MOE_FUSION = (
+            False  # the fusion kernel does not support gemmaNorm yet
+        )
         self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
-        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
-                                       or self.mapping.tp_size == 1
-                                       or self.enable_attention_dp)
+        self.disable_attn_allreduce = (
+            self.fusion_config.PRE_MOE_FUSION
+            or self.mapping.tp_size == 1
+            or self.enable_attention_dp
+        )
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
@@ -242,8 +246,7 @@ class Qwen3_5MoeLinearDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        if spec_metadata is not None and spec_metadata.is_layer_capture(
-                self.layer_idx):
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
         # Linear Attention
         ### FIXME: 1. forward_batch; 2. allreduce
@@ -251,9 +254,9 @@ class Qwen3_5MoeLinearDecoderLayer(DecoderLayer):
             hidden_states = self.linear_attn(
                 hidden_states,
                 attn_metadata,
-                all_reduce_params=AllReduceParams(
-                    enable_allreduce=not self.disable_attn_allreduce),
-                **kwargs)
+                all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
+                **kwargs,
+            )
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -262,27 +265,31 @@ class Qwen3_5MoeLinearDecoderLayer(DecoderLayer):
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                    enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
-                                          or self.mapping.tp_size == 1),
-                ))
+                    enable_allreduce=not (
+                        self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
+                    ),
+                ),
+            )
         else:
             # No fusion
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        do_finalize = not (
+            hidden_states.shape[0] <= self.moe_allreduce.max_token
+            and self.fusion_config.POST_MOE_FUSION
+            and self.model_config.moe_backend == "TRTLLM"
+            and self.mlp.experts.has_nvfp4
+        )
 
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
+                enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                )
+            ),
             do_finalize=do_finalize,
         )
         if self.fusion_config.POST_MOE_FUSION:
@@ -294,11 +301,12 @@ class Qwen3_5MoeLinearDecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+                    ),
+                )
             else:
-                assert len(
-                    hidden_states
-                ) == 3, f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                assert len(hidden_states) == 3, (
+                    f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                )
 
                 fc2_output = hidden_states[0]
                 expert_scale_factor = hidden_states[1]
@@ -314,22 +322,24 @@ class Qwen3_5MoeLinearDecoderLayer(DecoderLayer):
                     is_cutlass_min_latency=False,
                 )
                 hidden_states, residual = self.moe_allreduce(
-                    fc2_output, all_reduce_params=moe_all_reduce_params)
+                    fc2_output, all_reduce_params=moe_all_reduce_params
+                )
 
         else:
             if spec_metadata and spec_metadata.is_layer_capture(self.layer_idx):
-                spec_metadata.maybe_capture_hidden_states(
-                    self.layer_idx, hidden_states, residual)
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+                hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
         return hidden_states, residual
 
 
 class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
-
-    def __init__(self, model_config: ModelConfig[Qwen3_5MoeTextConfig],
-                 layer_idx: int, aux_stream: torch.cuda.Stream):
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3_5MoeTextConfig],
+        layer_idx: int,
+        aux_stream: torch.cuda.Stream,
+    ):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
@@ -342,28 +352,30 @@ class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3_5SparseMoeBlock(model_config,
-                                           aux_stream,
-                                           layer_idx=layer_idx)
+        self.mlp = Qwen3_5SparseMoeBlock(model_config, aux_stream, layer_idx=layer_idx)
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype,
-                                       use_gemma=True)
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
 
-        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                                eps=config.rms_norm_eps,
-                                                dtype=config.torch_dtype,
-                                                use_gemma=True)
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = AllReduce(
+            mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+        )
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()
@@ -372,9 +384,11 @@ class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
-        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
-                                       or self.mapping.tp_size == 1
-                                       or self.enable_attention_dp)
+        self.disable_attn_allreduce = (
+            self.fusion_config.PRE_MOE_FUSION
+            or self.mapping.tp_size == 1
+            or self.enable_attention_dp
+        )
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
@@ -386,12 +400,10 @@ class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        if spec_metadata is not None and spec_metadata.is_layer_capture(
-                self.layer_idx):
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
 
         # Self Attention
@@ -399,8 +411,7 @@ class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_attn_allreduce),
+            all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
 
@@ -412,25 +423,28 @@ class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
-                ))
+                ),
+            )
         else:
             # No fusion
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        do_finalize = not (
+            hidden_states.shape[0] <= self.moe_allreduce.max_token
+            and self.fusion_config.POST_MOE_FUSION
+            and self.model_config.moe_backend == "TRTLLM"
+            and self.mlp.experts.has_nvfp4
+        )
 
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
+                enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                )
+            ),
             do_finalize=do_finalize,
         )
 
@@ -443,11 +457,12 @@ class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+                    ),
+                )
             else:
-                assert len(
-                    hidden_states
-                ) == 3, f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                assert len(hidden_states) == 3, (
+                    f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+                )
 
                 fc2_output = hidden_states[0]
                 expert_scale_factor = hidden_states[1]
@@ -463,15 +478,14 @@ class Qwen3_5MoeFullAttentionDecoderLayer(DecoderLayer):
                     is_cutlass_min_latency=False,
                 )
                 hidden_states, residual = self.moe_allreduce(
-                    fc2_output, all_reduce_params=moe_all_reduce_params)
+                    fc2_output, all_reduce_params=moe_all_reduce_params
+                )
 
         else:
             if spec_metadata and spec_metadata.is_layer_capture(self.layer_idx):
-                spec_metadata.maybe_capture_hidden_states(
-                    self.layer_idx, hidden_states, residual)
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+                hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -483,7 +497,6 @@ ALL_DECODER_LAYER_TYPES = {
 
 
 class Qwen3_5MoeTextModel(DecoderModel):
-
     def __init__(self, model_config: ModelConfig[Qwen3_5MoeTextConfig]):
         super().__init__(model_config)
         config = self.model_config
@@ -501,9 +514,11 @@ class Qwen3_5MoeTextModel(DecoderModel):
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
             # So, we don't do parallelism here.
-            self.embed_tokens = Embedding(pretrained_config.vocab_size,
-                                          pretrained_config.hidden_size,
-                                          dtype=pretrained_config.torch_dtype)
+            self.embed_tokens = Embedding(
+                pretrained_config.vocab_size,
+                pretrained_config.hidden_size,
+                dtype=pretrained_config.torch_dtype,
+            )
         else:
             self.embed_tokens = Embedding(
                 pretrained_config.vocab_size,
@@ -514,13 +529,16 @@ class Qwen3_5MoeTextModel(DecoderModel):
                 gather_output=True,
             )
 
-        self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[pretrained_config.layer_types[layer_idx]](
-                model_config,
-                layer_idx,
-                self.aux_stream,
-            ) for layer_idx in range(pretrained_config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                ALL_DECODER_LAYER_TYPES[pretrained_config.layer_types[layer_idx]](
+                    model_config,
+                    layer_idx,
+                    self.aux_stream,
+                )
+                for layer_idx in range(pretrained_config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
@@ -546,7 +564,8 @@ class Qwen3_5MoeTextModel(DecoderModel):
         mamba_metadata = attn_metadata.mamba_metadata
         if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
             attn_metadata.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests, chunk_size=128)
+                attn_metadata.max_num_requests, chunk_size=128
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -560,14 +579,13 @@ class Qwen3_5MoeTextModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
-                mamba_metadata=mamba_metadata)
+                mamba_metadata=mamba_metadata,
+            )
         return hidden_states
 
 
 @register_auto_model("Qwen3_5MoeForCausalLM")
-class Qwen3_5MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3_5MoeTextModel,
-                                                       Qwen3_5MoeTextConfig]):
-
+class Qwen3_5MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3_5MoeTextModel, Qwen3_5MoeTextConfig]):
     def __init__(
         self,
         model_config: ModelConfig[Qwen3_5MoeTextConfig],
@@ -578,18 +596,21 @@ class Qwen3_5MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3_5MoeTextModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper, params_map: Optional[Dict[str, str]] = None):
+    def load_weights(
+        self,
+        weights: dict,
+        weight_mapper: BaseWeightMapper,
+        params_map: Optional[Dict[str, str]] = None,
+    ):
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(new_weights, weight_mapper, params_map=params_map)
 
     def post_load_weights(self):
-        for idx, layer in enumerate(
-                self.model.layers[:self.config.num_hidden_layers]):
+        for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
             else:
-                layer.next_layer_layernorm = self.model.layers[
-                    idx + 1].input_layernorm
+                layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
 
 
 # NOTE: this is technically not strictly necessary, since the underlying mechanism for registering

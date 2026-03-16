@@ -3,20 +3,21 @@ from typing import Union
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
 
 # Register Qwen3_5 configs, TODO: Remove this once we have a proper transformers package
 from transformers import AutoConfig, PretrainedConfig  # isort: skip
 
+
 class Qwen3_5TextConfig(PretrainedConfig):
     model_type = "qwen3_5_text"
     base_config_key = "text_config"
-    
+
     def __init__(
         self,
         tie_word_embeddings=False,
@@ -24,14 +25,16 @@ class Qwen3_5TextConfig(PretrainedConfig):
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
+
 class Qwen3_5VisionConfig(PretrainedConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
 
+
 class Qwen3_5Config(PretrainedConfig):
     model_type = "qwen3_5"
     sub_configs = {"vision_config": Qwen3_5VisionConfig, "text_config": Qwen3_5TextConfig}
-    
+
     def __init__(
         self,
         text_config=None,
@@ -51,10 +54,11 @@ class Qwen3_5Config(PretrainedConfig):
 
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
+
 logger.warning_once(
     "transformers version below 5.1.0 does not support 'Qwen3_5Config'. "
     "Register Qwen3_5Config to mimic the Qwen3_5 model.",
-    key="QWEN3_5_REGISTER_WARNING"
+    key="QWEN3_5_REGISTER_WARNING",
 )
 AutoConfig.register(Qwen3_5TextConfig.model_type, Qwen3_5TextConfig)
 AutoConfig.register(Qwen3_5Config.model_type, Qwen3_5Config)
@@ -76,12 +80,12 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
             raise TypeError(f"Unexpected config class {type(config).__name__}.")
 
         return config.hidden_size // num_heads
-    
-    def init_model_and_config(self, model: Union[nn.Module,
-                                                 DecoderModelForCausalLM],
-                              config: ModelConfig):
+
+    def init_model_and_config(
+        self, model: Union[nn.Module, DecoderModelForCausalLM], config: ModelConfig
+    ):
         super().init_model_and_config(model, config)
-        
+
     @property
     def _num_kv_heads(self) -> int:
         config = self._model.config
@@ -104,25 +108,27 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
             return True
         return super().should_skip_module(module_name)
 
-    def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
-                              weights: dict):
+    def _duplicate_kv_weights(self, module: nn.Module, new_name: str, weights: dict):
         tensors_to_duplicate = ["weight", "bias"]
         if module.quant_config.quant_mode.has_nvfp4():
             tensors_to_duplicate.append("weight_scale")
         if module.quant_config.quant_mode.has_fp8_block_scales():
             tensors_to_duplicate.append("weight_scale_inv")
 
-        if new_name in ['k_proj', 'v_proj']:
-            num_kv_heads_list = [self._num_kv_heads
-                                 ] * len(weights) if isinstance(
-                                     self._num_kv_heads,
-                                     int) else self._num_kv_heads
+        if new_name in ["k_proj", "v_proj"]:
+            num_kv_heads_list = (
+                [self._num_kv_heads] * len(weights)
+                if isinstance(self._num_kv_heads, int)
+                else self._num_kv_heads
+            )
             processed_weights = {
-                k:
-                self._duplicate_kv(weight=v[:],
-                                   num_kv_heads=num_kv_heads_list[i],
-                                   tensor_parallel_size=self._tp_size)
-                if k in tensors_to_duplicate else v
+                k: self._duplicate_kv(
+                    weight=v[:],
+                    num_kv_heads=num_kv_heads_list[i],
+                    tensor_parallel_size=self._tp_size,
+                )
+                if k in tensors_to_duplicate
+                else v
                 for i, (k, v) in enumerate(weights.items())
             }
             return processed_weights
@@ -131,12 +137,12 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
 
     def preprocess_weights(self, weights: dict) -> dict:
         # To process the language_model part of qwen3_5
-        
+
         # NOTE: A_log, dt_bias, conv1d, in_proj_qkv processed blow are all linear attention weights,
         # for attention dp, we do not need to reorder these weights
         if self.config.mapping.enable_attention_dp:
             return weights
-            
+
         config = self.config.pretrained_config
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
@@ -157,11 +163,11 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
                 new_weights[key] = w
             elif "conv1d" in key or "in_proj_qkv" in key:
                 # Note: Qwen3-Next use in_proj_qkvz, in_proj_ba in HF ckpt,
-                # and Qwen3.5 use seperate in_proj_qkv, in_proj_z, in_proj_b, in_proj_a in HF ckpt
-                # Qwen3-Next and Qwen3.5 have different qkv_proj layout, 
+                # and Qwen3.5 use separate in_proj_qkv, in_proj_z, in_proj_b, in_proj_a in HF ckpt
+                # Qwen3-Next and Qwen3.5 have different qkv_proj layout,
                 # we have to reorder the in_proj_qkv weight of Qwen3.5
                 # Refer: https://github.com/vllm-project/vllm/blob/9e19f8338b4098047175ca3119d5ae0368bcf24a/vllm/model_executor/models/qwen3_next.py#L407
-                
+
                 w = weights[name]
                 # removing dim(1) because we are using Linear to store conv1d weights
                 if "conv1d.weight" in key:
@@ -173,12 +179,17 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
                 # The split dims should be divided by 128, which is the dim 0 of weight block size (128, 128)
                 if "in_proj_qkv.weight_scale_inv" in key:
                     if self.config.quant_config.quant_mode.has_fp8_block_scales():
-                        split_dims = [linear_key_dim // 128, linear_key_dim // 128, linear_value_dim // 128]
+                        split_dims = [
+                            linear_key_dim // 128,
+                            linear_key_dim // 128,
+                            linear_value_dim // 128,
+                        ]
                     else:
-                        raise ValueError(f"Unexpected quantization {self.config.quant_config.quant_algo} for in_proj_qkv, currently only support FP8 block quantization for in_proj_qkv")
-                q, k, v = torch.split(
-                    w, split_dims,
-                    dim=0)
+                        raise ValueError(
+                            f"Unexpected quantization {self.config.quant_config.quant_algo} for in_proj_qkv, \
+                                currently only support FP8 block quantization for in_proj_qkv"
+                        )
+                q, k, v = torch.split(w, split_dims, dim=0)
 
                 w = []
                 for rank in range(tp_size):
@@ -191,5 +202,5 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
                 new_weights[key] = w
             else:
                 new_weights[key] = weights[name]
-        
+
         return new_weights

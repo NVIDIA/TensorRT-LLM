@@ -29,13 +29,13 @@ from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
+from .modeling_qwen3_5 import Qwen3_5Model
+from .modeling_qwen3_5_moe import Qwen3_5MoeModel
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
 from .modeling_qwen3vl_moe import Qwen3MoeVLModel
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
-from .modeling_qwen3_5 import Qwen3_5Model
-from .modeling_qwen3_5_moe import Qwen3_5MoeModel
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_starcoder2 import Starcoder2ForCausalLM
