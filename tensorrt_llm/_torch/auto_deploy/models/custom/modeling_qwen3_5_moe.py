@@ -1025,6 +1025,7 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         self.head_dim = self.dim // self.num_heads
         self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
         self.proj = nn.Linear(self.dim, self.dim)
+        self.scaling = self.head_dim**-0.5
 
     def forward(
         self,

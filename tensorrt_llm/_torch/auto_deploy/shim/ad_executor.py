@@ -845,10 +845,6 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
-        self.cache_seq_interface.info._store_extra_arg(
-            "batch_info", [torch.tensor(batch_info, dtype=torch.int32)]
-        )
-
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
         ):

@@ -13,7 +13,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache import 
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[7]
+    return Path(__file__).resolve().parents[6]
 
 
 def test_initialize_qwen_mrope_delta_cache_registers_state_resource():
@@ -45,7 +45,7 @@ def test_initialize_qwen_mrope_delta_cache_disabled_in_default_config():
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    assert config["initialize_qwen_mrope_delta_cache"]["enabled"] is False
+    assert config["transforms"]["initialize_qwen_mrope_delta_cache"]["enabled"] is False
 
 
 def test_qwen_registry_configs_explicitly_enable_mrope_delta_cache():

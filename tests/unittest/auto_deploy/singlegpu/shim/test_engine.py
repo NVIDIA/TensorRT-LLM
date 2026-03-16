@@ -275,7 +275,7 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     req.py_multimodal_data = None
 
     scheduled_requests = ScheduledRequests()
-    scheduled_requests.context_requests.append(req)
+    scheduled_requests.context_requests_last_chunk.append(req)
 
     engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
 
@@ -328,7 +328,7 @@ def test_ad_engine_skips_multimodal_runtime_metadata_when_no_multimodal_requests
     req = _DummyRequest(tokens=[1, 2, 3, 4], begin=0, size=4, seq_slot=0)
 
     scheduled_requests = ScheduledRequests()
-    scheduled_requests.context_requests.append(req)
+    scheduled_requests.context_requests_last_chunk.append(req)
 
     engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
 
