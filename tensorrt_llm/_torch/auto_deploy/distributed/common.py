@@ -4,6 +4,7 @@ import atexit
 import os
 import socket
 import sys
+from queue import Empty
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -460,9 +461,9 @@ class MultiProcessExecutor:
         # Drain the output queue before closing to prevent join_thread() from
         # blocking when the internal buffer feeder thread still holds data.
         try:
-            while not self.output_queue.empty():
+            while True:
                 self.output_queue.get_nowait()
-        except Exception:
+        except Empty:
             pass
 
         for q in self.input_queues:
