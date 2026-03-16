@@ -1,5 +1,5 @@
 metadata:
-  model_name: kimi-k2-thinking-fp4
+  model_name: k2_thinking_fp4
   precision: fp4
   model_dir_name: Kimi-K2-Thinking-NVFP4
   supported_gpus:
