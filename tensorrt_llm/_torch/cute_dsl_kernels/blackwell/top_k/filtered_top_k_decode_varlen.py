@@ -118,8 +118,8 @@ class ComputeDynamicCTAOffsets:
 
         # Block-wide inclusive prefix sum
         prefix_ctas, _ = block_prefix_sum_kernel(
-            ctas, s_warp_sums, tidx,
-            self.NUM_THREADS, num_warps, barrier_id=1)
+            ctas, s_warp_sums, tidx, self.NUM_THREADS, num_warps, barrier_id=1
+        )
 
         # Write exclusive prefix sum (shifted by 1)
         if tidx == 0:
@@ -517,7 +517,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             work_remaining = task_id < num_rows
             while work_remaining:
                 if tidx == 0:
-                    s_row_id[0] = atomicAdd(g_global_counter.iterator, cutlass.Int32(1)) + grid_size_x
+                    s_row_id[0] = (
+                        atomicAdd(g_global_counter.iterator, cutlass.Int32(1)) + grid_size_x
+                    )
                 cute.arch.barrier()
 
                 row_id = s_row_id[0]
@@ -722,7 +724,6 @@ def cute_dsl_topk_wrapper(
             seqlen_fake,
             output_indices_fake,
             output_values_fake,
-
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,  # TODO: do we need this one?
@@ -755,7 +756,6 @@ def cute_dsl_topk_wrapper(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-
     )
     return output_indices_torch, output_values_torch
 
@@ -856,7 +856,6 @@ def cute_dsl_topk_multi_cta_wrapper(
             # output_values_fake,
             first_kernel_output_indices_fake,
             first_kernel_output_values_fake,
-
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
@@ -902,7 +901,6 @@ def cute_dsl_topk_multi_cta_wrapper(
             seqlen_fake,
             output_indices_fake,
             output_values_fake,
-
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
@@ -947,7 +945,6 @@ def cute_dsl_topk_multi_cta_wrapper(
         seq_lens,
         first_kernel_output_indices_torch,
         first_kernel_output_values_torch,
-
     )
 
     compiled_kernel_second(
@@ -958,7 +955,6 @@ def cute_dsl_topk_multi_cta_wrapper(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-
     )
     return output_indices_torch, output_values_torch
 
@@ -1096,7 +1092,6 @@ def run_filtered_topk_decode(
         seqlen_fake,
         output_indices_fake,
         output_values_fake,
-
         stream=fake_stream,
         enable_persistent_dynamic_scheduling=load_balance,
         # TODO: confirm this parameter.
@@ -1147,7 +1142,6 @@ def run_filtered_topk_decode(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-
     )
 
     if do_ref_check and top_k <= max_num_cols and return_val:

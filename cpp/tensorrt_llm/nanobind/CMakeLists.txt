@@ -21,6 +21,7 @@ set(SRCS
     runtime/bindings.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
+    suffixAutomaton/bindings.cpp
     testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp

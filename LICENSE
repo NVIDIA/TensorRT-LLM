@@ -20,6 +20,14 @@ Copyright (c) 2024, Tri Dao.
 Licensed under the BSD 3-Clause License
 
 --------------------------------------------------------------------------------
+flash-attention
+--------------------------------------------------------------------------------
+Original Source: https://github.com/Dao-AILab/flash-attention/
+Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
+Licensed under the BSD 3-Clause License
+The AUTHORS file is available at `tensorrt_llm/_torch/visual_gen/jit_kernels/flash_attention/cute/AUTHORS`
+
+--------------------------------------------------------------------------------
 flash-linear-attention
 --------------------------------------------------------------------------------
 Original Source: https://github.com/fla-org/flash-linear-attention
@@ -33,6 +41,16 @@ Original Source: https://github.com/declare-lab/instruct-eval
 Copyright (c) 2020 Dan Hendrycks
 Copyright (c) 2023 Deep Cognition and Language Research (DeCLaRe) Lab
 Licensed under the MIT License
+
+--------------------------------------------------------------------------------
+LTX-2
+--------------------------------------------------------------------------------
+Original Source: https://github.com/Lightricks/LTX-2
+Copyright (c) 2025-2026 Lightricks Ltd.
+Licensed under the LTX-2 Community License Agreement
+
+The LTX-2 Community License Agreement applies only to use of the code in the
+`tensorrt_llm/_torch/visual_gen/models/ltx2/` directory of this project.
 
 --------------------------------------------------------------------------------
 Mamba
@@ -54,6 +72,13 @@ SGLang
 --------------------------------------------------------------------------------
 Original Source: https://github.com/sgl-project/sglang
 Copyright contributors to the SGLang project
+Licensed under the Apache License 2.0
+
+--------------------------------------------------------------------------------
+Suffix Automaton Speculative Decoding
+--------------------------------------------------------------------------------
+Original Source: https://github.com/basetenlabs/sa_spec
+Copyright 2025 Baseten
 Licensed under the Apache License 2.0
 
 --------------------------------------------------------------------------------
@@ -340,3 +365,389 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+                     LTX-2 Community License Agreement
+================================================================================
+
+LTX-2 Community License Agreement
+License date: January 5, 2026
+
+
+By using or distributing any portion or element of LTX-2, you agree
+to be bound by this Agreement.
+
+1. Definitions.
+
+"Agreement" means the terms and conditions for the license, use,
+reproduction, and distribution of LTX-2 and the Complementary
+Materials, as specified in this document.
+
+"Control" means the direct or indirect ownership of more than
+fifty percent (50%) of the voting securities or other ownership
+interests, or the power to direct the management and policies of
+such Entity through voting rights, contract, or otherwise.
+
+"Data" means a collection of information and/or content extracted
+from the dataset used with LTX-2, including to train, pretrain,
+or otherwise evaluate LTX-2. The Data is not licensed under this
+Agreement.
+
+"Derivatives of LTX-2" means all modifications to LTX-2, works
+based on LTX-2, or any other model which is created or initialized
+by transfer of patterns of the weights, parameters, activations or
+output of LTX-2, to the other model, in order to cause the other
+model to perform similarly to LTX-2, including – but not limited
+to - distillation methods entailing the use of intermediate data
+representations or methods based on the generation of synthetic
+data by LTX-2 for training the other model. For clarity, Derivatives
+of LTX-2 include: (i) any fine-tuned or adapted weights, parameters,
+or checkpoints derived from LTX-2; (ii) derivative model architectures
+that incorporate or are based upon LTX-2's architecture; and
+(iii) any modified or extended versions of the Complementary
+Materials. All intellectual property rights in Derivatives of LTX-2
+shall be subject to the terms of this Agreement, and you may not
+claim exclusive ownership rights in any Derivatives of LTX-2 that
+would restrict the rights granted herein.
+
+"Entity" means any individual, corporation, partnership, limited
+liability company, or other legal entity. For purposes of this
+Agreement, an Entity shall be deemed to include, on an aggregative
+basis, all subsidiaries, affiliates, and other companies under
+common Control with such Entity. When determining whether an Entity
+meets any threshold under this Agreement (including revenue
+thresholds), all subsidiaries, affiliates, and companies under
+common Control shall be considered collectively.
+
+"Harm" includes but is not limited to physical, mental,
+psychological, financial and reputational damage, pain, or loss.
+
+"Licensor" or "Lightricks" means the owner that is granting the
+license under this Agreement. For the purposes of this Agreement,
+the Licensor is Lightricks Ltd.
+
+"LTX-2" means the large language models, text/image/video/audio/3D
+generation models, and multimodal large language models and their
+software and algorithms, including trained model weights, parameters
+(including optimizer states), machine-learning model code,
+inference-enabling code, training-enabling code, fine-tuning
+enabling code, accompanying source code, scripts, documentation,
+tutorials, examples, and all other elements of the foregoing
+distributed and made publicly available by Lightricks (including,
+for example, at https://github.com/Lightricks/LTX-2) for the LTX-2
+model released on January 5, 2026. This license is applicable to
+all LTX-2 versions released since January 5, 2026, and all future
+releases of LTX-2 under this license.
+
+"Output" means the results of operating LTX-2 as embodied in
+informational content resulting therefrom.
+
+"you" (or "your") means an individual or legal Entity licensing
+LTX-2 in accordance with this Agreement and/or making use of LTX-2
+for whichever purpose and in any field of use, including usage of
+LTX-2 in an end-use application - e.g. chatbot, translator, image
+generator.
+
+2. Grant of License. Subject to the terms and conditions of this
+Agreement, you are granted a non-exclusive, worldwide,
+non-transferable and royalty-free limited license under Licensor's
+intellectual property or other rights owned by Licensor embodied
+in LTX-2 to use, reproduce, prepare, distribute, publicly display,
+publicly perform, sublicense, copy, create derivative works of,
+and make modifications to LTX-2, for any purpose, subject to the
+restrictions set forth in Attachment A; provided however, that
+Entities with annual revenues of at least $10,000,000 (the
+"Commercial Entities") are required to obtain a paid commercial
+use license in order to use LTX-2 and Derivatives of LTX-2,
+subject to the terms and provisions of a different license (the
+"Commercial Use Agreement"), as will be provided by the Licensor.
+Commercial Entities interested in such a commercial license are
+required to [contact Licensor](https://ltx.io/model/licensing).
+Any commercial use of LTX-2 or Derivatives of LTX-2 by the
+Commercial Entities not in accordance with this Agreement and/or
+the Commercial Use Agreement is strictly prohibited and shall be
+deemed a material breach of this Agreement. Such material breach
+will be subject, in addition to any license fees owed to Licensor
+for the period such Commercial Entity used LTX-2 (as will be
+determined by Licensor), to liquidated damages, which will be paid
+to Licensor immediately upon demand, in an amount equal to double
+the amount that would otherwise have been paid by you for the
+relevant period of time. Such amount reflects a reasonable estimation
+of the losses and administrative costs incurred due to such breach.
+You agree and understand that this remedy does not limit the Licensor's
+right to pursue other remedies available at law or equity.
+
+3. Distribution and Redistribution. You may host for third parties
+remote access purposes (e.g. software-as-a-service), reproduce
+and distribute copies of LTX-2 or Derivatives of LTX-2 thereof in
+any medium, with or without modifications, provided that you meet
+the following conditions:
+
+(a) Use-based restrictions as referenced in paragraph 4 and all
+provisions of Attachment A MUST be included as an enforceable
+provision by you in any type of legal agreement (e.g. a
+license) governing the use and/or distribution of LTX-2 or
+Derivatives of LTX-2, and you shall give notice to subsequent
+users you distribute to, that LTX-2 or Derivatives of LTX-2
+are subject to paragraph 4 and Attachment A in their entirety,
+including all use restrictions and acceptable use policies;
+
+(b) You must provide any third party recipients of LTX-2 or
+Derivatives of LTX-2 a copy of this Agreement, including all
+attachments and use policies. Any Derivative of LTX-2 (as
+defined in Section 1, including but not limited to fine-tuned
+weights, modified training code, models trained on Outputs, or
+any other derivative) must be distributed exclusively under
+the terms of this Agreement with a complete copy of this
+license included;
+
+(c) You must cause any modified files to carry prominent notices
+stating that you changed the files;
+
+(d) You must retain all copyright, patent, trademark, and
+attribution notices excluding those notices that do not
+pertain to any part of LTX-2, Derivatives of LTX-2.
+
+You may add your own copyright statement to your modifications and
+may provide additional or different license terms and conditions -
+respecting paragraph 3(a) - for use, reproduction, or distribution
+of your modifications, or for any such Derivatives of LTX-2 as a
+whole, provided your use, reproduction, and distribution of LTX-2
+otherwise complies with the conditions stated in this Agreement,
+and you provide a complete copy of this Agreement with any such
+use, reproduction and distribution of LTX-2 and any Derivatives
+thereof.
+
+4. Use-based restrictions. The restrictions set forth in Attachment A
+are considered Use-based restrictions. Therefore, you cannot use
+LTX-2 and the Derivatives of LTX-2 in violation of the specified
+restricted uses. You may use LTX-2 subject to this Agreement,
+including only for lawful purposes and in accordance with the
+Agreement. "Use" may include creating any content with, fine-tuning,
+updating, running, training, evaluating and/or re-parametrizing
+LTX-2. You shall require all of your users who use LTX-2 or a
+Derivative of LTX-2 to comply with the terms of this paragraph 4.
+
+5. The Output You Generate. Except as set forth herein, Licensor
+claims no rights in the Output you generate using LTX-2. You are
+accountable for input you insert into LTX-2, the Output you
+generate and its subsequent uses. No use of the Output can
+contravene any provision as stated in the Agreement.
+
+6. Updates and Runtime Restrictions. To the maximum extent permitted
+by law, Licensor reserves the right to restrict (remotely or
+otherwise) usage of LTX-2 in violation of this Agreement, update
+LTX-2 through electronic means, or modify the Output of LTX-2
+based on updates. You shall undertake reasonable efforts to use
+the latest version of LTX-2. Any use of the non-current version
+of LTX-2 is done solely at your risk.
+
+7. Export Controls and Sanctions Compliance. You acknowledge that
+LTX-2, Derivatives of LTX-2 may be subject to export control laws
+and regulations, including but not limited to the U.S. Export
+Administration Regulations and sanctions programs administered by
+the Office of Foreign Assets Control (OFAC). You represent and
+warrant that you and any users of LTX-2 are not (i) located in,
+organized under the laws of, or ordinarily resident in any country
+or territory subject to comprehensive sanctions; (ii) identified
+on any U.S. government restricted party list, including the
+Specially Designated Nationals and Blocked Persons List; or
+(iii) otherwise prohibited from receiving LTX-2 under applicable
+law. You shall not export, re-export, or transfer LTX-2, directly
+or indirectly, in violation of any applicable export control or
+sanctions laws or regulations. You agree to comply with all
+applicable trade control laws and shall indemnify and hold
+Licensor harmless from any claims arising from your failure to
+comply with such laws.
+
+8. Trademarks and related. Nothing in this Agreement permits you to
+make use of Licensor's trademarks, trade names, logos or to
+otherwise suggest endorsement or misrepresent the relationship
+between the parties; and any rights not expressly granted herein
+are reserved by the Licensor.
+
+9. Disclaimer of Warranty. Unless required by applicable law or
+agreed to in writing, Licensor provides LTX-2 on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+implied, including, without limitation, any warranties or
+conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS
+FOR A PARTICULAR PURPOSE. You are solely responsible for
+determining the appropriateness of using or redistributing LTX-2
+and Derivatives of LTX-2 and assume any risks associated with
+your exercise of permissions under this Agreement.
+
+10. Limitation of Liability. In no event and under no legal theory,
+whether in tort (including negligence), contract, or otherwise,
+unless required by applicable law (such as deliberate and grossly
+negligent acts) or agreed to in writing, shall Licensor be liable
+to you for damages, including any direct, indirect, special,
+incidental, or consequential damages of any character arising as
+a result of this Agreement or out of the use or inability to use
+LTX-2 (including but not limited to damages for loss of goodwill,
+work stoppage, computer failure or malfunction, or any and all
+other commercial damages or losses), even if Licensor has been
+advised of the possibility of such damages.
+
+11. Accepting Warranty or Additional Liability. While redistributing
+LTX-2 and Derivatives of LTX-2, you may, provided you do not
+violate the terms of this Agreement, choose to offer and charge
+a fee for, acceptance of support, warranty, indemnity, or other
+liability obligations. However, in accepting such obligations,
+you may act only on your own behalf and on your sole
+responsibility, not on behalf of Licensor, and only if you agree
+to indemnify, defend, and hold Licensor harmless for any liability
+incurred by, or claims asserted against Licensor, by reason of
+your accepting any such warranty or additional liability.
+
+12. Governing Law. This Agreement and all relations, disputes, claims
+and other matters arising hereunder (including non-contractual
+disputes or claims) will be governed exclusively by, and construed
+exclusively in accordance with, the laws of the State of New York.
+To the extent permitted by law, choice of laws rules and the
+United Nations Convention on Contracts for the International Sale
+of Goods will not apply. For the purposes of adjudicating any
+action or proceeding to enforce the terms of this Agreement, you
+hereby irrevocably consent to the exclusive jurisdiction of, and
+venue in, the federal and state courts located in the County of
+New York within the State of New York. The prevailing party in
+any claim or dispute between the parties under this Agreement
+will be entitled to reimbursement of its reasonable attorneys'
+fees and costs. You hereby waive the right to a trial by jury,
+to participate in a class or representative action (including in
+arbitration), or to combine individual proceedings in court or
+in arbitration without the consent of all parties.
+
+13. Term and Termination. This Agreement is effective upon your
+acceptance and continues until terminated. Licensor may terminate
+this Agreement immediately upon written notice to you if you
+breach any provision of this Agreement, including but not limited
+to violations of the use restrictions in Attachment A or
+unauthorized commercial use. Upon termination: (a) all rights
+granted to you under this Agreement will immediately cease;
+(b) you must immediately cease all use of LTX-2 and Derivatives
+of LTX-2; (c) you must delete or destroy all copies of LTX-2
+and Derivatives of LTX-2 in your possession or control; and
+(d) you must notify any third parties to whom you distributed
+LTX-2 or Derivatives of LTX-2 of the termination. Sections 8-13,
+and Section 15 shall survive termination of this Agreement.
+Termination does not relieve you of any obligations incurred
+prior to termination, including payment obligations under
+Section 2. In addition, if You commence a lawsuit or other
+proceedings (including a cross-claim or counterclaim in a lawsuit)
+against Licensor or any person or entity alleging that LTX-2 or
+any Output, or any portion of any of the foregoing, infringe any
+intellectual property or other right owned or licensable by you,
+then all licenses granted to you under this Agreement shall
+terminate as of the date such lawsuit or other proceeding is filed.
+
+14. Disputes and Arbitration. All disputes arising in connection with
+this Agreement shall be finally settled by arbitration under the
+Rules of Arbitration of the International Chamber of Commerce
+("ICC Rules"), by one (1) arbitrator appointed in accordance with
+the ICC Rules. The seat of arbitration shall be New York, NY, USA,
+and the proceedings shall be conducted in English. The arbitrator
+shall be empowered to grant any relief that a court could grant.
+Judgment on the arbitration award may be entered by any court
+having jurisdiction thereof. Each party waives its right to a
+trial by jury and to participate in any class or representative
+action.
+
+15. If any provision of this Agreement is held to be
+invalid, illegal
+or unenforceable, the remaining provisions shall be unaffected
+thereby and remain valid as if such provision had not been set
+forth herein.
+
+END OF TERMS AND CONDITIONS
+
+ATTACHMENT A: Use Restrictions
+
+When using the Outputs, LTX-2 and any Derivatives thereof, you
+will comply with the Acceptable Use Policy. In addition, you
+agree not to use the Outputs, LTX-2 or its Derivatives in any
+of the following ways:
+
+1. In any way that violates any applicable national, federal,
+state, local or international law or regulation;
+
+2. For the purpose of exploiting, Harming or attempting to
+exploit or Harm minors in any way;
+
+3. To generate or disseminate false information and/or content
+with the purpose of Harming others;
+
+4. To generate or disseminate personal identifiable information
+that can be used to Harm an individual;
+
+5. To generate or disseminate information and/or content (e.g.
+images, code, posts, articles), and place the information
+and/or content in any context (e.g. bot generating tweets)
+without expressly and intelligibly disclaiming that the
+information and/or content is machine generated;
+
+6. To defame, disparage or otherwise harass others;
+
+7. To impersonate or attempt to impersonate (e.g. deepfakes)
+others without their consent;
+
+8. For fully automated decision making that adversely impacts an
+individual's legal rights or otherwise creates or modifies a
+binding, enforceable obligation;
+
+9. For any use intended to or which has the effect of
+discriminating against or Harming individuals or groups based
+on online or offline social behavior or known or predicted
+personal or personality characteristics;
+
+10. To exploit any of the vulnerabilities of a specific group of
+persons based on their age, social, physical or mental
+characteristics, in order to materially distort the behavior
+of a person pertaining to that group in a manner that causes
+or is likely to cause that person or another person physical
+or psychological Harm;
+
+11. For any use intended to or which has the effect of
+discriminating against individuals or groups based on legally
+protected characteristics or categories;
+
+12. To provide medical advice and medical results interpretation;
+
+13. To generate or disseminate information for the purpose to be
+used for administration of justice, law enforcement,
+immigration or asylum processes, such as predicting an
+individual will commit fraud/crime commitment (e.g. by text
+profiling, drawing causal relationships between assertions
+made in documents, indiscriminate and arbitrarily-targeted use);
+
+14. To generate and/or disseminate malware (including – but not
+limited to – ransomware) or any other content to be used for
+the purpose of harming electronic systems;
+
+15. To engage in, promote, incite, or facilitate discrimination
+or other unlawful or harmful conduct in the provision of
+employment, employment benefits, credit, housing, or other
+essential goods and services;
+
+16. To engage in, promote, incite, or facilitate the harassment,
+abuse, threatening, or bullying of individuals or groups of
+individuals;
+
+17. For military, warfare, nuclear industries or applications,
+weapons development, or any use in connection with activities
+that may cause death, personal injury, or severe physical or
+environmental damage;
+
+18. For commercial use only: To train, improve, or fine-tune any
+other machine learning model, artificial intelligence system,
+or competing model, except for Derivatives of LTX-2 as
+expressly permitted under this Agreement;
+
+19. To circumvent, disable, or interfere with any technical
+limitations, safety features, content filters, or use
+restrictions implemented in LTX-2 by Licensor;
+
+20. To use LTX-2 or Derivatives of LTX-2 in any product, service,
+or application that directly competes with Licensor's
+commercial products or services, or is designed to replace or
+substitute Licensor's offerings in the market, without
+obtaining a separate commercial license from Licensor.

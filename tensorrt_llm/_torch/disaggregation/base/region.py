@@ -42,6 +42,8 @@ class DataRole(IntFlag):
 
     KEY = auto()
     VALUE = auto()
+    BLOCK_QUANT = auto()
+    INDEXER = auto()
 
 
 class DataLayout(IntFlag):

@@ -513,11 +513,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                          self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        # After DeepEPLowLatency dispatch, token_selected_experts has shape
+        # [N, 1] instead of [N, top_k], because each row is already assigned
+        # to exactly one expert. Use the tensor shape as the effective top_k.
+        effective_top_k = token_selected_experts.size(-1)
+
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoENvfp4Runner(
             forward_impl=self.run_moe_nvfp4_impl,
             num_experts=self.num_slots,
-            top_k=self.routing_method.experts_per_token,
+            top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             enable_finalize_fusion=self.use_fused_finalize,
@@ -547,11 +552,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         output_dtype = torch.bfloat16
 
+        # Use effective top_k from tensor shape rather than routing config.
+        # After DeepEPLowLatency dispatch, each row maps to one expert (top_k=1).
+        effective_top_k = token_selected_experts.size(1)
+
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
-            top_k=self.routing_method.experts_per_token,
+            top_k=effective_top_k,
             local_expert_offset=self.slot_start,
             local_num_experts=self.expert_size_per_partition,
             tile_tokens_dim=tile_size,
@@ -574,7 +583,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_non_exiting_tiles=num_non_exiting_tiles,
             global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,
-            top_k=self.routing_method.experts_per_token,
+            top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
@@ -591,7 +600,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
                     num_non_exiting_tiles=num_non_exiting_tiles,
                     tile_tokens_dim=tile_size,
-                    top_k=self.routing_method.experts_per_token,
+                    top_k=effective_top_k,
                     ep_size=self.mapping.moe_ep_size,
                     enable_alltoall=enable_alltoall,
                 )
@@ -612,7 +621,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 token_final_scales=token_final_scales,
                 num_experts=self.num_slots,
-                top_k=self.routing_method.experts_per_token,
+                top_k=effective_top_k,
                 num_local_experts=self.expert_size_per_partition,
                 local_expert_offset=self.slot_start,
                 tile_size=tile_size,
@@ -629,7 +638,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,
-                top_k=self.routing_method.experts_per_token,
+                top_k=effective_top_k,
                 num_local_experts=self.expert_size_per_partition,
                 local_expert_offset=self.slot_start,
                 tile_size=tile_size,

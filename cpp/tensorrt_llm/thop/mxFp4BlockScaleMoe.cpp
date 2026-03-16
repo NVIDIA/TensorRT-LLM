@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -131,8 +131,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
         || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
     {
-        TORCH_CHECK(top_k <= 10 && top_k > 0,
-            "Current routing kernel (no groups, renormalize) only supports top_k<=10 && top_k>0.");
+        TORCH_CHECK(top_k <= 32 && top_k > 0,
+            "Current routing kernel (no groups, renormalize) only supports top_k<=32 && top_k>0.");
     }
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
@@ -530,7 +530,8 @@ public:
         std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
         int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
         int64_t routing_method_type, std::vector<int64_t> moeConfigIndex,
-        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+        torch::optional<torch::Tensor> const& output = torch::nullopt)
 
     {
         // moeConfigIndex corresponds to pair (tileN, config)
@@ -555,8 +556,7 @@ public:
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size, local_expert_offset,
             local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config,
-            topk_weights, topk_ids,
-            /*out_tensor=*/torch::nullopt); // TODO: Support user-provided output
+            topk_weights, topk_ids, output);
     }
 
 private:

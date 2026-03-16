@@ -44,7 +44,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_nh, i_v, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
@@ -177,7 +177,7 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
@@ -189,7 +189,7 @@ def fused_sigmoid_gating_delta_rule_update(
         assert scale > 0, "scale must be positive"
 
     o = q.new_empty(NK, *v.shape)
-    grid = (NK, NV, N * HV)
+    grid = (N * HV, NV, NK)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
