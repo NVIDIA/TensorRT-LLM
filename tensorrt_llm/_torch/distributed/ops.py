@@ -691,7 +691,7 @@ class AllReduce(nn.Module):
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
-        if self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1 and not self.mapping.enable_attention_dp:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
                 try:
