@@ -2029,6 +2029,90 @@ def test_vlm_wrapper_mixed_multimodal_text_prefill():
 
 
 @torch.no_grad()
+def test_build_mixed_positions_handles_mixed_image_and_video_request():
+    """Mixed image+video requests should not drift grid indices across requests."""
+    config = _make_small_composite_config()
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    merge = config.vision_config.spatial_merge_size
+    image_grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long)
+    video_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long)
+    num_image_tokens_0 = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+    num_image_tokens_1 = int(
+        image_grid_thw[1, 0].item()
+        * (image_grid_thw[1, 1].item() // merge)
+        * (image_grid_thw[1, 2].item() // merge)
+    )
+    num_video_tokens = int(
+        video_grid_thw[0, 0].item()
+        * (video_grid_thw[0, 1].item() // merge)
+        * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    req1_tokens = [
+        1,
+        config.vision_start_token_id,
+        *([config.image_token_id] * num_image_tokens_0),
+        2,
+        config.vision_start_token_id,
+        *([config.video_token_id] * num_video_tokens),
+        3,
+    ]
+    req2_tokens = [
+        4,
+        config.vision_start_token_id,
+        *([config.image_token_id] * num_image_tokens_1),
+        5,
+    ]
+    all_tokens = req1_tokens + req2_tokens
+    input_ids = torch.tensor([all_tokens], dtype=torch.long)
+    position_ids = torch.arange(len(all_tokens)).unsqueeze(0)
+    batch_info = torch.tensor([2, len(all_tokens), 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, len(req1_tokens), len(all_tokens)], dtype=torch.int32)
+
+    actual_pos_3d = model.model._build_mixed_positions(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        delta=0,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+    )
+
+    req1_pos_3d, _ = compute_mrope_positions(
+        input_ids=input_ids[..., : len(req1_tokens)],
+        image_grid_thw=image_grid_thw[:1],
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    req2_pos_3d, _ = compute_mrope_positions(
+        input_ids=input_ids[..., len(req1_tokens) :],
+        image_grid_thw=image_grid_thw[1:],
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    expected_pos_3d = torch.cat([req1_pos_3d, req2_pos_3d], dim=-1)
+
+    torch.testing.assert_close(
+        actual_pos_3d,
+        expected_pos_3d,
+        msg="Mixed image+video requests should preserve request-local image/video grid indices",
+    )
+
+
+@torch.no_grad()
 def test_vlm_wrapper_chunked_prefill_inside_image_span():
     """Chunked multimodal prefill computes mRoPE from request metadata.
 
@@ -2079,6 +2163,7 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
         mm_chunk_flat_start=torch.tensor([2], dtype=torch.int64),
         mm_chunk_count=torch.tensor([num_merged_tokens - 2], dtype=torch.int64),
         mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
+        mm_item_types=torch.tensor([0], dtype=torch.int32),
         mm_token_positions=torch.tensor([len(text_before) + 1], dtype=torch.int32),
         mm_token_lengths=torch.tensor([num_merged_tokens], dtype=torch.int32),
         mm_special_offsets_cu_seqlen=torch.tensor([0, 0], dtype=torch.int32),
@@ -2119,6 +2204,89 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
         rtol=1e-5,
         atol=1e-5,
         msg="Chunked multimodal prefill should match the full-request mRoPE slice",
+    )
+
+
+@torch.no_grad()
+def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_request():
+    """Chunked mixed image+video requests should preserve item-type grid ordering."""
+    config = _make_small_composite_config()
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    merge = config.vision_config.spatial_merge_size
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    video_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long)
+    num_image_tokens = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+    num_video_tokens = int(
+        video_grid_thw[0, 0].item()
+        * (video_grid_thw[0, 1].item() // merge)
+        * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    text_before = [1]
+    text_between = [2, 3]
+    text_after = [4]
+    full_tokens = (
+        text_before
+        + [config.vision_start_token_id]
+        + ([config.image_token_id] * num_image_tokens)
+        + text_between
+        + [config.vision_start_token_id]
+        + ([config.video_token_id] * num_video_tokens)
+        + text_after
+    )
+
+    full_input_ids = torch.tensor([full_tokens], dtype=torch.long)
+    full_pos_3d, _ = compute_mrope_positions(
+        input_ids=full_input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    video_start = len(text_before) + 1 + num_image_tokens + len(text_between) + 1
+    chunk_start = video_start + 1
+    chunk_tokens = full_tokens[chunk_start:]
+    chunk_len = len(chunk_tokens)
+    input_ids = torch.tensor([chunk_tokens], dtype=torch.long)
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len).unsqueeze(0)
+
+    actual_pos_3d = model.model._build_chunked_multimodal_positions(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        delta=0,
+        batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_item_types=torch.tensor([0, 1], dtype=torch.int32),
+        mm_token_positions=torch.tensor(
+            [len(text_before), len(text_before) + 1 + num_image_tokens + len(text_between)],
+            dtype=torch.int32,
+        ),
+        mm_token_lengths=torch.tensor(
+            [1 + num_image_tokens, 1 + num_video_tokens],
+            dtype=torch.int32,
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_special_offsets=torch.tensor([0, 1 + num_image_tokens], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(
+        actual_pos_3d,
+        full_pos_3d[..., chunk_start:],
+        msg="Chunked mixed image+video requests should reconstruct positions using item types",
     )
 
 

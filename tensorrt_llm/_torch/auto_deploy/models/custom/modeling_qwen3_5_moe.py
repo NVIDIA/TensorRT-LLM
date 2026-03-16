@@ -1449,6 +1449,26 @@ def _normalize_video_grid_for_mrope(
     return video_grid_thw
 
 
+def _extract_mm_item_types_from_input_ids(
+    input_ids: torch.Tensor,
+    image_token_id: int,
+    video_token_id: int,
+    vision_start_token_id: int,
+) -> List[int]:
+    """Return multimodal item types in prompt order for a single request."""
+    flat_ids = input_ids.reshape(-1).tolist()
+    item_types: List[int] = []
+    for idx in range(len(flat_ids) - 1):
+        if flat_ids[idx] != vision_start_token_id:
+            continue
+        next_token = flat_ids[idx + 1]
+        if next_token == image_token_id:
+            item_types.append(0)
+        elif next_token == video_token_id:
+            item_types.append(1)
+    return item_types
+
+
 def _compute_mm_item_special_counts(
     mm_token_lengths: torch.Tensor,
     mm_special_offsets_cu_seqlen: torch.Tensor,
@@ -1850,6 +1870,7 @@ class Qwen3_5MoeModel(nn.Module):
         mrope_delta_cache = kwargs.get("mrope_delta_cache")
         has_chunk_mm_layout = (
             mm_item_cu_seqlen is not None
+            and mm_item_types is not None
             and mm_token_positions is not None
             and mm_token_lengths is not None
             and mm_item_cu_seqlen.numel() > 0
@@ -1891,6 +1912,7 @@ class Qwen3_5MoeModel(nn.Module):
                 image_grid_thw if has_images else None,
                 video_grid_thw if has_videos else None,
                 mm_item_cu_seqlen,
+                mm_item_types,
                 mm_token_positions,
                 mm_token_lengths,
                 mm_special_offsets_cu_seqlen,
@@ -1972,6 +1994,7 @@ class Qwen3_5MoeModel(nn.Module):
         image_grid_thw: Optional[torch.LongTensor],
         video_grid_thw: Optional[torch.LongTensor],
         mm_item_cu_seqlen: torch.Tensor,
+        mm_item_types: torch.Tensor,
         mm_token_positions: torch.Tensor,
         mm_token_lengths: torch.Tensor,
         mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
@@ -2001,6 +2024,7 @@ class Qwen3_5MoeModel(nn.Module):
 
             item_start = int(mm_item_cu_seqlen[i].item())
             item_end = int(mm_item_cu_seqlen[i + 1].item())
+            req_mm_item_types = mm_item_types[item_start:item_end].tolist()
             req_mm_positions = mm_token_positions[item_start:item_end].tolist()
             req_mm_lengths = mm_token_lengths[item_start:item_end].tolist()
 
@@ -2016,17 +2040,19 @@ class Qwen3_5MoeModel(nn.Module):
             if has_img or has_vid:
                 req_img_grid = None
                 req_vid_grid = None
-                num_items = len(req_mm_positions)
+                num_images = sum(item_type == 0 for item_type in req_mm_item_types)
+                num_videos = sum(item_type == 1 for item_type in req_mm_item_types)
                 if has_img:
-                    req_img_grid = image_grid_thw[img_grid_idx : img_grid_idx + num_items]
-                    img_grid_idx += num_items
+                    req_img_grid = image_grid_thw[img_grid_idx : img_grid_idx + num_images]
+                    img_grid_idx += num_images
                 if has_vid:
-                    req_vid_grid = video_grid_thw[vid_grid_idx : vid_grid_idx + num_items]
-                    vid_grid_idx += num_items
+                    req_vid_grid = video_grid_thw[vid_grid_idx : vid_grid_idx + num_videos]
+                    vid_grid_idx += num_videos
 
                 pos_3d = self._compute_request_chunk_mrope_positions(
                     req_input_pos=req_input_pos,
                     req_seq_len=req_seq_len,
+                    req_mm_item_types=req_mm_item_types,
                     req_mm_positions=req_mm_positions,
                     req_mm_lengths=req_mm_lengths,
                     req_special_offsets=req_special_offsets,
@@ -2068,6 +2094,7 @@ class Qwen3_5MoeModel(nn.Module):
         self,
         req_input_pos: int,
         req_seq_len: int,
+        req_mm_item_types: Sequence[int],
         req_mm_positions: Sequence[int],
         req_mm_lengths: Sequence[int],
         req_special_offsets: Sequence[int],
@@ -2137,7 +2164,7 @@ class Qwen3_5MoeModel(nn.Module):
 
             return vision_len, comp_start + max(llm_grid_t, llm_grid_h, llm_grid_w)
 
-        for item_idx, (mm_start, mm_len) in enumerate(zip(req_mm_positions, req_mm_lengths)):
+        for item_type, mm_start, mm_len in zip(req_mm_item_types, req_mm_positions, req_mm_lengths):
             item_mm_offset = mm_cumulative_offset
             leading_specials = 0
             while item_mm_offset + leading_specials in special_offsets_set:
@@ -2147,14 +2174,18 @@ class Qwen3_5MoeModel(nn.Module):
             fill_text(abs_cursor, vision_abs_start, comp_cursor)
             comp_cursor += vision_abs_start - abs_cursor
 
-            if image_grid_thw is not None:
+            if item_type == 0:
+                if image_grid_thw is None:
+                    raise ValueError("Missing image_grid_thw for image multimodal item")
                 grid = image_grid_thw[img_idx]
                 img_idx += 1
-            elif video_grid_thw is not None:
+            elif item_type == 1:
+                if video_grid_thw is None:
+                    raise ValueError("Missing video_grid_thw for video multimodal item")
                 grid = video_grid_thw[vid_idx]
                 vid_idx += 1
             else:
-                raise ValueError("Expected image or video grids for multimodal request")
+                raise ValueError(f"Unsupported multimodal item type: {item_type}")
 
             _, next_comp_cursor = fill_vision(vision_abs_start, grid, comp_cursor)
             comp_cursor = next_comp_cursor
@@ -2200,12 +2231,18 @@ class Qwen3_5MoeModel(nn.Module):
             if has_img or has_vid:
                 req_img_grid = None
                 req_vid_grid = None
+                req_item_types = _extract_mm_item_types_from_input_ids(
+                    req_ids,
+                    image_token_id=self.config.image_token_id,
+                    video_token_id=self.config.video_token_id,
+                    vision_start_token_id=self.config.vision_start_token_id,
+                )
                 if has_img:
-                    n_img = (req_ids[0] == self.config.vision_start_token_id).sum().item()
+                    n_img = sum(item_type == 0 for item_type in req_item_types)
                     req_img_grid = image_grid_thw[img_grid_idx : img_grid_idx + n_img]
                     img_grid_idx += n_img
                 if has_vid:
-                    n_vid = (req_ids[0] == self.config.vision_start_token_id).sum().item()
+                    n_vid = sum(item_type == 1 for item_type in req_item_types)
                     req_vid_grid = video_grid_thw[vid_grid_idx : vid_grid_idx + n_vid]
                     vid_grid_idx += n_vid
 
