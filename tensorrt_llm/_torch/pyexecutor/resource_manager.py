@@ -1686,9 +1686,11 @@ class KVCacheManagerV2(BaseResourceManager):
         (self.kv_cache_pool_pointers,
          self.kv_cache_pool_mapping) = self._build_pool_mapping_tensors()
 
-        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
+        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel.
+        # +1 accounts for try_allocate_generation adding 1 token after
+        # resize_context block-aligned capacity to max_blocks * tokens_per_block.
         self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
-                                   1) // tokens_per_block
+                                   1) // tokens_per_block + 1
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
