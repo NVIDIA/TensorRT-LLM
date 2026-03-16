@@ -312,6 +312,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
                                         max_total_draft_tokens=mtp_num_modules,
                                         mtp_num_modules=mtp_num_modules)
         spec_metadata.draft_tokens = draft_tokens
+        spec_metadata.runtime_draft_len = mtp_num_modules
 
         # mtp worker
         mtpworker = MTPWorker(spec_config)
@@ -901,6 +902,7 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
 
         spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool = mtp_hidden_states_tensor_pool
         spec_metadata.mtp_hidden_states_manager.mtp_past_tokens_pool = mtp_tokens_tensor_pool
+        spec_metadata.runtime_draft_len = num_nextn_predict_layers
         spec_metadata.prepare()
 
         mtpworker = MTPWorker(spec_config)
@@ -1397,6 +1399,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
 
         spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool = mtp_hidden_states_tensor_pool
         spec_metadata.mtp_hidden_states_manager.mtp_past_tokens_pool = mtp_tokens_tensor_pool
+        spec_metadata.runtime_draft_len = num_nextn_predict_layers
         spec_metadata.prepare()
 
         mtpworker = MTPWorker(spec_config)
