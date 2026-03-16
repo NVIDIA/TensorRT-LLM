@@ -333,41 +333,6 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
-    # Issue: Certain TRTLLM kernel runners crash with CUDA errors in multi-GPU
-    # DeepEP mode. the crash is specific to EP with DeepEP.
-    # Verified on 4 GPUs with DEP + DEEPEP + TRTLLM (e60_k4_h2048_i1408):
-    #   - FP8_BLOCK_SCALES:  CRASH   (fp8_block_scale_moe_runner -> CUDA_ERROR_INVALID_HANDLE)
-    #   - W4A16_MXFP4:       CRASH   (bf16_mxe2m1_block_scale_moe_runner -> illegal memory access)
-    #   - W4A8_MXFP4_MXFP8:  likely crash (same mxe2m1 kernel family as W4A16_MXFP4)
-    if comm_method in ("DEEPEP", "DEEPEPLOWLATENCY"):
-        deepep_crash_quant_algos = {
-            QuantAlgo.FP8_BLOCK_SCALES,
-            QuantAlgo.W4A16_MXFP4,
-            QuantAlgo.W4A8_MXFP4_MXFP8,
-        }
-        if quant_algo in deepep_crash_quant_algos:
-            return (
-                f"[Potential Bug] TRTLLMGenFusedMoE {quant_algo} crashes with "
-                f"CUDA error in multi-GPU DeepEP mode (comm={comm_method}). "
-                f"Single-GPU tests pass; issue is in the kernel runner under EP."
-            )
-
-        # Issue: NVFP4 with large model configs crashes with CUDA illegal memory
-        # access in DeepEP mode (deep_ep.cpp:86).
-        # Verified: e60_k4_h2048_i1408 passes, e256_k8_h7168_i2048 crashes.
-        # The crash kills the entire pytest process, blocking all subsequent tests.
-        if (
-            quant_algo == QuantAlgo.NVFP4
-            and num_experts >= 256
-            and model_config.hidden_size >= 7168
-        ):
-            return (
-                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model "
-                f"(num_experts={num_experts}, hidden_size={model_config.hidden_size}) "
-                f"crashes with CUDA illegal memory access in DeepEP mode "
-                f"(comm={comm_method}). Smaller configs pass."
-            )
-
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
     # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:

@@ -810,7 +810,9 @@ class KVCacheManager(BaseResourceManager):
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfigPython,
-                                 mapping: Mapping, **kwargs):
+                                 mapping: Mapping,
+                                 num_layers: Optional[int] = None,
+                                 **kwargs):
 
         # get num key value heads
         config = model_config.pretrained_config
@@ -833,9 +835,18 @@ class KVCacheManager(BaseResourceManager):
             head_dim = head_dim * num_key_value_heads // tp_size
             kv_factor = 2
 
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        # When num_layers is explicitly provided (e.g. for draft models
+        # where the HF config layer count differs from runtime), use it
+        # directly without PP distribution.  Draft layers have their own
+        # PP assignment logic (see get_pp_layers) that doesn't match the
+        # standard uniform split, so pp_layers() would give wrong results.
+        if num_layers is not None:
+            num_attention_layers = max(num_layers, 1)
+        else:
+            # provide at least 1 layer to prevent division by zero cache size
+            num_attention_layers = max(
+                len(mapping.pp_layers(model_config.get_num_attention_layers())),
+                1)
         # K and V
         mem_per_token = kv_factor * num_attention_layers * head_dim
         # The data type bytes.
@@ -2107,15 +2118,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
                     success = kv_cache.resize(new_capacity)
                     if not success:
-                        raise ValueError(
-                            f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
-                        )
+                        release_resources(req)
+                        return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
                         if not success:
-                            raise ValueError(
-                                f"Failed to resize capacity of draft KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
-                            )
+                            release_resources(req, free_draft_resources=True)
+                            return None
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
@@ -2314,7 +2323,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfigPython,
-                                 mapping: Mapping, **kwargs):
+                                 mapping: Mapping,
+                                 num_layers: Optional[int] = None,
+                                 **kwargs):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
@@ -2343,9 +2354,18 @@ class KVCacheManagerV2(BaseResourceManager):
             head_dim = head_dim * num_key_value_heads // tp_size
             kv_factor = 2
 
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        # When num_layers is explicitly provided (e.g. for draft models
+        # where the HF config layer count differs from runtime), use it
+        # directly without PP distribution.  Draft layers have their own
+        # PP assignment logic (see get_pp_layers) that doesn't match the
+        # standard uniform split, so pp_layers() would give wrong results.
+        if num_layers is not None:
+            num_attention_layers = max(num_layers, 1)
+        else:
+            # provide at least 1 layer to prevent division by zero cache size
+            num_attention_layers = max(
+                len(mapping.pp_layers(model_config.get_num_attention_layers())),
+                1)
         mem_per_token *= num_attention_layers * head_dim
 
         # K and V
@@ -2420,6 +2440,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.set_base_page_index_buf(i, pool_idx,
                                                  memoryview(buffer.numpy()))
         return kv_cache
+
+    def reset_reuse_state(self):
+        self.impl.clear_reusable_blocks()
 
 
 class SlotManager:
