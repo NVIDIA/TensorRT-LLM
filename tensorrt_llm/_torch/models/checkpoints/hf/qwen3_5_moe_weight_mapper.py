@@ -74,11 +74,11 @@ class Qwen3_5MoeHfWeightMapper(Qwen3_5HfWeightMapper):
     ) -> None:
         if isinstance(module, MoE):
             # NOTE: to check the weight loading mode, if gate_up_proj in HF ckpt, then FUSED_GATE_UP_PROJ
-            weight_loading_mode = MoEWeightLoadingMode.VANILLA
-            for weight_name, weight_value in module_weights.items():
-                if "gate_up_proj" in weight_name:
-                    weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
-                    break
+            weight_loading_mode = (
+                MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+                if any("gate_up_proj" in key for key in module_weights)
+                else MoEWeightLoadingMode.VANILLA
+            )
             module.weight_loading_mode = weight_loading_mode
 
             updated_module_weights = {}
