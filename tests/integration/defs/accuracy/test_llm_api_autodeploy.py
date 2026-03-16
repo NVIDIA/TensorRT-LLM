@@ -429,14 +429,17 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nemotron-MOE"
+    MODEL_NAME = "nvidia/Nemotron-3-Nano"
 
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
     MODEL_PATHS = {
-        "bf16": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024",
-        "fp8": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
-        "nvfp4": f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+        "bf16":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
+        "fp8":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"),
+        "nvfp4":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -478,19 +481,19 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
     MODEL_PATHS = {
         "bf16":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"),
         "fp8":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"),
         "nvfp4":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -520,10 +523,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         if model_id == "bf16":
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
-        if enable_attention_dp:
-            kwargs.setdefault("transforms", {})["detect_sharding"] = {
-                "enable_attention_dp": True
-            }
+        kwargs.setdefault("transforms", {}).setdefault(
+            "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
@@ -533,7 +534,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            trust_remote_code=True,
                            **kwargs) as llm:
             _set_quant_config(llm, model_id)
-
+            # the nvfp4 model is mixed precision, should be tested against higher thresholds
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             print_memory_usage("after engine build")
 
             sampling_params = self.get_default_sampling_params()
