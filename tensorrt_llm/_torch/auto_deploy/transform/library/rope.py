@@ -1092,9 +1092,11 @@ def _get_position_ids(
 
     if "position_ids" in rope_position_ids_cache:
         return rope_position_ids_cache["position_ids"]
+
     sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, batch_dim))
     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
     bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+
     # Retrieve device information, ensuring it is a torch.device.
     device = q_node.meta.get("device", "cpu")
     if isinstance(device, str):

@@ -49,7 +49,6 @@ def apply_rope_with_input_pos_flashinfer(
       - Rotated query tensor of the same shape and half precision as input.
       - Rotated key tensor of the same shape and half precision as input.
     """
-
     q_shape = q.shape
     k_shape = k.shape
     head_dim = cos_sin_cache.shape[-1]
