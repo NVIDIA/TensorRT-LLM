@@ -40,6 +40,7 @@
 #include <limits>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -520,6 +521,12 @@ private:
     std::set<KVCacheBlock::IdType> mUsedBlocks;
     // Current prepopulated prompt length
     SizeType32 mCurrentPrepopulatedPromptLen;
+    // Serialises per-sequence mutations (addToken, removeToken, storeNewBlock, etc.)
+    // against removeSequence to prevent use of freed blocks.
+    mutable std::mutex mMutex;
+    // Set by removeSequence under mMutex before releasing blocks; checked by all
+    // mutating callers so they can exit cleanly rather than touch freed state.
+    bool mRemoved{false};
 };
 
 // attach metadata to a pool pointer
