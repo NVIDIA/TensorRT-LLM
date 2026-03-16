@@ -278,7 +278,7 @@ class OpenAIServer:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
                 "model_name": self.model,
-                "engine_type": "tensorrt_llm"
+                "engine_type": getattr(self.generator.args, "backend", None) or "tensorrt"
             })
             max_perf_metrics = self.generator.args.perf_metrics_max_requests
             if max_perf_metrics > 0:
