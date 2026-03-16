@@ -26,6 +26,7 @@ from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
@@ -190,8 +191,11 @@ class TestBaseToolParser:
 
         results = parser.parse_base_json(action, sample_tools)
 
-        # Should return empty list and log warning
-        assert len(results) == 0
+        # Should return the tool call with tool_index=-1 and log warning.
+        assert len(results) == 1
+        assert results[0].name == "undefined_function"
+        assert results[0].tool_index == -1
+        assert json.loads(results[0].parameters) == {}
 
     def test_parse_base_json_missing_parameters(self, sample_tools):
         """Test parse_base_json handles missing parameters."""
@@ -298,14 +302,14 @@ class TestBaseToolParser:
         """Test streaming parser handles invalid tool name."""
         parser = ConcreteToolParser()
 
-        # Send invalid tool name
+        # Send invalid tool name - parser streams it through.
         result = parser.parse_streaming_increment(
             '[TOOL_CALLS] {"name":"invalid_tool"', sample_tools)
 
-        # Should reset state
-        assert len(result.calls) == 0
-        assert parser._buffer == ""
-        assert parser.current_tool_id == -1
+        # Should still return the tool call.
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "invalid_tool"
+        assert result.calls[0].tool_index == 0
 
     def test_supports_structural_tag(self):
         """Test supports_structural_tag returns True."""
@@ -469,8 +473,9 @@ class BaseToolParserTestClass:
 
         result = parser.detect_and_parse(text, sample_tools)
 
-        # Should not return any calls for undefined function
-        assert len(result.calls) == 0
+        # Should return the tool call with tool_index=-1.
+        assert len(result.calls) == 1
+        assert result.calls[0].tool_index == -1
 
 
 class TestKimiK2ToolParser(BaseToolParserTestClass):
@@ -602,6 +607,14 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert "get_weather" in info1.begin
         assert "search_web" in info2.begin
         assert info1.end == info2.end == "<|tool_call_end|><|tool_calls_section_end|>"
+
+    def test_undefined_tool(self, sample_tools, parser, tool_parser_test_cases):
+        """KimiK2 has custom detect_and_parse that filters undefined tools."""
+        text = tool_parser_test_cases.undefined_tool
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 0
 
     def test_kimi_k2_format_compliance(self, sample_tools, parser):
         """Test that KimiK2ToolParser follows the documented format structure."""
@@ -994,6 +1007,127 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             }
         }
 
+    def test_parse_anyof_parameter_type_conversion(self, parser):
+        """Test that parameters using anyOf schemas are correctly type-converted."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="create_record",
+                description="Create a record with various optional fields",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string"
+                        },
+                        "count": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "score": {
+                            "anyOf": [{
+                                "type": "number"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "active": {
+                            "anyOf": [{
+                                "type": "boolean"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "metadata": {
+                            "anyOf": [{
+                                "type": "object"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "tags": {
+                            "anyOf": [{
+                                "type": "array"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "label": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                    "required": ["name"],
+                },
+            ),
+        )
+
+        text = ("<tool_call>\n"
+                "<function=create_record>\n"
+                "<parameter=name>test</parameter>\n"
+                "<parameter=count>42</parameter>\n"
+                "<parameter=score>3.14</parameter>\n"
+                "<parameter=active>true</parameter>\n"
+                '<parameter=metadata>{"key": "value"}</parameter>\n'
+                "<parameter=tags>[1, 2, 3]</parameter>\n"
+                "<parameter=label>hello</parameter>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool_def])
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["name"] == "test"
+        assert params["count"] == 42
+        assert isinstance(params["count"], int)
+        assert params["score"] == 3.14
+        assert isinstance(params["score"], float)
+        assert params["active"] is True
+        assert params["metadata"] == {"key": "value"}
+        assert params["tags"] == [1, 2, 3]
+        assert params["label"] == "hello"
+
+    def test_parse_anyof_null_value(self, parser):
+        """Test that null values are handled correctly for anyOf parameters."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="set_value",
+                description="Set a value",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                },
+            ),
+        )
+
+        text = ("<tool_call>\n"
+                "<function=set_value>\n"
+                "<parameter=value>null</parameter>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool_def])
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["value"] is None
+
     def test_qwen3_coder_format_compliance(
         self,
         parser,
@@ -1313,6 +1447,241 @@ class TestDeepSeekV32Parser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+
+
+# ============================================================================
+# Glm4ToolParser Tests
+# ============================================================================
+
+
+class TestGlm4ToolParser(BaseToolParserTestClass):
+    """Test suite for Glm4ToolParser class."""
+
+    def make_parser(self):
+        return Glm4ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        single_text = ("Normal text"
+                       "<tool_call>get_weather\n"
+                       "<arg_key>location</arg_key>\n"
+                       "<arg_value>NYC</arg_value>\n"
+                       "</tool_call>")
+        single_expected_normal = "Normal text"
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "NYC"}
+
+        multiple_text = ("<tool_call>get_weather\n"
+                         "<arg_key>location</arg_key>\n"
+                         "<arg_value>LA</arg_value>\n"
+                         "</tool_call>"
+                         "<tool_call>search_web\n"
+                         "<arg_key>query</arg_key>\n"
+                         "<arg_value>AI</arg_value>\n"
+                         "</tool_call>")
+        multiple_names = ("get_weather", "search_web")
+
+        malformed_text = ("<tool_call>get_weather"
+                          "MALFORMED_NO_NEWLINE</tool_call>")
+
+        with_parameters_text = ("<tool_call>search_web\n"
+                                "<arg_key>query</arg_key>\n"
+                                "<arg_value>test</arg_value>\n"
+                                "</tool_call>")
+        with_parameters_name = "search_web"
+        with_parameters_params = {"query": "test"}
+
+        partial_bot_token = "<tool_cal"
+
+        undefined_tool_text = ("<tool_call>undefined_func\n"
+                               "<arg_key>arg</arg_key>\n"
+                               "<arg_value>value</arg_value>\n"
+                               "</tool_call>")
+
+        return ToolParserTestCases(
+            has_tool_call_true=
+            "Some text <tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>NYC</arg_value>\n</tool_call>",
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_text,
+                with_parameters_name,
+                with_parameters_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+    def test_initialization(self, parser):
+        """Test that Glm4ToolParser initializes correctly."""
+        assert parser.bot_token == "<tool_call>"
+        assert parser.eot_token == "</tool_call>"
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+
+        # Send bot token with function name
+        result = parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                                  sample_tools)
+
+        # Should send tool name
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+
+        # Send arguments
+        result = parser.parse_streaming_increment(
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>SF</arg_value>\n"
+            "</tool_call>", sample_tools)
+
+        # Should stream arguments and complete the tool call
+        all_params = "".join(call.parameters for call in result.calls
+                             if call.parameters)
+        assert "location" in all_params
+        assert "SF" in all_params
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles multiple tool calls."""
+
+        # First tool
+        parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n"
+            "</tool_call>", sample_tools)
+
+        # Second tool
+        result = parser.parse_streaming_increment("<tool_call>search_web\n",
+                                                  sample_tools)
+
+        # Should have started second tool
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[0].tool_index == 1
+
+    def test_parse_streaming_multiple_params(self, sample_tools, parser):
+        """Test streaming parser handles multiple parameters."""
+
+        # Send function name
+        parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                         sample_tools)
+
+        # Send first parameter
+        result1 = parser.parse_streaming_increment(
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n", sample_tools)
+
+        params1 = "".join(call.parameters for call in result1.calls
+                          if call.parameters)
+        assert "location" in params1
+
+        # Send second parameter and close
+        result2 = parser.parse_streaming_increment(
+            "<arg_key>unit</arg_key>\n"
+            "<arg_value>celsius</arg_value>\n"
+            "</tool_call>", sample_tools)
+
+        params2 = "".join(call.parameters for call in result2.calls
+                          if call.parameters)
+        assert "unit" in params2
+
+    def test_detect_and_parse_multiple_params(self, sample_tools):
+        """Test one-shot parsing with multiple parameters."""
+        parser = Glm4ToolParser()
+        text = ("<tool_call>get_weather\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>Tokyo</arg_value>\n"
+                "<arg_key>unit</arg_key>\n"
+                "<arg_value>celsius</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "Tokyo", "unit": "celsius"}
+
+    def test_detect_and_parse_with_number_type(self):
+        """Test parsing with number type coercion."""
+        parser = Glm4ToolParser()
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="set_temperature",
+                    description="Set temperature",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "number",
+                            },
+                            "label": {
+                                "type": "string",
+                            },
+                        },
+                        "required": ["value"],
+                    },
+                ),
+            )
+        ]
+
+        text = ("<tool_call>set_temperature\n"
+                "<arg_key>value</arg_key>\n"
+                "<arg_value>72.5</arg_value>\n"
+                "<arg_key>label</arg_key>\n"
+                "<arg_value>room temp</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["value"] == 72.5
+        assert params["label"] == "room temp"
+
+    def test_glm4_format_compliance(self, sample_tools, parser):
+        """Test that Glm4ToolParser follows the documented format structure."""
+
+        text = ("<tool_call>get_weather\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>Tokyo</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    def test_streaming_no_args(self, sample_tools, parser):
+        """Test streaming a tool call with no arguments."""
+
+        # First increment sends the tool name
+        result1 = parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                                   sample_tools)
+        names = [c.name for c in result1.calls if c.name]
+        assert "get_weather" in names
+
+        # Second increment closes the tool call with empty args
+        result2 = parser.parse_streaming_increment("</tool_call>", sample_tools)
+        params = "".join(c.parameters for c in result2.calls)
+        assert "{}" in params
+
+    def test_supports_structural_tag(self, parser):
+        """Test that supports_structural_tag returns False."""
+        assert parser.supports_structural_tag() is False
 
 
 # ============================================================================

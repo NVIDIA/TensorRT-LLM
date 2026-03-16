@@ -296,8 +296,8 @@ def generate_sbatch_params(args, hardware_config, work_dir):
 
 def generate_srun_args(args, runtime_mode, timestamp):
     """Generate srun arguments."""
-    is_disagg = runtime_mode == "disaggregated"
-    container_name = f"{'disagg' if is_disagg else 'aggr'}_test-{timestamp}"
+    is_aggr = runtime_mode == "aggregated"
+    container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
 
     lines = [
         f"--container-name={container_name}",
@@ -312,16 +312,14 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    if is_disagg:
-        lines.append("--mpi=pmix")
-    else:
+    if is_aggr:
         lines.append("--mpi=pmi2")
 
     return lines
 
 
 def generate_pytest_command(
-    llm_src, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
@@ -344,8 +342,8 @@ def generate_pytest_command(
     test_list_path = os.path.join(work_dir, "test_list.txt")
 
     pytest_command = (
-        f"pytest -v -s "
-        f"--test-prefix={llm_src}/tests/integration/defs "
+        f"pytest -v "
+        f"--test-prefix={test_prefix} "
         f"--test-list={test_list_path} "
         f"--output-dir={work_dir} "
         f"-o junit_logging=out-err"
@@ -423,6 +421,7 @@ def main():
         default="1-100",
         help="Nsys start-stop range for generation workers in disaggregated mode (default: 1-100)",
     )
+    parser.add_argument("--test-prefix", default="", help="Test prefix")
 
     args = parser.parse_args()
 
@@ -480,6 +479,8 @@ def main():
         work_dir = os.path.join(llm_src, "jenkins", "scripts", "perf", "local", timestamp)
     os.makedirs(work_dir, exist_ok=True)
 
+    test_prefix = args.test_prefix if args.test_prefix else f"{llm_src}/tests/integration/defs"
+
     # Determine paths
     launch_sh = args.launch_sh if args.launch_sh else os.path.join(work_dir, "slurm_launch.sh")
     run_sh = (
@@ -521,7 +522,7 @@ def main():
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
-        llm_src, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
     )
 
     # Write test list file
@@ -645,7 +646,10 @@ def main():
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
-                'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
+                (
+                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
+                ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",
                 f"export numGenServers={hardware_config.get('num_gen_servers', '')}",
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",

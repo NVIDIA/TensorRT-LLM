@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,10 +92,19 @@ class DeepEPLowLatency(Communication):
 
         # Set nvshmem queue pair depth larger than the number of on-flight WRs
         # (ref: https://github.com/deepseek-ai/DeepEP/issues/427)
-        os.environ["NVSHMEM_QP_DEPTH"] = str(2 * (self.deep_ep_max_num_tokens + 1))
+        os.environ["NVSHMEM_QP_DEPTH"] = str(max(128, 2 * (self.deep_ep_max_num_tokens + 1)))
 
         self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(mapping)
         self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens, hidden_size, num_slots)
+
+    def destroy(self):
+        """Release the DeepEP low-latency buffer to prevent deadlock/hang.
+
+        Buffer.__del__ calls intranode::barrier (collective op). Without
+        explicit release, non-deterministic GC timing across ranks causes
+        some ranks to block in the barrier indefinitely.
+        """
+        self.deep_ep_buffer = None
 
     @staticmethod
     def is_platform_supported() -> bool:

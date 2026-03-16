@@ -1962,7 +1962,7 @@ def test_gpt_350m_speculative_decoding_return_logits(
 @pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
 @pytest.mark.parametrize("DECODING_MODE", [""])
 @pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
-@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
+@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["True", "False"])
 @pytest.mark.parametrize("USE_DRAFT_LOGITS_VALUES", ["True", "False"])
 def test_gpt_speculative_decoding_bls(
     E2E_MODEL_NAME,
@@ -2082,6 +2082,9 @@ def test_gpt_speculative_decoding_bls(
         "--num-draft-tokens=5",
         "--verbose",
     ]
+
+    if EXCLUDE_INPUT_IN_OUTPUT == "True":
+        run_cmd += ["--exclude-input-in-output"]
 
     if USE_DRAFT_LOGITS_VALUES == "True":
         run_cmd += [
