@@ -71,6 +71,7 @@ class PostprocWorker:
         metrics: Optional[dict[str, float]] = None
         request_perf_metrics: Any = None
         disaggregated_params: Any = None
+        should_abort: bool = False
 
     def __init__(
         self,
@@ -185,6 +186,8 @@ class PostprocWorker:
                 inp.rsp) else True
             res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                 inp)
+            record = self._records.get(client_id)
+            should_abort = record._aborted if record else False
             batch.append(
                 PostprocWorker.Output(
                     client_id=client_id,
@@ -193,6 +196,7 @@ class PostprocWorker:
                     metrics=metrics,
                     request_perf_metrics=perf_metrics,
                     disaggregated_params=disaggregated_params,
+                    should_abort=should_abort,
                 ))
             if is_final:
                 self._records.pop(client_id)

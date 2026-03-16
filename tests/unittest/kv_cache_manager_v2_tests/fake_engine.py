@@ -26,6 +26,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DataRole,
         KVCacheManagerConfig,
         LayerId,
+        SsmLayerConfig,
         TokenIdExt,
         _KVCache,
     )
@@ -47,6 +48,7 @@ else:
         DataRole,
         KVCacheManagerConfig,
         LayerId,
+        SsmLayerConfig,
         TokenIdExt,
         _KVCache,
     )
@@ -102,7 +104,7 @@ class FakeEngine:
         }
 
     @cached_property
-    def layers(self) -> dict[LayerId, AttentionLayerConfig]:
+    def layers(self) -> dict[LayerId, AttentionLayerConfig | SsmLayerConfig]:
         return {
             layer.layer_id: layer
             for layer in sorted(self.cfg.layers, key=lambda layer: layer.layer_id)
@@ -115,7 +117,11 @@ class FakeEngine:
             for layer_id, layer_cfg in self.layers.items():
                 for buf_id, buf in enumerate(layer_cfg.buffers):
                     role = buf.role
-                    assert NDEBUG or buf.size == manager.get_page_stride(layer_id, role)
+                    assert (
+                        NDEBUG
+                        or isinstance(layer_cfg, SsmLayerConfig)
+                        or buf.size == manager.get_page_stride(layer_id, role)
+                    )
                     for beam in typed_range(kv_cache.beam_width):
                         # check history
                         self._check_pages(kv_cache, layer_id, buf_id, beam, history, stream)
@@ -135,31 +141,43 @@ class FakeEngine:
         stream: CudaStream,
     ):
         manager = kv_cache.manager
-        tokens_per_block = self.tokens_per_block_map[layer_id][buf_id]
         layer_cfg = self.layers[layer_id]
         buf = layer_cfg.buffers[buf_id]
         role = buf.role
-        token_bytes = exact_div(buf.size, tokens_per_block)
+        is_ssm = isinstance(layer_cfg, SsmLayerConfig)
+        tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
+        token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
-        base_pages = kv_cache.get_base_page_indices(lc_id, beam)
+        if is_ssm:
+            # SSM: only one page (the SSM slot), only check the last history token
+            if not history:
+                return
+            ssm_idx = kv_cache.get_ssm_block_base_index(lc_id, beam)
+            base_pages = [ssm_idx] if ssm_idx != BAD_PAGE_INDEX else []
+            history = history[-1:]
+        else:
+            base_pages = kv_cache.get_base_page_indices(lc_id, beam)
         page_converter = manager.get_page_index_converter(layer_id, role).__call__
         pages = list(
             itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
         )
         capacity = kv_cache.capacity
         history_len = len(history)
-        assert len(history) == history_len
-        window = (
-            (0, capacity)
-            if layer_cfg.window_size is None
-            else (max(0, history_len + 1 - layer_cfg.window_size), capacity)
-        )
-        sink = value_or(layer_cfg.num_sink_tokens, 0)
+        if is_ssm:
+            window = (0, 1)
+            sink = 0
+        else:
+            window = (
+                (0, capacity)
+                if layer_cfg.window_size is None
+                else (max(0, history_len + 1 - layer_cfg.window_size), capacity)
+            )
+            sink = value_or(layer_cfg.num_sink_tokens, 0)
         # check history
         for ordinal, page in enumerate(pages):
-            if page == BAD_PAGE_INDEX or tokens_per_block * ordinal >= capacity:
+            if page == BAD_PAGE_INDEX or tokens_per_block * ordinal >= (1 if is_ssm else capacity):
                 continue
             page_range = (tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
             need_page = overlap(page_range, (0, sink)) or overlap(page_range, window)
@@ -193,26 +211,36 @@ class FakeEngine:
         stream: CudaStream,
     ):
         manager = kv_cache.manager
-        tokens_per_block = self.tokens_per_block_map[layer_id][buf_id]
         layer_cfg = self.layers[layer_id]
         buf = layer_cfg.buffers[buf_id]
         role = buf.role
-        token_bytes = exact_div(buf.size, tokens_per_block)
+        is_ssm = isinstance(layer_cfg, SsmLayerConfig)
+        tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
+        token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
-        base_pages = kv_cache.get_base_page_indices(lc_id, beam)[
-            : div_up(history_len + len(input), tokens_per_block)
-        ]
+        if is_ssm:
+            # SSM: write only the last input token at position 0 of the SSM page
+            ssm_idx = kv_cache.get_ssm_block_base_index(lc_id, beam)
+            assert ssm_idx != BAD_PAGE_INDEX
+            base_pages = [ssm_idx]
+            input = input[-1:]
+            history_len = 0
+        else:
+            base_pages = kv_cache.get_base_page_indices(lc_id, beam)[
+                : div_up(history_len + len(input), tokens_per_block)
+            ]
         page_converter = manager.get_page_index_converter(layer_id, role).__call__
         pages = list(
             itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
         )
         capacity = kv_cache.capacity
         input_range = (history_len, history_len + len(input))
-        assert input_range[1] <= capacity
+        if not is_ssm:
+            assert input_range[1] <= capacity
         ordinal_beg = input_range[0] // tokens_per_block
-        pages = itertools.islice(pages, ordinal_beg, div_up(capacity, tokens_per_block))
+        pages = itertools.islice(pages, ordinal_beg, div_up(input_range[1], tokens_per_block))
         ordinal = None
         for i, page in enumerate(pages):
             ordinal = ordinal_beg + i

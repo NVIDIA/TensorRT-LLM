@@ -6,6 +6,7 @@ The following is a table of supported models for the PyTorch backend:
 | Architecture                         | Model                              | HuggingFace Example                          |
 | ------------------------------------ | ---------------------------------- | -------------------------------------------- |
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` |
+| `Cohere2ForCausalLM`                 | Command A                          | `CohereLabs/c4ai-command-a-03-2025`          |
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3                        | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
@@ -22,7 +23,7 @@ The following is a table of supported models for the PyTorch backend:
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
-| `NemotronHForCausalLM`               | Nemotron-3-Nano                    | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8`  |
+| `NemotronHForCausalLM`               | Nemotron-3-Nano, Nemotron-3-Super  | `nvidia/nvidia-nemotron-v3` |
 | `NemotronNASForCausalLM`             | NemotronNAS                        | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`     |
 | `Phi3ForCausalLM`                    | Phi-4                              | `microsoft/Phi-4`                            |
 | `Qwen2ForCausalLM`                   | QwQ, Qwen2                         | `Qwen/Qwen2-7B-Instruct`                     |
@@ -44,11 +45,12 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No                        | No                        | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No                        | No                        | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
-| `Qwen3NextForCausalLM` [^3]          | Yes                | Yes        | No                         | Untested                    | Yes              | No  | No                        | No                        | Yes            | Yes               | No             | No                       | Untested                    | Untested              |
+| `Qwen3NextForCausalLM` [^3]          | Yes                | Yes        | Yes                         | Untested                    | Yes              | No  | No                        | No                        | Yes            | Yes               | No             | No                       | Untested                    | Untested              |
 | `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `GptOssForCausalLM`            | Yes              | Yes         | Yes                        | Yes                   | Yes             | No   | Yes                       | Yes [^4]                   | Yes           | Yes              | Yes             | N/A                      | Yes                    | Yes             |
 | `Qwen3_5MoeForCausalLM` [^5]  | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No                        | No                        | Yes           | Untested         | Yes       | N/A                      | Untested              | Untested        |
 | `Glm4MoeLiteForCausalLM` [^6] | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No                        | No                        | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
+| `NemotronHForCausalLM` (Super) | Yes               | Yes        | Untested                   | Untested              | Yes             | Yes | No                        | No                        | Yes           | Yes              | Untested       | N/A                      | Untested              | Untested        |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
@@ -80,3 +82,7 @@ Note:
 - I: Image
 - V: Video
 - A: Audio
+
+# Visual Generation Models
+
+For diffusion-based image and video generation models, see the [Visual Generation](./visual-generation.md) documentation.

@@ -94,6 +94,17 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
         (f"a b {R1_END}", f"a b {R1_END}", "", {
             "enable_thinking": False
         }),
+        # force_nonempty_content swaps reasoning into content when content is
+        # empty (reasoning_at_start stays True, so parsing is unchanged).
+        ("a b", "a b", "", {
+            "force_nonempty_content": True
+        }),
+        (f"a {R1_END} b", " b", "a ", {
+            "force_nonempty_content": True
+        }),
+        (f"a b {R1_END}", "a b ", "", {
+            "force_nonempty_content": True
+        }),
     ])
 def test_nano_v3_reasoning_parser(text: str, content: str,
                                   reasoning_context: str,
@@ -149,3 +160,36 @@ def test_nano_v3_reasoning_parser_stream(delta_texts: list, content: list,
         print(f"delta_text: {delta_text}, result: {result}")
         assert result.content == content[i]
         assert result.reasoning_content == reasoning_context[i]
+
+
+@pytest.mark.parametrize(("delta_texts", "finish_content", "finish_reasoning",
+                          "chat_template_kwargs"), [
+                              (["a", "b"], "", "", None),
+                              ([R1_END, "a", "b"], "", "", None),
+                              (["a", R1_END, "b"], "", "", None),
+                              (["a", "b"], "", "", {
+                                  "enable_thinking": False
+                              }),
+                              ([f"{R1_START}a", "b"], "", "", {
+                                  "enable_thinking": False
+                              }),
+                              (["a", "b"], "", "", {
+                                  "force_nonempty_content": False
+                              }),
+                              (["a", "b"], "ab", "", {
+                                  "force_nonempty_content": True
+                              }),
+                              ([R1_END, "a", "b"], "", "", {
+                                  "force_nonempty_content": True
+                              }),
+                          ])
+def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
+                                         finish_reasoning: str,
+                                         chat_template_kwargs: dict):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "nano-v3", chat_template_kwargs)
+    for delta_text in delta_texts:
+        reasoning_parser.parse_delta(delta_text)
+    result = reasoning_parser.finish()
+    assert result.content == finish_content
+    assert result.reasoning_content == finish_reasoning

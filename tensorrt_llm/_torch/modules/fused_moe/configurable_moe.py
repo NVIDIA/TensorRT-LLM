@@ -202,7 +202,7 @@ class ConfigurableMoE(MoE):
 
         self.validate_backend(backend)
         self.backend = backend
-
+        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
         # Sync critical attributes from ConfigurableMoE to backend
         # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
         # Backend was created with init_load_balancer=False and without_comm=True to avoid
@@ -367,7 +367,6 @@ class ConfigurableMoE(MoE):
         feasible_workload = self.comm.is_workload_feasible(all_rank_num_tokens, num_chunks)
 
         if not feasible_workload:
-            # Current comm cannot be used, fallback to AllGather
             all_rank_max_num_tokens = max(all_rank_num_tokens)
             logger.info(
                 f"Communication strategy {self.comm.__class__.__name__} "
@@ -375,8 +374,29 @@ class ConfigurableMoE(MoE):
                 f"Falling back to AllGatherReduceScatter."
             )
 
-            # Switch to AllGather (always works)
+            self.comm.destroy()
             self.comm = AllGatherReduceScatter(mapping=self.mapping)
+
+    def destroy(self):
+        """Release communication resources.
+
+        Must be called on ALL ranks before the module is discarded.
+        DeepEP Buffer.__del__ calls intranode::barrier (a collective op);
+        without an explicit, synchronous release, non-deterministic GC
+        timing across ranks causes some to enter the barrier while others
+        proceed, resulting in an indefinite hang.
+
+        Prefer using ConfigurableMoE as a context manager (``with``) so
+        that destroy() is called automatically on scope exit.
+        """
+        if self.comm is not None:
+            self.comm.destroy()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.destroy()
 
     def _create_comm_strategy_auto(self) -> Communication:
         """
@@ -395,6 +415,7 @@ class ConfigurableMoE(MoE):
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
+            use_flashinfer=self.use_flashinfer,
         )
 
     def forward_impl(
@@ -694,6 +715,10 @@ class ConfigurableMoE(MoE):
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
 
+            dispatch_kwargs = dict(eplb_dispatch_kwargs)
+            if isinstance(self.comm, DeepEP) and isinstance(self.backend, TRTLLMGenFusedMoE):
+                dispatch_kwargs["enable_sanitize_expert_ids"] = True
+
             if supports_post_quant:
                 # ===== Post-quant flow: Quantize → Dispatch =====
 
@@ -703,7 +728,6 @@ class ConfigurableMoE(MoE):
                 # Step 4b: Dispatch AFTER quantization
                 # Get pre_quant_scale for W4AFP8 if available (only DeepEPLowLatency needs it)
                 # Other strategies will ignore this via **kwargs, so it's safe to pass unconditionally
-                dispatch_kwargs = dict(eplb_dispatch_kwargs)
                 if hasattr(self, "quant_scales") and self.quant_scales is not None:
                     if hasattr(self.quant_scales, "pre_quant_scale_1"):
                         dispatch_kwargs["pre_quant_scale"] = self.quant_scales.pre_quant_scale_1
@@ -730,10 +754,11 @@ class ConfigurableMoE(MoE):
                     token_final_scales=token_final_scales,
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=use_dp_padding,
+                    **dispatch_kwargs,
                 )
 
                 # Step 4b: Quantization AFTER dispatch
-                x, x_sf = self.backend.quantize_input(x)
+                x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No communication, just quantize
             # (use non-post-quant-comm path for TRTLLMGenFusedMoE)
@@ -764,7 +789,8 @@ class ConfigurableMoE(MoE):
             # Use unified combine interface (reads dispatch state from strategy)
             all_rank_max_num_tokens = max(all_rank_num_tokens)
             final_hidden_states = self.comm.combine(
-                final_hidden_states, all_rank_max_num_tokens=all_rank_max_num_tokens
+                final_hidden_states,
+                all_rank_max_num_tokens=all_rank_max_num_tokens,
             )
         else:
             # For non-comm case, It should be attention TP or single rank.

@@ -130,7 +130,7 @@ def get_pp_layers(
         assert sum(layer_mask) == num_layers, (
             f"The number of enabled layers in layer_mask ({sum(layer_mask)}) "
             f"must match the number of layers ({num_layers}) "
-            f"in KV cache manager, but get layer_mask: {layer_mask}")
+            f"in KV cache manager, but got layer_mask: {layer_mask}")
         total_num_layers = len(layer_mask)
     pp_layers = mapping.pp_layers(total_num_layers)
     if layer_mask is not None:
@@ -582,14 +582,11 @@ class KVCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests
-            generation_batch = scheduled_batch.generation_requests
-
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
             # allocate KV Cache
-            for req in context_batch:
+            for req in scheduled_batch.context_requests:
                 req_beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
@@ -602,8 +599,11 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
-                    if self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                              req_beam_width, req):
+                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
+                            req):
+                        self.impl.add_sequence(req.py_request_id,
+                                               req.prompt_len, req_beam_width,
+                                               req)
                         for _ in range(self.num_extra_kv_tokens):
                             self.impl.add_token(req.py_request_id)
                         for _ in range(get_draft_token_length(req)):
@@ -614,7 +614,10 @@ class KVCacheManager(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
-            for req in generation_batch:
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            scheduled_batch.reset_context_requests()
+
+            for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
                     decode_block_id = (req.py_decoding_iter -
@@ -632,6 +635,14 @@ class KVCacheManager(BaseResourceManager):
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self)
+
+    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
+        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
+            request)
 
     def add_dummy_requests(
         self,
@@ -735,7 +746,7 @@ class KVCacheManager(BaseResourceManager):
                         for _ in range(max_num_draft_tokens):
                             draft_kv_cache_manager.impl.add_token(req_id)
 
-            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
+            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
                 dummy_mrope_position_ids = torch.arange(
                     0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
@@ -927,7 +938,7 @@ class KVCacheManager(BaseResourceManager):
         max_atten_window_upper_bound = max_token_num - sink_bubble_len
         if max_seq_len is not None and max_seq_len > max_atten_window_upper_bound and max_beam_width > 1:
             max_atten_window_upper_bound -= tokens_per_block
-        assert max_atten_window_upper_bound > 0, "Impossibe to fit in any sequence in kvCache"
+        assert max_atten_window_upper_bound > 0, "Impossible to fit in any sequence in kvCache"
         return max_atten_window_upper_bound
 
     def get_cache_indices(self,
@@ -1624,21 +1635,20 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_connector_manager = kv_connector_manager
 
         quota = float('inf')
-        if kv_cache_config.max_tokens is not None:
-            quota = int(
-                math.ceil(
-                    self._get_cache_quota(kv_cache_config.max_tokens) /
-                    kv_cache_config.max_util_for_resume))
-            if kv_cache_config.free_gpu_memory_fraction is not None:
-                logger.warning(
-                    f"Both max_tokens and free_gpu_memory_fraction are set to {kv_cache_config.max_tokens} and {kv_cache_config.free_gpu_memory_fraction}, the smaller value will be used."
-                )
         if kv_cache_config.max_gpu_total_bytes is not None and kv_cache_config.max_gpu_total_bytes > 0:
-            if quota > int(kv_cache_config.max_gpu_total_bytes):
-                logger.warning(
-                    f"max_gpu_total_bytes {kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB is smaller than the calculated quota {quota / (1 << 30)}GiB, clamping quota to {kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB"
-                )
-            quota = min(quota, int(kv_cache_config.max_gpu_total_bytes))
+            quota = int(kv_cache_config.max_gpu_total_bytes)
+            logger.info(
+                f"max_gpu_total_bytes is provided. New quota is {quota / (1 << 30)}GiB"
+            )
+        if kv_cache_config.max_tokens is not None:
+            quota_from_max_tokens = int(
+                math.ceil(
+                    self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
+                    / kv_cache_config.max_util_for_resume))
+            quota = min(quota, quota_from_max_tokens)
+            logger.info(
+                f"max_tokens {kv_cache_config.max_tokens} is provided. Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. New quota is {quota / (1 << 30)}GiB"
+            )
 
         assert quota != float(
             'inf'
@@ -1730,7 +1740,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
-    def _get_cache_quota(self, max_tokens: int) -> int:
+    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1912,10 +1922,8 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests
-            generation_batch = scheduled_batch.generation_requests
             # allocate KV Cache
-            for req in context_batch:
+            for req in scheduled_batch.context_requests:
                 beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
@@ -1966,7 +1974,10 @@ class KVCacheManagerV2(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
-            for req in generation_batch:
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            scheduled_batch.reset_context_requests()
+
+            for req in scheduled_batch.generation_requests:
                 kv_cache = self.kv_cache_map[req.py_request_id]
                 new_capacity = kv_cache.capacity + 1 + get_draft_token_length(
                     req)
@@ -2106,7 +2117,7 @@ class KVCacheManagerV2(BaseResourceManager):
                                 f"Failed to resize capacity of draft KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
                             )
 
-            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
+            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
                 dummy_mrope_position_ids = torch.arange(
                     0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
@@ -2208,7 +2219,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if data_role in [Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
                 assert self.dtype == DataType.NVFP4, "NVFP4 is the only supported dtype for block quant data roles"
             if data_role == Role.VALUE:
-                assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, "SELFKONLY is the only supported cache type for value data role"
+                assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, "VALUE data role is not supported for SELFKONLY cache type"
             kv_factor = 1
         else:
             raise ValueError(f"Invalid data role: {data_role}")
