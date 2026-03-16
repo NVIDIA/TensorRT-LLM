@@ -434,6 +434,8 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
 
+        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
         def slurmJobID = Utils.exec(
@@ -486,6 +488,8 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     CloudManager.destroyNode(nodeName)
 
     Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
+
+    Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
