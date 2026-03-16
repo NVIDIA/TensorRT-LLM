@@ -739,6 +739,7 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
     }
 
     TLLM_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
     if (params.residual_out && not params.norm_out && params.quant_out)

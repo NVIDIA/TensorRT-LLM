@@ -944,6 +944,10 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
         else:
+            if all_reduce_params.residual is not None:
+                assert all_reduce_params.residual.shape[
+                    0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+
             return torch.ops.trtllm.moe_finalize_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,

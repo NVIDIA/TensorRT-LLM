@@ -4060,7 +4060,8 @@ def create_allreduce_plugin(
     if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         if all_reduce_params.has_bias() == 1:
             plug_inputs.append(all_reduce_params.bias.trt_tensor)
-        plug_inputs.append(all_reduce_params.residual.trt_tensor)
+        if all_reduce_params.residual is not None:
+            plug_inputs.append(all_reduce_params.residual.trt_tensor)
         if all_reduce_params.has_affine() == 1:
             plug_inputs.append(all_reduce_params.norm_weight.trt_tensor)
             if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM:
