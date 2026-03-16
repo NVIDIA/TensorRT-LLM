@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -616,8 +616,20 @@ class ADEngine(ModelEngine):
             )
             mm_pos_list = list(mm_pos) if mm_pos is not None else []
             mm_len_list = list(mm_len) if mm_len is not None else []
+            mm_item_types_list = list(mm_item_types)
+            if len(mm_pos_list) != len(mm_len_list):
+                raise ValueError(
+                    "Mismatch between multimodal_positions and multimodal_lengths in "
+                    f"request {i}: positions={len(mm_pos_list)}, lengths={len(mm_len_list)}"
+                )
+            if mm_item_types_list and len(mm_item_types_list) != len(mm_pos_list):
+                raise ValueError(
+                    "Mismatch between multimodal item_types and multimodal span arrays in "
+                    f"request {i}: item_types={len(mm_item_types_list)}, "
+                    f"positions={len(mm_pos_list)}, lengths={len(mm_len_list)}"
+                )
             mm_item_cu_seqlen.append(mm_item_cu_seqlen[-1] + len(mm_pos_list))
-            mm_item_types_flat.extend(list(mm_item_types))
+            mm_item_types_flat.extend(mm_item_types_list)
             mm_token_positions_flat.extend(mm_pos_list)
             mm_token_lengths_flat.extend(mm_len_list)
             mm_special_offsets_cu_seqlen.append(
