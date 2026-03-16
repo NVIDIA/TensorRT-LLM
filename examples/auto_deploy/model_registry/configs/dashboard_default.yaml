@@ -4,7 +4,7 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
-skip_loading_weights: true
+skip_loading_weights: false
 max_seq_len: 512
 transforms:
   fuse_trtllm_attn_quant_fp8:

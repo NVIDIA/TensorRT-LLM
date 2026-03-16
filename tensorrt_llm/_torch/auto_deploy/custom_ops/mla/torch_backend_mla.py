@@ -561,7 +561,11 @@ class TorchBackendMLAAttention(AttentionDescriptor):
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
 
-        # Get scale from kwargs
-        scale = source_attn_node.kwargs.get("scale", None)
+        # scale is at positional index 6 in torch_mla(q_nope, q_pe, compressed_kv,
+        # kpe, kv_b_proj_weight, is_causal, scale, layout); fall back to kwargs.
+        if len(source_attn_node.args) > 6:
+            scale = source_attn_node.args[6]
+        else:
+            scale = source_attn_node.kwargs.get("scale", None)
 
         return [scale, kv_lora_rank]

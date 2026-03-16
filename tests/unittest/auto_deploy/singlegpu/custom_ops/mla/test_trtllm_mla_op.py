@@ -122,10 +122,11 @@ def _create_trtllm_paged_metadata(
     latent_dim = kv_lora_rank + qk_rope_head_dim
     num_kv_heads = 1
 
-    # HND paged cache: [num_pages, 2, num_kv_heads, page_size, latent_dim]
+    # HND paged cache: [num_pages, kv_factor, num_kv_heads, page_size, latent_dim]
+    # Production MLA uses kv_factor=1 (K and V are the same latent data).
     kv_cache = torch.zeros(
         max_num_pages,
-        2,
+        1,
         num_kv_heads,
         page_size,
         latent_dim,
@@ -198,8 +199,7 @@ def _create_trtllm_paged_metadata(
         device=device,
     )
 
-    # block_offset_multiplier: for HND with kv_factor=2, each page occupies 2 slots
-    block_offset_multiplier = 2
+    block_offset_multiplier = 1
     max_blocks_per_seq = max(pages_per_seq) if pages_per_seq else 1
     max_context_length = max(kv_lengths) if kv_lengths else 1
 
@@ -241,8 +241,6 @@ def _run_trtllm_mla(inputs, meta, kv_lora_rank):
         meta["seq_len_with_cache_host"],
         meta["cu_num_pages_host"],
         meta["cache_loc"],
-        meta["page_seq_indices"],
-        meta["page_in_seq"],
         meta["input_pos_host"],
         meta["seq_len_host"],
     )
@@ -448,7 +446,7 @@ def _build_metadata_with_pages(
         "seq_len_with_cache": torch.tensor(kv_lengths, dtype=torch.int32, device=device),
         "seq_len_with_cache_host": torch.tensor(kv_lengths, dtype=torch.int32, device="cpu"),
         "max_seq_info_host": torch.tensor(
-            [max_context_length, max_blocks_per_seq, 2, batch_size],
+            [max_context_length, max_blocks_per_seq, 1, batch_size],
             dtype=torch.int32,
             device="cpu",
         ),
@@ -491,7 +489,7 @@ def _run_multi_step(
     latent_dim = kv_lora_rank + qk_rope_head_dim
     kv_cache = torch.zeros(
         max_num_pages,
-        2,
+        1,
         1,
         page_size,
         latent_dim,
@@ -922,7 +920,7 @@ def test_trtllm_mla_mixed_batch(num_heads, dtype, device):
         "seq_len_with_cache": torch.tensor(kv_lengths, dtype=torch.int32, device=device),
         "seq_len_with_cache_host": torch.tensor(kv_lengths, dtype=torch.int32, device="cpu"),
         "max_seq_info_host": torch.tensor(
-            [max_context_length, max_blocks_per_seq, 2, total_seqs],
+            [max_context_length, max_blocks_per_seq, 1, total_seqs],
             dtype=torch.int32,
             device="cpu",
         ),
@@ -1094,7 +1092,7 @@ def _build_step_metadata(seq_specs, kv_cache, page_size, device):
         "seq_len_with_cache": torch.tensor(kv_lengths, dtype=torch.int32, device=device),
         "seq_len_with_cache_host": torch.tensor(kv_lengths, dtype=torch.int32, device="cpu"),
         "max_seq_info_host": torch.tensor(
-            [max(kv_lengths), max(pages_per_seq), 2, batch_size],
+            [max(kv_lengths), max(pages_per_seq), 1, batch_size],
             dtype=torch.int32,
             device="cpu",
         ),
@@ -1156,7 +1154,7 @@ def test_trtllm_mla_inference_session(dtype, device):
         qb_nope, qb_pe, qb_ckv, qb_kpe = model.project(hidden_b)
     kv_b_w = model.kv_b_proj.weight
 
-    kv_cache = torch.zeros(10, 2, 1, page_size, latent_dim, dtype=dtype, device=device)
+    kv_cache = torch.zeros(10, 1, 1, page_size, latent_dim, dtype=dtype, device=device)
     a_pages = [0, 1]  # A grows from 32 to 35 tokens (2 pages)
     b_pages = [2]  # B grows from 16 to 18 tokens (1 page)
 

@@ -779,7 +779,7 @@ def _handle_prefill(
             tokens_per_block,
             max_num_requests,
             max_context_length,
-            1.0,
+            scale,
             quant_mode,
             kv_lora_rank,
             qk_nope_head_dim,
@@ -830,7 +830,7 @@ def _handle_prefill(
                 tokens_per_block,
                 1,
                 seq_kv_len,
-                1.0,
+                scale,
                 quant_mode,
                 kv_lora_rank,
                 qk_nope_head_dim,
@@ -1531,16 +1531,20 @@ def trtllm_mla_with_cache(
             )
         quant_mode = int(QuantMode.FP8_KV_CACHE)
 
-    # Flatten from [B, S, ...] to [num_tokens, ...], only copy if non-contiguous
+    # Flatten from [B, S, ...] to [bs, ...] using actual tensor dims (not
+    # num_tokens from metadata) because piecewise CUDA graphs may pad inputs
+    # to bucket size.  Subsequent slicing with num_tokens / num_prefill_tokens
+    # selects only the real tokens within the padded buffer.
+    bs = b * s
     q_nope_c = q_nope if q_nope.is_contiguous() else q_nope.contiguous()
     q_pe_c = q_pe if q_pe.is_contiguous() else q_pe.contiguous()
     compressed_kv_c = compressed_kv if compressed_kv.is_contiguous() else compressed_kv.contiguous()
     kpe_c = kpe if kpe.is_contiguous() else kpe.contiguous()
 
-    q_nope_flat = q_nope_c.view(num_tokens, num_heads, qk_nope_head_dim)
-    q_pe_flat = q_pe_c.view(num_tokens, num_heads, qk_rope_head_dim)
-    compressed_kv_flat = compressed_kv_c.view(num_tokens, kv_lora_rank)
-    kpe_flat = kpe_c.view(num_tokens, qk_rope_head_dim)
+    q_nope_flat = q_nope_c.view(bs, num_heads, qk_nope_head_dim)
+    q_pe_flat = q_pe_c.view(bs, num_heads, qk_rope_head_dim)
+    compressed_kv_flat = compressed_kv_c.view(bs, kv_lora_rank)
+    kpe_flat = kpe_c.view(bs, qk_rope_head_dim)
 
     # Ensure decode-path scratch buffers are allocated
     if num_decode > 0:
@@ -1555,15 +1559,17 @@ def trtllm_mla_with_cache(
             q_nope.dtype,
         )
 
-    # Build latent_cache: [num_tokens, kv_lora_rank + qk_rope_head_dim]
+    # Build latent_cache: [bs, kv_lora_rank + qk_rope_head_dim]
     # Use torch.cat with out= for decode-only to write into pre-allocated buffer
     # with a single kernel instead of two slice-assign copies.
     if num_prefill == 0:
         latent_buf = planner.latent_cache_buf[:num_tokens]
-        torch.cat([compressed_kv_flat, kpe_flat], dim=-1, out=latent_buf)
+        torch.cat([compressed_kv_flat[:num_tokens], kpe_flat[:num_tokens]], dim=-1, out=latent_buf)
         latent_cache = latent_buf
     else:
-        latent_cache = torch.cat([compressed_kv_flat, kpe_flat], dim=-1).contiguous()
+        latent_cache = torch.cat(
+            [compressed_kv_flat[:num_tokens], kpe_flat[:num_tokens]], dim=-1
+        ).contiguous()
 
     # Metadata from planner
     sequence_length = seq_len_with_cache[:num_seq]
@@ -1640,6 +1646,10 @@ def trtllm_mla_with_cache(
             n_pf,
         )
 
+    # Allocate output with bs rows (may include CG padding); only real-token
+    # positions are filled — padding stays zero, matching the FI MLA pattern.
+    y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
+
     if num_prefill > 0 and num_decode > 0:
         _write_latent_cache_to_paged_kv(
             latent_cache[:num_prefill_tokens],
@@ -1649,12 +1659,6 @@ def trtllm_mla_with_cache(
             input_pos_host,
             num_prefill,
             tokens_per_block,
-        )
-        y = torch.empty(
-            num_tokens,
-            num_heads * v_head_dim,
-            dtype=q_nope_flat.dtype,
-            device=q_nope_flat.device,
         )
         y[:num_prefill_tokens] = _do_prefill(
             q_nope_flat[:num_prefill_tokens],
@@ -1688,9 +1692,9 @@ def trtllm_mla_with_cache(
             num_prefill,
             tokens_per_block,
         )
-        y = _do_prefill(
-            q_nope_flat,
-            q_pe_flat,
+        y[:num_tokens] = _do_prefill(
+            q_nope_flat[:num_tokens],
+            q_pe_flat[:num_tokens],
             latent_cache,
             num_prefill_tokens,
             num_prefill,
@@ -1701,9 +1705,9 @@ def trtllm_mla_with_cache(
             kv_cache,
             num_tokens,
         )
-        y = _handle_decode(
-            q_nope_flat,
-            q_pe_flat,
+        y[:num_tokens] = _handle_decode(
+            q_nope_flat[:num_tokens],
+            q_pe_flat[:num_tokens],
             kv_b_proj_weight,
             latent_cache,
             kv_cache,
@@ -1818,15 +1822,17 @@ def trtllm_mla_fused_rope_with_cache(
             )
         quant_mode = int(QuantMode.FP8_KV_CACHE)
 
+    # Flatten using actual tensor dims (see trtllm_mla_with_cache for rationale).
+    bs = b * s
     q_nope_c = q_nope if q_nope.is_contiguous() else q_nope.contiguous()
     q_pe_c = q_pe if q_pe.is_contiguous() else q_pe.contiguous()
     compressed_kv_c = compressed_kv if compressed_kv.is_contiguous() else compressed_kv.contiguous()
     kpe_c = kpe if kpe.is_contiguous() else kpe.contiguous()
 
-    q_nope_flat = q_nope_c.view(num_tokens, num_heads, qk_nope_head_dim)
-    q_pe_flat = q_pe_c.view(num_tokens, num_heads, qk_rope_head_dim)
-    compressed_kv_flat = compressed_kv_c.view(num_tokens, kv_lora_rank)
-    kpe_flat = kpe_c.view(num_tokens, qk_rope_head_dim)
+    q_nope_flat = q_nope_c.view(bs, num_heads, qk_nope_head_dim)
+    q_pe_flat = q_pe_c.view(bs, num_heads, qk_rope_head_dim)
+    compressed_kv_flat = compressed_kv_c.view(bs, kv_lora_rank)
+    kpe_flat = kpe_c.view(bs, qk_rope_head_dim)
 
     if num_decode > 0:
         planner.ensure_decode_buffers(
@@ -1845,10 +1851,12 @@ def trtllm_mla_fused_rope_with_cache(
     # to the kpe portion of latent_cache during the cache write.
     if num_prefill == 0:
         latent_buf = planner.latent_cache_buf[:num_tokens]
-        torch.cat([compressed_kv_flat, kpe_flat], dim=-1, out=latent_buf)
+        torch.cat([compressed_kv_flat[:num_tokens], kpe_flat[:num_tokens]], dim=-1, out=latent_buf)
         latent_cache = latent_buf
     else:
-        latent_cache = torch.cat([compressed_kv_flat, kpe_flat], dim=-1).contiguous()
+        latent_cache = torch.cat(
+            [compressed_kv_flat[:num_tokens], kpe_flat[:num_tokens]], dim=-1
+        ).contiguous()
 
     sequence_length = seq_len_with_cache[:num_seq]
     context_lengths = seq_len[:num_seq]
@@ -1936,6 +1944,10 @@ def trtllm_mla_fused_rope_with_cache(
             *_make_shared_metadata(),
         )
 
+    # Allocate output with bs rows (may include CG padding); only real-token
+    # positions are filled — padding stays zero, matching the FI MLA pattern.
+    y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
+
     if num_prefill > 0 and num_decode > 0:
         # Apply RoPE for prefill tokens to get rotated kpe for cache write.
         q_pe_rot_pf, kpe_rot_pf = _apply_prefill_rope(
@@ -1956,12 +1968,6 @@ def trtllm_mla_fused_rope_with_cache(
             num_prefill,
             tokens_per_block,
         )
-        y = torch.empty(
-            num_tokens,
-            num_heads * v_head_dim,
-            dtype=q_nope_flat.dtype,
-            device=q_nope_flat.device,
-        )
         y[:num_prefill_tokens] = _do_prefill(
             q_nope_flat[:num_prefill_tokens],
             q_pe_rot_pf,
@@ -1979,9 +1985,9 @@ def trtllm_mla_fused_rope_with_cache(
     elif num_prefill > 0:
         # Apply RoPE for prefill tokens.
         q_pe_rot_pf, kpe_rot_pf = _apply_prefill_rope(
-            q_pe_flat, kpe_flat, num_prefill_tokens, num_prefill
+            q_pe_flat[:num_tokens], kpe_flat[:num_tokens], num_prefill_tokens, num_prefill
         )
-        latent_for_cache = torch.cat([compressed_kv_flat, kpe_rot_pf], dim=-1)
+        latent_for_cache = torch.cat([compressed_kv_flat[:num_tokens], kpe_rot_pf], dim=-1)
         _write_latent_cache_to_paged_kv(
             latent_for_cache,
             kv_cache,
@@ -1991,17 +1997,17 @@ def trtllm_mla_fused_rope_with_cache(
             num_prefill,
             tokens_per_block,
         )
-        y = _do_prefill(
-            q_nope_flat,
+        y[:num_tokens] = _do_prefill(
+            q_nope_flat[:num_tokens],
             q_pe_rot_pf,
-            compressed_kv_flat,
+            compressed_kv_flat[:num_tokens],
             kpe_rot_pf,
             num_prefill,
         )
     else:
-        y = _do_decode(
-            q_nope_flat,
-            q_pe_flat,
+        y[:num_tokens] = _do_decode(
+            q_nope_flat[:num_tokens],
+            q_pe_flat[:num_tokens],
             latent_cache,
             num_tokens,
             0,
@@ -2121,5 +2127,10 @@ class TrtllmMLAAttention(AttentionDescriptor):
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
-        scale = source_attn_node.kwargs.get("scale", None)
+        # scale is at positional index 6 in torch_mla(q_nope, q_pe, compressed_kv,
+        # kpe, kv_b_proj_weight, is_causal, scale, layout); fall back to kwargs.
+        if len(source_attn_node.args) > 6:
+            scale = source_attn_node.args[6]
+        else:
+            scale = source_attn_node.kwargs.get("scale", None)
         return [scale, kv_lora_rank]

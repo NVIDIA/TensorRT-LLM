@@ -2,9 +2,6 @@ compile_backend: torch-cudagraph
 max_batch_size: 64
 max_seq_len: 4096
 enable_chunked_prefill: true
-skip_loading_weights: true
-# kv_cache_config:
-#   tokens_per_block: 64
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64]
 transforms:
   match_swiglu_pattern:
