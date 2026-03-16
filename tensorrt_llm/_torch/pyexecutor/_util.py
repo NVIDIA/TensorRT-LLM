@@ -140,12 +140,26 @@ class KvCacheCreator:
                 mapping,
                 tokens_per_block=self._tokens_per_block)
         elif self._should_create_separate_draft_kv_cache():
-            # One-model draft with separate KV cache layout
+            # One-model draft with separate KV cache layout.
+            # Pass num_layers explicitly since the HF config may report a
+            # different layer count than what is actually used at runtime
+            # (e.g. EAGLE3: config says 1, runtime uses 4).
+            # For PP, draft layers are only on the last rank (see
+            # get_pp_layers), so only that rank should include draft cost.
             effective_draft_config = self._get_effective_draft_config()
-            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
-                effective_draft_config,
-                mapping,
-                tokens_per_block=self._tokens_per_block)
+            if self._speculative_config.spec_dec_mode.is_external_drafter():
+                # External drafter: layers start from 0, normal PP distribution
+                kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                    effective_draft_config,
+                    mapping,
+                    tokens_per_block=self._tokens_per_block)
+            elif mapping.is_last_pp_rank():
+                # EAGLE3/MTP: draft layers only on last PP rank
+                kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                    effective_draft_config,
+                    mapping,
+                    tokens_per_block=self._tokens_per_block,
+                    num_layers=self._get_num_draft_layers())
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -601,9 +615,21 @@ class KvCacheCreator:
         # layers as well.
         return self._model_engine.model.model_config
 
+    def _get_num_draft_layers(self) -> int:
+        """Return the actual number of draft KV cache layers.
+
+        This must stay in sync with the num_layers passed to the draft KV
+        cache manager constructor in _create_one_model_draft_kv_cache_manager.
+        """
+        if self._speculative_config.spec_dec_mode.is_external_drafter():
+            return self._draft_config.pretrained_config.num_hidden_layers
+        return get_num_spec_layers(self._speculative_config)
+
     def _create_one_model_draft_kv_cache_manager(
-            self,
-            estimating_kv_cache: bool = False) -> Optional[KVCacheManager]:
+        self,
+        estimating_kv_cache: bool = False,
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+    ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
         when target and draft have different KV cache layouts.
@@ -615,11 +641,10 @@ class KvCacheCreator:
 
         # PARD, External Drafter: draft is a separate model, layers start from 0.
         # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
+        num_draft_layers = self._get_num_draft_layers()
         if self._speculative_config.spec_dec_mode.is_external_drafter():
-            num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_draft_layers
         else:
-            num_draft_layers = get_num_spec_layers(self._speculative_config)
             spec_dec_layer_mask = [False] * target_num_layers + [
                 True
             ] * num_draft_layers
@@ -650,11 +675,12 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
+        draft_kv_config = kv_cache_config_override if kv_cache_config_override is not None else self._kv_cache_config
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
-            kv_cache_config=self._kv_cache_config,
+            kv_cache_config=draft_kv_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
@@ -673,12 +699,62 @@ class KvCacheCreator:
             num_layers=num_draft_layers,
         )
 
+    def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
+        """Split max_gpu_total_bytes between target and draft KV caches.
+
+        When using KVCacheManagerV2 with a separate draft KV cache,
+        max_gpu_total_bytes represents the total budget for both target and
+        draft combined.  This method splits the budget proportionally based
+        on their per-token KV cache sizes.
+
+        Returns a cloned KvCacheConfig for the draft, or None if no split is
+        needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
+        in-place for the target.
+        """
+        total_budget = self._kv_cache_config.max_gpu_total_bytes
+        if total_budget is None or total_budget <= 0:
+            return None
+
+        total_kv = self._get_kv_size_per_token()
+        target_kv = self._kv_cache_manager_cls.get_cache_size_per_token(
+            self._model_engine.model.model_config,
+            self._mapping,
+            tokens_per_block=self._tokens_per_block)
+        draft_kv = total_kv - target_kv
+        if total_kv <= 0 or draft_kv <= 0:
+            return None
+
+        draft_budget = int(total_budget * draft_kv / total_kv)
+        target_budget = total_budget - draft_budget
+
+        logger.info(
+            f"Splitting KV cache budget: total={total_budget / GB:.2f} GiB, "
+            f"target={target_budget / GB:.2f} GiB ({target_kv}B/tok), "
+            f"draft={draft_budget / GB:.2f} GiB ({draft_kv}B/tok)")
+
+        self._kv_cache_config.max_gpu_total_bytes = target_budget
+
+        draft_kv_cache_config = self._kv_cache_config.model_copy()
+        draft_kv_cache_config.max_gpu_total_bytes = draft_budget
+        return draft_kv_cache_config
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         if self._skip_est:
             self.configure_kv_cache_capacity()
+
+        # For V2 with separate one-model draft KV cache, split the total budget
+        # between target and draft before creating either manager.
+        # Only split for the final managers, not during estimation — estimation
+        # uses max_tokens-based logic and must not have its config mutated.
+        # Two-model draft is excluded: V2 does not support two-model mode.
+        draft_kv_cache_config = None
+        if (not estimating_kv_cache
+                and self._should_create_separate_draft_kv_cache()
+                and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
+            draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine, estimating_kv_cache)
@@ -691,12 +767,16 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
+            assert draft_kv_cache_config is None, (
+                "KVCacheManagerV2 does not support two-model speculative decoding "
+                "with separate draft KV cache budget splitting.")
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine, estimating_kv_cache)
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
-                estimating_kv_cache)
+                estimating_kv_cache,
+                kv_cache_config_override=draft_kv_cache_config)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
