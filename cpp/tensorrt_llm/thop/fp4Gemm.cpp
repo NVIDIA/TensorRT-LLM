@@ -62,16 +62,10 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4
     {
         if (sm >= 120)
         {
-            // Query max shared memory to select a tile config that fits the device.
-            // All SM12x devices — SM120 (RTX 5090) and SM121 (GB10/DGX Spark) — have
-            // ~99 KiB (101376 bytes) max SMEM per block. The 128x128x256B tile requires
-            // more than that and only fits on SM100 (B200/B100, ~227 KiB).
-            // Use 105 KiB as a conservative threshold with safety margin.
-            int const maxSmem = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
-            constexpr int kMinSmemForLargeTile = 105 * 1024;
-            auto tileConfig = maxSmem > kMinSmemForLargeTile ? tkc::CutlassTileConfigSM120::CtaShape128x128x256B
-                                                             : tkc::CutlassTileConfigSM120::CtaShape128x128x128B;
-            return tkc::CutlassGemmConfig(tileConfig, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
+            // Use the smallest SM120 tile as default; the autotuner will select
+            // the optimal config (including larger tiles) for the current device.
+            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x128B,
+                tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
                 tkc::ClusterShape::ClusterShape_1x1x1);
         }
         else if (sm == 103)
