@@ -428,7 +428,11 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
         // but if it happens we cannot safely coordinate — abort on this rank.
         if (localAllocOk)
         {
-            ncclMemFree(buffer.ptr);
+            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
+            if (freeResult != ncclSuccess)
+            {
+                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during cudaMalloc error cleanup: %d", freeResult);
+            }
         }
         TLLM_THROW("[NCCLUtil] cudaMalloc for rank-sync flag failed; cannot coordinate safely across ranks.");
     }
@@ -438,41 +442,72 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     cudaError_t memcpyErr = cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice);
     if (memcpyErr != cudaSuccess)
     {
-        cudaFree(rankSyncFlag);
+        cudaError_t freeErr = cudaFree(rankSyncFlag);
+        if (freeErr != cudaSuccess)
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] cudaFree failed during H2D memcpy error cleanup: %s", cudaGetErrorString(freeErr));
+        }
         if (localAllocOk)
         {
-            ncclMemFree(buffer.ptr);
+            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
+            if (freeResult != ncclSuccess)
+            {
+                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during H2D memcpy error cleanup: %d", freeResult);
+            }
         }
         TLLM_THROW("[NCCLUtil] cudaMemcpy H2D for rank-sync flag failed: %s", cudaGetErrorString(memcpyErr));
     }
     ncclResult_t reduceResult = ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream);
-    cudaStreamSynchronize(stream);
+    if (reduceResult != ncclSuccess)
+    {
+        cudaError_t freeErr = cudaFree(rankSyncFlag);
+        if (freeErr != cudaSuccess)
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] cudaFree failed during ncclAllReduce error cleanup: %s", cudaGetErrorString(freeErr));
+        }
+        if (localAllocOk)
+        {
+            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
+            if (freeResult != ncclSuccess)
+            {
+                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during ncclAllReduce error cleanup: %d", freeResult);
+            }
+        }
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] ncclAllReduce for rank-sync flag failed (error: %d); "
+            "aborting window registration on this rank.",
+            reduceResult);
+        return NCCLWindowBuffer();
+    }
+    cudaError_t syncErr = cudaStreamSynchronize(stream);
+    if (syncErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] cudaStreamSynchronize failed after ncclAllReduce: %s", cudaGetErrorString(syncErr));
+    }
     int allAllocOk = 0;
     memcpyErr = cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaFree(rankSyncFlag);
+    cudaError_t freeErr = cudaFree(rankSyncFlag);
+    if (freeErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING("[NCCLUtil] cudaFree failed for rank-sync flag: %s", cudaGetErrorString(freeErr));
+    }
     if (memcpyErr != cudaSuccess)
     {
         TLLM_LOG_WARNING("[NCCLUtil] cudaMemcpy D2H for rank-sync flag failed: %s; assuming allocation failed.",
             cudaGetErrorString(memcpyErr));
         if (localAllocOk)
         {
-            ncclMemFree(buffer.ptr);
+            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
+            if (freeResult != ncclSuccess)
+            {
+                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during D2H memcpy error cleanup: %d", freeResult);
+            }
         }
         return NCCLWindowBuffer();
     }
-    if (reduceResult != ncclSuccess)
-    {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] ncclAllReduce for rank-sync flag failed (error: %d); "
-            "aborting window registration on this rank.",
-            reduceResult);
-        if (localAllocOk)
-        {
-            ncclMemFree(buffer.ptr);
-        }
-        return NCCLWindowBuffer();
-    }
-
     if (!allAllocOk)
     {
         if (localAllocOk)
@@ -481,7 +516,11 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
                 "[NCCLUtil] ncclMemAlloc failed on at least one other rank; "
                 "freeing local allocation (size=%zu) and aborting window registration on all ranks.",
                 size);
-            ncclMemFree(buffer.ptr);
+            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
+            if (freeResult != ncclSuccess)
+            {
+                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during !allAllocOk cleanup: %d", freeResult);
+            }
         }
         // Return an empty buffer — callers fall back to regular (non-symmetric) allreduce.
         return NCCLWindowBuffer();
@@ -493,7 +532,12 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     ncclResult_t regResult = ncclCommWindowRegister(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
     if (regResult != ncclSuccess)
     {
-        ncclMemFree(buffer.ptr);
+        ncclResult_t freeResult = ncclMemFree(buffer.ptr);
+        if (freeResult != ncclSuccess)
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] ncclMemFree failed during ncclCommWindowRegister error cleanup: %d", freeResult);
+        }
         TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
     }
 
