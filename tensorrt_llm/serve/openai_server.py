@@ -1275,8 +1275,6 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 trace_headers=trace_headers,
             )
-            postproc_args.request_id = promise.request_id
-
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
