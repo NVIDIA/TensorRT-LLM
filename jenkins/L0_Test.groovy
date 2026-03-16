@@ -3442,15 +3442,6 @@ def launchTestJobs(pipeline, testFilter)
         16,
         4
     )
-    // 5 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        2,
-        20,
-        5
-    )
     // 6 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX2-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",

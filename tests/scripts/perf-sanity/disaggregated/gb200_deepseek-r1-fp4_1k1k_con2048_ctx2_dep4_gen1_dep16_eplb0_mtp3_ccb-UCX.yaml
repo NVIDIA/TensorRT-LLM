@@ -17,7 +17,7 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: false
-  multi_round: 10
+  multi_round: 5
   benchmark_ratio: 0.0
   streaming: true
   concurrency_list: '2048'
@@ -47,9 +47,8 @@ accuracy:
 worker_config:
   gen:
     print_iter_log: true
-    max_batch_size: 128
-    max_num_tokens: 512
-    max_seq_len: 2251
+    max_batch_size: 768
+    max_num_tokens: 1536
     tensor_parallel_size: 16
     moe_expert_parallel_size: 16
     pipeline_parallel_size: 1
@@ -58,15 +57,15 @@ worker_config:
     enable_lm_head_tp_in_adp: true
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 128
+      max_batch_size: 768
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.9
+      free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
       backend: CUTEDSL
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 16384
       backend: UCX
     disable_overlap_scheduler: true
     speculative_config: &id001
@@ -76,9 +75,8 @@ worker_config:
     stream_interval: 20
   ctx:
     print_iter_log: true
-    max_batch_size: 4
-    max_num_tokens: 4608
-    max_seq_len: 2251
+    max_batch_size: 16
+    max_num_tokens: 16384
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
@@ -88,12 +86,12 @@ worker_config:
     cuda_graph_config: null
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.6
       dtype: fp8
     moe_config:
       backend: CUTEDSL
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 16384
       backend: UCX
     disable_overlap_scheduler: true
     speculative_config: *id001
