@@ -364,7 +364,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         if sa_manager is not None:
             gen_request_ids = self.request_ids[num_seqs - self.num_generations:]
             if gen_request_ids:
-                sa_manager.prepare(gen_request_ids, self.max_draft_len)
+                sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
 
     def maybe_capture_hidden_states(
             self,
@@ -467,7 +467,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 num_accepted_tokens=num_accepted_tokens,
                 num_gens=num_gens,
                 num_contexts=num_contexts,
-                max_draft_len=self.max_draft_len,
+                max_draft_len=runtime_draft_len,
             )
 
         # Save the old attn_metadata and spec_metadata

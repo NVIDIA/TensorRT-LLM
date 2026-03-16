@@ -225,8 +225,8 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_external_drafter() or self.is_sa()
 
     def support_dynamic_draft_len(self):
-        # TODO: expand to all one-model algorithms
-        return self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_pard() or self.is_draft_target_one_model() or self.is_sa()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -365,6 +365,9 @@ class SpecMetadata:
     # draft_len_schedule.  Otherwise it equals max_draft_len (the static max).
     # Always set by model_engine.forward() before any downstream code reads it.
     runtime_draft_len: int = 0
+    # Total runtime tokens per generation request for the current iteration,
+    # Normally, it equals 1 + runtime_draft_len. But for PARD, it equals 2 * runtime_draft_len.
+    runtime_tokens_per_gen_step: int = 1
 
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
@@ -658,9 +661,8 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
         # Derive draft length from the actual draft_tokens shape rather than
-        # spec_metadata.runtime_draft_len, because they can differ: PARD sets
-        # runtime_draft_len = 2K-1 for input sizing but only passes K draft
-        # tokens for acceptance;
+        # spec_metadata.runtime_draft_len, because callers may slice a wider
+        # runtime token layout down to the K draft tokens used for acceptance.
         runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
