@@ -39,7 +39,7 @@ from ..interface import (
 )
 
 
-@TransformRegistry.register("initialize_qwen_mrope_delta_cache")
+@TransformRegistry.register("initialize_mrope_delta_cache")
 class InitializeMropeDeltaCache(BaseTransform):
     """Allocate a per-slot mrope_delta_cache for multimodal mRoPE models.
 
@@ -64,3 +64,7 @@ class InitializeMropeDeltaCache(BaseTransform):
         return mod, TransformInfo(
             skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True
         )
+
+
+# Backward-compatible alias for older model registry configs.
+TransformRegistry._registry["initialize_qwen_mrope_delta_cache"] = InitializeMropeDeltaCache

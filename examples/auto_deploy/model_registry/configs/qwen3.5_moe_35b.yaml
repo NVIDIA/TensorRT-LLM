@@ -10,7 +10,7 @@ kv_cache_config:
 model_kwargs:
   torch_dtype: bfloat16
 transforms:
-  initialize_qwen_mrope_delta_cache:
+  initialize_mrope_delta_cache:
     enabled: true
   export_to_gm:
     num_moe_experts_for_export: 2

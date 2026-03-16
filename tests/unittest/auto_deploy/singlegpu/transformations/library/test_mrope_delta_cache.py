@@ -16,7 +16,7 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[6]
 
 
-def test_initialize_qwen_mrope_delta_cache_registers_state_resource():
+def test_initialize_mrope_delta_cache_registers_state_resource():
     cm = CachedSequenceInterface(
         max_seq_len=8,
         max_batch_size=2,
@@ -38,14 +38,14 @@ def test_initialize_qwen_mrope_delta_cache_registers_state_resource():
     assert cm._resource_lookup["mrope_delta_cache"] == StateResourceHandler(1, dtype=torch.int32)
 
 
-def test_initialize_qwen_mrope_delta_cache_disabled_in_default_config():
+def test_initialize_mrope_delta_cache_disabled_in_default_config():
     config_path = (
         _repo_root() / "tensorrt_llm" / "_torch" / "auto_deploy" / "config" / "default.yaml"
     )
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    assert config["transforms"]["initialize_qwen_mrope_delta_cache"]["enabled"] is False
+    assert config["transforms"]["initialize_mrope_delta_cache"]["enabled"] is False
 
 
 def test_qwen_registry_configs_explicitly_enable_mrope_delta_cache():
@@ -54,4 +54,4 @@ def test_qwen_registry_configs_explicitly_enable_mrope_delta_cache():
         with open(config_dir / config_name) as f:
             config = yaml.safe_load(f)
 
-        assert config["transforms"]["initialize_qwen_mrope_delta_cache"]["enabled"] is True
+        assert config["transforms"]["initialize_mrope_delta_cache"]["enabled"] is True
