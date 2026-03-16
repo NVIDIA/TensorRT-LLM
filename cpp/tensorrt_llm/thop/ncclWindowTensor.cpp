@@ -78,7 +78,7 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     at::IntArrayRef const outShape = (shape.has_value() && !shape->empty()) ? *shape : like.sizes();
     std::string const shapeStr = shapeToDebugString(outShape);
     auto [tensor, buffer]
-        = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(*commPtr, outShape, like.scalar_type());
+        = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, outShape, like.scalar_type());
     if (!tensor.defined() || buffer.invalid())
     {
         TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation failed; tensor_defined=%d buffer_valid=%d shape=%s",
