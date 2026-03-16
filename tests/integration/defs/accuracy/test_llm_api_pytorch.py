@@ -606,7 +606,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_4gpus(self, backend: str, mocker):
-        pytest.skip("IMA. GPU: DGX_H100")
+        # Not sure whether fixed or not. Just trigger ci
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         with LLM(self.MODEL_PATH,
                  guided_decoding_backend=backend,
@@ -621,7 +621,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_guided_decoding_with_eagle3(self, backend: str,
                                          eagle3_one_model: bool, mocker):
         if not eagle3_one_model:
-            pytest.skip("IMA. GPU: DGX_H100")
+            pytest.skip("KV cache manager v2 only supports one-model eagle3")
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -1397,7 +1397,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
     def test_auto_dtype(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1412,7 +1411,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_fp8_prequantized(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         enable_partial_reuse=False,
@@ -1430,7 +1428,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_fp8_vswa_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1447,7 +1444,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.parametrize("backend", ["xgrammar"])
     def test_fp8_guided_decoding_vswa_reuse(self, backend: str, mocker):
-        pytest.skip("IMA. GPU: DGX_H100")
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
         kv_cache_config = KvCacheConfig(
@@ -1464,7 +1460,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_without_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1479,7 +1474,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_without_reuse_low_memory_available(self):
-        pytest.skip("IMA. GPU: DGX_H100")
+        pytest.skip("OOM. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1495,7 +1490,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1509,7 +1503,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1526,7 +1519,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_disable_overlap_scheduler(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1542,7 +1534,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_partial_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1557,7 +1548,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
+        pytest.skip("OOM. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1573,7 +1564,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
+        pytest.skip("OOM. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1589,7 +1580,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1611,7 +1601,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_chunked_prefill_reuse(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1908,10 +1897,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
     def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler, torch_compile):
-        pytest.skip("IMA. GPU: DGX_H100")
 
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
+        if (mtp == "eagle" and fp8kv and attention_dp and cuda_graph
+                and overlap_scheduler and not torch_compile):
+            pytest.skip("IMA. GPU: DGX_H100")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
