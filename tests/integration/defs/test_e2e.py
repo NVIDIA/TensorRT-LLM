@@ -540,7 +540,8 @@ def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
                          streaming=False,
                          use_pytorch_backend=use_pytorch_backend,
                          use_mpirun=True,
-                         tp_size=2)
+                         tp_size=2,
+                         kv_cache_free_gpu_mem_fraction=0.5)
     runner()
 
 
