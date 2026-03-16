@@ -175,21 +175,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
-        # Handle context requests (prefill phase)
-        for req in state.scheduled_requests.context_requests:
-            if (
-                req.state == LlmRequestState.GENERATION_COMPLETE
-                or req.context_remaining_length != 0
-            ):
-                continue
-            new_token = add_token(req, new_tokens, beam_idx=beam_idx)
-            TorchSampler._handle_stop_criteria(
-                req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
-            )
-            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
-        # Handle generation requests (decode phase)
-        for req in state.scheduled_requests.generation_requests:
+        for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
@@ -225,14 +212,20 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         Returns:
             SampleStateSpec with device and host tensors
         """
-        requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.py_seq_slot for r in requests])
+        num_skip = len(scheduled_requests.context_requests_chunking)
+        finished_context_requests = scheduled_requests.context_requests_last_chunk
+        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
+        num_sampling_requests = len(sampling_requests)
+
+        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
 
-        o_new_tokens = outputs["new_tokens"][: len(requests)]
-        o_new_tokens_lens = outputs["new_tokens_lens"][: len(requests)]
-        o_next_draft_tokens = outputs["next_draft_tokens"][: len(requests)]
-        o_next_new_tokens = outputs["next_new_tokens"][: len(requests)]
+        o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
+        o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
+        o_next_draft_tokens = outputs["next_draft_tokens"][
+            num_skip : num_skip + num_sampling_requests
+        ]
+        o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
         # Pad to match fixed-size store buffers for index_copy_.
@@ -271,11 +264,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
         # Add dummy draft tokens to context requests for KV cache preparation
         if self._add_dummy_draft_tokens():
-            for request in scheduled_requests.context_requests:
+            for request in finished_context_requests:
                 request.py_draft_tokens = [1] * self.draft_len
 
         return SampleStateSpec(
-            scheduled_requests=scheduled_requests,
+            requests=sampling_requests,
             device=device_tensors,
             host=host_tensors,
             sampler_event=sampler_event,
