@@ -715,6 +715,10 @@ class ConfigurableMoE(MoE):
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
 
+            dispatch_kwargs = dict(eplb_dispatch_kwargs)
+            if isinstance(self.comm, DeepEP) and isinstance(self.backend, TRTLLMGenFusedMoE):
+                dispatch_kwargs["enable_sanitize_expert_ids"] = True
+
             if supports_post_quant:
                 # ===== Post-quant flow: Quantize → Dispatch =====
 
@@ -724,7 +728,6 @@ class ConfigurableMoE(MoE):
                 # Step 4b: Dispatch AFTER quantization
                 # Get pre_quant_scale for W4AFP8 if available (only DeepEPLowLatency needs it)
                 # Other strategies will ignore this via **kwargs, so it's safe to pass unconditionally
-                dispatch_kwargs = dict(eplb_dispatch_kwargs)
                 if hasattr(self, "quant_scales") and self.quant_scales is not None:
                     if hasattr(self.quant_scales, "pre_quant_scale_1"):
                         dispatch_kwargs["pre_quant_scale"] = self.quant_scales.pre_quant_scale_1
@@ -751,6 +754,7 @@ class ConfigurableMoE(MoE):
                     token_final_scales=token_final_scales,
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=use_dp_padding,
+                    **dispatch_kwargs,
                 )
 
                 # Step 4b: Quantization AFTER dispatch
@@ -785,7 +789,8 @@ class ConfigurableMoE(MoE):
             # Use unified combine interface (reads dispatch state from strategy)
             all_rank_max_num_tokens = max(all_rank_num_tokens)
             final_hidden_states = self.comm.combine(
-                final_hidden_states, all_rank_max_num_tokens=all_rank_max_num_tokens
+                final_hidden_states,
+                all_rank_max_num_tokens=all_rank_max_num_tokens,
             )
         else:
             # For non-comm case, It should be attention TP or single rank.

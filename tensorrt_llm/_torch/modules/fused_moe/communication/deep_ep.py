@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,6 +76,9 @@ class DeepEP(Communication):
         # Initialize DeepEP buffer
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
+
+        # Invalid token expert ID: TRTLLM-gen kernels only support -1 for invalid tokens.
+        self.invalid_token_expert_id = -1
 
     def destroy(self):
         """Release the DeepEP buffer to prevent deadlock/hang.
@@ -232,6 +235,19 @@ class DeepEP(Communication):
                 "deep_ep_handle": deep_ep_handle,
                 "padded": padded,
             }
+
+        if kwargs.get("enable_sanitize_expert_ids", False) and token_selected_slots.numel() > 0:
+            # After dispatch, non-local expert slots are replaced with invalid_token_expert_id.
+            # Some renormalize kernel but not all yet might do this sanitization,
+            # but we want to make sure it is always done for non-local tokens to avoid potential issues.
+            slot_start = self.expert_size_per_partition * self.ep_rank
+            slot_end = slot_start + self.expert_size_per_partition
+            non_local_mask = (token_selected_slots < slot_start) | (
+                token_selected_slots >= slot_end
+            )
+            token_selected_slots = token_selected_slots.masked_fill(
+                non_local_mask, self.invalid_token_expert_id
+            )
 
         # Restore token_final_scales to original dtype for downstream consumers
         if (
