@@ -1356,6 +1356,8 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     """
     # Set default artifacts_dir relative to this script's location
     # The artifacts are at defs/artifacts/, one level up from stress_test/
+    # For local testing, the artifacts are at
+    # artifacts_dir = os.path.join(script_dir, "artifacts")
     if artifacts_dir is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         artifacts_dir = os.path.join(script_dir, "..", "artifacts")
