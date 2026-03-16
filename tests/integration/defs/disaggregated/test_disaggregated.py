@@ -233,8 +233,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
-        "llama31_8b_nixl":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_nixl.yaml",
+        "llama31_8b_ucx":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
     }
 
     if test_desc not in config_map:
@@ -2179,7 +2179,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     setup_model_symlink(llm_venv, llama_model_root,
                         "llama-3.1-model/Llama-3.1-8B-Instruct")
 
-    config_file = get_test_config("llama31_8b_nixl",
+    config_file = get_test_config("llama31_8b_ucx",
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
 
