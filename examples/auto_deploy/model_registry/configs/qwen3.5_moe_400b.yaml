@@ -45,6 +45,7 @@ transforms:
         # "shared_expert_down_proj": "rowwise"
         # gating layer should be replicated as well
         # "gate": "gather"
+    shard_all_unprocessed: true
   multi_stream_moe:
     stage: compile
     enabled: true
