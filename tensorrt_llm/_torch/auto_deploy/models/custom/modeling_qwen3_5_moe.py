@@ -47,6 +47,7 @@ from tensorrt_llm._torch.auto_deploy.models.hf import (
     TextModelExportInfo,
 )
 from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
+from tensorrt_llm.inputs.utils import VideoData
 
 # =============================================================================
 # Configuration
@@ -1469,6 +1470,58 @@ def _extract_mm_item_types_from_input_ids(
     return item_types
 
 
+def _is_qwen_video_frame(value: Any) -> bool:
+    return isinstance(value, (Image.Image, torch.Tensor))
+
+
+def _normalize_qwen_image_items(images: Any) -> list[Any]:
+    if images is None:
+        return []
+    if isinstance(images, list):
+        return images
+    return [images]
+
+
+def _normalize_qwen_video_items(videos: Any) -> list[Any]:
+    if videos is None:
+        return []
+    if isinstance(videos, VideoData):
+        return [videos]
+    if isinstance(videos, list):
+        if not videos:
+            return []
+        if all(_is_qwen_video_frame(frame) for frame in videos):
+            return [videos]
+        normalized_items = []
+        for item in videos:
+            if isinstance(item, VideoData):
+                normalized_items.append(item)
+            elif (
+                isinstance(item, list)
+                and item
+                and all(_is_qwen_video_frame(frame) for frame in item)
+            ):
+                normalized_items.append(item)
+            else:
+                normalized_items.append(item)
+        return normalized_items
+    return [videos]
+
+
+def _get_qwen_video_num_spans(video: Any) -> int:
+    if isinstance(video, VideoData):
+        return len(video.frames)
+    if isinstance(video, list):
+        if not video:
+            return 0
+        if all(_is_qwen_video_frame(frame) for frame in video):
+            return len(video)
+    shape = getattr(video, "shape", None)
+    if shape is not None and len(shape) >= 4:
+        return int(shape[0])
+    return 1
+
+
 def _compute_mm_item_special_counts(
     mm_token_lengths: torch.Tensor,
     mm_special_offsets_cu_seqlen: torch.Tensor,
@@ -1753,6 +1806,182 @@ class Qwen3_5MoeModel(nn.Module):
         )
         return special_image_mask, special_video_mask
 
+    def _select_request_chunk_multimodal_embeds(
+        self,
+        req_input_pos: int,
+        req_seq_len: int,
+        req_mm_item_types: Sequence[int],
+        req_mm_positions: Sequence[int],
+        req_mm_lengths: Sequence[int],
+        req_special_offsets: Sequence[int],
+        image_embeds_list: Optional[Sequence[torch.Tensor]],
+        video_embeds_list: Optional[Sequence[torch.Tensor]],
+    ) -> torch.Tensor:
+        chunk_end = req_input_pos + req_seq_len
+        mm_cumulative_offset = 0
+        img_idx = 0
+        vid_idx = 0
+        chunks: list[torch.Tensor] = []
+        hidden_size = self.config.text_config.hidden_size
+        special_offsets_set = set(int(x) for x in req_special_offsets)
+
+        for item_type, mm_start, mm_len in zip(req_mm_item_types, req_mm_positions, req_mm_lengths):
+            item_mm_offset = mm_cumulative_offset
+            item_mm_len = int(mm_len)
+            item_abs_start = int(mm_start)
+            item_abs_end = item_abs_start + item_mm_len
+            overlap_start = max(req_input_pos, item_abs_start)
+            overlap_end = min(chunk_end, item_abs_end)
+
+            if item_type == 0:
+                if image_embeds_list is None:
+                    raise ValueError("Missing image embeddings for image multimodal item")
+                item_embeds = image_embeds_list[img_idx]
+                img_idx += 1
+            elif item_type == 1:
+                if video_embeds_list is None:
+                    raise ValueError("Missing video embeddings for video multimodal item")
+                item_embeds = video_embeds_list[vid_idx]
+                vid_idx += 1
+            else:
+                raise ValueError(f"Unsupported multimodal item type: {item_type}")
+
+            local_to_feature_idx: list[Optional[int]] = []
+            feature_idx = 0
+            for rel in range(item_mm_len):
+                if item_mm_offset + rel in special_offsets_set:
+                    local_to_feature_idx.append(None)
+                else:
+                    local_to_feature_idx.append(feature_idx)
+                    feature_idx += 1
+
+            if feature_idx != item_embeds.shape[0]:
+                raise ValueError(
+                    "Multimodal embedding length mismatch for Qwen3.5 item: "
+                    f"type={item_type}, expected={feature_idx}, actual={item_embeds.shape[0]}, "
+                    f"mm_len={item_mm_len}, item_start={item_abs_start}, "
+                    f"special_offsets={sorted(special_offsets_set)}"
+                )
+
+            if overlap_start < overlap_end:
+                selected_indices = [
+                    local_to_feature_idx[rel]
+                    for rel in range(overlap_start - item_abs_start, overlap_end - item_abs_start)
+                    if local_to_feature_idx[rel] is not None
+                ]
+                if selected_indices:
+                    chunks.append(item_embeds[selected_indices])
+
+            mm_cumulative_offset += item_mm_len
+
+        if chunks:
+            return torch.cat(chunks, dim=0)
+
+        device = None
+        dtype = None
+        if image_embeds_list:
+            device = image_embeds_list[0].device
+            dtype = image_embeds_list[0].dtype
+        elif video_embeds_list:
+            device = video_embeds_list[0].device
+            dtype = video_embeds_list[0].dtype
+        if device is None or dtype is None:
+            raise ValueError(
+                "Cannot build empty multimodal chunk without image or video embeddings"
+            )
+        return torch.empty(0, hidden_size, device=device, dtype=dtype)
+
+    def _expand_video_embeds_by_span(
+        self,
+        video_embeds_list: Optional[Sequence[torch.Tensor]],
+        video_grid_thw: Optional[torch.Tensor],
+    ) -> Optional[List[torch.Tensor]]:
+        if video_embeds_list is None or video_grid_thw is None:
+            return None
+
+        merge = self.config.vision_config.spatial_merge_size
+        video_span_embeds: List[torch.Tensor] = []
+        for video_embeds, grid in zip(video_embeds_list, video_grid_thw):
+            t, h, w = [int(v) for v in grid.tolist()]
+            frame_tokens = (int(h) // merge) * (int(w) // merge)
+            expected = int(t) * frame_tokens
+            if video_embeds.shape[0] != expected:
+                raise ValueError(
+                    "Video embedding length mismatch in Qwen3.5 VLM forward: "
+                    f"expected={expected}, actual={video_embeds.shape[0]}, grid={tuple(grid.tolist())}"
+                )
+            video_span_embeds.extend(list(torch.split(video_embeds, frame_tokens, dim=0)))
+        return video_span_embeds
+
+    def _build_chunked_multimodal_embeds(
+        self,
+        input_ids: torch.LongTensor,
+        batch_info: torch.Tensor,
+        cu_seqlen: torch.Tensor,
+        input_pos: torch.Tensor,
+        seq_len: torch.Tensor,
+        image_embeds_list: Optional[Sequence[torch.Tensor]],
+        video_span_embeds_list: Optional[Sequence[torch.Tensor]],
+        mm_item_cu_seqlen: torch.Tensor,
+        mm_item_types: torch.Tensor,
+        mm_token_positions: torch.Tensor,
+        mm_token_lengths: torch.Tensor,
+        mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
+        mm_special_offsets: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        num_prefill_seqs = int(batch_info[0].item())
+        img_idx = 0
+        vid_idx = 0
+        chunks: list[torch.Tensor] = []
+
+        for i in range(num_prefill_seqs):
+            item_start = int(mm_item_cu_seqlen[i].item())
+            item_end = int(mm_item_cu_seqlen[i + 1].item())
+            req_mm_item_types = mm_item_types[item_start:item_end].tolist()
+            req_mm_positions = mm_token_positions[item_start:item_end].tolist()
+            req_mm_lengths = mm_token_lengths[item_start:item_end].tolist()
+
+            req_special_offsets: list[int] = []
+            if mm_special_offsets_cu_seqlen is not None and mm_special_offsets is not None:
+                special_start = int(mm_special_offsets_cu_seqlen[i].item())
+                special_end = int(mm_special_offsets_cu_seqlen[i + 1].item())
+                req_special_offsets = mm_special_offsets[special_start:special_end].tolist()
+
+            num_images = sum(item_type == 0 for item_type in req_mm_item_types)
+            num_videos = sum(item_type == 1 for item_type in req_mm_item_types)
+            req_image_embeds = (
+                image_embeds_list[img_idx : img_idx + num_images]
+                if image_embeds_list is not None
+                else None
+            )
+            req_video_embeds = (
+                video_span_embeds_list[vid_idx : vid_idx + num_videos]
+                if video_span_embeds_list is not None
+                else None
+            )
+            img_idx += num_images
+            vid_idx += num_videos
+
+            req_chunk_embeds = self._select_request_chunk_multimodal_embeds(
+                req_input_pos=int(input_pos[i].item()),
+                req_seq_len=int(seq_len[i].item()),
+                req_mm_item_types=req_mm_item_types,
+                req_mm_positions=req_mm_positions,
+                req_mm_lengths=req_mm_lengths,
+                req_special_offsets=req_special_offsets,
+                image_embeds_list=req_image_embeds,
+                video_embeds_list=req_video_embeds,
+            )
+            chunks.append(req_chunk_embeds)
+
+        if chunks:
+            return torch.cat(chunks, dim=0)
+
+        hidden_size = self.config.text_config.hidden_size
+        return torch.empty(
+            0, hidden_size, device=input_ids.device, dtype=self.get_input_embeddings().weight.dtype
+        )
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1787,59 +2016,22 @@ class Qwen3_5MoeModel(nn.Module):
         has_images = pixel_values is not None and image_grid_thw is not None
         has_videos = pixel_values_videos is not None and video_grid_thw is not None
 
+        image_embeds_list = None
         if has_images:
-            image_embeds = torch.cat(
-                self.get_image_features(pixel_values, image_grid_thw), dim=0
-            ).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask = (
-                (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-            )
-            # Chunked prefill: use only the slice of image_embeds for this chunk.
-            mm_chunk_flat_start = kwargs.pop("mm_chunk_flat_start", None)
-            mm_chunk_count = kwargs.pop("mm_chunk_count", None)
-            if (
-                mm_chunk_flat_start is not None
-                and mm_chunk_count is not None
-                and mm_chunk_flat_start.shape[0] > 0
-                and int(mm_chunk_count.sum().item()) > 0
-            ):
-                flat_start = mm_chunk_flat_start.to(image_embeds.device)
-                count = mm_chunk_count.to(image_embeds.device)
-                chunks = []
-                for i in range(flat_start.shape[0]):
-                    c = count[i].item()
-                    if c > 0:
-                        s = flat_start[i].item()
-                        chunks.append(image_embeds[s : s + c])
-                if chunks:
-                    chunk_image_embeds = torch.cat(chunks, dim=0)
-                else:
-                    chunk_image_embeds = torch.empty(
-                        0,
-                        image_embeds.shape[1],
-                        device=image_embeds.device,
-                        dtype=image_embeds.dtype,
-                    )
-                num_image_tokens = int((input_ids == self.config.image_token_id).sum().item())
-                if chunk_image_embeds.shape[0] != num_image_tokens:
-                    raise ValueError(
-                        "Chunk image embedding count mismatch in Qwen3.5 VLM forward: "
-                        f"selected={chunk_image_embeds.shape[0]}, placeholders={num_image_tokens}, "
-                        f"mm_chunk_flat_start={flat_start.tolist()}, mm_chunk_count={count.tolist()}, "
-                        f"input_shape={tuple(input_ids.shape)}, image_grid_shape={tuple(image_grid_thw.shape)}"
-                    )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, chunk_image_embeds)
-            else:
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            image_embeds_list = [
+                embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                for embeds in self.get_image_features(pixel_values, image_grid_thw)
+            ]
 
+        video_embeds_list = None
         if has_videos:
-            video_embeds = torch.cat(
-                self.get_video_features(pixel_values_videos, video_grid_thw), dim=0
-            ).to(inputs_embeds.device, inputs_embeds.dtype)
-            video_mask = (
-                (input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            video_embeds_list = [
+                embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                for embeds in self.get_video_features(pixel_values_videos, video_grid_thw)
+            ]
+        video_span_embeds_list = self._expand_video_embeds_by_span(
+            video_embeds_list, video_grid_thw
+        )
 
         delta = mrope_position_deltas if mrope_position_deltas is not None else 0
 
@@ -1878,6 +2070,76 @@ class Qwen3_5MoeModel(nn.Module):
             and mm_token_positions.numel() > 0
             and mm_token_lengths.numel() > 0
         )
+
+        if has_images or has_videos:
+            multimodal_mask = (
+                (
+                    (input_ids == self.config.image_token_id)
+                    | (input_ids == self.config.video_token_id)
+                )
+                .unsqueeze(-1)
+                .expand_as(inputs_embeds)
+            )
+            num_multimodal_tokens = int(
+                (
+                    (input_ids == self.config.image_token_id)
+                    | (input_ids == self.config.video_token_id)
+                )
+                .sum()
+                .item()
+            )
+            if (
+                batch_info is not None
+                and cu_seqlen is not None
+                and input_pos is not None
+                and seq_len is not None
+                and has_chunk_mm_layout
+            ):
+                multimodal_embeds = self._build_chunked_multimodal_embeds(
+                    input_ids=input_ids,
+                    batch_info=batch_info,
+                    cu_seqlen=cu_seqlen,
+                    input_pos=input_pos,
+                    seq_len=seq_len,
+                    image_embeds_list=image_embeds_list,
+                    video_span_embeds_list=video_span_embeds_list,
+                    mm_item_cu_seqlen=mm_item_cu_seqlen,
+                    mm_item_types=mm_item_types,
+                    mm_token_positions=mm_token_positions,
+                    mm_token_lengths=mm_token_lengths,
+                    mm_special_offsets_cu_seqlen=mm_special_offsets_cu_seqlen,
+                    mm_special_offsets=mm_special_offsets,
+                )
+            else:
+                if image_embeds_list is not None:
+                    image_embeds = torch.cat(image_embeds_list, dim=0)
+                    image_mask = (
+                        (input_ids == self.config.image_token_id)
+                        .unsqueeze(-1)
+                        .expand_as(inputs_embeds)
+                    )
+                    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                if video_embeds_list is not None:
+                    video_embeds = torch.cat(video_embeds_list, dim=0)
+                    video_mask = (
+                        (input_ids == self.config.video_token_id)
+                        .unsqueeze(-1)
+                        .expand_as(inputs_embeds)
+                    )
+                    inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+                multimodal_embeds = None
+
+            if (
+                multimodal_embeds is not None
+                and multimodal_embeds.shape[0] != num_multimodal_tokens
+            ):
+                raise ValueError(
+                    "Multimodal embedding count mismatch in Qwen3.5 VLM forward: "
+                    f"selected={multimodal_embeds.shape[0]}, placeholders={num_multimodal_tokens}, "
+                    f"input_shape={tuple(input_ids.shape)}"
+                )
+            if multimodal_embeds is not None:
+                inputs_embeds = inputs_embeds.masked_scatter(multimodal_mask, multimodal_embeds)
         if mrope_delta_cache is not None and batch_info_host is not None and slot_idx is not None:
             delta = torch.ops.auto_deploy.qwen3_mrope_delta_with_cache(
                 batch_info_host,
@@ -2015,6 +2277,7 @@ class Qwen3_5MoeModel(nn.Module):
         img_grid_idx = 0
         vid_grid_idx = 0
         prefill_3d_parts: list[torch.Tensor] = []
+        normalized_video_grid_thw = _normalize_video_grid_for_mrope(video_grid_thw)
 
         for i in range(num_prefill_seqs):
             start = cu_seqlen[i].item()
@@ -2035,7 +2298,7 @@ class Qwen3_5MoeModel(nn.Module):
                 req_special_offsets = mm_special_offsets[special_start:special_end].tolist()
 
             has_img = image_grid_thw is not None and len(req_mm_positions) > 0
-            has_vid = video_grid_thw is not None and len(req_mm_positions) > 0
+            has_vid = normalized_video_grid_thw is not None and len(req_mm_positions) > 0
 
             if has_img or has_vid:
                 req_img_grid = None
@@ -2046,7 +2309,9 @@ class Qwen3_5MoeModel(nn.Module):
                     req_img_grid = image_grid_thw[img_grid_idx : img_grid_idx + num_images]
                     img_grid_idx += num_images
                 if has_vid:
-                    req_vid_grid = video_grid_thw[vid_grid_idx : vid_grid_idx + num_videos]
+                    req_vid_grid = normalized_video_grid_thw[
+                        vid_grid_idx : vid_grid_idx + num_videos
+                    ]
                     vid_grid_idx += num_videos
 
                 pos_3d = self._compute_request_chunk_mrope_positions(
@@ -2106,13 +2371,12 @@ class Qwen3_5MoeModel(nn.Module):
         """Compute chunk-local 3D mRoPE positions for one request in absolute coordinates."""
         chunk_end = req_input_pos + req_seq_len
         out = torch.empty((3, 1, req_seq_len), dtype=dtype, device=device)
-
+        special_offsets_set = set(int(x) for x in req_special_offsets)
         mm_cumulative_offset = 0
         abs_cursor = 0
         comp_cursor = 0
         img_idx = 0
         vid_idx = 0
-        special_offsets_set = set(int(x) for x in req_special_offsets)
 
         def fill_text(abs_start: int, abs_end: int, comp_start: int) -> None:
             ov_start = max(req_input_pos, abs_start)
@@ -2127,7 +2391,7 @@ class Qwen3_5MoeModel(nn.Module):
                 0
             ).expand(3, -1)
 
-        def fill_vision(abs_start: int, grid: torch.Tensor, comp_start: int) -> None:
+        def fill_vision(abs_start: int, grid: torch.Tensor, comp_start: int) -> Tuple[int, int]:
             t, h, w = [int(v) for v in grid.tolist()]
             llm_grid_t = int(t)
             llm_grid_h = int(h) // self.config.vision_config.spatial_merge_size
@@ -2483,19 +2747,21 @@ class Qwen3_5MoeADInputProcessor:
             mm_union_offset += j - i
             i = j
 
-        image_items = []
-        if "image" in mm_data:
-            images = mm_data["image"]
-            image_items = images if isinstance(images, list) else [images]
-        video_items = []
-        if "video" in mm_data:
-            videos = mm_data["video"]
-            video_items = videos if isinstance(videos, list) else [videos]
+        image_items = _normalize_qwen_image_items(mm_data.get("image"))
+        video_items = _normalize_qwen_video_items(mm_data.get("video"))
 
-        if len(starts) != len(image_items) + len(video_items):
+        num_video_spans = sum(item_type == 1 for item_type in item_types)
+        video_span_counts = [_get_qwen_video_num_spans(video) for video in video_items]
+        if num_video_spans != sum(video_span_counts):
+            raise ValueError(
+                "Mismatch between Qwen video prompt spans and video inputs: "
+                f"spans={num_video_spans}, expected_from_videos={sum(video_span_counts)}"
+            )
+
+        if len(starts) != len(image_items) + num_video_spans:
             raise ValueError(
                 "Mismatch between multimodal prompt spans and multimodal items: "
-                f"spans={len(starts)}, images={len(image_items)}, videos={len(video_items)}"
+                f"spans={len(starts)}, images={len(image_items)}, video_spans={num_video_spans}"
             )
 
         mm_uuids = inputs.get("multi_modal_uuids", None)
@@ -2512,6 +2778,7 @@ class Qwen3_5MoeADInputProcessor:
         video_uuids = list((mm_uuids or {}).get("video", [None] * len(video_items)))
         image_idx = 0
         video_idx = 0
+        remaining_video_spans = video_span_counts[0] if video_span_counts else 0
         mm_hashes_flat: List[List[int]] = []
         mm_uuid_list: List[Optional[str]] = []
         for item_type in item_types:
@@ -2520,9 +2787,16 @@ class Qwen3_5MoeADInputProcessor:
                 mm_uuid_list.append(image_uuids[image_idx])
                 image_idx += 1
             else:
+                if video_idx >= len(video_hashes):
+                    raise ValueError("Video span count exceeded available video items")
                 mm_hashes_flat.append(video_hashes[video_idx])
                 mm_uuid_list.append(video_uuids[video_idx])
-                video_idx += 1
+                remaining_video_spans -= 1
+                if remaining_video_spans == 0:
+                    video_idx += 1
+                    remaining_video_spans = (
+                        video_span_counts[video_idx] if video_idx < len(video_span_counts) else 0
+                    )
         return (
             MultimodalInput.from_components(
                 mm_hashes_flat,

@@ -34,10 +34,12 @@ Mixed batch position handling (mRoPE computed in forward):
 import pytest
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 # Register autodeploy custom ops (torch_moe, torch_causal_conv1d, etc.)
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
+    Qwen3_5MoeADInputProcessor,
     Qwen3_5MoeAttention,
     Qwen3_5MoeConfig,
     Qwen3_5MoeDecoderLayer,
@@ -1641,6 +1643,92 @@ def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
     torch.testing.assert_close(cache[slot : slot + 1], expected_delta_i32)
 
 
+class _DummyQwenProcessor:
+    def __init__(self, config):
+        self.image_token_id = config.image_token_id
+        self.video_token_id = config.video_token_id
+        self.vision_start_token_id = config.vision_start_token_id
+
+
+class _DummyQwenBaseProcessor:
+    def __init__(self, token_ids, config):
+        self._token_ids = token_ids
+        self.processor = _DummyQwenProcessor(config)
+        self.tokenizer = None
+
+    def __call__(self, inputs, sampling_params):
+        return self._token_ids, {}
+
+
+def test_qwen_ad_input_processor_duplicates_video_hashes_per_frame_span():
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+    frame_tokens = int((4 // merge) * (4 // merge))
+    token_ids = [
+        1,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        2,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        3,
+    ]
+    processor = Qwen3_5MoeADInputProcessor(_DummyQwenBaseProcessor(token_ids, config))
+    frames = [
+        Image.new("RGB", (4, 4), color="red"),
+        Image.new("RGB", (4, 4), color="blue"),
+    ]
+
+    multimodal_input, _, item_types = processor._build_multimodal_input(
+        token_ids, {"multi_modal_data": {"video": frames}}
+    )
+
+    assert multimodal_input.multimodal_positions == [1, 1 + (1 + frame_tokens) + 1]
+    assert item_types == [1, 1]
+    assert len(multimodal_input.multimodal_hashes) == 2
+    assert multimodal_input.multimodal_hashes[0] == multimodal_input.multimodal_hashes[1]
+
+
+def test_qwen_ad_input_processor_preserves_video_item_order_across_frame_spans():
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+    frame_tokens = int((4 // merge) * (4 // merge))
+    token_ids = [
+        1,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        2,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        3,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        4,
+    ]
+    processor = Qwen3_5MoeADInputProcessor(_DummyQwenBaseProcessor(token_ids, config))
+    videos = [
+        [
+            Image.new("RGB", (4, 4), color="red"),
+            Image.new("RGB", (4, 4), color="blue"),
+        ],
+        [Image.new("RGB", (4, 4), color="blue")],
+    ]
+
+    multimodal_input, _, item_types = processor._build_multimodal_input(
+        token_ids, {"multi_modal_data": {"video": videos}}
+    )
+
+    assert multimodal_input.multimodal_positions == [
+        1,
+        1 + (1 + frame_tokens) + 1,
+        1 + ((1 + frame_tokens) + 1) * 2,
+    ]
+    assert item_types == [1, 1, 1]
+    assert len(multimodal_input.multimodal_hashes) == 3
+    assert multimodal_input.multimodal_hashes[0] == multimodal_input.multimodal_hashes[1]
+    assert multimodal_input.multimodal_hashes[1] != multimodal_input.multimodal_hashes[2]
+
+
 # =============================================================================
 # VLM Wrapper Multimodal Forward Tests
 # =============================================================================
@@ -2208,6 +2296,92 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
 
 
 @torch.no_grad()
+def test_vlm_wrapper_chunked_prefill_inside_video_span():
+    """Chunked video prefill should select the request-local video embedding slice."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 2, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    frame_tokens = (grid_h // merge) * (grid_w // merge)
+
+    video_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values_videos = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+
+    text_before = [1, 2]
+    between_frames = [3]
+    text_after = [4]
+    frame_span = [config.vision_start_token_id] + [config.video_token_id] * frame_tokens
+    full_tokens = text_before + frame_span + between_frames + frame_span + text_after
+
+    second_frame_start = len(text_before) + len(frame_span) + len(between_frames)
+    chunk_start = second_frame_start + 2
+    chunk_tokens = full_tokens[chunk_start:]
+    chunk_len = len(chunk_tokens)
+
+    input_ids = torch.tensor([chunk_tokens])
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len).unsqueeze(0)
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values_videos=pixel_values_videos,
+        video_grid_thw=video_grid_thw,
+        batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_item_types=torch.tensor([1, 1], dtype=torch.int32),
+        mm_token_positions=torch.tensor([len(text_before), second_frame_start], dtype=torch.int32),
+        mm_token_lengths=torch.tensor([1 + frame_tokens, 1 + frame_tokens], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_special_offsets=torch.tensor([0, 1 + frame_tokens], dtype=torch.int32),
+    )
+
+    full_input_ids = torch.tensor([full_tokens])
+    full_pos_3d, _ = compute_mrope_positions(
+        input_ids=full_input_ids,
+        image_grid_thw=None,
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    expected_chunk_pos_3d = full_pos_3d[..., chunk_start:]
+
+    full_inputs_embeds = model.model.get_input_embeddings()(full_input_ids)
+    full_video_embeds = torch.cat(
+        model.model.get_video_features(pixel_values_videos, video_grid_thw), dim=0
+    ).to(full_inputs_embeds.device, full_inputs_embeds.dtype)
+    full_video_mask = (
+        (full_input_ids == config.video_token_id).unsqueeze(-1).expand_as(full_inputs_embeds)
+    )
+    full_inputs_embeds = full_inputs_embeds.masked_scatter(full_video_mask, full_video_embeds)
+    expected_chunk_embeds = full_inputs_embeds[:, chunk_start:]
+
+    text_out = model.model.language_model(
+        inputs_embeds=expected_chunk_embeds,
+        position_ids=expected_chunk_pos_3d,
+    )
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Chunked video prefill should match the full-request video mRoPE slice",
+    )
+
+
+@torch.no_grad()
 def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_request():
     """Chunked mixed image+video requests should preserve item-type grid ordering."""
     config = _make_small_composite_config()
@@ -2216,28 +2390,29 @@ def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_reques
 
     merge = config.vision_config.spatial_merge_size
     image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
-    video_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long)
+    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long)
     num_image_tokens = int(
         image_grid_thw[0, 0].item()
         * (image_grid_thw[0, 1].item() // merge)
         * (image_grid_thw[0, 2].item() // merge)
     )
-    num_video_tokens = int(
-        video_grid_thw[0, 0].item()
-        * (video_grid_thw[0, 1].item() // merge)
-        * (video_grid_thw[0, 2].item() // merge)
+    frame_tokens = int(
+        (video_grid_thw[0, 1].item() // merge) * (video_grid_thw[0, 2].item() // merge)
     )
 
     text_before = [1]
-    text_between = [2, 3]
+    text_between = [2]
+    between_video_frames = [3]
     text_after = [4]
+    image_span = [config.vision_start_token_id] + ([config.image_token_id] * num_image_tokens)
+    video_span = [config.vision_start_token_id] + ([config.video_token_id] * frame_tokens)
     full_tokens = (
         text_before
-        + [config.vision_start_token_id]
-        + ([config.image_token_id] * num_image_tokens)
+        + image_span
         + text_between
-        + [config.vision_start_token_id]
-        + ([config.video_token_id] * num_video_tokens)
+        + video_span
+        + between_video_frames
+        + video_span
         + text_after
     )
 
@@ -2252,8 +2427,9 @@ def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_reques
         spatial_merge_size=merge,
     )
 
-    video_start = len(text_before) + 1 + num_image_tokens + len(text_between) + 1
-    chunk_start = video_start + 1
+    first_video_start = len(text_before) + len(image_span) + len(text_between)
+    second_video_start = first_video_start + len(video_span) + len(between_video_frames)
+    chunk_start = second_video_start + 1
     chunk_tokens = full_tokens[chunk_start:]
     chunk_len = len(chunk_tokens)
     input_ids = torch.tensor([chunk_tokens], dtype=torch.long)
@@ -2269,24 +2445,146 @@ def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_reques
         seq_len=torch.tensor([chunk_len], dtype=torch.int32),
         image_grid_thw=image_grid_thw,
         video_grid_thw=video_grid_thw,
-        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
-        mm_item_types=torch.tensor([0, 1], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
+        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32),
         mm_token_positions=torch.tensor(
-            [len(text_before), len(text_before) + 1 + num_image_tokens + len(text_between)],
+            [len(text_before), first_video_start, second_video_start],
             dtype=torch.int32,
         ),
         mm_token_lengths=torch.tensor(
-            [1 + num_image_tokens, 1 + num_video_tokens],
+            [1 + num_image_tokens, 1 + frame_tokens, 1 + frame_tokens],
             dtype=torch.int32,
         ),
-        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
-        mm_special_offsets=torch.tensor([0, 1 + num_image_tokens], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
+        mm_special_offsets=torch.tensor(
+            [0, 1 + num_image_tokens, 1 + num_image_tokens + 1 + frame_tokens],
+            dtype=torch.int32,
+        ),
     )
 
     torch.testing.assert_close(
         actual_pos_3d,
         full_pos_3d[..., chunk_start:],
         msg="Chunked mixed image+video requests should reconstruct positions using item types",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_chunked_prefill_inside_mixed_image_and_video_spans():
+    """Chunked mixed multimodal prefill should preserve prompt-order embed slices."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long)
+    num_image_patches = int(image_grid_thw[0].prod().item())
+    num_video_patches = int(video_grid_thw[0].prod().item())
+    num_image_tokens = num_image_patches // (merge**2)
+    frame_tokens = int(
+        (video_grid_thw[0, 1].item() // merge) * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_image_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values_videos = torch.randn(num_video_patches, vc.in_channels * t_ps * ps * ps)
+
+    text_before = [1]
+    text_between = [2]
+    between_video_frames = [3]
+    text_after = [4]
+    image_span = [config.vision_start_token_id] + ([config.image_token_id] * num_image_tokens)
+    video_span = [config.vision_start_token_id] + ([config.video_token_id] * frame_tokens)
+    full_tokens = (
+        text_before
+        + image_span
+        + text_between
+        + video_span
+        + between_video_frames
+        + video_span
+        + text_after
+    )
+
+    first_video_start = len(text_before) + len(image_span) + len(text_between)
+    second_video_start = first_video_start + len(video_span) + len(between_video_frames)
+    chunk_start = second_video_start + 1
+    chunk_tokens = full_tokens[chunk_start:]
+    chunk_len = len(chunk_tokens)
+
+    input_ids = torch.tensor([chunk_tokens], dtype=torch.long)
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len).unsqueeze(0)
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
+        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32),
+        mm_token_positions=torch.tensor(
+            [len(text_before), first_video_start, second_video_start],
+            dtype=torch.int32,
+        ),
+        mm_token_lengths=torch.tensor(
+            [1 + num_image_tokens, 1 + frame_tokens, 1 + frame_tokens], dtype=torch.int32
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
+        mm_special_offsets=torch.tensor(
+            [0, 1 + num_image_tokens, 1 + num_image_tokens + 1 + frame_tokens],
+            dtype=torch.int32,
+        ),
+    )
+
+    full_input_ids = torch.tensor([full_tokens], dtype=torch.long)
+    full_pos_3d, _ = compute_mrope_positions(
+        input_ids=full_input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    expected_chunk_pos_3d = full_pos_3d[..., chunk_start:]
+
+    full_inputs_embeds = model.model.get_input_embeddings()(full_input_ids)
+    full_image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(full_inputs_embeds.device, full_inputs_embeds.dtype)
+    full_video_embeds = torch.cat(
+        model.model.get_video_features(pixel_values_videos, video_grid_thw), dim=0
+    ).to(full_inputs_embeds.device, full_inputs_embeds.dtype)
+    full_image_mask = (
+        (full_input_ids == config.image_token_id).unsqueeze(-1).expand_as(full_inputs_embeds)
+    )
+    full_video_mask = (
+        (full_input_ids == config.video_token_id).unsqueeze(-1).expand_as(full_inputs_embeds)
+    )
+    full_inputs_embeds = full_inputs_embeds.masked_scatter(full_image_mask, full_image_embeds)
+    full_inputs_embeds = full_inputs_embeds.masked_scatter(full_video_mask, full_video_embeds)
+    expected_chunk_embeds = full_inputs_embeds[:, chunk_start:]
+
+    text_out = model.model.language_model(
+        inputs_embeds=expected_chunk_embeds,
+        position_ids=expected_chunk_pos_3d,
+    )
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Chunked mixed multimodal prefill should match the full-request embed slice",
     )
 
 
