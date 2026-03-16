@@ -81,7 +81,9 @@ def _translate_gather_nd_op(data: ir.Tensor, indices: ir.Tensor, batch_dims: int
 
 
 def _translate_rope_attention_op(
-    qkv: ir.Tensor,
+    q: ir.Tensor,
+    k: ir.Tensor,
+    v: ir.Tensor,
     past_key_values: ir.Tensor,
     context_lengths: ir.Tensor,
     rope_rotary_cos_sin: ir.Tensor,
@@ -90,6 +92,8 @@ def _translate_rope_attention_op(
     head_size: int,
     num_kv_heads: int,
     num_q_heads: int,
+    enable_fp8_kv_cache: int = 0,
+    sliding_window_size: int = -1,
 ):
     """
     ONNX custom op translation function for AttentionPlugin.
@@ -103,7 +107,9 @@ def _translate_rope_attention_op(
     """
     # Call the custom op from the trt domain
     return _onnx_schemas.trt_opset.AttentionPlugin(
-        qkv,
+        q,
+        k,
+        v,
         past_key_values,
         context_lengths,
         rope_rotary_cos_sin,
@@ -112,6 +118,8 @@ def _translate_rope_attention_op(
         head_size=head_size,
         num_kv_heads=num_kv_heads,
         num_q_heads=num_q_heads,
+        enable_fp8_kv_cache=enable_fp8_kv_cache,
+        sliding_window_size=sliding_window_size,
     )
 
 
