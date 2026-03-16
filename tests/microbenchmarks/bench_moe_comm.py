@@ -213,6 +213,7 @@ def _create_model_config(
     act_dtype: torch.dtype,
     max_num_tokens_per_rank: int,
     quant_config: Optional[QuantConfig],
+    use_low_precision_moe_combine: bool = False,
 ) -> ModelConfig:
     # Keep it minimal: just enough fields for CommunicationFactory.
     return ModelConfig(
@@ -222,7 +223,7 @@ def _create_model_config(
         max_num_tokens=int(max_num_tokens_per_rank),
         moe_max_num_tokens=int(max_num_tokens_per_rank),
         use_cuda_graph=False,
-        use_low_precision_moe_combine=False,
+        use_low_precision_moe_combine=use_low_precision_moe_combine,
     )
 
 
@@ -901,6 +902,12 @@ def parse_args() -> argparse.Namespace:
         help="Use deterministic balanced router assignments to avoid communication load imbalance.",
     )
     parser.add_argument(
+        "--use_low_precision_moe_combine",
+        action="store_true",
+        default=False,
+        help="Enable low-precision (FP8) MoE combine path.",
+    )
+    parser.add_argument(
         "--no_cuda_graph",
         action="store_true",
         help="Disable CUDA graph mode. By default, dispatch and combine are captured into CUDA graphs for lower CPU overhead and more accurate timing.",
@@ -1087,6 +1094,7 @@ def _run_benchmark_worker_under_current_mpi(
                 act_dtype=act_dtype,
                 max_num_tokens_per_rank=max_num_tokens_per_rank,
                 quant_config=quant_config,
+                use_low_precision_moe_combine=args.use_low_precision_moe_combine,
             )
 
             backend = CommunicationFactory._create_forced_method(  # pylint: disable=protected-access

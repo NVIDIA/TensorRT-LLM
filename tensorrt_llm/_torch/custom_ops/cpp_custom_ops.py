@@ -396,6 +396,7 @@ def _register_fake():
         top_k: int,
         combine_payload_offset: int,
         payload_in_workspace: bool,
+        use_low_precision: bool = False,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
