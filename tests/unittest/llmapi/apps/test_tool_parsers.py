@@ -1007,6 +1007,127 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             }
         }
 
+    def test_parse_anyof_parameter_type_conversion(self, parser):
+        """Test that parameters using anyOf schemas are correctly type-converted."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="create_record",
+                description="Create a record with various optional fields",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string"
+                        },
+                        "count": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "score": {
+                            "anyOf": [{
+                                "type": "number"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "active": {
+                            "anyOf": [{
+                                "type": "boolean"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "metadata": {
+                            "anyOf": [{
+                                "type": "object"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "tags": {
+                            "anyOf": [{
+                                "type": "array"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "label": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                    "required": ["name"],
+                },
+            ),
+        )
+
+        text = ("<tool_call>\n"
+                "<function=create_record>\n"
+                "<parameter=name>test</parameter>\n"
+                "<parameter=count>42</parameter>\n"
+                "<parameter=score>3.14</parameter>\n"
+                "<parameter=active>true</parameter>\n"
+                '<parameter=metadata>{"key": "value"}</parameter>\n'
+                "<parameter=tags>[1, 2, 3]</parameter>\n"
+                "<parameter=label>hello</parameter>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool_def])
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["name"] == "test"
+        assert params["count"] == 42
+        assert isinstance(params["count"], int)
+        assert params["score"] == 3.14
+        assert isinstance(params["score"], float)
+        assert params["active"] is True
+        assert params["metadata"] == {"key": "value"}
+        assert params["tags"] == [1, 2, 3]
+        assert params["label"] == "hello"
+
+    def test_parse_anyof_null_value(self, parser):
+        """Test that null values are handled correctly for anyOf parameters."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="set_value",
+                description="Set a value",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                },
+            ),
+        )
+
+        text = ("<tool_call>\n"
+                "<function=set_value>\n"
+                "<parameter=value>null</parameter>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool_def])
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["value"] is None
+
     def test_qwen3_coder_format_compliance(
         self,
         parser,

@@ -352,22 +352,6 @@ def should_skip_trtllm(
                 f"Single-GPU tests pass; issue is in the kernel runner under EP."
             )
 
-        # Issue: NVFP4 with large model configs crashes with CUDA illegal memory
-        # access in DeepEP mode (deep_ep.cpp:86).
-        # Verified: e60_k4_h2048_i1408 passes, e256_k8_h7168_i2048 crashes.
-        # The crash kills the entire pytest process, blocking all subsequent tests.
-        if (
-            quant_algo == QuantAlgo.NVFP4
-            and num_experts >= 256
-            and model_config.hidden_size >= 7168
-        ):
-            return (
-                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model "
-                f"(num_experts={num_experts}, hidden_size={model_config.hidden_size}) "
-                f"crashes with CUDA illegal memory access in DeepEP mode "
-                f"(comm={comm_method}). Smaller configs pass."
-            )
-
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
     # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:
@@ -611,15 +595,6 @@ def should_skip_multi_gpu(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    # DEEPEPLOWLATENCY hangs on H100 (SM90) in CI multi-GPU tests.
-    if comm_method == "DEEPEPLOWLATENCY":
-        capability = torch.cuda.get_device_capability(0)
-        if capability == (9, 0):
-            return (
-                "[CI Hang] DEEPEPLOWLATENCY hangs on H100 (SM90) in "
-                "multi-GPU tests. Skipping until the issue is resolved."
-            )
-
     # Only EP modes have ep_size = world_size; TP modes have ep_size = 1
     if parallel_mode not in ("DEP", "TEP"):
         return None
@@ -632,6 +607,22 @@ def should_skip_multi_gpu(
             f"in {parallel_mode} mode. Requires EPLB to handle non-uniform "
             f"expert partitioning (tested separately in test_configurable_moe_multi_gpu_eplb)."
         )
+
+    # DeepEP Low Latency requires NVSHMEM IBGDA transport, which needs
+    # GPU-side MMIO mapping of InfiniBand UAR (User Access Region).
+    # On Hopper (SM90) nodes the cudaHostRegister(IoMemory) call fails
+    # (cudaErrorNotSupported), causing IBGDA init to fail.  NVSHMEM v3.2.5
+    # has a double-free bug in the IBGDA cleanup path that crashes MPI
+    # workers with SIGABRT, leaving the parent process hung forever.
+    # Skip on Hopper until NVSHMEM ships a fix or IBRC fallback is enabled.
+    if comm_method == "DEEPEPLOWLATENCY":
+        if torch.cuda.get_device_capability(0) == (9, 0):
+            return (
+                "DEEPEPLOWLATENCY requires NVSHMEM IBGDA transport. "
+                "Hopper (SM90) nodes lack GPU-side UAR mapping support "
+                "(cudaHostRegister IoMemory returns cudaErrorNotSupported), "
+                "and NVSHMEM v3.2.5 crashes on IBGDA init failure cleanup."
+            )
 
     return None
 
@@ -675,6 +666,7 @@ def should_skip_routing_method(
 def supports_autotuner_capture(
     backend_type: MoeBackendType,
     _quant_algo: Optional[QuantAlgo],
+    use_flashinfer: bool,
 ) -> bool:
     """
     Determine if a backend+quant_algo combination supports AutoTuner capture/replay.
@@ -689,6 +681,9 @@ def supports_autotuner_capture(
     """
     # DEEPGEMM does not support autotuner capture
     if backend_type == MoeBackendType.DEEPGEMM:
+        return False
+
+    if use_flashinfer:
         return False
 
     return True
