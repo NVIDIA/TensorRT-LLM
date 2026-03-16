@@ -937,11 +937,17 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    mla_layer.forward_impl(position_ids,
-                           hidden_states,
-                           metadata,
-                           output=output,
-                           latent_cache_gen=latent_cache_gen)
+    if mla_layer.is_dsa:
+        mla_layer.forward_impl_with_dsa(position_ids,
+                                        hidden_states,
+                                        metadata,
+                                        output=output)
+    else:
+        mla_layer.forward_impl(position_ids,
+                               hidden_states,
+                               metadata,
+                               output=output,
+                               latent_cache_gen=latent_cache_gen)
 
 
 def fp8_block_scaling_bmm_out(
@@ -2597,16 +2603,15 @@ class MLA(nn.Module):
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
-        if self.is_dsa:
+        if self.register_to_config:
+            torch.ops.trtllm.mla_custom_op_inplace(
+                hidden_states, position_ids, self.layer_idx_str, attn_output,
+                None if self.is_dsa else latent_cache_gen)
+        elif self.is_dsa:
             self.forward_impl_with_dsa(position_ids,
                                        hidden_states,
                                        attn_metadata,
                                        output=attn_output)
-        elif self.register_to_config:
-            torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
-                                                   self.layer_idx_str,
-                                                   attn_output,
-                                                   latent_cache_gen)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
