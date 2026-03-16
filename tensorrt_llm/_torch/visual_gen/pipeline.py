@@ -1,6 +1,7 @@
+import itertools
 import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -24,8 +25,6 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
-    warmup_steps: int = 2
-
     def __init__(self, model_config: "DiffusionModelConfig"):
         super().__init__()
         self.model_config = model_config
@@ -33,6 +32,7 @@ class BasePipeline(nn.Module):
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
+        self._warmed_up_shapes: Set[Tuple[int, int, int]] = set()
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -102,12 +102,102 @@ class BasePipeline(nn.Module):
         return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes for the pipeline.
-        Should be in format of (height, width, num_frames)
-        Override this property and use in self._run_warmup() for model-specific warmup.
+    def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
+        """Model-specific default warmup resolutions (height, width).
+
+        Subclasses should override. Combined with default_warmup_num_frames
+        via Cartesian product to produce warmup shapes.
         """
         return []
+
+    @property
+    def default_warmup_num_frames(self) -> List[int]:
+        """Model-specific default warmup frame counts.
+
+        Subclasses should override. Combined with default_warmup_resolutions
+        via Cartesian product to produce warmup shapes.
+        """
+        return []
+
+    @property
+    def default_warmup_steps(self) -> int:
+        """Model-specific default denoising steps for warmup. Subclass override."""
+        return 2
+
+    @property
+    def resolution_multiple_of(self) -> Tuple[int, int]:
+        """(h_multiple, w_multiple) resolution constraint. Subclass override."""
+        return (1, 1)
+
+    def validate_resolution(self, height: int, width: int, num_frames: int) -> None:
+        """Validate resolution against model constraints. Raises ValueError.
+
+        Only checks resolution constraints (must be positive and divisible by
+        model-specific multiples). Frame count is NOT validated here — following
+        HuggingFace diffusers convention, invalid frame counts are silently
+        rounded in forward() instead of rejected.
+        """
+        if height <= 0 or width <= 0 or num_frames <= 0:
+            raise ValueError(
+                f"Dimensions must be positive: height={height}, width={width}, "
+                f"num_frames={num_frames} for {self.__class__.__name__}."
+            )
+        h_mul, w_mul = self.resolution_multiple_of
+        if h_mul > 1 or w_mul > 1:
+            if height % h_mul != 0 or width % w_mul != 0:
+                raise ValueError(
+                    f"Resolution ({height}x{width}) must be multiples of "
+                    f"({h_mul}x{w_mul}) for {self.__class__.__name__}."
+                )
+
+    def resolve_warmup_plan(self) -> Tuple[List[Tuple[int, int, int]], int]:
+        """Resolve warmup shapes and steps from config or model defaults.
+
+        Shapes are the Cartesian product of resolutions x num_frames.
+
+        Priority:
+            1. User-specified: model_config.compilation.resolutions / num_frames
+            2. Model defaults: default_warmup_resolutions / default_warmup_num_frames
+            3. Empty: skip warmup
+
+        Steps: always from model subclass (default_warmup_steps).
+
+        Returns:
+            (shapes, steps) tuple where shapes = list of (h, w, f)
+        """
+        warmup_cfg = self.model_config.compilation
+
+        if warmup_cfg.resolutions is not None or warmup_cfg.num_frames is not None:
+            resolutions = (
+                warmup_cfg.resolutions
+                if warmup_cfg.resolutions is not None
+                else self.default_warmup_resolutions
+            )
+            num_frames_list = (
+                warmup_cfg.num_frames
+                if warmup_cfg.num_frames is not None
+                else self.default_warmup_num_frames
+            )
+        else:
+            resolutions = self.default_warmup_resolutions
+            num_frames_list = self.default_warmup_num_frames
+
+        all_shapes = [(h, w, f) for (h, w), f in itertools.product(resolutions, num_frames_list)]
+
+        valid_shapes = []
+        for h, w, f in all_shapes:
+            try:
+                self.validate_resolution(h, w, f)
+                valid_shapes.append((h, w, f))
+            except ValueError as e:
+                logger.warning(f"Skipping invalid warmup shape ({h}x{w}, {f} frames): {e}")
+
+        return valid_shapes, self.default_warmup_steps
+
+    @property
+    def vae_adapter_class(self) -> Type[ParallelVAEFactory] | None:
+        """Return the VAE adapter class for the pipeline."""
+        return None
 
     def infer(self, req: Any):
         raise NotImplementedError
@@ -320,43 +410,48 @@ class BasePipeline(nn.Module):
     def warmup(self) -> None:
         """Run warmup inference to trigger torch.compile and CUDA initialization.
 
-        Runs a short denoising loop with dummy inputs. This:
+        Resolves warmup shapes from user config or model defaults, then runs
+        a short denoising loop with dummy inputs for each shape. This:
         1. Triggers torch.compile's lazy compilation (first forward trace + codegen)
-        2. Warms up CUDA kernels and allocators
-        3. Populates any lazy caches (e.g., RoPE frequencies)
+        2. Pre-captures CUDA graphs (if enabled)
+        3. Warms up CUDA kernels and allocators
+        4. Populates any lazy caches (e.g., RoPE frequencies)
 
         Called automatically by PipelineLoader after model loading and torch.compile.
+        OOM is not caught — if a warmup shape OOMs, the server fails fast at startup.
         """
-        warmup_steps = self.warmup_steps
-        if warmup_steps <= 0:
-            logger.info("Warmup disabled (warmup_steps=0)")
+        shapes, steps = self.resolve_warmup_plan()
+        if not shapes:
+            logger.info("Warmup disabled (no warmup shapes)")
             return
 
         logger.info(
-            f"Running warmup for {self.__class__.__name__} with {self.common_warmup_shapes} shapes "
-            f"and {warmup_steps} steps..."
+            f"Running warmup for {self.__class__.__name__} "
+            f"with {len(shapes)} shapes and {steps} steps..."
         )
         warmup_start = time.time()
 
-        self._run_warmup(warmup_steps)
+        for height, width, num_frames in shapes:
+            logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
+            self._run_warmup(height, width, num_frames, steps)
+            torch.cuda.synchronize()
 
-        torch.cuda.synchronize()
+        self._warmed_up_shapes = set(tuple(s) for s in shapes)
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Execute warmup forward passes. Subclasses should override for model-specific warmup.
-
-        Default implementation runs the transformer forward with dummy tensors matching
-        typical input shapes. Subclasses can override to run the full pipeline with
-        reduced steps for more thorough warmup.
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        """Run warmup for a single shape. Subclasses must override.
 
         Args:
-            warmup_steps: Number of denoising steps to run
+            height: Video/image height in pixels
+            width: Video/image width in pixels
+            num_frames: Number of frames (1 for image models)
+            steps: Number of denoising steps
         """
         logger.warning(
             f"{self.__class__.__name__} does not implement _run_warmup(); "
-            "skipping warmup. Override _run_warmup() for model-specific warmup."
+            "skipping warmup for this shape."
         )
 
     def decode_latents(
