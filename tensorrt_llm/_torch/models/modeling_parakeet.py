@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Dict, NamedTuple, Optional
 
 import numpy as np
@@ -32,30 +47,32 @@ class ParakeetExtractor(ParakeetFeatureExtractor):
         return clip_sizes
 
     def audio_token_count(self, audio_len: int) -> int:
-        total_tokens = 0
-        for clip_size in self._clip_sizes(audio_len):
-            num_frames = clip_size // self.hop_length
-            # NOTE: this is a massive hack in order not to duplicate the functionality here.
-            n_tokens = HFParakeetEncoder._get_subsampling_output_length(
-                self, torch.tensor([num_frames], dtype=torch.float)
-            )
-            total_tokens += int(n_tokens.item())
-        return max(1, total_tokens)
+        clip_sizes = self._clip_sizes(audio_len)
+        num_frames = torch.tensor([cs // self.hop_length for cs in clip_sizes], dtype=torch.float)
+        # NOTE: this is a massive hack in order not to duplicate the functionality here.
+        n_tokens = HFParakeetEncoder._get_subsampling_output_length(self, num_frames)
+        return max(1, int(n_tokens.sum().item()))
 
     def _split_audio_into_clips(self, audio: np.ndarray) -> list[np.ndarray]:
-        assert audio.ndim == 1
+        if audio.ndim == 2:
+            if audio.shape[1] == 0:
+                raise ValueError(
+                    f"Unsupported audio shape {audio.shape}: expected at least one channel"
+                )
+            audio = audio.mean(axis=1)
+        elif audio.ndim != 1:
+            raise ValueError(
+                f"Unsupported audio shape {audio.shape}: "
+                "expected 1-D (mono) or 2-D (samples x channels)"
+            )
         audio_len = int(audio.shape[0])
         clip_sizes = self._clip_sizes(audio_len)
         target_len = sum(clip_sizes)
         if audio_len < target_len:
             audio = np.pad(audio, (0, target_len - audio_len))
 
-        clips = list[np.ndarray]()
-        offset = 0
-        for clip_size in clip_sizes:
-            clips.append(audio[offset : offset + clip_size])
-            offset += clip_size
-        return clips
+        split_indices = np.cumsum(clip_sizes[:-1])
+        return np.split(audio, split_indices)
 
     def __call__(self, raw_speech: list[np.ndarray], *args, **kwargs) -> torch.Tensor:
         audio_clips = list[np.ndarray]()

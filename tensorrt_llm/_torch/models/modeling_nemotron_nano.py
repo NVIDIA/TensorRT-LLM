@@ -1369,19 +1369,22 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
     def _encode_multimodal(
         self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[List[torch.Tensor], List[None]]:
+    ) -> Tuple[List[torch.Tensor], List[Optional[List[int]]]]:
         """Dispatch multimodal encoding to the appropriate encoder."""
         mm_embeddings = []
+        mm_num_tokens = []
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
             if modality_type in ("image", "video"):
-                embs, _ = self.vision_encoder([param])
+                embs, num_tokens = self.vision_encoder([param])
                 mm_embeddings.append(embs[0])
+                mm_num_tokens.append(num_tokens[0])
             elif modality_type == "audio":
                 mm_embeddings.append(self._encode_audio(param))
+                mm_num_tokens.append(None)
             else:
                 raise ValueError(f"Unknown modality: {modality_type}")
-        return mm_embeddings, [None] * len(multimodal_params)
+        return mm_embeddings, mm_num_tokens
 
     @torch.inference_mode()
     def forward(

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import numpy as np
@@ -320,6 +320,14 @@ async def async_load_video(video: str,
     return results
 
 
+def _normalize_file_uri(uri: str) -> str:
+    """Strip the file:// scheme and unquote percent-encoded characters."""
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
+        return unquote(parsed.path)
+    return uri
+
+
 def load_audio(
     audio: str,
     format: str = "pt",
@@ -329,6 +337,8 @@ def load_audio(
     if parsed_url.scheme in ["http", "https"]:
         audio = requests.get(audio, stream=True, timeout=10)
         audio = BytesIO(audio.content)
+    elif parsed_url.scheme == "file":
+        audio = _normalize_file_uri(audio)
 
     audio = soundfile.read(audio)
     return audio
@@ -345,7 +355,7 @@ async def async_load_audio(
             async with session.get(audio) as response:
                 audio = BytesIO(await response.content.read())
     elif parsed_url.scheme == "file":
-        audio = parsed_url.path
+        audio = _normalize_file_uri(audio)
 
     audio = soundfile.read(audio)
     return audio
@@ -579,8 +589,19 @@ def handle_placeholder_exceptions(model_type: str,
         # In the near future, we will remove this placeholder exception and use dict format as vllm does.
         for conv, mm_placeholder_count in zip(conversation,
                                               mm_placeholder_counts):
+            if '<image>' not in mm_placeholder_count and '<video>' not in mm_placeholder_count and '<so_embedding>' not in mm_placeholder_count:
+                # Skip if no image, video, or audio placeholders.
+                continue
+
+            # Audio placeholders must be added directly to the text content because the
+            # chat template for this model doesn't handle {"type": "audio"} list items.
+            if '<so_embedding>' in mm_placeholder_count:
+                audio_placeholders = '<so_embedding>' * mm_placeholder_count[
+                    '<so_embedding>']
+                conv["content"] = audio_placeholders + "\n" + conv["content"]
+
+            # For image/video, convert to list format for the chat_template.
             if '<image>' not in mm_placeholder_count and '<video>' not in mm_placeholder_count:
-                # Skip if no image or video placeholders.
                 continue
 
             # Contents from all kinds of roles will be handled.
