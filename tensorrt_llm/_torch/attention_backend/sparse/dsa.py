@@ -904,7 +904,14 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
+        logger.info(f"Indexer layer {layer_idx}: using_cute_dsl_topk={self.use_cute_dsl_topk} for decode top-k")
+
+        if self.use_cute_dsl_topk and layer_idx == 0:
+            from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+            cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
+                dtype=dtype, top_k=self.index_topk)
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1476,10 +1483,19 @@ class Indexer(nn.Module):
                 # This is because rowEnd = seq_len - next_n + offset + 1
                 gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
-                torch.ops.trtllm.indexer_topk_decode(
-                    logits_decode, gen_kv_lens_cuda,
-                    topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                        num_gen_tokens, :], next_n)
+                # TODO: Note, cute dsl top_k requires extra memory.
+                if self.use_cute_dsl_topk and num_gen_tokens <= 256:
+                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                        logits_decode, gen_kv_lens_cuda,
+                        topk_indices_buffer[
+                            num_ctx_tokens:num_ctx_tokens +
+                            num_gen_tokens, :],
+                        self.index_topk, next_n)
+                else:
+                    torch.ops.trtllm.indexer_topk_decode(
+                        logits_decode, gen_kv_lens_cuda,
+                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                            num_gen_tokens, :], next_n)
             else:
                 # padded
                 positions = torch.arange(
