@@ -3508,7 +3508,7 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
@@ -3546,8 +3546,8 @@ def launchTestJobs(pipeline, testFilter)
             AARCH64_TRIPLE,
             false,
             "",
-            DLFW_IMAGE,
-            false, // Extra PyTorch CUDA 13.0 install
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
         ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
