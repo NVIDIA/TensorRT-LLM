@@ -209,22 +209,22 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     K_packed = 32  # weight is packed by 2 FP4 per byte
     K_eff = 2 * K_packed
 
-    # FP4 dummy tensors
+    # FP4 dummy tensors (new IR format: weight_scale is FP8 per-block 2D)
     x_fp4 = torch.randn(3, K_eff, device="meta", dtype=torch.float16)
     w_fp4 = torch.randint(0, 255, (N, K_packed), device="meta", dtype=torch.uint8)
 
     s_in2 = torch.tensor(0.01, device="meta", dtype=torch.float32)
     ws2 = torch.tensor(1.2345, device="meta", dtype=torch.float32)
 
-    cutlass_len = N * (K_eff // 16)  # 32 * (64/16) = 128
-    cutlass_vec = torch.randint(0, 255, (cutlass_len,), device="meta", dtype=torch.uint8)
+    # Per-block FP8 weight scale: 2D [N, K_eff//16] (new IR format)
+    weight_scale_fp8 = torch.empty((N, K_eff // 16), device="meta", dtype=torch.float8_e4m3fn)
 
     # no-bias variant
     dummy_args_fp4_1 = [
         x_fp4,
         w_fp4,
         s_in2,
-        cutlass_vec,
+        weight_scale_fp8,
         ws2,
     ]
     register_ad_pattern(
@@ -240,7 +240,7 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         w_fp4,
         torch.randn(N, device="meta", dtype=torch.float16),  # bias
         s_in2,
-        cutlass_vec,
+        weight_scale_fp8,
         ws2,
     ]
     register_ad_pattern(
@@ -299,6 +299,34 @@ class FuseFP8Linear(BaseTransform):
         return gm, info
 
 
+def _swizzle_nvfp4_scale(
+    raw_ws: torch.Tensor, float4_sf_dtype, flatten: bool = True
+) -> torch.Tensor:
+    """Swizzle a 2D FP8 per-block weight scale into CUTLASS-ready uint8.
+
+    Args:
+        raw_ws: Per-block weight scale tensor, dtype=float8_e4m3fn, shape (M, N/16).
+        float4_sf_dtype: The float4 scale factor dtype (from fp4_utils).
+        flatten: If True (default), return flat 1D uint8. If False, return 2D uint8
+            [padded_M, padded_N] suitable for MoE stacking into 3D.
+
+    Returns:
+        uint8 tensor in CUTLASS-swizzled layout, on the same device as raw_ws.
+        Shape is flat 1D if flatten=True, else 2D [padded_M, padded_N].
+    """
+    device = raw_ws.device
+    weight_scale = raw_ws.view(float4_sf_dtype)
+    weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
+        weight_scale.view(torch.uint8).cpu().contiguous()
+    ).view(float4_sf_dtype)
+    m, n = weight_scale.shape
+    padded_m = math.ceil(m / 128) * 128
+    padded_n = math.ceil(n / 4) * 4
+    swizzled_shape = (padded_m, padded_n)
+    result = weight_scale_swizzled.reshape(swizzled_shape).view(torch.uint8).to(device)
+    return result.reshape(-1) if flatten else result
+
+
 def _collect_nvfp4_scale_keys(gm: GraphModule):
     """Collect (input_scale, weight_scale, weight_scale_2) buffer keys from fused nvfp4 nodes."""
     scale_keys = []
@@ -310,11 +338,12 @@ def _collect_nvfp4_scale_keys(gm: GraphModule):
             if inp.op != "get_attr":
                 continue
             t = inp.target
-            if t.endswith(".weight_scale_2"):
+            attr = t.rsplit(".", 1)[-1]
+            if attr == "weight_scale_2":
                 scale_map["ws2"] = t
-            elif t.endswith(".weight_scale"):
+            elif attr == "weight_scale":
                 scale_map["ws"] = t
-            elif t.endswith(".input_scale"):
+            elif attr == "input_scale":
                 scale_map["is"] = t
         if len(scale_map) == 3:
             scale_keys.append((scale_map["is"], scale_map["ws"], scale_map["ws2"]))
@@ -349,25 +378,12 @@ def _process_nvfp4_scales_inplace(gm: GraphModule, scale_keys):
         raw_is = getattr(is_submod, is_attr)
         raw_ws = getattr(ws_submod, ws_attr)
         raw_ws2 = getattr(ws2_submod, ws2_attr)
-        device = raw_ws.device
 
         alpha = torch.clamp(raw_ws2 * raw_is, min=1e-30)
 
         inv_input_scale = 1 / torch.clamp(raw_is, min=1e-30)
 
-        weight_scale = raw_ws.view(float4_sf_dtype)
-        weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
-            weight_scale.view(torch.uint8).cpu().contiguous()
-        ).view(float4_sf_dtype)
-
-        m, n = weight_scale.shape
-        padded_m = math.ceil(m / 128) * 128
-        padded_n = math.ceil(n / 4) * 4
-        swizzled_shape = (padded_m, padded_n)
-
-        new_ws = (
-            weight_scale_swizzled.reshape(swizzled_shape).view(torch.uint8).reshape(-1).to(device)
-        )
+        new_ws = _swizzle_nvfp4_scale(raw_ws, float4_sf_dtype)
 
         is_submod.register_buffer(is_attr, inv_input_scale)
         ws_submod.register_buffer(ws_attr, new_ws)

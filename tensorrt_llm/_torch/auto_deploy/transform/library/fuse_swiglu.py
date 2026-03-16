@@ -25,6 +25,11 @@ The SwiGLU pattern is: silu(x @ gate.T) * (x @ up.T) @ down.T
 from typing import Tuple, Type
 
 import torch
+
+try:
+    from .....quantization.utils.fp4_utils import float4_sf_dtype as _float4_sf_dtype
+except ImportError:
+    _float4_sf_dtype = None
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
@@ -311,6 +316,7 @@ class FuseSwiGLU(BaseTransform):
 # ── NVFP4 quantized SwiGLU pattern matching and fusion ──────────────────────
 
 from ...custom_ops.linear.swiglu import torch_nvfp4_swiglu_mlp  # noqa: E402
+from .fuse_quant import _swizzle_nvfp4_scale  # noqa: E402
 
 
 def _nvfp4_swiglu_pattern_no_bias(
@@ -432,28 +438,24 @@ class MatchNVFP4SwiGLUPattern(BaseTransform):
         N_down = K_eff  # hidden_size (output of down proj)
         K_down_packed = N // 2  # intermediate_size / 2 (down proj input)
 
-        # Weight scale sizes (per-block scale: N * K / 16)
-        gate_cutlass_len = N * (K_eff // 16)
-        down_cutlass_len = N_down * (N // 16)
-
         x = torch.randn(2, K_eff, device="meta", dtype=torch.float16)
 
-        # Gate args
+        # Gate args — weight_scale is FP8 per-block 2D (new IR format)
         gate_w = torch.randint(0, 255, (N, K_packed), device="meta", dtype=torch.uint8)
         gate_is = torch.tensor(0.01, device="meta", dtype=torch.float32)
-        gate_ws = torch.randint(0, 255, (gate_cutlass_len,), device="meta", dtype=torch.uint8)
+        gate_ws = torch.empty((N, K_eff // 16), device="meta", dtype=torch.float8_e4m3fn)
         gate_a = torch.tensor(1.2345, device="meta", dtype=torch.float32)
 
         # Up args (same shapes as gate)
         up_w = torch.randint(0, 255, (N, K_packed), device="meta", dtype=torch.uint8)
         up_is = torch.tensor(0.02, device="meta", dtype=torch.float32)
-        up_ws = torch.randint(0, 255, (gate_cutlass_len,), device="meta", dtype=torch.uint8)
+        up_ws = torch.empty((N, K_eff // 16), device="meta", dtype=torch.float8_e4m3fn)
         up_a = torch.tensor(2.3456, device="meta", dtype=torch.float32)
 
         # Down args
         down_w = torch.randint(0, 255, (N_down, K_down_packed), device="meta", dtype=torch.uint8)
         down_is = torch.tensor(0.03, device="meta", dtype=torch.float32)
-        down_ws = torch.randint(0, 255, (down_cutlass_len,), device="meta", dtype=torch.uint8)
+        down_ws = torch.empty((N_down, N // 16), device="meta", dtype=torch.float8_e4m3fn)
         down_a = torch.tensor(3.4567, device="meta", dtype=torch.float32)
 
         dummy_args = [
@@ -554,23 +556,66 @@ class FuseNVFP4SwiGLU(BaseTransform):
             # Concatenate gate and up FP4 packed weights along dim=0
             gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
 
-            # Get and concatenate weight scales
+            # Get and concatenate FP8 per-block weight scales (new IR format: 2D float8_e4m3fn)
             gate_weight_scale = get_attr_by_name(gm, gate_weight_scale_node.target)
             up_weight_scale = get_attr_by_name(gm, up_weight_scale_node.target)
-            gate_up_weight_scale = torch.cat([gate_weight_scale, up_weight_scale], dim=0)
+            gate_up_weight_scale_fp8 = torch.cat([gate_weight_scale, up_weight_scale], dim=0)
 
-            # Register fused buffers
+            # Get raw scale values for processing:
+            #   gate_input_scale_node  -> input_scale buffer = 1/s_in2 (raw)
+            #   gate_alpha_node        -> weight_scale_2 buffer = 1/s_w2 (raw)
+            #   down_input_scale_node  -> down input_scale buffer = 1/s_in2_down (raw)
+            #   down_weight_scale_node -> down FP8 weight scale (raw)
+            #   down_alpha_node        -> down weight_scale_2 buffer = 1/s_w2_down (raw)
+            raw_gate_is = get_attr_by_name(gm, gate_input_scale_node.target)
+            raw_gate_ws2 = get_attr_by_name(gm, gate_alpha_node.target)
+            raw_down_is = get_attr_by_name(gm, down_input_scale_node.target)
+            raw_down_ws = get_attr_by_name(gm, down_weight_scale_node.target)
+            raw_down_ws2 = get_attr_by_name(gm, down_alpha_node.target)
+
+            # Process gate+up scales into kernel-ready format (same logic as
+            # _process_nvfp4_scales_inplace in fuse_quant.py):
+            #   inv_input_scale = 1 / raw_is  = s_in2
+            #   alpha           = raw_ws2 * raw_is  = 1/(s_in2*s_w2)
+            #   weight_scale    = swizzled uint8
             prefix = f"fused_nvfp4_swiglu_{fused_weight_idx}"
-            gm.register_buffer(f"{prefix}_gate_up_weight", gate_up_weight)
-            gm.register_buffer(f"{prefix}_gate_up_weight_scale", gate_up_weight_scale)
 
-            # Create get_attr nodes for fused weights/scales
+            if _float4_sf_dtype is not None:
+                gate_up_ws_uint8 = _swizzle_nvfp4_scale(gate_up_weight_scale_fp8, _float4_sf_dtype)
+                gate_up_inv_is = 1.0 / torch.clamp(raw_gate_is, min=1e-30)
+                gate_up_alpha_val = torch.clamp(raw_gate_ws2 * raw_gate_is, min=1e-30)
+                down_ws_uint8 = _swizzle_nvfp4_scale(raw_down_ws, _float4_sf_dtype)
+                down_inv_is = 1.0 / torch.clamp(raw_down_is, min=1e-30)
+                down_alpha_val = torch.clamp(raw_down_ws2 * raw_down_is, min=1e-30)
+            else:
+                # float4_sf_dtype not available: keep raw values (swizzling deferred)
+                gate_up_ws_uint8 = gate_up_weight_scale_fp8
+                gate_up_inv_is = raw_gate_is
+                gate_up_alpha_val = raw_gate_ws2
+                down_ws_uint8 = raw_down_ws
+                down_inv_is = raw_down_is
+                down_alpha_val = raw_down_ws2
+
+            # Register fused buffers (processed)
+            gm.register_buffer(f"{prefix}_gate_up_weight", gate_up_weight)
+            gm.register_buffer(f"{prefix}_gate_up_weight_scale", gate_up_ws_uint8)
+            gm.register_buffer(f"{prefix}_gate_up_inv_input_scale", gate_up_inv_is)
+            gm.register_buffer(f"{prefix}_gate_up_alpha", gate_up_alpha_val)
+            gm.register_buffer(f"{prefix}_down_weight_scale", down_ws_uint8)
+            gm.register_buffer(f"{prefix}_down_inv_input_scale", down_inv_is)
+            gm.register_buffer(f"{prefix}_down_alpha", down_alpha_val)
+
+            # Create get_attr nodes for all processed buffers
             with graph.inserting_before(node):
                 fused_gate_up_weight_node = graph.get_attr(f"{prefix}_gate_up_weight")
                 fused_gate_up_weight_scale_node = graph.get_attr(f"{prefix}_gate_up_weight_scale")
+                gate_up_inv_is_node = graph.get_attr(f"{prefix}_gate_up_inv_input_scale")
+                gate_up_alpha_node = graph.get_attr(f"{prefix}_gate_up_alpha")
+                down_ws_node = graph.get_attr(f"{prefix}_down_weight_scale")
+                down_inv_is_node = graph.get_attr(f"{prefix}_down_inv_input_scale")
+                down_alpha_node_new = graph.get_attr(f"{prefix}_down_alpha")
 
-            # Create the fused_nvfp4_swiglu_mlp node
-            # Use gate's input_scale and alpha (same as up's since they share input)
+            # Create the fused_nvfp4_swiglu_mlp node with kernel-ready processed scales
             with graph.inserting_after(node):
                 fused_node: Node = graph.call_function(
                     torch.ops.auto_deploy.fused_nvfp4_swiglu_mlp.default,
@@ -578,12 +623,12 @@ class FuseNVFP4SwiGLU(BaseTransform):
                         input_node,
                         fused_gate_up_weight_node,
                         down_weight_node,
-                        gate_input_scale_node,  # shared input_scale for gate+up
+                        gate_up_inv_is_node,
                         fused_gate_up_weight_scale_node,
-                        gate_alpha_node,  # shared alpha for gate+up
-                        down_input_scale_node,
-                        down_weight_scale_node,
-                        down_alpha_node,
+                        gate_up_alpha_node,
+                        down_inv_is_node,
+                        down_ws_node,
+                        down_alpha_node_new,
                     ),
                 )
 
@@ -600,6 +645,12 @@ class FuseNVFP4SwiGLU(BaseTransform):
             _try_free_attr_node(gm, graph, up_weight_scale_node)
             _try_free_attr_node(gm, graph, up_input_scale_node)
             _try_free_attr_node(gm, graph, up_alpha_node)
+            # Free raw scale nodes replaced by processed buffers
+            _try_free_attr_node(gm, graph, gate_input_scale_node)
+            _try_free_attr_node(gm, graph, gate_alpha_node)
+            _try_free_attr_node(gm, graph, down_input_scale_node)
+            _try_free_attr_node(gm, graph, down_weight_scale_node)
+            _try_free_attr_node(gm, graph, down_alpha_node)
 
             fused_weight_idx += 1
             cnt += 1
