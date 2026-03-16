@@ -313,6 +313,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         if num_gens > 0:
             max_path_len = self.max_draft_len + 1
+
+            # During CUDA graph warmup the first forward may not have run
+            # verification yet, so _last_num_accepted / _accept_token are None.
+            if self._last_num_accepted is None:
+                self._last_num_accepted = torch.ones(batch_size, dtype=torch.int32, device="cuda")
+            if self._accept_token is None:
+                self._accept_token = torch.zeros(
+                    self._max_batch_size, max_path_len, dtype=torch.int64, device="cuda"
+                )
+
             n_acc_all = self._last_num_accepted[num_contexts:batch_size]
 
             # input_ids: directly from verify kernel (contiguous + zero-padded)
@@ -686,6 +696,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             candidates = self._candidates_buf[:num_gens]
             candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(torch.int64)
             candidates[:, 0] = target_predict[:, 0]
+
+            if spec_tree_manager is None:
+                # During CUDA graph warmup, spec_tree_manager is not yet
+                # initialized.  Accept only the first token per request so
+                # the output tensors have the right shapes/dtypes.
+                num_accepted_tokens[num_contexts:batch_size] = 1
+                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(torch.int32)
+                self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
+                return accepted_tokens, num_accepted_tokens
 
             # Call in-place verification kernel with pre-allocated output buffers
             _, accept_index, accept_token_num, accept_token = (
