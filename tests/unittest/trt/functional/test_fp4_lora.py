@@ -66,7 +66,15 @@ class TestFP4LinearLora(unittest.TestCase):
 
     @skip_pre_blackwell_unittest
     def test_fp4_linear_lora_forward(self):
-        """FP4Linear OOTB path: output must equal W*x + B*A*x + bias."""
+        """FP4Linear OOTB path: LoRA delta must equal lora_B * lora_A * x.
+
+        FP4 double-quantization (weights + activations) introduces noise that
+        makes it difficult to compare the full output against a pure FP16
+        reference.  Instead we verify the *LoRA delta*: the difference between
+        the output with LoRA active and the output with LoRA disabled
+        (lora_rank=0).  The delta is computed entirely in FP16 so it is
+        accurate to within floating-point rounding.
+        """
         dtype = "float16"
         torch_dtype = torch.float16
         batch_size, seq_len, in_size, out_size, lora_rank = 2, 16, 512, 256, 8
@@ -76,7 +84,7 @@ class TestFP4LinearLora(unittest.TestCase):
         bias_raw = torch.randn(out_size, dtype=torch_dtype, device="cpu")
 
         weight_q, weight_block_sf, weight_global_sf = _quantize_fp4(weight_raw)
-        _, act_block_sf, act_global_sf = _quantize_fp4(x)
+        _, _act_block_sf, act_global_sf = _quantize_fp4(x)
 
         lora_A, lora_B, lora_weights_ptrs, lora_ranks = _build_lora_inputs(
             batch_size, in_size, out_size, lora_rank, dtype
@@ -96,6 +104,9 @@ class TestFP4LinearLora(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
         network.plugin_config.lora_plugin = dtype
+        # Use padded 3-D input layout (batch, seq, hidden); remove_input_padding
+        # requires host_context_lengths which is not needed for this test.
+        network.plugin_config.remove_input_padding = False
 
         with tensorrt_llm.net_guard(network):
             inp = Tensor(
@@ -121,32 +132,33 @@ class TestFP4LinearLora(unittest.TestCase):
             out.mark_output("output", dtype)
 
         session = create_session(builder, network, precision=dtype)
-        outputs = run_session(
-            session,
-            {
-                "input": x,
-                "host_request_types": torch.zeros(batch_size, dtype=torch.int32),
-                "lora_weights_pointers": lora_weights_ptrs,
-                "lora_ranks": lora_ranks,
-            },
-        )
+        base_inputs = {
+            "input": x,
+            "host_request_types": torch.zeros(batch_size, dtype=torch.int32),
+            "lora_weights_pointers": lora_weights_ptrs,
+            "lora_ranks": torch.zeros(batch_size, dtype=torch.int32),  # rank=0 → no LoRA
+        }
+        lora_inputs = {**base_inputs, "lora_ranks": lora_ranks}
+
+        out_base = run_session(session, base_inputs)["output"]
+        out_lora = run_session(session, lora_inputs)["output"]
         torch.cuda.synchronize()
 
-        # Reference: dequantize weights, compute base GEMM + LoRA + bias.
-        w_deq = weight_q.dequantize(
-            torch_dtype,
-            scale=weight_block_sf.float(),
-            double_scale=weight_global_sf,
-            block_sizes=[BLOCK_SIZE],
-        )
-        ref = x @ w_deq.T + x @ lora_A.T @ lora_B.T
-        ref = ref + bias_raw.to("cuda", dtype=torch_dtype)
-
-        torch.testing.assert_close(outputs["output"].float(), ref.float(), atol=1e-2, rtol=1e-2)
+        # The LoRA delta is computed in FP16 (original x, before FP4 quantization),
+        # so it should be accurate to within FP16 rounding.
+        trt_delta = (out_lora - out_base).float()
+        expected_delta = (x @ lora_A.T @ lora_B.T).float()
+        torch.testing.assert_close(trt_delta, expected_delta, atol=2e-3, rtol=1e-2)
 
     @skip_pre_blackwell_unittest
     def test_fp4_row_linear_lora_forward(self):
-        """FP4RowLinear OOTB path (tp_size=1): output must equal W*x + B*A*x + bias."""
+        """FP4RowLinear OOTB path (tp_size=1): LoRA delta must equal lora_B * lora_A * x.
+
+        Same delta-based verification strategy as test_fp4_linear_lora_forward:
+        compare (output with LoRA) - (output without LoRA) against the expected
+        FP16 LoRA contribution to avoid conflating FP4 quantization noise with
+        LoRA injection correctness.
+        """
         dtype = "float16"
         torch_dtype = torch.float16
         batch_size, seq_len, in_size, out_size, lora_rank = 2, 16, 512, 256, 8
@@ -175,6 +187,9 @@ class TestFP4LinearLora(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
         network.plugin_config.lora_plugin = dtype
+        # Use padded 3-D input layout; remove_input_padding requires
+        # host_context_lengths which is not needed for this test.
+        network.plugin_config.remove_input_padding = False
 
         with tensorrt_llm.net_guard(network):
             inp = Tensor(
@@ -200,27 +215,21 @@ class TestFP4LinearLora(unittest.TestCase):
             out.mark_output("output", dtype)
 
         session = create_session(builder, network, precision=dtype)
-        outputs = run_session(
-            session,
-            {
-                "input": x,
-                "host_request_types": torch.zeros(batch_size, dtype=torch.int32),
-                "lora_weights_pointers": lora_weights_ptrs,
-                "lora_ranks": lora_ranks,
-            },
-        )
+        base_inputs = {
+            "input": x,
+            "host_request_types": torch.zeros(batch_size, dtype=torch.int32),
+            "lora_weights_pointers": lora_weights_ptrs,
+            "lora_ranks": torch.zeros(batch_size, dtype=torch.int32),  # rank=0 → no LoRA
+        }
+        lora_inputs = {**base_inputs, "lora_ranks": lora_ranks}
+
+        out_base = run_session(session, base_inputs)["output"]
+        out_lora = run_session(session, lora_inputs)["output"]
         torch.cuda.synchronize()
 
-        w_deq = weight_q.dequantize(
-            torch_dtype,
-            scale=weight_block_sf.float(),
-            double_scale=weight_global_sf,
-            block_sizes=[BLOCK_SIZE],
-        )
-        ref = x @ w_deq.T + x @ lora_A.T @ lora_B.T
-        ref = ref + bias_raw.to("cuda", dtype=torch_dtype)
-
-        torch.testing.assert_close(outputs["output"].float(), ref.float(), atol=1e-2, rtol=1e-2)
+        trt_delta = (out_lora - out_base).float()
+        expected_delta = (x @ lora_A.T @ lora_B.T).float()
+        torch.testing.assert_close(trt_delta, expected_delta, atol=2e-3, rtol=1e-2)
 
     def test_fp4_linear_lora_tuple_input_raises(self):
         """FP4Linear must raise RuntimeError when input is a pre-quantized tuple.
