@@ -2429,9 +2429,15 @@ void KVCacheManager::addToken(RequestIdType requestId)
 {
     // TODO: add streamLLM support
     auto seqPtr = getSequence(requestId);
-    if (!seqPtr) return;
+    if (!seqPtr)
+    {
+        return;
+    }
     std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved) return;
+    if (seqPtr->mRemoved)
+    {
+        return;
+    }
     auto& sequence = *seqPtr;
     sequence.addNewTokens(1);
     mBlockManager.adjustBlocksIfNeeded(sequence);
@@ -2609,7 +2615,10 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
     auto seqPtr = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
     std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved) return;
+    if (seqPtr->mRemoved)
+    {
+        return;
+    }
     auto& sequence = *seqPtr;
     if (sequence.getBeamWidth() > 1 || !mEnableBlockReuse)
     {
@@ -2626,7 +2635,10 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     {
         std::scoped_lock lock(mSequencesMtx);
         auto it = mSequences.find(requestId);
-        if (it == mSequences.end()) return nullptr;
+        if (it == mSequences.end())
+        {
+            return nullptr;
+        }
         auto ptr = it->second;
         mSequences.erase(it);
         return ptr;
@@ -2662,7 +2674,10 @@ std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
     auto seqPtr = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
     std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved) return {};
+    if (seqPtr->mRemoved)
+    {
+        return {};
+    }
     auto& sequence = *seqPtr;
     auto pinnedBlockIds = mBlockManager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
@@ -2680,7 +2695,10 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
     auto seqPtr = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
     std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved) return;
+    if (seqPtr->mRemoved)
+    {
+        return;
+    }
     mBlockManager.pinBlocks(*seqPtr);
 }
 
@@ -3027,9 +3045,15 @@ void KVCacheManager::removeToken(RequestIdType requestId)
 {
     // TODO: add streamLLM support
     auto seqPtr = getSequence(requestId);
-    if (!seqPtr) return;
+    if (!seqPtr)
+    {
+        return;
+    }
     std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved) return;
+    if (seqPtr->mRemoved)
+    {
+        return;
+    }
     auto& sequence = *seqPtr;
     if (sequence.getNumTokens() == 0)
     {
@@ -3101,7 +3125,10 @@ std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheB
 std::optional<KVCacheBlock::IdType> KVCacheManager::getLastBlockId(LlmRequest::RequestIdType requestId) const
 {
     auto const seq = getSequence(requestId);
-    if (!seq) return std::nullopt;
+    if (!seq)
+    {
+        return std::nullopt;
+    }
     // Use the first window size
     auto firstWindowSize = mBlockManager.getFirstWindowSize();
     if (firstWindowSize == 0)
