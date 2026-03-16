@@ -739,12 +739,17 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
 
         def send_request():
             try:
-                return client.completions.create(
+                stream = client.completions.create(
                     model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                     prompt="What is the capital of Germany?",
                     max_tokens=10,
                     temperature=0.0,
                     stream=True)
+                # Must iterate the stream to receive SSE error chunks
+                chunks = []
+                for chunk in stream:
+                    chunks.append(chunk.choices[0].text)
+                return "".join(chunks)
             except Exception as e:
                 return e
 
