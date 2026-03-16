@@ -19,7 +19,7 @@ import unittest
 import pytest
 import torch
 from parameterized import parameterized
-from utils.util import unittest_name_func
+from utils.util import skip_pre_blackwell_unittest, unittest_name_func
 
 import tensorrt_llm
 
@@ -31,6 +31,7 @@ except ImportError:
     HAS_FLASHINFER = False
 
 
+@skip_pre_blackwell_unittest
 class TestFp4QuantizeFlashinfer(unittest.TestCase):
     """Test tunable FP4 quantization across TRTLLM and FlashInfer backends."""
 
