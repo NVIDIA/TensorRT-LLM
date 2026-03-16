@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include <algorithm>
 #include <cstdint>
 
 namespace
@@ -368,7 +369,9 @@ void XqaDispatcher::runImpl(
         // Use the nullptr for cu_seqlens when it is not computed.
         int const* cu_seqlens{nullptr};
         int const* cu_kv_seqlens{nullptr};
-        if (decoder_params.isBuildDecoderInfoKernelNeeded())
+        bool const needDecoderInfo
+            = decoder_params.isBuildDecoderInfoKernelNeeded() || (params.is_spec_dec_tree && params.multi_query_tokens);
+        if (needDecoderInfo)
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             cu_seqlens = launchParams.cu_seq_lens;
@@ -470,7 +473,9 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+        tllmRunnerParams.mMaxSeqLenKv = (params.is_spec_dec_tree && params.multi_query_tokens)
+            ? std::max(params.max_past_kv_length, params.max_past_kv_length + params.generation_input_length)
+            : params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;

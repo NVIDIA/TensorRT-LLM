@@ -528,6 +528,10 @@ class TrtllmAttentionWrapper:
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
+        # Zero bl_tree_mask before each attention call to clear stale bits from atomicOr
+        if self.spec_decoding_bl_tree_mask is not None:
+            self.spec_decoding_bl_tree_mask.zero_()
+
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
@@ -1246,6 +1250,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
 
+        # Zero bl_tree_mask and update sparse mask offset for Blackwell
+        if self.spec_decoding_bl_tree_mask is not None:
+            self.spec_decoding_bl_tree_mask.zero_()
+        if self.spec_bl_tree_first_sparse_mask_offset_kv is not None:
+            self.update_blackwell_first_sparse_mask_offset()
+
     def prepare_flash_mla(self) -> None:
         # Invalidate the pre-computed metadata so that forward() recomputes it
         # for this forward pass before the first attention layer runs.
@@ -1455,48 +1465,46 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def spec_decoding_param_prepare_for_blackwell(self) -> None:
         """
         Prepare the blackwell parameters for the speculative decoding (Medusa and Eagle) generation-phase attention kernels.
+        Uses persistent buffers (only allocate if None) for CUDA graph compatibility.
         """
-        self.spec_decoding_bl_tree_mask_offset = torch.zeros(
-            [self.max_num_requests],
-            dtype=torch.int64,
-            device='cuda',
-        )
-        max_kv_len = self.kv_lens[:self.num_seqs].max()
-        assert self.kv_lens_cuda[:self.
-                                 num_seqs] >= self._seq_lens_cuda[:self.
-                                                                  num_seqs], "kv_lens should be greater than seq_lens,please run prepare() first"
+        if self.spec_decoding_bl_tree_mask_offset is None:
+            self.spec_decoding_bl_tree_mask_offset = torch.zeros(
+                [self.max_num_requests],
+                dtype=torch.int64,
+                device='cuda',
+            )
 
-        # Only support seq_lens are equal in one batch
-        seq_lens_slice = self.seq_lens[:self.num_seqs]
-        assert seq_lens_slice.min() == seq_lens_slice.max(), \
-            f"All elements in seq_lens must be equal in one batch, but got min={seq_lens_slice.min()}, max={seq_lens_slice.max()}"
+        self.update_blackwell_first_sparse_mask_offset()
 
+        if self.spec_decoding_bl_tree_mask is None:
+            # Use upper bound from packed_mask shape for sizing
+            seqLenQ = self.spec_decoding_packed_mask.shape[
+                1] if self.spec_decoding_packed_mask is not None else 1
+            max_kv_len = self.kv_lens[:self.num_seqs].max()
+            tile_size_kv = 128
+            tile_size_q = 128
+            num_instances_q = 1
+            num_instances_kv = 2
+            tile_size_kv_per_cta = tile_size_kv * num_instances_kv
+            tile_size_q_per_cta = tile_size_q * num_instances_q
+            max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
+                max_kv_len, 0, tile_size_kv_per_cta)
+            max_num_tiles_q = math.ceil(
+                (seqLenQ * self.num_heads_per_kv) / tile_size_q_per_cta)
+            mask_size = int(self.max_num_requests * max_num_tiles_q *
+                            max_num_custom_mask_tiles_kv * num_instances_q *
+                            num_instances_kv * tile_size_q * tile_size_kv / 32)
+            self.spec_decoding_bl_tree_mask = torch.zeros(
+                mask_size,
+                dtype=torch.uint32,
+                device='cuda',
+            )
+
+    def update_blackwell_first_sparse_mask_offset(self) -> None:
+        """Update first_sparse_mask_offset_kv for current batch."""
         self.spec_bl_tree_first_sparse_mask_offset_kv = (
             self.kv_lens_cuda[:self.num_seqs] -
             self._seq_lens_cuda[:self.num_seqs]).to(torch.int32)
-        min_first_sparse_mask_offset_kv = self.spec_bl_tree_first_sparse_mask_offset_kv.min(
-        )
-        # tile_size_kv * tile_size_q * num_instances_q * num_instances_kv is the largest value that is used in the trtllm-gen kernels
-        tile_size_kv = 128
-        tile_size_q = 128
-        # num_instances_q * num_instances_kv <= 2
-        num_instances_q = 1
-        num_instances_kv = 2
-        tile_size_kv_per_cta = tile_size_kv * num_instances_kv
-        tile_size_q_per_cta = tile_size_q * num_instances_q
-        max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
-            max_kv_len, min_first_sparse_mask_offset_kv, tile_size_kv_per_cta)
-        max_num_tiles_q = math.ceil(
-            (self.seq_lens[:self.num_seqs].max() * self.num_heads_per_kv) /
-            tile_size_q_per_cta)
-        mask_size = int(self.max_num_requests * max_num_tiles_q *
-                        max_num_custom_mask_tiles_kv * num_instances_q *
-                        num_instances_kv * tile_size_q * tile_size_kv / 32)
-        self.spec_decoding_bl_tree_mask = torch.zeros(
-            mask_size,
-            dtype=torch.uint32,
-            device='cuda',
-        )
 
     def update_spec_dec_param(
         self,

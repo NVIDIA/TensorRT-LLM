@@ -1024,8 +1024,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ] = parent_offset + selected_parents
 
             # 3) Reconstruct accumulated_hs in pre-allocated buffer:
-            #    first K slots keep step0_hs from step 0 (unchanged), gather rest from write_buffer
+            #    first K = step0_hs, rest gathered from write_buffer
             num_tokens_next = (cur_draft_idx + 1) * self.K
+            self._accumulated_hs[:batch_size, : self.K] = self._step0_hs.unsqueeze(1).expand(
+                -1, self.K, -1
+            )
             if num_tokens_next > self.K:
                 read_idx = self._hs_read_map[:batch_size, self.K : num_tokens_next]
                 gathered = torch.gather(
