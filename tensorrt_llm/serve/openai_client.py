@@ -105,7 +105,11 @@ class OpenAIHttpClient(OpenAIClient):
         self._metrics_collector = ClientMetricsCollector(role)
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
-                limit=0, limit_per_host=0, force_close=False, keepalive_timeout=3
+                limit=0,
+                limit_per_host=0,
+                force_close=False,
+                # Set keepalive_timeout below the server-side keepalive timeout to avoid reusing stale connections.
+                keepalive_timeout=3,
             ),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
         )
