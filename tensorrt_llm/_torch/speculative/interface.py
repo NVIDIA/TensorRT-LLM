@@ -12,7 +12,6 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
-from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata, Indexer
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -70,6 +69,8 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     attn_metadata.host_kv_cache_block_offsets = (
         draft_kv_cache_manager.host_kv_cache_block_offsets)
 
+    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                Indexer)
     if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
             and hasattr(draft_kv_cache_manager, 'index_head_dim')):
         m = attn_metadata
