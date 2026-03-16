@@ -238,6 +238,7 @@ class HFReplaceCachedAttn(_InsertCachedOperator):
         self,
         gm: GraphModule,
         attn_node: Node,
+        cached_attn_op,
         qkv_nodes: List[Node],
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
