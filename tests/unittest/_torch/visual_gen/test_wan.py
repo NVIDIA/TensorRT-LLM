@@ -3435,7 +3435,7 @@ class TestWanRobustness(unittest.TestCase):
 
 
 # =============================================================================
-# Batch Generation Tests (TRTLLM-11362)
+# Batch Generation Tests
 # =============================================================================
 
 
