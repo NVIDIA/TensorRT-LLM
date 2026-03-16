@@ -9,7 +9,57 @@ class ReasoningParserResult:
     reasoning_content: str = ""
 
 
+def register_reasoning_parser(*keys: str, **default_kwargs):
+    """Decorator that registers a BaseReasoningParser under one or more keys.
+
+    Any extra keyword arguments are stored as defaults and forwarded to
+    the parser constructor at creation time.
+
+    Usage::
+
+        @register_reasoning_parser("my-model", reasoning_at_start=True)
+        class MyParser(BaseReasoningParser):
+            ...
+    """
+
+    def decorator(parser_cls: Type["BaseReasoningParser"]):
+        for key in keys:
+            ReasoningParserFactory._parsers[key] = (parser_cls, default_kwargs)
+        return parser_cls
+
+    return decorator
+
+
+class ReasoningParserFactory:
+    _parsers: dict[str, tuple[Type["BaseReasoningParser"], dict[str, Any]]] = {}
+
+    @classmethod
+    def create_reasoning_parser(
+        cls,
+        reasoning_parser: str,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> "BaseReasoningParser":
+        key = reasoning_parser.lower()
+        try:
+            parser_cls, default_kwargs = cls._parsers[key]
+        except KeyError as e:
+            raise ValueError(
+                f"Invalid reasoning parser: {reasoning_parser}\n"
+                f"Supported parsers: {list(cls._parsers.keys())}") from e
+        return parser_cls(chat_template_kwargs=chat_template_kwargs,
+                          **default_kwargs)
+
+    @classmethod
+    def keys(cls):
+        return cls._parsers.keys()
+
+
 class BaseReasoningParser(ABC):
+
+    def __init__(self,
+                 *,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        pass
 
     @abstractmethod
     def parse(self, text: str) -> ReasoningParserResult:
@@ -19,7 +69,15 @@ class BaseReasoningParser(ABC):
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         raise NotImplementedError
 
+    def finish(self) -> ReasoningParserResult:
+        """Called when the stream ends. Subclasses may override to flush
+        buffered state or reclassify accumulated content. The default
+        implementation returns an empty result."""
+        return ReasoningParserResult()
 
+
+@register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
+@register_reasoning_parser("qwen3")
 class DeepSeekR1Parser(BaseReasoningParser):
     """
     Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
@@ -28,7 +86,11 @@ class DeepSeekR1Parser(BaseReasoningParser):
     treat all the text before the </think> tag as `reasoning_content` and the text after as `content`.
     """
 
-    def __init__(self, reasoning_at_start: bool = False) -> None:
+    def __init__(self,
+                 *,
+                 reasoning_at_start: bool = False,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
         self.reasoning_start = "<think>"
         self.reasoning_end = "</think>"
         self.reasoning_at_start = reasoning_at_start
@@ -105,35 +167,90 @@ class DeepSeekR1Parser(BaseReasoningParser):
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 
 
-class ReasoningParserFactory:
-    parsers: dict[str, Type[BaseReasoningParser]] = {
-        "deepseek-r1": DeepSeekR1Parser,
-        "qwen3": DeepSeekR1Parser,
-        "nano-v3": DeepSeekR1Parser,
-    }
+@register_reasoning_parser("nano-v3")
+class NemotronV3ReasoningParser(DeepSeekR1Parser):
+    """Reasoning parser for Nemotron Nano v3.
 
-    @staticmethod
-    def create_reasoning_parser(
-        reasoning_parser: str,
-        chat_template_kwargs: Optional[dict[str, Any]] = None
-    ) -> BaseReasoningParser:
-        try:
-            reasoning_parser_class = ReasoningParserFactory.parsers[
-                reasoning_parser.lower()]
-            if reasoning_parser == "deepseek-r1":
-                return reasoning_parser_class(reasoning_at_start=True)
-            elif reasoning_parser == "nano-v3":
-                # Note: If the model is with reasoning (default behavior), `reasoning_at_start` should be True, and the starting response should be parsed into `reasoning_content`.
-                # While the model is without reasoning, `reasoning_at_start` should be False to parse the response into `content` fields.
-                is_reasoning_model = True
-                if isinstance(chat_template_kwargs, dict):
-                    is_reasoning_model = chat_template_kwargs.get(
-                        "enable_thinking", True)
-                return reasoning_parser_class(
-                    reasoning_at_start=is_reasoning_model)
-            return reasoning_parser_class()
-        except KeyError as e:
-            raise ValueError(
-                f"Invalid reasoning parser: {reasoning_parser}\n"
-                f"Supported parsers: {list(ReasoningParserFactory.parsers.keys())}"
-            ) from e
+    If the model is with reasoning (default behavior), `reasoning_at_start` is `True` and the
+    starting response is parsed into `reasoning_content`.
+    When the model is without reasoning, `reasoning_at_start` is `False` so the response is parsed
+    into `content` fields.
+
+    The `enable_thinking` flag is read from `chat_template_kwargs`.
+    """
+
+    def __init__(self,
+                 *,
+                 reasoning_at_start: bool = True,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        self._force_nonempty_content = False
+        if isinstance(chat_template_kwargs, dict):
+            reasoning_at_start = chat_template_kwargs.get(
+                "enable_thinking", reasoning_at_start)
+            self._force_nonempty_content = chat_template_kwargs.get(
+                "force_nonempty_content", False) is True
+        super().__init__(reasoning_at_start=reasoning_at_start,
+                         chat_template_kwargs=chat_template_kwargs)
+        # Workaround: the model sometimes does not send closing think tags
+        # which affects downstream applications. This is addressed by
+        # optionally accumulating reasoning tokens and returning them as
+        # content at the end of streaming.
+        self._accumulated_reasoning = ""
+        self._found_closing_tag = False
+
+    def _maybe_swap_content(
+            self, result: ReasoningParserResult) -> ReasoningParserResult:
+        """When force_nonempty_content is set and content is empty, move
+        reasoning_content into content so the response always has content."""
+        if self._force_nonempty_content and not result.content and result.reasoning_content:
+            return ReasoningParserResult(content=result.reasoning_content,
+                                         reasoning_content="")
+        return result
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        """Wraps the parent parse_delta to track accumulated reasoning when
+        force_nonempty_content is set. When the closing tag is found
+        (in_reasoning transitions from True to False), the accumulation
+        is cleared to free memory."""
+        was_in_reasoning = self.in_reasoning
+        result = super().parse_delta(delta_text)
+        if self._force_nonempty_content:
+            if result.reasoning_content:
+                self._accumulated_reasoning += result.reasoning_content
+            if was_in_reasoning and not self.in_reasoning:
+                self._found_closing_tag = True
+                self._accumulated_reasoning = ""
+        return result
+
+    def finish(self) -> ReasoningParserResult:
+        """Called when the stream ends.
+
+        If no closing think tag was found and force_nonempty_content is
+        set, returns the full accumulated reasoning as content so the
+        response is never empty. If no closing tag was found and
+        force_nonempty_content is not set, returns any remaining buffer
+        as reasoning_content since we are still in reasoning mode.
+
+        If the closing tag was already found (or reasoning was never
+        entered), flushes any remaining buffer as content."""
+        if self.in_reasoning and not self._found_closing_tag:
+            remaining = self._buffer
+            self._buffer = ""
+            if self._force_nonempty_content:
+                all_content = self._accumulated_reasoning + remaining
+                self._accumulated_reasoning = ""
+                self.in_reasoning = False
+                return ReasoningParserResult(content=all_content)
+            self._accumulated_reasoning = ""
+            self.in_reasoning = False
+            if remaining:
+                return ReasoningParserResult(reasoning_content=remaining)
+            return ReasoningParserResult()
+        remaining = self._buffer
+        self._buffer = ""
+        if remaining:
+            return ReasoningParserResult(content=remaining)
+        return ReasoningParserResult()
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return self._maybe_swap_content(super().parse(text))

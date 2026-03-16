@@ -5261,7 +5261,7 @@ For more information, please refer to <http://unlicense.org>
   - `Tracker`: https://github.com/tox-dev/py-filelock/issues
 
 
-## flashinfer-python (0.6.4)
+## flashinfer-python (0.6.6)
 
 ### Licenses
 License: `Apache-2.0`
@@ -63471,7 +63471,7 @@ SOFTWARE.
   - `Homepage`: https://github.com/akshaynagpal/w2n
 
 
-## xgrammar (0.1.25)
+## xgrammar (0.1.32)
 
 ### Licenses
 License: `Apache 2.0`

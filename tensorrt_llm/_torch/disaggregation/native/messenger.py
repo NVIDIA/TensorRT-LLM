@@ -170,6 +170,7 @@ class ZMQMessenger(MessengerInterface):
 
             self._stop_event.set()
 
+        logger.info(f"Starting Messenger listener thread for {self._endpoint}")
         self._listener_thread = Thread(target=listener, daemon=True)
         self._listener_thread.start()
 
