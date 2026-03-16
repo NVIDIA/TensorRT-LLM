@@ -1935,7 +1935,21 @@ def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
     layer_type: LayerType = LayerType.UNKNOWN,
+    key_filter: Optional[Callable[[Node], bool]] = None,
 ) -> int:
+    """
+
+    Args:
+        nodes_linear: A dictionary of nodes_linear, or a list of nodes_linear.
+        transform_container: The transform container.
+        layer_type: The layer type.
+        key_filter: A function to filter the nodes.
+    """
+    if key_filter is None:
+
+        def key_filter(n: Node) -> bool:
+            return True
+
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
     # if nodes_linear is a dict, flatten it to a 1D list of nodes
@@ -1945,6 +1959,8 @@ def _process_simple_shard(
 
     num_simple_shards = 0
     for n in nodes_linear:
+        if not key_filter(n):
+            continue
         num_simple_shards += int(
             transform_container.add(
                 WeightShardingInfo.from_node(
@@ -3173,7 +3189,9 @@ def detect_column_row_shard(
 
     # simple shard remaining linear nodes
     if config.shard_all_unprocessed:
-        num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
+        num_simple_shards += _process_simple_shard(
+            unprocessed_linear_nodes, transform_container, key_filter=lambda n: "lm_head" in n.name
+        )
     num_column_row_shards += num_ssm_shards + num_mla_shards
     num_shards = num_simple_shards + num_column_row_shards
     ad_logger.info(

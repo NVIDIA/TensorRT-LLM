@@ -21,6 +21,7 @@ transforms:
     enabled: true
   detect_sharding:
     allreduce_strategy: SYMM_MEM
+    shard_all_unprocessed: true
   multi_stream_moe:
     stage: compile
     enabled: true
