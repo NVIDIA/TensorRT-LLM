@@ -242,8 +242,7 @@ def parse_arguments():
         type=int,
         default=None,
         required=False,
-        help="Limit number of samples from dataset (for fast debugging)."
-    )
+        help="Limit number of samples from dataset (for fast debugging).")
     args = parser.parse_args()
     return args
 

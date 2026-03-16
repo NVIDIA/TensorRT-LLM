@@ -675,10 +675,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # Linear mode: reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens, spec_metadata.runtime_draft_len
-        ) if num_gens > 0 else torch.empty(
-            0, spec_metadata.runtime_draft_len, dtype=torch.int,
-            device=logits.device)
+            num_gens,
+            spec_metadata.runtime_draft_len) if num_gens > 0 else torch.empty(
+                0,
+                spec_metadata.runtime_draft_len,
+                dtype=torch.int,
+                device=logits.device)
         return self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
