@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_mla,
     is_nemotron_hybrid,
     is_qwen3_next,
+    is_qwen3_5,
     load_pretrained_config,
 )
 from tensorrt_llm._torch.pyexecutor.model_loader import (
@@ -648,12 +649,12 @@ class Runner:
         )
         kwargs = {}
 
-        if is_nemotron_hybrid(pretrained_config) or is_qwen3_next(pretrained_config):
+        if is_nemotron_hybrid(pretrained_config) or is_qwen3_next(pretrained_config) or is_qwen3_5(pretrained_config):
             # Please refer to `tensorrt_llm/_torch/models/modeling_qwen3_next.py` for the magic number chunk_size=128
             mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests,
                 chunk_size=128
-                if is_qwen3_next(pretrained_config)
+                if is_qwen3_next(pretrained_config) or is_qwen3_5(pretrained_config)
                 else pretrained_config.chunk_size,
             )
             mamba_metadata.prepare(attn_metadata)
@@ -842,7 +843,7 @@ class Runner:
                 dtype=kv_cache_dtype,
                 spec_config=None,
             )
-        elif is_qwen3_next(config):
+        elif is_qwen3_next(config) or is_qwen3_5(config):
             mamba_layer_mask = [
                 i in layer_indices
                 if i % config.full_attention_interval != config.full_attention_interval - 1
