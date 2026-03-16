@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import json
 import os
 import re
+import shutil
 from datetime import datetime
 
 import yaml
@@ -352,6 +355,26 @@ def generate_pytest_command(
     return pytest_command, test_list_content, test_list_path
 
 
+def replace_env_in_file(work_dir: str, file_path: str, env_vars: dict) -> str:
+    """Read a file, replace env var placeholders, write to work_dir/lm_eval_configs/.
+
+    Returns the lm_eval_configs directory path (for use as --include_path).
+    Also copies utils.py from the same directory if present (needed for GPQA task).
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    for key, value in env_vars.items():
+        content = content.replace(key, value)
+    tmp_dir = os.path.join(work_dir, "lm_eval_configs")
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(os.path.join(tmp_dir, os.path.basename(file_path)), "w", encoding="utf-8") as f:
+        f.write(content)
+    utils_py = os.path.join(os.path.dirname(file_path), "utils.py")
+    if os.path.exists(utils_py):
+        shutil.copy(utils_py, tmp_dir)
+    return tmp_dir
+
+
 def remove_whitespace_lines(lines):
     """Remove empty lines and strip whitespace."""
     return [line for line in lines if line.strip()]
@@ -688,6 +711,24 @@ def main():
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
             ]
         )
+
+    # Export accuracy config to BENCHMARK node (disagg only)
+    if runtime_mode == "disaggregated":
+        acc_cfg = config.get("accuracy", {})
+        if acc_cfg.get("enable_accuracy_test"):
+            env_sub = {"LLM_MODELS_ROOT": args.llm_models_root}
+            processed = copy.deepcopy(acc_cfg)
+            for task_cfg in processed.get("tasks", {}).values():
+                extra = task_cfg.get("extra_kwargs", {})
+                if "custom_config" in extra:
+                    cfg_path = extra.pop("custom_config")
+                    if not os.path.isabs(cfg_path):
+                        cfg_path = os.path.join(llm_src, cfg_path)
+                    extra["include_path"] = replace_env_in_file(work_dir, cfg_path, env_sub)
+            script_prefix_lines.append(
+                f"export ACCURACY_CONFIG_JSON='{json.dumps(processed)}'"
+            )
+            srun_args_lines.append("--container-env=ACCURACY_CONFIG_JSON")
 
     # Remove whitespace lines
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
