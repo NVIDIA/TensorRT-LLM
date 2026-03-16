@@ -2150,7 +2150,7 @@ class KVCacheManagerV2(BaseResourceManager):
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         block_ids_per_seq_tensors = [
             torch.tensor([
-                i // self.num_local_layers if i != BAD_PAGE_INDEX else i
+                i // self.num_local_layers if i != BAD_PAGE_INDEX else 0
                 for i in sublist
             ],
                          dtype=torch.int) for sublist in block_ids_per_seq
