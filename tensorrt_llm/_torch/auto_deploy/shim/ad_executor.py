@@ -665,7 +665,15 @@ class ADEngine(ModelEngine):
         extra_args["mm_special_offsets"] = [
             torch.tensor(mm_special_offsets_flat, dtype=torch.int32, device="cpu")
         ]
-        if self._enable_chunked_prefill:
+        # Export multimodal slice bounds whenever the current prefill step only needs a
+        # subset of the request's multimodal embeddings. This is required for regular
+        # chunked prefill, but also for KV-cache reuse where begin_compute > 0 even when
+        # chunked prefill is disabled in the config.
+        needs_mm_chunk_bounds = self._enable_chunked_prefill or any(
+            int(input_pos[i]) > 0 and getattr(req, "multimodal_positions", None)
+            for i, req in enumerate(prefill_requests)
+        )
+        if needs_mm_chunk_bounds:
             extra_args["mm_chunk_flat_start"] = [
                 torch.tensor(flat_start_list, dtype=torch.int64, device="cpu")
             ]
