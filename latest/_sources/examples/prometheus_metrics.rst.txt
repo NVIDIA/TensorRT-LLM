@@ -2,7 +2,7 @@ Prometheus Metrics
 ==================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/69de4a60e7db73177e30bb80f333e6a35091a3dd/examples/serve/prometheus_metrics.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/73cca36b4ef4f9a26c61ec214c0b9c1871ec10f7/examples/serve/prometheus_metrics.py.
 
 .. literalinclude:: ../../../examples/serve/prometheus_metrics.py
     :lines: 2-144

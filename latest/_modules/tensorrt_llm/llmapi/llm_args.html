@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc8';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -511,7 +511,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc7" />
+  <meta name="docsearch:version" content="1.3.0rc8" />
 
 
   </head>
@@ -807,6 +807,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
@@ -971,11 +972,13 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">types</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span><span class="p">,</span> <span class="n">EnumMeta</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">Annotated</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Set</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span>
-                    <span class="n">Type</span><span class="p">,</span> <span class="n">TypeAlias</span><span class="p">,</span> <span class="n">TypeVar</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Annotated</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span>
+                    <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Set</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Type</span><span class="p">,</span> <span class="n">TypeAlias</span><span class="p">,</span> <span class="n">TypeVar</span><span class="p">,</span>
+                    <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span><span class="p">)</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">yaml</span>
@@ -994,7 +997,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_helper</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
                                       <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">)</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">_str_to_torch_dtype_dict</span><span class="p">,</span> <span class="n">mpi_rank</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">_str_to_torch_dtype_dict</span><span class="p">,</span> <span class="n">mpi_rank</span><span class="p">,</span> <span class="n">prefer_pinned</span>
 
 <span class="c1"># yapf: disable</span>
 <span class="c1"># isort: off</span>
@@ -1029,6 +1032,12 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">get_type_repr</span><span class="p">)</span>
 
 <span class="n">TypeBaseModel</span> <span class="o">=</span> <span class="n">TypeVar</span><span class="p">(</span><span class="s2">&quot;T&quot;</span><span class="p">,</span> <span class="n">bound</span><span class="o">=</span><span class="n">BaseModel</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.virtual_memory</span><span class="w"> </span><span class="kn">import</span> \
+        <span class="n">RestoreMode</span> <span class="k">as</span> <span class="n">_VirtualMemoryRestoreMode</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">_VirtualMemoryRestoreMode</span> <span class="o">=</span> <span class="n">Enum</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">Field</span><span class="p">(</span><span class="n">default</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="o">...</span><span class="p">,</span>
@@ -1147,7 +1156,46 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">max_batch_size</span> <span class="o">!=</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
             <span class="n">batch_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
 
-        <span class="k">return</span> <span class="n">batch_sizes</span></div>
+        <span class="k">return</span> <span class="n">batch_sizes</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_merge_schedule_keys</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+                             <span class="n">schedule</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Merge draft_len_schedule keys into batch_sizes so that each</span>
+<span class="sd">        schedule threshold has a corresponding CUDA graph.</span>
+
+<span class="sd">        e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300</span>
+<span class="sd">        into batch_sizes.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            batch_sizes: Sorted list of existing CUDA graph batch sizes.</span>
+<span class="sd">            schedule: draft_len_schedule mapping batch-size thresholds to</span>
+<span class="sd">                draft lengths.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            Sorted, deduplicated list of batch sizes.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">max_bs</span> <span class="o">=</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+        <span class="n">extra</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">bs</span> <span class="k">for</span> <span class="n">bs</span> <span class="ow">in</span> <span class="n">schedule</span> <span class="k">if</span> <span class="n">bs</span> <span class="o">&lt;=</span> <span class="n">max_bs</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">extra</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">batch_sizes</span>
+
+        <span class="n">merged</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">i</span><span class="p">,</span> <span class="n">j</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="k">while</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">)</span> <span class="ow">and</span> <span class="n">j</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">extra</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">&lt;</span> <span class="n">extra</span><span class="p">[</span><span class="n">j</span><span class="p">]:</span>
+                <span class="n">merged</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+                <span class="n">i</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">elif</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">extra</span><span class="p">[</span><span class="n">j</span><span class="p">]:</span>
+                <span class="n">merged</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">extra</span><span class="p">[</span><span class="n">j</span><span class="p">])</span>
+                <span class="n">j</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">merged</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+                <span class="n">i</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="n">j</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="n">merged</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">[</span><span class="n">i</span><span class="p">:])</span>
+        <span class="n">merged</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">extra</span><span class="p">[</span><span class="n">j</span><span class="p">:])</span>
+        <span class="k">return</span> <span class="n">merged</span></div>
 
 
 
@@ -1258,6 +1306,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Whether to skip the MQA and Top-K in the indexer for short sequences.&quot;</span><span class="p">)</span>
+    <span class="n">q_split_threshold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">8192</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;If number of packed tokens in prefill chunk exceeds this threshold, </span><span class="se">\</span>
+<span class="s2">            q tokens will be evenly distributed across ranks for indexer computation. </span><span class="se">\</span>
+<span class="s2">            If negative, q split will always be disabled.&quot;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="DeepSeekSparseAttentionConfig.supports_backend">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.supports_backend">[docs]</a>
@@ -1663,21 +1717,25 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory.&quot;</span>
     <span class="p">)</span>
 
-    <span class="n">max_concurrency</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">NonNegativeInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">max_concurrency</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;When specified, speculation will be disabled at batch sizes above this value. Otherwise, &quot;</span>
-        <span class="s2">&quot;speculation will always be on. PyTorch backend only.&quot;</span><span class="p">)</span>
+        <span class="s2">&quot;When specified (&gt;0), speculation will be disabled at batch sizes above this value. Otherwise, &quot;</span>
+        <span class="s2">&quot;speculation will always be on. PyTorch backend only. &quot;</span>
+        <span class="s2">&quot;Mutually exclusive with max_concurrency since draft_len_schedule implicitly supports max concurrency control.&quot;</span>
+    <span class="p">)</span>
 
     <span class="n">draft_len_schedule</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Developer interface: dynamically adjust draft length based on active batch size in runtime. &quot;</span>
-        <span class="s2">&quot;Maps batch size to draft lengths. For example, {1: 4, 4: 2, 8: 0} means: &quot;</span>
-        <span class="s2">&quot;batch_size &gt;= 1 uses draft_len=4, batch_size &gt;= 4 uses draft_len=2, &quot;</span>
-        <span class="s2">&quot;batch_size &gt;= 8 uses draft_len=0 (disable speculation). &quot;</span>
-        <span class="s2">&quot;draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals &quot;</span>
-        <span class="s2">&quot;max_draft_len for consistency; for example, if max_draft_len=4, the schedule must contain </span><span class="si">{1: 4}</span><span class="s2">.&quot;</span>
+        <span class="s2">&quot;Developer interface: dynamically adjust draft length based on active batch size in runtime.&quot;</span>
+        <span class="s2">&quot;Maps batch size to draft lengths.&quot;</span>
+        <span class="s2">&quot;For example: draft_len_schedule = {4:4, 8:2, 32:1}&quot;</span>
+        <span class="s2">&quot; - Batch sizes 1-4:   use draft_len=4&quot;</span>
+        <span class="s2">&quot; - Batch sizes 5-8:   use draft_len=2&quot;</span>
+        <span class="s2">&quot; - Batch sizes 9-32:  use draft_len=1&quot;</span>
+        <span class="s2">&quot; - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). &quot;</span>
+        <span class="s2">&quot;Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.&quot;</span>
     <span class="p">)</span>
 
     <span class="n">load_format</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -1713,6 +1771,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">_decoding_type_alias</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
     <span class="c1"># If set, drafting will use separate KV cache in one-model speculative decoding.</span>
     <span class="n">_allow_separate_draft_kv_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+    <span class="c1"># Internal: true when draft_len_schedule was auto-translated from max_concurrency.</span>
+    <span class="n">_translated_from_max_concurrency</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;draft_len_schedule&#39;</span><span class="p">)</span>
     <span class="nd">@classmethod</span>
@@ -1730,20 +1790,16 @@ window.runMermaid = runMermaid;</script>
                         <span class="sa">f</span><span class="s2">&quot;draft_len_schedule: draft length must be &gt;= 0, got </span><span class="si">{</span><span class="n">draft_len</span><span class="si">}</span><span class="s2">&quot;</span>
                     <span class="p">)</span>
 
-            <span class="c1"># Require batch_size=1 in schedule</span>
-            <span class="k">if</span> <span class="mi">1</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">v</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="s2">&quot;draft_len_schedule must include batch_size=1. &quot;</span>
-                    <span class="s2">&quot;All systems can have batch_size=1. Add {1: &lt;max_draft_len&gt;} to your schedule.&quot;</span>
-                <span class="p">)</span>
-
-            <span class="c1"># Enforce schedule[1] == max_draft_len for consistency</span>
+            <span class="c1"># Enforce smallest schedule key maps to max_draft_len for consistency.</span>
+            <span class="n">smallest_batch_size</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
             <span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">max_draft_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">v</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="n">max_draft_len</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">max_draft_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">v</span><span class="p">[</span>
+                    <span class="n">smallest_batch_size</span><span class="p">]</span> <span class="o">!=</span> <span class="n">max_draft_len</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;draft_len_schedule[1] must equal max_draft_len for consistency. &quot;</span>
-                    <span class="sa">f</span><span class="s2">&quot;Got schedule[1]=</span><span class="si">{</span><span class="n">v</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">, but max_draft_len=</span><span class="si">{</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">. &quot;</span>
-                    <span class="sa">f</span><span class="s2">&quot;batch_size=1 should use maximum draft length.&quot;</span><span class="p">)</span>
+                    <span class="sa">f</span><span class="s2">&quot;draft_len_schedule[</span><span class="si">{</span><span class="n">smallest_batch_size</span><span class="si">}</span><span class="s2">] must equal max_draft_len &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;because it is the smallest batch-size key. &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;Got schedule[</span><span class="si">{</span><span class="n">smallest_batch_size</span><span class="si">}</span><span class="s2">]=</span><span class="si">{</span><span class="n">v</span><span class="p">[</span><span class="n">smallest_batch_size</span><span class="p">]</span><span class="si">}</span><span class="s2">, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;but max_draft_len=</span><span class="si">{</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
 
             <span class="c1"># Enforce all draft lengths &lt;= max_draft_len</span>
             <span class="k">if</span> <span class="n">max_draft_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1758,6 +1814,34 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># This ensures efficient lookup</span>
             <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="p">[</span><span class="mi">0</span><span class="p">]))</span>
         <span class="k">return</span> <span class="n">v</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="c1"># 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.</span>
+    <span class="c1"># 2. If max_concurrency is set, translate it to the corresponding draft_len_schedule.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_max_concurrency_and_draft_len_schedule_mutually_exclusive</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;DecodingBaseConfig&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_concurrency</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">draft_len_schedule</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># Avoid ValueError during nested re-validation when only max_concurrency is set and draft_len_schedule is translated from max_concurrency</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_translated_from_max_concurrency</span><span class="p">:</span>
+                <span class="k">return</span> <span class="bp">self</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;max_concurrency and draft_len_schedule are mutually exclusive. &quot;</span>
+                <span class="s2">&quot;Use max_concurrency for a simple speculation cutoff, or &quot;</span>
+                <span class="s2">&quot;draft_len_schedule for dynamic draft-length control.&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_concurrency</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="ow">is</span> <span class="kc">None</span>
+                <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_dec_mode</span><span class="o">.</span><span class="n">support_dynamic_draft_len</span><span class="p">()):</span>
+            <span class="k">return</span> <span class="bp">self</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">draft_len_schedule</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_concurrency</span><span class="p">):</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">)</span>
+        <span class="p">}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_translated_from_max_concurrency</span> <span class="o">=</span> <span class="kc">True</span>
+
+        <span class="k">return</span> <span class="bp">self</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -2567,6 +2651,119 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">ExecutorMemoryType</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Types of GPU memory used by executor.</span>
+
+<span class="sd">     These are used by the sleep/wakeup feature to target specific type of memory.</span>
+<span class="sd">     &quot;&quot;&quot;</span>
+    <span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">&quot;sampler&quot;</span>
+    <span class="n">DRAFTER</span> <span class="o">=</span> <span class="s2">&quot;drafter&quot;</span>
+    <span class="n">GUIDED_DECODER</span> <span class="o">=</span> <span class="s2">&quot;guided_decoder&quot;</span>
+    <span class="n">SPEC_RESOURCES</span> <span class="o">=</span> <span class="s2">&quot;spec_resource_manager&quot;</span>
+    <span class="n">INIT_KV_CACHE</span> <span class="o">=</span> <span class="s2">&quot;_no_capture_init_kv_cache&quot;</span>
+    <span class="n">INIT_EXTRA_RESOURCES</span> <span class="o">=</span> <span class="s2">&quot;_no_capture_init_extra_resources&quot;</span>
+    <span class="n">MODEL_EXTRA</span> <span class="o">=</span> <span class="s2">&quot;model_extra&quot;</span>
+    <span class="n">EXTRA_RESOURCES</span> <span class="o">=</span> <span class="s2">&quot;executor_extra&quot;</span>
+    <span class="n">KV_CACHE</span> <span class="o">=</span> <span class="s2">&quot;kv_cache&quot;</span>
+    <span class="n">MODEL_ENGINE_MAIN</span> <span class="o">=</span> <span class="s2">&quot;model&quot;</span>
+    <span class="n">MODEL_ENGINE_DRAFT</span> <span class="o">=</span> <span class="s2">&quot;draft_model&quot;</span>
+    <span class="n">MODEL_WEIGHTS_MAIN</span> <span class="o">=</span> <span class="s2">&quot;model_weights&quot;</span>
+    <span class="n">MODEL_WEIGHTS_DRAFT</span> <span class="o">=</span> <span class="s2">&quot;draft_model_weights&quot;</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">SleepConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the LLM sleep/wakeup feature.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">restore_modes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span>
+        <span class="n">ExecutorMemoryType</span><span class="p">,</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;NONE&quot;</span><span class="p">,</span> <span class="s2">&quot;MEMSET&quot;</span><span class="p">,</span> <span class="s2">&quot;CPU&quot;</span><span class="p">,</span> <span class="s2">&quot;PINNED&quot;</span><span class="p">]</span>
+        <span class="o">|</span> <span class="n">_VirtualMemoryRestoreMode</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+            <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">SleepConfig</span><span class="o">.</span><span class="n">_make_defaulted_restore_modes</span><span class="p">(),</span>
+            <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Per-component RestoreMode for the sleep feature. &quot;</span>
+            <span class="s2">&quot;Keys are ExecutorMemoryType values (e.g. &#39;model&#39;, &#39;kv_cache&#39;), &quot;</span>
+            <span class="s2">&quot;values can be RestoreMode names (NONE, MEMSET, CPU, PINNED) or &quot;</span>
+            <span class="s2">&quot;RestoreMode enum values. &quot;</span>
+            <span class="s2">&quot;Unlisted entries default to the suitable mode selected between &quot;</span>
+            <span class="s2">&quot;PINNED and CPU.&quot;</span><span class="p">)</span>
+
+    <span class="n">DEFAULT_RESTORE_MODES</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">ExecutorMemoryType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">:</span> <span class="s2">&quot;NONE&quot;</span><span class="p">,</span>
+    <span class="p">}</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_normalize_restore_mode</span><span class="p">(</span>
+            <span class="n">value</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">_VirtualMemoryRestoreMode</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_VirtualMemoryRestoreMode</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.virtual_memory</span><span class="w"> </span><span class="kn">import</span> <span class="n">RestoreMode</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">RestoreMode</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">value</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">RestoreMode</span><span class="p">[</span><span class="n">value</span><span class="p">]</span>
+            <span class="k">except</span> <span class="ne">KeyError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="n">valid</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">mode</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">mode</span> <span class="ow">in</span> <span class="n">RestoreMode</span><span class="p">)</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;invalid restore_mode: </span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s2">. Expected one of: </span><span class="si">{</span><span class="n">valid</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;invalid restore_mode type: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_normalize_executor_memory_type</span><span class="p">(</span>
+            <span class="n">key</span><span class="p">:</span> <span class="n">ExecutorMemoryType</span> <span class="o">|</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ExecutorMemoryType</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">ExecutorMemoryType</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">key</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">ExecutorMemoryType</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="n">valid</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">member</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">member</span> <span class="ow">in</span> <span class="n">ExecutorMemoryType</span><span class="p">)</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;invalid executor memory type: </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">. Expected one of: </span><span class="si">{</span><span class="n">valid</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;executor memory type must be ExecutorMemoryType or str, got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">key</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_make_defaulted_restore_modes</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">cases</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="n">ExecutorMemoryType</span><span class="p">,</span>
+                             <span class="nb">str</span> <span class="o">|</span> <span class="n">_VirtualMemoryRestoreMode</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">default_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">_VirtualMemoryRestoreMode</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">defaultdict</span><span class="p">[</span><span class="n">ExecutorMemoryType</span><span class="p">,</span> <span class="n">_VirtualMemoryRestoreMode</span><span class="p">]:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.virtual_memory</span><span class="w"> </span><span class="kn">import</span> <span class="n">RestoreMode</span>
+        <span class="n">default_mode</span><span class="p">:</span> <span class="n">_VirtualMemoryRestoreMode</span> <span class="o">=</span> <span class="n">default_mode</span> <span class="ow">or</span> <span class="p">(</span>
+            <span class="n">RestoreMode</span><span class="o">.</span><span class="n">PINNED</span> <span class="k">if</span> <span class="n">prefer_pinned</span><span class="p">()</span> <span class="k">else</span> <span class="n">RestoreMode</span><span class="o">.</span><span class="n">CPU</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">cases</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cases</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">DEFAULT_RESTORE_MODES</span>
+        <span class="n">normalized_cases</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="bp">cls</span><span class="o">.</span><span class="n">_normalize_executor_memory_type</span><span class="p">(</span><span class="n">key</span><span class="p">):</span>
+            <span class="bp">cls</span><span class="o">.</span><span class="n">_normalize_restore_mode</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">cases</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="p">}</span>
+        <span class="k">return</span> <span class="n">defaultdict</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">default_mode</span><span class="p">,</span> <span class="n">normalized_cases</span><span class="p">)</span>
+
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;restore_modes&#39;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;plain&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_restore_modes</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;restore_modes must be dict, got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">v</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="n">default_mode</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">defaultdict</span><span class="p">)</span> <span class="ow">and</span> <span class="n">v</span><span class="o">.</span><span class="n">default_factory</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">default_mode</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_normalize_restore_mode</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">default_factory</span><span class="p">())</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;restore_modes defaultdict default_factory must return a valid RestoreMode&quot;</span>
+                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+
+        <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_make_defaulted_restore_modes</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">default_mode</span><span class="o">=</span><span class="n">default_mode</span><span class="p">)</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">PybindMirror</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; A class containing the utilities for mirroring Python classes to</span>
 <span class="sd">    pybind classes.</span>
@@ -3076,6 +3273,22 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">&quot;The data type to use for the Mamba SSM cache. If set to &#39;auto&#39;, the data type will be inferred from the model config.&quot;</span>
         <span class="p">)</span>
 
+    <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
+    <span class="n">mamba_ssm_stochastic_rounding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Enable stochastic rounding for Mamba SSM state updates. Only applicable with float16 cache dtype.&quot;</span>
+    <span class="p">)</span>
+
+    <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
+    <span class="n">mamba_ssm_philox_rounds</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
+        <span class="n">ge</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness &quot;</span>
+        <span class="s2">&quot;but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled.&quot;</span>
+    <span class="p">)</span>
+
     <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
                                   <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of tokens per block.&quot;</span><span class="p">)</span>
 
@@ -3382,7 +3595,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">moe_cluster_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The cluster parallel size for MoE model&#39;s expert weights.&quot;</span><span class="p">,</span>
-        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;deprecated&quot;</span><span class="p">)</span>
 
     <span class="n">moe_tensor_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -3776,10 +3989,10 @@ window.runMermaid = runMermaid;</script>
                                      <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The workspace for the model.&quot;</span><span class="p">)</span>
 
     <span class="n">fail_fast_on_attention_window_too_large</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Fail fast when attention window is too large to fit even a single sequence in the KV cache.&quot;</span><span class="p">,</span>
-        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;deprecated&quot;</span><span class="p">)</span>
 
     <span class="c1"># Once set, the model will reuse the build_cache</span>
     <span class="n">enable_build_cache</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">BuildCacheConfig</span><span class="p">,</span>
@@ -4387,10 +4600,10 @@ window.runMermaid = runMermaid;</script>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
-    <span class="n">enable_sleep</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Enable LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. &quot;</span>
+    <span class="n">sleep_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SleepConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Configuration for the LLM sleep feature. &quot;</span>
+        <span class="s2">&quot;Sleep feature requires extra setup that may slow down model loading. &quot;</span>
         <span class="s2">&quot;Only enable it if you intend to use this feature.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
@@ -4520,6 +4733,22 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;Draft model must be specified.&quot;</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">_draft_target_one_model</span> <span class="o">=</span> <span class="kc">False</span>
+
+            <span class="c1"># If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.</span>
+            <span class="c1"># Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.</span>
+            <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">draft_len_schedule</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                        <span class="s2">&quot;Automatically enabling cuda_graph_config.enable_padding &quot;</span>
+                        <span class="s2">&quot;because draft_len_schedule is set.&quot;</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">enable_padding</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">batch_sizes</span> <span class="o">=</span> <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">_merge_schedule_keys</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">draft_len_schedule</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;draft_len_schedule keys added to cuda_graph_config.batch_sizes, current batch_sizes: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span>
 
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="kc">None</span>
@@ -4887,9 +5116,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 09, 2026.</p>
+  <p>Last updated on March 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/73cca36">73cca36</a>.</p>
   
 </div></div>
       
