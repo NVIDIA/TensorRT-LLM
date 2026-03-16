@@ -25,6 +25,7 @@ Launch (examples):
 
 ```bash
 # Minimal: sweep batch sizes 1..1024 (powers of 2) on ep=8.
+# --profile means a pre-defined combo of hidden_size, top_k, and num_experts
 python tests/microbenchmarks/bench_moe_comm.py \
     --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3 -b 1 -e 1024 -f 2
 
@@ -89,16 +90,13 @@ class Profile:
 
 
 PROFILES: Dict[str, Profile] = {
-    # DeepSeek-V3: hidden_size 7168, router_topk 8 (public config)
     "deepseek_v3": Profile(
         name="deepseek_v3",
         hidden_size=7168,
         top_k=8,
-        # Previously: experts_per_rank=32 with recommended ep_size=8 => 256 total experts.
         num_experts=256,
         quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
     ),
-    # Repo already references "gpt-oss" hidden_size=2880 in the MoE A2A unit test.
     "gpt_oss": Profile(
         name="gpt_oss",
         hidden_size=2880,
@@ -474,7 +472,6 @@ def _demangle_names(names: List[str]) -> Dict[str, str]:
 def _build_cuda_graph_kernel_stats_cupti(
     cupti_kernels: List[Tuple[str, int, int]],  # (name, start_ns, end_ns)
     cupti_events: List[int],  # device_timestamps of EXTERNAL events, sorted
-    warmup: int,
     iters: int,
 ) -> Optional[Dict[str, Any]]:
     """Categorize GPU kernels from a CUDA graph replay into dispatch/combine/other.
@@ -490,6 +487,12 @@ def _build_cuda_graph_kernel_stats_cupti(
     dispatch or combine window; everything else (including warmup kernels) is other.
 
     Returns None if CUPTI events are missing.
+
+    The returned dict includes:
+      dispatch_times_us / combine_times_us: per-iter kernel-span times (ns → µs),
+        computed as (last_kernel_end − first_kernel_start) within each window.
+        None for iterations where no kernels were attributed (caller should fall back
+        to CUDA-event elapsed_time for those iterations).
     """
     expected_events = 4 * iters
     if len(cupti_events) != expected_events:
@@ -514,27 +517,38 @@ def _build_cuda_graph_kernel_stats_cupti(
     combine_kernel_times: Dict[str, List[float]] = {}
     other_kernel_times: Dict[str, List[float]] = {}
 
+    # Per-iteration [first_start_ns, last_end_ns] for kernel-span timing.
+    dispatch_iter_span: List[List[Optional[int]]] = [[None, None] for _ in range(iters)]
+    combine_iter_span: List[List[Optional[int]]] = [[None, None] for _ in range(iters)]
+
     for name, k_start, k_end in cupti_kernels:
         demangled = dm.get(name, name)
         device_time_us = (k_end - k_start) / 1e3  # ns → µs
 
         category = "other"
+        iter_idx = -1
         for i in range(iters):
             if k_start >= d_starts_abs[i] and k_end <= d_ends_abs[i]:
                 category = "dispatch"
+                iter_idx = i
                 break
             if k_start >= c_starts_abs[i] and k_end <= c_ends_abs[i]:
                 category = "combine"
+                iter_idx = i
                 break
 
-        target = (
-            dispatch_kernel_times
-            if category == "dispatch"
-            else combine_kernel_times
-            if category == "combine"
-            else other_kernel_times
-        )
-        target.setdefault(demangled, []).append(device_time_us)
+        if category == "dispatch":
+            span = dispatch_iter_span[iter_idx]
+            span[0] = k_start if span[0] is None else min(span[0], k_start)
+            span[1] = k_end if span[1] is None else max(span[1], k_end)
+            dispatch_kernel_times.setdefault(demangled, []).append(device_time_us)
+        elif category == "combine":
+            span = combine_iter_span[iter_idx]
+            span[0] = k_start if span[0] is None else min(span[0], k_start)
+            span[1] = k_end if span[1] is None else max(span[1], k_end)
+            combine_kernel_times.setdefault(demangled, []).append(device_time_us)
+        else:
+            other_kernel_times.setdefault(demangled, []).append(device_time_us)
 
     def _build(ktimes: Dict[str, List[float]]) -> List[Dict[str, Any]]:
         result = [{"name": n, "count": len(t), "_times": t} for n, t in ktimes.items()]
@@ -543,10 +557,19 @@ def _build_cuda_graph_kernel_stats_cupti(
         )
         return result
 
+    dispatch_times_us = [
+        (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in dispatch_iter_span
+    ]
+    combine_times_us = [
+        (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in combine_iter_span
+    ]
+
     return {
         "dispatch_kernels": _build(dispatch_kernel_times),
         "combine_kernels": _build(combine_kernel_times),
         "other_kernels": _build(other_kernel_times),
+        "dispatch_times_us": dispatch_times_us,
+        "combine_times_us": combine_times_us,
     }
 
 
@@ -618,8 +641,8 @@ def _time_dispatch_and_combine_cuda_graph(
       5. Sync, read per-iter timings from events.
       6. Profiler pass (two small graphs) for kernel breakdown.
 
-    No L2 flush between iterations inside the graph; consecutive iters share cache state,
-    which matches real inference behaviour.
+    L2 cache is flushed before each iteration inside the graph (including warmup),
+    matching the eager-mode behaviour.
 
     Returns same types as _time_dispatch_and_combine.
     """
@@ -753,10 +776,19 @@ def _time_dispatch_and_combine_cuda_graph(
         _cupti_kernels.sort(key=lambda k: k[1])
         _cupti_events.sort()  # sort by device_timestamp; CUPTI may deliver out of order
 
-        detailed_stats = _build_cuda_graph_kernel_stats_cupti(
-            _cupti_kernels, _cupti_events, warmup, iters
-        )
-        if detailed_stats is None:
+        detailed_stats = _build_cuda_graph_kernel_stats_cupti(_cupti_kernels, _cupti_events, iters)
+        if detailed_stats is not None:
+            # Replace event-based times with tighter kernel-span times.
+            # Fall back per-iter to event timing if no kernels were attributed.
+            cupti_dispatch = detailed_stats.pop("dispatch_times_us")
+            cupti_combine = detailed_stats.pop("combine_times_us")
+            dispatch_times_us = [
+                ct if ct is not None else et for ct, et in zip(cupti_dispatch, dispatch_times_us)
+            ]
+            combine_times_us = [
+                ct if ct is not None else et for ct, et in zip(cupti_combine, combine_times_us)
+            ]
+        else:
             detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
     else:
         detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
@@ -819,9 +851,30 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="deepseek_v3",
         choices=sorted(PROFILES.keys()),
-        help="Optional named profile to provide defaults for hidden_size/top_k/num_experts.",
+        help=(
+            "Named model profile supplying defaults for hidden_size, top_k, and num_experts. "
+            "Any of these can be overridden individually via their own flags."
+        ),
     )
-    parser.add_argument("--hidden_size", type=int, default=None, help="Custom hidden size.")
+    parser.add_argument(
+        "--hidden_size", type=int, default=None, help="Hidden dimension of the model."
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=None, help="Number of experts each token is routed to."
+    )
+    parser.add_argument(
+        "--num_experts",
+        type=int,
+        default=None,
+        help="Total number of experts of the model across all EP ranks.",
+    )
+    parser.add_argument(
+        "--quant",
+        type=lambda s: QuantAlgo[str(s).upper()] if s is not None else None,
+        default=None,
+        choices=[q.name for q in QuantAlgo],
+        help="Quantization recipe of the model.",
+    )
     # Sizes to scan (NCCL-tests style, adapted from bytes -> local_batch_size in tokens).
     parser.add_argument(
         "-b",
@@ -851,20 +904,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Multiplication factor between local_batch_size values. Default: disabled.",
-    )
-    parser.add_argument("--top_k", type=int, default=None, help="Custom router top-k.")
-    parser.add_argument(
-        "--num_experts",
-        type=int,
-        default=None,
-        help="Total number of experts.",
-    )
-    parser.add_argument(
-        "--quant",
-        type=lambda s: str(s).upper(),
-        default=None,
-        choices=[q.name for q in QuantAlgo],
-        help="Override quantization algo (defaults to profile.quant_algo).",
     )
     parser.add_argument("--iters", type=int, default=200, help="Timed iterations.")
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
@@ -922,12 +961,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def _iter_local_batch_sizes(args: argparse.Namespace) -> List[int]:
-    scanning_enabled = any(
-        x is not None for x in (args.minbatch, args.maxbatch, args.stepbatch, args.stepfactor)
-    )
-    if not scanning_enabled:
-        raise ValueError("Must specify -b/--minbatch and/or -e/--maxbatch (tokens).")
-
     if args.stepbatch is not None and args.stepfactor is not None:
         raise ValueError("Only one of -i/--stepbatch or -f/--stepfactor should be used.")
 
@@ -964,28 +997,23 @@ def _iter_local_batch_sizes(args: argparse.Namespace) -> List[int]:
     return list(range(minb, maxb + 1, step))
 
 
-def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int, QuantAlgo]:
-    """Returns (hidden_size, local_num_tokens, top_k, num_experts_total, quant_algo)."""
-    local_num_tokens = _iter_local_batch_sizes(args)[0]
-
-    # If a profile is provided, it supplies defaults; any explicit CLI values override.
-    if args.profile is not None:
-        prof = PROFILES[args.profile]
-        hidden_size = int(args.hidden_size or prof.hidden_size)
-        top_k = int(args.top_k or prof.top_k)
-        num_experts_total = int(args.num_experts or prof.num_experts)
-        quant_algo = prof.quant_algo
-        return hidden_size, local_num_tokens, top_k, num_experts_total, quant_algo
-
-    # No profile: all fields must be provided explicitly.
-    if args.hidden_size is None or args.top_k is None or args.num_experts is None:
+def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, QuantAlgo]:
+    """Returns (hidden_size, top_k, num_experts_total, quant_algo)."""
+    prof = PROFILES.get(args.profile) if args.profile is not None else None
+    if prof is None and (
+        args.hidden_size is None
+        or args.top_k is None
+        or args.num_experts is None
+        or args.quant is None
+    ):
         raise ValueError(
-            "No --profile specified; must provide --hidden_size, --top_k, --num_experts."
+            "No --profile specified; must provide --hidden_size, --top_k, --num_experts, and --quant."
         )
-    hidden_size = int(args.hidden_size)
-    top_k = int(args.top_k)
-    num_experts_total = int(args.num_experts)
-    return hidden_size, local_num_tokens, top_k, num_experts_total, QuantAlgo.NO_QUANT
+    hidden_size = int(args.hidden_size or prof.hidden_size)
+    top_k = int(args.top_k or prof.top_k)
+    num_experts_total = int(args.num_experts or prof.num_experts)
+    quant_algo = args.quant or prof.quant_algo
+    return hidden_size, top_k, num_experts_total, quant_algo
 
 
 _WORKER_ENV = {
@@ -1003,7 +1031,7 @@ def _run_benchmark_worker_under_current_mpi(
     # but silently drops CUDA_EVENT records.  _set_device_from_local_rank() (below) is
     # the first call that creates the CUDA context, so we init CUPTI here.
     _early_cupti_ctx: Optional[Any] = None
-    if not args.no_cuda_graph and args.kernel_breakdown:
+    if not args.no_cuda_graph:
         _cupti_module, _cupti_kernels_list, _cupti_events_list, _cupti_ok = _try_init_cupti()
         if _cupti_ok:
             _early_cupti_ctx = (_cupti_module, _cupti_kernels_list, _cupti_events_list, True)
@@ -1020,10 +1048,9 @@ def _run_benchmark_worker_under_current_mpi(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    hidden_size, _, top_k, num_experts_total, profile_quant_algo = _resolve_profile_args(args)
+    hidden_size, top_k, num_experts_total, quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
     act_dtype = torch.bfloat16
-    quant_algo = QuantAlgo[args.quant] if args.quant is not None else profile_quant_algo
     quant_config = (
         QuantConfig(quant_algo=None)
         if quant_algo == QuantAlgo.NO_QUANT
@@ -1081,9 +1108,9 @@ def _run_benchmark_worker_under_current_mpi(
     # CUPTI was initialized before the CUDA context at the top of this function.
     # Reuse that early context; do not re-initialize here (too late for CUDA_EVENT delivery).
     _cupti_ctx: Optional[Any] = _early_cupti_ctx
-    if not args.no_cuda_graph and args.kernel_breakdown and _cupti_ctx is None:
+    if not args.no_cuda_graph and _cupti_ctx is None:
         _maybe_warn_rank0(
-            "[bench] CUPTI unavailable, kernel breakdown disabled for cuda_graph mode."
+            "[bench] CUPTI unavailable; dispatch_us/combine_us will use CUDA event elapsed_time."
         )
 
     for backend_name in backends:
@@ -1106,6 +1133,7 @@ def _run_benchmark_worker_under_current_mpi(
                 experts_per_rank,
                 payload_in_workspace=False,
                 alltoall_result_do_sum=True,
+                use_flashinfer=False,
             )
 
             if backend is None:
@@ -1313,6 +1341,9 @@ def main() -> None:
     if ep_size <= 0:
         raise ValueError("--ep_size must be > 0")
 
+    _worker_env = dict(_WORKER_ENV)
+    _worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
+
     world_size = mpi_world_size()
     if world_size > 1:
         if args.ep_size is not None and ep_size != world_size:
@@ -1320,6 +1351,9 @@ def main() -> None:
                 f"--ep_size ({ep_size}) must match external MPI world size ({world_size}) "
                 "when running under mpirun."
             )
+        # In external MPI mode, workers are already launched, so MPIPoolExecutor(env=...)
+        # is not used. Apply worker env directly for parity with spawn mode.
+        os.environ.update(_worker_env)
         # Reuse externally launched MPI processes (supports multi-node SPMD).
         _run_benchmark_worker_under_current_mpi(args, launcher="external_mpi")
         return
@@ -1339,11 +1373,8 @@ def main() -> None:
             flush=True,
         )
 
-    worker_env = dict(_WORKER_ENV)
-    worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
-
     args_blob = cloudpickle.dumps(args)
-    executor = MPIPoolExecutor(max_workers=ep_size, env=worker_env)
+    executor = MPIPoolExecutor(max_workers=ep_size, env=_worker_env)
     try:
         # Map the same args to all workers; each worker uses its own mpi_rank() and participates
         # in collectives within its spawned MPI world.
