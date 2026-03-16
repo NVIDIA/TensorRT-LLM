@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc8';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc7" />
+  <meta name="docsearch:version" content="1.3.0rc8" />
 
 
   </head>
@@ -376,6 +376,7 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
@@ -1425,8 +1426,8 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25setVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE">
-<span id="_CPPv3N12tensorrt_llm7runtime25setVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE"></span><span id="_CPPv2N12tensorrt_llm7runtime25setVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE"></span><span id="tensorrt_llm::runtime::setVirtualMemoryAllocator__ssCR.CudaVirtualMemoryAllocator::RestoreMode.std::shared_ptr:CudaStream:"></span><span class="target" id="virtualMemory_8h_1a4f4e6fa6c4260e43db6960fa89d87ccf"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setVirtualMemoryAllocator</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime26pushVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE">
+<span id="_CPPv3N12tensorrt_llm7runtime26pushVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE"></span><span id="_CPPv2N12tensorrt_llm7runtime26pushVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE"></span><span id="tensorrt_llm::runtime::pushVirtualMemoryAllocator__ssCR.CudaVirtualMemoryAllocator::RestoreMode.std::shared_ptr:CudaStream:"></span><span class="target" id="virtualMemory_8h_1aa4a08ee1ec46fb7d484ae3629897f776"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">pushVirtualMemoryAllocator</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">tag</span></span></em>,</dd>
@@ -1434,12 +1435,12 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">shared_ptr</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10CudaStreamE" title="tensorrt_llm::runtime::CudaStream"><span class="n"><span class="pre">CudaStream</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">backStream</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25setVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime26pushVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime27clearVirtualMemoryAllocatorEv">
-<span id="_CPPv3N12tensorrt_llm7runtime27clearVirtualMemoryAllocatorEv"></span><span id="_CPPv2N12tensorrt_llm7runtime27clearVirtualMemoryAllocatorEv"></span><span id="tensorrt_llm::runtime::clearVirtualMemoryAllocator"></span><span class="target" id="virtualMemory_8h_1a4661d6837a9f876dc622bf4b40cb0394"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">clearVirtualMemoryAllocator</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime27clearVirtualMemoryAllocatorEv" title="Link to this definition">#</a><br /></dt>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime25popVirtualMemoryAllocatorEv">
+<span id="_CPPv3N12tensorrt_llm7runtime25popVirtualMemoryAllocatorEv"></span><span id="_CPPv2N12tensorrt_llm7runtime25popVirtualMemoryAllocatorEv"></span><span id="tensorrt_llm::runtime::popVirtualMemoryAllocator"></span><span class="target" id="virtualMemory_8h_1a3673c39783851c7c0c717e8c9edc8a1f"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">popVirtualMemoryAllocator</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime25popVirtualMemoryAllocatorEv" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -1628,8 +1629,8 @@
 </dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration25setVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE">
-<span id="_CPPv3N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration25setVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE"></span><span id="_CPPv2N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration25setVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE"></span><span id="tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::setVirtualMemoryAllocator__ssCR.RestoreMode.std::shared_ptr:CudaStream:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1CudaVirtualMemoryAllocator_1_1Configuration_1a817c8bc084aaecc7427d6ac21b2eca84"></span><span class="k"><span class="pre">friend</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setVirtualMemoryAllocator</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration26pushVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE">
+<span id="_CPPv3N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration26pushVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE"></span><span id="_CPPv2N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration26pushVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE"></span><span id="tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::pushVirtualMemoryAllocator__ssCR.RestoreMode.std::shared_ptr:CudaStream:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1CudaVirtualMemoryAllocator_1_1Configuration_1a5193457a383c3cc69fd26ab6052f329d"></span><span class="k"><span class="pre">friend</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">pushVirtualMemoryAllocator</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">tag</span></span></em>,</dd>
@@ -1637,7 +1638,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">shared_ptr</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10CudaStreamE" title="tensorrt_llm::runtime::CudaStream"><span class="n"><span class="pre">CudaStream</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">backStream</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration25setVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration26pushVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -8991,6 +8992,21 @@ one more than decoding draft tokens for prediction from primary head </p>
 <span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType12kMLP_GATE_UPE"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType12kMLP_GATE_UPE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8a941ac1ef5486393e4fc0129d27d4ebd9"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kMLP_GATE_UP</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType12kMLP_GATE_UPE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_H_TO_4HE">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_H_TO_4HE"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_H_TO_4HE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8a488c1f537fae21dc2eb3092aa66562a0"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kSHARED_EXPERT_H_TO_4H</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_H_TO_4HE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_4H_TO_HE">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_4H_TO_HE"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_4H_TO_HE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8a4bbaf8ad8d423a34cedaf0c7f6a770e7"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kSHARED_EXPERT_4H_TO_H</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_4H_TO_HE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8aaa9314f82e98093b4d76a8204e1d3ffb"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kSHARED_EXPERT_GATE</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
 </dd></dl>
 
 <dl class="cpp type">
@@ -9218,8 +9234,8 @@ one more than decoding draft tokens for prediction from primary head </p>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-static-functions">Public Static Functions</p>
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32">
-<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::LoraModule::createLoraModules__std::vector:ss:CR.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a93b14a632d0f904290d2a7e9d0debf46"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10LoraModuleE" title="tensorrt_llm::runtime::LoraModule"><span class="n"><span class="pre">LoraModule</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">createLoraModules</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::LoraModule::createLoraModules__std::vector:ss:CR.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1ac804828b38616b5afd18ab566f4dbb53"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10LoraModuleE" title="tensorrt_llm::runtime::LoraModule"><span class="n"><span class="pre">LoraModule</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">createLoraModules</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">loraModuleNames</span></span></em>,</dd>
@@ -9230,9 +9246,11 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">attentionHeadSize</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">tpSize</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">numExperts</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">sharedExpertHiddenSize</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">moeHiddenSize</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp function">
@@ -12837,8 +12855,8 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#virtualmemory-h">virtualMemory.h</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime23getVirtualMemoryManagerEv"><code class="docutils literal notranslate"><span class="pre">getVirtualMemoryManager()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25getVirtualMemoryAllocatorEv"><code class="docutils literal notranslate"><span class="pre">getVirtualMemoryAllocator()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25setVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE"><code class="docutils literal notranslate"><span class="pre">setVirtualMemoryAllocator()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime27clearVirtualMemoryAllocatorEv"><code class="docutils literal notranslate"><span class="pre">clearVirtualMemoryAllocator()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26pushVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE"><code class="docutils literal notranslate"><span class="pre">pushVirtualMemoryAllocator()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime25popVirtualMemoryAllocatorEv"><code class="docutils literal notranslate"><span class="pre">popVirtualMemoryAllocator()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocatorE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::CudaVirtualMemoryAllocator</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator11RestoreModeE"><code class="docutils literal notranslate"><span class="pre">RestoreMode</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator11RestoreMode4NONEE"><code class="docutils literal notranslate"><span class="pre">NONE</span></code></a></li>
@@ -12865,7 +12883,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration10mAlignmentE"><code class="docutils literal notranslate"><span class="pre">mAlignment</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration5mModeE"><code class="docutils literal notranslate"><span class="pre">mMode</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration11mBackgroundE"><code class="docutils literal notranslate"><span class="pre">mBackground</span></code></a></li>
-<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration25setVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE"><code class="docutils literal notranslate"><span class="pre">setVirtualMemoryAllocator</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration26pushVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE"><code class="docutils literal notranslate"><span class="pre">pushVirtualMemoryAllocator</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -13996,6 +14014,9 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType11kMOE_ROUTERE"><code class="docutils literal notranslate"><span class="pre">kMOE_ROUTER</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType11kMLP_ROUTERE"><code class="docutils literal notranslate"><span class="pre">kMLP_ROUTER</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType12kMLP_GATE_UPE"><code class="docutils literal notranslate"><span class="pre">kMLP_GATE_UP</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_H_TO_4HE"><code class="docutils literal notranslate"><span class="pre">kSHARED_EXPERT_H_TO_4H</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_4H_TO_HE"><code class="docutils literal notranslate"><span class="pre">kSHARED_EXPERT_4H_TO_H</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE"><code class="docutils literal notranslate"><span class="pre">kSHARED_EXPERT_GATE</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule9TensorPtrE"><code class="docutils literal notranslate"><span class="pre">TensorPtr</span></code></a></li>
@@ -14023,7 +14044,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime10LoraModule11outDimFirstEv"><code class="docutils literal notranslate"><span class="pre">outDimFirst()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime10LoraModule12inTpSplitDimEv"><code class="docutils literal notranslate"><span class="pre">inTpSplitDim()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime10LoraModule13outTpSplitDimEv"><code class="docutils literal notranslate"><span class="pre">outTpSplitDim()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">createLoraModules()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">createLoraModules()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule12toModuleTypeERKNSt11string_viewE"><code class="docutils literal notranslate"><span class="pre">toModuleType()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule12toModuleNameE10ModuleType"><code class="docutils literal notranslate"><span class="pre">toModuleName()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule12toModuleNameE10SizeType32"><code class="docutils literal notranslate"><span class="pre">toModuleName()</span></code></a></li>
@@ -14713,9 +14734,9 @@ one more than decoding draft tokens for prediction from primary head </p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 09, 2026.</p>
+  <p>Last updated on March 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/73cca36">73cca36</a>.</p>
   
 </div></div>
       
