@@ -235,6 +235,28 @@ class CompilationConfig(StrictBaseModel):
     More warmup shapes = slower startup, but lower risk of torch.compile
     recompilation delays on first requests. Fewer shapes = faster startup,
     but first request with an un-warmed shape triggers recompilation.
+
+    If not configured, each model pipeline uses its own defaults
+    (e.g., Wan uses [(480, 832), (720, 1280)] x [33, 81]).
+
+    YAML usage (via ``--extra_visual_gen_options``)::
+
+        # Custom warmup: 2 resolutions x 2 frame counts = 4 shapes
+        compilation:
+          resolutions:
+            - [480, 832]
+            - [720, 1280]
+          num_frames: [33, 81]
+
+        # Only override resolutions (frame counts use model defaults)
+        compilation:
+          resolutions:
+            - [1920, 1080]
+
+        # Skip warmup entirely
+        compilation:
+          resolutions: []
+          num_frames: []
     """
 
     resolutions: Optional[List[Tuple[int, int]]] = PydanticField(
