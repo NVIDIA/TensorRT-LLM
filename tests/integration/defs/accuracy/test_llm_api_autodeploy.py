@@ -597,7 +597,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                 },
                 "fuse_rope_into_trtllm_mla": {
                     "stage": "cache_init",
-                    "enabled": True,
+                    "enabled": mla_attn_backend == "trtllm_mla",
                 },
             }
         }
