@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
+from tensorrt_llm._utils import prefer_pinned
 
 
 @triton.jit
@@ -195,7 +196,7 @@ class Mamba2Metadata:
 
         self.state_indices_cpu = torch.zeros(max_batch_size,
                                              dtype=torch.int32,
-                                             pin_memory=True)
+                                             pin_memory=prefer_pinned())
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
@@ -256,10 +257,10 @@ class Mamba2Metadata:
             initial_states = [
                 num_cached_tokens_per_seq[i] > 0 for i in range(num_contexts)
             ]
+            self.has_initial_states[:num_contexts] = torch.tensor(
+                initial_states, dtype=torch.bool)
             self.use_initial_states = any(initial_states)
             if self.use_initial_states:
-                self.has_initial_states[:num_contexts] = torch.tensor(
-                    initial_states, dtype=torch.bool)
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
                     self.cu_seqlens[:num_contexts + 1], self.chunk_size)
             else:

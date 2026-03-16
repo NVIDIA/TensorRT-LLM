@@ -159,7 +159,7 @@ if rank == 0:
     LLaMAForCausalLM.quantize(hf_model_dir,
                           checkpoint_dir,
                           quant_config=quant_config)
-mpi_barrier() # wait for rank-o finishes the quantization
+mpi_barrier() # wait for rank-0 to finish the quantization
 llama = LLaMAForCausalLM.from_checkpoint(checkpoint_dir, rank)
 engine = build(llama, build_config)
 engine.save(engine_dir)

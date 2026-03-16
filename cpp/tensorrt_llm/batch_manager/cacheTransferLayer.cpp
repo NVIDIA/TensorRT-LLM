@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 #include <algorithm>
@@ -95,6 +96,13 @@ void CacheTransferLayer::format(TransferSession& session) const
     mKvFormatter->format(session);
     if (mRnnFormatter)
     {
+        for (auto const* conn : session.getConnections())
+        {
+            if (conn != nullptr)
+            {
+                conn->activateBuffer(static_cast<uint8_t>(BufferKind::kRNN));
+            }
+        }
         mRnnFormatter->format(session);
     }
 }

@@ -25,7 +25,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionArgs, PipelineConfig
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, PipelineConfig, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
@@ -52,8 +52,6 @@ FLUX2_CHECKPOINT_PATH = os.environ.get(
     os.path.join(_llm_models_root(), "FLUX.2-dev"),
 )
 SKIP_COMPONENTS = ["text_encoder", "text_encoder_2", "vae", "tokenizer", "tokenizer_2", "scheduler"]
-# When skip_components includes tokenizer, warmup must be disabled (warmup calls _encode_prompt)
-PIPELINE_NO_WARMUP = PipelineConfig(warmup_steps=0)
 
 
 def _get_flux_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -157,15 +155,14 @@ class TestFluxPipelineLoading:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_load_flux1_pipeline_basic(self, flux1_checkpoint_exists):
         """Test loading FLUX.1 pipeline."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline=PIPELINE_NO_WARMUP,
         )
 
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         assert pipeline is not None
         assert hasattr(pipeline, "transformer")
@@ -179,15 +176,14 @@ class TestFluxPipelineLoading:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_load_flux2_pipeline_basic(self, flux2_checkpoint_exists):
         """Test loading FLUX.2 pipeline."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX2_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline=PIPELINE_NO_WARMUP,
         )
 
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         assert pipeline is not None
         assert hasattr(pipeline, "transformer")
@@ -201,16 +197,15 @@ class TestFluxPipelineLoading:
     @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
     def test_load_flux1_with_attention_backend(self, flux1_checkpoint_exists, backend: str):
         """Test loading FLUX.1 with different attention backends."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend=backend),
-            pipeline=PIPELINE_NO_WARMUP,
         )
 
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         assert pipeline.model_config.attention.backend == backend
 
@@ -231,16 +226,15 @@ class TestFluxQuantization:
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_load_flux1_with_quantization(self, flux1_checkpoint_exists, quant_algo: str):
         """Test loading FLUX.1 with FP8 quantization and verify FP8 weights."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline=PIPELINE_NO_WARMUP,
         )
 
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         assert pipeline.model_config.quant_config.quant_algo is not None
 
@@ -276,16 +270,15 @@ class TestFluxQuantization:
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_load_flux2_with_quantization(self, flux2_checkpoint_exists, quant_algo: str):
         """Test loading FLUX.2 with FP8 quantization and verify FP8 weights."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX2_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline=PIPELINE_NO_WARMUP,
         )
 
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         assert pipeline.model_config.quant_config.quant_algo is not None
 
@@ -338,26 +331,24 @@ class TestFluxFP8NumericalCorrectness:
         """
         # Load BF16 pipeline (reference)
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         # Load FP8 pipeline
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load()
+        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
 
         # Get matching Linear layers from both pipelines
         linear_bf16, layer_name = _find_first_quantizable_linear(pipeline_bf16.transformer)
@@ -422,27 +413,25 @@ class TestFluxFP8NumericalCorrectness:
         """
         # Load BF16 transformer (reference)
         print("\n[E2E] Loading BF16 transformer...")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
         transformer_bf16 = pipeline_bf16.transformer
 
         # Load FP8 transformer
         print(f"[E2E] Loading {quant_algo} transformer...")
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load()
+        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
         transformer_fp8 = pipeline_fp8.transformer
 
         # Create test inputs
@@ -539,14 +528,13 @@ class TestFluxFP8Memory:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         bf16_model_mem = get_module_memory_gb(pipeline_bf16.transformer)
         bf16_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -560,15 +548,14 @@ class TestFluxFP8Memory:
         # Load FP8
         torch.cuda.reset_peak_memory_stats()
 
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load()
+        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
 
         fp8_model_mem = get_module_memory_gb(pipeline_fp8.transformer)
         fp8_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -609,15 +596,14 @@ class TestFluxAttentionBackend:
         # Run VANILLA first, save output, then free before loading TRTLLM
         # (two full transformers don't fit in GPU memory simultaneously)
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="VANILLA"),
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
         transformer_baseline = pipeline_baseline.transformer
 
         inputs = _get_flux_transformer_inputs(transformer_baseline)
@@ -633,15 +619,14 @@ class TestFluxAttentionBackend:
 
         # Load and run TRTLLM backend
         print("[Attention Backend Test] Loading TRTLLM transformer...")
-        args_trtllm = DiffusionArgs(
+        args_trtllm = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="TRTLLM"),
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_trtllm = PipelineLoader(args_trtllm).load()
+        pipeline_trtllm = PipelineLoader(args_trtllm).load(skip_warmup=True)
         transformer_trtllm = pipeline_trtllm.transformer
 
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
@@ -720,7 +705,7 @@ class TestFluxE2E:
         torch.cuda.empty_cache()
 
         # 2. Load TRT-LLM pipeline (full, no skip_components)
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -773,7 +758,7 @@ class TestFluxE2E:
         torch.cuda.empty_cache()
 
         # 2. Load TRT-LLM pipeline (full, no skip_components)
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX2_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -836,19 +821,18 @@ def _run_ulysses_worker(rank, world_size, checkpoint_path, inputs_cpu, return_di
     try:
         _setup_distributed(rank, world_size)
 
-        from tensorrt_llm._torch.visual_gen.config import DiffusionArgs, ParallelConfig
+        from tensorrt_llm._torch.visual_gen.config import ParallelConfig, VisualGenArgs
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
         # Load pipeline with Ulysses parallelism
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_ulysses_size=world_size),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Load inputs on this GPU
         inputs = {k: v.to(f"cuda:{rank}") for k, v in inputs_cpu.items()}
@@ -901,14 +885,13 @@ class TestFluxParallelism:
 
         # Load single-GPU reference
         print("\n[1/3] Loading single-GPU reference (ulysses_size=1) on GPU 0...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
 
         # Create test inputs (seq_len must be divisible by 2 for Ulysses)
         print("\n[2/3] Creating test inputs...")
@@ -984,15 +967,15 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
 
         from tensorrt_llm._torch.visual_gen.config import (
             AttentionConfig,
-            DiffusionArgs,
             ParallelConfig,
             TeaCacheConfig,
+            VisualGenArgs,
         )
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
         from tensorrt_llm.quantization.mode import QuantAlgo
 
         # Load pipeline with ALL optimizations
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -1005,9 +988,8 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
             ),
             attention=AttentionConfig(backend="TRTLLM"),
             parallel=ParallelConfig(dit_ulysses_size=world_size),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
@@ -1080,14 +1062,13 @@ class TestFluxCombinedOptimizations:
 
         # Load baseline on GPU 0 (no optimizations)
         print("\n[1/3] Loading baseline on GPU 0 (BF16, no optimizations)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline=PIPELINE_NO_WARMUP,
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
 
         # Reset torch compile state
         torch._dynamo.reset()

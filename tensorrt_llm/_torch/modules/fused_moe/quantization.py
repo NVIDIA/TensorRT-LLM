@@ -176,6 +176,19 @@ def maybe_pad_for_mxfp4(weight: torch.Tensor,
     return weight
 
 
+def _pad_tensor_to_shape(tensor: torch.Tensor, shape: tuple) -> torch.Tensor:
+    """Pad tensor to match target shape. Used for post-shard alignment."""
+    if tensor.numel() == 0:
+        return tensor
+    if tensor.shape == shape:
+        return tensor
+    if len(tensor.shape) == 1:
+        return F.pad(tensor, (0, shape[0] - tensor.shape[0])).contiguous()
+    row_pad = shape[0] - tensor.shape[0]
+    col_pad = shape[1] - tensor.shape[1]
+    return F.pad(tensor, (0, col_pad, 0, row_pad)).contiguous()
+
+
 def interleave_linear_and_gate(x: torch.Tensor,
                                group_size: int = 64,
                                dim: int = -1) -> torch.Tensor:
@@ -895,6 +908,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
+    FP8_QUANT_BLOCK_SIZE = 128
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -913,16 +927,18 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         cell_div = lambda x, y: (x + y - 1) // y
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
             (module.expert_size_per_partition,
-             cell_div(module.intermediate_size_per_partition, 128) * 2,
-             cell_div(w3_w1_weight_shape[2], 128)),
+             cell_div(module.intermediate_size_per_partition,
+                      self.FP8_QUANT_BLOCK_SIZE) * 2,
+             cell_div(w3_w1_weight_shape[2], self.FP8_QUANT_BLOCK_SIZE)),
             dtype=torch.float32),
                                                    requires_grad=False)
         module.register_parameter("w3_w1_weight_scaling_factor",
                                   w3_w1_weight_scaling_factor)
 
         w2_weight_scaling_factor = nn.Parameter(torch.empty(
-            (module.expert_size_per_partition, cell_div(
-                w2_weight_shape[1], 128), cell_div(w2_weight_shape[2], 128)),
+            (module.expert_size_per_partition,
+             cell_div(w2_weight_shape[1], self.FP8_QUANT_BLOCK_SIZE),
+             cell_div(w2_weight_shape[2], self.FP8_QUANT_BLOCK_SIZE)),
             dtype=torch.float32),
                                                 requires_grad=False)
         module.register_parameter("w2_weight_scaling_factor",
@@ -973,6 +989,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                     f"{expert_id}.w2.weight_scale_inv"] if f"{expert_id}.w2.weight_scale_inv" in weights else None
                 dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale[
                     local_slot_id].chunk(2, dim=0)
+                assert module.intermediate_size_per_partition % self.FP8_QUANT_BLOCK_SIZE == 0, "For DeepSeekFP8BlockScalesFusedMoEMethod, intermediate_size_per_partition should be divisible by FP8_QUANT_BLOCK_SIZE."
                 if w1_scale is not None:
                     w1_scale_shard = load_weight_shard(
                         w1_scale,
@@ -1089,8 +1106,11 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
 
+    def _needs_e8m0_resmooth(self):
+        return is_sm_100f() or get_sm_version() == 120
+
     def post_load_weights(self, module: torch.nn.Module):
-        if is_sm_100f():
+        if is_sm_100f() or get_sm_version() == 120:
             # Resmooth shared experts before registering shared weights
             if self.need_load_shared_weights(module):
                 local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -1129,7 +1149,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
         super().post_load_weights(module)
 
-        if is_sm_100f():
+        if self._needs_e8m0_resmooth():
             logger.debug("Resmoothing FP8 weights in post_load_weights")
             resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
@@ -1887,7 +1907,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
             [torch.stack(all_w3_scales),
              torch.stack(all_w1_scales)], dim=-2)
 
-        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16).view(module.dtype)
+        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16)
         w3_w1_s_shape = w3_w1_scales.shape
         w3_w1_scales_interleaved = w3_w1_scales.reshape(
             w3_w1_s_shape[0], w3_w1_s_shape[1],
@@ -1915,8 +1935,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 w2_scales_shard, (0, pad_size_inter, 0, pad_size_hidden))
             all_w2_scales.append(w2_scales_shard)
 
-        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
-            module.dtype)
+        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16)
         w2_s_shape = w2_scales.shape
         w2_scales_interleaved = w2_scales.reshape(
             w2_s_shape[0], w2_s_shape[1],
@@ -2192,6 +2211,9 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         if has_pre_quant_scale:
+            assert module.is_gated_activation, (
+                "pre_quant_scale (NVFP4_AWQ) is not supported with non-gated activations"
+            )
             from ..linear import TensorParallelMode, load_weight_shard
 
             device = module.fc31_act_scale.device
@@ -2813,10 +2835,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # last step: load fc31_scale_c
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
-        # For non-gated activations (Relu2), scale_c_fc1 is just the input scale
+        # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
         from ...utils import ActivationType
-        if hasattr(module, 'activation_type'
-                   ) and module.activation_type == ActivationType.Relu2:
+        if hasattr(module, 'activation_type') and module.activation_type in [
+                ActivationType.Relu2, ActivationType.Silu
+        ]:
             # For Relu2: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
                 module.expert_size_per_partition),
@@ -2915,6 +2938,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         return (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape,
                 w2_bias_shape, w3_w1_weight_scale_shape, w2_weight_scale_shape)
 
+    def _round_up(self, x, alignment):
+        return (x + alignment - 1) // alignment * alignment
+
     def create_weights(self, module: torch.nn.Module):
         # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
         if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
@@ -2922,6 +2948,15 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
             # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
             self.input_hidden_alignment = 256
+
+        else:
+            # Weight scales require M % 128 in get_shuffle_matrix_sf_a_row_indices.
+            # Check if intermediate_size after padding satisfies this requirement.
+            # If not, set weight_alignment to 128.
+            intermediate_size_padded = self._round_up(
+                module.intermediate_size_per_partition, self.weight_alignment)
+            if intermediate_size_padded % 128 != 0:
+                self.weight_alignment = 128
 
         super().create_weights(module, bias_dtype=torch.float32)
 
@@ -2981,6 +3016,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
             dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
         else:
+            w1_weight_shard = _pad_tensor_to_shape(w1_weight_shard,
+                                                   dst_w3_w1_weight_gpu.shape)
             dst_w3_w1_weight_gpu.copy_(
                 w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
 
@@ -3038,6 +3075,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         epilogue_tile_m = 128
 
         # Keep weights in device buffer
+        w2_weight_shard = _pad_tensor_to_shape(w2_weight_shard,
+                                               dst_w2_weight_gpu.shape)
         dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
                                 non_blocking=dst_on_gpu)
         # Get permuted indices
@@ -3071,26 +3110,28 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
                                           module.tp_size,
-                                          w3_weight_scale.shape[0])
+                                          w1_weight_scale.shape[0])
         w1_weight_scale = maybe_pad_for_mxfp4(
             w1_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
             alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
-            w3_weight_scale,
-            self.input_hidden_alignment // module.scaling_vector_size,
-            alignment)
+        if module.is_gated_activation:
+            w3_weight_scale = maybe_pad_for_mxfp4(
+                w3_weight_scale,
+                self.input_hidden_alignment // module.scaling_vector_size,
+                alignment)
 
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
+        if module.is_gated_activation:
+            w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
 
         # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
         w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0
@@ -3113,6 +3154,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                     w1_weight_scale.view(dst_w1_weight_scale.dtype))
         else:
             # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
+            w1_weight_scale = _pad_tensor_to_shape(
+                w1_weight_scale, dst_w3_w1_weight_scale_gpu.shape)
             dst_w3_w1_weight_scale_gpu.copy_(
                 w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
 
@@ -3170,6 +3213,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                             TensorParallelMode.ROW,
                                             device=device)
         # Keep weights in device buffer
+        w2_weight_scale = _pad_tensor_to_shape(w2_weight_scale,
+                                               dst_w2_weight_scale_gpu.shape)
         dst_w2_weight_scale_gpu.copy_(
             w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
 

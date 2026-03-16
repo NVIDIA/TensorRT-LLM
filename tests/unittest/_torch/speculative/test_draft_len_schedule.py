@@ -29,7 +29,6 @@ def enforce_single_worker(monkeypatch):
     "drafter_type,schedule",
     [
         ("ngram", {1: 3, 4: 2, 8: 1}),
-        ("model_drafter", {1: 3, 4: 2, 8: 1}),
     ],
 )
 @pytest.mark.high_cuda_memory
@@ -116,6 +115,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
             is_public_pool=False,
         )
     else:
+        # skipped for move to 1 model
         spec_config_fixed = DraftTargetDecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=str(draft_model),
@@ -142,7 +142,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     "drafter_type,draft_schedule",
     [
         ("ngram", {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}),
-        ("model_drafter", {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}),
     ],
 )
 @pytest.mark.high_cuda_memory
@@ -180,6 +179,7 @@ def test_draft_len_schedule_functionality(
             draft_len_schedule=draft_schedule,
         )
     else:
+        # skipped for move to 1 model
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=5,
             speculative_model=str(llm_models_root() / "llama-3.2-models" / "Llama-3.2-3B-Instruct"),

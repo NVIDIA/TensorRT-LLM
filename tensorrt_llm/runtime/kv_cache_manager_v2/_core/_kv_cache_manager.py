@@ -16,12 +16,14 @@
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, cast
+from typing import Iterable, Iterator, cast
 
 from .. import rawref
 from .._block_radix_tree import BlockRadixTree
 from .._common import (
+    BAD_PAGE_INDEX,
     GPU_LEVEL,
     PRIORITY_DEFAULT,
     BlockOrdinal,
@@ -48,7 +50,6 @@ from .._utils import (
     init_cuda_once,
     make_typed,
     typed_enumerate,
-    typed_map,
     typed_range,
     unwrap_rawref,
 )
@@ -81,6 +82,12 @@ class Range:
 
 
 @dataclass(slots=True, frozen=True)
+class ExpandedBuffer:
+    id: BufferId
+    expansion: int  # expansion factor of page due to heterogeneous tokens_per_block
+
+
+@dataclass(slots=True, frozen=True)
 class AggregatedPageDesc:
     """
     The data you need would be in the following byte ranges:
@@ -91,7 +98,23 @@ class AggregatedPageDesc:
     size: int
     stride: int
     layer_group_id: LayerGroupId
-    buffers: Sequence[BufferId]
+    buffers: Sequence[ExpandedBuffer]
+
+
+@dataclass(slots=True, frozen=True)
+class PageIndexConverter:
+    scale: int
+    expansion: int
+
+    def __call__(self, base_index: int) -> Iterator[int]:
+        """
+        Convert from base page indices to page indices expected by operators/kernels.
+        This is just an reference implementation. Users are encouraged to do it with a CUDA kernel.
+        """
+        valid = base_index != BAD_PAGE_INDEX
+        index = base_index * self.scale
+        expansion = self.expansion
+        return ((index * expansion + i if valid else BAD_PAGE_INDEX) for i in range(expansion))
 
 
 class KVCacheManager:
@@ -135,11 +158,12 @@ class KVCacheManager:
 
     def __init__(self, config: KVCacheManagerConfig) -> None:
         init_cuda_once()
+        config = deepcopy(config)
         self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
         self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
         storage_config = create_storage_config(config)
-        self._storage = StorageManager(self._life_cycles, storage_config)
+        self._storage = StorageManager(self._life_cycles, storage_config, config.tokens_per_block)
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
@@ -177,7 +201,7 @@ class KVCacheManager:
     # Currently always equals to page size. In the future, that will change when kernels support page stride.
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int:
         attr = self._storage.get_buffer_attr(layer_id, data_role)
-        return attr.size
+        return exact_div(attr.size, attr.expansion)
 
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int:
         """
@@ -194,10 +218,14 @@ class KVCacheManager:
         attr = storage.get_buffer_attr(layer_id, data_role)
         pool_idx = attr.pool_index
         slot_size = pool_group.slot_size[pool_idx]
-        return exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size)
+        return (
+            exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size)
+        ) * attr.expansion
 
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int:
         """
+        Deprecated. Use get_page_index_converter instead.
+
         The multiplier to convert from base page indices to page indices expected by operators/kernels.
 
         For layers in the same layer group, users are encouraged to share the computed page indices
@@ -207,11 +235,26 @@ class KVCacheManager:
         attr = storage.get_buffer_attr(layer_id, data_role)
         return storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
 
+    def get_page_index_converter(
+        self, layer_id: LayerId, data_role: DataRole
+    ) -> PageIndexConverter:
+        """
+        Get the converter to convert from base page indices to page indices expected by operators/kernels.
+
+        For layers in the same layer group and with the same tokens_per_block, users are encouraged to
+        share the computed page indices between buffers of these layers, if the page index scale for these
+        buffers are the same.
+        """
+        storage = self._storage
+        attr = storage.get_buffer_attr(layer_id, data_role)
+        scale = storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
+        return PageIndexConverter(scale, attr.expansion)
+
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
-        id: Any = None,
+        id: int | None = None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
     ) -> _KVCache:
@@ -303,7 +346,7 @@ class KVCacheManager:
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]:
         """
         Internally, we concatenate buffers into larger buffers.
-        This API takes a iterator of buffers (unordered), and try to find those that can form
+        This API takes a iterable of buffers (unordered), and try to find those that can form
         contiguous aggregated buffers.
         When we need data transfer, this helps us improve performance.
         Args:
@@ -312,8 +355,8 @@ class KVCacheManager:
             A iterator of aggregated buffers.
         """
         # Group by (life_cycle, pool_index)
-        groups = defaultdict[tuple[LifeCycleId, PoolIndex], list[tuple[Range, BufferId]]](
-            list[tuple[Range, BufferId]]
+        groups = defaultdict[tuple[LifeCycleId, PoolIndex], list[tuple[Range, ExpandedBuffer]]](
+            list[tuple[Range, ExpandedBuffer]]
         )
         buffer_attr_map = self._storage._buffer_attr
         for b in buffers:
@@ -321,7 +364,7 @@ class KVCacheManager:
             size = attr.size
             start = attr.offset
             key = (attr.life_cycle_id, attr.pool_index)
-            groups[key].append((Range(start, start + size), b))
+            groups[key].append((Range(start, start + size), ExpandedBuffer(b, attr.expansion)))
 
         storage = self._storage._levels[GPU_LEVEL].storage
         lc2pg = self._storage._life_cycle_grouping
@@ -455,27 +498,13 @@ class KVCacheManager:
         if self._num_closed_kv_caches - self._last_update_num_closed_requests < 100:
             return
         self._last_update_num_closed_requests = self._num_closed_kv_caches
-        tokens_per_blocks = self.tokens_per_block
-        life_cycles = self._life_cycles.get()
-        num_pool_groups = self._storage.num_pool_groups
+        tokens_per_block = self.tokens_per_block
         storage = self._storage
-        lc2pg = storage._life_cycle_grouping
 
         def ratio_from_length(
             history_length: int, capacity: int
         ) -> TypedIndexList[PoolGroupIndex, float]:
-            num_blocks = div_up(capacity, tokens_per_blocks)
-            num_bytes = filled_list(0.0, num_pool_groups)
-            for lc_idx, lc in typed_enumerate(life_cycles):
-                stale_beg, stale_end = _KVCache._get_stale_range(
-                    tokens_per_blocks, history_length, lc
-                )
-                pg_idx = lc2pg[lc_idx]
-                slot_size = storage.slot_size(pg_idx)
-                num_bytes[pg_idx] += (num_blocks - (stale_end - stale_beg)) * sum(slot_size)
-            total = sum(num_bytes)
-            assert total > 0
-            return typed_map(num_bytes, lambda x: x / total)
+            return storage.ratio_from_length(tokens_per_block, history_length, capacity)
 
         avg_reused_length: int = round(self._avg_reused_length.value)
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)

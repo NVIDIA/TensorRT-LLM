@@ -16,6 +16,7 @@ from transformers import AutoConfig
 
 from tensorrt_llm import AsyncLLM
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
 
 @ray.remote
@@ -53,7 +54,7 @@ class TRTLLMInstance:
             max_num_tokens=self.async_llm_kwargs["max_num_tokens"],
             tensor_parallel_size=self.async_llm_kwargs["tensor_parallel_size"],
             trust_remote_code=self.async_llm_kwargs["trust_remote_code"],
-            enable_sleep=True,
+            sleep_config=self.async_llm_kwargs["sleep_config"],
             sampler_type=self.async_llm_kwargs["sampler_type"],
             placement_groups=self.async_llm_kwargs["placement_groups"],
             placement_bundle_indices=self.async_llm_kwargs["placement_bundle_indices"],
@@ -190,7 +191,13 @@ async def setup_rl_llm(args):
                         "max_num_tokens": args.max_num_tokens,
                         "tensor_parallel_size": args.tp_size,
                         "trust_remote_code": args.trust_remote_code,
-                        "enable_sleep": True,
+                        "sleep_config": SleepConfig(
+                            restore_modes={
+                                # For RL use case we can discard weights
+                                ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "NONE",
+                                ExecutorMemoryType.KV_CACHE: "NONE",
+                            }
+                        ),
                         "sampler_type": args.sampler_type,
                         "placement_groups": placement_group_list[i],
                         "placement_bundle_indices": placement_bundle_indices_list[i],

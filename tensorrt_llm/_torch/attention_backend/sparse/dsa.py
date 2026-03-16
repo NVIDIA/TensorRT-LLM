@@ -11,14 +11,15 @@ from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
+from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
-from tensorrt_llm._utils import get_size_in_bytes, get_sm_version
+from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -29,7 +30,6 @@ from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.utils import fp8_utils
 
 from .kernel import triton_convert_req_index_to_global_index
 
@@ -339,7 +339,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_indexer_k_cache_block_offsets = torch.zeros_like(
             self.indexer_k_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
         if not self.enable_context_mla_with_cached_kv:
@@ -353,7 +353,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_ctx_cached_token_indptr = torch.zeros_like(
                 self.ctx_cached_token_indptr,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
             self.ctx_kv_indptr = self.get_empty(
                 self.cuda_graph_buffers,
@@ -365,7 +365,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_ctx_kv_indptr = torch.zeros_like(
                 self.ctx_kv_indptr,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
 
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
@@ -385,7 +385,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_gen_cached_token_indptr = torch.zeros_like(
             self.gen_cached_token_indptr,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.gen_kv_indptr = self.get_empty(
             self.cuda_graph_buffers,
@@ -397,7 +397,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_gen_kv_indptr = torch.zeros_like(
             self.gen_kv_indptr,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
@@ -411,7 +411,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_slot_mapping_fp8 = torch.zeros_like(
             self.slot_mapping_fp8,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.slot_mapping_scale = self.get_empty(
             self.cuda_graph_buffers,
@@ -423,7 +423,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_slot_mapping_scale = torch.zeros_like(
             self.slot_mapping_scale,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         # Per-token request index buffer for topk_indices conversion
         self.req_idx_per_token = self.get_empty(
@@ -474,7 +474,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_topk_indices_buffer = torch.zeros_like(
                 self.topk_indices_buffer,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
@@ -491,7 +491,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.kv_lens_expanded_host = torch.zeros_like(
             self.kv_lens_expanded_cuda,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.block_table_expanded = self.get_empty(
             self.cuda_graph_buffers,
@@ -506,7 +506,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_block_table_expanded = torch.zeros_like(
             self.block_table_expanded,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.scheduler_metadata_buffer_expanded = self.get_empty(
             self.cuda_graph_buffers,
@@ -621,7 +621,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int,
             device='cpu',
         )
-        kv_lens = cached_token_lens + self.seq_lens_kv
+        if self.enable_helix:
+            # For Helix CP, inactive ranks only attend to previously cached
+            # tokens (no new token appended), while active ranks add new tokens.
+            # This mirrors the kv_lens logic in TrtllmAttentionMetadata.prepare().
+            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+            kv_lens = cached_token_lens.clone()
+            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+        else:
+            kv_lens = cached_token_lens + self.seq_lens_kv
 
         # Prepare to support skip indexer
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
@@ -1022,14 +1030,15 @@ class Indexer(nn.Module):
         - Prepares schedule_metadata for fp8_paged_mqa_logits
         - Stores generation request IDs for decode phase
         """
+        kv_cache_manager = metadata.kv_cache_manager
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
-        head_dim = metadata.kv_cache_manager.index_head_dim
-        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
-        quant_block_size = metadata.kv_cache_manager.quant_block_size
+        head_dim = kv_cache_manager.index_head_dim
+        tokens_per_block = kv_cache_manager.tokens_per_block
+        quant_block_size = kv_cache_manager.quant_block_size
         cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         total_tokens = seq_lens.sum().item()
 
@@ -1171,12 +1180,10 @@ class Indexer(nn.Module):
             total_kv_per_request = seq_lens[:
                                             num_contexts] + start_positions[:
                                                                             num_contexts]
-            host_slot_mapping_fp8_fullkv = torch.empty(total_kv_len,
-                                                       dtype=torch.int64,
-                                                       pin_memory=True)
-            host_slot_mapping_scale_fullkv = torch.empty(total_kv_len,
-                                                         dtype=torch.int64,
-                                                         pin_memory=True)
+            host_slot_mapping_fp8_fullkv = torch.empty(
+                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
+            host_slot_mapping_scale_fullkv = torch.empty(
+                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
 
             req_indices = torch.repeat_interleave(
                 torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
@@ -1354,40 +1361,77 @@ class Indexer(nn.Module):
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
+
+                # Default to 8192 if sparse_attention_config is not available (e.g., in unit tests)
+                q_split_threshold = metadata.sparse_attention_config.q_split_threshold if metadata.sparse_attention_config is not None else 8192
+                q_split_eligible = q_split_threshold >= 0 and metadata.mapping is not None and not metadata.mapping.enable_attention_dp and metadata.mapping.tp_size > 1
+
+                if q_split_eligible:
+                    tp_rank = metadata.mapping.tp_rank
+                    tp_size = metadata.mapping.tp_size
+
                 for chunk in metadata.indexer_prefill_chunks:
                     # Gather K from cache for this chunk (dual to _update_k_cache)
                     chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(
                         metadata, chunk)
+
+                    chunk_num_token = chunk.token_end - chunk.token_start
+                    apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
+                    if apply_q_split:
+                        chunk_q_start = chunk_num_token * tp_rank // tp_size
+                        chunk_q_end = chunk_num_token * (tp_rank + 1) // tp_size
+                    else:
+                        chunk_q_start = 0
+                        chunk_q_end = chunk_num_token
+
+                    global_q_start = chunk.token_start + chunk_q_start
+                    global_q_end = chunk.token_start + chunk_q_end
+
                     logits = fp8_mqa_logits(
-                        q_fp8[chunk.token_start:chunk.token_end, ...],
+                        q_fp8[global_q_start:global_q_end, ...],
                         (chunk_k_fp8, chunk_k_scale),
-                        weights[chunk.token_start:chunk.token_end, ...],
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        weights[global_q_start:global_q_end, ...],
+                        chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
+                        chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
                     )
                     if use_custom_topk:
                         torch.ops.trtllm.indexer_topk_prefill(
-                            logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke,
-                            topk_indices_buffer[
-                                chunk.token_start:chunk.token_end, :])
+                            logits,
+                            chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
+                            chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
+                            topk_indices_buffer[global_q_start:global_q_end, :])
                     else:
                         topk_indices = logits.topk(min(self.index_topk,
                                                        logits.shape[-1]),
                                                    dim=-1)[1]
-                        topk_indices -= chunk.cu_seqlen_ks[:, None]
+                        topk_indices -= chunk.cu_seqlen_ks[
+                            chunk_q_start:chunk_q_end][:, None]
 
                         mask_lo = topk_indices >= 0
-                        mask_hi = topk_indices - (chunk.cu_seqlen_ke -
-                                                  chunk.cu_seqlen_ks)[:,
-                                                                      None] < 0
+                        mask_hi = topk_indices - (
+                            chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end] -
+                            chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end]
+                        )[:, None] < 0
                         mask = mask_lo & mask_hi
 
                         # local indices per sequence
                         topk_indices = topk_indices.masked_fill(~mask, -1)
 
                         topk_indices_buffer[
-                            chunk.token_start:chunk.token_end, :topk_indices.
+                            global_q_start:global_q_end, :topk_indices.
                             shape[-1]] = topk_indices.to(dtype=torch.int32)
+
+                    if apply_q_split:
+                        q_sizes = [(r + 1) * chunk_num_token // tp_size -
+                                   r * chunk_num_token // tp_size
+                                   for r in range(tp_size)]
+                        topk_indices_buffer[
+                            chunk.token_start:chunk.token_end, :] = allgather(
+                                topk_indices_buffer[
+                                    global_q_start:global_q_end, :],
+                                metadata.mapping,
+                                dim=0,
+                                sizes=q_sizes)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
@@ -1540,13 +1584,10 @@ class Indexer(nn.Module):
         return q_pe, q_nope, k_pe, k_nope
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
-        """Concatenate, rotate, and FP8 quantize for Q or K"""
-        q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
-        q_or_k = rotate_activation(q_or_k)
-        q_or_k = q_or_k.view(-1, self.head_dim)
-        q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
-            q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
-        return q_or_k
+        """Concatenate and FP8 quantize for Q or K via fused kernel."""
+        fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
+            qk_pe, qk_nope, self.scale_fmt == "ue8m0")
+        return fp8_out, scale
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,

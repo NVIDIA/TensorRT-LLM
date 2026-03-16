@@ -27,7 +27,8 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
 
 from .. import profiler
-from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
+from .._utils import (maybe_pin_memory, mpi_rank, prefer_pinned,
+                      str_dtype_to_torch, str_dtype_to_trt,
                       supports_inflight_batching, torch_dtype_to_trt,
                       trt_dtype_to_torch)
 from ..functional import RopeEmbeddingUtils, RotaryScalingType
@@ -1649,9 +1650,11 @@ class MultimodalModelRunner:
             # CUDA Stream Overlapping Requirements:
             # 1. Both memory copy stream and kernel execution stream must be non-default streams
             # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
+            # NOTE: pinning is skipped under Confidential Compute
+            # (see maybe_pin_memory() and prefer_pinned())
             pinned_embeds = torch.empty_like(image_embeds,
                                              device='cpu',
-                                             pin_memory=True)
+                                             pin_memory=prefer_pinned())
             pinned_embeds.copy_(image_embeds, non_blocking=True)
             image_embeds = pinned_embeds
 
@@ -2140,7 +2143,9 @@ class MultimodalModelRunner:
                     # CUDA Stream Overlapping Requirements:
                     # 1. Both memory copy stream and kernel execution stream must be non-default streams
                     # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
-                    prompt_table = prompt_table.pin_memory().to(
+                    # NOTE: pinning is skipped under Confidential Compute
+                    # (see maybe_pin_memory() and prefer_pinned())
+                    prompt_table = maybe_pin_memory(prompt_table).to(
                         dtype=self.model.dtype)
                 else:
                     prompt_table = prompt_table.cuda().to(

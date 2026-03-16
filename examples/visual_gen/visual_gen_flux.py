@@ -38,12 +38,9 @@ import json
 import os
 import time
 
-from output_handler import OutputHandler
+from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
+from tensorrt_llm.serve.media_storage import MediaStorage
 
-from tensorrt_llm import logger
-from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
-
-# Set logger level to ensure timing logs are printed
 logger.set_level("info")
 
 
@@ -110,15 +107,21 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # TeaCache Arguments
+    # TeaCache
     parser.add_argument(
         "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
     )
     parser.add_argument(
         "--teacache_thresh",
         type=float,
-        default=0.2,
-        help="TeaCache similarity threshold (rel_l1_thresh)",
+        default=None,
+        help="TeaCache similarity threshold (default: 0.6 for FLUX.1, 0.2 for FLUX.2)",
+    )
+    parser.add_argument(
+        "--use_ret_steps",
+        action="store_true",
+        help="Use ret_steps mode for TeaCache. "
+        "Using Retention Steps will result in faster generation speed and better generation quality.",
     )
 
     # Quantization
@@ -138,39 +141,13 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM"],
-        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
-        "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
-    )
-
-    # torch.compile
-    parser.add_argument(
-        "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
-    )
-    parser.add_argument(
-        "--torch_compile_mode",
-        type=str,
-        default="default",
-        help="Torch compile mode",
-        choices=["default", "max-autotune", "reduce-overhead"],
-    )
-
-    # Warmup
-    parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=1,
-        help="Number of warmup steps (0 to disable)",
+        choices=["VANILLA", "TRTLLM", "FA4"],
+        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
+        "FA4: Flash Attention 4). "
+        "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
 
     # Parallelism
-    parser.add_argument(
-        "--cfg_size",
-        type=int,
-        default=1,
-        choices=[1, 2],
-        help="CFG parallel size (1 or 2). Set to 2 for CFG Parallelism.",
-    )
     parser.add_argument(
         "--ulysses_size",
         type=int,
@@ -178,9 +155,31 @@ def parse_args():
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
 
+    # CUDA graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
+    # torch.compile
+    parser.add_argument(
+        "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
+    )
+    parser.add_argument(
+        "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
+    )
+
+    # Autotune
+    parser.add_argument(
+        "--disable_autotune", action="store_true", help="Disable autotuning during warmup"
+    )
+
+    # Debug / profiling
+    parser.add_argument(
+        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise NVTX markers"
+    )
+
     args = parser.parse_args()
 
-    # Validate: either --prompt or --prompts_file is required
     if args.prompt is None and args.prompts_file is None:
         parser.error("Either --prompt or --prompts_file is required")
     if args.prompt is not None and args.prompts_file is not None:
@@ -200,70 +199,64 @@ def load_prompts(prompts_file, num_prompts=None):
     return prompts
 
 
-def build_diffusion_config(args):
-    """Build diffusion_config dict from parsed args."""
-    # Convert linear_type to quant_config
-    quant_config = None
-    if args.linear_type == "trtllm-fp8-per-tensor":
-        quant_config = {"quant_algo": "FP8", "dynamic": True}
-    elif args.linear_type == "trtllm-fp8-blockwise":
-        quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
-    elif args.linear_type == "trtllm-nvfp4":
-        quant_config = {"quant_algo": "NVFP4", "dynamic": True}
+def _linear_type_to_quant_config(linear_type: str):
+    """Map --linear_type CLI shortcut to quant_config dict for VisualGenArgs."""
+    mapping = {
+        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
+        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
+    }
+    return mapping.get(linear_type)
 
-    # Note: pipeline type (FLUX.1 vs FLUX.2) is auto-detected from model_index.json
-    diffusion_config = {
-        "revision": args.revision,
-        "attention": {
-            "backend": args.attention_backend,
-        },
-        "teacache": {
+
+def build_diffusion_args(args) -> VisualGenArgs:
+    """Build VisualGenArgs from parsed CLI args."""
+    kwargs = dict(
+        revision=args.revision,
+        attention={"backend": args.attention_backend},
+        teacache={
             "enable_teacache": args.enable_teacache,
-            "teacache_thresh": args.teacache_thresh,
+            **(
+                {"teacache_thresh": args.teacache_thresh}
+                if args.teacache_thresh is not None
+                else {}
+            ),
+            "use_ret_steps": args.use_ret_steps,
         },
-        "parallel": {
-            "dit_cfg_size": args.cfg_size,
+        parallel={
             "dit_ulysses_size": args.ulysses_size,
         },
-        "pipeline": {
+        torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
-            "torch_compile_mode": args.torch_compile_mode,
-            "warmup_steps": args.warmup_steps,
+            "enable_fullgraph": args.enable_fullgraph,
+            "enable_autotune": not args.disable_autotune,
         },
-    }
-
+        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
+        pipeline={"enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker},
+    )
+    quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
-        diffusion_config["quant_config"] = quant_config
-
-    return diffusion_config
+        kwargs["quant_config"] = quant_config
+    return VisualGenArgs(**kwargs)
 
 
 def main():
     args = parse_args()
 
-    # world_size = cfg_size * ulysses_size
-    n_workers = args.cfg_size * args.ulysses_size
+    diffusion_args = build_diffusion_args(args)
 
-    diffusion_config = build_diffusion_config(args)
-
-    # Initialize VisualGen
-    logger.info(
-        f"Initializing VisualGen: world_size={n_workers} "
-        f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
-    )
+    logger.info(f"Initializing VisualGen: ulysses_size={diffusion_args.parallel.dit_ulysses_size}")
     visual_gen = VisualGen(
         model_path=args.model_path,
-        n_workers=n_workers,
-        diffusion_config=diffusion_config,
+        diffusion_args=diffusion_args,
     )
 
     try:
         if args.prompts_file:
-            # Batch mode
             prompts = load_prompts(args.prompts_file, args.num_prompts)
             os.makedirs(args.output_dir, exist_ok=True)
 
-            logger.info(f"Batch mode: {len(prompts)} prompts → {args.output_dir}")
+            logger.info(f"Batch mode: {len(prompts)} prompts -> {args.output_dir}")
             logger.info(f"Resolution: {args.height}x{args.width}, Steps: {args.steps}")
 
             timing_records = []
@@ -286,7 +279,7 @@ def main():
 
                 elapsed = time.time() - start_time
                 output_path = os.path.join(args.output_dir, f"{i:02d}.png")
-                OutputHandler.save(output, output_path)
+                MediaStorage.save_image(output.image, output_path)
                 logger.info(f"  Saved {output_path} ({elapsed:.1f}s)")
 
                 timing_records.append(
@@ -301,7 +294,6 @@ def main():
             total_elapsed = time.time() - total_start
             times = [r["time"] for r in timing_records]
 
-            # Write timing metadata
             timing_data = {
                 "images": timing_records,
                 "total_time": round(total_elapsed, 2),
@@ -327,7 +319,6 @@ def main():
             logger.info(f"Timing saved to {timing_path}")
 
         else:
-            # Single image mode
             logger.info(f"Generating image for prompt: '{args.prompt}'")
             logger.info(f"Resolution: {args.height}x{args.width}, Steps: {args.steps}")
 
@@ -344,10 +335,9 @@ def main():
                 ),
             )
 
-            end_time = time.time()
-            logger.info(f"Generation completed in {end_time - start_time:.2f}s")
+            logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-            OutputHandler.save(output, args.output_path)
+            MediaStorage.save_image(output.image, args.output_path)
 
     finally:
         visual_gen.shutdown()

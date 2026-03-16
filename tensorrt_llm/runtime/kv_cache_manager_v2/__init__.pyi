@@ -88,6 +88,7 @@ class DiskCacheTierConfig:
 class BufferConfig:
     role: DataRole
     size: int
+    tokens_per_block_override: int | None = None
 
 @dataclass(slots=True)
 class HelixConfig:
@@ -106,11 +107,18 @@ class AttentionLayerConfig:
     def window_size(self) -> int | None: ...
 
 @dataclass(slots=True)
+class SsmLayerConfig:
+    layer_id: LayerId
+    buffers: list[BufferConfig]
+
+LayerConfig = AttentionLayerConfig | SsmLayerConfig
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     vocab_size: int
     cache_tiers: list[CacheTierConfig]
-    layers: list[AttentionLayerConfig]
+    layers: list[LayerConfig]
     max_util_for_resume: float = ...
     helix_config: HelixConfig | None = None
 
@@ -163,6 +171,9 @@ class _KVCache:
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
+    def get_ssm_block_base_index(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> int: ...
     def get_aggregated_page_indices(
         self,
         layer_group_id: LayerGroupId,
@@ -210,6 +221,11 @@ class BufferId(NamedTuple):
     role: DataRole
 
 @dataclass(slots=True, frozen=True)
+class ExpandedBuffer:
+    id: BufferId
+    expansion: int  # expansion factor of page due to heterogeneous tokens_per_block
+
+@dataclass(slots=True, frozen=True)
 class AggregatedPageDesc:
     """The data you need would be in the following byte ranges.
 
@@ -220,9 +236,16 @@ class AggregatedPageDesc:
     size: int
     stride: int
     layer_group_id: LayerGroupId
-    buffers: Sequence[BufferId]
+    buffers: Sequence[ExpandedBuffer]
 
 # From _core/_kv_cache_manager.py
+@dataclass(slots=True, frozen=True)
+class PageIndexConverter:
+    scale: int
+    expansion: int
+
+    def __call__(self, base_index: int) -> Iterator[int]: ...
+
 class KVCacheManager:
     def __init__(self, config: KVCacheManagerConfig) -> None: ...
     def __del__(self) -> None: ...
@@ -232,6 +255,9 @@ class KVCacheManager:
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def get_page_index_converter(
+        self, layer_id: LayerId, data_role: DataRole
+    ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,

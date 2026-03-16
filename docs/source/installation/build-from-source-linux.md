@@ -9,7 +9,7 @@ This document provides instructions for building TensorRT LLM from source code o
 
 Use [Docker](https://www.docker.com) to build and run TensorRT LLM. Instructions to install an environment to run Docker containers for the NVIDIA platform can be found [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
 
-If you intend to build any TensortRT-LLM artifacts, such as any of the container images (note that there exist pre-built [develop](#build-from-source-tip-develop-container) and [release](#build-from-source-tip-release-container) container images in NGC), or the TensorRT LLM Python wheel, you first need to clone the TensorRT LLM repository:
+If you intend to build any TensorRT-LLM artifacts, such as any of the container images (note that there exist pre-built [develop](#build-from-source-tip-develop-container) and [release](#build-from-source-tip-release-container) container images in NGC), or the TensorRT LLM Python wheel, you first need to clone the TensorRT LLM repository:
 
 ```bash
 # TensorRT LLM uses git-lfs, which needs to be installed in advance.
@@ -104,7 +104,7 @@ If you wish to use enroot instead of docker, then you can build a sqsh file that
     make -C enroot build_sqsh SQSH_PATH=/path/to/dev_trtllm_image.sqsh
     ```
 
-3. Once this squash file is ready, you can follow the steps under [Build TensorRT LLM](#build-tensorrt-llm)by launching an enroot sandbox from `dev_trtllm_image.sqsh`. To do this, proceed as follows:
+3. Once this squash file is ready, you can follow the steps under [Build TensorRT LLM](#build-tensorrt-llm) by launching an enroot sandbox from `dev_trtllm_image.sqsh`. To do this, proceed as follows:
     ```bash
     export SQSH_PATH=/path/to/dev_trtllm_image.sqsh
 

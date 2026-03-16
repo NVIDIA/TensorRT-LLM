@@ -22,10 +22,13 @@ from tensorrt_llm.logger import logger
 from .transformer_flux import FluxTransformer2DModel
 
 # TeaCache coefficients for FLUX.1 variants
+# Source: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4FLUX/teacache_flux.py
+# Official default threshold: 0.6 (~2x speedup), range: 0.25 (~1.5x) to 0.8 (~2.25x)
 FLUX_TEACACHE_COEFFICIENTS = {
     "dev": {
-        "ret_steps": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
-        "standard": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
+        "ret_steps": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "standard": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "default_thresh": 0.6,
     },
     "schnell": {
         "ret_steps": [1.0, 0.0],  # Schnell is already fast, minimal caching
@@ -41,33 +44,49 @@ class FluxPipeline(BasePipeline):
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
 
+    def __init__(self, model_config):
+        if model_config.parallel.dit_cfg_size != 1:
+            raise ValueError(
+                "FluxPipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+            )
+
+        super().__init__(model_config)
+
     @staticmethod
-    def _compute_flux_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX transformer.
+    def _compute_flux_timestep_embedding(
+        module,
+        hidden_states=None,
+        timestep=None,
+        guidance=None,
+        pooled_projections=None,
+        **kwargs,
+    ):
+        """Compute modulated input for FLUX.1 TeaCache (matches original paper).
 
-        FLUX combines timestep and guidance embeddings.
-
-        Args:
-            module: FluxTransformer2DModel instance
-            timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional)
-
-        Returns:
-            Combined timestep embedding for TeaCache distance calculation
+        Computes norm1(x_embedder(hidden_states), emb=temb) from the first
+        transformer block, which captures both temporal (timestep) and content
+        (hidden_states) changes for cache distance calculation.
         """
-        # Cast to embedder's dtype (avoid int8 quantized layers)
-        te_dtype = next(iter(module.time_text_embed.parameters())).dtype
-        if timestep.dtype != te_dtype and te_dtype != torch.int8:
-            timestep = timestep.to(te_dtype)
 
-        temb = module.time_text_embed(timestep)
+        # Embed hidden states through x_embedder (same as forward() line 790)
+        x = module.x_embedder(hidden_states.contiguous())
 
-        if module.guidance_embeds and guidance is not None:
-            if guidance.dtype != te_dtype and te_dtype != torch.int8:
-                guidance = guidance.to(te_dtype)
-            temb = temb + module.guidance_embed(guidance)
+        # Scale timestep/guidance (FLUX convention: multiply by 1000)
+        timestep = timestep.to(x.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(x.dtype) * 1000
 
-        return temb
+        # Compute full temb (timestep + guidance + pooled_projection)
+        if module.config.guidance_embeds and guidance is not None:
+            temb = module.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = module.time_text_embed(timestep, pooled_projections)
+
+        # Apply AdaLayerNorm from first transformer block:
+        # norm1(x, emb=temb) -> (modulated_x, gate, shift_mlp, scale_mlp, gate_mlp)
+        modulated_input = module.transformer_blocks[0].norm1(x, emb=temb)[0]
+
+        return modulated_input
 
     @property
     def dtype(self):
@@ -80,29 +99,29 @@ class FluxPipeline(BasePipeline):
         return torch.device("cuda:0")
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes (height, width, num_frames)."""
-        return [(1024, 1024, 1)]
+    def default_warmup_resolutions(self):
+        return [(1024, 1024)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [1]
 
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
         logger.info("Creating FLUX transformer with quantization support...")
         self.transformer = FluxTransformer2DModel(model_config=self.model_config)
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init."""
-        for height, width, _ in self.common_warmup_shapes:
-            logger.info(f"Warmup: FLUX.1 {height}x{width}, {warmup_steps} steps")
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    height=height,
-                    width=width,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=3.5,
-                    seed=0,
-                    max_sequence_length=512,
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=3.5,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def load_standard_components(
         self,
@@ -201,8 +220,8 @@ class FluxPipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=FLUX_TEACACHE_COEFFICIENTS)
+            # Enable TeaCache with FLUX.1-specific polynomial coefficients
+            self._setup_teacache(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

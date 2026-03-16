@@ -44,11 +44,11 @@ from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
 
-# TeaCache coefficients for FLUX.2
+# TeaCache coefficients for FLUX.2 (different from FLUX.1)
 FLUX2_TEACACHE_COEFFICIENTS = {
     "dev": {
-        "ret_steps": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
-        "standard": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
+        "ret_steps": [1.04582360e02, -6.87605554e00, -8.61659379e-02, 5.37600252e-02],
+        "standard": [1.04582360e02, -6.87605554e00, -8.61659379e-02, 5.37600252e-02],
     },
 }
 
@@ -113,28 +113,48 @@ class Flux2Pipeline(BasePipeline):
     # Default for backward compatibility (FLUX.2-dev)
     HIDDEN_STATE_LAYERS: Tuple[int, ...] = (10, 20, 30)
 
+    def __init__(self, model_config):
+        if model_config.parallel.dit_cfg_size != 1:
+            raise ValueError(
+                "Flux2Pipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+            )
+
+        super().__init__(model_config)
+
     @staticmethod
-    def _compute_flux2_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX.2 transformer.
+    def _compute_flux2_timestep_embedding(
+        module,
+        hidden_states=None,
+        timestep=None,
+        guidance=None,
+        **kwargs,
+    ):
+        """Compute modulated input for FLUX.2 TeaCache (matches original paper).
 
-        Always uses time_guidance_embed (handles both guided and unguided variants).
-
-        Args:
-            module: Flux2Transformer2DModel instance
-            timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional, None for klein)
-
-        Returns:
-            Timestep embedding for TeaCache distance calculation
+        Computes norm1(x_embedder(hidden_states)) * (1 + scale) + shift using
+        the first transformer block's modulation, which captures both temporal
+        (timestep) and content (hidden_states) changes.
         """
-        embed = module.time_guidance_embed
-        te_dtype = next(embed.timestep_embedder.linear_1.parameters()).dtype
-        if te_dtype != torch.int8:
-            t = timestep.to(te_dtype)
-            g = guidance.to(te_dtype) if guidance is not None else None
-        else:
-            t, g = timestep, guidance
-        return embed(t, g)
+
+        # Embed hidden states through x_embedder (same as forward() line 698)
+        x = module.x_embedder(hidden_states.contiguous())
+
+        # Scale timestep/guidance (FLUX convention: multiply by 1000)
+        timestep = timestep.to(x.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(x.dtype) * 1000
+
+        # Compute temb (timestep + optional guidance)
+        temb = module.time_guidance_embed(timestep, guidance)
+
+        # Compute modulation from first block: ((shift1, scale1, gate1), ...)
+        img_mod = module.double_stream_modulation_img(temb)
+        shift1, scale1, _gate1 = img_mod[0]
+
+        # Apply modulation: norm1(x) * (1 + scale) + shift (same as block line 293-294)
+        modulated_input = module.transformer_blocks[0].norm1(x) * (1 + scale1) + shift1
+
+        return modulated_input
 
     @property
     def dtype(self):
@@ -147,29 +167,29 @@ class Flux2Pipeline(BasePipeline):
         return torch.device("cuda:0")
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes (height, width, num_frames)."""
-        return [(1024, 1024, 1)]
+    def default_warmup_resolutions(self):
+        return [(1024, 1024)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [1]
 
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
         logger.info("Creating FLUX.2 transformer with quantization support...")
         self.transformer = Flux2Transformer2DModel(model_config=self.model_config)
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init."""
-        for height, width, _ in self.common_warmup_shapes:
-            logger.info(f"Warmup: FLUX.2 {height}x{width}, {warmup_steps} steps")
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    height=height,
-                    width=width,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=3.5,
-                    seed=0,
-                    max_sequence_length=512,
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=3.5,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def _detect_text_encoder_type(self, checkpoint_dir: str) -> str:
         """Detect text encoder class from model_index.json."""
@@ -293,8 +313,8 @@ class Flux2Pipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.2-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=FLUX2_TEACACHE_COEFFICIENTS)
+            # Enable TeaCache with FLUX.2-specific polynomial coefficients
+            self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

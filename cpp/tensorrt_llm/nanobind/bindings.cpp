@@ -44,6 +44,7 @@
 #include "tensorrt_llm/nanobind/executor/bindings.h"
 #include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
+#include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
@@ -216,7 +217,10 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("MOE_GATE", tr::LoraModule::ModuleType::kMOE_GATE)
         .value("MOE_ROUTER", tr::LoraModule::ModuleType::kMOE_ROUTER)
         .value("MLP_ROUTER", tr::LoraModule::ModuleType::kMLP_ROUTER)
-        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP);
+        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP)
+        .value("SHARED_EXPERT_H_TO_4H", tr::LoraModule::ModuleType::kSHARED_EXPERT_H_TO_4H)
+        .value("SHARED_EXPERT_4H_TO_H", tr::LoraModule::ModuleType::kSHARED_EXPERT_4H_TO_H)
+        .value("SHARED_EXPERT_GATE", tr::LoraModule::ModuleType::kSHARED_EXPERT_GATE);
 
     nb::class_<tr::LoraModule>(m, "LoraModule")
         .def(nb::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32>(),
@@ -232,7 +236,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_static("create_lora_modules", &tr::LoraModule::createLoraModules, nb::arg("lora_module_names"),
             nb::arg("hidden_size"), nb::arg("mlp_hidden_size"), nb::arg("num_attention_heads"),
             nb::arg("num_kv_attention_heads"), nb::arg("attention_head_size"), nb::arg("tp_size") = 1,
-            nb::arg("num_experts") = 0);
+            nb::arg("num_experts") = 0, nb::arg("shared_expert_hidden_size") = 0, nb::arg("moe_hidden_size") = 0);
 
     nb::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)
@@ -511,6 +515,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     auto mUserbuffers = mInternal.def_submodule("userbuffers", "User buffers internal bindings");
     tensorrt_llm::kernels::userbuffers::UserBufferBindings::initBindings(mUserbuffers);
+
+    auto mSuffixAutomaton = mInternal.def_submodule("suffix_automaton", "Suffix automaton internal bindings");
+    tensorrt_llm::nanobind::suffix_automaton::initBindings(mSuffixAutomaton);
 
     // NVLS allocators
     nb::class_<tr::IpcNvlsHandle>(m, "IpcNvlsHandle")

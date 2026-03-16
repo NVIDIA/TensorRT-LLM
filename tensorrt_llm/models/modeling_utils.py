@@ -159,6 +159,17 @@ class QuantConfig(StrictBaseModel):
         description="Module name patterns that are skipped in quantization.")
     mamba_ssm_cache_dtype: Optional[str] = Field(
         default=None, description="Data type for mamba SSM cache.")
+    mamba_ssm_stochastic_rounding: bool = Field(
+        default=False,
+        description=
+        "Enable stochastic rounding for Mamba SSM state updates. Requires fp16 cache."
+    )
+    mamba_ssm_philox_rounds: int = Field(
+        default=10,
+        ge=1,
+        description=
+        "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness."
+    )
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
@@ -515,7 +526,7 @@ class PretrainedConfig:
                         config["quantized_layers"][moe_name] = quant_cfg
                     else:
                         assert quant_cfg == config["quantized_layers"][
-                            moe_name], "MoE module needs to have the same quantization format for non-rounter sub-modules"
+                            moe_name], "MoE module needs to have the same quantization format for non-router sub-modules"
 
         self.quantization = LayerQuantConfig.model_validate(config)
 
@@ -817,9 +828,9 @@ class PretrainedModel(Module,
         mrope_rotary_cos_sin_size: int = None,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
-            ranges of the dimensions of when using TRT dynamic shapes.
+            ranges of the dimensions when using TRT dynamic shapes.
 
-            @return: a list contains values which can be fed into the self.forward()
+            @return: a list containing values which can be fed into the self.forward()
         '''
 
         # Prepare inputs
@@ -1545,7 +1556,7 @@ def share_embedding(model: PretrainedModel) -> PretrainedModel:
     return model
 
 
-def set_fp8_context_fhma(model: PretrainedModel) -> PretrainedModel:
+def set_fp8_context_fmha(model: PretrainedModel) -> PretrainedModel:
     for name, layer in model.named_modules():
         if isinstance(layer, Attention) and hasattr(
                 layer.dense, 'activation_scaling_factor'):
@@ -1603,7 +1614,7 @@ def optimize_model(
         model = parallelize_embedding(model)
 
     if share_embedding_table:
-        # if share_embedding_table is enabled, only one copy of the embedding table is store in converted ckpt
+        # if share_embedding_table is enabled, only one copy of the embedding table is stored in converted ckpt
         # this pass is required to make lm_head.weight and vocab_embedding.weight point to the same tensor
         # however even if share_embedding_table is not enabled, trt would still only keep one copy of the table if the weights are identical
         model = share_embedding(model)
@@ -1623,7 +1634,7 @@ def optimize_model(
     if use_lora:
         model = add_lora(model, max_lora_rank, with_dora=use_dora)
     if use_fp8_context_fmha:
-        model = set_fp8_context_fhma(model)
+        model = set_fp8_context_fmha(model)
     if fuse_fp4_quant:
         model = set_fuse_fp4_quant(model)
     if not use_lora and use_optimize_cross_qkv is True:
@@ -1639,7 +1650,7 @@ def optimize_cross_qkv(model):
     So, add a new attribute 'kv' in the cross_attention layer. This might lead to
     additional memory cost on model size, but save the memory usage on runtime.
 
-    Currently, this function only detect the ColumnLinear and FP8Linear. It does not supports
+    Currently, this function only detects ColumnLinear and FP8Linear. It does not support
     other quantization now.
     """
     for name, attn, layer in model.named_modules_with_parent():
