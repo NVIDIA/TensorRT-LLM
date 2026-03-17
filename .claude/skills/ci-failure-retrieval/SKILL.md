@@ -1,8 +1,13 @@
-# Retrieving CI Test Failures from a PR
+---
+name: ci-failure-retrieval
+description: Retrieve and diagnose CI test failures from TensorRT-LLM pull requests using the GitHub API and Jenkins testReport API. Use when the user asks about CI failures on a PR, wants to see failed test details, or needs stdout/stderr from a CI run.
+---
 
-CI tests run on internal NVIDIA Jenkins infrastructure (`blossom-ci`). To retrieve failed test cases from a PR:
+# CI Failure Retrieval
 
-## Step 1: Get the Jenkins build number from PR comments
+**Input:** a PR number or a request to check CI failures. **Auth requirement:** requires corporate network access to resolve the Jenkins base URL. **Output:** a summary of failed tests with error details, and optionally full stdout/stderr for specific failures.
+
+## Phase 1 — Get the Jenkins Build Number
 
 The CI bot (`tensorrt-cicd`) posts comments with links to the Jenkins build. Extract the `L0_MergeRequest_PR` build number:
 ```bash
@@ -12,7 +17,7 @@ BUILD_NUM=$(gh api "repos/NVIDIA/TensorRT-LLM/issues/${PR_NUM}/comments" --jq \
   | grep -oP 'L0_MergeRequest_PR/\K\d+')
 ```
 
-## Step 2: Query the Jenkins testReport API for failures
+## Phase 2 — Query the Jenkins testReport API for Failures
 
 Resolve the Jenkins base URL dynamically from the internal shortcut (requires corporate network):
 ```bash
@@ -41,7 +46,7 @@ else:
 "
 ```
 
-## Step 3 (if needed): Get full stdout/stderr for a specific failure
+## Phase 3 — Get Full stdout/stderr for a Specific Failure
 
 The `errorStackTrace` can be incomplete when errors originate from subprocesses. In that case, fetch `stdout` and `stderr` for the specific test case to find the real error:
 ```bash
@@ -66,9 +71,16 @@ for suite in data.get('suites', []):
 "
 ```
 
-## Available fields per failed test case (from Jenkins testReport API)
+## Available Fields per Failed Test Case (Jenkins testReport API)
+
 - `className`, `name`: test identifier
 - `status`: `FAILED` or `REGRESSION`
 - `errorDetails`: error message
 - `errorStackTrace`: full stack trace (may be incomplete for subprocess errors)
 - `stdout`, `stderr`: full test output (can be large, check these when stack trace is insufficient)
+
+## Anti-Patterns
+
+- Do not guess Jenkins URLs; always resolve dynamically via the internal shortcut.
+- Do not stop at `errorStackTrace` if it mentions generic wrapper failures like `Process exited with status 1`; check `stdout` and `stderr` for the real error.
+- Do not fetch all test cases when looking for a specific failure; use the `<search_term>` filter in Phase 3.

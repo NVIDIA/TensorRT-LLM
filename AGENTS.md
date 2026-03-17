@@ -38,7 +38,7 @@ For container images, see [NGC containers](docs/source/installation/containers.m
 
 ### Reference Configs
 
-`examples/configs/database/` contains ~200 pareto-optimized serving configurations
+`examples/configs/database/` contains pareto-optimized serving configurations
 across multiple models, GPUs, ISL/OSL combinations, and concurrency levels.
 Use these as starting points for deployment and benchmarking rather than hand-tuning parameters.
 See [deployment guides](docs/source/deployment-guide/) for model-specific walkthroughs.
@@ -147,7 +147,7 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 
 ### Retrieving CI Test Failures from a PR
 
-See [CI failure retrieval guide](.github/ci-failure-retrieval.md) for step-by-step scripts to query Jenkins test results via the API.
+See the CI failure retrieval skill (`.claude/skills/ci-failure-retrieval/SKILL.md`) for step-by-step scripts to query Jenkins test results via the API.
 
 ## Key Documentation
 
