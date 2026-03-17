@@ -331,7 +331,9 @@ class SpecTreeManager:
         total_bits = num_blocks * 32
         padded_m = self._padded_mask_buf[:bs, :num_tokens, :total_bits]
         padded_m.zero_()
-        padded_m[:, :, :num_tokens_attend].copy_(mask_matrix.to(torch.int32))
+        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
+            torch.int32)
+        padded_m[:, :, :num_tokens_attend].copy_(src)
 
         # Reshape last dim into [num_blocks, 32] for blocked packing
         blocked_matrix = padded_m.view(bs, num_tokens, num_blocks, 32)

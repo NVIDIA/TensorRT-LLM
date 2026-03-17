@@ -94,6 +94,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._last_num_accepted = None
         self._last_selected_parents = None
 
+        # Pre-allocated buffers for _relocate_kv_eagerly (avoid per-call allocations)
+        self._reloc_n_acc_draft = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
+        self._reloc_offsets = torch.zeros(max_batch_size + 1, dtype=torch.int32, device="cuda")
+        self._reloc_col_idx = torch.arange(max_draft_len, device="cuda")
+        self._reloc_valid_mask = torch.zeros(
+            max_batch_size, max_draft_len, dtype=torch.bool, device="cuda"
+        )
+        self._reloc_rewind_adj = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
+
         # Hidden state management buffers (lazily initialized in update_hidden_states)
         self._hs_write_buffer = None
         self._hs_read_map = torch.zeros(
@@ -198,7 +207,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         return output
 
     def _relocate_kv_eagerly(self, attn_metadata, batch_size):
-        """Move accepted draft tokens' KV from tree to linear positions."""
+        """Move accepted draft tokens' KV from tree to linear positions.
+
+        Uses pre-allocated buffers to avoid per-call GPU allocations
+        (required for CUDA graph compatibility).
+        """
         if self._last_num_accepted is None:
             return
         cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
@@ -211,20 +224,22 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         if num_gens <= 0:
             return
 
-        # Accepted DRAFT tokens per request (exclude root)
-        n_acc = self._last_num_accepted[:batch_size].clone()
-        n_acc_draft = (n_acc - 1).clamp(min=0)
-        n_acc_draft[:num_contexts] = 0
+        # Accepted DRAFT tokens per request (exclude root), using pre-allocated buffer
+        n_acc_draft = self._reloc_n_acc_draft[:batch_size]
+        n_acc_draft.copy_(self._last_num_accepted[:batch_size])
+        n_acc_draft.sub_(1).clamp_(min=0)
+        n_acc_draft[:num_contexts].zero_()
 
-        if n_acc_draft.sum() == 0:
-            return
+        # Build packed offsets using pre-allocated buffer
+        offsets = self._reloc_offsets[: batch_size + 1]
+        offsets[0] = 0
+        torch.cumsum(n_acc_draft, dim=0, out=offsets[1:])
 
-        offsets = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
-        offsets[1:] = torch.cumsum(n_acc_draft, dim=0)
         indices_2d = self._accepted_draft_indices_tensor[:batch_size]
         max_draft = indices_2d.shape[1]
-        col_idx = torch.arange(max_draft, device="cuda")
-        valid_mask = col_idx.unsqueeze(0) < n_acc_draft.unsqueeze(1)
+        col_idx = self._reloc_col_idx[:max_draft]
+        valid_mask = self._reloc_valid_mask[:batch_size, :max_draft]
+        torch.less(col_idx.unsqueeze(0), n_acc_draft.unsqueeze(1), out=valid_mask)
         packed = indices_2d[valid_mask]
 
         if packed.numel() == 0:
@@ -238,12 +253,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             dtype = cache_mgr.dtype
             if dtype in (DataType.HALF, DataType.BF16):
                 self._kv_byte_size = 2.0
+            elif dtype == DataType.FLOAT:
+                self._kv_byte_size = 4.0
             elif dtype in (DataType.FP8, DataType.INT8):
                 self._kv_byte_size = 1.0
             else:
-                self._kv_byte_size = 0.5
+                self._kv_byte_size = 0.5  # INT4
 
-        rewind_adj = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+        rewind_adj = self._reloc_rewind_adj[:batch_size]
+        rewind_adj.zero_()
 
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
             offsets,
