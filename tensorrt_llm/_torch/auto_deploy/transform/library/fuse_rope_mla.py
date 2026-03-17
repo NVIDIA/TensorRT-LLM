@@ -381,11 +381,6 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         buf_name = "_ad_rotary_cos_sin"
         gm.register_buffer(buf_name, rotary_cos_sin)
 
-        # Also store on the global planner for runtime access.
-        from ...custom_ops.mla.trtllm_mla import _GlobalTrtllmMLAPlanner
-
-        _GlobalTrtllmMLAPlanner.rotary_cos_sin = rotary_cos_sin
-
         replaced = 0
         for mla_node in mla_nodes:
             result = _trace_rope_node(mla_node)

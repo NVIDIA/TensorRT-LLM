@@ -14,7 +14,12 @@ Exports:
 from .flashinfer_mla import FlashInferMLAAttention, flashinfer_mla_with_cache
 from .torch_backend_mla import TorchBackendMLAAttention, torch_backend_mla_with_cache
 from .torch_mla import torch_mla
-from .trtllm_mla import TrtllmMLAAttention, trtllm_mla_fused_rope_with_cache, trtllm_mla_with_cache
+from .trtllm_mla import (
+    TrtllmMLAAttention,
+    prepare_trtllm_mla_metadata,
+    trtllm_mla_fused_rope_with_cache,
+    trtllm_mla_with_cache,
+)
 
 __all__ = [
     "TorchBackendMLAAttention",
@@ -25,4 +30,5 @@ __all__ = [
     "flashinfer_mla_with_cache",
     "trtllm_mla_with_cache",
     "trtllm_mla_fused_rope_with_cache",
+    "prepare_trtllm_mla_metadata",
 ]

@@ -50,7 +50,7 @@ Cache layout:
 """
 
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -71,6 +71,7 @@ from ..attention_interface import (
     Constant,
     KVPagedResourceHandler,
     MHACallable,
+    PrepareMetadataCallable,
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
 )
@@ -101,23 +102,23 @@ def _mla_padded_num_heads(num_heads: int, num_kv_heads: int) -> int:
 
 
 class _TrtllmMLAPlanner:
-    """Minimal planner for TRT-LLM MLA attention backend.
+    """Planner for TRT-LLM MLA attention backend.
 
-    Mirrors ``_TrtllmPlanner`` from the standard trtllm backend. Manages persistent
-    buffers for thop.attention metadata and per-layer pool pointers for CUDA graph
-    compatibility.
+    Mirrors ``_TrtllmPlanner`` from the standard trtllm backend.  Only stores data
+    that cannot be derived from ``SequenceInfo`` or tensor shapes:
 
-    Decode-specific buffers (cu_q_decode, cu_kv_decode, fmha_scheduler_counter_decode,
-    output_latent, fused_q_flat, latent_cache_buf) are pre-allocated once and reused
-    across all layers within a step, eliminating per-layer arange/zeros/cat/empty
-    kernel launches.
+    - ``workspace``: scratch for thop.attention
+    - Host metadata not in SequenceInfo: ``host_request_types``, ``host_total_kv_lens``,
+      ``host_past_kv_lengths``, ``host_context_lengths``
+    - ``block_offsets`` / ``block_ids_per_seq``: filled by the device-side
+      ``prepare_trtllm_mla_metadata`` op using a Triton kernel
+    - Per-layer pool pointers (``_per_layer_pool_ptrs``)
+    - Decode scratch buffers for MLA weight absorption / V projection
 
-    Cache write indices (decode_page_idx, decode_slot_idx) are pre-computed on the
-    host during plan() and copied to GPU, eliminating per-layer subtract/div/mod/arange
-    kernel launches in the decode hot path.  Page IDs are resolved once per step
-    and combined with the pool stride ratio into a flat write index so that
-    per-layer cache writes use a single ``index_copy_`` via ``as_strided``,
-    replacing multi-dim ``index_put`` and its internal bf16 copy overhead.
+    Two entry points:
+    - ``plan_host()``: fills pinned host tensors (runs outside CUDA graph)
+    - ``plan_device()``: computes block_offsets/block_ids_per_seq via Triton (runs
+      inside the graph as part of ``prepare_trtllm_mla_metadata``)
     """
 
     def __init__(self):
@@ -148,38 +149,11 @@ class _TrtllmMLAPlanner:
         self._decode_buf_rope_dim: int = 0
         self._decode_buf_dtype: Optional[torch.dtype] = None
         self._decode_padded_num_heads: int = 0
-
-        # Pre-computed cache write indices (host→GPU, computed in plan())
-        self.decode_page_idx: Optional[torch.Tensor] = None
-        self.decode_slot_idx: Optional[torch.Tensor] = None
-        self._decode_page_idx_host: Optional[torch.Tensor] = None
-        self._decode_slot_idx_host: Optional[torch.Tensor] = None
         self._tokens_per_block: int = 0
-
-        # Pre-resolved page IDs and flat write indices for cache writes.
-        # page_ids are resolved once per step in plan(); the flat write
-        # index (page_id * rows_per_block + slot) is computed once per step
-        # (either in plan() or lazily on first layer) so that per-layer
-        # writes use a single index_copy_ via an as_strided view.
-        self.decode_cache_page_ids: Optional[torch.Tensor] = None
-        self.decode_flat_write_idx: Optional[torch.Tensor] = None
-        self._seq_range_buf: Optional[torch.Tensor] = None
         self._cache_rows_per_block: int = 0
-        self._flat_write_idx_dirty: bool = True
-
-        # Per-layer weight cache: dict[data_ptr → (w_kn, w_v_t)].
-        # Each layer has a different kv_b_proj_weight; caching by data_ptr
-        # ensures the .contiguous() materialisation runs only once (at warmup).
-        self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
         # Pre-allocated V-projection output buffer (allocated in ensure_decode_buffers)
         self.v_proj_output: Optional[torch.Tensor] = None
-
-        # Pre-computed RoPE cos/sin table in the flat interleaved format expected
-        # by torch.ops.trtllm.mla_rope_generation:
-        #   [1, max_pos * qk_rope_head_dim * 2] float32
-        # Set by the fuse_rope_into_trtllm_mla graph transform.
-        self.rotary_cos_sin: Optional[torch.Tensor] = None
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers."""
@@ -208,22 +182,6 @@ class _TrtllmMLAPlanner:
         self.block_ids_per_seq = torch.zeros(
             max_batch, max_blocks_per_seq, dtype=torch.int32, device=device
         )
-        self.cu_q_seqlens: Optional[torch.Tensor] = None
-        self.cu_kv_seqlens: Optional[torch.Tensor] = None
-        self.fmha_scheduler_counter = torch.zeros(1, dtype=torch.int32, device=device)
-
-        self.decode_page_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
-        self.decode_slot_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
-        self._decode_page_idx_host = torch.zeros(
-            max_batch, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
-        )
-        self._decode_slot_idx_host = torch.zeros(
-            max_batch, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.decode_cache_page_ids = torch.zeros(max_batch, dtype=torch.int32, device=device)
-        self.decode_flat_write_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
-        self._seq_range_buf = torch.arange(max_batch, dtype=torch.int64, device=device)
-
         self.cu_kv_decode = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
         self._cu_kv_decode_host = torch.zeros(
             max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
@@ -286,79 +244,24 @@ class _TrtllmMLAPlanner:
             max_tokens, num_heads, v_head_dim, dtype=dtype, device=device
         )
 
-    def get_weight_matrices(
-        self,
-        kv_b_proj_weight: torch.Tensor,
-        num_heads: int,
-        qk_nope_head_dim: int,
-        v_head_dim: int,
-        kv_lora_rank: int,
-    ):
-        """Return cached contiguous w_kn and w_v_t weight slices.
-
-        Uses a per-``data_ptr`` dict so every layer's weight is materialised
-        exactly once (at warmup) instead of every step.
-        """
-        ptr = kv_b_proj_weight.data_ptr()
-        cached = self._weight_cache.get(ptr)
-        if cached is not None:
-            return cached
-        weight_reshaped = kv_b_proj_weight.view(
-            num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank
-        )
-        # w_kn: [H, qk_nope_head_dim, kv_lora_rank] — used by bmm_out
-        w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
-        # w_v_t: [H, kv_lora_rank, v_head_dim] — used by bmm_out
-        w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
-        self._weight_cache[ptr] = (w_kn, w_v_t)
-        return w_kn, w_v_t
-
-    def plan(
+    def plan_host(
         self,
         num_prefill: int,
         num_decode: int,
         max_context_length: int,
-        block_offset_multiplier: int,
         seq_len_with_cache_host: torch.Tensor,
-        cu_num_pages_host: torch.Tensor,
-        cache_loc: torch.Tensor,
         input_pos_host: torch.Tensor,
         seq_len_host: torch.Tensor,
     ) -> None:
-        """Per-forward host metadata: fills host_request_types, block_offsets, etc.
+        """Per-forward HOST metadata: pinned tensors for thop.attention.
 
-        Also pre-computes decode cache write indices (page_idx, slot_idx) on the host
-        and copies them to GPU, eliminating per-layer subtract/div/mod GPU kernels.
+        Called from ``prepare_trtllm_mla_metadata_host`` before every forward
+        (including CUDA graph replays).  Mirrors ``_TrtllmPlanner.plan_host``.
         """
         num_seq = num_prefill + num_decode
 
         self.host_request_types[:num_prefill].fill_(0)
         self.host_request_types[num_prefill:num_seq].fill_(1)
-
-        if self.host_pool_mapping.size(0) != block_offset_multiplier:
-            self.host_pool_mapping = torch.zeros(
-                block_offset_multiplier,
-                2,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-
-        block_offsets = self.block_offsets
-        total_pages = int(cu_num_pages_host[num_seq])
-        base_offsets = cache_loc[:total_pages] * block_offset_multiplier
-
-        pages_per_seq = cu_num_pages_host[1 : num_seq + 1] - cu_num_pages_host[:num_seq]
-        seq_idx = torch.repeat_interleave(torch.arange(num_seq, dtype=torch.int), pages_per_seq)
-        pg_idx = torch.cat([torch.arange(n, dtype=torch.int) for n in pages_per_seq.tolist()])
-
-        block_offsets[0, seq_idx, 0, pg_idx] = base_offsets
-        block_offsets[0, seq_idx, 1, pg_idx] = base_offsets
-
-        self.block_ids_per_seq.fill_(0)
-        self.block_ids_per_seq[seq_idx, pg_idx] = cache_loc[:total_pages]
-
-        tokens_per_block = self._tokens_per_block
 
         is_capturing = torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up()
         if is_capturing:
@@ -366,16 +269,6 @@ class _TrtllmMLAPlanner:
             self.host_total_kv_lens[1] = max_context_length * num_decode
             self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
             self.host_context_lengths[:num_seq].fill_(max_context_length)
-            if num_decode > 0 and tokens_per_block > 0:
-                positions = max_context_length - 1
-                self._decode_page_idx_host[:num_decode].fill_(positions // tokens_per_block)
-                self._decode_slot_idx_host[:num_decode].fill_(positions % tokens_per_block)
-                self.decode_page_idx[:num_decode].copy_(
-                    self._decode_page_idx_host[:num_decode], non_blocking=True
-                )
-                self.decode_slot_idx[:num_decode].copy_(
-                    self._decode_slot_idx_host[:num_decode], non_blocking=True
-                )
             if num_decode > 0:
                 cu_kv = self._cu_kv_decode_host
                 for i in range(num_decode):
@@ -388,16 +281,6 @@ class _TrtllmMLAPlanner:
             self.host_total_kv_lens[1] = seq_len_with_cache_host[num_prefill:num_seq].sum()
             self.host_past_kv_lengths[:num_seq] = input_pos_host[:num_seq]
             self.host_context_lengths[:num_seq] = seq_len_host[:num_seq]
-            if num_decode > 0 and tokens_per_block > 0:
-                positions = seq_len_with_cache_host[num_prefill:num_seq] - 1
-                self._decode_page_idx_host[:num_decode] = positions // tokens_per_block
-                self._decode_slot_idx_host[:num_decode] = positions % tokens_per_block
-                self.decode_page_idx[:num_decode].copy_(
-                    self._decode_page_idx_host[:num_decode], non_blocking=True
-                )
-                self.decode_slot_idx[:num_decode].copy_(
-                    self._decode_slot_idx_host[:num_decode], non_blocking=True
-                )
             if num_decode > 0:
                 cu_kv = self._cu_kv_decode_host
                 decode_lens = seq_len_with_cache_host[num_prefill:num_seq]
@@ -406,22 +289,37 @@ class _TrtllmMLAPlanner:
                     cu_kv[: num_decode + 1], non_blocking=True
                 )
 
-        # Pre-resolve page IDs once per step (outside the CUDA graph) so
-        # per-layer cache writes skip the 2D gather from block_ids_per_seq.
-        # When the stride ratio is known (after the first forward pass),
-        # also compute the flat write index here to avoid per-layer arithmetic.
-        self._flat_write_idx_dirty = True
-        if num_decode > 0 and tokens_per_block > 0:
-            seq_range = self._seq_range_buf[num_prefill : num_prefill + num_decode]
-            page_idx = self.decode_page_idx[:num_decode]
-            slot_idx = self.decode_slot_idx[:num_decode]
-            page_ids = self.block_ids_per_seq[seq_range, page_idx]
-            self.decode_cache_page_ids[:num_decode] = page_ids
-            if self._cache_rows_per_block > 0:
-                self.decode_flat_write_idx[:num_decode] = (
-                    page_ids.long() * self._cache_rows_per_block + slot_idx
-                )
-                self._flat_write_idx_dirty = False
+    def plan_device(
+        self,
+        num_seq: int,
+        block_offset_multiplier: int,
+        cu_num_pages: torch.Tensor,
+        cache_loc: torch.Tensor,
+    ) -> None:
+        """Per-forward DEVICE metadata: block_offsets and block_ids_per_seq via Triton.
+
+        Called from the ``prepare_trtllm_mla_metadata`` custom op (in the graph).
+        Uses ``ragged_to_block_table_triton`` to scatter ``cache_loc`` pages into
+        ``block_ids_per_seq`` on the GPU, then derives ``block_offsets``.
+        """
+        if self.host_pool_mapping.size(0) != block_offset_multiplier:
+            self.host_pool_mapping = torch.zeros(
+                block_offset_multiplier,
+                2,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+
+        self.block_ids_per_seq[:num_seq].fill_(0)
+        torch.ops.auto_deploy.ragged_to_block_table_triton(
+            cache_loc, cu_num_pages, self.block_ids_per_seq, num_seq
+        )
+
+        k_slice = self.block_offsets[0, :num_seq, 0, :]
+        k_slice.copy_(self.block_ids_per_seq[:num_seq])
+        k_slice.mul_(block_offset_multiplier)
+        self.block_offsets[0, :num_seq, 1, :] = k_slice
 
     def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view."""
@@ -447,34 +345,75 @@ def prepare_trtllm_mla_metadata_host(
     batch_info_host: torch.Tensor,
     max_seq_info_host: torch.Tensor,
     seq_len_with_cache_host: torch.Tensor,
-    cu_num_pages_host: torch.Tensor,
-    cache_loc: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_host: torch.Tensor,
 ) -> None:
-    """Fill thop-specific host metadata and compute block_offsets for MLA.
+    """Fill thop-specific HOST metadata (pinned tensors for thop.attention).
 
-    Identical signature to ``prepare_trtllm_metadata_host`` but operates on the
-    MLA-specific planner instance. Runs OUTSIDE the CUDA graph before every forward.
+    Runs OUTSIDE the CUDA graph before every forward (including replays).
+    Mirrors ``prepare_trtllm_metadata_host`` from the standard trtllm backend.
     """
     num_prefill, _, num_decode = batch_info_host.tolist()
-    max_context_length, max_blocks_per_seq, block_offset_multiplier, max_batch_size = (
-        max_seq_info_host.tolist()
-    )
+    max_context_length, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
 
-    _GlobalTrtllmMLAPlanner.reset(cache_loc.device, max_batch_size, max_blocks_per_seq)
+    _GlobalTrtllmMLAPlanner.reset(torch.device("cuda"), max_batch_size, max_blocks_per_seq)
 
-    _GlobalTrtllmMLAPlanner.plan(
+    _GlobalTrtllmMLAPlanner.plan_host(
         num_prefill=num_prefill,
         num_decode=num_decode,
         max_context_length=max_context_length,
-        block_offset_multiplier=block_offset_multiplier,
         seq_len_with_cache_host=seq_len_with_cache_host,
-        cu_num_pages_host=cu_num_pages_host,
-        cache_loc=cache_loc,
         input_pos_host=input_pos_host,
         seq_len_host=seq_len_host,
     )
+
+
+# =============================================================================
+# Device-side prepare function (inserted into the graph)
+# =============================================================================
+
+
+@torch.library.custom_op("auto_deploy::trtllm_mla_prepare_metadata", mutates_args=())
+def prepare_trtllm_mla_metadata(
+    batch_info_host: torch.Tensor,
+    max_seq_info_host: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+) -> List[torch.Tensor]:
+    """Compute block_offsets and block_ids_per_seq for MLA (device-side, part of graph).
+
+    Uses ``ragged_to_block_table_triton`` to scatter ``cache_loc`` pages into
+    ``block_ids_per_seq`` on the GPU, then derives ``block_offsets``.
+    Returns ``[block_offsets]`` which flows through the graph to each attention op.
+    """
+    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    _, _, block_offset_multiplier, _ = max_seq_info_host.tolist()
+
+    _GlobalTrtllmMLAPlanner.plan_device(
+        num_seq=num_seq,
+        block_offset_multiplier=block_offset_multiplier,
+        cu_num_pages=cu_num_pages,
+        cache_loc=cache_loc,
+    )
+
+    return [_GlobalTrtllmMLAPlanner.block_offsets]
+
+
+@prepare_trtllm_mla_metadata.register_fake
+def prepare_trtllm_mla_metadata_fake(
+    batch_info_host: torch.Tensor,
+    max_seq_info_host: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+) -> List[torch.Tensor]:
+    """Fake implementation for torch.compile tracing."""
+    _, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
+    return [
+        torch.empty(
+            1, max_batch_size, 2, max_blocks_per_seq, dtype=torch.int32, device=cache_loc.device
+        )
+    ]
 
 
 # =============================================================================
@@ -1055,41 +994,33 @@ def _write_decode_latent_to_cache(
     latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     num_decode: int,
+    num_prefill: int,
+    seq_len_with_cache: torch.Tensor,
+    tokens_per_block: int,
 ) -> None:
     """Write decode tokens' latent_cache to the paged KV cache.
 
-    Uses an ``as_strided`` 2D view of the (possibly non-contiguous) paged
-    cache with a pre-computed flat index and ``index_copy_``.  This replaces
-    the multi-dim ``index_put`` (which internally spawns an extra bf16 copy
-    kernel per call) with a single efficient scatter.
-
-    The flat index is computed once per step — either in ``plan()`` (after
-    the stride ratio is learned) or lazily on the first layer call.
+    Computes write indices from ``seq_len_with_cache`` and ``block_ids_per_seq``
+    (filled by the device-side ``prepare_trtllm_mla_metadata`` op), then uses
+    ``as_strided`` + ``index_copy_`` for an efficient single-kernel scatter.
     """
     planner = _GlobalTrtllmMLAPlanner
+    device = kv_cache.device
 
-    # Learn stride ratio from the first kv_cache encountered.
     if planner._cache_rows_per_block == 0:
         planner._cache_rows_per_block = kv_cache.stride(0) // kv_cache.stride(3)
-
-    # Compute flat write index once per step; subsequent layers reuse it.
-    if planner._flat_write_idx_dirty:
-        page_ids = planner.decode_cache_page_ids[:num_decode]
-        slot_idx = planner.decode_slot_idx[:num_decode]
-        planner.decode_flat_write_idx[:num_decode] = (
-            page_ids.long() * planner._cache_rows_per_block + slot_idx
-        )
-        planner._flat_write_idx_dirty = False
-
-    flat_idx = planner.decode_flat_write_idx[:num_decode]
-
-    # as_strided maps (block, slot) pairs to correct storage offsets even
-    # when the pool has kv_factor > 1, making the 5D tensor non-contiguous.
-    # Use a tight row count: the last block only needs tokens_per_block rows
-    # (not the full rows_per_block which includes kv_factor/kv_heads gaps),
-    # avoiding overflow past the pool's storage when there is a storage_offset.
-    D = kv_cache.shape[-1]
     rpb = planner._cache_rows_per_block
+
+    num_seq = num_prefill + num_decode
+    positions = seq_len_with_cache[num_prefill:num_seq] - 1
+    page_in_seq = positions // tokens_per_block
+    slot = positions % tokens_per_block
+
+    seq_range = torch.arange(num_decode, device=device, dtype=torch.long)
+    page_ids = planner.block_ids_per_seq[num_prefill:num_seq][seq_range, page_in_seq.long()]
+    flat_idx = page_ids.long() * rpb + slot
+
+    D = kv_cache.shape[-1]
     tpb = kv_cache.shape[3]
     num_rows = (kv_cache.shape[0] - 1) * rpb + tpb
     kv_cache_2d = torch.as_strided(
@@ -1200,9 +1131,9 @@ def _handle_decode_impl(
     padded_num_heads = planner._decode_padded_num_heads
     needs_head_padding = padded_num_heads != num_heads
 
-    w_kn, w_v_t = planner.get_weight_matrices(
-        kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
-    )
+    weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+    w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
+    w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
 
     # Build fused_q = [q_absorbed | q_pe] into pre-allocated buffer.
     # bmm_out writes q_absorbed directly into the left slice of fused_q.
@@ -1341,16 +1272,20 @@ def _mla_with_cache_impl(
     kv_b_proj_weight: torch.Tensor,
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_len_host: torch.Tensor,
-    input_pos_host: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
     max_seq_info_host: torch.Tensor,
+    kv_cache_block_offsets: torch.Tensor,
     kv_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Shared implementation for both MLA attention ops (with and without fused RoPE).
+
+    Host-side metadata (``host_past_kv_lengths``, ``host_context_lengths``, etc.)
+    is read from the planner singleton (filled by ``plan_host``).
+    ``kv_cache_block_offsets`` flows through the graph from the device-side
+    ``prepare_trtllm_mla_metadata`` op.
 
     When ``rotary_cos_sin`` is None, q_pe/kpe arrive post-RoPE and latent_cache
     is written to the paged KV cache as-is.  When provided, q_pe/kpe are pre-RoPE:
@@ -1444,8 +1379,10 @@ def _mla_with_cache_impl(
     host_context_lengths = planner.host_context_lengths[:num_seq]
     host_request_types = planner.host_request_types[:num_seq]
     host_total_kv_lens = planner.host_total_kv_lens
-    kv_cache_block_offsets = planner.block_offsets
     host_kv_cache_pool_mapping = planner.host_pool_mapping
+
+    seq_len_host = host_context_lengths
+    input_pos_host = host_past_kv_lengths
 
     # thop.attention's MLA generation runners compute the effective softmax
     # scale from q_scaling and qk_head_dim (NOT gen_head_size):
@@ -1541,7 +1478,9 @@ def _mla_with_cache_impl(
     def _do_decode(q_n, q_p, lc, n_tok, n_pf):
         """Write cache (non-fused only) and run decode attention."""
         if not fused_rope:
-            _write_decode_latent_to_cache(lc, kv_cache, n_tok)
+            _write_decode_latent_to_cache(
+                lc, kv_cache, n_tok, n_pf, seq_len_with_cache, tokens_per_block
+            )
         return _handle_decode_impl(
             q_n,
             q_p,
@@ -1628,13 +1567,16 @@ def trtllm_mla_with_cache(
     compressed_kv: torch.Tensor,
     kpe: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
+    # Standard metadata (4 args — matches trtllm attention pattern)
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_len_host: torch.Tensor,
-    input_pos_host: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
     max_seq_info_host: torch.Tensor,
+    # Extra metadata from prepare_trtllm_mla_metadata (1 arg)
+    kv_cache_block_offsets: torch.Tensor,
+    # Cache
     kv_cache: torch.Tensor,
+    # Constants
     scale: Optional[float],
     kv_lora_rank: int,
 ) -> torch.Tensor:
@@ -1647,10 +1589,9 @@ def trtllm_mla_with_cache(
         kv_b_proj_weight,
         batch_info_host,
         seq_len,
-        seq_len_host,
-        input_pos_host,
         seq_len_with_cache,
         max_seq_info_host,
+        kv_cache_block_offsets,
         kv_cache,
         scale,
         kv_lora_rank,
@@ -1666,10 +1607,9 @@ def trtllm_mla_with_cache_fake(
     kv_b_proj_weight: torch.Tensor,
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_len_host: torch.Tensor,
-    input_pos_host: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
     max_seq_info_host: torch.Tensor,
+    kv_cache_block_offsets: torch.Tensor,
     kv_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
@@ -1688,13 +1628,16 @@ def trtllm_mla_fused_rope_with_cache(
     kpe: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
     rotary_cos_sin: torch.Tensor,
+    # Standard metadata (4 args — matches trtllm attention pattern)
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_len_host: torch.Tensor,
-    input_pos_host: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
     max_seq_info_host: torch.Tensor,
+    # Extra metadata from prepare_trtllm_mla_metadata (1 arg)
+    kv_cache_block_offsets: torch.Tensor,
+    # Cache
     kv_cache: torch.Tensor,
+    # Constants
     scale: Optional[float],
     kv_lora_rank: int,
 ) -> torch.Tensor:
@@ -1707,10 +1650,9 @@ def trtllm_mla_fused_rope_with_cache(
         kv_b_proj_weight,
         batch_info_host,
         seq_len,
-        seq_len_host,
-        input_pos_host,
         seq_len_with_cache,
         max_seq_info_host,
+        kv_cache_block_offsets,
         kv_cache,
         scale,
         kv_lora_rank,
@@ -1728,10 +1670,9 @@ def trtllm_mla_fused_rope_with_cache_fake(
     rotary_cos_sin: torch.Tensor,
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_len_host: torch.Tensor,
-    input_pos_host: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
     max_seq_info_host: torch.Tensor,
+    kv_cache_block_offsets: torch.Tensor,
     kv_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
@@ -1774,11 +1715,21 @@ class TrtllmMLAAttention(AttentionDescriptor):
         return [
             "batch_info_host",
             "seq_len",
-            "seq_len_host",
-            "input_pos_host",
             "seq_len_with_cache",
             "max_seq_info_host",
         ]
+
+    @classmethod
+    def get_prepare_extra_metadata_info(
+        cls,
+        any_source_attn_node: Node,
+    ) -> Tuple[Optional[PrepareMetadataCallable], int, List[Constant]]:
+        """Register the device-side prepare op that computes block_offsets via Triton."""
+        return (
+            torch.ops.auto_deploy.trtllm_mla_prepare_metadata.default,
+            1,
+            [],
+        )
 
     @classmethod
     def get_cache_initializers(

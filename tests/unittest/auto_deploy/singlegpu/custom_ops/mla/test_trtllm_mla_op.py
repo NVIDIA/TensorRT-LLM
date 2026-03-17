@@ -230,20 +230,28 @@ def _run_trtllm_mla(inputs, meta, kv_lora_rank):
     # Reset planner so it re-initializes
     _GlobalTrtllmMLAPlanner.__init__()
 
-    # Host-side prepare (fills block_offsets, request types, etc.)
     from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import (
         prepare_trtllm_mla_metadata_host,
     )
 
+    # Host-side prepare (fills pinned host tensors for thop.attention)
     prepare_trtllm_mla_metadata_host(
         meta["batch_info_host"],
         meta["max_seq_info_host"],
         meta["seq_len_with_cache_host"],
-        meta["cu_num_pages_host"],
-        meta["cache_loc"],
         meta["input_pos_host"],
         meta["seq_len_host"],
     )
+
+    # Device-side prepare (computes block_offsets and block_ids_per_seq via Triton)
+    cu_num_pages_device = meta["cu_num_pages_host"].to(meta["cache_loc"].device)
+    block_offsets_list = torch.ops.auto_deploy.trtllm_mla_prepare_metadata(
+        meta["batch_info_host"],
+        meta["max_seq_info_host"],
+        cu_num_pages_device,
+        meta["cache_loc"],
+    )
+    kv_cache_block_offsets = block_offsets_list[0]
 
     return torch.ops.auto_deploy.trtllm_mla_with_cache(
         inputs["q_nope"],
@@ -253,10 +261,9 @@ def _run_trtllm_mla(inputs, meta, kv_lora_rank):
         inputs["kv_b_proj_weight"],
         meta["batch_info_host"],
         meta["seq_len"],
-        meta["seq_len_host"],
-        meta["input_pos_host"],
         meta["seq_len_with_cache"],
         meta["max_seq_info_host"],
+        kv_cache_block_offsets,
         meta["kv_cache"],
         None,  # scale
         kv_lora_rank,
