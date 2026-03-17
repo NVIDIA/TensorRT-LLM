@@ -41,6 +41,7 @@ def test_flashinfer_decode_matches_triton(mamba_env):
     cu_seqlen = torch.zeros(batch + 1, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
 
+    any_prefill_use_initial_states_host = torch.tensor([False], device=device, dtype=torch.bool)
     y_triton = torch.ops.auto_deploy.triton_cached_ssm(
         hidden_states,
         A,
@@ -54,6 +55,7 @@ def test_flashinfer_decode_matches_triton(mamba_env):
         cu_seqlen,
         slot_idx,
         use_initial_states,
+        any_prefill_use_initial_states_host,
         # EXTRA METADATA
         None,  # chunk indices
         None,  # chunk offsets
@@ -78,6 +80,7 @@ def test_flashinfer_decode_matches_triton(mamba_env):
         cu_seqlen,
         slot_idx,
         use_initial_states,
+        any_prefill_use_initial_states_host,
         # EXTRA METADATA
         None,  # chunk indices
         None,  # chunk offsets

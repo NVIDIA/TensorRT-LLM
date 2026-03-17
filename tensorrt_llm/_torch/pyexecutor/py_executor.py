@@ -1310,6 +1310,8 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     # The generation requests that do not have batch_idx
@@ -1533,7 +1535,7 @@ class PyExecutor:
         tag = PPCommTag.SAMPLE_STATE
         microbatch_id = executed_batch.microbatch_id
         sample_state = executed_batch.sample_state
-        requests = sample_state.scheduled_requests.all_requests()
+        requests = sample_state.requests
 
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
@@ -1568,13 +1570,9 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                scheduled_requests = executed_batch.scheduled_requests
-                sampling_requests = ScheduledRequests()
-                sampling_requests.context_requests_last_chunk = scheduled_requests.context_requests_last_chunk
-                sampling_requests.generation_requests = scheduled_requests.generation_requests
-                executed_batch.sample_state.scheduled_requests = sampling_requests
                 self._update_requests(executed_batch.sample_state)
 
+                scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -1611,6 +1609,55 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    def _handle_dynamic_draft_len(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
+        """Handle dynamic draft length for the current batch.
+
+        Must be called BEFORE prepare_resources so that KV cache allocation
+        uses the correct draft length.
+
+        Two things happen here:
+        1. Determine the runtime draft length from the draft_len_schedule
+           based on the current batch size, and store it on model_engine so
+           that the rest of the forward path can read it.
+        2. Pad / truncate each request's py_draft_tokens to exactly match
+           the determined draft length, ensuring uniform draft token counts across the
+           batch (required by CUDA graph replay and the attention kernel).
+
+        When dynamic draft length is not enabled, runtime_draft_len is simply
+        set to max_draft_len (the static maximum).
+        """
+        if not hasattr(self.model_engine, 'max_draft_len'):
+            return
+
+        if (self.model_engine.spec_config is not None
+                and self.model_engine.spec_config.draft_len_schedule is not None
+                and self.model_engine.spec_config.spec_dec_mode.
+                support_dynamic_draft_len()):
+            from tensorrt_llm._torch.speculative.utils import \
+                get_draft_len_for_batch_size
+
+            # 1. Resolve runtime draft length from schedule
+            runtime_draft_len = get_draft_len_for_batch_size(
+                self.model_engine.spec_config.draft_len_schedule,
+                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+
+            # 2. Pad or truncate draft tokens to the resolved length
+            PADDING_TOKEN = 0
+            for request in scheduled_batch.generation_requests:
+                current_draft_len = len(request.py_draft_tokens)
+                if current_draft_len < runtime_draft_len:
+                    padding_needed = runtime_draft_len - current_draft_len
+                    request.py_draft_tokens.extend([PADDING_TOKEN] *
+                                                   padding_needed)
+                elif current_draft_len > runtime_draft_len:
+                    request.py_draft_tokens = request.py_draft_tokens[:
+                                                                      runtime_draft_len]
+
+            self.model_engine.runtime_draft_len = runtime_draft_len
+        else:
+            self.model_engine.runtime_draft_len = self.model_engine.max_draft_len
 
     def _can_queue(self, scheduled_batch):
 
@@ -1789,6 +1836,9 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
@@ -2054,6 +2104,8 @@ class PyExecutor:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
 
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
@@ -2313,9 +2365,11 @@ class PyExecutor:
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
+        sampling_requests = scheduled_batch.context_requests_last_chunk + scheduled_batch.generation_requests
         return self.sampler.SampleState(
-            scheduled_requests=scheduled_batch,
+            requests=sampling_requests,
             sampler_event=SamplerEvent(cuda_event=sampler_event),
+            runtime_draft_len=self.model_engine.runtime_draft_len,
         )
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:
