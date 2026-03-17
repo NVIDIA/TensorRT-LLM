@@ -410,6 +410,24 @@ def _fused_expert_checkpoint_from_moe(moe_module: Mistral4MoE) -> dict[str, torc
     }
 
 
+def _fused_expert_scale_checkpoint_from_moe(moe_module: Mistral4MoE) -> dict[str, torch.Tensor]:
+    num_experts = len(moe_module.experts)
+    return {
+        "experts.gate_up_proj_scale_inv": torch.arange(
+            1, num_experts + 1, dtype=torch.float32
+        ).view(num_experts, 1, 1),
+        "experts.down_proj_scale_inv": torch.arange(
+            101, 101 + num_experts, dtype=torch.float32
+        ).view(num_experts, 1, 1),
+        "experts.gate_up_proj_activation_scale": torch.arange(
+            201, 201 + num_experts, dtype=torch.float32
+        ),
+        "experts.down_proj_activation_scale": torch.arange(
+            301, 301 + num_experts, dtype=torch.float32
+        ),
+    }
+
+
 def _expand_fused_moe_checkpoint(fused_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     expanded = {}
     gate_up = fused_state["experts.gate_up_proj"]
@@ -468,6 +486,106 @@ def test_moe_equivalence_and_converter():
     actual = ad_module(hidden_states)
     expected = ref_module(hidden_states)
     assert_rmse_close(actual, expected, rmse_ratio_tol=0.02, msg="MoE: ")
+
+
+def test_moe_fused_checkpoint_hook_expands_static_fp8_scales():
+    config = _small_text_config()
+    moe = Mistral4MoE(config)
+
+    state_dict = {}
+    state_dict.update(_fused_expert_checkpoint_from_moe(moe))
+    state_dict.update(_fused_expert_scale_checkpoint_from_moe(moe))
+
+    moe._load_experts_from_fused_checkpoint(state_dict, "")
+
+    for idx in range(config.n_routed_experts):
+        gate_scale = state_dict[f"experts.{idx}.gate_proj.weight_scale"]
+        up_scale = state_dict[f"experts.{idx}.up_proj.weight_scale"]
+        down_scale = state_dict[f"experts.{idx}.down_proj.weight_scale"]
+        gate_input_scale = state_dict[f"experts.{idx}.gate_proj.input_scale"]
+        up_input_scale = state_dict[f"experts.{idx}.up_proj.input_scale"]
+        down_input_scale = state_dict[f"experts.{idx}.down_proj.input_scale"]
+
+        assert gate_scale.shape == torch.Size([])
+        assert up_scale.shape == torch.Size([])
+        assert down_scale.shape == torch.Size([])
+        torch.testing.assert_close(gate_scale, torch.tensor(idx + 1, dtype=torch.float32))
+        torch.testing.assert_close(up_scale, torch.tensor(idx + 1, dtype=torch.float32))
+        torch.testing.assert_close(down_scale, torch.tensor(101 + idx, dtype=torch.float32))
+        torch.testing.assert_close(gate_input_scale, torch.tensor(201 + idx, dtype=torch.float32))
+        torch.testing.assert_close(up_input_scale, torch.tensor(201 + idx, dtype=torch.float32))
+        torch.testing.assert_close(down_input_scale, torch.tensor(301 + idx, dtype=torch.float32))
+
+    assert "experts.gate_up_proj_scale_inv" not in state_dict
+    assert "experts.down_proj_scale_inv" not in state_dict
+    assert "experts.gate_up_proj_activation_scale" not in state_dict
+    assert "experts.down_proj_activation_scale" not in state_dict
+
+
+def test_moe_fused_checkpoint_hook_uses_owned_expert_ids():
+    config = _small_text_config()
+    moe = Mistral4MoE(config)
+
+    original_state_dict = moe.state_dict
+
+    def local_only_state_dict(*args, **kwargs):
+        full = original_state_dict(*args, **kwargs)
+        keep = {}
+        for key, value in full.items():
+            if not key.startswith("experts."):
+                keep[key] = value
+                continue
+            parts = key.split(".", 3)
+            if len(parts) >= 4 and parts[1] in {"1", "3"}:
+                keep[key] = value
+        return keep
+
+    moe.state_dict = local_only_state_dict
+
+    state_dict = {}
+    state_dict.update(_fused_expert_checkpoint_from_moe(moe))
+    state_dict.update(_fused_expert_scale_checkpoint_from_moe(moe))
+
+    moe._load_experts_from_fused_checkpoint(state_dict, "")
+
+    assert "experts.1.gate_proj.weight" in state_dict
+    assert "experts.3.up_proj.weight" in state_dict
+    assert "experts.1.down_proj.weight_scale" in state_dict
+    assert "experts.3.down_proj.input_scale" in state_dict
+    assert "experts.0.gate_proj.weight" not in state_dict
+    assert "experts.2.up_proj.weight" not in state_dict
+    assert "experts.4.down_proj.weight_scale" not in state_dict
+
+
+def test_attention_kv_b_proj_load_hook_dequantizes_absorbed_fp8_weight():
+    device = _device()
+    config = _small_text_config()
+    attention = Mistral4Attention(config, layer_idx=0).to(device)
+
+    dequantized = torch.tensor(
+        [[-0.5, 0.25], [0.75, -0.125]],
+        dtype=torch.float32,
+        device=device,
+    )
+    scale = torch.tensor(0.25, dtype=torch.float32, device=device)
+    quantized = (dequantized / scale).to(torch.float8_e4m3fn)
+    state_dict = {
+        "kv_b_proj.weight": quantized,
+        "kv_b_proj.weight_scale_inv": scale,
+        "kv_b_proj.activation_scale": torch.tensor(3.0, dtype=torch.float32, device=device),
+    }
+
+    attention._load_absorbed_kv_b_proj_from_fp8_checkpoint(state_dict, "")
+
+    assert "kv_b_proj.weight_scale_inv" not in state_dict
+    assert "kv_b_proj.activation_scale" not in state_dict
+    assert state_dict["kv_b_proj.weight"].dtype == attention.kv_b_proj.weight.dtype
+    torch.testing.assert_close(
+        state_dict["kv_b_proj.weight"].float(),
+        dequantized,
+        rtol=0,
+        atol=1e-3,
+    )
 
 
 def test_decoder_layer_equivalence():

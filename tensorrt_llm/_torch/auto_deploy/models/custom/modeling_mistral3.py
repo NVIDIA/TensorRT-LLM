@@ -350,25 +350,75 @@ class Mistral4MoE(nn.Module):
         self.gate = Mistral4MoEGate(config)
         self._register_load_state_dict_pre_hook(self._load_experts_from_fused_checkpoint)
 
-    @staticmethod
-    def _load_experts_from_fused_checkpoint(state_dict, prefix, *args):
+    def _owned_expert_ids(self) -> list[int]:
+        """Derive expert ids from the params/buffers that currently exist on this module.
+
+        This stays shard-agnostic in modeling code. On an unsharded module the state dict
+        contains all experts; after AD sharding it contains only the surviving local experts.
+        """
+        expert_ids = set()
+        for key in self.state_dict().keys():
+            if not key.startswith("experts."):
+                continue
+            parts = key.split(".", 3)
+            if len(parts) < 4:
+                continue
+            try:
+                expert_ids.add(int(parts[1]))
+            except ValueError:
+                continue
+        return sorted(expert_ids)
+
+    def _load_experts_from_fused_checkpoint(self, state_dict, prefix, *args):
         gate_up_key = prefix + "experts.gate_up_proj"
         down_key = prefix + "experts.down_proj"
+        gate_up_scale_key = prefix + "experts.gate_up_proj_scale_inv"
+        down_scale_key = prefix + "experts.down_proj_scale_inv"
+        gate_up_act_scale_key = prefix + "experts.gate_up_proj_activation_scale"
+        down_act_scale_key = prefix + "experts.down_proj_activation_scale"
+        local_expert_ids = self._owned_expert_ids()
 
         if gate_up_key in state_dict:
             fused = state_dict.pop(gate_up_key)
-            num_experts = fused.shape[0]
             intermediate_dim = fused.shape[1] // 2
             gate_weights = fused[:, :intermediate_dim, :]
             up_weights = fused[:, intermediate_dim:, :]
-            for idx in range(num_experts):
+            for idx in local_expert_ids:
                 state_dict[f"{prefix}experts.{idx}.gate_proj.weight"] = gate_weights[idx]
                 state_dict[f"{prefix}experts.{idx}.up_proj.weight"] = up_weights[idx]
 
+        if gate_up_scale_key in state_dict:
+            fused_scale = state_dict.pop(gate_up_scale_key)
+            for idx in local_expert_ids:
+                # The checkpoint stores one static FP8 weight scale per fused gate/up expert.
+                # Both split projections reuse that same expert-local scale.
+                expert_scale = fused_scale[idx].reshape(())
+                state_dict[f"{prefix}experts.{idx}.gate_proj.weight_scale"] = expert_scale
+                state_dict[f"{prefix}experts.{idx}.up_proj.weight_scale"] = expert_scale
+
+        if gate_up_act_scale_key in state_dict:
+            fused_act_scale = state_dict.pop(gate_up_act_scale_key)
+            for idx in local_expert_ids:
+                # The fused gate/up checkpoint also uses one input scale per expert.
+                state_dict[f"{prefix}experts.{idx}.gate_proj.input_scale"] = fused_act_scale[idx]
+                state_dict[f"{prefix}experts.{idx}.up_proj.input_scale"] = fused_act_scale[idx]
+
         if down_key in state_dict:
             fused = state_dict.pop(down_key)
-            for idx in range(fused.shape[0]):
+            for idx in local_expert_ids:
                 state_dict[f"{prefix}experts.{idx}.down_proj.weight"] = fused[idx]
+
+        if down_scale_key in state_dict:
+            fused_scale = state_dict.pop(down_scale_key)
+            for idx in local_expert_ids:
+                state_dict[f"{prefix}experts.{idx}.down_proj.weight_scale"] = fused_scale[
+                    idx
+                ].reshape(())
+
+        if down_act_scale_key in state_dict:
+            fused_act_scale = state_dict.pop(down_act_scale_key)
+            for idx in local_expert_ids:
+                state_dict[f"{prefix}experts.{idx}.down_proj.input_scale"] = fused_act_scale[idx]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
@@ -418,6 +468,9 @@ class Mistral4Attention(nn.Module):
             bias=False,
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
+        # kv_b_proj is absorbed into torch_mla, so it bypasses the generic FP8 linear transform.
+        # Dequantize it during checkpoint load using the model-card reference conversion.
+        self._register_load_state_dict_pre_hook(self._load_absorbed_kv_b_proj_from_fp8_checkpoint)
         self.softmax_scale = self.q_head_dim ** (-0.5)
         if config.rope_scaling is not None:
             scale = config.rope_scaling.get("factor", 1.0)
@@ -448,6 +501,22 @@ class Mistral4Attention(nn.Module):
             rope_scaling.get("mscale", 1.0),
             rope_scaling.get("mscale_all_dim", 1.0),
         )
+
+    def _load_absorbed_kv_b_proj_from_fp8_checkpoint(self, state_dict, prefix, *args):
+        weight_key = prefix + "kv_b_proj.weight"
+        scale_key = prefix + "kv_b_proj.weight_scale_inv"
+        activation_scale_key = prefix + "kv_b_proj.activation_scale"
+        if weight_key not in state_dict or scale_key not in state_dict:
+            return
+
+        weight = state_dict[weight_key]
+        if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            return
+
+        target_dtype = self.kv_b_proj.weight.dtype
+        scale = state_dict.pop(scale_key).to(torch.float32)
+        state_dict[weight_key] = weight.to(torch.float32).mul(scale).to(target_dtype)
+        state_dict.pop(activation_scale_key, None)
 
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape

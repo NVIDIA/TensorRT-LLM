@@ -320,12 +320,22 @@ class FP8LinearQuantizationFromConfig(Quantization):
         return ([scales["input_scale"]], [scales["weight_scale"]], [], [])
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
-        if weight_name in state_dict:
-            weight = state_dict[weight_name]
+        prefix = prefix or ""
+        weight_key = prefix + weight_name
+        if weight_key in state_dict:
+            weight = state_dict[weight_key]
             if weight.dtype != torch.float8_e4m3fn:
-                scale = fp8_scale(state_dict[weight_name])
-                state_dict[weight_name] = (state_dict[weight_name] / scale).to(torch.float8_e4m3fn)
-                state_dict[weight_name + "_scale"] = scale
+                scale = fp8_scale(state_dict[weight_key])
+                state_dict[weight_key] = (state_dict[weight_key] / scale).to(torch.float8_e4m3fn)
+                state_dict[weight_key + "_scale"] = scale
+            else:
+                mod_prefix = prefix + weight_name.rsplit(".", 1)[0]
+                activation_scale_name = mod_prefix + ".activation_scale"
+                weight_scale_inv_name = weight_key + "_scale_inv"
+                if activation_scale_name in state_dict:
+                    state_dict[mod_prefix + ".input_scale"] = state_dict.pop(activation_scale_name)
+                if weight_scale_inv_name in state_dict:
+                    state_dict[mod_prefix + ".weight_scale"] = state_dict.pop(weight_scale_inv_name)
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
         """Convert amax from modelopt quantized graph to scales."""
@@ -880,6 +890,10 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
         quant_method = str(qcfg.get("quant_method", "")).lower()
         if quant_method != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        if qcfg.get("weight_block_size") is None:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
