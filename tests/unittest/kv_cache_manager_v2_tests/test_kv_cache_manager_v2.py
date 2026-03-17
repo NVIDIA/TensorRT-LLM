@@ -410,8 +410,16 @@ class TestNoBatching(TestKVCacheManagerV2):
         tokens_per_block = 32
         # Choose max_seq_len that is exactly block-aligned
         max_seq_len = tokens_per_block * 10  # 320 tokens = 10 blocks
-        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1,
-                     tokens_per_block=tokens_per_block, kv_buf_size=32768)
+        self.prepare(
+            32 << 20,
+            32 << 20,
+            1 << 30,
+            36,
+            128,
+            1,
+            tokens_per_block=tokens_per_block,
+            kv_buf_size=32768,
+        )
 
         prompt_len = 1
         decode_len = max_seq_len - prompt_len
@@ -423,13 +431,11 @@ class TestNoBatching(TestKVCacheManagerV2):
         max_num_blocks = div_up(max_seq_len, tokens_per_block) + 1
         num_layer_groups = len(self.manager.layer_grouping)
         base_page_indices = [
-            array.array("i", [-1]) * max_num_blocks
-            for _ in range(num_layer_groups)
+            array.array("i", [-1]) * max_num_blocks for _ in range(num_layer_groups)
         ]
         for id in range(num_layer_groups):
             req0.kv_cache.set_base_page_index_buf(
-                DEFAULT_BEAM_INDEX, LayerGroupId(id),
-                memoryview(base_page_indices[id])
+                DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(base_page_indices[id])
             )
 
         with TemporaryCudaStream([]) as s:
