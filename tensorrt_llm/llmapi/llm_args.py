@@ -328,6 +328,9 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "If number of packed tokens in prefill chunk exceeds this threshold, \
             q tokens will be evenly distributed across ranks for indexer computation. \
             If negative, q split will always be disabled.")
+    indexer_rope_interleave: bool = Field(
+        default=False,
+        description="Whether to use interleaved RoPE layout for the indexer.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -2612,6 +2615,12 @@ class BaseLlmArgs(StrictBaseModel):
         default=0,
         description=
         "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        status="prototype")
+
+    enable_energy_metrics: bool = Field(
+        default=False,
+        description=
+        "Enable GPU energy monitoring via NVML. When enabled, the server exposes an /energy_metrics endpoint that reports cumulative GPU energy consumption in joules.",
         status="prototype")
 
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
