@@ -18,8 +18,7 @@ from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
                      Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
-from .eagle3_dynamic_tree import (Eagle3OneModelDynamicTreeSampler,
-                                  Eagle3OneModelDynamicTreeWorker)
+from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -250,9 +249,6 @@ def get_spec_decoder(
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
-        if getattr(spec_config, 'use_dynamic_tree', False):
-            return Eagle3OneModelDynamicTreeSampler(sampler_args,
-                                                    spec_config=spec_config)
         return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
     if spec_config.spec_dec_mode.is_pard():
         return MTPSampler(sampler_args,

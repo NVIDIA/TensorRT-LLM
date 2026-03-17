@@ -2364,6 +2364,11 @@ class PyTorchModelEngine(ModelEngine):
                     spec_resource_manager, 'spec_tree_manager'):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
 
+        # For tree decoding, runtime_draft_len should match total tree
+        # tokens (not tree depth).  py_executor resets it every iteration.
+        if spec_config is not None and not spec_config.is_linear_tree:
+            self.runtime_draft_len = self.max_total_draft_tokens
+
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
@@ -3795,30 +3800,13 @@ class PyTorchModelEngine(ModelEngine):
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
 
-            # Sync CUDA graph attn_metadata back to persistent attn_metadata
-            # for dynamic tree spec decoding.  The CUDA graph uses its own
-            # attn_metadata with independently allocated kv_lens_cuda and
-            # kv_cache_block_offsets.  After graph replay, the KV cache
-            # relocation kernel (_update_kv_cache_draft_token_location) reads
-            # from the persistent self.attn_metadata.  Without this sync the
-            # kernel would use stale values, causing either illegal memory
-            # access (wrong kv_lens) or KV cache data corruption (wrong
-            # block offsets).
-            if (can_run_graph and attn_metadata is not self.attn_metadata
-                    and self.spec_config is not None
+            # Relocate accepted draft tokens' KV from tree to linear positions.
+            if (self.spec_config is not None
                     and getattr(self.spec_config, 'use_dynamic_tree', False)):
-                batch_size = scheduled_requests.batch_size
-                if hasattr(attn_metadata, 'kv_lens_cuda') and hasattr(
-                        self.attn_metadata, 'kv_lens_cuda'):
-                    self.attn_metadata.kv_lens_cuda[:batch_size].copy_(
-                        attn_metadata.kv_lens_cuda[:batch_size])
-                if hasattr(
-                        attn_metadata, 'kv_cache_block_offsets'
-                ) and attn_metadata.kv_cache_block_offsets is not None and hasattr(
-                        self.attn_metadata, 'kv_cache_block_offsets'
-                ) and self.attn_metadata.kv_cache_block_offsets is not None:
-                    self.attn_metadata.kv_cache_block_offsets[:, :batch_size].copy_(
-                        attn_metadata.kv_cache_block_offsets[:, :batch_size])
+                spec_worker = self._get_spec_worker()
+                if spec_worker is not None:
+                    spec_worker._relocate_kv_eagerly(
+                        attn_metadata, scheduled_requests.batch_size)
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
@@ -3826,6 +3814,10 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
+
+    def _get_spec_worker(self):
+        """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
+        return getattr(self.model, 'spec_worker', None)
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()

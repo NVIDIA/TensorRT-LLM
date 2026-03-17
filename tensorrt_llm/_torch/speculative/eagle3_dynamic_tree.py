@@ -20,7 +20,6 @@ worker (eagle3.py) for clearer architecture. The base eagle3.py handles linear
 tree mode and shared infrastructure; this file handles:
 
 - Eagle3OneModelDynamicTreeWorker: draft loop, verification, tree construction
-- Eagle3OneModelDynamicTreeSampler: sampler with accepted indices tracking
 - Buffer management for dynamic tree operations (history, scores, parents, masks)
 
 Goal: CUDA graph accept rate must match eager accept rate exactly.
@@ -31,51 +30,11 @@ from typing import TYPE_CHECKING, override
 import torch
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.llm_request import LlmRequestState
-from ..pyexecutor.sampler import TorchSampler
 from .eagle3 import Eagle3OneModelWorker
-from .mtp import MTPSampler
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
-
-
-class Eagle3OneModelDynamicTreeSampler(MTPSampler):
-    """Sampler for one-model EAGLE3 dynamic tree mode.
-
-    Extends MTPSampler with accepted draft token indices tracking, which is
-    needed for KV cache rewind after dynamic tree verification.
-    """
-
-    def __init__(self, args: TorchSampler.Args, spec_config=None):
-        super().__init__(args, nextn=args.max_total_draft_tokens)
-        seq_slots = args.max_num_sequences
-        max_draft_len = spec_config.max_draft_len
-
-        self._accepted_indices_store = torch.full(
-            (seq_slots, max_draft_len), -1, dtype=torch.int32, device="cuda"
-        )
-
-    def sample_async(self, scheduled_requests, outputs, num_context_logits_prefix_sum):
-        if "accepted_draft_tokens_indices" in outputs:
-            requests = scheduled_requests.all_requests()
-            slots = torch.as_tensor([r.py_seq_slot for r in requests], device="cuda")
-            indices = outputs["accepted_draft_tokens_indices"][: len(requests)]
-            self._accepted_indices_store.index_copy_(0, slots, indices)
-        return super().sample_async(scheduled_requests, outputs, num_context_logits_prefix_sum)
-
-    def update_requests(self, state, resource_manager=None):
-        super().update_requests(state, resource_manager)
-        for req in state.scheduled_requests.generation_requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE:
-                continue
-            n_accepted = req.py_num_accepted_draft_tokens
-            if n_accepted > 0:
-                slot = req.py_seq_slot
-                req.py_num_accepted_draft_tokens_indices = (
-                    self._accepted_indices_store[slot, :n_accepted].cpu().tolist()
-                )
 
 
 class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
@@ -257,6 +216,82 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         output["accepted_draft_tokens_indices"] = self._accepted_draft_indices_tensor[:batch_size]
 
         return output
+
+    def _relocate_kv_eagerly(self, attn_metadata, batch_size):
+        """Move accepted draft tokens' KV from tree to linear positions.
+
+        Called by the model engine after forward/graph-replay so the KV cache
+        is ready for the next iteration's target model.
+        """
+        if self._last_num_accepted is None:
+            return
+        cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        if cache_mgr is None:
+            return
+
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+
+        if num_gens <= 0:
+            return
+
+        # Number of accepted DRAFT tokens per request (exclude root).
+        n_acc = self._last_num_accepted[:batch_size].clone()
+        n_acc_draft = (n_acc - 1).clamp(min=0)
+        # Context requests have 0 accepted draft tokens.
+        n_acc_draft[:num_contexts] = 0
+
+        if n_acc_draft.sum() == 0:
+            return
+
+        # Build offsets: cumsum of accepted draft counts per request.
+        offsets = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+        offsets[1:] = torch.cumsum(n_acc_draft, dim=0)
+
+        # Pack valid indices into a flat tensor (vectorized, no Python loop).
+        indices_2d = self._accepted_draft_indices_tensor[:batch_size]
+        max_draft = indices_2d.shape[1]
+        col_idx = torch.arange(max_draft, device="cuda")
+        valid_mask = col_idx.unsqueeze(0) < n_acc_draft.unsqueeze(1)
+        packed = indices_2d[valid_mask]
+
+        if packed.numel() == 0:
+            return
+
+        past_kv_lens = attn_metadata.kv_lens_cuda[:batch_size]
+
+        # Cache kv_byte_size (computed once, stable across calls).
+        if not hasattr(self, "_kv_byte_size"):
+            from tensorrt_llm.bindings import DataType
+
+            dtype = cache_mgr.dtype
+            if dtype in (DataType.HALF, DataType.BF16):
+                self._kv_byte_size = 2.0
+            elif dtype in (DataType.FP8, DataType.INT8):
+                self._kv_byte_size = 1.0
+            else:
+                self._kv_byte_size = 0.5
+
+        rewind_adj = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+
+        torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
+            offsets,
+            packed,
+            past_kv_lens,
+            True,  # use_paged_kv_cache
+            cache_mgr.num_layers,
+            cache_mgr.num_kv_heads,
+            int(cache_mgr.head_dim * self._kv_byte_size),
+            cache_mgr.max_total_draft_tokens,
+            cache_mgr.max_attention_window_vec[0],
+            rewind_adj,
+            None,
+            cache_mgr.kv_cache_pool_pointers,
+            attn_metadata.kv_cache_block_offsets,
+            cache_mgr.max_blocks_per_seq,
+            cache_mgr.tokens_per_block,
+            None,
+        )
 
     @override
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
