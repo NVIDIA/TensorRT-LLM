@@ -2433,8 +2433,8 @@ void KVCacheManager::addToken(RequestIdType requestId)
     {
         return;
     }
-    std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved)
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
     {
         return;
     }
@@ -2612,8 +2612,8 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
     auto const requestId = llmRequest.mRequestId;
     auto seqPtr = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
-    std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved)
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
     {
         return;
     }
@@ -2644,8 +2644,8 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
     if (seqPtr)
     {
-        std::scoped_lock seqLock(seqPtr->mMutex);
-        seqPtr->mRemoved = true;
+        auto seqLock = seqPtr->getLock();
+        seqPtr->markRemoved();
         if (mEnableBlockReuse)
         {
             lastStoredId = mBlockManager.releaseBlocks(*seqPtr, llmRequest, pinBlocks);
@@ -2671,8 +2671,8 @@ std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     auto seqPtr = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
-    std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved)
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
     {
         return {};
     }
@@ -2692,8 +2692,8 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
 {
     auto seqPtr = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
-    std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved)
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
     {
         return;
     }
@@ -3047,8 +3047,8 @@ void KVCacheManager::removeToken(RequestIdType requestId)
     {
         return;
     }
-    std::scoped_lock seqLock(seqPtr->mMutex);
-    if (seqPtr->mRemoved)
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
     {
         return;
     }

@@ -527,6 +527,18 @@ private:
     // Set by removeSequence under mMutex before releasing blocks; checked by all
     // mutating callers so they can exit cleanly rather than touch freed state.
     bool mRemoved{false};
+
+public:
+    // Acquires mMutex; the returned unique_lock is moveable so callers hold RAII ownership.
+    [[nodiscard]] std::unique_lock<std::mutex> getLock() const
+    {
+        return std::unique_lock<std::mutex>(mMutex);
+    }
+
+    bool isRemoved() const noexcept { return mRemoved; }
+
+    // Called by KVCacheManager::removeSequence while holding the lock.
+    void markRemoved() noexcept { mRemoved = true; }
 };
 
 // attach metadata to a pool pointer
