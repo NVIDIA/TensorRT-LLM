@@ -270,7 +270,7 @@ class BaseMultimodalInputProcessor(ABC):
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: torch.Tensor,
         **kwargs,
     ):
         """
@@ -281,9 +281,7 @@ class BaseMultimodalInputProcessor(ABC):
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
-        image_height = image.height
-        image_width = image.width
-        image_size = (image_height, image_width)
+        image_size = image.shape[-2:]
         return self.get_num_multimodal_tokens([image_size],
                                               **kwargs)["num_image_tokens"][0]
 
@@ -301,10 +299,8 @@ class BaseMultimodalInputProcessor(ABC):
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
-        video_width = video[0].width
-        video_height = video[0].height
         num_frames = len(video)
-        video_size = (num_frames, video_height, video_width)
+        video_size = (num_frames, video[0].shape[-2], video[0].shape[-1])
         try:
             num_video_tokens = self.get_num_multimodal_tokens(
                 video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
