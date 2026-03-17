@@ -36,6 +36,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
                                                       _KVCache)
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
+    gen_multi_modal_tokens
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -1722,6 +1724,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 host cache quota set to {kv_cache_config.host_cache_size / (1 << 30)}GiB"
             )
 
+        self.vocab_size = vocab_size
+
         config = self._build_cache_config(
             kv_cache_config,
             tokens_per_block=tokens_per_block,
@@ -2163,6 +2167,119 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Draft KV cache context resize failed for request "
                         f"{req.py_request_id}: could not resize to {capacity} tokens"
                     )
+    def _augment_tokens_for_block_reuse(
+            self,
+            tokens: Sequence[int],
+            req: LlmRequest,
+            start: int = 0,
+            end: int | None = None) -> Sequence[TokenIdExt]:
+        """Augment token sequence with multimodal content digests for block reuse.
+
+        Multimodal placeholder tokens (e.g. image_token_id) share the same ID
+        regardless of the underlying content. This method replaces each
+        multimodal token region with TokenIdExt values produced by
+        gen_multi_modal_tokens(), embedding the content digest (Blake3 hash)
+        into the token sequence so that the radix tree can distinguish blocks
+        belonging to different images/videos.
+
+        When *start*/*end* are given, only the slice ``tokens[start:end]`` is
+        materialized and returned. This avoids re-augmenting the full prompt
+        on every chunk during chunked prefill.
+
+        For text-only requests this is a no-op.
+        """
+        if end is None:
+            end = len(tokens)
+        is_sliced = start != 0 or end != len(tokens)
+
+        if (req.multimodal_hashes is None or req.multimodal_positions is None
+                or req.multimodal_lengths is None):
+            return tokens[start:end] if is_sliced else tokens
+
+        result: list[TokenIdExt] = list(tokens[start:end])
+        for hash_ints, pos, length in zip(req.multimodal_hashes,
+                                          req.multimodal_positions,
+                                          req.multimodal_lengths):
+            mm_end = pos + length
+            # Skip multimodal items outside [start, end).
+            if mm_end <= start or pos >= end:
+                continue
+            # Convert 8 x int32 hash to 32-byte digest (big-endian,
+            # matching v1 C++ getNthByte which extracts MSB first).
+            digest = b''.join(
+                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+            mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
+            # Overlap between [pos, mm_end) and [start, end).
+            overlap_start = max(pos, start)
+            overlap_end = min(mm_end, end)
+            mm_offset = overlap_start - pos
+            result_offset = overlap_start - start
+            n = overlap_end - overlap_start
+            result[result_offset:result_offset +
+                   n] = mm_tokens[mm_offset:mm_offset + n]
+        return result
+
+    @nvtx_range("prepare_resources_kv_cache_manager_v2")
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        with request_context(self.is_draft, scheduled_batch):
+            # allocate KV Cache
+            for req in scheduled_batch.context_requests:
+                beam_width = req.sampling_config.beam_width
+                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
+                        'cp_type']:
+                    raise RuntimeError(
+                        "Star attention is not supported for kv cache manager v2"
+                    )
+                else:
+                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
+                            req):
+                        # Last token cannot be recovered, so we don't include it in the input tokens to look up for the block that can be reused.
+                        if self.enable_block_reuse:
+                            all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                            tokens = self._augment_tokens_for_block_reuse(
+                                all_tokens, req, end=len(all_tokens) - 1)
+                        else:
+                            tokens = None
+                        kv_cache = self._create_kv_cache(
+                            req.py_request_id, req.lora_task_id, tokens)
+                        kv_cache.cuda_stream = self._stream.cuda_stream
+                        assert beam_width == 1, "Currently, KVCacheManagerV2 only supports beam width 1"
+                        if not self.enable_block_reuse:
+                            assert kv_cache.num_committed_tokens == 0
+                            kv_cache.stop_committing()
+                        else:
+                            req.context_current_position = kv_cache.num_committed_tokens
+                            req.set_prepopulated_prompt_len(
+                                kv_cache.num_committed_tokens,
+                                self.tokens_per_block)
+                            chunk_size = req.context_chunk_size
+                            if req.context_current_position + req.context_chunk_size < req.prompt_len:
+                                floored_end_position = (
+                                    req.context_current_position +
+                                    req.context_chunk_size
+                                ) // self.tokens_per_block * self.tokens_per_block
+                                chunk_size = floored_end_position - req.context_current_position
+
+                            req.context_chunk_size = min(
+                                chunk_size,
+                                req.prompt_len - req.context_current_position)
+
+                        success = kv_cache.resume()
+                        assert success
+                        new_capacity = req.prompt_len + self.num_extra_kv_tokens + get_draft_token_length(
+                            req)
+                        success = kv_cache.resize(new_capacity)
+                        if not success:
+                            raise ValueError(
+                                f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for context update"
+                            )
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            scheduled_batch.reset_context_requests()
 
             for req in scheduled_batch.generation_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
@@ -2335,19 +2452,18 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.close()
         self.index_mapper.remove_sequence(request.py_request_id)
 
-    def get_batch_cache_indices(self,
-                                request_ids: List[int],
-                                layer_id: Optional[int] = None
-                                ) -> List[List[int]]:
+    def get_batch_cache_indices(
+            self,
+            request_ids: List[int],
+            layer_id: Optional[int] = None) -> List[List[int]]:
         if layer_id is None:
             pool_id = 0
         else:
             pool_id = self.layer_to_pool_mapping_dict[
                 self.layer_offsets[layer_id]]
-        return self._get_batch_cache_indices_by_pool_id(
-            request_ids,
-            pool_id=pool_id,
-            is_kv_aggregate=True)
+        return self._get_batch_cache_indices_by_pool_id(request_ids,
+                                                        pool_id=pool_id,
+                                                        is_kv_aggregate=True)
 
     def _get_batch_cache_indices_by_pool_id(
             self,
@@ -2563,10 +2679,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
                 if req.context_current_position > kv_cache.num_committed_tokens:
-                    kv_cache.commit(
-                        req.get_tokens(DEFAULT_BEAM_INDEX)
-                        [kv_cache.num_committed_tokens:req.
-                         context_current_position])
+                    tokens = self._augment_tokens_for_block_reuse(
+                        req.get_tokens(DEFAULT_BEAM_INDEX),
+                        req,
+                        start=kv_cache.num_committed_tokens,
+                        end=req.context_current_position)
+                    kv_cache.commit(tokens)
                 if req.context_remaining_length == 0:
                     kv_cache.stop_committing()
             else:

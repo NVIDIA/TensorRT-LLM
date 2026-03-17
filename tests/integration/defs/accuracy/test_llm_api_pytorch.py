@@ -5019,9 +5019,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_fp8(self):
-        pytest.skip(
-            "KV cache v2 resume failure: kv_cache.resume() returns False in prepare_resources. GPU: RTX Pro 6000"
-        )
+        pytest.skip("Skip due to OOM. GPU: RTX Pro 6000")
         model_path = f"{self.MODEL_PATH}-FP8"
         with LLM(model_path, max_seq_len=4096) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -5616,9 +5614,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           mocker):
         if not one_model:
             pytest.skip("v2 does not support two model")
-        pytest.skip(
-            "IMA in kv_cache_manager_v2 during speculative decoding. GPU: DGX_H100, B200"
-        )
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
