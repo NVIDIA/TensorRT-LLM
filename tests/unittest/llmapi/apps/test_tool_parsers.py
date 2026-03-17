@@ -1915,6 +1915,55 @@ class TestMiniMaxM2ToolParser:
         """Test that supports_structural_tag returns False."""
         assert parser.supports_structural_tag() is False
 
+    def test_parse_param_value_string_not_coerced(self):
+        """Test that string-typed params are not coerced by json.loads."""
+        from tensorrt_llm.serve.tool_parser.minimax_m2_parser import \
+            _parse_param_value
+
+        # Values that json.loads would coerce if not short-circuited.
+        assert _parse_param_value("42", "string") == "42"
+        assert _parse_param_value("true", "string") == "true"
+        assert _parse_param_value("null", "string") == "null"
+        assert _parse_param_value('{"k": 1}', "string") == '{"k": 1}'
+        assert _parse_param_value("[1,2]", "string") == "[1,2]"
+        # Non-string types should still be parsed.
+        assert _parse_param_value("42", "integer") == 42
+        assert _parse_param_value("3.14", "number") == 3.14
+        assert _parse_param_value("true", "boolean") is True
+        assert _parse_param_value('{"k": 1}', "object") == {"k": 1}
+
+    def test_detect_and_parse_preserves_suffix(self, sample_tools):
+        """Test that text after </minimax:tool_call> is preserved."""
+        parser = MiniMaxM2ToolParser()
+        text = ('prefix text'
+                '<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">NYC</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>'
+                ' suffix text')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "prefix text" in result.normal_text
+        assert "suffix text" in result.normal_text
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+
+    def test_streaming_preserves_prefix_in_same_chunk(self, sample_tools):
+        """Test streaming returns prefix when it arrives with the tool token."""
+        parser = MiniMaxM2ToolParser()
+        result = parser.parse_streaming_increment(
+            'Hello! <minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">NYC</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>', sample_tools)
+
+        assert "Hello!" in result.normal_text
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+
 
 # ============================================================================
 # Reasoning Parser Tests for Interleaved Thinking

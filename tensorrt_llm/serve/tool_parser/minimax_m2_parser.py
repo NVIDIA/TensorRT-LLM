@@ -34,7 +34,11 @@ def _parse_param_value(value_str: str, param_type: Optional[str]) -> Any:
     """Parse a parameter value string into the appropriate Python type."""
     value_str = value_str.strip()
 
-    # Try JSON parsing first
+    # Short-circuit: declared strings should never be coerced.
+    if param_type == "string":
+        return value_str
+
+    # Try JSON parsing for structured types (object, array, null, etc.).
     try:
         parsed = json.loads(value_str)
         return parsed
@@ -104,10 +108,19 @@ class MiniMaxM2ToolParser(BaseToolParser):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-time parsing: detect and parse all tool calls in the text."""
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
+        if idx == -1:
+            return StreamingParseResult(normal_text=text, calls=[])
 
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+        # Preserve prefix text before the tool call block.
+        prefix = text[:idx].strip()
+
+        # Preserve suffix text after the closing tag (if present).
+        suffix = ""
+        eot_idx = text.rfind(self.eot_token)
+        if eot_idx != -1:
+            suffix = text[eot_idx + len(self.eot_token) :].strip()
+
+        normal_text = (prefix + " " + suffix).strip() if prefix and suffix else (prefix or suffix)
 
         calls: List[ToolCallItem] = []
         tool_call_blocks = self.tool_call_block_regex.findall(text)
@@ -167,6 +180,8 @@ class MiniMaxM2ToolParser(BaseToolParser):
         try:
             # Extract content after <minimax:tool_call>
             tc_start = current_text.find(self.bot_token)
+            # Preserve any text before the tool call opening tag.
+            prefix_text = current_text[:tc_start].strip() if tc_start > 0 else ""
             inner_text = current_text[tc_start + len(self.bot_token) :]
 
             # Find all complete invoke blocks
@@ -265,7 +280,7 @@ class MiniMaxM2ToolParser(BaseToolParser):
                 self._current_invoke_count = 0
                 self._json_buffers.clear()
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=prefix_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in MiniMaxM2 parse_streaming_increment: {e}")

@@ -316,6 +316,20 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)
 
+    def _find_partial_tag_suffix(self, text: str) -> int:
+        """Find trailing partial prefix of a special token at the end of text.
+
+        Returns the index where the partial suffix starts, or -1 if none found.
+        """
+        last_lt = text.rfind("<")
+        if last_lt != -1:
+            suffix = text[last_lt:]
+            if (self.reasoning_start.startswith(suffix)
+                    or self.reasoning_end.startswith(suffix)
+                    or self.tool_section_start.startswith(suffix)):
+                return last_lt
+        return -1
+
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         self._buffer += delta_text
         delta_text = self._buffer
@@ -330,6 +344,12 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
         if not self.in_reasoning:
             begin_idx = delta_text.find(self.reasoning_start)
             if begin_idx == -1:
+                # No <think> found -- check for partial start-tag at end.
+                partial_idx = self._find_partial_tag_suffix(delta_text)
+                if partial_idx != -1:
+                    self._buffer = delta_text[partial_idx:]
+                    return ReasoningParserResult(
+                        content=delta_text[:partial_idx])
                 self._buffer = ""
                 return ReasoningParserResult(content=delta_text)
             self.in_reasoning = True
@@ -349,7 +369,13 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
                 reasoning_content = delta_text[:end_idx]
                 content = delta_text[end_idx + len(self.reasoning_end):]
                 self.in_reasoning = False
-                self._buffer = ""
+                # Check for partial special tag at end of content.
+                partial_idx = self._find_partial_tag_suffix(content)
+                if partial_idx != -1:
+                    self._buffer = content[partial_idx:]
+                    content = content[:partial_idx]
+                else:
+                    self._buffer = ""
                 return ReasoningParserResult(
                     content=content, reasoning_content=reasoning_content)
             elif tool_idx != -1:
@@ -361,9 +387,8 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
                 return ReasoningParserResult(
                     content=content, reasoning_content=reasoning_content)
 
-            # No complete end marker – check for partial tag at the end of
-            # the buffer (could be a prefix of </think> or
-            # <|tool_calls_section_begin|>).
+            # No complete end marker - check for partial tag at end of buffer
+            # (could be a prefix of </think> or <|tool_calls_section_begin|>).
             last_lt = delta_text.rfind("<")
             if last_lt != -1:
                 suffix = delta_text[last_lt:]

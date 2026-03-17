@@ -98,6 +98,18 @@ def test_kimi_k2_reasoning_parser(text: str, content: str,
             ["", TOOL_START + "tool_data"],
             ["", "reasoning"],
         ),
+        # Partial start-tag at end of delta should be buffered (not leaked).
+        (
+            ["content<th", "ink>reason</think>after"],
+            ["content", "after"],
+            ["", "reason"],
+        ),
+        # Partial tool section tag at end of content after </think>.
+        (
+            ["<think>reason</think>content<|tool", "_calls_section_begin|>td"],
+            ["content", TOOL_START + "td"],
+            ["reason", ""],
+        ),
     ])
 def test_kimi_k2_reasoning_parser_stream(delta_texts: list, content: list,
                                          reasoning_context: list):
