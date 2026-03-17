@@ -319,7 +319,7 @@ def test_forward_dynamic_path(vision_encoder):
     fake_embeds = torch.randn(1, 10, 512)
     vision_encoder.extract_feature_dynamic = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature = mock.MagicMock()
-    vision_encoder.apply_evs = mock.MagicMock()
+    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
 
     mm_data = {
         "modality_type": "image",
@@ -341,6 +341,7 @@ def test_forward_fixed_tile_path(vision_encoder):
     fake_embeds = torch.randn(2, 8, 512)
     vision_encoder.extract_feature = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature_dynamic = mock.MagicMock()
+    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
 
     mm_data = {
         "modality_type": "image",
