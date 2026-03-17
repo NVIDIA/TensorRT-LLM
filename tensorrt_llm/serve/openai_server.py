@@ -1116,12 +1116,18 @@ class OpenAIServer:
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
                 # instead of breaking the HTTP connection.
-                error_data = json.dumps(
-                    {"error": {
+                error_data = json.dumps({
+                    "error": {
                         "message": str(e),
-                        "type": "server_error"
-                    }})
+                        "type": "server_error",
+                        "code": None,
+                        "param": None,
+                        "object": "error"
+                    },
+                    "object": "error",
+                })
                 yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
