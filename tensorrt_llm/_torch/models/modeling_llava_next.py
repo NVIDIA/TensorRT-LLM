@@ -327,8 +327,9 @@ class LlavaNextVisionModel(nn.Module):
 
         clip_model_config = copy.deepcopy(self.model_config)
         clip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
-        self.dtype = (self.model_config.pretrained_config.text_config.torch_dtype
-                      or self.model_config.pretrained_config.torch_dtype)
+        self.dtype = (
+            self.model_config.pretrained_config.text_config.torch_dtype
+            or self.model_config.pretrained_config.torch_dtype)
         self.vision_model = CLIPVisionModel(clip_model_config).to(self.dtype)
         self.mm_projector = LlavaNextMultiModalProjector(
             self.pretrained_config).to(self.dtype)
