@@ -2337,13 +2337,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_batch_cache_indices(self,
                                 request_ids: List[int],
-                                layer_id: int = 0) -> List[List[int]]:
-
-        # returns the block numbers needed for each request
+                                layer_id: Optional[int] = None
+                                ) -> List[List[int]]:
+        if layer_id is None:
+            pool_id = 0
+        else:
+            pool_id = self.layer_to_pool_mapping_dict[
+                self.layer_offsets[layer_id]]
         return self._get_batch_cache_indices_by_pool_id(
             request_ids,
-            pool_id=self.layer_to_pool_mapping_dict[
-                self.layer_offsets[layer_id]],
+            pool_id=pool_id,
             is_kv_aggregate=True)
 
     def _get_batch_cache_indices_by_pool_id(

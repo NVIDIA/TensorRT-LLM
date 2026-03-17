@@ -1818,9 +1818,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
-        if (mtp == "eagle" and fp8kv and attention_dp and cuda_graph
-                and overlap_scheduler and not torch_compile):
-            pytest.skip("IMA. GPU: DGX_H100")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -1903,7 +1900,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales_cuda_graph_padding(self, mtp_nextn):
-        pytest.skip("IMA. GPU: DGX_H100")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
@@ -1931,7 +1927,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attention_dp", [False, True])
     def test_fp8_block_scales_cuda_graph_padding_4gpus(self, mtp_nextn,
                                                        attention_dp):
-        pytest.skip("IMA. GPU: DGX_H100")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
@@ -1974,7 +1969,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile,
                                     sampler_async_worker):
-        pytest.skip("IMA. GPU: DGX_H100")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -2072,7 +2066,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
     def test_fp8_block_scales_4gpus_static_eplb(self):
-        pytest.skip("IMA. GPU: DGX_H100")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
 
         num_experts = 72
@@ -2315,8 +2308,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     ])
     def test_no_kv_cache_reuse(self, quant_dtype, mtp_nextn, fp8kv,
                                attention_dp, cuda_graph, overlap_scheduler):
-        if quant_dtype == "fp8" and fp8kv and attention_dp and cuda_graph and overlap_scheduler and mtp_nextn == 2:
-            pytest.skip("IMA. GPU: (no CI data)")
         if quant_dtype == "nvfp4" and mtp_nextn > 0:
             pytest.skip("MTP is not supported for NVFP4")
 
@@ -2432,7 +2423,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_4gpus(self, backend: str, mtp_nextn: int, mocker):
-        pytest.skip("IMA on Hopper. GPU: DGX_H100")
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
