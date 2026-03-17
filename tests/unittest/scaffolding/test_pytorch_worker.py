@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for PyTorchWorker.
 
 Tests the PyTorch backend worker implementation for scaffolding,
@@ -49,7 +63,6 @@ class TestPyTorchWorkerInitialization:
         )
         assert worker.model is not None
         assert worker.tokenizer is not None
-        assert worker.own_model is True
         worker.shutdown()
 
     def test_device_selection_explicit(self, small_model_name):
@@ -104,7 +117,8 @@ class TestPyTorchWorkerGeneration:
         task.max_tokens = 10
 
         status = await pytorch_worker.generation_handler(task)
-        assert status == TaskStatus.WORKER_EXCEPTION
+        # Note: enum name is misspelled in upstream task.py
+        assert status == TaskStatus.WORKER_EXECEPTION  # noqa: E501
 
     @pytest.mark.asyncio
     async def test_generation_with_logprobs(self, pytorch_worker, test_prompt):
@@ -243,8 +257,9 @@ class TestPyTorchWorkerReward:
         # Will likely fail since gpt2 is not a classification model,
         # but should not fail due to missing input
         status = await pytorch_worker.reward_handler(task)
-        # Accept either SUCCESS or EXCEPTION (model type mismatch is OK)
-        assert status in (TaskStatus.SUCCESS, TaskStatus.WORKER_EXCEPTION)
+        # Accept either SUCCESS or error (model type mismatch is OK)
+        # Note: enum name is misspelled in upstream task.py
+        assert status in (TaskStatus.SUCCESS, TaskStatus.WORKER_EXECEPTION)
 
 
 class TestPyTorchWorkerWithScaffolding:
@@ -304,5 +319,4 @@ class TestPyTorchWorkerShutdown:
             small_model_name, device="cpu", torch_dtype=torch.float32
         )
         worker.shutdown()
-        # Should not raise after shutdown
-        assert True
+        assert next(worker.model.parameters()).device.type == "cpu"

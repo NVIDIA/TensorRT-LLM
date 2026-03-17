@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """PyTorch backend worker for TensorRT-LLM Scaffolding.
 
 This module provides a worker implementation that uses native PyTorch and
@@ -86,7 +100,6 @@ class PyTorchWorker(Worker):
         self.model.eval()
 
         self.max_batch_size = max_batch_size
-        self.own_model = False
 
     @classmethod
     def from_pretrained(
@@ -125,9 +138,7 @@ class PyTorchWorker(Worker):
             **model_kwargs,
         )
 
-        worker = cls(model, tokenizer, device=device)
-        worker.own_model = True
-        return worker
+        return cls(model, tokenizer, device=device)
 
     @classmethod
     def from_pretrained_reward_model(
@@ -157,9 +168,7 @@ class PyTorchWorker(Worker):
             **model_kwargs,
         )
 
-        worker = cls(model, tokenizer, device=device)
-        worker.own_model = True
-        return worker
+        return cls(model, tokenizer, device=device)
 
     def _tokenize_input(self, input_str: Optional[str], input_tokens: Optional[list]):
         """Tokenize from input_str or input_tokens, returning model inputs dict.
@@ -181,10 +190,10 @@ class PyTorchWorker(Worker):
     def convert_task_params(self, task: GenerationTask) -> GenerationConfig:
         """Convert task sampling parameters to HuggingFace GenerationConfig."""
         return GenerationConfig(
-            max_new_tokens=task.max_tokens or 100,
-            temperature=task.temperature or 1.0,
-            top_p=task.top_p or 1.0,
-            top_k=task.top_k or 50,
+            max_new_tokens=task.max_tokens if task.max_tokens is not None else 100,
+            temperature=task.temperature if task.temperature is not None else 1.0,
+            top_p=task.top_p if task.top_p is not None else 1.0,
+            top_k=task.top_k if task.top_k is not None else 50,
             do_sample=(task.temperature is not None and task.temperature > 0),
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
@@ -450,8 +459,8 @@ class PyTorchWorker(Worker):
             return TaskStatus.WORKER_EXECEPTION
 
     def shutdown(self):
-        """Clean up resources."""
-        if self.own_model and hasattr(self.model, "cpu"):
+        """Clean up resources by moving model to CPU and freeing GPU memory."""
+        if hasattr(self.model, "cpu"):
             self.model.cpu()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
