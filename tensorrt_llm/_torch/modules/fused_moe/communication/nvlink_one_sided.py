@@ -249,6 +249,8 @@ class NVLinkOneSided(Communication):
                 "metainfo": metainfo,
             }
         else:
+            print(f"self._WORKSPACE: {self._WORKSPACE}")
+            print(f"self.workspace_size_per_rank: {self.workspace_size_per_rank}")
             assert self._WORKSPACE["workspace_size_per_rank"] == self.workspace_size_per_rank, (
                 "reuse workspace with different workspace_size_per_rank"
             )
