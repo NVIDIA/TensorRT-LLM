@@ -114,11 +114,14 @@ class TestProjectedParakeet:
         device = torch.device("cuda")
         sound_cfg = _make_sound_config()
         llm_hidden = 128
-        model = ProjectedParakeet(sound_cfg, llm_hidden_size=llm_hidden, dtype=torch.float32)
+        dtype = torch.bfloat16
+        model = ProjectedParakeet(sound_cfg, llm_hidden_size=llm_hidden, dtype=dtype)
         model.to(device).eval()
 
         batch, time_steps = 2, 200
-        features = torch.randn(batch, time_steps, sound_cfg.num_mel_bins, device=device)
+        features = torch.randn(
+            batch, time_steps, sound_cfg.num_mel_bins, device=device, dtype=dtype
+        )
         mask = torch.ones(batch, time_steps, dtype=torch.long, device=device)
         out = model(features, attention_mask=mask)
 

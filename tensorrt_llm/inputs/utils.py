@@ -600,23 +600,16 @@ def handle_placeholder_exceptions(model_type: str,
                     '<so_embedding>']
                 conv["content"] = audio_placeholders + "\n" + conv["content"]
 
-            # For image/video, convert to list format for the chat_template.
-            if '<image>' not in mm_placeholder_count and '<video>' not in mm_placeholder_count:
-                continue
-
-            # Contents from all kinds of roles will be handled.
-            content = []
-            content.append({"type": "text", "text": conv["content"]})
-            # Extend image/video placeholders so that the chat_template can be applied correctly.
+            # Image/video placeholders must be added directly to the text
+            # content because the chat template for this model doesn't
+            # handle {"type": "image"/"video"} list items — it just
+            # stringifies them.
             if '<image>' in mm_placeholder_count:
-                content.extend([{
-                    "type": "image"
-                } for _ in range(mm_placeholder_count['<image>'])])
+                image_placeholders = '<image>' * mm_placeholder_count['<image>']
+                conv["content"] = image_placeholders + "\n" + conv["content"]
             if '<video>' in mm_placeholder_count:
-                content.extend([{
-                    "type": "video"
-                } for _ in range(mm_placeholder_count['<video>'])])
-            conv["content"] = content
+                video_placeholders = '<video>' * mm_placeholder_count['<video>']
+                conv["content"] = video_placeholders + "\n" + conv["content"]
     else:
         raise ValueError(f"This path should not be reached for: {model_type}")
     return conversation
