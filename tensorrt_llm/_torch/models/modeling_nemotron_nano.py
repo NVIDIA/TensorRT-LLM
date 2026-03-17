@@ -1283,6 +1283,10 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         weight_mapper.init_model_and_config(self.llm, self.model_config)
         self.llm.load_weights(filtered_weights, weight_mapper=weight_mapper)
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 

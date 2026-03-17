@@ -1066,6 +1066,10 @@ class HCXVisionForCausalLM(PreTrainedModel):
         if not DISAGG:
             self.mm_encoder.load_weights(weights)
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
