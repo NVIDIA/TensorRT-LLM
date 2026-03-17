@@ -3,6 +3,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional, Tuple
 
+import numpy as np
+
 from tensorrt_llm import logger
 
 
@@ -27,10 +29,42 @@ class MemoryDesc(NamedTuple):
     device_id: int
 
 
-@dataclass
 class MemoryDescs:
-    type: str
-    descs: List[MemoryDesc]
+    """Describes a set of memory regions with a common type.
+
+    descs: List of (ptr, size, device_id) tuples.
+    """
+
+    __slots__ = ("type", "descs")
+
+    def __init__(self, type: str, descs: List[tuple]):
+        self.type = type
+        self.descs = descs
+
+    @classmethod
+    def from_arrays(
+        cls, type: str, addrs: np.ndarray, sizes: np.ndarray, device_ids: np.ndarray
+    ) -> "MemoryDescs":
+        """Batch-construct from numpy arrays of addrs, sizes, device_ids.
+
+        Pure-Python fallback; the C++ binding overrides this with a version
+        that reads numpy raw pointers directly.
+        """
+        descs = np.stack([addrs, sizes, device_ids], axis=1).tolist()
+        return cls(type, [tuple(d) for d in descs])
+
+    @classmethod
+    def from_arrays_uniform_device(
+        cls, type: str, addrs: np.ndarray, sizes: np.ndarray, device_id: int
+    ) -> "MemoryDescs":
+        """Batch-construct from numpy arrays with a single device_id for all entries.
+
+        Pure-Python fallback; the C++ binding overrides this with a version
+        that reads numpy raw pointers directly.
+        """
+        dev_ids = np.full(addrs.size, device_id, dtype=np.int32)
+        descs = np.stack([addrs, sizes, dev_ids], axis=1).tolist()
+        return cls(type, [tuple(d) for d in descs])
 
 
 @dataclass
