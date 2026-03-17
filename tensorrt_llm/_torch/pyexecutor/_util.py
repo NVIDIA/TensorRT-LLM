@@ -1238,25 +1238,6 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
-    adp_router = None
-    if model_engine.enable_attention_dp and kv_cache_manager is not None:
-        from .scheduler.adp_router import KVCacheAwareADPRouter
-        force_default = os.environ.get(
-            "TRTLLM_FORCE_DEFAULT_ADP_ROUTER", "0") == "1"
-        if (hasattr(kv_cache_manager, 'probe_prefix_match_length')
-                and kv_cache_manager.enable_block_reuse
-                and not force_default):
-            adp_router = KVCacheAwareADPRouter(
-                dist=dist, kv_cache_manager=kv_cache_manager)
-            logger.info(
-                "Using KVCacheAwareADPRouter for attention DP routing")
-        elif (force_default
-              and hasattr(kv_cache_manager, 'probe_prefix_match_length')
-              and kv_cache_manager.enable_block_reuse):
-            logger.info(
-                "TRTLLM_FORCE_DEFAULT_ADP_ROUTER=1: "
-                "using DefaultADPRouter despite block_reuse=True")
-
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -1281,8 +1262,7 @@ def create_py_executor_instance(
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
-        waiting_queue_policy=waiting_queue_policy,
-        adp_router=adp_router)
+        waiting_queue_policy=waiting_queue_policy)
 
 
 def create_torch_sampler_args(

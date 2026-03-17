@@ -532,6 +532,12 @@ class AttentionDpConfig(StrictBaseModel):
     batching_wait_iters: int = Field(
         default=10,
         description="The number of iterations to wait for batching.")
+    enable_kv_cache_aware_routing: bool = Field(
+        default=False,
+        description=
+        "Use KV cache-aware routing for attention DP request distribution. "
+        "When enabled, routes requests to ranks that already have matching "
+        "prefix KV cache, reducing redundant prefill computation. ")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':

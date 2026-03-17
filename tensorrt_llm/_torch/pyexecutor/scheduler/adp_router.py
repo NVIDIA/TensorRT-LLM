@@ -70,6 +70,30 @@ class ADPRouter(ABC):
     def __init__(self, dist: Distributed):
         self.dist = dist
 
+    @classmethod
+    def create(cls, dist: "Distributed", kv_cache_manager=None,
+               attention_dp_config=None) -> "ADPRouter":
+        """Factory method to create the appropriate ADP router.
+
+        Args:
+            dist: Distributed communicator.
+            kv_cache_manager: KV cache manager instance (may be None).
+            attention_dp_config: AttentionDpConfig instance (may be None).
+
+        Returns:
+            A KVCacheAwareADPRouter if config requests it and the
+            kv_cache_manager has block reuse enabled; DefaultADPRouter
+            otherwise.
+        """
+        if (attention_dp_config is not None
+                and attention_dp_config.enable_kv_cache_aware_routing
+                and kv_cache_manager is not None
+                and kv_cache_manager.enable_block_reuse):
+            return KVCacheAwareADPRouter(
+                dist=dist, kv_cache_manager=kv_cache_manager)
+
+        return DefaultADPRouter(dist=dist)
+
     @abstractmethod
     def create_rank_state(
         self,

@@ -256,8 +256,7 @@ public:
         NB_OVERRIDE_PURE(flushIterationEvents);
     }
 
-    SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest,
+    SizeType32 countReusableBlocks(VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest,
         bool onlyAllocated = false) const override
     {
         NB_OVERRIDE_PURE(countReusableBlocks, uniqueTokens, llmRequest, onlyAllocated);
@@ -501,8 +500,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),
             nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
         .def("count_reusable_blocks", &BaseKVCacheManager::countReusableBlocks, nb::arg("unique_tokens"),
-            nb::arg("llm_request"), nb::arg("only_allocated") = false,
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("llm_request"), nb::arg("only_allocated") = false, nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
