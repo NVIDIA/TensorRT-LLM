@@ -1254,11 +1254,14 @@ class SequenceInfo:
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
         """Inverse of nest_sequences: split logits back into per-sequence tensors.
 
-        Automatically consistent with how tokens were gathered in nest_sequences():
-        - If gather was required (gather_context_logits=False), t_nested has shape
-          [num_seqs, *other_dims] and each returned tensor has shape [1, *other_dims].
-        - Otherwise (gather_context_logits=True), t_nested has shape [total_tokens, *other_dims]
-          and each returned tensor has shape [seq_len_i, *other_dims].
+        Handles both gather modes consistently with nest_sequences():
+        - gather_context_logits=True: t_nested is [total_tokens, *other_dims]; splits by seq_len.
+        - gather_context_logits=False: t_nested is [num_seqs, *other_dims] (model already gathered
+          one token per sequence); returns one [1, *other_dims] tensor per sequence.
+
+        NOTE: callers using unnest_sequences() should pass gather_context_logits=True to
+        nest_sequences() if they need all per-token outputs (e.g. for full-sequence comparison
+        in tests).
 
         Returns:
             List of per-sequence tensors.
