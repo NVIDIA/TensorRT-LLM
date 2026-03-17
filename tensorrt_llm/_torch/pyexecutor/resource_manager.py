@@ -2043,10 +2043,6 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
 
-        # Align to block boundary
-        capacity = ((capacity + self.tokens_per_block - 1) //
-                    self.tokens_per_block * self.tokens_per_block)
-
         if not kv_cache.resize(capacity):
             if req.is_first_context_chunk:
                 kv_cache.suspend()

@@ -234,10 +234,11 @@ class TestConstruction:
         sched = make_scheduler(mgr, max_batch_size=100, scheduler_capacity=5)
         assert sched.max_num_requests == 5
 
-    def test_chunk_unit_alignment(self):
+    def test_chunk_unit_no_alignment(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, ctx_chunk_config=(None, 100))
-        assert sched.chunk_unit_size == 64
+        # chunk_unit_size is used as-is, no alignment to tokens_per_block
+        assert sched.chunk_unit_size == 100
 
     def test_chunk_unit_already_aligned(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -1736,18 +1737,17 @@ class TestEdgeCases:
 # ===========================================================================
 
 
-class TestBlockReuseBoundaryAlignment:
-    """Verify that chunked context aligns chunk end to block boundary when
-    context_current_position is not block-aligned (partial reuse scenario)."""
+class TestPartialReuse:
+    """Verify chunked context behaviour when context_current_position is not
+    block-aligned (partial reuse scenario).  Block boundary alignment is NOT
+    performed by the scheduler — the KV cache manager handles it internally."""
 
-    def test_partial_reuse_aligns_chunk_end(self):
+    def test_partial_reuse_no_block_alignment(self):
         """Partial reuse sets context_current_position=50 (not block-aligned).
         tokens_per_block=64, chunk_unit_size=64, max_num_tokens=128.
-        remaining after reuse = 950 (prompt=1000, reused=50).
+        remaining after reuse = 950.
         chunk_size = min(128, 950) = 128 → unit round: 128//64*64 = 128.
-        chunk < remaining (128 < 950) → enters alignment block.
-        end_pos = 50 + 128 = 178, 178 % 64 != 0.
-        floored = 178 // 64 * 64 = 128 → chunk_size = 128 - 50 = 78.
+        No block boundary floor — chunk_size stays 128.
         """
 
         def prepare_with_partial_reuse(req):
@@ -1762,8 +1762,7 @@ class TestBlockReuseBoundaryAlignment:
         req = make_ctx_request(0, context_remaining_length=1000, prompt_len=1000)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
-        # chunk_size should be 78 (aligned to block boundary at pos 128)
-        assert req.context_chunk_size == 78
+        assert req.context_chunk_size == 128
 
     def test_block_aligned_position_no_change(self):
         """When context_current_position is already block-aligned (full block
@@ -1779,7 +1778,7 @@ class TestBlockReuseBoundaryAlignment:
         req = make_ctx_request(0, context_remaining_length=1000, prompt_len=1000)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
-        # 300 // 64 * 64 = 256; end = 128 + 256 = 384, already aligned
+        # 300 // 64 * 64 = 256 (unit round only)
         assert req.context_chunk_size == 256
 
     def test_partial_reuse_last_chunk_no_alignment(self):
@@ -1801,9 +1800,9 @@ class TestBlockReuseBoundaryAlignment:
         # 80 <= 500 budget, 80 == remaining → last chunk, no rounding
         assert req.context_chunk_size == 80
 
-    def test_partial_reuse_resize_uses_aligned_size(self):
-        """Verify resize_context is called with the aligned chunk_size, not
-        the pre-alignment value."""
+    def test_partial_reuse_resize_uses_chunk_size(self):
+        """Verify resize_context is called with the chunk_size directly
+        (no block boundary alignment by the scheduler)."""
         resize_calls = []
 
         def prepare_with_partial_reuse(req):
@@ -1823,15 +1822,14 @@ class TestBlockReuseBoundaryAlignment:
         sched = make_scheduler(mgr, max_num_tokens=128, ctx_chunk_config=(None, 64))
         req = make_ctx_request(0, context_remaining_length=1000, prompt_len=1000)
         sched.schedule_request([req], set())
-        # resize should receive 78 (aligned), not 128 (pre-alignment)
-        assert resize_calls == [78]
+        # resize receives chunk_size directly (128), no block alignment
+        assert resize_calls == [128]
 
-    def test_partial_reuse_budget_accounting_uses_aligned_size(self):
-        """Token budget should account for the aligned chunk_size.
-        After aligned chunk of 78, remaining budget should allow a gen request.
+    def test_partial_reuse_budget_accounting(self):
+        """Token budget should account for the chunk_size as-is.
         pos=50, budget=80, remaining=950 → chunk=64 (unit round of 80).
-        end=50+64=114, 114%64!=0 → floored=64, chunk=64-50=14.
-        14 + 1(gen) = 15 <= 80: gen fits.
+        No block boundary floor — chunk stays 64.
+        64 + 1(gen) = 65 <= 80: gen fits.
         """
 
         def prepare_with_partial_reuse(req):
@@ -1848,6 +1846,6 @@ class TestBlockReuseBoundaryAlignment:
         gen = make_gen_request(1)  # 1 token
         out = sched.schedule_request([ctx, gen], set())
         assert ids(out.context_requests) == [0]
-        assert ctx.context_chunk_size == 14
-        # 14 + 1 = 15 <= 80: gen fits
+        assert ctx.context_chunk_size == 64
+        # 64 + 1 = 65 <= 80: gen fits
         assert ids(out.generation_requests) == [1]

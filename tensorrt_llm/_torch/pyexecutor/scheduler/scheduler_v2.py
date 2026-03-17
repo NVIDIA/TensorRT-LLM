@@ -76,16 +76,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
             self.chunk_unit_size = ctx_chunk_config[1]
-            if self.chunk_unit_size % self.tokens_per_block != 0:
-                old = self.chunk_unit_size
-                self.chunk_unit_size = max(
-                    self.tokens_per_block, (old // self.tokens_per_block) * self.tokens_per_block
-                )
-                logger.info(
-                    f"Adjusted chunk_unit_size from {old} to "
-                    f"{self.chunk_unit_size} (must be a multiple of "
-                    f"tokens_per_block={self.tokens_per_block})"
-                )
 
         # State value caches for fast comparison.
         # Default range [CONTEXT_INIT, GENERATION_TO_COMPLETE) matches C++
@@ -341,19 +331,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = min(chunk_size, self.max_context_length)
 
         # Round down to chunk_unit_size boundary (unless last chunk).
-        # Since chunk_unit_size % tokens_per_block == 0 (ensured in
-        # constructor), this also guarantees block alignment.
         if chunk_size < context_remaining:
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
-            # When partial reuse is enabled, context_current_position may not
-            # be block-aligned. Floor the absolute end position to a block
-            # boundary so that committed blocks stay reusable. This must
-            # happen before resize_context() so allocation, token budget, and
-            # forward pass all use the same chunk_size.
-            end_pos = req.context_current_position + chunk_size
-            if end_pos % self.tokens_per_block != 0:
-                end_pos = (end_pos // self.tokens_per_block) * self.tokens_per_block
-                chunk_size = end_pos - req.context_current_position
 
         if chunk_size <= 0:
             # TODO: consider suspending first-chunk KVCache to release
