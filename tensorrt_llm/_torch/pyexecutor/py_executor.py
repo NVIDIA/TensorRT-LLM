@@ -865,8 +865,7 @@ class PyExecutor:
                 enabled = False
 
             if start_time is not None and self.print_log and (
-                    log_all_ranks
-                    or self.dist.rank in log_ranks):
+                    log_all_ranks or self.dist.rank in log_ranks):
                 end_time = time.time()
                 if it % 2 == 0:
                     end_event_1.record()
