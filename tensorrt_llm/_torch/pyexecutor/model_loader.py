@@ -497,6 +497,12 @@ class ModelLoader:
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
+        # Store allreduce pre-allocation config for AllReduce module access
+        config.extra_attrs['allreduce_max_num_tokens'] = config.max_num_tokens
+        config.extra_attrs[
+            'allreduce_hidden_size'] = config.pretrained_config.hidden_size
+        config.extra_attrs[
+            'allreduce_dtype'] = config.pretrained_config.torch_dtype
 
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)

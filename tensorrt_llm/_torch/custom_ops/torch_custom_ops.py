@@ -1711,6 +1711,10 @@ def _(
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
+    # Set from AllReduce.__init__ via extra_attrs when the model is built.
+    _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
+    _prealloc_hidden_size: ClassVar[Optional[int]] = None
+    _prealloc_dtype: ClassVar[Optional[torch.dtype]] = None
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -1743,7 +1747,10 @@ class AllReduceRunner(TunableRunner):
     def _maybe_preallocate_buffers(cls,
                                    input_tensor: torch.Tensor,
                                    group: List[int],
-                                   do_preparation: bool = False) -> None:
+                                   do_preparation: bool = False,
+                                   max_num_tokens: Optional[int] = None,
+                                   hidden_size: Optional[int] = None,
+                                   dtype: Optional[torch.dtype] = None) -> None:
         if not do_preparation:
             return
         if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
@@ -1758,7 +1765,22 @@ class AllReduceRunner(TunableRunner):
                 # If capture status can't be queried, avoid prealloc to be safe.
                 return
 
-        num_tokens = int(input_tensor.size(0))
+        # If max_num_tokens and hidden_size are provided, pre-allocate at 2x
+        # the model-configured size to give the NCCL window allocator extra
+        # headroom beyond the nominal max shape.  dtype comes from the model
+        # spec; fall back to the actual input tensor's properties when any
+        # value is missing.
+        # The dummy tensor is created here, after the stream-capture guard,
+        # so it is never allocated inside a CUDA graph context.
+        if max_num_tokens is not None and hidden_size is not None:
+            prealloc_input = torch.empty(
+                [2 * max_num_tokens, hidden_size],
+                dtype=dtype if dtype is not None else input_tensor.dtype,
+                device=input_tensor.device)
+        else:
+            prealloc_input = input_tensor
+
+        num_tokens = int(prealloc_input.size(0))
         if num_tokens <= 0:
             return
         group_key = tuple(group)
@@ -1771,7 +1793,6 @@ class AllReduceRunner(TunableRunner):
         logger.debug(
             "[tunable_allreduce] Pre-allocating NCCL window buffers: "
             "tokens=%d group=%s", num_tokens, list(group))
-        prealloc_input = input_tensor
         torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
                                                         2)
 
@@ -1816,9 +1837,14 @@ class AllReduceRunner(TunableRunner):
                                                    OptimizationProfile(),
                                                    **kwargs)
             if AllReduceStrategy.NCCL_SYMMETRIC.value in valid_tactics:
-                self._maybe_preallocate_buffers(input,
-                                                self.group,
-                                                do_preparation=True)
+                self._maybe_preallocate_buffers(
+                    input,
+                    self.group,
+                    do_preparation=True,
+                    max_num_tokens=AllReduceRunner._prealloc_max_num_tokens,
+                    hidden_size=AllReduceRunner._prealloc_hidden_size,
+                    dtype=AllReduceRunner._prealloc_dtype,
+                )
             return input
         if tactic == -1:
             # tactic == -1 means the autotuner cache missed for this shape;
