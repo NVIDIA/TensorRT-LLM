@@ -3902,7 +3902,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto constexpr beamIdx = 0;
 
     auto const assertBlocks
-        = [minAttentionWindow, maxAttentionWindow, beamIdx](GenerationRequest seq,
+        = [minAttentionWindow, maxAttentionWindow, beamIdx](GenerationRequest const& seq,
               std::initializer_list<int> expectedBlocksMin, std::initializer_list<int> expectedBlocksMax)
     {
         auto blocksMin = seq.getCacheBlockIds(minAttentionWindow).at(beamIdx);
