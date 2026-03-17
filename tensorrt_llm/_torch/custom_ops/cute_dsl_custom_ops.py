@@ -318,10 +318,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
-    from ..cute_dsl_kernels.blackwell.top_k.distributed_radix_topk import (
-        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE,
-        DistributedRadixTopKKernel,
-    )
+    from ..cute_dsl_kernels.blackwell.top_k.distributed_radix_topk import \
+        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
+    from ..cute_dsl_kernels.blackwell.top_k.distributed_radix_topk import \
+        DistributedRadixTopKKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
         FilteredTopKKernelVarlenDecode
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
@@ -2873,7 +2873,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         max(b, s) for b, s in zip(buf.shape, shape))
                 else:
                     alloc_shape = shape
-                cls.buffer_cache[key] = torch.empty(alloc_shape, dtype=dtype,
+                cls.buffer_cache[key] = torch.empty(alloc_shape,
+                                                    dtype=dtype,
                                                     device=device)
                 buf = cls.buffer_cache[key]
             # Slice each dim to the requested size
@@ -2984,12 +2985,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             large_occupancy = num_rows > num_sms
 
             cls._compile(
-                dtype, bucketed_num_cols, top_k, next_n,
-                return_val, num_copy_bits, load_balance, large_occupancy,
+                dtype,
+                bucketed_num_cols,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
             )
             key = (
-                dtype, bucketed_num_cols, top_k, next_n,
-                return_val, num_copy_bits, load_balance, large_occupancy,
+                dtype,
+                bucketed_num_cols,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
             )
             compiled_kernel = cls.kernel_cache[key]
 
@@ -3007,23 +3020,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Prepare buffer
             # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
-            # maxinum: 256 * 2 * 8192 * 4 bytes = 8388608 bytes = 8 MB
-            # maxinum: 256 * 2 * 16384 * 4 bytes = 16777216 bytes = 16 MB
-            # maxinum: 256 * 2 * 32768 * 4 bytes = 33554432 bytes = 32 MB
-            # maxinum: 256 * 2 * 65536 * 4 bytes = 67108864 bytes = 64 MB
-            # maxinum: 256 * 2 * 131072 * 4 bytes = 134217728 bytes = 128 MB
-            # maxinum: 256 * 2 * 262144 * 4 bytes = 268435456 bytes = 256 MB
+            # maximum: 256 * 2 * 8192 * 4 bytes = 8388608 bytes = 8 MB
+            # maximum: 256 * 2 * 16384 * 4 bytes = 16777216 bytes = 16 MB
+            # maximum: 256 * 2 * 32768 * 4 bytes = 33554432 bytes = 32 MB
+            # maximum: 256 * 2 * 65536 * 4 bytes = 67108864 bytes = 64 MB
+            # maximum: 256 * 2 * 131072 * 4 bytes = 134217728 bytes = 128 MB
+            # maximum: 256 * 2 * 262144 * 4 bytes = 268435456 bytes = 256 MB
             if dtype == cutlass.Float32:
                 buffer_numbers = 2
             else:
                 buffer_numbers = 1
             buffer_torch = cls._get_or_alloc_buffer(
-                "buffer", (num_rows, buffer_numbers, bucketed_num_cols), torch.int32)
+                "buffer", (num_rows, buffer_numbers, bucketed_num_cols),
+                torch.int32)
             buffer_torch = buffer_torch[:, :, :num_cols]
             # Prepare global counter for persistent dynamic scheduling
             if load_balance:
                 g_global_counter_torch = cls._get_or_alloc_buffer(
-                    "g_global_counter", (1,), torch.int32)
+                    "g_global_counter", (1, ), torch.int32)
                 g_global_counter_torch.zero_()
             else:
                 g_global_counter_torch = None
@@ -3182,7 +3196,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         max(b, s) for b, s in zip(buf.shape, shape))
                 else:
                     alloc_shape = shape
-                cls.buffer_cache[key] = torch.empty(alloc_shape, dtype=dtype,
+                cls.buffer_cache[key] = torch.empty(alloc_shape,
+                                                    dtype=dtype,
                                                     device=device)
                 buf = cls.buffer_cache[key]
             # Slice each dim to the requested size
@@ -3190,9 +3205,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return buf[slices]
 
         @classmethod
-        def _compile(cls, dtype, top_k, next_n, return_val,
-                     num_copy_bits, load_balance, large_occupancy,
-                     chunk_size_per_cta, num_ctas_per_row,
+        def _compile(cls,
+                     dtype,
+                     top_k,
+                     next_n,
+                     return_val,
+                     num_copy_bits,
+                     load_balance,
+                     large_occupancy,
+                     chunk_size_per_cta,
+                     num_ctas_per_row,
                      dynamic=False):
             """Compile and cache multi-CTA top-k kernels for the given config."""
             key = (
@@ -3349,14 +3371,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             merge_cols = num_ctas_per_row * top_k
 
             cls._compile(
-                dtype, top_k, next_n, return_val, num_copy_bits,
-                load_balance, large_occupancy, chunk_size_per_cta,
-                num_ctas_per_row, dynamic,
+                dtype,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
+                chunk_size_per_cta,
+                num_ctas_per_row,
+                dynamic,
             )
             key = (
-                dtype, top_k, next_n, return_val, num_copy_bits,
-                load_balance, large_occupancy, chunk_size_per_cta,
-                num_ctas_per_row, dynamic,
+                dtype,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
+                chunk_size_per_cta,
+                num_ctas_per_row,
+                dynamic,
             )
             compiled_kernel_first, compiled_kernel_second = \
                 cls.kernel_cache[key]
@@ -3451,7 +3487,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         max(b, s) for b, s in zip(buf.shape, shape))
                 else:
                     alloc_shape = shape
-                cls.buffer_cache[key] = torch.empty(alloc_shape, dtype=dtype,
+                cls.buffer_cache[key] = torch.empty(alloc_shape,
+                                                    dtype=dtype,
                                                     device=device)
                 buf = cls.buffer_cache[key]
             # Slice each dim to the requested size
@@ -3485,8 +3522,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             seqlen_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
-                (n_batch,),
-                stride_order=(0,),
+                (n_batch, ),
+                stride_order=(0, ),
             )
             output_indices_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
@@ -3526,7 +3563,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cls.kernel_cache[key] = compiled_kernel
 
         @classmethod
-        def _compute_max_chunk(cls, dtype, num_copy_bits: int = 256,
+        def _compute_max_chunk(cls,
+                               dtype,
+                               num_copy_bits: int = 256,
                                max_smem: int = 227 * 1024):
             """Compute the maximum chunk_size a single CTA can handle."""
             overhead = 256 * 4 * 2 + 16 + 8 * 4
@@ -3540,10 +3579,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return max_chunk, vec_size
 
         @classmethod
-        def _get_chunk_config(cls, dtype, num_cols: int,
-                                  chunk_size: Optional[int] = None,
-                                  num_copy_bits: int = 256,
-                                  num_rows: int = 1):
+        def _get_chunk_config(cls,
+                              dtype,
+                              num_cols: int,
+                              chunk_size: Optional[int] = None,
+                              num_copy_bits: int = 256,
+                              num_rows: int = 1):
             """Resolve chunk_size and ctas_per_group.
 
             If chunk_size is provided, use it (clamped and aligned).
@@ -3576,8 +3617,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if ctas_per_group < 1:
                         ctas_per_group = 1
                     chunk_size = math.ceil(num_cols / ctas_per_group)
-                    chunk_size = ((chunk_size + vec_size - 1) //
-                                  vec_size) * vec_size
+                    chunk_size = (
+                        (chunk_size + vec_size - 1) // vec_size) * vec_size
                     if chunk_size > max_chunk:
                         chunk_size = max_chunk
                 else:
@@ -3593,8 +3634,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         chunk_size = num_cols
 
                     # Snap to power-of-2 for JIT cache friendliness
-                    snap_up = 1 << math.ceil(
-                        math.log2(max(chunk_size, 1)))
+                    snap_up = 1 << math.ceil(math.log2(max(chunk_size, 1)))
                     if snap_up > max_chunk:
                         snap_up = 1 << int(math.log2(max_chunk))
                     chunk_size = snap_up
@@ -3643,8 +3683,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_sms = _get_num_sms()
 
             chunk_size, ctas_per_group, _ = cls._get_chunk_config(
-                dtype, num_cols, chunk_size, num_copy_bits,
-                num_rows=num_rows)
+                dtype, num_cols, chunk_size, num_copy_bits, num_rows=num_rows)
 
             num_groups = min(num_sms // ctas_per_group, num_rows)
             if num_groups < 1:
@@ -3664,8 +3703,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # extra buffer: 148 * 770 * 4 bytes = 452960 bytes = 440 KB
             if "row_states" not in cls.buffer_cache:
                 cls.buffer_cache["row_states"] = torch.zeros(
-                    num_sms, DISTRIBUTED_TOPK_STATE_SIZE,
-                    dtype=torch.int32, device="cuda")
+                    num_sms,
+                    DISTRIBUTED_TOPK_STATE_SIZE,
+                    dtype=torch.int32,
+                    device="cuda")
             row_states = cls.buffer_cache["row_states"]
 
             # Allocate outputs
@@ -3790,7 +3831,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return indices
 
     @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
-                             mutates_args=("output_indices",),
+                             mutates_args=("output_indices", ),
                              device_types="cuda")
     def cute_dsl_indexer_topk_decode(
         input_values: torch.Tensor,
@@ -3937,8 +3978,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             bucketed_num_cols = 1 << log2_n
             for large_occupancy in (False, True):
                 CuteDSLTopKDecodeSingleCTARunner._compile(
-                    cutlass_dtype, bucketed_num_cols, top_k, next_n,
-                    return_val, num_copy_bits, load_balance=False,
+                    cutlass_dtype,
+                    bucketed_num_cols,
+                    top_k,
+                    next_n,
+                    return_val,
+                    num_copy_bits,
+                    load_balance=False,
                     large_occupancy=large_occupancy,
                 )
 
@@ -3951,8 +3997,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         for num_ctas_per_row in range(min_ctas, max_ctas + 1):
             for large_occupancy in (False, True):
                 CuteDSLTopKDecodeMultiCTARunner._compile(
-                    cutlass_dtype, top_k, next_n,
-                    return_val, num_copy_bits, load_balance=False,
+                    cutlass_dtype,
+                    top_k,
+                    next_n,
+                    return_val,
+                    num_copy_bits,
+                    load_balance=False,
                     large_occupancy=large_occupancy,
                     chunk_size_per_cta=chunk_size_per_cta,
                     num_ctas_per_row=num_ctas_per_row,
@@ -3986,9 +4036,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cs = max_chunk
                 distributed_configs.add((cs, ctas))
         for cs, ctas in sorted(distributed_configs):
-            CuteDSLTopKDecodeDistributedRunner._compile(
-                cutlass_dtype, cs, top_k, next_n, num_copy_bits,
-                ctas, num_sms, return_val)
+            CuteDSLTopKDecodeDistributedRunner._compile(cutlass_dtype, cs,
+                                                        top_k, next_n,
+                                                        num_copy_bits, ctas,
+                                                        num_sms, return_val)
 
         logger.info(
             f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
@@ -3996,5 +4047,4 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}], "
             f"Distributed chunk_sizes={possible_chunks} "
             f"({len(distributed_configs)} configs), "
-            f"top_k={top_k}, next_n={next_n}"
-        )
+            f"top_k={top_k}, next_n={next_n}")
