@@ -215,21 +215,21 @@ class MnnvlMemory:
                 allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        if (
-            allocation_prop.requestedHandleTypes
-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        ):
-            all_handles_data = comm.allgather(exported_fabric_handle.data)
-        else:
-            all_handles_data = comm.allgather(exported_fabric_handle)
-            all_pids = comm.allgather(os.getpid())
-            libc = ctypes.CDLL(None, use_errno=True)
-            syscall = libc.syscall
-            SYS_pidfd_open = 434
-            SYS_pidfd_getfd = 438
-            pidfds = []
-            remote_fds = []
-            try:
+        pidfds = []
+        remote_fds = []
+        try:
+            if (
+                allocation_prop.requestedHandleTypes
+                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            ):
+                all_handles_data = comm.allgather(exported_fabric_handle.data)
+            else:
+                all_handles_data = comm.allgather(exported_fabric_handle)
+                all_pids = comm.allgather(os.getpid())
+                libc = ctypes.CDLL(None, use_errno=True)
+                syscall = libc.syscall
+                SYS_pidfd_open = 434
+                SYS_pidfd_getfd = 438
                 for i, pid in enumerate(all_pids):
                     pidfd = syscall(SYS_pidfd_open, pid, 0)
                     if pidfd < 0:
@@ -253,36 +253,36 @@ class MnnvlMemory:
                             error_msg += " This may be due to kernel version (requires Linux 5.6+)."
                         raise RuntimeError(error_msg)
                     remote_fds.append(remote_fd)
-            except Exception:
-                # Release resources on failure path to avoid leaks; then re-raise.
-                if isinstance(exported_fabric_handle, int):
-                    try:
-                        os.close(exported_fabric_handle)
-                    except OSError as e:
-                        logger.warning(
-                            "Failed to close exported shareable handle on error: %s",
-                            e,
-                        )
+
+                all_handles_data = remote_fds
+        except Exception:
+            # Release resources on failure path to avoid leaks; then re-raise.
+            if isinstance(exported_fabric_handle, int):
                 try:
-                    _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
-                except RuntimeError as e:
+                    os.close(exported_fabric_handle)
+                except OSError as e:
                     logger.warning(
-                        "cuMemRelease failed during error cleanup (original error will be raised): %s",
+                        "Failed to close exported shareable handle on error: %s",
                         e,
                     )
-                for _pidfd in pidfds:
-                    try:
-                        os.close(_pidfd)
-                    except OSError:
-                        pass
-                for _rfd in remote_fds:
-                    try:
-                        os.close(_rfd)
-                    except OSError:
-                        pass
-                raise
-
-            all_handles_data = remote_fds
+            try:
+                _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
+            except RuntimeError as e:
+                logger.warning(
+                    "cuMemRelease failed during error cleanup (original error will be raised): %s",
+                    e,
+                )
+            for _pidfd in pidfds:
+                try:
+                    os.close(_pidfd)
+                except OSError:
+                    pass
+            for _rfd in remote_fds:
+                try:
+                    os.close(_rfd)
+                except OSError:
+                    pass
+            raise
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
