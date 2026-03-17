@@ -1,0 +1,43 @@
+metadata:
+  model_name: super_nvfp4
+  supported_gpus:
+  - GB200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  # 1k1k config - EP8+BMM sharding, AutoDeploy backend
+  - name: "super_ad_ep8_1k1k"
+    model_name: "super_nvfp4"
+    backend: "_autodeploy"
+    extra_llm_api_config_path: "examples/auto_deploy/super_v3.yaml"
+    world_size: 8
+    max_batch_size: 384
+    max_seq_len: 65536
+    enable_chunked_prefill: true
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.88
+    client_configs:
+      - name: "con64_iter10_1k1k"
+        concurrency: 64
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+
+  # 1k1k config - TP8+BMM sharding, AutoDeploy backend
+  - name: "super_ad_tp8_1k1k"
+    model_name: "super_nvfp4"
+    backend: "_autodeploy"
+    extra_llm_api_config_path: "examples/auto_deploy/super_v3_tp.yaml"
+    max_batch_size: 384
+    max_seq_len: 65536
+    enable_chunked_prefill: true
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.88
+    client_configs:
+      - name: "con64_iter10_1k1k"
+        concurrency: 64
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
