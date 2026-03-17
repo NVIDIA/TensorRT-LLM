@@ -1092,28 +1092,44 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
     block->freeLeafBlock();
 }
 
+// Why freeChildren and releaseChildren exist as separate operations
+//
+// Consider a scenario where we know that a block and its children will never be used again.
+// This is based on real-world cases where agent applications spawn sub-agents. When a
+// sub-agent exits, its KV cache can be proactively freed to reduce memory pressure.
+//
+// The goal of releaseChildren is to mark these blocks as "released." When future requests
+// need to claim free blocks, we want to avoid claiming blocks that are still in the radix
+// tree (which could potentially be reused). To achieve this, releaseChildren:
+//   1. Removes each block from the radix tree (freeLeafBlock).
+//   2. Claims the block (claimBlock) — this removes it from its current position in the
+//      free queue and sets its priority to kMinRetentionPriority.
+//   3. Re-inserts the block at the front of the free queue (releaseBlock with toFront),
+//      making it a preferred candidate for reclamation.
+//
+// In contrast, freeChildren only removes blocks from the radix tree and does nothing to the
+// free queue. As a result, these blocks are later reclaimed based on LRU policy (therefore,
+// they are not guaranteed to be the preferred candidates for reclamation), which fails to
+// leverage our knowledge that these blocks from the exited sub-agent will never be reused.
+
 void WindowBlockManager::freeChildren(BlockPtr const& block)
 {
-    // Tell event manager we are freeing block
     if (mEventManager && blockInRadixTree(block))
     {
         mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
 
-    // Free block and all it's descendants from radix tree
     block->freeBlockAndAllDescendants();
 }
 
 void WindowBlockManager::releaseChildren(BlockPtr const& block, bool toFront)
 {
-    // Release all descendants of block
     for (auto const& p : block->getNextBlocks())
     {
         auto childBlock = p.second;
         releaseChildren(childBlock, toFront);
     }
 
-    // Free block from radix tree
     if (mEventManager && blockInRadixTree(block))
     {
         mEventManager->enqueueRemovedEvent(block, mWindowSize);
@@ -1122,6 +1138,8 @@ void WindowBlockManager::releaseChildren(BlockPtr const& block, bool toFront)
 
     if (!block->hasRefs())
     {
+        // Remove from current free queue position, then re-insert at front so this block is
+        // reclaimed before blocks that might still be reusable.
         mEvictionPolicy->claimBlock(block, executor::KvCacheRetentionConfig::kMinRetentionPriority, std::nullopt);
         mEvictionPolicy->releaseBlock(block, toFront);
     }
