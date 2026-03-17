@@ -1244,6 +1244,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
+    def pre_reload_weights(self, module: Linear):
+        pass
+
     def _input_prepare(self, module: Linear, input: torch.Tensor):
         """Quantize input tensor to FP4 format.
 
@@ -2731,8 +2734,8 @@ class Linear(nn.Module):
         assert self._weights_created
 
         weight_mode = self.weights_loading_config.weight_mode
-        if not isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert allow_partial_loading is False, "allow_partial_loading is only supported for unquantized linear methods now"
+        # if not isinstance(self.quant_method, UnquantizedLinearMethod):
+        #     assert allow_partial_loading is False, "allow_partial_loading is only supported for unquantized linear methods now"
         self.quant_method.load_weights(
             self,
             weights,
