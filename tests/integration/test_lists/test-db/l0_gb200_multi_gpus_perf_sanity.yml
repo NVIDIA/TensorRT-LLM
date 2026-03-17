@@ -3,6 +3,22 @@ l0_gb200_multi_gpus_perf_sanity:
 - condition:
     ranges:
       system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb200*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # super-nvfp4 (AutoDeploy backend, EP8+BMM sharding)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ep8_1k1k] TIMEOUT (120)
+- condition:
+    ranges:
+      system_gpu_count:
         gte: 4
         lte: 4
     wildcards:
