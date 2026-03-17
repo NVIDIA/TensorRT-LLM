@@ -282,7 +282,7 @@ class PyTorchWorker(Worker):
         try:
             inputs = self._tokenize_input(task.input_str, task.input_tokens)
             if inputs is None:
-                return TaskStatus.WORKER_EXECEPTION
+                return TaskStatus.WORKER_EXCEPTION
 
             # Ensure inputs is a dict (tokenizer returns BatchEncoding)
             if not isinstance(inputs, dict):
@@ -321,7 +321,7 @@ class PyTorchWorker(Worker):
         except Exception as e:
             print(f"PyTorchWorker generation error: {e}")
             traceback.print_exc()
-            return TaskStatus.WORKER_EXECEPTION
+            return TaskStatus.WORKER_EXCEPTION
 
     async def stream_generation_handler(self, task: StreamGenerationTask) -> TaskStatus:
         """Handle streaming generation with pause/resume/cancel semantics.
@@ -338,7 +338,7 @@ class PyTorchWorker(Worker):
             if task.request_handle is None:
                 inputs = self._tokenize_input(task.input_str, task.input_tokens)
                 if inputs is None:
-                    return TaskStatus.WORKER_EXECEPTION
+                    return TaskStatus.WORKER_EXCEPTION
 
                 input_ids = inputs["input_ids"] if isinstance(inputs, dict) else inputs.input_ids
 
@@ -421,7 +421,7 @@ class PyTorchWorker(Worker):
         except Exception as e:
             print(f"PyTorchWorker stream generation error: {e}")
             traceback.print_exc()
-            return TaskStatus.WORKER_EXECEPTION
+            return TaskStatus.WORKER_EXCEPTION
 
     async def reward_handler(self, task: RewardTask) -> TaskStatus:
         """Handle reward/scoring task using sequence classification model."""
@@ -456,7 +456,7 @@ class PyTorchWorker(Worker):
         except Exception as e:
             print(f"PyTorchWorker reward error: {e}")
             traceback.print_exc()
-            return TaskStatus.WORKER_EXECEPTION
+            return TaskStatus.WORKER_EXCEPTION
 
     def shutdown(self):
         """Clean up resources by moving model to CPU and freeing GPU memory."""

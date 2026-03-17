@@ -118,7 +118,7 @@ class TestPyTorchWorkerGeneration:
 
         status = await pytorch_worker.generation_handler(task)
         # Note: enum name is misspelled in upstream task.py
-        assert status == TaskStatus.WORKER_EXECEPTION  # noqa: E501
+        assert status == TaskStatus.WORKER_EXCEPTION  # noqa: E501
 
     @pytest.mark.asyncio
     async def test_generation_with_logprobs(self, pytorch_worker, test_prompt):
@@ -259,7 +259,7 @@ class TestPyTorchWorkerReward:
         status = await pytorch_worker.reward_handler(task)
         # Accept either SUCCESS or error (model type mismatch is OK)
         # Note: enum name is misspelled in upstream task.py
-        assert status in (TaskStatus.SUCCESS, TaskStatus.WORKER_EXECEPTION)
+        assert status in (TaskStatus.SUCCESS, TaskStatus.WORKER_EXCEPTION)
 
 
 class TestPyTorchWorkerWithScaffolding:
