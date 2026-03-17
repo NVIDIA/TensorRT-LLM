@@ -203,7 +203,11 @@ def test_whisper_beam_search_generation_logits(llm_venv, engine_dir,
         f"--num_beams={num_beams}",
     ]
     env = {
-        "HF_DATASETS_OFFLINE": "0",
-        "PYTHONPATH": whisper_example_root,
+        "HF_DATASETS_OFFLINE":
+        "0",
+        "PYTHONPATH":
+        os.pathsep.join(
+            filter(None, [whisper_example_root,
+                          os.environ.get("PYTHONPATH")])),
     }
     venv_check_call(llm_venv, run_cmd, env=env)
