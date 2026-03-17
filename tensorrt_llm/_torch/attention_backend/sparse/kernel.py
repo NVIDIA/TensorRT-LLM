@@ -1834,20 +1834,25 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     # Only token == -1 should propagate as -1
     is_invalid_tok = tok < 0
 
+    # Clamp negative tokens to 0 for safe block_id computation.
+    # The result is discarded via is_invalid_tok below, but this prevents
+    # computing negative block_id which would cause OOB block_table loads.
+    safe_tok = tl.maximum(tok, 0)
+
     # Compute block id and in-block offset
-    block_id = tok // BLOCK_SIZE
-    inblock_off = tok % BLOCK_SIZE + layer_id * BLOCK_SIZE
+    block_id = safe_tok // BLOCK_SIZE
+    inblock_off = safe_tok % BLOCK_SIZE + layer_id * BLOCK_SIZE
 
     # Guard block_table access
     valid_block = block_id < max_num_blocks_per_req
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
-    base = tl.load(bt_ptr, mask=valid_block, other=0)
+    base = tl.load(bt_ptr, mask=valid_block & (~is_invalid_tok), other=0)
 
-    # If token == -1 OR block_id OOB, output -1
+    # If token == -1 OR block_id OOB OR block_table has -1 (padding), output -1
     # Otherwise: base * stride_factor + inblock_off
     # (stride_factor accounts for layer interleaving in strided KV cache pools)
-    out_val = tl.where(is_invalid_tok | (~valid_block), -1,
-                       base * stride_factor + inblock_off)
+    is_invalid = is_invalid_tok | (~valid_block) | (base < 0)
+    out_val = tl.where(is_invalid, -1, base * stride_factor + inblock_off)
 
     # Store results
     out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
