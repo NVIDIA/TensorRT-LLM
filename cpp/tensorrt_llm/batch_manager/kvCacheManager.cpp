@@ -3094,7 +3094,6 @@ void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLen
     }
 }
 
-
 std::shared_ptr<GenerationRequest> KVCacheManager::getSequence(RequestIdType requestId) const
 {
     auto lck = std::scoped_lock(mSequencesMtx);
