@@ -2,7 +2,7 @@
 # Fill in the API keys below, then pass this file via --config to the MCP
 # server and/or the runner script.
 
-# ---- MCP server (iter_research_tools.py) ----
+# ---- MCP servers (google_search, google_scholar, fetch_webpage, python_interpreter) ----
 search_api_key: ""           # SerpAPI key for google_search / google_scholar
 search_api_url: "https://serpapi.com/search"
 jina_api_key: ""             # Jina Reader API key for webpage fetching

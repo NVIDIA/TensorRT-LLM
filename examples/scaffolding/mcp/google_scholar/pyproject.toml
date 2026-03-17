@@ -1,13 +1,11 @@
 [project]
-name = "IterResearchMCP"
+name = "google-scholar-mcp"
 version = "0.1.0"
-description = "An MCP server for IterResearch tools (search, scholar, visit, python)"
-readme = "README.md"
+description = "MCP server for Google Scholar search via SerpAPI"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.9.0",
-    "pymupdf>=1.24.0",
     "pyyaml>=6.0",
     "uvicorn>=0.30.0",
     "starlette>=0.38.0",

@@ -15,9 +15,18 @@
 """Runner script for IterResearch with TensorRT-LLM scaffolding.
 
 Usage:
-    # Terminal 1: Start MCP server
-    cd examples/scaffolding/contrib/iter_research/IterResearchMCP
-    uv run iter_research_tools.py --config ../config.yaml
+    # Terminal 1: Start MCP servers (each tool is a separate server)
+    cd examples/scaffolding/mcp/google_search
+    uv run google_search.py --config ../../contrib/iter_research/config.yaml
+
+    cd examples/scaffolding/mcp/google_scholar
+    uv run google_scholar.py --config ../../contrib/iter_research/config.yaml
+
+    cd examples/scaffolding/mcp/fetch_webpage
+    uv run fetch_webpage.py --config ../../contrib/iter_research/config.yaml
+
+    cd examples/scaffolding/mcp/python_interpreter
+    uv run python_interpreter.py --config ../../contrib/iter_research/config.yaml
 
     # Terminal 2: Start LLM server
     trtllm-serve <hf_model> --port 8000

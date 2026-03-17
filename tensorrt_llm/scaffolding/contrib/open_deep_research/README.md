@@ -69,7 +69,7 @@ reorder_policy_config:
 ### 2. Start Tavily MCP Server
 
 ```bash
-cd examples/scaffolding/contrib/open_deep_research/TavilyMCP
+cd examples/scaffolding/mcp/tavily
 export TAVILY_API_KEY=<your_api_key>
 uv run travily.py
 ```

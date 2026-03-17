@@ -17,7 +17,7 @@ Example usage:
     )
 
     # Start CoderMCP server first:
-    # python examples/scaffolding/contrib/Coder/CoderMCP/coder_mcp.py --port 8083
+    # python examples/scaffolding/mcp/coder/coder_mcp.py --port 8083
 
     mcp_worker = MCPWorker(urls=["http://localhost:8083/sse"])
 
