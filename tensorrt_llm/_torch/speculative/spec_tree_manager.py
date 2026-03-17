@@ -300,8 +300,7 @@ class SpecTreeManager:
                 "get_eagle_paths() is not supported in dynamic tree mode; "
                 "use retrieve_index/retrieve_next_token/retrieve_next_sibling instead"
             )
-        actual_idx = tree_idx if self.use_dynamic_tree else 0
-        return self.eagle_paths[actual_idx]
+        return self.eagle_paths[0]
 
     # Get the topK list for the specific draft layer
     def get_top_k_list(self, draft_layer_id):
@@ -313,10 +312,9 @@ class SpecTreeManager:
             raise RuntimeError(
                 "compute_spec_dec_mask_matrix() is not supported in dynamic tree mode"
             )
-        actual_idx = tree_idx if self.use_dynamic_tree else 0
-        for i, path in enumerate(self.eagle_paths[actual_idx]):
+        for i, path in enumerate(self.eagle_paths[0]):
             indices = path[path > -1]
-            self.spec_dec_mask_matrix[actual_idx][i, indices] = 1
+            self.spec_dec_mask_matrix[0][i, indices] = 1
 
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
         bs, num_tokens, num_tokens_attend = mask_matrix.shape

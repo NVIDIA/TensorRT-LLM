@@ -93,6 +93,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accept_token = None
         self._last_num_accepted = None
         self._last_selected_parents = None
+        self._kv_byte_size = None  # Lazily set on first _relocate_kv_eagerly call
 
         # Pre-allocated buffers for _relocate_kv_eagerly (avoid per-call allocations)
         self._reloc_n_acc_draft = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
@@ -247,7 +248,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         past_kv_lens = attn_metadata.kv_lens_cuda[:batch_size]
 
-        if not hasattr(self, "_kv_byte_size"):
+        if self._kv_byte_size is None:
             from tensorrt_llm.bindings import DataType
 
             dtype = cache_mgr.dtype
@@ -330,7 +331,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             # CUDA graph warmup: verification hasn't run yet
             if self._last_num_accepted is None:
-                self._last_num_accepted = torch.ones(batch_size, dtype=torch.int32, device="cuda")
+                self._last_num_accepted = torch.ones(
+                    self._max_batch_size, dtype=torch.int32, device="cuda"
+                )
             if self._accept_token is None:
                 self._accept_token = torch.zeros(
                     self._max_batch_size, max_path_len, dtype=torch.int64, device="cuda"
@@ -416,6 +419,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # path_pos_2d[i, j]: tree position of j-th accepted token for gen request i
         path_pos_2d = self._step0_path_pos_buf[:num_gens, :max_path_len]
+        path_pos_2d[:, 0] = 0  # root position is always 0
         if max_path_len > 1:
             path_pos_2d[:, 1:] = (
                 self._accepted_draft_indices_tensor[
