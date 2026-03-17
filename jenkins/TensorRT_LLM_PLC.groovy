@@ -239,6 +239,37 @@ def pulseScanSourceCode(llmRepo, branchName) {
     }
 }
 
+def processContainerScanResults(branchName) {
+    container("cpu") {
+        def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc/posting"
+        def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
+        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc"
+        def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
+        def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
+        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+            withEnv([
+                "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
+                "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
+                "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
+                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
+            ]) {
+                sh """
+                    python3 -m venv venv
+                    venv/bin/pip install requests elasticsearch==7.13.4
+                    venv/bin/python ./jenkins/scripts/process_scan_report.py \
+                        --scan-report-dir scan_report \
+                        --output-dir scan_report_diff
+                    venv/bin/python ./jenkins/scripts/submit_container_scan_report.py \
+                        --diff-dir scan_report_diff \
+                        --build-url ${pipelineUrl} \
+                        --build-number ${env.BUILD_NUMBER} \
+                        --branch ${branchName}
+                """
+            }
+        }
+    }
+}
+
 def pulseScanContainer(llmRepo, branchName) {
     // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
     def imageTags = [:]
@@ -296,10 +327,6 @@ def pulseScanContainer(llmRepo, branchName) {
                 }
             }
         }
-    }
-    container("cpu") {
-        sh "zip -r scan_report.zip scan_report/"
-        archiveArtifacts artifacts: "scan_report.zip", fingerprint: true
     }
 }
 
@@ -369,6 +396,14 @@ pipeline {
                             {
                                 script {
                                     pulseScanContainer(env.LLM_REPO, env.BRANCH_NAME)
+                                }
+                            }
+                        }
+                        stage("Process Container Scan Results"){
+                            steps
+                            {
+                                script {
+                                    processContainerScanResults(env.BRANCH_NAME)
                                 }
                             }
                         }
