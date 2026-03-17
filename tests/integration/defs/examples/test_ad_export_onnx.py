@@ -36,10 +36,11 @@ def test_ad_export_onnx(model: str, output_dir: str, num_attn_ops: int):
         max_batch_size=13,
         max_seq_len=4,
     )
-    # Set output directory for both transforms to ensure embedding.safetensors
-    # and model.onnx are in the same location
+    # Set output directory so embedding.safetensors and model.onnx are in the same location
     ad_config.transforms["rewrite_embedding_to_inputs_embeds"]["output_dir"] = output_dir
     ad_config.transforms["export_to_onnx"]["output_dir"] = output_dir
+    if "extract_embedding_to_safetensors" in ad_config.transforms:
+        ad_config.transforms["extract_embedding_to_safetensors"]["output_dir"] = output_dir
     export_onnx(ad_config)
 
     # check if the output directory exists

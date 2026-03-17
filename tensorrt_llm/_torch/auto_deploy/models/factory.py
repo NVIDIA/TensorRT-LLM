@@ -217,6 +217,10 @@ class ModelFactory(ABC):
         """
         return {}
 
+    def get_vision_pipeline_info(self, model: nn.Module) -> Optional[SubModuleExportInfo]:
+        """Return export info for the vision submodule if present; otherwise None (e.g. causal LM)."""
+        return None
+
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model.
 

@@ -53,7 +53,26 @@ def main():
         help="Optional. For VLM, the directory to save the exported vision ONNX (vision_model.onnx). "
         "When set, the pipeline may write visual subgraph to this dir if supported.",
     )
+    parser.add_argument(
+        "--model_factory",
+        type=str,
+        default=None,
+        help="Model factory name (e.g. AutoModelForCausalLM, AutoModelForImageTextToText). "
+        "Default is AutoModelForCausalLM. For VLM, use AutoModelForImageTextToText or --vlm.",
+    )
+    parser.add_argument(
+        "--vlm",
+        action="store_true",
+        help="Use AutoModelForImageTextToText factory for vision-language models. "
+        "Equivalent to --model_factory AutoModelForImageTextToText.",
+    )
     args = parser.parse_args()
+
+    model_factory = (
+        "AutoModelForImageTextToText"
+        if args.vlm
+        else (args.model_factory or "AutoModelForCausalLM")
+    )
 
     print(f"Constructing model from {args.model}")
 
@@ -73,19 +92,16 @@ def main():
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         device=args.device,
+        model_factory=model_factory,
     )
     ad_config.attn_backend = "torch"
     if args.output_dir is not None:
         ad_config.transforms["export_to_onnx"]["output_dir"] = args.output_dir
         ad_config.transforms["rewrite_embedding_to_inputs_embeds"]["output_dir"] = args.output_dir
-    if args.visual_output_dir is not None:
-        # Pass through for pipeline transforms that export vision ONNX.
-        ad_config.transforms["export_to_onnx"]["visual_output_dir"] = args.visual_output_dir
-        # When export_vision_to_onnx exists, it can read from here.
-        if "export_vision_to_onnx" in ad_config.transforms:
-            ad_config.transforms["export_vision_to_onnx"]["visual_output_dir"] = (
-                args.visual_output_dir
-            )
+        if "extract_embedding_to_safetensors" in ad_config.transforms:
+            ad_config.transforms["extract_embedding_to_safetensors"]["output_dir"] = args.output_dir
+    if args.visual_output_dir is not None and "export_vision_to_onnx" in ad_config.transforms:
+        ad_config.transforms["export_vision_to_onnx"]["visual_output_dir"] = args.visual_output_dir
 
     # Use direct InferenceOptimizer instead of LLM to avoid executor initialization
     export_onnx(ad_config)

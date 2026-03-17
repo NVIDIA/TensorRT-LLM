@@ -514,7 +514,7 @@ class ExportToONNX(BaseTransform):
             self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Step 1: Export all auxiliary JSON files (config, tokenizer, chat template)
-        self._export_json_files(gm, cm, factory, shared_config)
+        # self._export_json_files(gm, cm, factory, shared_config)
 
         # Step 1.5: Sync .meta["val"] dtype with actual state_dict dtype for weight nodes
         # This ensures ONNX export sees the correct dtype (e.g., FP8) instead of the
