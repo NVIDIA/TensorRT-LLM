@@ -1,6 +1,8 @@
 # Visual Generation Examples
 
-Quick reference for running visual generation models (FLUX, WAN).
+Quick reference for running visual generation models.
+Please refer to [the VisualGen doc](https://nvidia.github.io/TensorRT-LLM/models/visual-generation.html)
+about the details of the feature.
 
 ## Prerequisites
 
@@ -8,120 +10,53 @@ Quick reference for running visual generation models (FLUX, WAN).
 # Install dependencies (from repository root)
 pip install -r requirements-dev.txt
 pip install git+https://github.com/huggingface/diffusers.git
-pip install av
 ```
 
-## Quick Start
-
-```bash
-# Set MODEL_ROOT to your model directory (required for examples)
-export MODEL_ROOT=/llm-models
-# Optional: PROJECT_ROOT defaults to repo root when run from examples/visual_gen
-
-# Run all examples (auto-detects GPUs)
-cd examples/visual_gen
-./visual_gen_examples.sh
-```
-
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PROJECT_ROOT` | Auto-detected | Path to repository root (set when running from `examples/visual_gen`) |
-| `MODEL_ROOT` | `/llm-models` | Path to model directory |
-| `TLLM_LOG_LEVEL` | `INFO` | Logging level |
-
----
 
 ## FLUX (Text-to-Image)
 
-Supports both FLUX.1-dev and FLUX.2-dev. The pipeline type is auto-detected from the model checkpoint (`model_index.json`).
-
 ### Basic Usage
 
-**FLUX.1-dev:**
+**FLUX.1:**
+
 ```bash
 python visual_gen_flux.py \
-    --model_path ${MODEL_ROOT}/FLUX.1-dev \
+    --model_path black-forest-labs/FLUX.1-dev \
     --prompt "A cat sitting on a windowsill" \
+    --height 1024 --width 1024 \
     --guidance_scale 3.5 \
     --output_path output.png
 ```
 
-**FLUX.2-dev:**
-```bash
-python visual_gen_flux.py \
-    --model_path ${MODEL_ROOT}/FLUX.2-dev \
-    --prompt "A cat sitting on a windowsill" \
-    --guidance_scale 4.0 \
-    --output_path output.png
-```
+**With FP8 quantization:**
 
-**With FP8 Quantization:**
 ```bash
 python visual_gen_flux.py \
-    --model_path ${MODEL_ROOT}/FLUX.2-dev \
+    --model_path black-forest-labs/FLUX.2-dev \
     --prompt "A cat sitting on a windowsill" \
     --linear_type trtllm-fp8-per-tensor \
-    --output_path output.png
+    --output_path output_fp8.png
 ```
 
-**With TeaCache:**
-```bash
-python visual_gen_flux.py \
-    --model_path ${MODEL_ROOT}/FLUX.1-dev \
-    --prompt "A cat sitting on a windowsill" \
-    --enable_teacache \
-    --output_path output.png
-```
-
-### Batch Mode
-
-Generate multiple images from a prompts file (one prompt per line):
+**Batch mode (multiple prompts from file):**
 
 ```bash
 python visual_gen_flux.py \
-    --model_path ${MODEL_ROOT}/FLUX.1-dev \
+    --model_path black-forest-labs/FLUX.1-dev \
     --prompts_file prompts.txt \
-    --output_dir results/bf16/ \
-    --seed 42
+    --output_dir results/ --seed 42
 ```
 
-```bash
-# With FP8 quantization
-python visual_gen_flux.py \
-    --model_path ${MODEL_ROOT}/FLUX.2-dev \
-    --prompts_file prompts.txt \
-    --output_dir results/fp8/ \
-    --linear_type trtllm-fp8-per-tensor
-```
-
-Images are saved as `00.png`, `01.png`, etc. with a `timing.json` summary.
-
-### Multi-GPU Parallelism
-
-FLUX supports CFG and Ulysses parallelism, same as WAN.
-
-**CFG + Ulysses (4 GPUs):**
-```bash
-python visual_gen_flux.py \
-    --model_path ${MODEL_ROOT}/FLUX.1-dev \
-    --prompts_file prompts.txt \
-    --output_dir results/ \
-    --cfg_size 2 --ulysses_size 2
-```
-
----
 
 ## WAN (Text-to-Video)
 
 ### Basic Usage
 
 **Single GPU:**
+
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --output_path output.mp4
@@ -130,7 +65,7 @@ python visual_gen_wan_t2v.py \
 **With TeaCache:**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --enable_teacache \
@@ -147,7 +82,7 @@ WAN supports two parallelism modes that can be combined:
 **Ulysses Only (2 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
@@ -159,7 +94,7 @@ GPU Layout: GPU 0-1 share sequence (6 heads each)
 **CFG Only (2 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
@@ -171,7 +106,7 @@ GPU Layout: GPU 0 (positive) | GPU 1 (negative)
 **CFG + Ulysses (4 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
@@ -183,36 +118,113 @@ GPU Layout: GPU 0-1 (positive, Ulysses) | GPU 2-3 (negative, Ulysses)
 **Large-Scale (8 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
     --cfg_size 2 --ulysses_size 4 \
     --output_path output.mp4
 ```
-GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
+
+
+## WAN (Image-to-Video)
+
+```bash
+python visual_gen_wan_i2v.py \
+    --model_path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
+    --image_path input_image.jpg \
+    --prompt "She turns around and smiles" \
+    --height 480 --width 832 --num_frames 81 \
+    --output_path output_i2v.mp4
+```
+
+
+## LTX2 (Text/Image-to-Video with Audio)
+
+LTX2 generates video **with audio** from text prompts or input images.
+It uses a Gemma3 text encoder (provided separately via `--text_encoder_path`)
+and supports BF16, FP8, and FP4 precision checkpoints.
+
+Please refer to tensorrt_llm/_torch/visual_gen/models/ltx2/LTX_2_CHECKPOINT_FORMAT.md for model checkpoint info.
+
+### Basic Usage
+
+**Text-to-Video (single GPU):**
+```bash
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --height 720 --width 1280 --num_frames 121 \
+    --steps 40 --guidance_scale 4.0 --seed 42 \
+    --output_path output_t2v.mp4
+```
+
+**Image-to-Video:**
+```bash
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --image ${PROJECT_ROOT}/examples/visual_gen/cat_piano.png \
+    --image_cond_strength 1.0 \
+    --height 720 --width 1280 --num_frames 121 \
+    --steps 40 --seed 42 \
+    --output_path output_i2v.mp4
+```
+
+### Precision Variants
+
+LTX2 ships checkpoints at three precision levels. Simply point `--model_path` at the
+appropriate directory:
+
+```bash
+# FP8
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp8/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --height 720 --width 1280 --num_frames 121 \
+    --output_path output_fp8.mp4
+
+# FP4
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp4/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --height 512 --width 768 --num_frames 121 \
+    --output_path output_fp4.mp4
+```
 
 ---
 
 ## Common Arguments
 
-| Argument | FLUX | WAN | Default | Description |
-|----------|------|-----|---------|-------------|
-| `--height` | ✓ | ✓ | 1024 / 720 | Output height |
-| `--width` | ✓ | ✓ | 1024 / 1280 | Output width |
-| `--num_frames` | | ✓ | 81 | Number of frames |
-| `--steps` | ✓ | ✓ | 50 | Denoising steps |
-| `--guidance_scale` | ✓ | ✓ | 3.5 / 5.0 | CFG guidance strength |
-| `--seed` | ✓ | ✓ | 42 | Random seed |
-| `--enable_teacache` | ✓ | ✓ | False | Cache optimization |
-| `--teacache_thresh` | ✓ | ✓ | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | ✓ | VANILLA | VANILLA or TRTLLM |
-| `--cfg_size` | ✓ | ✓ | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | ✓ | 1 | Sequence parallelism |
-| `--linear_type` | ✓ | ✓ | default | Quantization type |
-| `--prompts_file` | ✓ | | — | Batch mode prompts file |
-| `--output_dir` | ✓ | | — | Batch mode output directory |
-| `--disable_torch_compile` | ✓ | ✓ | False | Disable torch.compile |
+| Argument | FLUX | WAN | LTX2 | Default | Description |
+|----------|------|-----|------|---------|-------------|
+| `--model_path` | ✓ | ✓ | — | Path to model checkpoint directory |
+| `--text_encoder_path` | — | ✓ | — | Path to Gemma3 text encoder |
+| `--prompt` | ✓ | ✓ | — | Text prompt for generation |
+| `--negative_prompt` | — | ✓ | *(built-in)* | Negative prompt |
+| `--height` | ✓ | ✓ | ✓ | 1024 / 720 | Output height |
+| `--width` | ✓ | ✓ | ✓ | 1024 / 1280 | Output width |
+| `--num_frames` | — | ✓ | ✓ | 81 / 121 | Number of frames |
+| `--frame_rate` | — | ✓ | 24.0 | Output frame rate (fps) |
+| `--steps` | ✓ | ✓ | ✓ | 50 / 40 | Denoising steps |
+| `--guidance_scale` | ✓ | ✓ | ✓ | 3.5 / 5.0 / 4.0 | Guidance strength |
+| `--seed` | ✓ | ✓ | ✓ | 42 | Random seed |
+| `--image` | — | ✓ | None | Input image for image-to-video |
+| `--image_cond_strength` | — | ✓ | 1.0 | Image conditioning strength |
+| `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
+| `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
+| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
+| `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
+| `--ulysses_size` | ✓ | ✓ | — | 1 | Sequence parallelism |
+| `--linear_type` | ✓ | ✓ | — | default | Quantization type |
+| `--enhance_prompt` | — | ✓ | False | Gemma3 prompt enhancement |
+| `--stg_scale` | — | ✓ | 0.0 | Spatiotemporal guidance scale |
+| `--modality_scale` | — | ✓ | 1.0 | Cross-modal guidance scale |
+| `--rescale_scale` | — | ✓ | 0.0 | Variance-preserving rescale factor |
 
 ## Troubleshooting
 
@@ -239,18 +251,9 @@ GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 ## Output Formats
 
 - **FLUX**: `.png` (image)
-- **WAN**: `.mp4` (video), `.gif` (animated), `.png` (single frame)
+- **WAN**: `.mp4` if FFmpeg is installed, otherwise `.avi` (video)
+- **LTX2**: `.mp4` (video with audio) if FFmpeg is installed, otherwise `.avi` (video)
 
-## Baseline Validation
+## Serving
 
-Compare with official HuggingFace Diffusers implementation:
-
-```bash
-# Run HuggingFace baselines
-./hf_examples.sh
-
-# Or run individual models
-python hf_wan.py --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers
-```
-
-Compare outputs with same seed for correctness verification.
+See [`serve/README.md`](serve/README.md) for `trtllm-serve` examples including image generation (FLUX), video generation (WAN T2V/I2V), and API endpoint reference.

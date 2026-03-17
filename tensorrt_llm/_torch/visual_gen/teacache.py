@@ -65,8 +65,8 @@ class ExtractorConfig:
     Only the timestep embedding logic is model-specific; all other logic is handled generically.
 
     Attributes:
-        model_class_name: Model class name (e.g., "LTX2VideoTransformer3DModel")
-        timestep_embed_fn: Callable(module, timestep, guidance=None) -> Tensor
+        model_class_name: Model class name
+        timestep_embed_fn: Callable(module, **forward_kwargs) -> Tensor
         timestep_param_name: Parameter name for timestep in forward() (default: "timestep")
         guidance_param_name: Parameter name for guidance if used (default: None)
         forward_params: List of parameter names (None = auto-introspect from forward signature)
@@ -115,25 +115,16 @@ class GenericExtractor:
         return extracted
 
     def _compute_timestep_embedding(self, module: torch.nn.Module, params: Dict) -> torch.Tensor:
-        """Compute timestep embedding using configured callable."""
+        """Compute timestep embedding using configured callable.
+
+        Unpacks the forward params as kwargs to the model-specific embed function,
+        which declares only the parameters it needs (e.g., timestep, hidden_states).
+        """
         timestep = params.get(self.config.timestep_param_name)
         if timestep is None:
             raise ValueError(f"Missing required parameter: {self.config.timestep_param_name}")
 
-        # Flatten timestep if needed (common pattern)
-        timestep_flat = timestep.flatten() if timestep.ndim == 2 else timestep
-        guidance = (
-            params.get(self.config.guidance_param_name) if self.config.guidance_param_name else None
-        )
-
-        # Call configured timestep embedding function
-        try:
-            return self.config.timestep_embed_fn(module, timestep_flat, guidance)
-        except Exception as e:
-            logger.error(f"Timestep embedder failed: {e}")
-            # Last resort: use timestep as-is
-            logger.warning("Using timestep fallback")
-            return timestep_flat.unsqueeze(-1) if timestep_flat.ndim == 1 else timestep_flat
+        return self.config.timestep_embed_fn(module, **params)
 
     def __call__(self, module: torch.nn.Module, *args, **kwargs) -> CacheContext:
         """Main extractor logic - called by TeaCacheHook.
@@ -302,12 +293,12 @@ class TeaCacheHook:
         Returns True to compute, False to use cache.
         """
         # Warmup: Always compute first few steps to build stable cache
-        if self.config.ret_steps and state["cnt"] < self.config.ret_steps:
+        if self.config.ret_steps is not None and state["cnt"] < self.config.ret_steps:
             state["acc_dist"] = 0.0
             return True
 
         # Cooldown: Always compute last few steps for quality
-        if self.config.cutoff_steps and state["cnt"] >= self.config.cutoff_steps:
+        if self.config.cutoff_steps is not None and state["cnt"] >= self.config.cutoff_steps:
             return True
 
         # First step: no previous input to compare
@@ -338,8 +329,7 @@ class TeaCacheHook:
 
         # Cache decision based on accumulated distance
         if state["acc_dist"] < self.config.teacache_thresh:
-            # Below threshold: use cache, apply decay to distance
-            state["acc_dist"] *= 0.95
+            # Below threshold: use cache
             return False
         else:
             # Above threshold: compute, reset accumulated distance
@@ -384,15 +374,14 @@ class TeaCacheBackend:
         # Reset cache state (clears previous residuals and counters)
         self.hook.reset_state()
 
-        # Configure warmup and cutoff based on mode
-        if self.config.use_ret_steps:
-            # Aggressive warmup: 5 steps to stabilize cache
-            self.config.ret_steps = 5
-            self.config.cutoff_steps = num_inference_steps  # No cutoff (cache until end)
-        else:
-            # Minimal warmup: 1 step
-            self.config.ret_steps = 1
-            self.config.cutoff_steps = num_inference_steps - 2  # Compute last 2 steps
+        # Derive warmup/cutoff from mode (use_ret_steps)
+        # Aligns with TeaCache repo settings for Wan 2.1
+        # (ref: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4Wan2.1/teacache_generate.py)
+        if self.config.ret_steps is None:
+            self.config.ret_steps = 5 if self.config.use_ret_steps else 1
+        self.config.cutoff_steps = (
+            num_inference_steps if self.config.use_ret_steps else num_inference_steps - 1
+        )
 
         self.config.num_steps = num_inference_steps
 

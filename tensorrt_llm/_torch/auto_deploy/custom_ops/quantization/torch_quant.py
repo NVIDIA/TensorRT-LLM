@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import List, Optional
 
 import torch
@@ -464,7 +465,9 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=torch.float32)
+    # Keep scale metadata in the model dtype to avoid FP32->BF16 cast kernels
+    # when the tensor is consumed by downstream MoE/quantized paths.
+    s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=x.dtype)
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
     _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
@@ -474,8 +477,14 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
 def _dequant_block_fp8_weight(weight_fp8, weight_scale, block_n, block_k, dtype=torch.bfloat16):
     """Dequantize block-scaled FP8 weight to BF16 for tiny projections."""
     N, K = weight_fp8.shape
-    scale_expanded = weight_scale.repeat_interleave(block_n, dim=0).repeat_interleave(
-        block_k, dim=1
+    scale_n, scale_k = weight_scale.shape
+    # Use ceil division so the expanded scale covers the full weight dimension
+    # even when N or K is not exactly divisible by the block size (e.g. 576 / 5
+    # scales → ceil=116, giving 580 rows after repeat, then sliced to 576).
+    actual_block_n = math.ceil(N / scale_n) if scale_n > 0 else block_n
+    actual_block_k = math.ceil(K / scale_k) if scale_k > 0 else block_k
+    scale_expanded = weight_scale.repeat_interleave(actual_block_n, dim=0).repeat_interleave(
+        actual_block_k, dim=1
     )
     scale_expanded = scale_expanded[:N, :K]
     return weight_fp8.to(dtype) * scale_expanded.to(dtype)
@@ -581,6 +590,8 @@ def trtllm_finegrained_fp8_linear(
     # For small layers where a dimension < 128 (e.g. N=64), the derived block
     # size will be < 128.  Fall back to BF16 dequant + cuBLAS.
     if block_n != 128 or block_k != 128:
+        # BF16 fallback: the Triton FP8 kernel launches Grid=1x1x1 for tiny N,
+        # wasting 99% of SM capacity. Dequantize weight + cuBLAS is faster.
         weight_dequant = _dequant_block_fp8_weight(
             weight, weight_scale, block_n, block_k, dtype=input.dtype
         )

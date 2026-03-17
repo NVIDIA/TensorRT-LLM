@@ -20,6 +20,7 @@ with external routers (e.g., sgl-router) using pre-tokenized input.
 """
 
 import asyncio
+import io
 import time
 from collections.abc import AsyncGenerator
 from typing import List, Union
@@ -27,6 +28,7 @@ from typing import List, Union
 import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
+from tensorrt_llm.inputs.utils import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
@@ -82,11 +84,9 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         try:
             # Extract tokenized input (required)
             if not request.HasField("tokenized"):
-                yield self._error_response(
-                    request_id,
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
                     "Missing tokenized input",
-                    "INVALID_REQUEST",
-                    400,
                 )
                 return
 
@@ -118,6 +118,18 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 request.disaggregated_params if request.HasField("disaggregated_params") else None
             )
 
+            # Extract multimodal data if present.
+            # Images arrive as raw bytes from the external router (already fetched),
+            # so we only need to decode and convert to PIL RGB here.
+            multi_modal_data = None
+            if request.HasField("multimodal_input") and request.multimodal_input.image_data:
+                images = [
+                    _load_and_convert_image(io.BytesIO(img_bytes))
+                    for img_bytes in request.multimodal_input.image_data
+                ]
+                multi_modal_data = {"image": images}
+                logger.info(f"Request {request_id}: extracted {len(images)} multimodal images")
+
             # Track tokens sent per sequence index to avoid duplicates
             # TRT-LLM's token_ids_diff doesn't clear between iterations for n>1
             sent_token_counts: dict[int, int] = {}
@@ -131,6 +143,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 streaming=request.streaming,
                 lora_request=lora_request,
                 disaggregated_params=disaggregated_params,
+                multi_modal_data=multi_modal_data,
             ):
                 # Check if client disconnected
                 if context.cancelled():
@@ -156,14 +169,18 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             logger.info(f"Request {request_id} cancelled")
             await self.request_manager.abort(request_id)
             raise
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Invalid request in Generate for {request_id}: {e}")
+            if self.request_manager is not None:
+                await self.request_manager.abort(request_id)
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(f"Error in Generate for {request_id}: {e}")
-            yield self._error_response(
-                request_id,
-                str(e),
-                "INTERNAL_ERROR",
-                500,
-            )
+            if self.request_manager is not None:
+                await self.request_manager.abort(request_id)
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def Embed(
         self,
@@ -180,13 +197,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             EmbedResponse protobuf
         """
         logger.warning("Embed RPC not yet implemented")
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Embed RPC not yet implemented")
-        return trtllm_service_pb2.EmbedResponse(
-            request_id=request.request_id,
-            embedding=[],
-            prompt_tokens=0,
-        )
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Embed RPC not yet implemented")
 
     async def HealthCheck(
         self,

@@ -136,6 +136,23 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
         }
     }
 
+    int arch = tensorrt_llm::common::getSMVersion();
+    if (arch == 120)
+    {
+        if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
+        {
+            fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
+                nullptr, fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets,
+                num_problems, expected_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
+                internal_quantize_a, internal_quantize_b);
+        }
+        else
+        {
+            TLLM_THROW("sm120 fp8 blockscale moe gemm only supports ElementA=bfloat16, ElementB=fp8_e4m3.");
+        }
+        return;
+    }
+
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_bfloat16>)
     {

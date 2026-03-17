@@ -74,6 +74,7 @@ class GrpcRequestManager:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        multi_modal_data: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[GenerationResult, None]:
         """Submit a generation request and stream outputs.
 
@@ -86,6 +87,7 @@ class GrpcRequestManager:
             prompt_adapter_request: Optional prompt adapter request
             kv_cache_retention_config: KV cache retention config
             disaggregated_params: Disaggregated inference params
+            multi_modal_data: Multimodal data dict (e.g. {"image": [PIL images]})
 
         Yields:
             GenerationResult objects containing token IDs (text will be empty
@@ -94,8 +96,12 @@ class GrpcRequestManager:
         try:
             # Submit to LLM.generate_async which returns a GenerationResult
             # that is an async iterator
+            inputs = {"prompt_token_ids": prompt_token_ids}
+            if multi_modal_data:
+                inputs["multi_modal_data"] = multi_modal_data
+
             gen_result = self.llm.generate_async(
-                {"prompt_token_ids": prompt_token_ids},
+                inputs,
                 sampling_params,
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
@@ -418,8 +424,7 @@ def create_disaggregated_params_from_proto(
 
     if proto_config.HasField("context_phase_params"):
         ctx_params = proto_config.context_phase_params
-        params.first_gen_token_id = ctx_params.first_gen_token_id
-        if ctx_params.kv_cache_blocks:
-            params.kv_cache_blocks = ctx_params.kv_cache_blocks
+        if ctx_params.first_gen_token_id:
+            params.first_gen_tokens = [ctx_params.first_gen_token_id]
 
     return params
