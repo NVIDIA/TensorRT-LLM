@@ -6156,7 +6156,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 max_batch_size=32, enable_padding=True) if cuda_graph else None)
 
         with LLM(
-                f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
                 kv_cache_config=kv_cache_config,
                 max_batch_size=32,
                 tensor_parallel_size=tp_size,
@@ -6201,7 +6201,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                            "1" if use_cpp_mamba else "0")
 
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-fp8-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6243,7 +6243,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         # The optimized config is still under investigation.
         # Adding this test as placeholder.
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6281,7 +6281,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_parallelism(self, tp_size, ep_size, pp_size, attention_dp):
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6313,7 +6313,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-011526"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
                 kv_cache_config=KvCacheConfig(
@@ -6348,7 +6348,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=max_draft_len,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-011526"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
             model=model_path,
@@ -6407,13 +6407,13 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_fp16_4gpu_mtp_ar(self):
+    def test_bf16_4gpu_mtp_ar(self):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=max_draft_len,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
         llm_common_config = dict(
             model=model_path,
             tensor_parallel_size=4,
