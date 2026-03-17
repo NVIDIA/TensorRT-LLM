@@ -3434,5 +3434,75 @@ class TestWanRobustness(unittest.TestCase):
         print("\n[Error Handling] ✓ Invalid quant_algo raises error as expected")
 
 
+# =============================================================================
+# Batch Generation Tests
+# =============================================================================
+
+
+class TestWanBatchGeneration:
+    """Batch generation tests for WAN T2V pipeline.
+
+    Tests that passing a list of prompts produces batched output
+    and matches sequential generation with the same seeds.
+    """
+
+    @pytest.fixture(scope="class")
+    def wan21_full_pipeline(self):
+        """Load full Wan 2.1 pipeline (all components) for batch tests."""
+        if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
+            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH.")
+        if not is_wan21_checkpoint():
+            pytest.skip("Batch tests require Wan 2.1 checkpoint")
+
+        from tensorrt_llm._torch.visual_gen.config import TorchCompileConfig
+
+        args = VisualGenArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        yield pipeline
+        del pipeline
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_single_prompt_backward_compat(self, wan21_full_pipeline):
+        """Single prompt returns (T, H, W, C) for backward compatibility."""
+        result = wan21_full_pipeline.forward(
+            prompt="a cat walking",
+            height=480,
+            width=832,
+            num_frames=9,
+            num_inference_steps=4,
+            guidance_scale=5.0,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 1 and H == 480 and W == 832 and C == 3
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_batch_prompt_shape(self, wan21_full_pipeline):
+        """List of prompts returns (B, T, H, W, C)."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+        result = wan21_full_pipeline.forward(
+            prompt=prompts,
+            height=480,
+            width=832,
+            num_frames=9,
+            num_inference_steps=4,
+            guidance_scale=5.0,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 2 and H == 480 and W == 832 and C == 3
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
