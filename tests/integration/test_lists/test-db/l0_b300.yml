@@ -56,5 +56,5 @@ l0_b300:
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
   # ---- end MoE tests ----
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-eager]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-eager]
