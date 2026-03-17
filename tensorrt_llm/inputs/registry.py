@@ -692,6 +692,8 @@ def _get_single_mm_token_lengths(
 ) -> Optional[List[int]]:
     """Get the single set of MM token lengths (first value from find_mm_token_lengths). Returns None if empty."""
     num_mm_tokens_by_key = find_mm_token_lengths(mm_data, input_processor)
+    if not num_mm_tokens_by_key:
+        return None
     # find_mm_token_lengths returns Dict[modality, List[int]], e.g. {"image": [2928, 2928]}.
     # We need the list of per-item lengths (for find_mm_token_positions), We take the first modality's
     # list; multi-modality is not yet supported (see TODO in multimodal_hashing_process).
