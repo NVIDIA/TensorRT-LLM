@@ -1,0 +1,21 @@
+# IterResearch configuration
+# Fill in the API keys below, then pass this file via --config to the MCP
+# server and/or the runner script.
+
+# ---- MCP server (iter_research_tools.py) ----
+search_api_key: ""           # SerpAPI key for google_search / google_scholar
+search_api_url: "https://serpapi.com/search"
+jina_api_key: ""             # Jina Reader API key for webpage fetching
+scraper_api_key: ""          # ScraperAPI key (optional, fallback for Jina)
+sandbox_endpoint: "http://127.0.0.1:8080"  # Python sandbox for PythonInterpreter
+
+# ---- MCP server networking ----
+mcp_host: "0.0.0.0"
+mcp_port: 8083
+
+# ---- Runner (run_iter_research.py) ----
+openai_api_key: "tensorrt_llm"
+base_url: "http://localhost:8000/v1"
+model: "Qwen/Qwen2.5-72B-Instruct"
+max_turn: 25
+max_tokens: 16384
