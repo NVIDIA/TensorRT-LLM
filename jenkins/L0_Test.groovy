@@ -1332,9 +1332,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
             }
             echo "Finished test stage execution."
-        }
-            }
-        }
+            }  // end CloudManager.withSlurmSshCredentials
+        }  // end withCredentials
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
