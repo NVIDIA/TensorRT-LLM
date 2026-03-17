@@ -535,10 +535,16 @@ public:
         return std::unique_lock<std::mutex>(mMutex);
     }
 
-    bool isRemoved() const noexcept { return mRemoved; }
+    bool isRemoved() const noexcept
+    {
+        return mRemoved;
+    }
 
     // Called by KVCacheManager::removeSequence while holding the lock.
-    void markRemoved() noexcept { mRemoved = true; }
+    void markRemoved() noexcept
+    {
+        mRemoved = true;
+    }
 };
 
 // attach metadata to a pool pointer
