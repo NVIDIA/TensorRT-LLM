@@ -129,7 +129,7 @@ For example, you can run :
 ```
 export TRTLLM_USE_UCX_KVCACHE=1
 
-mpirun -n <num_ranks> --allow-run-as-root --oversubscribe ./executorExampleDisaggregated --context_engine_dir <path_to_context_engine_dir> --context_rank_size <num_ranks_for_context> --generation_engine_dir <path_to_generation_engine_dir> --generation_rank_size <num_ranks_for_generation> --input_tokens ../inputTokens.csv
+mpirun -n <num_ranks> --allow-run-as-root --oversubscribe ./executorExampleDisaggregated --context_engine_dir <path_to_context_engine_dir> --context_rank_size <num_ranks_for_context> --generation_engine_dir <path_to_generation_engine_dir> --generation_rank_size <num_ranks_for_generation> --input_tokens_csv_file ../inputTokens.csv
 
 ```
 where `<num_ranks_for_context>` must equal to `tp*pp` for the context engine, and `<num_ranks_for_generation>` must equal to `tp*pp` for the generation engine,the context engine and generation engine can be heterogeneous in parallelism. `<num_ranks>` must equal to `<num_ranks_for_context>+<num_ranks_for_generation>+1`, the additional rank is used as orchestrator process.
