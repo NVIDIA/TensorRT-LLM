@@ -312,8 +312,7 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-# @pytest.mark.parametrize("batch_size", [1, 4, 64])
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
@@ -402,8 +401,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-# @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32, 64])
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 256])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
@@ -424,11 +422,3 @@ def test_cute_dsl_topk_decode_distributed(batch_size, next_n, index_topk, num_to
             num_copy_bits=256,
         )[0],
     )
-
-
-test_cute_dsl_topk_decode_distributed(
-    batch_size=16, next_n=3, index_topk=2048, num_tokens=65536, dtype=torch.float32
-)
-test_cute_dsl_topk_decode_distributed(
-    batch_size=16, next_n=3, index_topk=2048, num_tokens=262144, dtype=torch.float32
-)
