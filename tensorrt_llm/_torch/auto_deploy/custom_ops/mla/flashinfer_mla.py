@@ -381,6 +381,40 @@ class _FlashInferMLAPlanner:
 _GlobalFlashInferMLAPlanner = _FlashInferMLAPlanner()
 
 
+def _append_paged_mla_kv_cache_fallback(
+    append_ckv: torch.Tensor,
+    append_kpe: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+) -> None:
+    """Write MLA paged cache entries without relying on FlashInfer's append kernel.
+
+    FlashInfer 0.6.6 exposes wider MLA decode support than its paged-cache append
+    kernel. In particular, decode planning/execution accepts the smaller
+    ``kv_lora_rank=256, qk_rope_head_dim=64`` shape family, but
+    ``append_paged_mla_kv_cache`` is still hard-coded to ``512/64``. This fallback
+    reproduces FlashInfer's page addressing logic directly from the paged-cache
+    metadata that AutoDeploy already materializes.
+    """
+    page_size = ckv_cache.shape[1]
+
+    batch_indices = batch_indices.to(torch.long)
+    positions = positions.to(torch.long)
+    kv_indices = kv_indices.to(torch.long)
+    kv_indptr = kv_indptr.to(torch.long)
+
+    page_offsets = kv_indptr[batch_indices] + torch.div(positions, page_size, rounding_mode="floor")
+    entry_idx = torch.remainder(positions, page_size)
+    page_idx = kv_indices[page_offsets]
+
+    ckv_cache[page_idx, entry_idx] = append_ckv
+    kpe_cache[page_idx, entry_idx] = append_kpe
+
+
 @torch.library.custom_op("auto_deploy::flashinfer_mla_prepare_metadata", mutates_args=())
 def prepare_flashinfer_mla_metadata(
     position_ids: torch.Tensor,
@@ -538,19 +572,40 @@ def flashinfer_mla_with_cache(
     compressed_kv_for_cache = compressed_kv_flat.to(ckv_cache.dtype)
     kpe_for_cache = kpe_flat.to(kpe_cache.dtype)
 
-    # Append to paged cache using FlashInfer's append function
-    # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
-    flashinfer.page.append_paged_mla_kv_cache(
-        compressed_kv_for_cache[:num_total_tokens],
-        kpe_for_cache[:num_total_tokens],
-        flashinfer_batch_indices[:num_total_tokens],
-        flashinfer_positions[:num_total_tokens],
-        ckv_cache,
-        kpe_cache,
-        cache_loc,
-        cu_num_pages[: num_seq + 1],
-        last_page_len[:num_seq],
-    )
+    append_ckv = compressed_kv_for_cache[:num_total_tokens]
+    append_kpe = kpe_for_cache[:num_total_tokens]
+    append_batch_indices = flashinfer_batch_indices[:num_total_tokens]
+    append_positions = flashinfer_positions[:num_total_tokens]
+    kv_indptr = cu_num_pages[: num_seq + 1]
+    kv_last_page_len = last_page_len[:num_seq]
+
+    # FlashInfer's paged MLA append kernel is still limited to DeepSeek-style
+    # 512/64 cache dimensions in the currently supported runtime. Fall back to
+    # repo-local writes for smaller MLA shapes while keeping FlashInfer planning
+    # and decode kernels for the actual attention computation.
+    if kv_lora_rank == 512 and qk_rope_head_dim == 64:
+        flashinfer.page.append_paged_mla_kv_cache(
+            append_ckv,
+            append_kpe,
+            append_batch_indices,
+            append_positions,
+            ckv_cache,
+            kpe_cache,
+            cache_loc,
+            kv_indptr,
+            kv_last_page_len,
+        )
+    else:
+        _append_paged_mla_kv_cache_fallback(
+            append_ckv,
+            append_kpe,
+            append_batch_indices,
+            append_positions,
+            ckv_cache,
+            kpe_cache,
+            cache_loc,
+            kv_indptr,
+        )
 
     if out is not None:
         y = out.view(bs, num_heads, v_head_dim)
@@ -937,9 +992,8 @@ class FlashInferMLAAttention(AttentionDescriptor):
         kv_lora_rank = compressed_kv_fake.shape[-1]
         qk_rope_head_dim = kpe_fake.shape[-1]
 
-        # flashinfer mla requires kv_lora_rank to be 512 and qk_rope_head_dim to be 64
-        if kv_lora_rank != 512:
-            raise ValueError("kv_lora_rank must be 512 for flashinfer_mla")
+        # FlashInfer MLA decode currently supports multiple kv_lora_rank values,
+        # but still expects the standard 64-dim RoPE cache component.
         if qk_rope_head_dim != 64:
             raise ValueError("qk_rope_head_dim must be 64 for flashinfer_mla")
 

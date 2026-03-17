@@ -10,6 +10,34 @@ from typing import Dict
 
 import torch
 
+_FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype_name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, dtype_name, None)) is not None
+)
+
+
+def _index_select_with_float8_cpu_workaround(
+    tensor: torch.Tensor, dim: int, index: torch.Tensor
+) -> torch.Tensor:
+    """Index-select helper that preserves raw FP8 encodings on CPU.
+
+    PyTorch CPU indexing on float8 tensors currently raises ``index_cpu`` errors.
+    This hook only needs to reorder checkpoint values, so for CPU float8 tensors we
+    reorder the underlying bytes via a ``uint8`` view and reinterpret them back.
+    """
+    if tensor.device.type != "cpu" or tensor.dtype not in _FLOAT8_DTYPES:
+        return tensor.index_select(dim, index.to(device=tensor.device))
+
+    uint8_view = tensor.view(torch.uint8)
+    reordered = uint8_view.index_select(dim, index.to(device=tensor.device))
+    return reordered.view(tensor.dtype)
+
 
 def _rope_deinterleave_load_hook(
     state_dict: Dict[str, torch.Tensor],
@@ -43,7 +71,7 @@ def _rope_deinterleave_load_hook(
             w = w.view(num_heads, qk_head_dim, -1)
             w_nope = w[:, :qk_nope_head_dim, :]
             w_rope = w[:, qk_nope_head_dim:, :]
-            w_rope = w_rope[:, perm, :]
+            w_rope = _index_select_with_float8_cpu_workaround(w_rope, 1, perm)
             w = torch.cat([w_nope, w_rope], dim=1)
             state_dict[q_key] = w.view(-1, w.shape[-1])
 
@@ -53,7 +81,7 @@ def _rope_deinterleave_load_hook(
             w = state_dict[kv_key]
             w_kv = w[:kv_lora_rank, :]
             w_pe = w[kv_lora_rank:, :]
-            w_pe = w_pe[perm, :]
+            w_pe = _index_select_with_float8_cpu_workaround(w_pe, 0, perm)
             state_dict[kv_key] = torch.cat([w_kv, w_pe], dim=0)
 
         # --- kv_a_proj_with_mqa.bias (if present) ---
@@ -62,5 +90,5 @@ def _rope_deinterleave_load_hook(
             b = state_dict[kv_bias_key]
             b_kv = b[:kv_lora_rank]
             b_pe = b[kv_lora_rank:]
-            b_pe = b_pe[perm]
+            b_pe = _index_select_with_float8_cpu_workaround(b_pe, 0, perm)
             state_dict[kv_bias_key] = torch.cat([b_kv, b_pe])

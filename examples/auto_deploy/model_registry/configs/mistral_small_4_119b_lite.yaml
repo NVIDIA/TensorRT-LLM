@@ -1,0 +1,15 @@
+# Standalone AutoDeploy config for a reduced-layer Mistral Small 4 119B sanity run.
+runtime: trtllm
+attn_backend: trtllm
+compile_backend: torch-cudagraph
+model_factory: AutoModelForImageTextToText
+skip_loading_weights: false
+max_seq_len: 512
+world_size: 8
+tokenizer: tensorrt_llm/_torch/auto_deploy/tokenizers/mistral_small_4_119b
+model_kwargs:
+  text_config:
+    num_hidden_layers: 5
+transforms:
+  insert_cached_mla_attention:
+    backend: flashinfer_mla

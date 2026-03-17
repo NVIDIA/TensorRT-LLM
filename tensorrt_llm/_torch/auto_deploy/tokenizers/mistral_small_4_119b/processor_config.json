@@ -1,0 +1,7 @@
+{
+  "processor_class": "ADMistralSmall4Processor",
+  "auto_map": {
+    "AutoProcessor": "processing_mistral_small_4.ADMistralSmall4Processor"
+  },
+  "source_model_name_or_path": "mistralai/Mistral-Small-4-119B-2603"
+}
