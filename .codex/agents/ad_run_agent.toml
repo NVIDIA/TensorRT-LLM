@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+model_reasoning_effort = "medium"
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+Run AutoDeploy build_and_run_ad.py flows for a given model and archive the results.
+
+If the caller did not provide the model id and a short run description, ask first. If the caller wants the local yaml flow instead of the registry flow, also ask for the config yaml.
+
+Setup before the first run:
+- Create $PWD/ad_run_logs/
+- Create or append to $PWD/ad_run_logs/<MODEL_SHORT_NAME>_worklog.md
+- Derive MODEL_SHORT_NAME from the config yaml filename without the .yaml suffix for the local yaml flow.
+- Derive MODEL_SHORT_NAME from MODEL_HF_ID for the registry flow, unless the caller explicitly provides a model short name.
+
+Workflow:
+1. Run one of the following flows:
+
+Registry flow:
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR> python examples/auto_deploy/build_and_run_ad.py \
+  --model <MODEL_HF_ID> \
+  --use-registry \
+  2>&1 | tee <LOG_FILE>
+
+Local yaml flow:
+AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR> python examples/auto_deploy/build_and_run_ad.py \
+  --model <MODEL_HF_ID> \
+  --args.yaml-extra examples/auto_deploy/model_registry/configs/<CONFIG_YAML_FILE> \
+  2>&1 | tee <LOG_FILE>
+
+Use a timestamped temporary log file name such as ad_run_<MODEL_SHORT_NAME>_<YYYYMMDD_HHMMSS>.log.
+
+2. Evaluate the output:
+- If compilation failed, extract and summarize the error.
+- If compilation succeeded, inspect the generated text and assess whether it is coherent, on-topic, and not garbled or repetitious nonsense.
+
+3. Archive the log as:
+$PWD/ad_run_logs/<MODEL_SHORT_NAME>_<YYYYMMDD_HHMMSS>_<STATUS>.log
+
+Allowed STATUS values:
+- success
+- compile_error
+- runtime_error
+- bad_generation
+
+4. Update the worklog by appending:
+## Run: <YYYY-MM-DD HH:MM:SS>
+
+**Description:** <description provided by caller>
+**Model:** <MODEL_HF_ID>
+**Config:** <CONFIG_YAML_FILE> or registry entry from `models.yaml`
+**Log:** <path to archived log file>
+**Status:** <success | compile_error | runtime_error | bad_generation>
+
+### Summary
+<brief summary of the outcome>
+
+If the worklog does not exist, create it with this header first:
+# AutoDeploy Run Worklog: <MODEL_SHORT_NAME>
+
+---
+
+Notes:
+- If the run fails, show the relevant error and suggest next steps.
+- Use the available shell execution path in this environment for GPU-capable commands rather than assuming a separate gpu-shell tool exists.
+"""
