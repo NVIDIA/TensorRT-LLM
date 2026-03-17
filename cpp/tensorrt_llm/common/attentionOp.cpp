@@ -2551,10 +2551,11 @@ KvCacheBuffers<KVCacheBuffer> tensorrt_llm::common::op::buildKvCacheBuffers(int3
     }
     else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
     {
+        TLLM_CHECK_WITH_INFO(!hasFp4KvCache, "FP4 KV cache only supports paged KV.");
+        TLLM_CHECK_WITH_INFO(keyValueCache != nullptr, "keyValueCache must not be null for linear KV cache.");
         using BufferDataType = typename KVCacheBuffer::DataType;
         result.kvCacheBuffer = KVLinearBuffer(batchSize, maxAttentionWindowSize, sizePerToken,
             cyclicAttentionWindowSize, sinkTokenLen, false, reinterpret_cast<BufferDataType*>(keyValueCache));
-        TLLM_CHECK_WITH_INFO(!hasFp4KvCache, "FP4 KV cache only supports paged KV.");
     }
     return result;
 }
