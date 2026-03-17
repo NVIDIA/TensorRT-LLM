@@ -286,6 +286,7 @@ class MoeAlltoAll:
         payload,
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        use_low_precision_combine: bool = False,
     ):
         """
         Perform MoE all-to-all combine operation.
@@ -294,6 +295,7 @@ class MoeAlltoAll:
             payload: [ep_size, max_tokens_per_rank, num_elements_per_token] tensor to combine. The dtype must be float32, bfloat16 or float16.
             runtime_max_tokens_per_rank: Maximum of the number of tokens of each DP rank's local batch.
             payload_in_workspace: If True, 'payload' is a view into 'workspace' at 'combine_payload_offset' and no staging copy is needed. If False, the op stages 'payload' into the workspace region before combining.
+            use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink transfer (halves NVLink bandwidth usage, output precision is preserved).
 
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
@@ -305,7 +307,7 @@ class MoeAlltoAll:
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            payload_in_workspace)
+            payload_in_workspace, use_low_precision_combine)
 
         # Reset state for next round
         self._state = _A2AState()

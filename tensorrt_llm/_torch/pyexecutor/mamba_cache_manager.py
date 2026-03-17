@@ -206,7 +206,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.spec_state_size = spec_state_size
 
         # get tp size
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -531,7 +531,7 @@ class MambaCacheManager(BaseResourceManager):
                 n_groups=n_groups,
                 head_dim=head_dim,
                 num_layers=num_layers,
-                max_batch_size=max_batch_size,
+                max_batch_size=max_num_sequences,
                 spec_state_size=spec_state_size,
                 mapping=mapping,
                 dtype=dtype,
