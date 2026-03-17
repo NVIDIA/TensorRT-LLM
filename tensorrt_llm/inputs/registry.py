@@ -746,10 +746,9 @@ def create_input_processor_with_hash(
         )
         num_mm_tokens = _get_single_mm_token_lengths(mm_data, input_processor)
         if num_mm_tokens is None:
-            logger.warning(
-                "tokenized_multimodal_process: no mm tokens from find_mm_token_lengths, returning [], None"
-            )
-            return [], None
+            raise ValueError(
+                "tokenized_multimodal_process: find_mm_token_lengths returned "
+                "no token lengths for the provided multi_modal_data.")
 
         expanded_ids = input_processor.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
