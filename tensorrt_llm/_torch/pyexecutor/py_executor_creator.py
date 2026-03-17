@@ -369,11 +369,7 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        # Propagate runtime max_batch_size so one-model workers can pre-allocate
-        # buffers without hardcoding. Pydantic forbids extra fields, so use
-        # object.__setattr__ to bypass validation.
-        object.__setattr__(spec_config, '_runtime_max_batch_size',
-                           max_batch_size)
+        spec_config.runtime_max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode

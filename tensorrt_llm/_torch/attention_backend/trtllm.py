@@ -528,10 +528,6 @@ class TrtllmAttentionWrapper:
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
-        # Zero bl_tree_mask before each attention call to clear stale bits from atomicOr
-        if self.spec_decoding_bl_tree_mask is not None:
-            self.spec_decoding_bl_tree_mask.zero_()
-
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
@@ -1465,7 +1461,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def spec_decoding_param_prepare_for_blackwell(self) -> None:
         """
         Prepare the blackwell parameters for the speculative decoding (Medusa and Eagle) generation-phase attention kernels.
-        Uses persistent buffers (only allocate if None) for CUDA graph compatibility.
         """
         if self.spec_decoding_bl_tree_mask_offset is None:
             self.spec_decoding_bl_tree_mask_offset = torch.zeros(

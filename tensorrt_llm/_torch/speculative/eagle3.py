@@ -471,6 +471,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 self._saved_kv_lens_cuda)
             self._saved_kv_lens_cuda = None
 
+    # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
+    # @torch.compile(options={"max-autotune": True})
+
     def forward(self,
                 input_ids,
                 position_ids,
@@ -597,6 +600,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     ],
                                               dim=0)
                 else:
+                    # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                     gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
                 if self.guided_decoder is not None:
@@ -605,6 +609,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                         num_accepted_tokens,
                                                         draft_step=i)
 
+                # Update attn_metadata.all_rank_num_tokens for attention DP
                 if original_all_rank_num_tokens is not None:
                     if i == 0:
                         attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
@@ -614,6 +619,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 hidden_states, hidden_states_to_save = draft_model.model(
                     **inputs)
 
+                # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+                # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+                # then the following step can use regular decoding mode to generate 1 tokens per step.
+                # Currently the spec-dec mask for chained tree is not implemented yet.
+                # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
                 attn_metadata.use_spec_decoding = False
 
                 logits = draft_model.logits_processor(hidden_states[gather_ids],
@@ -627,16 +637,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
                 new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
+                # update inputs
                 hidden_states = hidden_states_to_save[gather_ids]
                 position_ids = inputs["position_ids"][gather_ids] + 1
+                # update attn_metadata
                 if i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
+                    # cannot run generation if there is no kv cache
                     if inputs["attn_metadata"].kv_cache_manager is not None:
                         attn_metadata.host_request_types[:attn_metadata.
                                                          num_contexts].fill_(1)
                         attn_metadata.num_contexts = 0
+                    # update kv_lens_cuda
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                             runtime_draft_len -
@@ -644,6 +658,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
                     attn_metadata.kv_lens_cuda[:batch_size] += 1
+                # support attention dp
                 inputs = {
                     "input_ids": new_draft_token,
                     "position_ids": position_ids,
