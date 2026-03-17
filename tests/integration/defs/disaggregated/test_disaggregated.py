@@ -2181,9 +2181,12 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, env=llm_venv._new_env,
+        setup_disagg_cluster(config_file, env=env,
                              model_name=llama_model_root,
                              cwd=llm_venv.get_working_directory(),
                              server_start_timeout=600)
@@ -2246,13 +2249,18 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 # Skip position 0: the first token logprob can diverge
                 # between streaming and non-streaming in disaggregated mode
                 # due to the context/generation handoff boundary.
-                for i, (n, s) in enumerate(zip(ns_logprobs, st_logprobs)):
+                comparable = 0
+                for i, (n, s) in enumerate(zip(ns_logprobs, st_logprobs,
+                                                strict=True)):
                     if i == 0 or n is None or s is None:
                         continue
+                    comparable += 1
                     rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
                                                                           1e-5)
                     assert np.isclose(n, s, rtol=rtol, atol=atol), \
                         f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
+                assert comparable > 0, (
+                    f"[{api_type}] no comparable post-handoff logprobs found")
 
                 # 2) Chat API with top_logprobs (requires gather_generation_logits)
                 if api_type == "chat":
