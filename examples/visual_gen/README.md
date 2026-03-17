@@ -139,22 +139,92 @@ python visual_gen_wan_i2v.py \
 ```
 
 
+## LTX2 (Text/Image-to-Video with Audio)
+
+LTX2 generates video **with audio** from text prompts or input images.
+It uses a Gemma3 text encoder (provided separately via `--text_encoder_path`)
+and supports BF16, FP8, and FP4 precision checkpoints.
+
+Please refer to tensorrt_llm/_torch/visual_gen/models/ltx2/LTX_2_CHECKPOINT_FORMAT.md for model checkpoint info.
+
+### Basic Usage
+
+**Text-to-Video (single GPU):**
+```bash
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --height 720 --width 1280 --num_frames 121 \
+    --steps 40 --guidance_scale 4.0 --seed 42 \
+    --output_path output_t2v.mp4
+```
+
+**Image-to-Video:**
+```bash
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --image ${PROJECT_ROOT}/examples/visual_gen/cat_piano.png \
+    --image_cond_strength 1.0 \
+    --height 720 --width 1280 --num_frames 121 \
+    --steps 40 --seed 42 \
+    --output_path output_i2v.mp4
+```
+
+### Precision Variants
+
+LTX2 ships checkpoints at three precision levels. Simply point `--model_path` at the
+appropriate directory:
+
+```bash
+# FP8
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp8/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --height 720 --width 1280 --num_frames 121 \
+    --output_path output_fp8.mp4
+
+# FP4
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp4/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A cute cat playing piano" \
+    --height 512 --width 768 --num_frames 121 \
+    --output_path output_fp4.mp4
+```
+
+---
+
 ## Common Arguments
 
-| Argument | FLUX | WAN | Default | Description |
-|----------|------|-----|---------|-------------|
-| `--height` | ✓ | ✓ | 1024 / 720 | Output height |
-| `--width` | ✓ | ✓ | 1024 / 1280 | Output width |
-| `--num_frames` | — | ✓ | 81 | Number of frames |
-| `--steps` | ✓ | ✓ | 50 | Denoising steps |
-| `--guidance_scale` | ✓ | ✓ | 3.5 / 5.0 | Guidance strength |
-| `--seed` | ✓ | ✓ | 42 | Random seed |
-| `--enable_teacache` | ✓ | ✓ | False | Cache optimization |
-| `--teacache_thresh` | ✓ | ✓ | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | ✓ | VANILLA | VANILLA or TRTLLM |
-| `--cfg_size` | — | ✓ | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | ✓ | 1 | Sequence parallelism |
-| `--linear_type` | ✓ | ✓ | default | Quantization type |
+| Argument | FLUX | WAN | LTX2 | Default | Description |
+|----------|------|-----|------|---------|-------------|
+| `--model_path` | ✓ | ✓ | — | Path to model checkpoint directory |
+| `--text_encoder_path` | — | ✓ | — | Path to Gemma3 text encoder |
+| `--prompt` | ✓ | ✓ | — | Text prompt for generation |
+| `--negative_prompt` | — | ✓ | *(built-in)* | Negative prompt |
+| `--height` | ✓ | ✓ | ✓ | 1024 / 720 | Output height |
+| `--width` | ✓ | ✓ | ✓ | 1024 / 1280 | Output width |
+| `--num_frames` | — | ✓ | ✓ | 81 / 121 | Number of frames |
+| `--frame_rate` | — | ✓ | 24.0 | Output frame rate (fps) |
+| `--steps` | ✓ | ✓ | ✓ | 50 / 40 | Denoising steps |
+| `--guidance_scale` | ✓ | ✓ | ✓ | 3.5 / 5.0 / 4.0 | Guidance strength |
+| `--seed` | ✓ | ✓ | ✓ | 42 | Random seed |
+| `--image` | — | ✓ | None | Input image for image-to-video |
+| `--image_cond_strength` | — | ✓ | 1.0 | Image conditioning strength |
+| `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
+| `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
+| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
+| `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
+| `--ulysses_size` | ✓ | ✓ | — | 1 | Sequence parallelism |
+| `--linear_type` | ✓ | ✓ | — | default | Quantization type |
+| `--enhance_prompt` | — | ✓ | False | Gemma3 prompt enhancement |
+| `--stg_scale` | — | ✓ | 0.0 | Spatiotemporal guidance scale |
+| `--modality_scale` | — | ✓ | 1.0 | Cross-modal guidance scale |
+| `--rescale_scale` | — | ✓ | 0.0 | Variance-preserving rescale factor |
 
 ## Troubleshooting
 
@@ -182,6 +252,7 @@ python visual_gen_wan_i2v.py \
 
 - **FLUX**: `.png` (image)
 - **WAN**: `.mp4` if FFmpeg is installed, otherwise `.avi` (video)
+- **LTX2**: `.mp4` (video with audio) if FFmpeg is installed, otherwise `.avi` (video)
 
 ## Serving
 

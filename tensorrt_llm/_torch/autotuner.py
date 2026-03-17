@@ -1302,7 +1302,15 @@ class AutoTuner:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
             if self.skip_dynamic_tuning_buckets:
-                opt_shapes = ()
+                if spec.map_to_tuning_buckets is not None:
+                    # Still include the bucketed value of the actual shape so the
+                    # cache key used during profiling (raw) aligns with the key
+                    # used during inference (bucketed via map_to_tuning_buckets).
+                    actual_val = base_profile.shapes[spec.input_idx][
+                        spec.dim_idx].val
+                    opt_shapes = (spec.map_to_tuning_buckets(actual_val), )
+                else:
+                    opt_shapes = ()
             elif callable(spec.gen_tuning_buckets):
                 if tuning_config.tune_max_num_tokens is None:
                     # Use the current input size as the opt value

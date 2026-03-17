@@ -15,7 +15,7 @@
 
 from typing import Callable, Iterator, Protocol, cast
 
-from llist import sllist, sllistnode
+from llist import dllist, dllistnode
 
 from .._common import NDEBUG, CacheLevel, PageStatus, Priority
 from .._exceptions import OutOfPagesError
@@ -74,12 +74,12 @@ class EvictionPolicy(Protocol):
 
 class LRUEvictionPolicy:
     __slots__ = ("_queue",)
-    _queue: sllist
+    _queue: dllist
 
     def __init__(self) -> None:
-        self._queue = sllist()
+        self._queue = dllist()
 
-    def push(self, page: EvictablePage, evict_first: bool = False) -> sllistnode:
+    def push(self, page: EvictablePage, evict_first: bool = False) -> dllistnode:
         assert page.node_ref is None
         return self._queue.appendleft(page) if evict_first else self._queue.append(page)
 
@@ -90,7 +90,7 @@ class LRUEvictionPolicy:
         self.remove(victim)
         return page
 
-    def remove(self, node: sllistnode) -> EvictablePage:
+    def remove(self, node: dllistnode) -> EvictablePage:
         # assert isinstance(node, NodeRef) # mypyc does not support runtime_checkable
         assert node == node.value.node_ref
         return self._queue.remove(node)

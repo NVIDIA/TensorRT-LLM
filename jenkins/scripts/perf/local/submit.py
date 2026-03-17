@@ -296,8 +296,8 @@ def generate_sbatch_params(args, hardware_config, work_dir):
 
 def generate_srun_args(args, runtime_mode, timestamp):
     """Generate srun arguments."""
-    is_disagg = runtime_mode == "disaggregated"
-    container_name = f"{'disagg' if is_disagg else 'aggr'}_test-{timestamp}"
+    is_aggr = runtime_mode == "aggregated"
+    container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
 
     lines = [
         f"--container-name={container_name}",
@@ -312,9 +312,7 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    if is_disagg:
-        lines.append("--mpi=pmix")
-    else:
+    if is_aggr:
         lines.append("--mpi=pmi2")
 
     return lines
@@ -648,7 +646,10 @@ def main():
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
-                'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
+                (
+                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
+                ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",
                 f"export numGenServers={hardware_config.get('num_gen_servers', '')}",
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",

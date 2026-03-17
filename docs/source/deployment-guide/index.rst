@@ -32,6 +32,11 @@ This table is designed to provide a straightforward starting point; for detailed
      - Inference Scenario
      - Config
      - Command
+   * - `Nemotron v3 Super (NVFP4) <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4>`_
+     - B200, GB200
+     - Max Throughput
+     - `nemotron-3-super-throughput.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-3-super-throughput.yaml>`_
+     - ``trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-3-super-throughput.yaml``
    * - `DeepSeek-R1 <https://huggingface.co/deepseek-ai/DeepSeek-R1-0528>`_
      - H100, H200
      - Max Throughput
@@ -97,6 +102,7 @@ The deployment guides below provide more detailed instructions for serving speci
    :maxdepth: 1
    :name: Deployment Guides
 
+   deployment-guide-for-nemotron-3-super-on-trtllm.md
    deployment-guide-for-deepseek-r1-on-trtllm.md
    deployment-guide-for-llama3.3-70b-on-trtllm.md
    deployment-guide-for-llama4-scout-on-trtllm.md

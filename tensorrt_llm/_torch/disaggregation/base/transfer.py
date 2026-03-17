@@ -6,6 +6,7 @@ from enum import Enum
 from typing import List, Optional
 
 from tensorrt_llm import DisaggregatedParams
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 
 @dataclass
@@ -86,13 +87,6 @@ class SessionState:
     finished_tasks: List[TaskIdType]
 
 
-@dataclass
-class SessionArgsBase:
-    """Base arguments for transfer sessions."""
-
-    params: DisaggregatedParams
-
-
 class SenderBase(ABC):
     """Base class for sending KV cache data."""
 
@@ -105,72 +99,48 @@ class ReceiverBase(ABC):
     ...
 
 
-class TxSessionBase(ABC):
-    def __init__(self, sender: SenderBase, args: SessionArgsBase):
-        """
-        Initializes the transmission session.
-        :param sender: The sender instance responsible for sending data.
-        :param args: The session arguments.
-        """
-        self._sender = sender
-        self._base_args = args
+def get_unique_rid(request: LlmRequest) -> Optional[int]:
+    return (
+        request.py_disaggregated_params.disagg_request_id
+        if request.py_disaggregated_params
+        else request.request_id
+    )
+
+
+class SessionBase(ABC):
+    def __init__(self, request: LlmRequest):
+        self._request = request
+        self._unique_rid: Optional[int] = get_unique_rid(request)
+        self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
+        self._exception: Optional[Exception] = None
 
     @property
-    @abstractmethod
+    def unique_rid(self) -> Optional[int]:
+        # readonly
+        return self._unique_rid
+
+    @property
+    def disagg_params(self) -> Optional[DisaggregatedParams]:
+        return self._request.py_disaggregated_params if self._request else None
+
+    @property
+    def request(self) -> Optional[LlmRequest]:
+        return self._request
+
+    @property
     def state(self) -> SessionState:
         """
         Returns the current state of the session.
         """
-        ...
+        return self._state
 
-    @abstractmethod
-    def poll_task(self, id: TaskIdType) -> SessionStatus:
+    @state.setter
+    def state(self, state: SessionState):
         """
-        Polls the status of a specific task by its ID.
-        :param id: The task ID to poll.
+        Set the state of the session.
+        :param state: The state to set.
         """
-        ...
-
-    @abstractmethod
-    def send(self, slice: KVSlice) -> TaskIdType:
-        """
-        Sends a slice of KV cache data and returns the task ID.
-        :param slice: The KV slice to send.
-        """
-        ...
-
-    @property
-    @abstractmethod
-    def exception(self) -> Optional[Exception]:
-        """
-        Returns any exception that occurred during the session.
-        """
-        ...
-
-    @abstractmethod
-    def close(self) -> None:
-        """
-        Closes the session and releases any resources.
-        """
-        ...
-
-
-class RxSessionBase(ABC):
-    def __init__(self, receiver: ReceiverBase, args: SessionArgsBase):
-        """
-        Initializes the reception session.
-        :param receiver: The receiver instance responsible for receiving data.
-        """
-        self._receiver = receiver
-        self._base_args = args
-
-    @property
-    @abstractmethod
-    def state(self) -> SessionState:
-        """
-        Returns the current state of the session.
-        """
-        ...
+        self._state = state
 
     @abstractmethod
     def poll_task(self, task_id: TaskIdType) -> SessionStatus:
@@ -181,22 +151,51 @@ class RxSessionBase(ABC):
         ...
 
     @abstractmethod
-    def receive(self, slice: KVSlice) -> TaskIdType:
+    def close(self) -> None:
         """
-        Receives a slice of KV cache data and returns the task ID.
-        :param slice: The KV slice to receive.
+        Closes the session and releases any resources.
         """
         ...
 
     @property
-    @abstractmethod
     def exception(self) -> Optional[Exception]:
-        """Returns any exception that occurred during the session."""
-        ...
+        """
+        Returns any exception that occurred during the session.
+        """
+        return self._exception
+
+
+class TxSessionBase(SessionBase):
+    def __init__(self, sender: SenderBase, request: LlmRequest):
+        """
+        Initializes the transmission session.
+        :param sender: The sender instance responsible for sending data.
+        :param request: The LLM request associated with this session.
+        """
+        self._sender = sender
+        super().__init__(request)
 
     @abstractmethod
-    def close(self) -> None:
+    def send(self, slice: KVSlice) -> TaskIdType:
         """
-        Closes the session and releases any resources.
+        Sends a slice of KV cache data and returns the task ID.
+        :param slice: The KV slice to send.
+        """
+
+
+class RxSessionBase(SessionBase):
+    def __init__(self, receiver: ReceiverBase, request: LlmRequest):
+        """
+        Initializes the reception session.
+        :param receiver: The receiver instance responsible for receiving data.
+        """
+        super().__init__(request)
+        self._receiver = receiver
+
+    @abstractmethod
+    def receive(self, slice: KVSlice) -> TaskIdType:
+        """
+        Receives a slice of KV cache data and returns the task ID.
+        :param slice: The KV slice to receive.
         """
         ...

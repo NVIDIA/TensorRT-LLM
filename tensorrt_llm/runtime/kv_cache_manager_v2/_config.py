@@ -132,6 +132,9 @@ class SsmLayerConfig:
     buffers: list[BufferConfig]
 
     def __post_init__(self) -> None:
+        assert len(set(buffer.role for buffer in self.buffers)) == len(self.buffers), (
+            "duplicate buffer role"
+        )
         assert all(buf.tokens_per_block_override is None for buf in self.buffers)
 
 
