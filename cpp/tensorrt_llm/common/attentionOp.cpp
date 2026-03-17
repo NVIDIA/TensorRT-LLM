@@ -1353,18 +1353,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     {
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
-            kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
+            auto arrays = buildKvCacheBlockArrays(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
                 sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
                 params.sink_token_length, params.can_use_one_more_block, params.host_primary_pool_pointer,
-                params.host_secondary_pool_pointer, params.block_offsets);
-            if (mKVCacheQuantMode.hasFp4KvCache())
-            {
-                kv_scale_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
-                    sizePerToken / 8, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
-                    params.sink_token_length, params.can_use_one_more_block,
-                    params.host_primary_block_scale_pool_pointer, params.host_secondary_block_scale_pool_pointer,
-                    params.block_offsets);
-            }
+                params.host_secondary_pool_pointer, params.host_primary_block_scale_pool_pointer,
+                params.host_secondary_block_scale_pool_pointer, params.block_offsets,
+                mKVCacheQuantMode.hasFp4KvCache());
+            kv_cache_buffer = arrays.kvCacheBuffer;
+            kv_scale_cache_buffer = arrays.kvScaleCacheBuffer;
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
         {
@@ -2248,19 +2244,14 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     {
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
-            using BufferDataType = typename KVCacheBuffer::DataType;
-            kv_cache_buffer = KVBlockArray(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock, sizePerToken,
-                params.cyclic_attention_window_size, params.max_cyclic_attention_window_size, params.sink_token_length,
-                params.can_use_one_more_block, params.host_primary_pool_pointer, params.host_secondary_pool_pointer,
-                reinterpret_cast<BufferDataType*>(params.block_offsets));
-            if (mKVCacheQuantMode.hasFp4KvCache())
-            {
-                kv_scale_cache_buffer = KVBlockArray(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock,
-                    sizePerToken / 8, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
-                    params.sink_token_length, params.can_use_one_more_block,
-                    params.host_primary_block_scale_pool_pointer, params.host_secondary_block_scale_pool_pointer,
-                    reinterpret_cast<BufferDataType*>(params.block_offsets));
-            }
+            auto arrays = buildKvCacheBlockArrays(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock,
+                sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
+                params.sink_token_length, params.can_use_one_more_block, params.host_primary_pool_pointer,
+                params.host_secondary_pool_pointer, params.host_primary_block_scale_pool_pointer,
+                params.host_secondary_block_scale_pool_pointer, params.block_offsets,
+                mKVCacheQuantMode.hasFp4KvCache());
+            kv_cache_buffer = arrays.kvCacheBuffer;
+            kv_scale_cache_buffer = arrays.kvScaleCacheBuffer;
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
         {
@@ -2571,6 +2562,25 @@ template void AttentionOp::prepareEnqueueGeneration<float, KVBlockArray>(Enqueue
 template void AttentionOp::prepareEnqueueGeneration<__nv_bfloat16, KVBlockArray>(
     EnqueueGenerationParams<__nv_bfloat16> const& params);
 #endif
+
+AttentionOp::KvCacheBuffers AttentionOp::buildKvCacheBlockArrays(int32_t batchSize, int32_t maxBlocksPerSeq,
+    int32_t tokensPerBlock, int32_t sizePerToken, int32_t cyclicAttentionWindowSize,
+    int32_t maxCyclicAttentionWindowSize, int32_t sinkTokenLen, bool canUseOneMoreBlock, void* primaryPoolPtr,
+    void* secondaryPoolPtr, void* primaryBlockScalePoolPtr, void* secondaryBlockScalePoolPtr,
+    KVBlockArray::DataType* blockOffsets, bool hasFp4KvCache)
+{
+    KvCacheBuffers result;
+    result.kvCacheBuffer = KVBlockArray(batchSize, maxBlocksPerSeq, tokensPerBlock, sizePerToken,
+        cyclicAttentionWindowSize, maxCyclicAttentionWindowSize, sinkTokenLen, canUseOneMoreBlock, primaryPoolPtr,
+        secondaryPoolPtr, blockOffsets);
+    if (hasFp4KvCache)
+    {
+        result.kvScaleCacheBuffer = KVBlockArray(batchSize, maxBlocksPerSeq, tokensPerBlock, sizePerToken / 8,
+            cyclicAttentionWindowSize, maxCyclicAttentionWindowSize, sinkTokenLen, canUseOneMoreBlock,
+            primaryBlockScalePoolPtr, secondaryBlockScalePoolPtr, blockOffsets);
+    }
+    return result;
+}
 
 int AttentionOp::initialize() noexcept
 {
