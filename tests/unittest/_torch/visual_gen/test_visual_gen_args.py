@@ -4,6 +4,7 @@
 """Tests for VisualGenArgs construction, validation, and serialization."""
 
 import pickle
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -186,3 +187,160 @@ class TestVisualGenArgsPickle:
         updated = args.model_copy(update={"device": "cuda:3"})
         assert updated.device == "cuda:3"
         assert args.device == "cuda"
+
+
+# =============================================================================
+# Batch Generation Input Parsing
+# =============================================================================
+
+
+class TestDiffusionRequestBatchPrompt:
+    """DiffusionRequest accepts Union[str, List[str]] for prompt field."""
+
+    def test_single_prompt(self):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+
+        req = DiffusionRequest(request_id=0, prompt="hello")
+        assert req.prompt == "hello"
+
+    def test_list_prompt(self):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+
+        prompts = ["a sunset", "a city"]
+        req = DiffusionRequest(request_id=0, prompt=prompts)
+        assert req.prompt == prompts
+        assert len(req.prompt) == 2
+
+
+class TestVisualGenBatchInputParsing:
+    """Test that VisualGen.generate_async() correctly parses batch inputs.
+
+    Uses mocking to avoid spawning GPU worker processes.
+    """
+
+    def _make_visual_gen_with_mock_executor(self):
+        """Create a VisualGen instance with a mocked executor."""
+        from tensorrt_llm.llmapi.visual_gen import VisualGen
+
+        # Patch __init__ to avoid spawning workers
+        with patch.object(VisualGen, "__init__", lambda self, *a, **kw: None):
+            vg = VisualGen.__new__(VisualGen)
+            vg.model_path = "/tmp/fake"
+            vg.diffusion_args = VisualGenArgs(checkpoint_path="/tmp/fake")
+            vg.req_counter = 0
+            vg.executor = MagicMock()
+            return vg
+
+    def _make_params(self):
+        from tensorrt_llm.llmapi.visual_gen import VisualGenParams
+
+        return VisualGenParams()
+
+    def test_string_input(self):
+        """String input → single-element list in DiffusionRequest."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        vg.generate_async(inputs="a cat", params=params)
+
+        # Check the DiffusionRequest passed to enqueue_requests
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        assert len(call_args) == 1
+        assert call_args[0].prompt == ["a cat"]
+
+    def test_dict_input(self):
+        """Dict input → prompt wrapped in list + negative_prompt extracted."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        vg.generate_async(
+            inputs={"prompt": "a cat", "negative_prompt": "blurry"},
+            params=params,
+        )
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        assert call_args[0].prompt == ["a cat"]
+        assert call_args[0].negative_prompt == "blurry"
+
+    def test_list_of_strings_input(self):
+        """List of strings → batch prompt in single DiffusionRequest."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        vg.generate_async(inputs=["a sunset", "a city"], params=params)
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        assert len(call_args) == 1
+        req = call_args[0]
+        assert req.prompt == ["a sunset", "a city"]
+        assert req.negative_prompt is None
+
+    def test_list_of_dicts_input(self):
+        """List of dicts → batch prompts with negative_prompt from first dict."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        vg.generate_async(
+            inputs=[
+                {"prompt": "a sunset", "negative_prompt": "dark"},
+                {"prompt": "a city"},
+            ],
+            params=params,
+        )
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        req = call_args[0]
+        assert req.prompt == ["a sunset", "a city"]
+        assert req.negative_prompt == "dark"
+
+    def test_mixed_list_input(self):
+        """Mixed list of strings and dicts → batch prompts extracted."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        vg.generate_async(inputs=["a sunset", {"prompt": "a city"}], params=params)
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        req = call_args[0]
+        assert req.prompt == ["a sunset", "a city"]
+
+    def test_conflicting_negative_prompt_raises(self):
+        """Conflicting per-item negative_prompt raises ValueError."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        with pytest.raises(ValueError, match="Per-item negative_prompt is not supported"):
+            vg.generate_async(
+                inputs=[
+                    {"prompt": "a sunset", "negative_prompt": "dark"},
+                    {"prompt": "a city", "negative_prompt": "light"},
+                ],
+                params=params,
+            )
+
+    def test_empty_batch_raises(self):
+        """Empty batch input raises ValueError."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        with pytest.raises(ValueError, match="at least one item"):
+            vg.generate_async(inputs=[], params=params)
+
+    def test_missing_prompt_in_dict_raises(self):
+        """Dict without 'prompt' key raises ValueError."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        with pytest.raises(ValueError, match="missing 'prompt'"):
+            vg.generate_async(
+                inputs=[{"negative_prompt": "dark"}],
+                params=params,
+            )
+
+    def test_invalid_input_raises(self):
+        """Invalid input type raises ValueError."""
+        vg = self._make_visual_gen_with_mock_executor()
+        params = self._make_params()
+
+        with pytest.raises(ValueError, match="Invalid inputs type"):
+            vg.generate_async(inputs=12345, params=params)

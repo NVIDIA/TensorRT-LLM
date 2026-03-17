@@ -1402,7 +1402,7 @@ class LTX2Pipeline(BasePipeline):
                 )
             )
             video = torch.cat(chunks, dim=2)
-            video = postprocess_video_tensor(video, remove_batch_dim=True)
+            video = postprocess_video_tensor(video)
             return video
 
         def decode_audio_fn(aud_latents):

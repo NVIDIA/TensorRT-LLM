@@ -21,7 +21,7 @@ class DiffusionRequest:
     """Request for diffusion inference with explicit model-specific parameters."""
 
     request_id: int
-    prompt: str
+    prompt: List[str]
     negative_prompt: Optional[str] = None
     height: int = 720
     width: int = 1280
