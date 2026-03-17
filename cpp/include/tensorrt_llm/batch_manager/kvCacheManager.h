@@ -2127,6 +2127,9 @@ public:
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
 private:
+    // Removes one token from sequence; caller must hold seqPtr->getLock().
+    void removeTokenLocked(GenerationRequest& sequence);
+
     // Maximum number of sequences
     SizeType32 mMaxNumSequences;
     // Maximum beam width

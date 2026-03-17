@@ -3039,20 +3039,8 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     return windowSizeToBlocks;
 }
 
-void KVCacheManager::removeToken(RequestIdType requestId)
+void KVCacheManager::removeTokenLocked(GenerationRequest& sequence)
 {
-    // TODO: add streamLLM support
-    auto seqPtr = getSequence(requestId);
-    if (!seqPtr)
-    {
-        return;
-    }
-    auto seqLock = seqPtr->getLock();
-    if (seqPtr->isRemoved())
-    {
-        return;
-    }
-    auto& sequence = *seqPtr;
     if (sequence.getNumTokens() == 0)
     {
         return;
@@ -3069,21 +3057,43 @@ void KVCacheManager::removeToken(RequestIdType requestId)
     }
 }
 
+void KVCacheManager::removeToken(RequestIdType requestId)
+{
+    // TODO: add streamLLM support
+    auto seqPtr = getSequence(requestId);
+    if (!seqPtr)
+    {
+        return;
+    }
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return;
+    }
+    removeTokenLocked(*seqPtr);
+}
+
 void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLengths)
 {
-    // Hold shared_ptr so a concurrent removeSequence cannot destroy the object during rewind.
+    // Hold the per-sequence lock for the entire loop so removeSequence cannot
+    // slip in between iterations and cause a partial rewind.
     auto seqPtr = getSequence(requestId);
     if (!seqPtr)
     {
         TLLM_LOG_DEBUG("Request %lu has already been removed from KV cache manager, skipping rewind", requestId);
         return;
     }
-
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return;
+    }
     for (SizeType32 si = 0; si < rewindLengths; ++si)
     {
-        removeToken(requestId);
+        removeTokenLocked(*seqPtr);
     }
 }
+
 
 std::shared_ptr<GenerationRequest> KVCacheManager::getSequence(RequestIdType requestId) const
 {
