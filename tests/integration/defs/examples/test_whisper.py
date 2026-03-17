@@ -188,7 +188,7 @@ def test_whisper_beam_search_generation_logits(llm_venv, engine_dir,
             build_cmd.append("--bert_attention_plugin=float16")
             build_cmd.append("--gpt_attention_plugin=float16")
 
-        check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd), env=llm_venv._new_env)
 
     print("Run generation logits beam search validation...")
     run_cmd = [
