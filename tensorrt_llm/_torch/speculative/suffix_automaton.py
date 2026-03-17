@@ -171,6 +171,11 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._dummy_slot_index: int = self.pool_size
         self._dummy_request_ids: Set[int] = set()
 
+        # Pre-allocated CPU staging buffers for prepare() to avoid
+        # repeated pinned-memory allocation every round.
+        self._cpu_batch_indices: Optional[torch.Tensor] = None
+        self._cpu_nondummy_mask: Optional[torch.Tensor] = None
+
         # Retained slots: completed requests whose SA states remain in the
         # pool for cross-request search. OrderedDict preserves insertion
         # (completion) order for FIFO eviction.
@@ -237,6 +242,26 @@ class SuffixAutomatonManager(BaseResourceManager):
 
     # --- Core SA operations ---
 
+    def _allocate_slot(self) -> int:
+        """Allocate a slot, evicting the oldest retained request if needed."""
+        if self._free_slots:
+            return self._free_slots.pop()
+
+        if self._retained_slots:
+            slot, old_rid = self._retained_slots.popitem(last=False)  # FIFO
+            if self._gpu_slots is not None:
+                _sa_native.clear_slot(self._gpu_slots, slot, self.max_seq_len)
+            self._pending_mask_updates[slot] = 0
+            logger.debug(
+                f"Evicted retained SA slot {slot} (request {old_rid}) to make room for new request"
+            )
+            return slot
+
+        raise RuntimeError(
+            f"No free or retained slots available. pool_size={self.pool_size}, "
+            f"active={len(self._active_slots)}"
+        )
+
     def add_request(self, request_id: int, context_tokens: List[int]):
         """
         Add a new request and build its initial suffix automaton from context.
@@ -253,12 +278,9 @@ class SuffixAutomatonManager(BaseResourceManager):
             self._pending_copies.add(request_id)
             return
 
-        if not self._free_slots:
-            raise RuntimeError("No free slots available for new request")
-
-        # Allocate a slot
-        slot = self._free_slots.pop()
+        slot = self._allocate_slot()
         self._request_to_slot[request_id] = slot
+        self._active_slots.add(slot)
 
         # Build SA state on host using native code
         self._host_states_native[request_id] = _sa_native.build_automaton_host(
@@ -270,27 +292,39 @@ class SuffixAutomatonManager(BaseResourceManager):
             self._pending_mask_updates[slot] = 1
 
     def remove_request(self, request_id: int):
-        """Remove a request and free its resources."""
+        """Remove a request, retaining its SA state for cross-request search
+        when global pool is enabled and the pool has retention capacity."""
         if request_id not in self._request_to_slot:
             return
 
         slot = self._request_to_slot.pop(request_id)
 
-        if self.enable_global_pool:
-            self._pending_mask_updates[slot] = 0
-
         if request_id in self._dummy_request_ids:
-            # Dummy slot is reserved; never return it to the free pool.
             self._dummy_request_ids.discard(request_id)
+            # Dummy slot is reserved; never retain or free.
+            return
+
+        self._active_slots.discard(slot)
+
+        # If the GPU copy was never flushed, the slot contains stale data —
+        # skip retention and free immediately to avoid searching garbage.
+        stale = request_id in self._pending_copies
+
+        if self.enable_global_pool and self.pool_size > self.max_num_requests and not stale:
+            # Retain: keep SA state alive for cross-request search.
+            # Active mask stays ON — the slot is still searchable.
+            self._retained_slots[slot] = request_id
         else:
+            # Free immediately
+            if self.enable_global_pool:
+                self._pending_mask_updates[slot] = 0
             self._free_slots.append(slot)
+            if self._gpu_slots is not None:
+                _sa_native.clear_slot(self._gpu_slots, slot, self.max_seq_len)
 
         self._host_states_native.pop(request_id, None)
         self._pending_copies.discard(request_id)
         self._initialized_requests.discard(request_id)
-
-        if self._gpu_slots is not None:
-            _sa_native.clear_slot(self._gpu_slots, slot, self.max_seq_len)
 
     def prepare(self, request_ids: List[int], max_draft_len: int):
         """
@@ -328,25 +362,32 @@ class SuffixAutomatonManager(BaseResourceManager):
         # Map each request ID to its slot. Unknown IDs (e.g. CUDA graph
         # warmup dummies that skipped the context phase) are routed to the
         # reserved dummy slot so the kernel still runs on valid memory.
-        slots = [self._request_to_slot.get(rid, self._dummy_slot_index) for rid in request_ids]
-        batch_indices = torch.tensor(
-            slots,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
-        # Build a non-dummy mask (1 = real, 0 = dummy) on CPU, then copy to
-        # the pre-allocated GPU buffer.  extend() will use this mask via a
-        # simple element-wise multiply which is CUDA-graph-safe.
-        nondummy_mask = torch.tensor(
-            [0 if s == self._dummy_slot_index else 1 for s in slots],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
-
         num_requests = len(request_ids)
+        slots = [self._request_to_slot.get(rid, self._dummy_slot_index) for rid in request_ids]
+
+        # Reuse pre-allocated pinned CPU buffers to avoid costly
+        # pinned-memory allocation every round.
+        if self._cpu_batch_indices is None or self._cpu_batch_indices.shape[0] < num_requests:
+            buf_size = self.max_num_requests
+            self._cpu_batch_indices = torch.zeros(
+                buf_size, dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+            self._cpu_nondummy_mask = torch.zeros(
+                buf_size, dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+
+        batch_indices = self._cpu_batch_indices[:num_requests]
+        nondummy_mask = self._cpu_nondummy_mask[:num_requests]
+        for i, s in enumerate(slots):
+            batch_indices[i] = s
+            nondummy_mask[i] = 0 if s == self._dummy_slot_index else 1
+
         self._gpu_batch_indices[:num_requests].copy_(batch_indices, non_blocking=True)
         self._gpu_nondummy_mask[:num_requests].copy_(nondummy_mask, non_blocking=True)
-        torch.cuda.synchronize()
+        # Stream-ordered: the non_blocking copies above are on the current
+        # stream, so any kernel launched on the same stream afterwards will
+        # see the updated values. No device-wide sync needed.
+        torch.cuda.current_stream().synchronize()
 
     def extend(
         self,

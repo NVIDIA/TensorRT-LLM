@@ -522,7 +522,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
-    def test_suffix_automaton(self):
+    @parametrize_with_ids("enable_global_pool", [False, True])
+    def test_suffix_automaton(self, enable_global_pool):
         max_bs = 16
 
         pytorch_config = dict(
@@ -537,7 +538,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         spec_config = SADecodingConfig(
             max_draft_len=4,
             max_matching_ngram_size=-1,  # longest match via suffix automaton
-            enable_global_pool=True,
+            enable_global_pool=enable_global_pool,
         )
 
         with LLM(model=self.MODEL_PATH,

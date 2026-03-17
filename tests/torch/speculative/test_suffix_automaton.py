@@ -825,6 +825,170 @@ class TestExtendGlobal:
         manager.shutdown()
 
 
+class TestRetainedPool:
+    """Tests for retained slot pool (completed requests stay searchable)."""
+
+    def test_retained_slot_is_searchable(self):
+        """Completed request's SA stays searchable by active requests."""
+        # pool_size=4 > max_num_requests=2 → retention capacity of 2
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=4,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+
+        # Request A: context has [1, 2, 3, 4, 5]
+        manager.add_request(0, [1, 2, 3, 4, 5])
+        # Request B: context has [10, 20, 30]
+        manager.add_request(1, [10, 20, 30])
+
+        # Flush A's state to GPU
+        manager.prepare([0, 1], max_draft_len=4)
+
+        # Complete request A — should be retained, not freed
+        manager.remove_request(0)
+        assert 0 not in manager._request_to_slot
+        assert len(manager._retained_slots) == 1
+
+        # Request C arrives, ends with [1, 2, 3]
+        manager.add_request(2, [50, 60, 1, 2, 3])
+
+        request_ids = [1, 2]
+        manager.prepare(request_ids, max_draft_len=4)
+
+        # Extend request C with token 4 — should match retained A's [1,2,3,4]
+        accepted_tokens = torch.tensor(
+            [[99, 0, 0, 0, 0], [4, 0, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        num_accepted_tokens = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_global(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len=4,
+            max_ngram_size=-1,
+        )
+
+        # Request C (index 1) should find a match from retained A
+        match_len_c = match_len[1].item()
+        assert match_len_c >= 3, (
+            f"Request C should match retained A's pattern (len>=3), got {match_len_c}"
+        )
+        draft_c = draft_tokens[1].cpu().tolist()
+        assert draft_c[0] == 5, f"Expected continuation token 5 from A, got {draft_c}"
+
+        manager.shutdown()
+
+    def test_eviction_fifo_order(self):
+        """Oldest retained slot is evicted first when pool is full."""
+        # pool_size=4, max_batch=2 → 2 retained slot capacity
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=4,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+        # Initial: free=[0,1,2,3], active={}, retained={}
+
+        manager.add_request(0, [1, 2, 3])
+        manager.add_request(1, [4, 5, 6])
+        manager.prepare([0, 1], max_draft_len=4)
+        # free=[0,1], active={2,3}, retained={}  (slots allocated from end)
+
+        # Complete A → retained
+        manager.remove_request(0)
+        assert len(manager._retained_slots) == 1
+        assert len(manager._active_slots) == 1
+
+        # Complete B → retained
+        manager.remove_request(1)
+        assert len(manager._retained_slots) == 2  # A and B both retained
+        assert len(manager._active_slots) == 0
+
+        # Requests C and D fill both free slots
+        manager.add_request(2, [7, 8, 9])
+        manager.add_request(3, [10, 11, 12])
+        # free=[], active={slot_c, slot_d}, retained={slot_a: 0, slot_b: 1}
+        assert len(manager._free_slots) == 0
+        assert len(manager._active_slots) == 2
+        assert len(manager._retained_slots) == 2
+
+        # Request E arrives — pool full, must evict oldest retained (A)
+        manager.add_request(4, [13, 14, 15])
+        assert len(manager._retained_slots) == 1
+        retained_rids = list(manager._retained_slots.values())
+        assert retained_rids == [1], f"Expected B (rid=1) retained, got {retained_rids}"
+
+        manager.shutdown()
+
+    def test_active_never_evicted(self):
+        """Active (in-flight) requests must never be evicted."""
+        # pool_size=2 = max_batch=2 → 0 retained capacity → no retention
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=2,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+
+        manager.add_request(0, [1, 2, 3])
+        manager.add_request(1, [4, 5, 6])
+        manager.prepare([0, 1], max_draft_len=4)
+
+        # Complete A — pool_size == max_num_requests, so no retention
+        manager.remove_request(0)
+        assert len(manager._retained_slots) == 0
+        assert len(manager._free_slots) == 1
+
+        manager.shutdown()
+
+    def test_no_retention_when_global_pool_disabled(self):
+        """With global pool off, remove_request always frees immediately."""
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=4,
+            enable_global_pool=False,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=4)
+
+        manager.add_request(0, [1, 2, 3])
+        manager.prepare([0], max_draft_len=4)
+        manager.remove_request(0)
+
+        assert len(manager._retained_slots) == 0
+        assert len(manager._free_slots) == 4
+
+        manager.shutdown()
+
+    def test_stale_request_not_retained(self):
+        """Request removed before GPU copy is flushed should not be retained."""
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=4,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+
+        # Add but don't prepare (GPU copy still pending)
+        manager.add_request(0, [1, 2, 3])
+        assert 0 in manager._pending_copies
+
+        # Remove before prepare — should NOT be retained (stale GPU data)
+        manager.remove_request(0)
+        assert len(manager._retained_slots) == 0
+        assert len(manager._free_slots) == 4  # slot returned to free list
+
+        manager.shutdown()
+
+
 class TestNativeKernel:
     """Tests for native kernel."""
 
@@ -881,6 +1045,14 @@ if __name__ == "__main__":
     print("\n--- CUDA graph compatibility tests ---")
     test = TestCUDAGraphCompatibility()
     test.test_cuda_graph_capture()
+
+    print("\n--- Retained pool tests ---")
+    test = TestRetainedPool()
+    test.test_retained_slot_is_searchable()
+    test.test_eviction_fifo_order()
+    test.test_active_never_evicted()
+    test.test_no_retention_when_global_pool_disabled()
+    test.test_stale_request_not_retained()
 
     print("\n" + "=" * 60)
     print("All tests passed!")
