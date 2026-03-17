@@ -3221,6 +3221,23 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
 
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @skip_pre_blackwell
+    def test_nvfp4_attn_multi_gpus(self):
+        """Test with NVFP4 attention checkpoint (kv_a_proj_with_mqa quantized to NVFP4).
+
+        Unlike test_nvfp4_multi_gpus which uses a checkpoint with BF16 attention,
+        this test uses a checkpoint where kv_a_proj_with_mqa, q_a_proj, and q_b_proj
+        are also quantized to NVFP4, while indexer.wk remains BF16 (unfused).
+        """
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-NVFP4-FP4attn",
+                 tensor_parallel_size=4) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
