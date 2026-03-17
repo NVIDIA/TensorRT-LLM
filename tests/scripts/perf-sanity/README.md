@@ -55,11 +55,14 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 **Location**: `tests/scripts/perf-sanity/aggregated`
 
-**File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen).
+**File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen). The suffix indicates the GPU target:
+- B200 configs: `xxx_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_blackwell.yaml`)
+- GB200 configs: `xxx_grace_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_grace_blackwell.yaml`)
+- Multi-node: add `_2_nodes` before the GPU suffix (e.g., `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml`)
 
-**Examples**:
-- `deepseek_r1_fp4_v2_grace_blackwell.yaml` - Single-node aggregated test
-- `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml` - Multi-node aggregated test
+**Server Config Rules**:
+- Each `server_config` entry should have exactly **one** `client_config`. Use separate server configs for different ISL/OSL combinations.
+- Server config `name` should include ISL and OSL (e.g., `llama70b_fp4_tp4_512_32`). Do **not** include adjustable parameters like `max_batch_size` or `max_num_tokens` in the name.
 
 **Use Cases**:
 - Single-node: Performance tests on a single server with multiple GPUs
