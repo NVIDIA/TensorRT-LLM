@@ -315,7 +315,9 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    if is_aggr:
+    if args.mpi_type:
+        lines.append(f"--mpi={args.mpi_type}")
+    elif is_aggr:
         lines.append("--mpi=pmi2")
 
     return lines
@@ -445,6 +447,11 @@ def main():
         help="Nsys start-stop range for generation workers in disaggregated mode (default: 1-100)",
     )
     parser.add_argument("--test-prefix", default="", help="Test prefix")
+    parser.add_argument(
+        "--mpi-type",
+        default="",
+        help="MPI type for srun (e.g. pmix, pmi2). If not set, --mpi is not added to srun args.",
+    )
 
     args = parser.parse_args()
 
