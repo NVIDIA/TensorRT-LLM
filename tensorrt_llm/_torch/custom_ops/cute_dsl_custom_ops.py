@@ -2841,8 +2841,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if need_realloc:
             # Grow: take element-wise max of old and new shape
             if buf is not None:
-                alloc_shape = tuple(
-                    max(b, s) for b, s in zip(buf.shape, shape))
+                alloc_shape = tuple(max(b, s) for b, s in zip(buf.shape, shape))
             else:
                 alloc_shape = shape
             buffer_cache[key] = torch.empty(alloc_shape,
@@ -3009,11 +3008,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if output_indices is not None:
                 output_indices_torch = output_indices
             else:
-                output_indices_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                    "output_indices", (num_rows, top_k), torch.int32)
+                output_indices_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_indices", (num_rows, top_k),
+                    torch.int32)
             if return_val:
-                output_values_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                    "output_values", (num_rows, top_k), torch_dtype)
+                output_values_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_values", (num_rows, top_k),
+                    torch_dtype)
             else:
                 output_values_torch = None
 
@@ -3029,14 +3030,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 2
             else:
                 buffer_numbers = 1
-            buffer_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                "buffer", (num_rows, buffer_numbers, bucketed_num_cols),
-                torch.int32)
+            buffer_torch = _get_or_alloc_buffer(
+                cls.buffer_cache, "buffer",
+                (num_rows, buffer_numbers, bucketed_num_cols), torch.int32)
             buffer_torch = buffer_torch[:, :, :num_cols]
             # Prepare global counter for persistent dynamic scheduling
             if load_balance:
-                g_global_counter_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                    "g_global_counter", (1, ), torch.int32)
+                g_global_counter_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "g_global_counter", (1, ), torch.int32)
                 g_global_counter_torch.zero_()
             else:
                 g_global_counter_torch = None
@@ -3377,14 +3378,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Intermediate buffers for first kernel output
             first_output_indices = _get_or_alloc_buffer(cls.buffer_cache,
-                "first_output_indices", (num_rows, merge_cols), torch.int32)
+                                                        "first_output_indices",
+                                                        (num_rows, merge_cols),
+                                                        torch.int32)
             first_output_values = _get_or_alloc_buffer(cls.buffer_cache,
-                "first_output_values", (num_rows, merge_cols), torch_dtype)
+                                                       "first_output_values",
+                                                       (num_rows, merge_cols),
+                                                       torch_dtype)
 
             # Shared buffer for both kernels (they run sequentially)
             buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-            buffer_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                "buffer",
+            buffer_torch = _get_or_alloc_buffer(
+                cls.buffer_cache, "buffer",
                 (num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2),
                 torch.int32)
 
@@ -3392,11 +3397,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if output_indices is not None:
                 output_indices_torch = output_indices
             else:
-                output_indices_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                    "output_indices", (num_rows, top_k), torch.int32)
+                output_indices_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_indices", (num_rows, top_k),
+                    torch.int32)
             if return_val:
-                output_values_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                    "output_values", (num_rows, top_k), torch_dtype)
+                output_values_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_values", (num_rows, top_k),
+                    torch_dtype)
             else:
                 output_values_torch = None
 
@@ -3660,11 +3667,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if output_indices is not None:
                 output_indices_torch = output_indices
             else:
-                output_indices_torch = _get_or_alloc_buffer(cls.buffer_cache,
-                    "output_indices", (num_rows, top_k), torch.int32)
+                output_indices_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_indices", (num_rows, top_k),
+                    torch.int32)
             if return_val:
                 output_values = _get_or_alloc_buffer(cls.buffer_cache,
-                    "output_values", (num_rows, top_k), torch_dtype)
+                                                     "output_values",
+                                                     (num_rows, top_k),
+                                                     torch_dtype)
             else:
                 output_values = None
 
@@ -3865,14 +3875,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         num_rows=num_rows))
 
                 if ctas_per_group >= 2:
-                    use_distributed = (
-                        num_rows * ctas_per_group <= num_sms)
+                    use_distributed = (num_rows * ctas_per_group <= num_sms)
                     if is_fp32:
                         use_distributed = (use_distributed
                                            and num_tokens >= 65536)
                 else:  # ctas_per_group == 1
-                    use_distributed = (not is_fp32
-                                       and num_rows <= num_sms)
+                    use_distributed = (not is_fp32 and num_rows <= num_sms)
 
             if use_distributed:
                 CuteDSLTopKDecodeDistributedRunner.forward(
