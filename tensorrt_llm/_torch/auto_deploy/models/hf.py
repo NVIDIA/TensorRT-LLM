@@ -445,14 +445,10 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         try:
             if disable_preload:
                 # Load checkpoint directly to GPU using accelerate's load_checkpoint_in_model (no CPU preload)
-                ad_logger.info(
-                    "disable_preload=True: Using accelerate's load_checkpoint_in_model (no CPU preload)"
-                )
                 with hf_load_state_dict_with_device(device):
                     load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
             else:
                 # Preload checkpoint files to CPU
-                ad_logger.info("Preloading checkpoint files to CPU")
                 self._load_checkpoint_with_preload(model, ckpt_file, device)
         finally:
             load_handle.remove()
@@ -462,43 +458,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
     ):
         all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
-        model_keys = list(model.state_dict().keys())
-        model_moe_keys = [key for key in model_keys if _MOE_EXPERT_KEY_RE.search(key) is not None]
-        if model_moe_keys:
-            ad_logger.info(
-                f"Model expects {len(model_moe_keys)} MoE expert keys spanning expert ids: "
-                f"{_summarize_moe_expert_keys(model_moe_keys)}"
-            )
-
-        ad_logger.info(f"Loading weights into model (device: {device})...")
-        incompatible = model.load_state_dict(all_weights, strict=False)
-        if incompatible.missing_keys or incompatible.unexpected_keys:
-            ad_logger.warning(
-                "Checkpoint load completed with "
-                f"{len(incompatible.missing_keys)} missing and "
-                f"{len(incompatible.unexpected_keys)} unexpected keys"
-            )
-            if incompatible.missing_keys:
-                ad_logger.warning(
-                    "Sample missing keys: " + ", ".join(sorted(incompatible.missing_keys)[:20])
-                )
-            if incompatible.unexpected_keys:
-                ad_logger.warning(
-                    "Sample unexpected keys: "
-                    + ", ".join(sorted(incompatible.unexpected_keys)[:20])
-                )
-                unexpected_moe_keys = [
-                    key
-                    for key in incompatible.unexpected_keys
-                    if _MOE_EXPERT_KEY_RE.search(key) is not None
-                ]
-                if unexpected_moe_keys:
-                    ad_logger.warning(
-                        f"Unexpected MoE expert keys: {len(unexpected_moe_keys)} spanning expert "
-                        f"ids {_summarize_moe_expert_keys(unexpected_moe_keys)}"
-                    )
-
-        ad_logger.info("Checkpoint loading completed")
+        model.load_state_dict(all_weights, strict=False)
 
     def _load_full_checkpoint_to_cpu(self, checkpoint: str) -> dict:
         """Load the full checkpoint to CPU memory.

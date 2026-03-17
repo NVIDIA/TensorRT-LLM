@@ -16,9 +16,8 @@
 from pathlib import Path
 
 import pytest
-from transformers import AutoProcessor, AutoTokenizer
 
-_SIDECAR_DIR = Path("tensorrt_llm/_torch/auto_deploy/tokenizers/mistral_small_4_119b")
+_SOURCE_MODEL = "mistralai/Mistral-Small-4-119B-2603"
 
 
 def _require_mistral_small_4_snapshot() -> None:
@@ -31,10 +30,14 @@ def _require_mistral_small_4_snapshot() -> None:
         pytest.skip("Mistral Small 4 tokenizer snapshot is not available locally")
 
 
-def test_auto_tokenizer_loads_local_bridge():
+def test_wrapper_tokenizer_loads():
     _require_mistral_small_4_snapshot()
 
-    tokenizer = AutoTokenizer.from_pretrained(_SIDECAR_DIR, trust_remote_code=True)
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_mistral3 import (
+        ADMistralSmall4Tokenizer,
+    )
+
+    tokenizer = ADMistralSmall4Tokenizer.from_pretrained(_SOURCE_MODEL)
 
     encoded = tokenizer("Hello")
     assert encoded["input_ids"]
@@ -42,10 +45,14 @@ def test_auto_tokenizer_loads_local_bridge():
     assert tokenizer.chat_template is not None
 
 
-def test_auto_processor_loads_local_bridge():
+def test_wrapper_processor_loads():
     _require_mistral_small_4_snapshot()
 
-    processor = AutoProcessor.from_pretrained(_SIDECAR_DIR, trust_remote_code=True)
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_mistral3 import (
+        ADMistralSmall4Processor,
+    )
+
+    processor = ADMistralSmall4Processor.from_pretrained(_SOURCE_MODEL)
 
     assert processor.tokenizer.pad_token_id is not None
     assert processor.image_processor is not None

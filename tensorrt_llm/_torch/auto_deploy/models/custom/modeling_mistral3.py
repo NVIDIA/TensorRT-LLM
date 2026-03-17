@@ -17,21 +17,32 @@ This implementation follows the repo's current multimodal AD flow:
     AutoDeploy canonical ops for RMSNorm, RoPE, MLA, and MoE.
 """
 
+import json
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 import torch
+from tokenizers import Tokenizer
 from torch import nn
-from transformers import AutoConfig, Mistral3Config, PretrainedConfig
+from transformers import (
+    AutoConfig,
+    Mistral3Config,
+    PixtralImageProcessorFast,
+    PixtralProcessor,
+    PretrainedConfig,
+    PreTrainedTokenizerFast,
+)
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModelForCausalLM
-from transformers.utils import ModelOutput
+from transformers.utils import ModelOutput, cached_file
 
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
@@ -724,5 +735,129 @@ AutoModelForCausalLMFactory.register_custom_model_cls(
     "Mistral3Config", Mistral3ForConditionalGenerationAD
 )
 AutoModelForImageTextToTextFactory.register_custom_model_cls(
+    "Mistral3Config", Mistral3ForConditionalGenerationAD
+)
+
+# ---------------------------------------------------------------------------
+# Wrapper tokenizer / processor for Mistral Small 4
+#
+# The upstream HF checkpoint references a tokenizer class that requires
+# transformers v5+.  These thin wrappers delegate to the upstream tokenizer
+# assets while staying compatible with the current transformers version.
+# ---------------------------------------------------------------------------
+
+_TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+_CHAT_TEMPLATE_FILE = "chat_template.jinja"
+_TOKENIZER_FILE = "tokenizer.json"
+
+
+class ADMistralSmall4Tokenizer(PreTrainedTokenizerFast):
+    """Wrapper that loads the upstream Mistral Small 4 tokenizer on current transformers."""
+
+    vocab_files_names = {"tokenizer_file": _TOKENIZER_FILE}
+    model_input_names = ["input_ids", "attention_mask"]
+    slow_tokenizer_class = None
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        *inputs,
+        **kwargs,
+    ) -> "ADMistralSmall4Tokenizer":
+        del inputs
+        for k in ("_from_auto", "_commit_hash", "trust_remote_code"):
+            kwargs.pop(k, None)
+
+        config_path = cached_file(pretrained_model_name_or_path, _TOKENIZER_CONFIG_FILE, **kwargs)
+        assert config_path is not None
+        config = json.loads(Path(config_path).read_text())
+
+        tokenizer_file = cached_file(pretrained_model_name_or_path, _TOKENIZER_FILE, **kwargs)
+        assert tokenizer_file is not None
+
+        tokenizer = cls(
+            tokenizer_object=Tokenizer.from_file(tokenizer_file),
+            name_or_path=str(pretrained_model_name_or_path),
+            bos_token=config.get("bos_token"),
+            eos_token=config.get("eos_token"),
+            unk_token=config.get("unk_token"),
+            pad_token=config.get("pad_token"),
+            additional_special_tokens=config.get("extra_special_tokens", []),
+            clean_up_tokenization_spaces=config.get("clean_up_tokenization_spaces", False),
+            model_max_length=config.get("model_max_length"),
+            padding_side=config.get("padding_side", "left"),
+            truncation_side=config.get("truncation_side", "left"),
+        )
+
+        template_path = cached_file(
+            pretrained_model_name_or_path,
+            _CHAT_TEMPLATE_FILE,
+            _raise_exceptions_for_missing_entries=False,
+            **kwargs,
+        )
+        if template_path is not None:
+            tokenizer.chat_template = Path(template_path).read_text()
+
+        return tokenizer
+
+
+class ADMistralSmall4Processor(PixtralProcessor):
+    """Wrapper Pixtral processor wired to ``ADMistralSmall4Tokenizer``."""
+
+    @classmethod
+    def register_for_auto_class(cls, auto_class: str = "AutoProcessor") -> None:
+        del auto_class
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        **kwargs,
+    ) -> "ADMistralSmall4Processor":
+        for k in ("_from_auto", "_commit_hash", "trust_remote_code"):
+            kwargs.pop(k, None)
+
+        config_path = cached_file(pretrained_model_name_or_path, "processor_config.json", **kwargs)
+        assert config_path is not None
+        processor_config = json.loads(Path(config_path).read_text())
+
+        image_processor = PixtralImageProcessorFast.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=True, **kwargs
+        )
+        tokenizer = ADMistralSmall4Tokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            patch_size=processor_config.get("patch_size", 16),
+            spatial_merge_size=processor_config.get("spatial_merge_size", 1),
+            chat_template=getattr(tokenizer, "chat_template", None),
+            image_token=processor_config.get("image_token", "[IMG]"),
+            image_break_token=processor_config.get("image_break_token", "[IMG_BREAK]"),
+            image_end_token=processor_config.get("image_end_token", "[IMG_END]"),
+        )
+
+
+@ModelFactoryRegistry.register("Mistral3ForConditionalGeneration")
+class Mistral3ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
+    """Factory that wires the wrapper tokenizer/processor for Mistral Small 4."""
+
+    def init_tokenizer(self) -> Optional[Any]:
+        processor = self.init_processor()
+        if processor is None:
+            return None
+        return processor.tokenizer
+
+    def init_processor(self) -> Optional[Any]:
+        if self.tokenizer is None:
+            return None
+        return ADMistralSmall4Processor.from_pretrained(self.tokenizer)
+
+
+# __init_subclass__ resets _custom_model_mapping for each subclass, so re-register here.
+Mistral3ForConditionalGenerationFactory.register_custom_model_cls(
     "Mistral3Config", Mistral3ForConditionalGenerationAD
 )
