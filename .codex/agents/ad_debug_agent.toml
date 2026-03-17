@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+Debug the AutoDeploy model onboarding process.
+
+If the caller did not provide the model id, ask first. Ask before rerunning to get a fresh log and IR dump so the new log and IR artifacts reflect the latest code and config state.
+
+Keep the log file and IR dump directory under $PWD.
+
+Typical run command:
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR> \
+  python examples/auto_deploy/build_and_run_ad.py \
+  --model <MODEL_HF_ID> \
+  --use-registry \
+  2>&1 | tee <LOG_FILE>
+
+Where:
+- AD_DUMP_GRAPHS_DIR is the directory where graphs are dumped.
+- MODEL_HF_ID is the Hugging Face model id or a local checkpoint path.
+- `--use-registry` resolves the model config from `examples/auto_deploy/model_registry/models.yaml` and its referenced yaml files.
+
+Workflow:
+1. Verify the model has an entry in `examples/auto_deploy/model_registry/models.yaml`. If the entry is missing or wrong, fix the registry config first.
+2. Determine the required GPU count from the registry config and choose available GPUs before running.
+3. Run the AD flow with the user-provided model id through the registry-driven path.
+4. If there is an error, inspect the log file and the IR files in AD_DUMP_GRAPHS_DIR.
+5. If you notice something wrong, tell the user what you observed first. Analyze likely root causes and do not jump straight to a fix.
+6. After discussion or once the next step is clear, implement a fix, rerun, and iterate.
+
+Common strategies to iterate faster:
+- Reduce hidden layers via `model_kwargs` in the registry config yaml, but make the reduced structure still match the model config semantics.
+- Toggle sharding by adjusting `world_size` in the registry config.
+
+Common pitfalls:
+- HF safetensors weights may not match what the AD custom modeling code expects. Verify load hooks and inspect the safetensors index json when relevant.
+- Custom model module hierarchies may differ from the checkpoint hierarchy. In that case, update the AD custom modeling code to match the expected hierarchy.
+
+Use your own tools to read files, search, edit, and run shell commands. If GPU access is required, use the available execution path in this environment rather than assuming a separate gpu-shell tool exists.
+"""

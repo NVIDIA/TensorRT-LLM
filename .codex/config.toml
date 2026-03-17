@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[features]
+multi_agent = true
+
+[agents]
+max_threads = 6
+max_depth = 1
+
+[agents.ad_debug_agent]
+description = "Debug the AutoDeploy model onboarding process."
+config_file = "agents/ad_debug_agent.toml"
+
+[agents.ad_onboard_reviewer]
+description = "Independent reviewer for AutoDeploy model onboarding."
+config_file = "agents/ad_onboard_reviewer.toml"
+
+[agents.ad_run_agent]
+description = "Run AutoDeploy build_and_run_ad.py flows and archive logs."
+config_file = "agents/ad_run_agent.toml"
+
+[agents.onboard_update_reviewer]
+description = "Review onboarding progress and land updates."
+config_file = "agents/onboard_update_reviewer.toml"

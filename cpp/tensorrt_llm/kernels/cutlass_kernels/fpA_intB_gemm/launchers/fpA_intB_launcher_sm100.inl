@@ -224,11 +224,12 @@ void sm100_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType
         StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(n, m, 1));
         StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(0, m, 1));
 
+        ElementAccumulator output_op_beta = (biases == nullptr) ? ElementAccumulator(0.f) : ElementAccumulator(1.f);
         typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm, {n, m, k, 1},
             {reinterpret_cast<CutlassWeightType const*>(B), stride_B, reinterpret_cast<CutlassActivationType const*>(A),
                 stride_A, reinterpret_cast<ElementScale const*>(weight_scales), layout_S, group_size,
                 reinterpret_cast<ElementZero const*>(weight_zero_points)},
-            {{alpha}, reinterpret_cast<CutlassBiasType const*>(biases), stride_C,
+            {{alpha, output_op_beta}, reinterpret_cast<CutlassBiasType const*>(biases), stride_C,
                 reinterpret_cast<CutlassOutputType*>(C), stride_D}};
 
         Gemm gemm;
