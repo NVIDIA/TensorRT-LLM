@@ -539,7 +539,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         **kwargs,
     ):
         # Extract video_pruning_rate before passing kwargs to parent
-        video_pruning_rate = kwargs.pop("video_pruning_rate", None)
+        video_pruning_rate = kwargs.pop("video_pruning_rate", None) or 0.0
 
         super().__init__(
             model_path=model_path,
@@ -574,8 +574,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self.num_image_token = int(
             (self.image_size // self.patch_size) ** 2 * (self.downsample_ratio**2)
         )
-        # Use video_pruning_rate if explicitly provided (EVS enabled), otherwise default to 0.0 (EVS disabled)
-        self.video_pruning_rate = video_pruning_rate if video_pruning_rate is not None else 0.0
+        self.video_pruning_rate = video_pruning_rate
         self.img_context_token = self.config.img_context_token
         self.video_context_token = self.config.video_context_token
         self.img_start_token = self.config.img_start_token

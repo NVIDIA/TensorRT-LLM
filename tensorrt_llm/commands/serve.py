@@ -154,6 +154,7 @@ def get_llm_args(
         fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
+        video_pruning_rate: Optional[float] = None,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -236,6 +237,8 @@ def get_llm_args(
         otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "video_pruning_rate":
+        video_pruning_rate,
     }
 
     llm_args = {
@@ -725,7 +728,7 @@ class ChoiceWithAlias(click.Choice):
                   "Pruning rate for video frames in multimodal models. "
                   "Applied by Efficient Video Sampling (EVS). "
                   "None disables EVS, values in [0, 1) enable pruning.",
-                  "beta"))
+                  "prototype"))
 @click.option("--chat_template",
               type=str,
               default=None,
@@ -824,7 +827,8 @@ def serve(
             fail_fast_on_attention_window_too_large=
             fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
-            enable_chunked_prefill=enable_chunked_prefill)
+            enable_chunked_prefill=enable_chunked_prefill,
+            video_pruning_rate=video_pruning_rate)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
@@ -832,10 +836,6 @@ def serve(
                 llm_args_extra_dict = yaml.safe_load(f)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
-
-        # Add video_pruning_rate if specified via CLI (not None)
-        if video_pruning_rate is not None:
-            llm_args["video_pruning_rate"] = video_pruning_rate
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)

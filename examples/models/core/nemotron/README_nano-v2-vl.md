@@ -55,7 +55,7 @@ EOF
 
 # CMD to launch serve without EVS.
 trtllm-serve  \
-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
+nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 \
 --host 0.0.0.0 \
 --port 8000 \
 --backend pytorch \

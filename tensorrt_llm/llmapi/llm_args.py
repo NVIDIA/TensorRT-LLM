@@ -3462,7 +3462,7 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Pruning rate for video frames in multimodal models. "
         "Applied by Efficient Video Sampling (EVS) in NemotronH_Nano_VL_V2. "
         "None (default) disables EVS, values in [0, 1) enable pruning.",
-        status="beta")
+        status="prototype")
 
     @property
     def quant_config(self) -> QuantConfig:
