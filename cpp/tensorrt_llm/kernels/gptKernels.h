@@ -223,29 +223,23 @@ struct BuildDecoderInfoParams
     std::string toString() const
     {
         std::stringstream ss;
+        auto printTensor = [&ss](char const* name, void* ptr, nvinfer1::Dims shape)
+        {
+            ss << name << ": ";
+            if (ptr)
+                ss << *(runtime::ITensor::wrap((void*) ptr, nvinfer1::DataType::kINT32, shape));
+            else
+                ss << "nullptr";
+            ss << std::endl;
+        };
         ss << "BuildDecoderInfoParams ====================" << std::endl;
-        ss << "seqQOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seqQOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "seqKVOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seqKVOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "paddingOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "tokensInfo: "
-           << *(runtime::ITensor::wrap(
-                  (void*) tokensInfo, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({numTokens * 2})))
-           << std::endl;
+        printTensor("seqQOffsets", seqQOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("seqKVOffsets", seqKVOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("paddingOffsets", paddingOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("tokensInfo", tokensInfo, runtime::ITensor::makeShape({numTokens * 2}));
         if (encoderPaddingOffsets != nullptr)
         {
-            ss << "encoderPaddingOffsets: "
-               << *(runtime::ITensor::wrap((void*) encoderPaddingOffsets, nvinfer1::DataType::kINT32,
-                      runtime::ITensor::makeShape({batchSize})))
-               << std::endl;
+            printTensor("encoderPaddingOffsets", encoderPaddingOffsets, runtime::ITensor::makeShape({batchSize}));
         }
         ss << "attentionMask: " << static_cast<void*>(attentionMask) << std::endl;
         ss << "seqQLengths: " << seqQLengths << std::endl;
