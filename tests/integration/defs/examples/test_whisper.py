@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 from defs.common import convert_weights, venv_check_call
 from defs.conftest import get_sm_version, llm_models_root, skip_post_blackwell
@@ -191,13 +193,14 @@ def test_whisper_beam_search_generation_logits(llm_venv, engine_dir,
         check_call(" ".join(build_cmd), env=llm_venv._new_env)
 
     print("Run generation logits beam search validation...")
+    validation_script = os.path.join(os.path.dirname(__file__),
+                                     "validate_whisper_beam_logits.py")
     run_cmd = [
-        f"{whisper_example_root}/reproduce_beam_logits_bug.py",
+        validation_script,
         f"--engine_dir={whisper_engine_dir}",
         f"--assets_dir={model_ckpt_dir}",
         f"--input_file={whisper_example_audio_file}",
         f"--num_beams={num_beams}",
-        "--check",
     ]
     env = {"HF_DATASETS_OFFLINE": "0"}
     venv_check_call(llm_venv, run_cmd, env=env)
