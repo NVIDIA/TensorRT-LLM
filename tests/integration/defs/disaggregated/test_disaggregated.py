@@ -434,7 +434,6 @@ def fetch_prometheus_metrics(server_url: str):
     return response.text
 
 
-
 def setup_disagg_cluster(
     config_file: str,
     model_name: str | None = None,
@@ -2179,8 +2178,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     setup_model_symlink(llm_venv, llama_model_root,
                         "llama-3.1-model/Llama-3.1-8B-Instruct")
 
-    config_file = get_test_config("llama31_8b_ucx",
-                                  disaggregated_example_root,
+    config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
@@ -2206,25 +2204,35 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                        f"{server_url}/v1/chat/completions")
 
                 def make_payload(prompt, stream, _api_type=api_type):
-                    base = {"max_tokens": max_tokens, "logprobs": 1 if _api_type == "completions" else True,
-                            "stream": stream, "temperature": 0}
+                    base = {
+                        "max_tokens": max_tokens,
+                        "logprobs": 1 if _api_type == "completions" else True,
+                        "stream": stream,
+                        "temperature": 0
+                    }
                     if _api_type == "completions":
                         return {"model": model_name, "prompt": prompt, **base}
-                    return {"model": model_name,
-                            "messages": [{"role": "user", "content": prompt}], **base}
+                    return {
+                        "model": model_name,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt
+                        }],
+                        **base
+                    }
 
                 # 1) Streaming vs non-streaming consistency check
-                async with session.post(
-                        url, json=make_payload(prompt, False),
-                        timeout=timeout) as resp:
+                async with session.post(url,
+                                        json=make_payload(prompt, False),
+                                        timeout=timeout) as resp:
                     assert resp.status == 200, \
                         f"[{api_type}] non-streaming: {await resp.text()}"
                     ns_tokens, ns_logprobs = extract_logprobs(
                         await resp.json(), api_type)
 
-                async with session.post(
-                        url, json=make_payload(prompt, True),
-                        timeout=timeout) as resp:
+                async with session.post(url,
+                                        json=make_payload(prompt, True),
+                                        timeout=timeout) as resp:
                     assert resp.status == 200, \
                         f"[{api_type}] streaming: {await resp.text()}"
                     st_tokens, st_logprobs = \
@@ -2241,7 +2249,8 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 for i, (n, s) in enumerate(zip(ns_logprobs, st_logprobs)):
                     if i == 0 or n is None or s is None:
                         continue
-                    rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4, 1e-5)
+                    rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
+                                                                          1e-5)
                     assert np.isclose(n, s, rtol=rtol, atol=atol), \
                         f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
 
@@ -2249,17 +2258,19 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 if api_type == "chat":
                     top_lp_payload = {
                         "model": model_name,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt
+                        }],
                         "max_tokens": max_tokens,
                         "logprobs": True,
                         "top_logprobs": 3,
                         "stream": False,
                         "temperature": 0,
                     }
-                    async with session.post(
-                            f"{server_url}/v1/chat/completions",
-                            json=top_lp_payload,
-                            timeout=timeout) as resp:
+                    async with session.post(f"{server_url}/v1/chat/completions",
+                                            json=top_lp_payload,
+                                            timeout=timeout) as resp:
                         assert resp.status == 200, (
                             f"[chat/top_logprobs] {resp.status}: "
                             f"{await resp.text()}")
@@ -2267,14 +2278,17 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                     lp_obj = result["choices"][0].get("logprobs")
                     assert lp_obj is not None, "top_logprobs response should have logprobs"
                     content = lp_obj.get("content", [])
-                    assert len(content) > 0, "top_logprobs content should be non-empty"
+                    assert len(
+                        content) > 0, "top_logprobs content should be non-empty"
                     for item in content:
                         top_lps = item.get("top_logprobs")
                         assert top_lps is not None and len(top_lps) > 0, (
-                            f"top_logprobs should be non-empty when requested: {item}")
+                            f"top_logprobs should be non-empty when requested: {item}"
+                        )
                         for tl in top_lps:
                             assert "token" in tl and "logprob" in tl, (
-                                f"top_logprob entry missing token/logprob: {tl}")
+                                f"top_logprob entry missing token/logprob: {tl}"
+                            )
                             assert tl["logprob"] <= 0.0, (
                                 f"top_logprob {tl['logprob']} should be <= 0")
 
