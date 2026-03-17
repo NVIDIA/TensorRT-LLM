@@ -2507,7 +2507,7 @@ void KVCacheManager::addSequence(
         auto const [_, emplaceDone] = mSequences.emplace(requestId, seq);
         if (!emplaceDone)
         {
-            return false;
+            return;
         }
     }
 
