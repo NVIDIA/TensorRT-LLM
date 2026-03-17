@@ -41,7 +41,8 @@ async def test_async_llm_awaitable():
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
     pytest.skip(
-        "KV cache v2 resize failure: 'Failed to resize capacity of KV cache for context update' causes hang"
+        "KV cache v2 OOM: dummy scheduler schedules all requests without resource checking, "
+        "causing resize failure when total tokens exceed KV cache quota"
     )
     llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
