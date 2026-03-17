@@ -31,7 +31,7 @@ from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple
 import numpy as np
 import torch
 from torch._ops import OpOverloadPacket
-from torch.fx import Node
+from torch.fx import GraphModule, Node
 from torch.types import Number
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -1566,6 +1566,15 @@ class AttentionDescriptor(ABC):
         This method is responsible for preparing the attention op for the forward pass.
         This function is not expected to be graph capturable or compatible with cuda graphs. It can
         use any argument from the SequenceInfo interface as input argument to its function.
+        """
+        return None
+
+    @classmethod
+    def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
+        """Perform optional backend-specific graph prep before cached attention insertion.
+
+        Default implementation is a no-op. Backends can override this hook to materialize
+        backend-specific graph nodes or metadata needed by ``get_constants``.
         """
         return None
 

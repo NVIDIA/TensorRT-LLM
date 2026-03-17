@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
-from torch.fx import Node
+from torch.fx import GraphModule, Node
 
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
@@ -207,6 +207,21 @@ class _TrtllmPlanner:
 
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
+_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
+_TRTLLM_ATTN_OUT_SCALE_KEY = "trtllm_attention_out_scale"
+
+
+def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
+    attn_node.meta[_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY] = input_scale
+
+
+def get_trtllm_attention_fp8_input_scale(attn_node: Node) -> Optional[Node]:
+    scale = attn_node.meta.get(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY)
+    return scale if isinstance(scale, Node) else None
+
+
+def clear_trtllm_attention_fp8_input_scale(attn_node: Node) -> None:
+    attn_node.meta.pop(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY, None)
 
 
 # =============================================================================
@@ -317,6 +332,7 @@ def trtllm_mha_with_cache(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -369,8 +385,11 @@ def trtllm_mha_with_cache(
 
     # Prepare output (pre-allocate at full padded size so padding positions are clean zeros)
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
-    output = torch.zeros(total_padded_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
-
+    # If out_scale is set, attention quantizes output to FP8.
+    out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    output = torch.zeros(
+        total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
+    )
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
     context_lengths = seq_len[:num_seq]  # device
@@ -415,7 +434,7 @@ def trtllm_mha_with_cache(
         None,  # cache_indirection (beam search)
         kv_scale_oq,  # kv_scale_orig_quant
         kv_scale_qo,  # kv_scale_quant_orig
-        None,  # out_scale
+        out_scale,  # out_scale
         None,  # rotary_inv_freq
         None,  # rotary_cos_sin
         None,  # latent_cache (MLA)
@@ -500,9 +519,11 @@ def trtllm_mha_with_cache_fake(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
-    return torch.empty_like(q.contiguous())
+    out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    return torch.empty_like(q.contiguous(), dtype=out_dtype)
 
 
 # =============================================================================
@@ -579,10 +600,29 @@ class TrtllmAttention(AttentionDescriptor):
         return prepare_trtllm_metadata_host
 
     @classmethod
+    def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
+        """Materialize optional out_scale node for FP8 output path if contract exists."""
+        input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
+        if input_scale is None:
+            attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
+            return
+
+        existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+        if isinstance(existing_out_scale, Node):
+            return
+
+        with gm.graph.inserting_before(attn_node):
+            out_scale = gm.graph.call_function(
+                torch.ops.aten.reciprocal.default, args=(input_scale,)
+            )
+        attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
+
+    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Extract constants from the source attention node.
 
-        Returns scale, sliding_window, kv_scale_orig_quant, and kv_scale_quant_orig.
+        Returns scale, sliding_window, kv_scale_orig_quant, kv_scale_quant_orig,
+        and optional output quant scale for FP8 linear consumers.
         Everything else (num_heads, head_dim, max_context_length, etc.) is inferred
         from tensor shapes or SequenceInfo metadata at runtime.
         """
@@ -618,9 +658,15 @@ class TrtllmAttention(AttentionDescriptor):
         # Get sliding_window from source attention node
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
+        # Optional out_scale is injected by prepare_node_for_cache_insertion when available.
+        out_scale = source_attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+        if not isinstance(out_scale, Node):
+            out_scale = None
+
         return [
             scale,
             sliding_window,
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
+            out_scale,
         ]

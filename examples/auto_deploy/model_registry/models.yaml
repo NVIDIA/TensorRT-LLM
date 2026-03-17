@@ -92,7 +92,7 @@ models:
 - name: meta-llama/Llama-2-7b-chat-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-8B-Instruct-FP8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base

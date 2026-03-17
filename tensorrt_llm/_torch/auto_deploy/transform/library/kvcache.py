@@ -204,6 +204,9 @@ class _InsertCachedOperator(BaseTransform):
                 cm.add_resource(k_indexed, resource_handler)
                 cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
 
+            # allow backend-specific prep before constants are extracted
+            attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
+
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
 

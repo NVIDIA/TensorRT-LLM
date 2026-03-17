@@ -364,6 +364,8 @@ class FuseRMSNorm(BaseTransform):
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    # Preserve metadata (including val/tensor_meta) for downstream transforms.
+                    new_node.meta.update(node.meta)
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1
@@ -378,6 +380,7 @@ class FuseRMSNorm(BaseTransform):
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    new_node.meta.update(node.meta)
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1
