@@ -2045,7 +2045,8 @@ void TrtGptModelInflightBatching::postProcessRequest(
             }
 
             // Build the slot trace by tracing parentIds backward from the starting slot.
-            // The trace initially gives B_g (the post-reassignment slot at each step).
+            // After this loop, slotTrace[beam][g] = the slot the beam was assigned to
+            // after beam search at generation step g (the post-reassignment slot).
             SizeType32 slot = startSlot;
             slotTrace[beam][genLen - 1] = slot;
             for (SizeType32 t = seqLen - 1; t > promptLen; --t)
@@ -2054,10 +2055,12 @@ void TrtGptModelInflightBatching::postProcessRequest(
                 slotTrace[beam][t - 1 - promptLen] = slot;
             }
 
-            // Convert from post-reassignment slot (B_g) to pre-reassignment slot (A_g).
-            // The logits at generation step g were computed from the beam in slot A_g
-            // (before beam search reassignment), not B_g (after). A_g is recorded in
-            // parentIds[B_g][promptLen + g], which points back to the source slot.
+            // Convert from post-reassignment slot to pre-reassignment slot.
+            // At each step, the model computes logits BEFORE beam search reassigns
+            // beams to slots. So generationLogits[slot][g] holds logits from the
+            // pre-reassignment slot — not the post-reassignment slot that ids/parentIds
+            // reference. parentIds[postSlot][pos] points back to the pre-reassignment
+            // slot (the slot the beam was in when the model ran).
             for (SizeType32 g = 0; g < genLen; ++g)
             {
                 slotTrace[beam][g] = parentIdsData[slotTrace[beam][g] * maxSeqLength + (promptLen + g)];
