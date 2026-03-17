@@ -2614,6 +2614,12 @@ class BaseLlmArgs(StrictBaseModel):
         "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
         status="prototype")
 
+    enable_energy_metrics: bool = Field(
+        default=False,
+        description=
+        "Enable GPU energy monitoring via NVML. When enabled, the server exposes an /energy_metrics endpoint that reports cumulative GPU energy consumption in joules.",
+        status="prototype")
+
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
         description=

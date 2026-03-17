@@ -1691,8 +1691,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
-    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
 
     def _make_configs(self, backend: str):
         ctx_server_config = {
