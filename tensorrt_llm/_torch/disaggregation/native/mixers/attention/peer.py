@@ -26,18 +26,12 @@ class IdentityMapper(RegionMapperBase):
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert len(src_group.ptrs) == len(dst_group.ptrs), (
-            f"Number of regions of src({len(src_group.ptrs)}) and dst({len(dst_group.ptrs)}) must match"
-        )
-        new_src = MemRegionGroup(
-            ptrs=list(src_group.ptrs), bytes_per_region=src_group.bytes_per_region
-        )
-        new_dst = MemRegionGroup(
-            ptrs=list(dst_group.ptrs), bytes_per_region=dst_group.bytes_per_region
+        assert src_group.ptrs.size == dst_group.ptrs.size, (
+            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
         )
         return SpecRegionPair(
-            src=SpecRegion(memory=new_src, spec=src_regions.spec),
-            dst=SpecRegion(memory=new_dst, spec=dst_regions.spec),
+            src=SpecRegion(memory=src_group, spec=src_regions.spec),
+            dst=SpecRegion(memory=dst_group, spec=dst_regions.spec),
         )
 
 
@@ -97,11 +91,11 @@ class HeadMatchMapper(RegionMapperBase):
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert len(src_group.ptrs) == len(dst_group.ptrs), (
-            f"Number of regions of src({len(src_group.ptrs)}) and dst({len(dst_group.ptrs)}) must match"
+        assert src_group.ptrs.size == dst_group.ptrs.size, (
+            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
         )
-        new_src_ptrs = [src_ptr + self._src_block_off for src_ptr in src_group.ptrs]
-        new_dst_ptrs = [dst_ptr + self._dst_block_off for dst_ptr in dst_group.ptrs]
+        new_src_ptrs = src_group.ptrs + self._src_block_off
+        new_dst_ptrs = dst_group.ptrs + self._dst_block_off
         new_src = MemRegionGroup(ptrs=new_src_ptrs, bytes_per_region=self._frag_size)
         new_dst = MemRegionGroup(ptrs=new_dst_ptrs, bytes_per_region=self._frag_size)
         return SpecRegionPair(
@@ -177,8 +171,8 @@ class HeadMismatchMapper(RegionMapperBase):
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert len(src_group.ptrs) == len(dst_group.ptrs), (
-            f"Number of regions of src({len(src_group.ptrs)}) and dst({len(dst_group.ptrs)}) must match"
+        assert src_group.ptrs.size == dst_group.ptrs.size, (
+            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
         )
         src_bases = np.array(src_group.ptrs, dtype=np.int64)
         dst_bases = np.array(dst_group.ptrs, dtype=np.int64)
@@ -198,8 +192,8 @@ class HeadMismatchMapper(RegionMapperBase):
             head_off=self._dst_head_off,
             kv_factor=self._kv_indices.size,
         )
-        all_src_ptrs = [int(x) for x in src_frags.flatten()]
-        all_dst_ptrs = [int(x) for x in dst_frags.flatten()]
+        all_src_ptrs = src_frags.ravel()
+        all_dst_ptrs = dst_frags.ravel()
         new_src = MemRegionGroup(ptrs=all_src_ptrs, bytes_per_region=self._bytes_cont_heads)
         new_dst = MemRegionGroup(ptrs=all_dst_ptrs, bytes_per_region=self._bytes_cont_heads)
         return SpecRegionPair(
@@ -272,11 +266,11 @@ class IndexerKCacheHeadMatchMapper(RegionMapperBase):
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
-        assert len(src_group.ptrs) == len(dst_group.ptrs), (
-            f"Number of regions of src({len(src_group.ptrs)}) and dst({len(dst_group.ptrs)}) must match"
+        assert src_group.ptrs.size == dst_group.ptrs.size, (
+            f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
         )
-        new_src_ptrs = [src_ptr + self._src_block_off for src_ptr in src_group.ptrs]
-        new_dst_ptrs = [dst_ptr + self._dst_block_off for dst_ptr in dst_group.ptrs]
+        new_src_ptrs = src_group.ptrs + self._src_block_off
+        new_dst_ptrs = dst_group.ptrs + self._dst_block_off
         new_src = MemRegionGroup(ptrs=new_src_ptrs, bytes_per_region=self._frag_size)
         new_dst = MemRegionGroup(ptrs=new_dst_ptrs, bytes_per_region=self._frag_size)
         return SpecRegionPair(

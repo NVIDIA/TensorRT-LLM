@@ -26,6 +26,7 @@
 #endif
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
@@ -83,6 +84,28 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
                 new (self) kvc::MemoryDescs(type, std::move(descs));
             },
             nb::arg("type"), nb::arg("tuples"))
+        // Batch constructor from numpy arrays: addrs, sizes, device_ids
+        .def(
+            "__init__",
+            [](kvc::MemoryDescs* self, kvc::MemoryType type,
+                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes,
+                nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> deviceIds)
+            {
+                size_t n = addrs.shape(0);
+                std::vector<kvc::MemoryDesc> descs;
+                descs.reserve(n);
+                auto const* a = addrs.data();
+                auto const* s = sizes.data();
+                auto const* d = deviceIds.data();
+                for (size_t i = 0; i < n; ++i)
+                {
+                    descs.emplace_back(
+                        static_cast<uintptr_t>(a[i]), static_cast<size_t>(s[i]), static_cast<uint32_t>(d[i]));
+                }
+                new (self) kvc::MemoryDescs(type, std::move(descs));
+            },
+            nb::arg("type"), nb::arg("addrs"), nb::arg("sizes"), nb::arg("device_ids"))
         .def_prop_ro("type", &kvc::MemoryDescs::getType)
         .def_prop_ro("descs", &kvc::MemoryDescs::getDescs);
 
