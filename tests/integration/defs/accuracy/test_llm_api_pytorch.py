@@ -3085,6 +3085,57 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,overlap_scheduler,max_batch_size,host_cache_size_gb",
+        [
+            (8, 1, 8, 0, True, 24, 10),
+            (8, 1, 8, 1, True, 24, 10),
+        ],
+        ids=["host_cache_offload", "host_cache_offload_mtp1"])
+    def test_dsa_host_cache_offload(self, tp_size, pp_size, ep_size, mtp_nextn,
+                                    overlap_scheduler, max_batch_size,
+                                    host_cache_size_gb):
+        """Validate DSA host-offloading for both pools (MLA KV cache + indexer-K cache)."""
+        if get_sm_version() == 100 or get_sm_version() == 103:
+            moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
+        else:
+            moe_config = MoeConfig()
+
+        # Use a small GPU fraction so that host offload is actually exercised.
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.4,
+            host_cache_size=host_cache_size_gb * (1 << 30),
+        )
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig(),
+            moe_config=moe_config,
+        )
+
+        dsa_config = DeepSeekSparseAttentionConfig(
+            skip_indexer_for_short_seqs=False)
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        with LLM(self.MODEL_PATH,
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=True,
+                 speculative_config=mtp_config,
+                 sparse_attention_config=dsa_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,attention_dp,max_batch_size,moe_backend,fp8kv,chunked_prefill",
@@ -6156,7 +6207,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 max_batch_size=32, enable_padding=True) if cuda_graph else None)
 
         with LLM(
-                f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
                 kv_cache_config=kv_cache_config,
                 max_batch_size=32,
                 tensor_parallel_size=tp_size,
@@ -6201,7 +6252,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                            "1" if use_cpp_mamba else "0")
 
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-fp8-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6243,7 +6294,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         # The optimized config is still under investigation.
         # Adding this test as placeholder.
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6281,7 +6332,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_parallelism(self, tp_size, ep_size, pp_size, attention_dp):
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6313,7 +6364,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-011526"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
                 kv_cache_config=KvCacheConfig(
@@ -6348,7 +6399,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=max_draft_len,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-011526"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
             model=model_path,
@@ -6407,13 +6458,13 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_fp16_4gpu_mtp_ar(self):
+    def test_bf16_4gpu_mtp_ar(self):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=max_draft_len,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
         llm_common_config = dict(
             model=model_path,
             tensor_parallel_size=4,
