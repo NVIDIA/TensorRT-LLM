@@ -2250,8 +2250,8 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 # between streaming and non-streaming in disaggregated mode
                 # due to the context/generation handoff boundary.
                 comparable = 0
-                for i, (n, s) in enumerate(zip(ns_logprobs, st_logprobs,
-                                                strict=True)):
+                for i, (n, s) in enumerate(
+                        zip(ns_logprobs, st_logprobs, strict=True)):
                     if i == 0 or n is None or s is None:
                         continue
                     comparable += 1
