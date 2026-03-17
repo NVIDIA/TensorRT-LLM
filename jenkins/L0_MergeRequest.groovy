@@ -66,6 +66,8 @@ boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ 
 
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
 
+GEN_POST_MERGE_BUILDS_ONLY = (env.JOB_NAME?.contains("GenPostMergeBuilds") ?: false)
+
 BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
 
 def trimForStageList(stageNameList)
@@ -155,7 +157,9 @@ def globalVars = [
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
+// GenPostMergeBuilds pipelines do not update GitLab status.
 boolean enableUpdateGitlabStatus =
+    !GEN_POST_MERGE_BUILDS_ONLY &&
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     !testFilter[DISABLE_MULTI_GPU_TEST] &&
@@ -237,11 +241,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 20Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 20Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -310,7 +314,9 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
     sh "env | sort"
-    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    }
     echo "Using GitLab repo: ${LLM_REPO}."
     sh "git config --global --add safe.directory \"*\""
     // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
@@ -378,7 +384,7 @@ def mergeWaiveList(pipeline, globalVars)
 
 def preparation(pipeline, testFilter, globalVars)
 {
-    image = "urm.nvidia.com/docker/golang:1.22"
+    image = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
@@ -390,7 +396,7 @@ def preparation(pipeline, testFilter, globalVars)
     })
 }
 
-def launchReleaseCheck(pipeline)
+def launchReleaseCheck(pipeline, globalVars)
 {
     stages = {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
@@ -427,7 +433,23 @@ def launchReleaseCheck(pipeline)
         }
 
         // Step 3: Run pre-commit checks
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
+        // Post-merge CI runs on all files; pre-merge CI runs only on changed files.
+        def precommitArgs = "-a"
+        if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || env.alternativeTRT)) {
+            // Use GitLab/GitHub API to get the exact list of changed files in this MR.
+            // This avoids git history depth issues with shallow clones.
+            def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+            if (changedFileList && !changedFileList.isEmpty()) {
+                def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
+                writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
+                // Script runs after "cd ${LLM_ROOT}", so use relative path
+                precommitArgs = "--files-from changed_files.txt"
+                echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
+            } else {
+                echo "Could not determine changed files, falling back to all files"
+            }
+        }
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
 
         // Step 4: Run license check
         withEnv(['GONOSUMDB=*.nvidia.com']) {
@@ -729,7 +751,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
-        "tests/unittest/_torch/auto_deploy/unit/multigpu",
+        "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/disaggregated/",
@@ -865,30 +887,30 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        stage("Collect Perf Regression Result") {
+        stage("Collect Perf Sanity Test Result") {
             def yamlFiles = sh(
                 returnStdout: true,
-                script: 'find . -type f -name "regression_data.yaml" 2>/dev/null || true'
+                script: 'find . -type f -name "perf_data.yaml" 2>/dev/null || true'
             ).trim()
-            echo "Regression data yaml files: ${yamlFiles}"
+            echo "Perf data yaml files: ${yamlFiles}"
             if (yamlFiles) {
                 def yamlFileList = yamlFiles.split(/\s+/).collect { it.trim() }.findAll { it }.join(",")
-                echo "Found regression data files: ${yamlFileList}"
+                echo "Found perf data files: ${yamlFileList}"
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml requests")
                 sh """
-                    python3 llm/jenkins/scripts/perf/perf_regression.py \
+                    python3 llm/jenkins/scripts/perf/get_pre_merge_html.py \
                     --input-files=${yamlFileList} \
-                    --output-file=perf_regression.html
+                    --output-file=perf_sanity_report.html
                 """
-                trtllm_utils.uploadArtifacts("perf_regression.html", "${UPLOAD_PATH}/test-results/")
-                echo "Perf regression report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_regression.html"
+                trtllm_utils.uploadArtifacts("perf_sanity_report.html", "${UPLOAD_PATH}/test-results/")
+                echo "Perf sanity report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_sanity_report.html"
             } else {
-                echo "No regression_data.yaml files found."
+                echo "No perf_data.yaml files found."
             }
-        } // Collect Perf Regression Result stage
+        } // Collect Perf Sanity Test Result stage
         stage("Rerun Report") {
             sh "rm -rf rerun && mkdir -p rerun"
             sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
@@ -1048,7 +1070,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     stages = [
         "Release-Check": {
             script {
-                launchReleaseCheck(this)
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+                launchReleaseCheck(this, globalVars)
             }
         },
         "x86_64-Linux": {
@@ -1061,6 +1087,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
                     launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                }
+
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
+                    return
                 }
 
                 testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
@@ -1110,8 +1141,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
+                        echo "In the official post-merge pipeline or when fail fast is disabled, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
@@ -1168,6 +1199,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
 
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+
                 testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
                 def singleGpuTestFailed = false
                 stage(testStageName) {
@@ -1213,8 +1249,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
+                        echo "In the official post-merge pipeline or when fail fast is disabled, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
@@ -1278,10 +1314,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     ]
 
-    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+    if (env.JOB_NAME ==~ /.*PostMerge.*/ && !GEN_POST_MERGE_BUILDS_ONLY) {
         stages += dockerBuildJob
     }
-    if (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images")) {
+    if (!GEN_POST_MERGE_BUILDS_ONLY && (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
         stages += dockerBuildJob
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
@@ -1317,25 +1353,50 @@ pipeline {
     }
     post {
         unsuccessful {
-            updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "failed"
+            script {
+                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "failed"
+                }
+            }
         }
         success {
             script {
                 if (enableUpdateGitlabStatus) {
                     updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "success"
-                } else {
+                } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
                     updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "canceled"
                     updateGitlabCommitStatus name: "Custom Jenkins build", state: "success"
                 }
             }
         }
         aborted {
-            updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'canceled'
+            script {
+                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'canceled'
+                }
+            }
         }
         always {
             script {
-                if (!isReleaseCheckMode) {
+                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter)
+                }
+                stage("Upload Build Info") {
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+                        def buildInfo = "commit=${env.gitlabCommit}\n" +
+                            "branch=${branch}\n" +
+                            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                            "jenkins_url=${env.BUILD_URL}"
+                        writeFile file: 'build_info.txt', text: buildInfo
+                        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+                        echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+                    } catch (Exception e) {
+                        echo "Upload Build Info failed: ${e.toString()}"
+                    }
                 }
             }
         }
@@ -1362,7 +1423,7 @@ pipeline {
                     if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
-                                launchReleaseCheck(this)
+                                launchReleaseCheck(this, globalVars)
                             }
                         }
                     } else {

@@ -908,6 +908,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
+    FP8_QUANT_BLOCK_SIZE = 128
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -926,16 +927,18 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         cell_div = lambda x, y: (x + y - 1) // y
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
             (module.expert_size_per_partition,
-             cell_div(module.intermediate_size_per_partition, 128) * 2,
-             cell_div(w3_w1_weight_shape[2], 128)),
+             cell_div(module.intermediate_size_per_partition,
+                      self.FP8_QUANT_BLOCK_SIZE) * 2,
+             cell_div(w3_w1_weight_shape[2], self.FP8_QUANT_BLOCK_SIZE)),
             dtype=torch.float32),
                                                    requires_grad=False)
         module.register_parameter("w3_w1_weight_scaling_factor",
                                   w3_w1_weight_scaling_factor)
 
         w2_weight_scaling_factor = nn.Parameter(torch.empty(
-            (module.expert_size_per_partition, cell_div(
-                w2_weight_shape[1], 128), cell_div(w2_weight_shape[2], 128)),
+            (module.expert_size_per_partition,
+             cell_div(w2_weight_shape[1], self.FP8_QUANT_BLOCK_SIZE),
+             cell_div(w2_weight_shape[2], self.FP8_QUANT_BLOCK_SIZE)),
             dtype=torch.float32),
                                                 requires_grad=False)
         module.register_parameter("w2_weight_scaling_factor",
@@ -986,6 +989,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                     f"{expert_id}.w2.weight_scale_inv"] if f"{expert_id}.w2.weight_scale_inv" in weights else None
                 dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale[
                     local_slot_id].chunk(2, dim=0)
+                assert module.intermediate_size_per_partition % self.FP8_QUANT_BLOCK_SIZE == 0, "For DeepSeekFP8BlockScalesFusedMoEMethod, intermediate_size_per_partition should be divisible by FP8_QUANT_BLOCK_SIZE."
                 if w1_scale is not None:
                     w1_scale_shard = load_weight_shard(
                         w1_scale,
@@ -1102,8 +1106,11 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
 
+    def _needs_e8m0_resmooth(self):
+        return is_sm_100f() or get_sm_version() == 120
+
     def post_load_weights(self, module: torch.nn.Module):
-        if is_sm_100f():
+        if is_sm_100f() or get_sm_version() == 120:
             # Resmooth shared experts before registering shared weights
             if self.need_load_shared_weights(module):
                 local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -1142,7 +1149,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
         super().post_load_weights(module)
 
-        if is_sm_100f():
+        if self._needs_e8m0_resmooth():
             logger.debug("Resmoothing FP8 weights in post_load_weights")
             resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
@@ -1900,7 +1907,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
             [torch.stack(all_w3_scales),
              torch.stack(all_w1_scales)], dim=-2)
 
-        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16).view(module.dtype)
+        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16)
         w3_w1_s_shape = w3_w1_scales.shape
         w3_w1_scales_interleaved = w3_w1_scales.reshape(
             w3_w1_s_shape[0], w3_w1_s_shape[1],
@@ -1928,8 +1935,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 w2_scales_shard, (0, pad_size_inter, 0, pad_size_hidden))
             all_w2_scales.append(w2_scales_shard)
 
-        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
-            module.dtype)
+        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16)
         w2_s_shape = w2_scales.shape
         w2_scales_interleaved = w2_scales.reshape(
             w2_s_shape[0], w2_s_shape[1],
@@ -2205,6 +2211,9 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         if has_pre_quant_scale:
+            assert module.is_gated_activation, (
+                "pre_quant_scale (NVFP4_AWQ) is not supported with non-gated activations"
+            )
             from ..linear import TensorParallelMode, load_weight_shard
 
             device = module.fc31_act_scale.device
@@ -2826,10 +2835,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # last step: load fc31_scale_c
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
-        # For non-gated activations (Relu2), scale_c_fc1 is just the input scale
+        # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
         from ...utils import ActivationType
-        if hasattr(module, 'activation_type'
-                   ) and module.activation_type == ActivationType.Relu2:
+        if hasattr(module, 'activation_type') and module.activation_type in [
+                ActivationType.Relu2, ActivationType.Silu
+        ]:
             # For Relu2: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
                 module.expert_size_per_partition),
@@ -3105,21 +3115,23 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             w1_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
             alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
-            w3_weight_scale,
-            self.input_hidden_alignment // module.scaling_vector_size,
-            alignment)
+        if module.is_gated_activation:
+            w3_weight_scale = maybe_pad_for_mxfp4(
+                w3_weight_scale,
+                self.input_hidden_alignment // module.scaling_vector_size,
+                alignment)
 
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
+        if module.is_gated_activation:
+            w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
 
         # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
         w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0

@@ -43,6 +43,7 @@ def _flashinfer_cached_ssm(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     chunk_indices: torch.Tensor,  # [num_logical_chunks]
     chunk_offsets: torch.Tensor,  # [num_logical_chunks]
@@ -60,9 +61,8 @@ def _flashinfer_cached_ssm(
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
-    # Preallocate output tensor to avoid memcpy cost for merging prefill
-    # and decode outputs
-    preallocated_ssm_out = torch.empty(
+    # Preallocate output tensor (zeros so padding positions are clean)
+    preallocated_ssm_out = torch.zeros(
         [bs, num_heads, head_dim],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
@@ -81,6 +81,7 @@ def _flashinfer_cached_ssm(
         cu_seqlen,
         slot_idx,
         use_initial_states,
+        any_prefill_use_initial_states_host,
         chunk_indices,
         chunk_offsets,
         seq_idx_prefill,
@@ -140,13 +141,12 @@ def _flashinfer_cached_ssm(
         )
         preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
     if num_total_tokens > 0:
-        return (
-            preallocated_ssm_out[:num_total_tokens]
-            .view(b, s, num_heads, head_dim)
-            .to(hidden_states.dtype)
-        )
+        # Cast to input dtype if needed (prefill may compute in higher precision)
+        if preallocated_ssm_out.dtype != hidden_states.dtype:
+            preallocated_ssm_out = preallocated_ssm_out.to(hidden_states.dtype)
+        return preallocated_ssm_out.view(b, s, num_heads, head_dim)
     else:
-        return torch.empty_like(hidden_states)
+        return torch.zeros_like(hidden_states)
 
 
 @_flashinfer_cached_ssm.register_fake
@@ -164,6 +164,7 @@ def _flashinfer_cached_ssm_fake(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     chunk_indices: torch.Tensor,  # [num_logical_chunks]
     chunk_offsets: torch.Tensor,  # [num_logical_chunks]

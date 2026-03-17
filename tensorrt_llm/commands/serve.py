@@ -18,9 +18,9 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.commands.utils import (get_is_diffusion_model,
-                                         get_visual_gen_model_type)
+from tensorrt_llm.commands.utils import get_is_diffusion_model
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -151,7 +151,7 @@ def get_llm_args(
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
-        fail_fast_on_attention_window_too_large: bool = False,
+        fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
         **llm_args_extra_dict: Any):
@@ -372,6 +372,8 @@ def launch_grpc_server(host: str,
                 ("grpc.max_receive_message_length", -1),  # Unlimited
                 ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
                 ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
+                ("grpc.keepalive_permit_without_calls", True),
+                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
             ], )
 
         # Add servicer to server
@@ -451,7 +453,8 @@ def launch_mm_encoder_server(
 def launch_visual_gen_server(
     host: str,
     port: int,
-    visual_gen_config: dict,
+    model: str,
+    diffusion_args: Optional[VisualGenArgs] = None,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
     """Launch a VISUAL_GEN model server for image/video generation.
@@ -459,25 +462,22 @@ def launch_visual_gen_server(
     Args:
         host: Server hostname.
         port: Server port.
-        visual_gen_config: Arguments for VISUAL_GEN model initialization.
+        model: Model path or HuggingFace Hub model ID.
+        diffusion_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
-    model = visual_gen_config["model"]
     logger.info(f"Initializing VisualGen ({model})")
 
-    n_workers = 1
-    parallel_config = visual_gen_config.get("parallel", {})
-    if parallel_config:
-        n_workers = parallel_config.get(
-            "dit_cfg_size", 1) * parallel_config.get("dit_ulysses_size", 1)
-        logger.info(f"World size: {n_workers}")
-        logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
-        logger.info(
-            f"Ulysses size: {parallel_config.get('dit_ulysses_size', 1)}")
-
     visual_gen_model = VisualGen(model_path=model,
-                                 n_workers=n_workers,
-                                 diffusion_config=visual_gen_config)
+                                 diffusion_args=diffusion_args)
+
+    n_workers = visual_gen_model.diffusion_args.parallel.n_workers
+    logger.info(f"World size: {n_workers}")
+    logger.info(
+        f"CFG size: {visual_gen_model.diffusion_args.parallel.dit_cfg_size}")
+    logger.info(
+        f"Ulysses size: {visual_gen_model.diffusion_args.parallel.dit_ulysses_size}"
+    )
 
     server = OpenAIServer(generator=visual_gen_model,
                           model=model,
@@ -604,12 +604,15 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help=help_info_with_stability_tag("expert parallelism size",
                                                 "beta"))
-@click.option("--moe_cluster_parallel_size",
-              "--cluster_size",
-              type=int,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "expert cluster parallelism size", "beta"))
+@click.option(
+    "--moe_cluster_parallel_size",
+    "--cluster_size",
+    type=int,
+    default=None,
+    help=help_info_with_stability_tag(
+        "[Deprecated] Expert cluster parallelism size. "
+        "This option is no longer supported and will be removed in a future release.",
+        "deprecated"))
 @click.option(
     "--gpus_per_node",
     type=int,
@@ -661,7 +664,7 @@ class ChoiceWithAlias(click.Choice):
         "prototype"))
 @click.option(
     "--reasoning_parser",
-    type=click.Choice(ReasoningParserFactory.parsers.keys()),
+    type=click.Choice(ReasoningParserFactory.keys()),
     default=None,
     help=help_info_with_stability_tag(
         "Specify the parser for reasoning models.", "prototype"),
@@ -688,10 +691,12 @@ class ChoiceWithAlias(click.Choice):
 @click.option(
     "--fail_fast_on_attention_window_too_large",
     is_flag=True,
-    default=False,
+    default=True,
     help=help_info_with_stability_tag(
-        "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.",
-        "prototype"))
+        "[Deprecated] Exit with runtime error when attention window is too large "
+        "to fit even a single sequence in the KV cache. Now defaults to True. "
+        "This flag only affects the TRT backend and will be removed in a future release.",
+        "deprecated"))
 @click.option("--otlp_traces_endpoint",
               type=str,
               default=None,
@@ -763,6 +768,18 @@ def serve(
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if moe_cluster_parallel_size is not None:
+        logger.warning(
+            "--moe_cluster_parallel_size / --cluster_size is deprecated and "
+            "no longer supported. This option will be removed in a future release."
+        )
+
+    if "--fail_fast_on_attention_window_too_large" in sys.argv:
+        logger.warning(
+            "--fail_fast_on_attention_window_too_large is deprecated. "
+            "It now defaults to True and will be removed in a future release. "
+            "This flag only affects the TRT backend.")
 
     for custom_module_dir in custom_module_dirs:
         try:
@@ -874,22 +891,17 @@ def serve(
                           served_model_name=served_model_name)
 
     def _serve_visual_gen():
-        visual_gen_config = {
-            "model": model,
-            "model_type": get_visual_gen_model_type(model),
-        }
-
-        visual_gen_extra_args = {}
+        extra_args = {}
         if extra_visual_gen_options is not None:
             with open(extra_visual_gen_options, 'r') as f:
-                visual_gen_extra_args = yaml.safe_load(f)
+                extra_args = yaml.safe_load(f) or {}
 
-        visual_gen_config.update(visual_gen_extra_args)
+        diffusion_args = VisualGenArgs(**extra_args) if extra_args else None
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host, port, visual_gen_config,
+        launch_visual_gen_server(host, port, model, diffusion_args,
                                  metadata_server_cfg)
 
     if get_is_diffusion_model(model):
@@ -1001,8 +1013,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     "--metrics-log-interval",
     type=int,
     default=0,
-    help=
-    "The interval of logging metrics in seconds. Set to 0 to disable metrics logging."
+    help="[Deprecated] The interval of logging metrics in seconds. "
+    "This option is not connected to any functionality and will be removed in a future release."
 )
 def disaggregated(
     config_file: Optional[str],
@@ -1015,6 +1027,11 @@ def disaggregated(
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)
+
+    if metrics_log_interval != 0:
+        logger.warning(
+            "--metrics-log-interval is deprecated and not connected to any "
+            "functionality. This option will be removed in a future release.")
 
     disagg_cfg = parse_disagg_config_file(config_file)
 

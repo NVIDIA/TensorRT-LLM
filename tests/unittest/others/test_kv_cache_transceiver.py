@@ -334,7 +334,7 @@ def hybrid_dtypes(request):
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
 @pytest.mark.parametrize(
     "hybrid_dtypes",
     [
@@ -409,7 +409,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
     # Prepare resources for hybrid manager (handles both KV and Mamba)
     scheduled_ctx = ScheduledRequests()
-    scheduled_ctx.context_requests = [ctx_request]
+    scheduled_ctx.context_requests_last_chunk = [ctx_request]
     hybrid_cache_manager_ctx.prepare_resources(scheduled_ctx)
 
     # Send ctx request (sends both KV and Mamba states)
@@ -428,7 +428,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
     # Prepare resources for hybrid manager on gen side
     scheduled_gen = ScheduledRequests()
-    scheduled_gen.context_requests = [gen_request]
+    scheduled_gen.context_requests_last_chunk = [gen_request]
     hybrid_cache_manager_gen.prepare_resources(scheduled_gen)
 
     cache_transceiver_gen.request_and_receive_async(gen_request)
@@ -450,7 +450,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
 def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
     monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
 
@@ -460,7 +460,7 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
     hybrid_cache_manager_ctx = create_hybrid_cache_manager(mapping, dtype)
     hybrid_cache_manager_gen = create_hybrid_cache_manager(mapping, dtype)
 
-    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+    cache_transceiver_config = CacheTransceiverConfig(backend=backend,
                                                       max_tokens_in_buffer=512)
     dist = Distributed.get(mapping)
 
@@ -494,7 +494,7 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
     scheduled_ctx = ScheduledRequests()
-    scheduled_ctx.context_requests = [ctx_request]
+    scheduled_ctx.context_requests_last_chunk = [ctx_request]
     hybrid_cache_manager_ctx.prepare_resources(scheduled_ctx)
 
     # Send ctx request
@@ -519,7 +519,7 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
         context_phase_params=ctx_request.context_phase_params)
 
     scheduled_gen = ScheduledRequests()
-    scheduled_gen.context_requests = [gen_request]
+    scheduled_gen.context_requests_last_chunk = [gen_request]
     hybrid_cache_manager_gen.prepare_resources(scheduled_gen)
 
     # Try to receive gen request

@@ -12,6 +12,8 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..modules.attention import (maybe_allgather_for_helix_cp,
+                                 maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -95,6 +97,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
         self.mapping = model_config.mapping
+        self.mapping_with_cp = mapping_with_cp
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
         # When enable_attention_dp is True, TP reduction is skipped since each DP rank
@@ -168,6 +171,9 @@ class Qwen3DecoderLayer(DecoderLayer):
             mrope_config=mrope_config,
             **kwargs,
         )
+        residual = maybe_slice_for_helix_cp(residual, attn_metadata,
+                                            self.mapping_with_cp,
+                                            self.layer_idx)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
@@ -198,6 +204,7 @@ class Qwen3Model(DecoderModel):
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
         config = self.model_config
+        self.mapping_with_cp = mapping_with_cp
 
         self.embed_tokens = Embedding(
             config.pretrained_config.vocab_size,
@@ -256,6 +263,9 @@ class Qwen3Model(DecoderModel):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
+                                                     attn_metadata,
+                                                     self.mapping_with_cp)
         return hidden_states
 
 

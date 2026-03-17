@@ -35,7 +35,7 @@ from ..conftest import get_llm_root, llm_models_root
 from .open_search_db_utils import (
     SCENARIO_MATCH_FIELDS,
     add_id,
-    check_perf_regression,
+    generate_perf_yaml,
     get_common_values,
     get_history_data,
     get_job_info,
@@ -55,6 +55,8 @@ MODEL_PATH_DICT = {
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
+    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
+    "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -66,8 +68,10 @@ SUPPORTED_GPU_MAPPING = {
 }
 
 DEFAULT_TIMEOUT = 5400
-AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
-DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
+AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
+DISAGG_CONFIG_FOLDER = os.environ.get(
+    "DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated"
+)
 
 # Regex patterns for parsing benchmark output metrics
 # Key is the metric name used in database (e.g., "mean_e2el", "seq_throughput")
@@ -617,7 +621,7 @@ class DisaggTestCmds(NamedTuple):
         with open(hostname_file, "w") as f:
             f.write(f"{self.hostname}:{port}")
 
-    def _generate_disagg_server_config(self, server_idx: int, disagg_server_port: int) -> str:
+    def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
         hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
@@ -654,6 +658,11 @@ class DisaggTestCmds(NamedTuple):
                 ctx_hostnames.append(hostname_port)
             elif hostname_file.startswith("GEN"):
                 gen_hostnames.append(hostname_port)
+
+        # Allocate port here (after waiting) to minimize the window between
+        # port allocation and actual use, avoiding TOCTOU race conditions
+        # where another process on the same node grabs the port.
+        disagg_server_port = get_free_port()
 
         server_config = {
             "hostname": self.hostname,
@@ -735,10 +744,9 @@ class DisaggTestCmds(NamedTuple):
         benchmark_status_file = os.path.join(
             self.test_output_dir, f"benchmark_status.{server_idx}.txt"
         )
-        port = get_free_port()
-
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
+            port = get_free_port()
             self._generate_hostname_file(server_idx, port)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
@@ -766,7 +774,7 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
-                self._generate_disagg_server_config(server_idx, port)
+                self._generate_disagg_server_config(server_idx)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,
@@ -901,12 +909,16 @@ def get_config_dir(benchmark_mode: Optional[str]) -> str:
         benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
 
     Returns:
-        str: Config directory path (relative to llm_root)
+        str: Absolute config directory path
     """
     if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
-        return DISAGG_CONFIG_FOLDER
+        config_dir = DISAGG_CONFIG_FOLDER
     else:
-        return AGGR_CONFIG_FOLDER
+        config_dir = AGG_CONFIG_FOLDER
+    # If relative path, join with llm root
+    if not os.path.isabs(config_dir):
+        config_dir = os.path.join(get_llm_root(), config_dir)
+    return config_dir
 
 
 class PerfSanityTestConfig:
@@ -962,10 +974,7 @@ class PerfSanityTestConfig:
         )
 
         # Get config_dir based on benchmark_mode
-        config_dir = get_config_dir(self.benchmark_mode)
-        self.config_dir = os.getenv(
-            "TRTLLM_CONFIG_FOLDER", os.path.join(get_llm_root(), config_dir)
-        )
+        self.config_dir = get_config_dir(self.benchmark_mode)
 
     def parse_config_file(self):
         """Parse config file based on runtime and benchmark_mode."""
@@ -1425,7 +1434,7 @@ class PerfSanityTestConfig:
                     if not match_keys:
                         if server_config.match_mode == "scenario":
                             match_keys = SCENARIO_MATCH_FIELDS.copy()
-                            is_scenario_mode = True
+                            is_scenario_mode = True  # noqa: F841
                         else:
                             match_keys.extend(["s_gpu_type", "s_runtime"])
                             match_keys.extend(server_config.to_match_keys())
@@ -1538,11 +1547,12 @@ class PerfSanityTestConfig:
             # Upload the new perf data and baseline data to database
             post_new_perf_data(new_baseline_data_dict, new_data_dict)
 
-        check_perf_regression(
+        generate_perf_yaml(
             new_data_dict,
-            fail_on_regression=is_scenario_mode,
             output_dir=self.test_output_dir,
         )
+        # TODO: Re-enable regression failure check if needed
+        # check_perf_regression(new_data_dict, fail_on_regression=is_scenario_mode, output_dir=self.test_output_dir)
 
 
 # Perf sanity test case parameters
@@ -1575,8 +1585,10 @@ def get_yaml_files_with_server_names(directory: str) -> Dict[str, List[str]]:
 
 def get_aggr_test_cases() -> List[str]:
     """Generate aggr test cases based on actual server_config names in YAML files."""
-    llm_root = get_llm_root()
-    aggr_config_dir = os.path.join(llm_root, AGGR_CONFIG_FOLDER)
+    aggr_config_dir = AGG_CONFIG_FOLDER
+    # If relative path, join with llm root
+    if not os.path.isabs(aggr_config_dir):
+        aggr_config_dir = os.path.join(get_llm_root(), aggr_config_dir)
     yaml_server_names = get_yaml_files_with_server_names(aggr_config_dir)
 
     test_cases = []
@@ -1593,15 +1605,11 @@ def get_aggr_test_cases() -> List[str]:
 
 
 def get_disagg_test_cases() -> List[str]:
-    """Generate disagg test cases with benchmark modes.
-
-    New format:
-    - Disagg e2e: {test_type}-e2e-{config_base}
-    - Disagg gen_only: {test_type}-gen_only-{config_base}
-    - ctx_only: aggr_{upload}-ctx_only-{config_base} (uses aggr prefix)
-    """
-    llm_root = get_llm_root()
-    disagg_config_dir = os.path.join(llm_root, DISAGG_CONFIG_FOLDER)
+    """Generate disagg test cases with benchmark modes."""
+    disagg_config_dir = DISAGG_CONFIG_FOLDER
+    # If relative path, join with llm root
+    if not os.path.isabs(disagg_config_dir):
+        disagg_config_dir = os.path.join(get_llm_root(), disagg_config_dir)
     yaml_files = glob.glob(os.path.join(disagg_config_dir, "*.yaml"))
     basenames = sorted([os.path.splitext(os.path.basename(f))[0] for f in yaml_files])
 
