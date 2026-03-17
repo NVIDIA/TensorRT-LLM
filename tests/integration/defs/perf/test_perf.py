@@ -1386,7 +1386,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         serve_config = config or {}
         serve_config.setdefault('max_batch_size', self._config.max_batch_size)
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
-        serve_config.setdefault('kv_cache_free_gpu_memory_fraction',
+        kv_cache_cfg = serve_config.setdefault('kv_cache_config', {})
+        kv_cache_cfg.setdefault('free_gpu_memory_fraction',
                                 self._config.kv_cache_free_gpu_mem_fraction)
         if self._config.tp_size > 1:
             serve_config.setdefault('tensor_parallel_size',
