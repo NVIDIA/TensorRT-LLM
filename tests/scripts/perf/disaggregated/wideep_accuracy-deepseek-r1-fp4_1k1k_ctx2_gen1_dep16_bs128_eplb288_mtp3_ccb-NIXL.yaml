@@ -56,7 +56,6 @@ accuracy:
       model: "local-completions"
       model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
       extra_kwargs:
-        apply_chat_template: true
         trust_remote_code: true
         custom_config: tests/integration/lm_eval_configs/gsm8k_local.yaml
 worker_config:
