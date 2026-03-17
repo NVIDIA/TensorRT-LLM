@@ -4,10 +4,10 @@ from utils.util import getSMVersion, skip_pre_blackwell, skip_pre_hopper
 
 # Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
 # Import CuTE DSL utils
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for indexer_topk tests", allow_module_level=True)
@@ -319,8 +319,9 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode_single_cta(batch_size, next_n, index_topk, num_tokens, dtype,
-                              load_balance):
+def test_cute_dsl_topk_decode_single_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
+):
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -378,10 +379,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
     num_gen_tokens = batch_size * next_n
 
     def run_fn(logits, seq_lens):
-        output_indices = torch.empty(num_gen_tokens,
-                                     index_topk,
-                                     dtype=torch.int32,
-                                     device="cuda")
+        output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
         torch.ops.trtllm.cute_dsl_indexer_topk_decode(
             input_values=logits,
             seq_lens=seq_lens,
@@ -410,9 +408,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_distributed(
-    batch_size, next_n, index_topk, num_tokens, dtype
-):
+def test_cute_dsl_topk_decode_distributed(batch_size, next_n, index_topk, num_tokens, dtype):
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -420,14 +416,19 @@ def test_cute_dsl_topk_decode_distributed(
         num_tokens,
         dtype,
         lambda logits, seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeDistributedRunner.forward(
-                input_values=logits,
-                seq_lens=seq_lens,
-                top_k=index_topk,
-                next_n=next_n,
-                return_val=False,
-                num_copy_bits=256,
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            return_val=False,
+            num_copy_bits=256,
         )[0],
     )
 
-test_cute_dsl_topk_decode_distributed(batch_size=16, next_n=3, index_topk=2048, num_tokens=65536, dtype=torch.float32)
-test_cute_dsl_topk_decode_distributed(batch_size=16, next_n=3, index_topk=2048, num_tokens=262144, dtype=torch.float32)
+
+test_cute_dsl_topk_decode_distributed(
+    batch_size=16, next_n=3, index_topk=2048, num_tokens=65536, dtype=torch.float32
+)
+test_cute_dsl_topk_decode_distributed(
+    batch_size=16, next_n=3, index_topk=2048, num_tokens=262144, dtype=torch.float32
+)
