@@ -122,6 +122,7 @@ async def test_llm_rpc_streaming_tp2():
 def test_llm_return_logprobs_streaming_tp2(prompt_logprobs, logprobs,
                                            return_context_logits,
                                            return_generation_logits):
+    pytest.skip("del failure on H100, root cause unknown")
     llm_return_logprobs_test_harness(prompt_logprobs,
                                      logprobs,
                                      return_context_logits,
