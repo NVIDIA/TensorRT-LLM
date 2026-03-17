@@ -534,14 +534,39 @@ class VisualGen:
         req_id = self.req_counter
         self.req_counter += 1
 
+        # Normalize inputs to (prompt: List[str], negative_prompt: Optional[str])
+        # so DiffusionRequest.prompt is always a list.
         if isinstance(inputs, dict):
-            prompt = inputs.get("prompt")
+            prompt = [inputs.get("prompt")]
             negative_prompt = inputs.get("negative_prompt", None)
         elif isinstance(inputs, str):
-            prompt = inputs
+            prompt = [inputs]
             negative_prompt = None
+        elif isinstance(inputs, (list, tuple)):
+            # Batch generation: list of prompts
+            if not inputs:
+                raise ValueError("Batch inputs must contain at least one item")
+
+            prompt = []
+            negative_prompts = []
+            for idx, inp in enumerate(inputs):
+                if isinstance(inp, str):
+                    prompt.append(inp)
+                    negative_prompts.append(None)
+                elif isinstance(inp, dict):
+                    item_prompt = inp.get("prompt")
+                    if item_prompt is None:
+                        raise ValueError(f"Batch input at index {idx} is missing 'prompt'")
+                    prompt.append(item_prompt)
+                    negative_prompts.append(inp.get("negative_prompt"))
+                else:
+                    raise ValueError(f"Invalid batch item type at index {idx}: {type(inp)}")
+
+            unique_negatives = {p for p in negative_prompts if p is not None}
+            if len(unique_negatives) > 1:
+                raise ValueError("Per-item negative_prompt is not supported for batch inputs")
+            negative_prompt = next(iter(unique_negatives), None)
         else:
-            # TODO: Support batch generation
             raise ValueError(f"Invalid inputs type: {type(inputs)}")
 
         request = DiffusionRequest(
