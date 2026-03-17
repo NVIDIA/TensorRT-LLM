@@ -805,17 +805,6 @@ class DisaggTestCmds(NamedTuple):
                     check_files=self.get_server_logs(server_idx),
                 )
 
-                # Run accuracy tests before benchmark (if configured)
-                acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
-                if acc_cfg_json:
-                    import json as _json
-                    acc_cfg = _json.loads(acc_cfg_json)
-                    if acc_cfg.get("enable_accuracy_test"):
-                        _run_accuracy_tests(
-                            acc_cfg, self.model_name, disagg_server_hostname, disagg_server_port,
-                            self.test_output_dir, server_idx,
-                        )
-
                 # Run all clients for this server
                 for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
                     benchmark_file_path = os.path.join(
@@ -835,6 +824,17 @@ class DisaggTestCmds(NamedTuple):
                     with open(benchmark_file_path, "w") as benchmark_ctx:
                         benchmark_ctx.write(output)
                     outputs.append(output)
+
+                # Run accuracy tests after benchmark (if configured)
+                acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
+                if acc_cfg_json:
+                    import json as _json
+                    acc_cfg = _json.loads(acc_cfg_json)
+                    if acc_cfg.get("enable_accuracy_test"):
+                        _run_accuracy_tests(
+                            acc_cfg, self.model_name, disagg_server_hostname, disagg_server_port,
+                            self.test_output_dir, server_idx,
+                        )
 
             finally:
                 with open(benchmark_status_file, "w") as status_file:
