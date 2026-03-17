@@ -1076,13 +1076,13 @@ cu13 = ["cuda-bindings[all] (==13.*)"]
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.4.2"
+version = "1.4.3"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_pathfinder-1.4.2-py3-none-any.whl", hash = "sha256:eb354abc20278f8609dc5b666a24648655bef5613c6dfe78a238a6fd95566754"},
+    {file = "cuda_pathfinder-1.4.3-py3-none-any.whl", hash = "sha256:4345d8ead1f701c4fb8a99be6bc1843a7348b6ba0ef3b031f5a2d66fb128ae4c"},
 ]
 
 [[package]]
@@ -3415,30 +3415,30 @@ nvidia-cublas-cu12 = "*"
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.19.1"
+version = "1.20.0"
 description = "CUDNN FrontEnd python library"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "nvidia_cudnn_frontend-1.19.1-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ddc753d312e74ba4c0e2528a796411cdb93af3950811226e6f2b6e4420b97b74"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2ef4db77a06b0c1ba2bdea41dd056d4ab2ec7a291876153c2148b978729a40b4"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp310-cp310-win_amd64.whl", hash = "sha256:035dc1f8766181b83723e61f1c20de9ba39ffedba6f37fbf996305eeec3cdadb"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:25b79095b4d8e8ba131eb864e367d5c497a702db96ef50ca5e0ce7292335ca68"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:241fba15057135fed04223c5e7171a44bb407cb67d706255f072192553984792"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp311-cp311-win_amd64.whl", hash = "sha256:35bea3a533281c64361d094d3c07d0a536ebd25cafccf76ab9b1ba8df6d93c39"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f288b3475b961fc69daa6ca1d738ccf3ab589ad0f7a59762462c7b00237f3633"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c4f02adabf32c0ff305eaaa87c7cf27baea3ac396b01affffcfdcecc95f55fa6"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp312-cp312-win_amd64.whl", hash = "sha256:353814c052345c6fa3b06a904102c9a23c04a9ab66c3cb83077f5fec80930b3f"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5726bbda42a839aae0c9604272dcabbf298cfd8f3a9984c4b36161543abfb63b"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:451e57f95a44dceb9a7cfc6842cc0e645f3f3a44f8f4ccd1e7501f06ce4361d3"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp313-cp313-win_amd64.whl", hash = "sha256:409ec11e845f7fa14dbeb242f27080e4848cab7f66c3ad8d857051af0216bcb7"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3f14d616587b2ef0949bd33ce7d37481ec424558dd56941b11a6098a7a840e47"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:05b19c76e3ce2edfa9d17f8b7ee1c6d3b00cb389b95739121ac6736df15f6747"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp314-cp314-win_amd64.whl", hash = "sha256:65fefc992d7398ac6e98347c7f3d74a1b8122012893d41c75ea034cb43b51788"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ad89bd39c0ffcf159cfc28444f7fc174477fcb701ea708dd9f0349048739cd3f"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:64775262d138e412f960b40172214d0aa3956a1ec53073dd8c00e500c571afa4"},
-    {file = "nvidia_cudnn_frontend-1.19.1-cp39-cp39-win_amd64.whl", hash = "sha256:8110931a7b2c4e6fb08bcfaf992aecb43607febe4ee11ebc64094cf74f815562"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:559748a44e2c7358e99ba353d467498054675d5cc6ca68969c8f100c449434ce"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a9a339fcf1280ac9d06ecc53bc96275a40987f1a567299f31ecdc9ac77ce05bc"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp310-cp310-win_amd64.whl", hash = "sha256:60b2cf44c76caed4a9538ad450ba7ce13982ee70d834d4cdc86c9fe7704e9e8b"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c6a1b246a0bc70553424c7656c637823c73f7d98cca5a58db26f39e1207d2085"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5e1101a7fb810c62fd52a2a3beeeda85ea611e49ae18844044e63b1ea31a7b23"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp311-cp311-win_amd64.whl", hash = "sha256:9415c1f41ff84d2712a6ab55a87e06e5d934d05af6b45adaa709fc07e85eb32f"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bb891643598ac7b3734b82e5a459cbf778e467ebf7a5b586840003fb66df0ef3"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ce50afe3d1efda07f52e8df5e992f33e92dbb443d0e61e2de703ad5762edc53c"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp312-cp312-win_amd64.whl", hash = "sha256:f2449b0cfc547688e27f975c6ad5101257ae86df0315a80f28af78995adf55b6"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:651fdc9a61b0a4456b557d5f82fab72739b0a6ee61384a4cb23767191e2640cd"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f317548e700f74c167fa4988de5f0ac06931820e4d0c35b5c7dfe629dd191be4"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp313-cp313-win_amd64.whl", hash = "sha256:64e5c21853732a2f6ecf031d95d100656514d43fd2260f64266b5f8536f46434"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6a1cf3e86664fb64e4752d3936d9cebd0afa6c4b5f6ccde19b6ee4d65fcd9d17"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f4da0e9ed299843abdcccdde73392577809403d4ef2ad26b4335a3eaee42423f"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp314-cp314-win_amd64.whl", hash = "sha256:3f596e54398efab24727fc47291c61f969051f37e57e186ffe0fb6df06db19fd"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d81790d2c2b221ba9ccdcd213a5e405097c7179a937cb62c18d0d9127bb77055"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c94312cf1ec799199146e42097b9d4862e44bb3a17ebbcaee256c05b1cf45036"},
+    {file = "nvidia_cudnn_frontend-1.20.0-cp39-cp39-win_amd64.whl", hash = "sha256:09c97efc8d94bc451643861568babcb494f645b5785f6b53dcf09da78193b98d"},
 ]
 
 [package.extras]
@@ -4918,14 +4918,14 @@ typing-extensions = ">=4.14.1"
 
 [[package]]
 name = "pydantic-extra-types"
-version = "2.11.0"
+version = "2.11.1"
 description = "Extra Pydantic types."
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "pydantic_extra_types-2.11.0-py3-none-any.whl", hash = "sha256:84b864d250a0fc62535b7ec591e36f2c5b4d1325fa0017eb8cda9aeb63b374a6"},
-    {file = "pydantic_extra_types-2.11.0.tar.gz", hash = "sha256:4e9991959d045b75feb775683437a97991d02c138e00b59176571db9ce634f0e"},
+    {file = "pydantic_extra_types-2.11.1-py3-none-any.whl", hash = "sha256:1722ea2bddae5628ace25f2aa685b69978ef533123e5638cfbddb999e0100ec1"},
+    {file = "pydantic_extra_types-2.11.1.tar.gz", hash = "sha256:46792d2307383859e923d8fcefa82108b1a141f8a9c0198982b3832ab5ef1049"},
 ]
 
 [package.dependencies]
@@ -4934,13 +4934,14 @@ pydantic = ">=2.5.2"
 typing-extensions = "*"
 
 [package.extras]
-all = ["cron-converter (>=1.2.2)", "pendulum (>=3.0.0,<4.0.0)", "phonenumbers (>=8,<10)", "pycountry (>=23)", "pymongo (>=4.0.0,<5.0.0)", "python-ulid (>=1,<2) ; python_version < \"3.9\"", "python-ulid (>=1,<4) ; python_version >= \"3.9\"", "pytz (>=2024.1)", "semver (>=3.0.2)", "semver (>=3.0.2,<3.1.0)", "tzdata (>=2024.1)"]
+all = ["cron-converter (>=1.2.2)", "pendulum (>=3.0.0,<4.0.0)", "phonenumbers (>=8,<10)", "pycountry (>=23)", "pymongo (>=4.0.0,<5.0.0)", "python-ulid (>=1,<2) ; python_version < \"3.9\"", "python-ulid (>=1,<4) ; python_version >= \"3.9\"", "pytz (>=2024.1)", "semver (>=3.0.2)", "semver (>=3.0.2,<3.1.0)", "tzdata (>=2024.1)", "uuid-utils (>=0.6.0) ; python_version < \"3.14\""]
 cron = ["cron-converter (>=1.2.2)"]
 pendulum = ["pendulum (>=3.0.0,<4.0.0)"]
 phonenumbers = ["phonenumbers (>=8,<10)"]
 pycountry = ["pycountry (>=23)"]
 python-ulid = ["python-ulid (>=1,<2) ; python_version < \"3.9\"", "python-ulid (>=1,<4) ; python_version >= \"3.9\""]
 semver = ["semver (>=3.0.2)"]
+uuid-utils = ["uuid-utils (>=0.6.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "pydantic-settings"
@@ -6558,14 +6559,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "uvicorn"
-version = "0.41.0"
+version = "0.42.0"
 description = "The lightning-fast ASGI server."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "uvicorn-0.41.0-py3-none-any.whl", hash = "sha256:29e35b1d2c36a04b9e180d4007ede3bcb32a85fbdfd6c6aeb3f26839de088187"},
-    {file = "uvicorn-0.41.0.tar.gz", hash = "sha256:09d11cf7008da33113824ee5a1c6422d89fbc2ff476540d69a34c87fab8b571a"},
+    {file = "uvicorn-0.42.0-py3-none-any.whl", hash = "sha256:96c30f5c7abe6f74ae8900a70e92b85ad6613b745d4879eb9b16ccad15645359"},
+    {file = "uvicorn-0.42.0.tar.gz", hash = "sha256:9b1f190ce15a2dd22e7758651d9b6d12df09a13d51ba5bf4fc33c383a48e1775"},
 ]
 
 [package.dependencies]
@@ -6949,4 +6950,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "bf166ed1d1162e04d66b360293c4f23e74b08d9772e71909166465e39c244584"
+content-hash = "c4b2a61ec8fbed07aba8b77bf29d66fe4161f880d30ca97019405fe195fe13f0"
