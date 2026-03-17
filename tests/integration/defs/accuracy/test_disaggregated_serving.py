@@ -594,10 +594,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, ctx_disable_overlap_scheduler,
                         gen_disable_overlap_scheduler, ctx_enable_block_reuse,
                         gen_enable_block_reuse):
-        if ctx_enable_block_reuse and not ctx_disable_overlap_scheduler:
-            pytest.skip(
-                "Skip this test because overlap scheduler is not supported with block reuse for context server"
-            )
         ctx_server_config = {
             "disable_overlap_scheduler": ctx_disable_overlap_scheduler,
             "kv_cache_config": {
