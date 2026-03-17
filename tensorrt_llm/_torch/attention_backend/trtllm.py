@@ -295,6 +295,7 @@ class TrtllmAttentionWrapper:
             kv_cache_manager (Optional[KVCacheManager]): The KV cache manager.
         """
         self.layer_idx = layer_idx
+        self.global_layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
@@ -545,6 +546,12 @@ class TrtllmAttentionWrapper:
                 has_cross_kv=False,
                 quant_config=self.quant_config,
                 kv_cache_manager=self.kv_cache_manager,
+                sparse_kv_indices=self.sparse_kv_indices,
+                sparse_attn_indices=self.sparse_attn_indices,
+                skip_softmax_threshold_scale_factor_prefill=self.
+                skip_softmax_threshold_scale_factor_prefill,
+                skip_softmax_threshold_scale_factor_decode=self.
+                skip_softmax_threshold_scale_factor_decode,
         )[0]:
             trtllm_gen_attention(
                 q,
@@ -605,6 +612,7 @@ class TrtllmAttentionWrapper:
                 self.v_head_dim,
                 self.mrope_rotary_cos_sin,
                 self.mrope_position_deltas,
+                helix_tensor_params,
                 self.attention_chunk_size,
                 self.softmax_stats_tensor,
                 spec_decoding_bool_params,
@@ -626,6 +634,7 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.quant_config,
                 self.kv_cache_manager,
+                global_layer_idx=self.global_layer_idx,
             )
         else:
             thop.attention(
@@ -1942,6 +1951,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             quant_config=self.quant_config,
             kv_cache_manager=metadata.kv_cache_manager,
         )
+        self.wrapper.global_layer_idx = self.layer_idx
 
         self.wrapper.run(q,
                          output,
