@@ -38,7 +38,7 @@ python3 examples/llm-api/quickstart_multimodal.py --model_dir nvidia/NVIDIA-Nemo
  * Video modality input with Efficient video sampling (EVS):
 
 ```bash
-TLLM_VIDEO_PRUNING_RATIO=0.9 python3 examples/llm-api/quickstart_multimodal.py --model_dir nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 --disable_kv_cache_reuse --max_batch_size 128 --trust_remote_code --modality video --max_num_tokens 131072
+python3 examples/llm-api/quickstart_multimodal.py --model_dir nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 --disable_kv_cache_reuse --max_batch_size 128 --trust_remote_code --modality video --max_num_tokens 131072 --video_pruning_rate 0.9
 ```
 
 ## Online serving example CMDs
@@ -55,7 +55,7 @@ EOF
 
 # CMD to launch serve without EVS.
 trtllm-serve  \
-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
+nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 \
 --host 0.0.0.0 \
 --port 8000 \
 --backend pytorch \
@@ -65,9 +65,9 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
 --media_io_kwargs "{\"video\": {\"fps\": 2, \"num_frames\": 128} }" \
 --config config.yml
 
-# CMD to launch serve with EVS (video_pruning_ratio=0.9).
-TLLM_VIDEO_PRUNING_RATIO=0.9 trtllm-serve  \
-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
+# CMD to launch serve with EVS (video_pruning_rate=0.9).
+trtllm-serve  \
+nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 \
 --host 0.0.0.0 \
 --port 8000 \
 --backend pytorch \
@@ -75,6 +75,7 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
 --max_num_tokens 131072 \
 --trust_remote_code \
 --media_io_kwargs "{\"video\": {\"fps\": 2, \"num_frames\": 128} }" \
+--video_pruning_rate 0.9 \
 --config config.yml
 ```
 

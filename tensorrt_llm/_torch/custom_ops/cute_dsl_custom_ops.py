@@ -3493,9 +3493,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cls.kernel_cache[key] = compiled_kernel
 
         @classmethod
-        def _compute_max_chunk(cls,
-                               dtype,
-                               num_copy_bits: int = 256):
+        def _compute_max_chunk(cls, dtype, num_copy_bits: int = 256):
             """Compute the maximum chunk_size a single CTA can handle."""
             max_smem = cutlass.utils.get_smem_capacity_in_bytes()
             # Fixed shared memory overhead (excludes shared_ordered[chunk_size]):
@@ -4024,7 +4022,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
                     num_sms, return_val)
             multi_cta_info = (
-                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs)")
+                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs)"
+            )
         else:
             # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
             # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)

@@ -80,30 +80,6 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
-class TestNano_V2_VLM(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nano-v2-VLM"
-    MODEL_PATH = f"{llm_models_root()}/Nano-v2-VLM"
-    MAX_NUM_TOKENS = 25600
-
-    # NOTE: MMMU adds <|endoftext|> to the stop token.
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
-    )
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8, enable_block_reuse=False)
-
-    @pytest.mark.skip(reason="Nano V2 VLM ckpt is not released yet.")
-    def test_auto_dtype(self):
-        with LLM(
-            self.MODEL_PATH,
-            max_batch_size=128,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            kv_cache_config=self.kv_cache_config,
-        ) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
 class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
     MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b-hf"
