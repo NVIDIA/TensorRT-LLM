@@ -900,7 +900,25 @@ void WindowBlockManager::allocatePools(bool useUvm)
                 = ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
             TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
                 mLogPrefix.c_str(), mNumSecondaryBlocks, pool.numLayers, pool.numKvHeads);
-            pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
+            // On unified memory systems, CPU and GPU share the same physical memory.
+            // Allocating pinned host memory is unnecessary -- use GPU memory instead
+            // to avoid the overhead of page-locking and keep everything in one address space.
+            if (tc::isUnifiedMemorySystem())
+            {
+                TLLM_LOG_DEBUG("[%s] Unified memory: allocating secondary pool as GPU memory", mLogPrefix.c_str());
+                if (useUvm)
+                {
+                    pool.secondaryPtr = BufferManager::managed(cacheShapeOffload, poolDtype);
+                }
+                else
+                {
+                    pool.secondaryPtr = mBufferManager.gpuSync(cacheShapeOffload, poolDtype);
+                }
+            }
+            else
+            {
+                pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
+            }
         }
     }
 }
@@ -990,7 +1008,11 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     {
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
-        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+        // On unified memory, both pools reside in the same physical memory -- skip the copy.
+        if (!tc::isUnifiedMemorySystem())
+        {
+            mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+        }
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 
@@ -1085,7 +1107,11 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
     {
         auto block = getFreeBlock(
             sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
-        mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
+        // On unified memory, both pools reside in the same physical memory -- skip the copy.
+        if (!tc::isUnifiedMemorySystem())
+        {
+            mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
+        }
         // swap linear block offsets (i.e. make block the offload block and vice versa)
         offloadBlock->swapMemoryPoolBlockOffset(block);
 
@@ -1121,7 +1147,11 @@ void WindowBlockManager::offloadBlock(
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
         // If we're swapping a block to secondary memory, maintain the prior priority values.
         mEvictionPolicy->claimBlock(offloadBlock);
-        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+        // On unified memory, both pools reside in the same physical memory -- skip the copy.
+        if (!tc::isUnifiedMemorySystem())
+        {
+            mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+        }
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 
@@ -2796,8 +2826,22 @@ std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
         totalMem / static_cast<double>(1 << 30), finalFreeMem / static_cast<double>(1 << 30));
     TLLM_CHECK_WITH_INFO(finalFreeMem <= totalMem, "Free memory cannot exceed total memory");
 
-    auto const freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
-    auto const freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
+    auto freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
+    auto freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
+
+    // On unified memory systems (e.g. Grace Blackwell / DGX Spark), CPU and GPU share the same
+    // physical memory pool. The secondary (host) cache tier is redundant because there is no
+    // separate host DRAM to offload to -- all memory is equally accessible. Fold any configured
+    // host_cache_size budget into the primary pool so the block manager sees a single, larger tier.
+    if (tc::isUnifiedMemorySystem() && freeSecondaryMemBytes > 0)
+    {
+        TLLM_LOG_INFO("Unified memory detected: folding secondary cache budget (%" PRIu64
+                      " bytes) "
+                      "into primary pool. Offload memcpy will be skipped at runtime.",
+            static_cast<uint64_t>(freeSecondaryMemBytes));
+        freePrimaryMemBytes += freeSecondaryMemBytes;
+        freeSecondaryMemBytes = 0;
+    }
 
     TLLM_LOG_DEBUG("Calculated free memory: {.freePrimaryMemBytes=%" PRIu64 ", .freeSecondaryMemBytes=%" PRIu64 "}",
         freePrimaryMemBytes, freeSecondaryMemBytes);

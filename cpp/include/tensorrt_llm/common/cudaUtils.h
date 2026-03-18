@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -308,6 +308,26 @@ inline bool isSM100Family()
 {
     int const sm = getSMVersion();
     return sm == 100 || sm == 103; // To be continued...
+}
+
+/// @brief Detects whether the current device is part of a unified memory architecture.
+/// @details On Grace Blackwell (e.g. DGX Spark / GB10), CPU and GPU share the same physical
+/// LPDDR5x memory pool. In that case, KV cache "offload" from GPU to CPU is a no-op physically
+/// and the GPU/CPU tier distinction in the block manager can be eliminated.
+/// Detection uses cudaDevAttrPageableMemoryAccess: when the GPU can natively access all
+/// pageable host memory, the system has a unified memory architecture.
+/// @return true if the system has unified CPU-GPU memory.
+inline bool isUnifiedMemorySystem()
+{
+    static bool const sIsUnified = []()
+    {
+        int device{-1};
+        check_cuda_error(cudaGetDevice(&device));
+        int pageableMemAccess{0};
+        check_cuda_error(cudaDeviceGetAttribute(&pageableMemAccess, cudaDevAttrPageableMemoryAccess, device));
+        return pageableMemAccess != 0;
+    }();
+    return sIsUnified;
 }
 
 inline int getDevice()
