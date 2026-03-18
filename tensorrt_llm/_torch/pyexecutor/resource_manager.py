@@ -1992,6 +1992,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.set_base_page_index_buf(i, pool_idx,
                                                  memoryview(buffer.numpy()))
 
+    def _resume_and_restore(self, req_id: int, kv_cache) -> bool:
+        """Resume a suspended KV cache and restore its page index buffers.
+
+        Returns True if the cache is (or becomes) active, False on failure.
+        """
+        if kv_cache.is_active:
+            return True
+        if not kv_cache.resume(self._stream.cuda_stream):
+            return False
+        self._restore_page_index_bufs(req_id, kv_cache)
+        return True
+
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create _KVCache, handle block reuse, and resume. Does NOT resize.
 
@@ -2015,27 +2027,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.stop_committing()
             else:
                 req.context_current_position = kv_cache.num_committed_tokens
+                req.set_prepopulated_prompt_len(kv_cache.num_committed_tokens,
+                                                self.tokens_per_block)
 
-            if kv_cache.is_active:
-                return True
-            if not kv_cache.resume(self._stream.cuda_stream):
-                return False
-            self._restore_page_index_bufs(req.py_request_id, kv_cache)
-
-            return True
+            return self._resume_and_restore(req.py_request_id, kv_cache)
         else:
-            # Subsequent chunk: verify cache exists and is active.
-            # If suspended (e.g., after self-eviction + pause() in the
-            # scheduler), try to resume before giving up.
+            # Subsequent chunk: cache must exist from first chunk.
+            # It may be suspended (e.g., evicted between chunks), so
+            # _resume_and_restore handles reactivation.
             kv_cache = self.kv_cache_map.get(req.py_request_id)
-            if kv_cache is None:
-                return False
-            if kv_cache.is_active:
-                return True
-            if not kv_cache.resume(self._stream.cuda_stream):
-                return False
-            self._restore_page_index_bufs(req.py_request_id, kv_cache)
-            return True
+            assert kv_cache is not None, (
+                f"KV cache missing for non-first context chunk, request {req.py_request_id}"
+            )
+            return self._resume_and_restore(req.py_request_id, kv_cache)
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -2090,41 +2094,31 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
-                    # New request — create, resume, and resize.
                     kv_cache = self._create_kv_cache(req.py_request_id,
                                                      req.lora_task_id, None)
                     kv_cache.stop_committing()
-                    if not kv_cache.resume(self._stream.cuda_stream):
-                        raise RuntimeError(
-                            f"Failed to resume draft KV cache for request {req.py_request_id}"
-                        )
-                    self._restore_page_index_bufs(req.py_request_id, kv_cache)
-                elif not kv_cache.is_active:
-                    # Existing but suspended (evicted by main scheduler) —
-                    # resume before resize.
-                    if not kv_cache.resume(self._stream.cuda_stream):
-                        raise RuntimeError(
-                            f"Failed to resume draft KV cache for request {req.py_request_id}"
-                        )
-                    self._restore_page_index_bufs(req.py_request_id, kv_cache)
+                if not self._resume_and_restore(req.py_request_id, kv_cache):
+                    raise RuntimeError(
+                        f"Failed to resume draft KV cache for request {req.py_request_id}"
+                    )
                 capacity = (req.context_current_position +
                             req.context_chunk_size + self.num_extra_kv_tokens)
                 if not kv_cache.resize(capacity):
-                    logger.warning(
-                        "Draft KV cache context resize failed for request %s",
-                        req.py_request_id,
+                    raise RuntimeError(
+                        f"Draft KV cache context resize failed for request "
+                        f"{req.py_request_id}: could not resize to {capacity} tokens"
                     )
 
             for req in scheduled_batch.generation_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
-                    continue
-                if not kv_cache.is_active:
-                    if not kv_cache.resume(self._stream.cuda_stream):
-                        raise RuntimeError(
-                            f"Failed to resume draft KV cache for request {req.py_request_id}"
-                        )
-                    self._restore_page_index_bufs(req.py_request_id, kv_cache)
+                    raise RuntimeError(
+                        f"Missing draft KV cache for generation request {req.py_request_id}"
+                    )
+                if not self._resume_and_restore(req.py_request_id, kv_cache):
+                    raise RuntimeError(
+                        f"Failed to resume draft KV cache for request {req.py_request_id}"
+                    )
                 draft_len = get_draft_token_length(req)
                 old_cap = kv_cache.capacity
                 new_cap = (old_cap + 1 + draft_len)
@@ -2142,9 +2136,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 if new_cap < needed_cap:
                     new_cap = needed_cap
                 if not kv_cache.resize(new_cap):
-                    logger.warning(
-                        "Draft KV cache generation resize failed for request %s",
-                        req.py_request_id,
+                    raise RuntimeError(
+                        f"Draft KV cache generation resize failed for request "
+                        f"{req.py_request_id}: could not resize to {new_cap} tokens"
                     )
 
     def get_kv_cache_stats(self):
