@@ -678,9 +678,8 @@ class WanTransformer3DModel(nn.Module):
 
         # Output projection and unpatchify
         shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
-        shift = shift.to(x.device)
-        scale = scale.to(x.device)
-        x = (self.norm_out(x.float()) * (1 + scale) + shift).to(hidden_states.dtype)
+        x = self.norm_out(x) * (1 + scale) + shift
+        x = x.to(hidden_states.dtype)
 
         return self.unpatchify(self.proj_out(x), original_shape)
 
