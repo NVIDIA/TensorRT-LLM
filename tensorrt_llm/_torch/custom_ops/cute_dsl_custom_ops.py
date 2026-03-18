@@ -2982,16 +2982,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
 
-            cls._compile(
-                dtype,
-                bucketed_num_cols,
-                top_k,
-                next_n,
-                return_val,
-                num_copy_bits,
-                load_balance,
-                large_occupancy,
-            )
             key = (
                 dtype,
                 bucketed_num_cols,
@@ -3002,15 +2992,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 load_balance,
                 large_occupancy,
             )
+            cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
 
             # Prepare output tensors
-            if output_indices is not None:
-                output_indices_torch = output_indices
-            else:
-                output_indices_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_indices", (num_rows, top_k),
-                    torch.int32)
+            output_indices_torch = output_indices or _get_or_alloc_buffer(
+                cls.buffer_cache, "output_indices", (num_rows, top_k),
+                torch.int32)
             if return_val:
                 output_values_torch = _get_or_alloc_buffer(
                     cls.buffer_cache, "output_values", (num_rows, top_k),
@@ -3020,12 +3008,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Prepare buffer
             # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
-            # maximum: 256 * 2 * 8192 * 4 bytes = 8388608 bytes = 8 MB
-            # maximum: 256 * 2 * 16384 * 4 bytes = 16777216 bytes = 16 MB
-            # maximum: 256 * 2 * 32768 * 4 bytes = 33554432 bytes = 32 MB
-            # maximum: 256 * 2 * 65536 * 4 bytes = 67108864 bytes = 64 MB
-            # maximum: 256 * 2 * 131072 * 4 bytes = 134217728 bytes = 128 MB
-            # maximum: 256 * 2 * 262144 * 4 bytes = 268435456 bytes = 256 MB
+            # fp32: up to 256 MB (256 * 2 * 262144 * 4)
+            # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
             if dtype == cutlass.Float32:
                 buffer_numbers = 2
             else:
@@ -3344,18 +3328,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
             merge_cols = num_ctas_per_row * top_k
 
-            cls._compile(
-                dtype,
-                top_k,
-                next_n,
-                return_val,
-                num_copy_bits,
-                load_balance,
-                large_occupancy,
-                chunk_size_per_cta,
-                num_ctas_per_row,
-                dynamic,
-            )
             key = (
                 dtype,
                 top_k,
@@ -3368,6 +3340,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_ctas_per_row,
                 dynamic,
             )
+            cls._compile(*key)
             compiled_kernel_first, compiled_kernel_second = \
                 cls.kernel_cache[key]
 
@@ -3394,12 +3367,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 torch.int32)
 
             # Final output tensors
-            if output_indices is not None:
-                output_indices_torch = output_indices
-            else:
-                output_indices_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_indices", (num_rows, top_k),
-                    torch.int32)
+            output_indices_torch = output_indices or _get_or_alloc_buffer(
+                cls.buffer_cache, "output_indices", (num_rows, top_k),
+                torch.int32)
             if return_val:
                 output_values_torch = _get_or_alloc_buffer(
                     cls.buffer_cache, "output_values", (num_rows, top_k),
@@ -3522,7 +3492,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                num_copy_bits: int = 256,
                                max_smem: int = 227 * 1024):
             """Compute the maximum chunk_size a single CTA can handle."""
-            overhead = 256 * 4 * 2 + 16 + 8 * 4
+            # Fixed shared memory overhead (excludes shared_ordered[chunk_size]):
+            # local_histogram[256]*4 + prefix_buf[256]*4 + scalars[4]*4 + warp_sums[8]*4
+            overhead = 256 * 4 * 2 + 4 * 4 + 8 * 4
             if dtype == cutlass.Float32:
                 ordered_elem_size = 4
             else:
@@ -3643,10 +3615,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if num_groups < 1:
                 num_groups = 1
 
-            cls._compile(dtype, chunk_size, top_k, next_n, num_copy_bits,
-                         ctas_per_group, num_sms, return_val)
             key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
                    ctas_per_group, num_sms, return_val)
+            cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
 
             # Allocate row_states once with num_sms rows — large enough for
@@ -3664,12 +3635,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             row_states = cls.buffer_cache["row_states"]
 
             # Allocate outputs
-            if output_indices is not None:
-                output_indices_torch = output_indices
-            else:
-                output_indices_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_indices", (num_rows, top_k),
-                    torch.int32)
+            output_indices_torch = output_indices or _get_or_alloc_buffer(
+                cls.buffer_cache, "output_indices", (num_rows, top_k),
+                torch.int32)
             if return_val:
                 output_values = _get_or_alloc_buffer(cls.buffer_cache,
                                                      "output_values",
