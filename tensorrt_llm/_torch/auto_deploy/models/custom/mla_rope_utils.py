@@ -10,6 +10,20 @@ from typing import Dict
 
 import torch
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _permute_fp8_safe(t: torch.Tensor, perm: torch.Tensor, dim: int) -> torch.Tensor:
+    """Index-select along *dim* that works for FP8 tensors on CPU.
+
+    CPU kernels lack fancy-indexing for FP8 dtypes, so we temporarily
+    up-cast to bfloat16 (lossless for FP8 values) when needed.
+    """
+    if t.dtype not in _FP8_DTYPES:
+        return t.index_select(dim, perm)
+    orig_dtype = t.dtype
+    return t.to(torch.bfloat16).index_select(dim, perm).to(orig_dtype)
+
 
 def _rope_deinterleave_load_hook(
     state_dict: Dict[str, torch.Tensor],
@@ -43,7 +57,7 @@ def _rope_deinterleave_load_hook(
             w = w.view(num_heads, qk_head_dim, -1)
             w_nope = w[:, :qk_nope_head_dim, :]
             w_rope = w[:, qk_nope_head_dim:, :]
-            w_rope = w_rope[:, perm, :]
+            w_rope = _permute_fp8_safe(w_rope, perm, dim=1)
             w = torch.cat([w_nope, w_rope], dim=1)
             state_dict[q_key] = w.view(-1, w.shape[-1])
 
@@ -53,7 +67,7 @@ def _rope_deinterleave_load_hook(
             w = state_dict[kv_key]
             w_kv = w[:kv_lora_rank, :]
             w_pe = w[kv_lora_rank:, :]
-            w_pe = w_pe[perm, :]
+            w_pe = _permute_fp8_safe(w_pe, perm, dim=0)
             state_dict[kv_key] = torch.cat([w_kv, w_pe], dim=0)
 
         # --- kv_a_proj_with_mqa.bias (if present) ---
@@ -62,5 +76,5 @@ def _rope_deinterleave_load_hook(
             b = state_dict[kv_bias_key]
             b_kv = b[:kv_lora_rank]
             b_pe = b[kv_lora_rank:]
-            b_pe = b_pe[perm]
+            b_pe = _permute_fp8_safe(b_pe, perm, dim=0)
             state_dict[kv_bias_key] = torch.cat([b_kv, b_pe])
