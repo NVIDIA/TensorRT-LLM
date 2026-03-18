@@ -159,7 +159,7 @@ class SinglePassMultiCTARadixTopKKernel:
          a. Each CTA builds a local 256-bin histogram on its smem data.
          b. atomicAdd to a global histogram (triple-buffered in ``row_states``).
          c. Inter-CTA barrier.
-         d. All CTAs read the merged histogram, compute suffix sum, find the
+         d. All CTAs read the merged histogram, compute prefix sum, find the
             threshold bucket, update prefix and remaining_k.
       3. Collect output:
          a. Pass 1: elements strictly greater than pivot → atomicAdd to get
@@ -211,52 +211,52 @@ class SinglePassMultiCTARadixTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def to_ordered(self, x):
-        """Convert float to an ordered unsigned integer (descending order).
+        """Convert float to an ordered unsigned integer (descending mapping).
 
-        Sign-flip mapping so that larger float → larger ordered integer:
-          negative (sign=1) → flip ALL bits  (~bits)
-          positive (sign=0) → flip sign bit only  (bits ^ 0x80000000)
-        This matches FlashInfer's RadixTopKTraits::ToOrdered.
+        Descending sign-flip so that larger float → smaller ordered integer:
+          negative (sign=1) → keep bits unchanged  (bits)
+          positive (sign=0) → flip all bits and clear sign bit  (~bits & 0x7FFFFFFF)
+        This allows using a natural prefix sum to locate the top-k boundary.
         """
         if cutlass.const_expr(self.dtype == cutlass.Float32):
             bits = float_as_uint32(x)
             key = cutlass.Uint32(0)
             if bits & cutlass.Uint32(0x80000000):
-                key = bits ^ cutlass.Uint32(0xFFFFFFFF)
+                key = cutlass.Uint32(bits)
             else:
-                key = bits ^ cutlass.Uint32(0x80000000)
+                key = (bits ^ cutlass.Uint32(0xFFFFFFFF)) & cutlass.Uint32(0x7FFFFFFF)
             return cutlass.Uint32(key)
         else:
             bits = half_as_ushort(x)
             key = cutlass.Uint16(0)
             if bits & cutlass.Uint16(0x8000):
-                key = bits ^ cutlass.Uint16(0xFFFF)
+                key = cutlass.Uint16(bits)
             else:
-                key = bits ^ cutlass.Uint16(0x8000)
+                key = (bits ^ cutlass.Uint16(0xFFFF)) & cutlass.Uint16(0x7FFF)
             return cutlass.Uint16(key)
 
     @cute.jit
     def from_ordered(self, ordered):
         """Inverse of ``to_ordered``: ordered integer → float.
 
-        Matches FlashInfer's RadixTopKTraits::FromOrdered:
-          sign bit set (was positive) → flip sign bit  (ordered ^ 0x80000000)
-          sign bit clear (was negative) → flip ALL bits  (~ordered)
+        Inverse of the descending mapping:
+          sign bit set (was negative) → bits unchanged  (ordered)
+          sign bit clear (was positive) → flip all and clear sign  (~ordered & 0x7FFFFFFF)
         """
         if cutlass.const_expr(self.dtype == cutlass.Float32):
             # Initialize before dynamic branch to satisfy DSL scoping.
             bits = cutlass.Uint32(0)
             if ordered & cutlass.Uint32(0x80000000):
-                bits = ordered ^ cutlass.Uint32(0x80000000)
+                bits = ordered
             else:
-                bits = ordered ^ cutlass.Uint32(0xFFFFFFFF)
+                bits = (ordered ^ cutlass.Uint32(0xFFFFFFFF)) & cutlass.Uint32(0x7FFFFFFF)
             return llvm.bitcast(cutlass.Float32.mlir_type, bits.ir_value())
         else:
             bits = cutlass.Uint16(0)
             if ordered & cutlass.Uint16(0x8000):
-                bits = ordered ^ cutlass.Uint16(0x8000)
+                bits = ordered
             else:
-                bits = ordered ^ cutlass.Uint16(0xFFFF)
+                bits = (ordered ^ cutlass.Uint16(0xFFFF)) & cutlass.Uint16(0x7FFF)
             if cutlass.const_expr(self.dtype == cutlass.Float16):
                 return llvm.bitcast(cutlass.Float16.mlir_type, bits.ir_value())
             else:
@@ -401,45 +401,35 @@ class SinglePassMultiCTARadixTopKKernel:
                 atomicAdd(global_histogram_ptr + cutlass.Int32(i), count)
 
     # ------------------------------------------------------------------
-    # Step 2b: Suffix sum + find threshold bucket
+    # Step 2b: Prefix sum + find threshold bucket
     # ------------------------------------------------------------------
     @cute.jit
-    def suffix_sum_and_find_threshold(
-        self, local_histogram, suffix_buf, s_scalars, remaining_k, s_warp_sums, tidx
+    def prefix_sum_and_find_threshold(
+        self, local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
     ):
-        """Compute suffix sum over 256-bin histogram and find threshold bucket.
+        """Compute prefix sum over 256-bin histogram and find threshold bucket.
 
-        The threshold bucket is the one where:
-          suffix_sum[bucket] >= remaining_k  AND  suffix_sum[bucket+1] < remaining_k
+        With the descending ordered mapping (larger float → smaller bucket),
+        prefix_sum[b] = count of elements in buckets 0..b = count of the
+        largest elements.  The threshold bucket is the first one where:
+          prefix_sum[b] >= remaining_k  AND  prefix_sum[b-1] < remaining_k
 
         Results written to s_scalars:
           [0] = found_bucket
-          [1] = found_remaining_k (remaining_k - suffix_sum[bucket+1])
+          [1] = found_remaining_k (remaining_k - prefix_sum[bucket-1])
         """
-        # Read global histogram into suffix_buf (already done by caller or here)
-        # We do a *reverse* prefix sum: suffix_sum[i] = sum(histogram[i..255])
-        # Implemented as: reverse the array → prefix sum → reverse back
-
-        # Step 1: Reverse copy into suffix_buf
+        # Step 1: Inclusive prefix sum directly on the histogram
         if tidx < self.radix:
-            suffix_buf[tidx] = local_histogram[self.radix - 1 - tidx]
-        cute.arch.barrier()
-
-        # Step 2: Inclusive prefix sum on reversed data
-        if tidx < self.radix:
-            val = suffix_buf[tidx]
+            val = local_histogram[tidx]
             num_warps_scan = cutlass.const_expr(min(self.radix, 256) // 32)
             val, _ = block_prefix_sum_kernel(
                 val, s_warp_sums, tidx, self.radix, num_warps_scan, barrier_id=1
             )
-            suffix_buf[tidx] = val
+            prefix_buf[tidx] = val
         cute.arch.barrier()
 
-        # Now suffix_buf[i] = sum of histogram[(255-i)..255]
-        # So suffix_sum for original bucket b = suffix_buf[255 - b]
-
-        # Initialize fallback values (FlashInfer: found_bucket=0,
-        # found_remaining_k=remaining_k).  Without this, degenerate cases
+        # Initialize fallback values: found_bucket=0,
+        # found_remaining_k=remaining_k.  Without this, degenerate cases
         # where no thread satisfies the threshold condition would leave
         # s_scalars with stale values from a previous round.
         if tidx == 0:
@@ -447,19 +437,19 @@ class SinglePassMultiCTARadixTopKKernel:
             s_scalars[1] = remaining_k  # found_remaining_k
         cute.arch.barrier()
 
-        # Step 3: Find threshold bucket
+        # Step 2: Find threshold bucket
         if tidx < self.radix:
-            b = tidx  # original bucket index
-            count_ge = suffix_buf[self.radix - 1 - b]  # count >= bucket b
-            # For last bucket (b==255), count_gt=0 (nothing strictly above).
-            # Define count_gt unconditionally to avoid DSL scoping issues.
-            count_gt = cutlass.Int32(0)
-            if b < self.radix - 1:
-                count_gt = suffix_buf[self.radix - 2 - b]  # count > bucket b
+            b = tidx  # bucket index
+            current = prefix_buf[b]  # count of elements in buckets 0..b
+            # For first bucket (b==0), previous=0.
+            # Define previous unconditionally to avoid DSL scoping issues.
+            previous = cutlass.Int32(0)
+            if b > 0:
+                previous = prefix_buf[b - 1]  # count of elements in buckets 0..b-1
 
-            if count_ge >= remaining_k and count_gt < remaining_k:
+            if current >= remaining_k and previous < remaining_k:
                 s_scalars[0] = cutlass.Int32(b)  # found_bucket
-                s_scalars[1] = remaining_k - count_gt  # found_remaining_k
+                s_scalars[1] = remaining_k - previous  # found_remaining_k
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
@@ -475,7 +465,7 @@ class SinglePassMultiCTARadixTopKKernel:
         prefix,
         remaining_k,
         local_histogram,
-        suffix_buf,
+        prefix_buf,
         s_scalars,
         s_warp_sums,
         num_threads,
@@ -526,9 +516,9 @@ class SinglePassMultiCTARadixTopKKernel:
         cute.arch.barrier()
 
         # local_histogram is already the complete histogram — compute
-        # suffix sum and find the threshold bucket directly.
-        self.suffix_sum_and_find_threshold(
-            local_histogram, suffix_buf, s_scalars, remaining_k, s_warp_sums, tidx
+        # prefix sum and find the threshold bucket directly.
+        self.prefix_sum_and_find_threshold(
+            local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
         )
 
         found_bucket = s_scalars[0]
@@ -557,7 +547,7 @@ class SinglePassMultiCTARadixTopKKernel:
         prefix,
         remaining_k,
         local_histogram,
-        suffix_buf,
+        prefix_buf,
         s_scalars,
         s_warp_sums,
         state_base_ptr,
@@ -627,9 +617,9 @@ class SinglePassMultiCTARadixTopKKernel:
             local_histogram[i] = state_row[hist_offset + cutlass.Int32(i)]
         cute.arch.barrier()
 
-        # Suffix sum and find threshold bucket
-        self.suffix_sum_and_find_threshold(
-            local_histogram, suffix_buf, s_scalars, remaining_k, s_warp_sums, tidx
+        # Prefix sum and find threshold bucket
+        self.prefix_sum_and_find_threshold(
+            local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
         )
 
         # Update prefix and remaining_k
@@ -651,8 +641,10 @@ class SinglePassMultiCTARadixTopKKernel:
     def compute_local_gt_count(
         self, shared_ordered, actual_chunk_size, ordered_pivot, local_histogram, tidx
     ):
-        """Count elements strictly greater than ordered_pivot in this
-        CTA's shared_ordered.  Uses local_histogram[0] as shared counter.
+        """Count elements whose float value is strictly greater than pivot.
+
+        With the descending ordered mapping, float > pivot ↔ ordered < pivot.
+        Uses local_histogram[0] as shared counter.
 
         Uses warp reduction (FlashInfer pattern): each thread counts its
         elements, then a butterfly warp-sum reduces 32 threads to one
@@ -665,7 +657,7 @@ class SinglePassMultiCTARadixTopKKernel:
         my_count = cutlass.Int32(0)
         for i in range(tidx, actual_chunk_size, self.num_threads):
             ordered = shared_ordered[i]
-            if ordered > ordered_pivot:
+            if ordered < ordered_pivot:
                 my_count = my_count + 1
 
         # Warp-level reduction: butterfly sum across 32 threads.
@@ -704,6 +696,8 @@ class SinglePassMultiCTARadixTopKKernel:
     ):
         """Collect elements into output: first > pivot, then == pivot.
 
+        With the descending ordered mapping, float > pivot ↔ ordered < pivot.
+
         Uses FlashInfer-style batch atomicAdd for > pivot elements:
         one global atomicAdd per CTA (instead of per element) to get
         a contiguous allocation, then local atomicAdd within the CTA.
@@ -724,14 +718,15 @@ class SinglePassMultiCTARadixTopKKernel:
                 local_histogram[1] = atomicAdd(output_counter_ptr, local_gt_count)
         cute.arch.barrier()
 
-        # Pass 1: strictly greater than pivot — 3-region structure mirrors
-        # the reordered smem layout from load_chunk_to_smem:
+        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
+        # 3-region structure mirrors the reordered smem layout from
+        # load_chunk_to_smem:
         #   aligned:  smem[i]                       → gmem[chunk_start + prologue_elems + i]
         #   prologue: smem[aligned_size + i]         → gmem[chunk_start + i]
         #   tail:     smem[aligned_size+prologue+i]  → gmem[chunk_start + prologue_elems + aligned_size + i]
         for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
-            if ordered > ordered_pivot:
+            if ordered < ordered_pivot:
                 local_pos = atomicAdd(local_histogram.iterator, val_one)
                 pos = local_histogram[1] + local_pos
                 output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
@@ -739,7 +734,7 @@ class SinglePassMultiCTARadixTopKKernel:
                     output_values_row[pos] = self.from_ordered(ordered)
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
-            if ordered > ordered_pivot:
+            if ordered < ordered_pivot:
                 local_pos = atomicAdd(local_histogram.iterator, val_one)
                 pos = local_histogram[1] + local_pos
                 output_indices_row[pos] = cutlass.Int32(chunk_start + i)
@@ -747,7 +742,7 @@ class SinglePassMultiCTARadixTopKKernel:
                     output_values_row[pos] = self.from_ordered(ordered)
         for i in range(tidx, left_size, self.num_threads):
             ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered > ordered_pivot:
+            if ordered < ordered_pivot:
                 local_pos = atomicAdd(local_histogram.iterator, val_one)
                 pos = local_histogram[1] + local_pos
                 output_indices_row[pos] = cutlass.Int32(
@@ -815,6 +810,7 @@ class SinglePassMultiCTARadixTopKKernel:
 
         No inter-CTA barrier is needed.  ``local_histogram[2]`` is reused as
         a smem output counter (safe because the histogram phase is complete).
+        With the descending ordered mapping, float > pivot ↔ ordered < pivot.
         """
         val_one = cutlass.Int32(1)
 
@@ -823,24 +819,25 @@ class SinglePassMultiCTARadixTopKKernel:
             local_histogram[2] = cutlass.Int32(0)
         cute.arch.barrier()
 
-        # Pass 1: strictly greater than pivot — 3-region structure
+        # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
+        # 3-region structure
         for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
-            if ordered > ordered_pivot:
+            if ordered < ordered_pivot:
                 pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
                 output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
                 if cutlass.const_expr(output_values_row is not None):
                     output_values_row[pos] = self.from_ordered(ordered)
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
-            if ordered > ordered_pivot:
+            if ordered < ordered_pivot:
                 pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
                 output_indices_row[pos] = cutlass.Int32(chunk_start + i)
                 if cutlass.const_expr(output_values_row is not None):
                     output_values_row[pos] = self.from_ordered(ordered)
         for i in range(tidx, left_size, self.num_threads):
             ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered > ordered_pivot:
+            if ordered < ordered_pivot:
                 pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
                 output_indices_row[pos] = cutlass.Int32(
                     chunk_start + prologue_elems + aligned_size + i
@@ -918,8 +915,8 @@ class SinglePassMultiCTARadixTopKKernel:
             layout=cute.make_ordered_layout((self.radix,), order=(0,)),
             byte_alignment=128,
         )
-        # suffix sum buffer [256] int32
-        suffix_buf = smem.allocate_tensor(
+        # prefix sum buffer [256] int32
+        prefix_buf = smem.allocate_tensor(
             element_type=cutlass.Int32,
             layout=cute.make_ordered_layout((self.radix,), order=(0,)),
             byte_alignment=128,
@@ -1034,7 +1031,7 @@ class SinglePassMultiCTARadixTopKKernel:
                         prefix,
                         remaining_k,
                         local_histogram,
-                        suffix_buf,
+                        prefix_buf,
                         s_scalars,
                         s_warp_sums,
                         num_threads,
@@ -1049,7 +1046,7 @@ class SinglePassMultiCTARadixTopKKernel:
                         prefix,
                         remaining_k,
                         local_histogram,
-                        suffix_buf,
+                        prefix_buf,
                         s_scalars,
                         s_warp_sums,
                         num_threads,
@@ -1065,7 +1062,7 @@ class SinglePassMultiCTARadixTopKKernel:
                             prefix,
                             remaining_k,
                             local_histogram,
-                            suffix_buf,
+                            prefix_buf,
                             s_scalars,
                             s_warp_sums,
                             num_threads,
@@ -1080,7 +1077,7 @@ class SinglePassMultiCTARadixTopKKernel:
                             prefix,
                             remaining_k,
                             local_histogram,
-                            suffix_buf,
+                            prefix_buf,
                             s_scalars,
                             s_warp_sums,
                             num_threads,
@@ -1137,7 +1134,7 @@ class SinglePassMultiCTARadixTopKKernel:
                         prefix,
                         remaining_k,
                         local_histogram,
-                        suffix_buf,
+                        prefix_buf,
                         s_scalars,
                         s_warp_sums,
                         state_base_ptr,
@@ -1159,7 +1156,7 @@ class SinglePassMultiCTARadixTopKKernel:
                         prefix,
                         remaining_k,
                         local_histogram,
-                        suffix_buf,
+                        prefix_buf,
                         s_scalars,
                         s_warp_sums,
                         state_base_ptr,
@@ -1183,7 +1180,7 @@ class SinglePassMultiCTARadixTopKKernel:
                             prefix,
                             remaining_k,
                             local_histogram,
-                            suffix_buf,
+                            prefix_buf,
                             s_scalars,
                             s_warp_sums,
                             state_base_ptr,
@@ -1205,7 +1202,7 @@ class SinglePassMultiCTARadixTopKKernel:
                             prefix,
                             remaining_k,
                             local_histogram,
-                            suffix_buf,
+                            prefix_buf,
                             s_scalars,
                             s_warp_sums,
                             state_base_ptr,
