@@ -319,15 +319,11 @@ inline bool isSM100Family()
 /// @return true if the system has unified CPU-GPU memory.
 inline bool isUnifiedMemorySystem()
 {
-    static bool const sIsUnified = []()
-    {
-        int device{-1};
-        check_cuda_error(cudaGetDevice(&device));
-        int pageableMemAccess{0};
-        check_cuda_error(cudaDeviceGetAttribute(&pageableMemAccess, cudaDevAttrPageableMemoryAccess, device));
-        return pageableMemAccess != 0;
-    }();
-    return sIsUnified;
+    int device{-1};
+    check_cuda_error(cudaGetDevice(&device));
+    int pageableMemAccess{0};
+    check_cuda_error(cudaDeviceGetAttribute(&pageableMemAccess, cudaDevAttrPageableMemoryAccess, device));
+    return pageableMemAccess != 0;
 }
 
 inline int getDevice()

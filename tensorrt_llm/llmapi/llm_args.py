@@ -2281,7 +2281,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.enable_unified_memory_optimization is None:
             try:
                 unified = is_device_integrated()
-            except Exception:
+            except RuntimeError:
+                logger.debug(
+                    "Unified-memory auto-detection failed; "
+                    "defaulting to disabled")
                 unified = False
             object.__setattr__(self, 'enable_unified_memory_optimization',
                                unified)
