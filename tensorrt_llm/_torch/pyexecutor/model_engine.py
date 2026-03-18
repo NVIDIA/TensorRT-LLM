@@ -203,10 +203,15 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
 
+        input_processor_kwargs = {}
+        if llm_args.video_pruning_rate is not None:
+            input_processor_kwargs[
+                'video_pruning_rate'] = llm_args.video_pruning_rate
         self.input_processor = create_input_processor(
             model_path,
             tokenizer=None,
-            checkpoint_format=llm_args.checkpoint_format)
+            checkpoint_format=llm_args.checkpoint_format,
+            **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:

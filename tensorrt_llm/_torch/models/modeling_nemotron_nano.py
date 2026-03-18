@@ -42,7 +42,6 @@ from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model
 
-VIDEO_PRUNING_RATIO = float(os.getenv("TLLM_VIDEO_PRUNING_RATIO", "0"))
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
 IMAGE_PLACEHOLDER = "<image>"
@@ -257,7 +256,10 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             raise NotImplementedError(
                 f"Unsupported {config.ps_version=}. Supported versions: {supported_versions}."
             )
-        self.video_pruning_ratio = VIDEO_PRUNING_RATIO
+        # Use config value if explicitly set (EVS enabled), otherwise default to 0.0 (EVS disabled)
+        self.video_pruning_rate = (
+            model_config.video_pruning_rate if model_config.video_pruning_rate is not None else 0.0
+        )
 
         # Construct the vision projection.
         self.vit_hidden_size = config.vit_hidden_size
@@ -414,7 +416,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
                 video_embeds=reshaped_partial_mm_embed,
                 video_size=(t, p * ih, iw),
                 spatial_merge_size=self.spatial_merge_size,
-                pruning_ratio=self.video_pruning_ratio,
+                pruning_ratio=self.video_pruning_rate,
                 flatten_output=False,
             ).flatten(start_dim=1)
             # -> [num_frames, num_patches_per_frame*h*w]
@@ -437,7 +439,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     ) -> Tuple[List[torch.Tensor], Optional[List[List[int] | None]]]:
         """Apply EVS to the multimodal embedding."""
         # Skip EVS if pruning ratio is 0.
-        if self.video_pruning_ratio <= 0:
+        if self.video_pruning_rate <= 0:
             return mm_embedding, None
 
         modality_types = [
@@ -448,7 +450,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             return mm_embedding, None
 
         video_size_list = [
-            multimodal_data[modality_type]["video_size"]
+            multimodal_data[modality_type].get("video_size") if modality_type == "video" else None
             for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst)
         ]
         mm_embedding_evs = []
@@ -487,17 +489,23 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
                 pixel_values_flat = data["pixel_values"]
                 image_sizes = data["image_sizes"]
                 embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
-                mm_embedding.append(embeds.reshape(-1, self.llm_hidden_size))
+                # Keep 3D shape for apply_evs, will reshape to 2D after EVS
+                mm_embedding.append(embeds)
             # This applies to images without dynamic resolution, or videos.
             else:
                 # Fallback to fixed-tile extraction for this modality.
                 pixel_values = data["pixel_values"]
                 embeds = self.extract_feature(pixel_values)
-                mm_embedding.append(embeds.reshape(-1, self.llm_hidden_size))
+                # Keep 3D shape [num_patches, h*w, hidden] for apply_evs
+                mm_embedding.append(embeds)
 
-        return mm_embedding, [None] * len(modality_types)
+        # Apply EVS if video_pruning_rate > 0
+        mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_lst)
+        # Reshape to 2D after EVS: [num_patches*h*w, hidden_size]
+        mm_embedding = [m.reshape(-1, self.llm_hidden_size) for m in mm_embedding]
+        return mm_embedding, num_tokens_in_videos
 
-        # Existing fixed-tile path.
+        # Existing fixed-tile path (unreachable, kept for reference).
         pixel_values = [
             multimodal_data[modality_type]["pixel_values"]
             for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst)
@@ -530,6 +538,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         trust_remote_code: bool = True,
         **kwargs,
     ):
+        # Extract video_pruning_rate before passing kwargs to parent
+        video_pruning_rate = kwargs.pop("video_pruning_rate", None) or 0.0
+
         super().__init__(
             model_path=model_path,
             config=config,
@@ -563,7 +574,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self.num_image_token = int(
             (self.image_size // self.patch_size) ** 2 * (self.downsample_ratio**2)
         )
-        self.video_pruning_ratio = VIDEO_PRUNING_RATIO
+        self.video_pruning_rate = video_pruning_rate
         self.img_context_token = self.config.img_context_token
         self.video_context_token = self.config.video_context_token
         self.img_start_token = self.config.img_start_token
@@ -747,15 +758,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self,
         *,
         video: List[Image.Image],
-        video_pruning_ratio: Optional[float] = None,
+        video_pruning_rate: Optional[float] = None,
         **kwargs,
     ):
         # Use VIDEO_PRUNING_RATIO if not explicitly provided
-        if video_pruning_ratio is None:
-            video_pruning_ratio = self.video_pruning_ratio
+        if video_pruning_rate is None:
+            video_pruning_rate = self.video_pruning_rate
 
         num_frames = len(video)
-        if video_pruning_ratio > 0:
+        if video_pruning_rate > 0:
             num_tokens_per_frame = self.get_num_tokens_per_image(
                 image=video[0],
                 max_num_tiles=VIDEO_MAX_NUM_TILES,
@@ -767,7 +778,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             num_total_tokens = compute_retained_tokens_count(
                 video_size=video_size,
                 spatial_merge_size=self.spatial_merge_size,
-                pruning_ratio=video_pruning_ratio,
+                pruning_ratio=video_pruning_rate,
             )
             # Add special tokens for each frame.
             num_total_tokens += num_frames * len(self.get_mm_special_token_ids())
@@ -776,7 +787,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             num_total_tokens = sum(
                 self.get_num_tokens_per_image(
                     image=frame,
-                    video_pruning_ratio=None,
+                    video_pruning_rate=None,
                     max_num_tiles=VIDEO_MAX_NUM_TILES,
                     **kwargs,
                 )
@@ -961,7 +972,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 processed_query.extend(frame_prompts)
             # Video_context_token as placeholder,
             # it will be replaced with the real image_tokens_per_frames during model forward.
-            if self.video_pruning_ratio > 0:
+            if self.video_pruning_rate > 0:
                 evs_query.append(split_text_prompt[video_index])
                 evs_query.append("This is a video:\n")
                 for frame_sep in frame_separators:
@@ -986,7 +997,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         ]
         input_ids = torch.cat(input_ids_lst, dim=1)
 
-        if self.video_pruning_ratio > 0:
+        if self.video_pruning_rate > 0:
             evs_query.append(split_text_prompt[-1])
             evs_ids = [
                 self.tokenizer.encode(
@@ -1009,11 +1020,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             img_height = video_size[2]
             img_width = video_size[3]
 
-            if self.video_pruning_ratio > 0:
+            if self.video_pruning_rate > 0:
                 desired_num_tokens = compute_retained_tokens_count(
                     video_size=(num_frames, num_patches_per_frame * img_height, img_width),
                     spatial_merge_size=self.spatial_merge_size,
-                    pruning_ratio=self.video_pruning_ratio,
+                    pruning_ratio=self.video_pruning_rate,
                 )
                 # It is dummy tokens and will be adjusted in VisionEncoder after applied EVS.
                 # Need to know the length of the full input ids ahead,
@@ -1069,7 +1080,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             # Store input_ids for image modality here when EVS is enabled,
             # which will be used in merge_evs_mm_embeds later.
             modality_data["evs_ids"] = (
-                input_ids[0].to(torch.int32) if self.video_pruning_ratio > 0 else None
+                input_ids[0].to(torch.int32) if self.video_pruning_rate > 0 else None
             )
         elif videos is not None:
             modality_type = "video"
@@ -1249,7 +1260,10 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.post_config()
         self.is_loaded = True
-        self.video_pruning_ratio = VIDEO_PRUNING_RATIO
+        # Use config value if explicitly set (EVS enabled), otherwise default to 0.0 (EVS disabled)
+        self.video_pruning_rate = (
+            model_config.video_pruning_rate if model_config.video_pruning_rate is not None else 0.0
+        )
 
     def load_weights(self, weights):
         # Load vision encoder weights.
@@ -1378,7 +1392,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             if modality_type in ("image", "video"):
                 embs, num_tokens = self.vision_encoder([param])
                 mm_embeddings.append(embs[0])
-                mm_num_tokens.append(num_tokens[0])
+                mm_num_tokens.append(num_tokens[0] if num_tokens is not None else None)
             elif modality_type == "audio":
                 mm_embeddings.append(self._encode_audio(param))
                 mm_num_tokens.append(None)
@@ -1421,7 +1435,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
             # Adjust input_ids in videos if EVS is applied.
-            if self.video_pruning_ratio > 0:
+            if self.video_pruning_rate > 0:
                 input_ids = self.merge_evs_mm_embeds(
                     num_tokens_in_videos,
                     multimodal_params=multimodal_params[:num_context_requests],

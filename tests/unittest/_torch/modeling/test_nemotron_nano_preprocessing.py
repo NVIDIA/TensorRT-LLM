@@ -311,7 +311,7 @@ def vision_encoder():
     """Create a mock NanoV2VLVisionEncoder with required attributes."""
     encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
     encoder.llm_hidden_size = 512
-    encoder.video_pruning_ratio = 0.0
+    encoder.video_pruning_rate = 0.0
     return encoder
 
 
@@ -319,7 +319,7 @@ def test_forward_dynamic_path(vision_encoder):
     fake_embeds = torch.randn(1, 10, 512)
     vision_encoder.extract_feature_dynamic = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature = mock.MagicMock()
-    vision_encoder.apply_evs = mock.MagicMock()
+    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
 
     mm_data = {
         "modality_type": "image",
@@ -341,6 +341,7 @@ def test_forward_fixed_tile_path(vision_encoder):
     fake_embeds = torch.randn(2, 8, 512)
     vision_encoder.extract_feature = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature_dynamic = mock.MagicMock()
+    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
 
     mm_data = {
         "modality_type": "image",

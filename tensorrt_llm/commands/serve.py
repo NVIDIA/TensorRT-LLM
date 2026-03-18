@@ -154,6 +154,7 @@ def get_llm_args(
         fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
+        video_pruning_rate: Optional[float] = None,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -236,6 +237,8 @@ def get_llm_args(
         otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "video_pruning_rate":
+        video_pruning_rate,
     }
 
     llm_args = {
@@ -718,6 +721,14 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help=help_info_with_stability_tag(
                   "Keyword arguments for media I/O.", "prototype"))
+@click.option("--video_pruning_rate",
+              type=float,
+              default=None,
+              help=help_info_with_stability_tag(
+                  "Pruning rate for video frames in multimodal models. "
+                  "Applied by Efficient Video Sampling (EVS). "
+                  "None disables EVS, values in [0, 1) enable pruning.",
+                  "prototype"))
 @click.option("--chat_template",
               type=str,
               default=None,
@@ -760,8 +771,9 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str],
-        grpc: bool, served_model_name: Optional[str],
+        video_pruning_rate: Optional[float], custom_module_dirs: list[Path],
+        chat_template: Optional[str], grpc: bool,
+        served_model_name: Optional[str],
         extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -815,7 +827,8 @@ def serve(
             fail_fast_on_attention_window_too_large=
             fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
-            enable_chunked_prefill=enable_chunked_prefill)
+            enable_chunked_prefill=enable_chunked_prefill,
+            video_pruning_rate=video_pruning_rate)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
