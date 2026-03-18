@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/CUDAContext.h>
@@ -43,16 +44,7 @@
 
 #if ENABLE_MULTI_DEVICE
 
-// Throw on NCCL failure. Use for operations where failure is unrecoverable.
-#define TLLM_NCCL_CHECK(cmd)                                                                                           \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        ncclResult_t const _tllm_nccl_r = (cmd);                                                                       \
-        if (TLLM_UNLIKELY(_tllm_nccl_r != ncclSuccess))                                                                \
-        {                                                                                                              \
-            TLLM_THROW("NCCL error in %s (%s:%d): %s", #cmd, __FILE__, __LINE__, ncclGetErrorString(_tllm_nccl_r));    \
-        }                                                                                                              \
-    } while (0)
+// TLLM_NCCL_CHECK (throw on failure) is provided by multiDeviceUtils.h.
 
 // Warn-only variant: log a warning on NCCL failure but do not throw or abort.
 // Use for cleanup/secondary operations where an NCCL error is non-fatal (e.g. ncclMemFree on an error path).
