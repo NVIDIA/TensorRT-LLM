@@ -229,6 +229,7 @@ def test_gated_delta_rule_with_cache(num_k_heads, num_v_heads):
             cu_seqlen=cu_seqlen,
             input_pos=input_pos,
             slot_idx=list(range(bs)),
+            gather_context_logits=True,
         )
         y = gm(**cm.named_args)
         return torch.stack(cm.info.unnest_sequences(y))
