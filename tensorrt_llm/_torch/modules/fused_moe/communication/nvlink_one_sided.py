@@ -252,7 +252,7 @@ class NVLinkOneSided(Communication):
             print(f"self._WORKSPACE: {self._WORKSPACE}")
             print(f"self.workspace_size_per_rank: {self.workspace_size_per_rank}")
             assert self._WORKSPACE["workspace_size_per_rank"] == self.workspace_size_per_rank, (
-                "reuse workspace with different workspace_size_per_rank"
+                f"reuse workspace with different workspace_size_per_rank, self._WORKSPACE: {self._WORKSPACE['workspace_size_per_rank']}, self.workspace_size_per_rank: {self.workspace_size_per_rank}"
             )
             assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, (
                 "reuse workspace with different max_num_tokens_per_rank"
