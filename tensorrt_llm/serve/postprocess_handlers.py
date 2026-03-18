@@ -556,6 +556,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
+    stream_options: Optional[StreamOptions] = None
     chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
@@ -564,6 +565,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
             model=request.model,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            stream_options=request.stream_options if request.stream else None,
             chat_template_kwargs=request.chat_template_kwargs,
         )
 
@@ -578,6 +580,7 @@ def chat_harmony_post_processor(
         outputs=rsp.outputs,
         model=args.model,
         num_prompt_tokens=args.num_prompt_tokens,
+        cached_tokens=rsp.cached_tokens,
     )
     return response
 
@@ -599,6 +602,8 @@ def chat_harmony_streaming_post_processor(
         done=rsp._done,
         num_prompt_tokens=args.num_prompt_tokens,
         first_iteration=args.first_iteration,
+        stream_options=args.stream_options,
+        cached_tokens=rsp.cached_tokens,
     )
     args.first_iteration = False
     return response

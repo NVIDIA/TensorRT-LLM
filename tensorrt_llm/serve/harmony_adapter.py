@@ -25,7 +25,8 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
                               DeltaFunctionCall, DeltaMessage, DeltaToolCall,
-                              UsageInfo, to_disaggregated_params)
+                              PromptTokensDetails, UsageInfo,
+                              to_disaggregated_params)
 
 # yapf: enable
 
@@ -1631,10 +1632,15 @@ def get_harmony_adapter() -> HarmonyAdapter:
 
 
 def handle_streaming_response(tools: List[ChatCompletionToolsParam],
-                              tool_choice: str, result: GenerationResult,
-                              model: str, request_id: str, done: bool,
+                              tool_choice: str,
+                              result: GenerationResult,
+                              model: str,
+                              request_id: str,
+                              done: bool,
                               num_prompt_tokens: int,
-                              first_iteration: bool) -> List[str]:
+                              first_iteration: bool,
+                              stream_options=None,
+                              cached_tokens: int = 0) -> List[str]:
     output = result.outputs[0]
 
     # Convert tools to dictionary format for harmony adapter (standard pattern)
@@ -1649,12 +1655,20 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
     else:
         tools_for_parser = tools_dict
 
+    include_usage = True
+    if stream_options is not None:
+        include_usage = stream_options.include_usage
+
     def end_streaming(res):
         # Clean up state
         harmony_adapter.cleanup_stream_state(request_id)
 
+        if not include_usage:
+            return
+
         # Append usage info
-        usage_info = _create_usage_info(num_prompt_tokens, result.outputs)
+        usage_info = _create_usage_info(num_prompt_tokens, result.outputs,
+                                        cached_tokens)
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
                                                          model=model,
@@ -1746,8 +1760,11 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
 
 
 def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
-                                  tool_choice: str, outputs: List, model: str,
-                                  num_prompt_tokens: int):
+                                  tool_choice: str,
+                                  outputs: List,
+                                  model: str,
+                                  num_prompt_tokens: int,
+                                  cached_tokens: int = 0):
     """Handle non-streaming response with harmony format."""
     # Parse harmony output to OpenAI format
     # Convert tools to dictionary format for harmony adapter (standard pattern)
@@ -1794,7 +1811,7 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         response_message = {"role": "assistant", "content": ""}
 
     # Create usage info from metrics (RequestOutput doesn't have usage in v1)
-    usage_info = _create_usage_info(num_prompt_tokens, outputs)
+    usage_info = _create_usage_info(num_prompt_tokens, outputs, cached_tokens)
 
     # Create response
     response = ChatCompletionResponse(
@@ -1841,15 +1858,19 @@ def _determine_finish_reason(parsed_output: dict[str, Any],
         return reason
 
 
-def _create_usage_info(num_prompt_tokens, outputs) -> UsageInfo:
+def _create_usage_info(num_prompt_tokens,
+                       outputs,
+                       cached_tokens: int = 0) -> UsageInfo:
     """Create usage info from RequestOutput following serving_chat.py pattern."""
     # Calculate completion tokens from all outputs
     num_generated_tokens = sum(len(output.token_ids) for output in outputs)
 
     # Create usage info
-    usage = UsageInfo(prompt_tokens=num_prompt_tokens,
-                      completion_tokens=num_generated_tokens,
-                      total_tokens=num_prompt_tokens + num_generated_tokens)
+    usage = UsageInfo(
+        prompt_tokens=num_prompt_tokens,
+        completion_tokens=num_generated_tokens,
+        total_tokens=num_prompt_tokens + num_generated_tokens,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens))
     return usage
 
 
