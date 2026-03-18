@@ -21,8 +21,6 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 
 ## Tech Blogs
 
-
-
 * [03/16] Optimizing MoE Communication with One-Sided AlltoAll Over NVLink
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.md)
 
