@@ -128,9 +128,11 @@ AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", 
 
 @pytest.fixture(scope="session")
 def _visual_gen_deps(llm_venv):
-    """Install av + diffusers once per session (shared by all video-gen fixtures)."""
+    """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "git+https://github.com/huggingface/diffusers.git"])
+    # Install ffmpeg system package required by MediaStorage.save_video for MP4 encoding
+    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")
