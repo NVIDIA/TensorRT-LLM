@@ -477,6 +477,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             mla_layer.mqa.indexer.wk.weight.normal_(mean=0.0, std=nn_init_std)
             mla_layer.mqa.indexer.weights_proj.weight.normal_(mean=0.0,
                                                               std=nn_init_std)
+            # Build fused wk+weights_proj weight after random init
+            mla_layer.mqa.indexer.post_load_weights()
 
         # Extract W_UK and W_UV from test layer for reference calculation
         kv_b_weight = mla.kv_b_proj.weight.data
@@ -681,7 +683,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
         hidden_states,
         attn_metadata,
         position_ids,
-        indexer_k=mla.mqa.indexer.wk(hidden_states),  # indexer_k
     )
 
     # Validate indexer output against expected causal indices (since seq_len < topk=2048)

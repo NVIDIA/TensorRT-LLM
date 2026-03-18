@@ -125,6 +125,13 @@ deepseek-ai/DeepSeek-V3.2-Exp:
   - quant_algo: NVFP4
     spec_dec_algo: MTP
     accuracy: 95.6
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 95.2
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 95.6
 Qwen3/Qwen3-4B:
   - spec_dec_algo: Eagle
     accuracy: 85.823
@@ -359,10 +366,13 @@ mistral/Mistral-Large-3-675B:
   - spec_dec_algo: Eagle3
     accuracy: 86.1
 nvidia/Nemotron-Super-V3:
-  - accuracy: 83.74
+  - accuracy: 92.70
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 91.90
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 82.25
+    accuracy: 92.10
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 80.85
@@ -396,3 +406,8 @@ nvidia/NVIDIA-Nemotron-3-Super-120B-012726:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 82.121
+zai-org/GLM-5-FP8:
+  - accuracy: 78.0
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 78.0
