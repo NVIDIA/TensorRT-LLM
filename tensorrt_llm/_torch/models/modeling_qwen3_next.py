@@ -204,7 +204,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
         _layer = self.layer_idx if self.layer_idx is not None else 0
-        dump(hidden_states.clone(), _layer, "mlp_block_input")
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
@@ -253,12 +252,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return routed_output[0]
         
         router_logits, routed_output = routed_output
-        dump(router_logits.clone(), _layer, "mlp_router_logits")
-        dump(routed_output.clone(), _layer, "mlp_routed_output")
-        dump(shared_expert_output.clone(), _layer, "mlp_shared_output")
 
         final_hidden_states = routed_output + shared_expert_output
-        dump(final_hidden_states.clone(), _layer, "mlp_block_output")
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(
@@ -677,10 +672,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_prefill = kwargs["num_prefill"]
 
         conv_states_to_use = conv_states
+        
 
-        conv_states_before = conv_states_to_use.clone()
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
-        conv_input = mixed_qkv.clone()
         if num_decode_tokens > 0:
             mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv,
                                                    seqlen_split_size,
@@ -718,7 +712,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc).transpose(0, 1)
-
         # print(f"EXTEND Layer {self.layer_idx} mixed_qkv: {hex(mixed_qkv.data_ptr())} \n{mixed_qkv[0:3, 0:5]}")
         key_split_dim = self.key_dim // self.attn_tp_size
         value_split_dim = self.value_dim // self.attn_tp_size
@@ -760,12 +753,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         last_recurrent_state = last_recurrent_state.to(ssm_states.dtype,
                                                        copy=False)
         ssm_states[cache_indices] = last_recurrent_state
-        dump(conv_input, self.layer_idx, "conv_input")
-        dump(conv_states_before.clone(), self.layer_idx, "conv_states_before")
-        dump(conv_states_to_use.clone(), self.layer_idx, "conv_states_after")
-        dump(recurrent_state, self.layer_idx, "recurrent_state")
-        dump(last_recurrent_state, self.layer_idx, "last_recurrent_state")
-        dump(core_attn_out, self.layer_idx, "core_attn_out")
         return core_attn_out
 
     def forward(
@@ -809,10 +796,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if num_prefills > 0:
             # only select state_indices_p where has_initial_states is False
             has_initial_states_p = has_initial_states[:num_prefills]
-            # state_indices_p = state_indices_p[~has_initial_states_p]
-            # print(f"has_initial_states_p: {has_initial_states_p}")
-            # if self.layer_idx == 0:
-            #     print(f"resetting ssm_states for prefill requests, block id={state_indices_p[~has_initial_states_p]}")
             ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros((),
                                                       dtype=ssm_states.dtype,
                                                       device=ssm_states.device)
@@ -820,11 +803,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                                                       dtype=conv_states.dtype,
                                                       device=conv_states.device)
 
-        # if self.layer_idx == 0:
-        #     print(f"state_indices_d: {state_indices_d}")
-        #     print(f"ssm_states for decode req: {ssm_states[state_indices_d]}")
-        #     print(f"stride of ssm_states: {ssm_states.stride()}")
-        #     print(f"stride of conv_states: {conv_states.stride()}")
         def _compute_projected_states_qkvz():
             return self.in_proj_qkvz(hidden_states)
 
@@ -883,11 +861,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         attn_out = attn_out.reshape(-1, attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         attn_out = self.norm(attn_out, z)
-        dump(attn_out.clone(), self.layer_idx, "attn_out_after_norm")
         attn_out = attn_out.reshape(z_shape_og)
         attn_out = attn_out.reshape(*attn_out.shape[:-2], -1)
         output = self.out_proj(attn_out, all_reduce_params=all_reduce_params)
-        dump(output.clone(), self.layer_idx, "linear_attn_output")
         return output
 
 
@@ -954,12 +930,9 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        dump(hidden_states.clone(), self.layer_idx, "layer_input")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        dump(hidden_states.clone(), self.layer_idx, "after_input_layernorm")
-        layer_layernorm = hidden_states.clone()
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
@@ -987,15 +960,12 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        dump(hidden_states.clone(), self.layer_idx, "after_post_attn_layernorm")
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
         do_finalize = not (self.fusion_config.POST_MOE_FUSION
                            and hidden_states.shape[0]
                            <= self.moe_allreduce.max_token
                            and self.model_config.moe_backend == 'TRTLLM'
                            and self.mlp.experts.has_nvfp4)
-        after_linear_attn = hidden_states.clone()
-        dump(after_linear_attn, self.layer_idx, "after_linear_attn")
 
         hidden_states = self.mlp(
             hidden_states,
@@ -1045,7 +1015,6 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-        dump(hidden_states.clone(), self.layer_idx, "after_mlp")
         return hidden_states, residual
 
 
@@ -1129,9 +1098,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
-        layernorm = hidden_states.clone()
         # Self Attention
-        # print(f"host_kv_cache_block_offsets: {attn_metadata.host_kv_cache_block_offsets[:,0,:,0:8]}")
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1141,7 +1108,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             lora_params=lora_params,
             **kwargs,
         )
-        # after_attention = hidden_states.clone()
         if self.fusion_config.PRE_MOE_FUSION and self.enable_attention_dp:
             hidden_states, residual = self.allreduce(
                 hidden_states,

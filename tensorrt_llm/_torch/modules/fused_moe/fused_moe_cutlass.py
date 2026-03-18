@@ -658,11 +658,8 @@ class CutlassFusedMoE(MoE):
         _layer = self.layer_idx if self.layer_idx is not None else 0
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            dump(x.fp4_tensor.clone().float(), _layer, "moe_input_fp4")
         else:
             output_dtype = x.dtype
-            dump(x.clone(), _layer, "moe_input")
-        dump(router_logits.clone(), _layer, "moe_router_logits")
 
         is_first_call, is_last_call = repeating_info
 
@@ -671,8 +668,6 @@ class CutlassFusedMoE(MoE):
         # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
-        dump(token_selected_experts.clone().float(), _layer, "moe_token_selected_experts")
-        dump(token_final_scales.clone(), _layer, "moe_token_final_scales")
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape
@@ -715,10 +710,6 @@ class CutlassFusedMoE(MoE):
         # For post_quant_comm scenarios, x_sf will be reshaped to 2D inside quantize_input
         post_quant_comm = run_post_quant_allgather or self.enable_alltoall
         x, x_sf = self.quantize_input(x, post_quant_comm=post_quant_comm)
-        if isinstance(x, torch.Tensor):
-            dump(x.clone(), _layer, "moe_quantized_input")
-        elif isinstance(x, Fp4QuantizedTensor):
-            dump(x.fp4_tensor.clone().float(), _layer, "moe_quantized_input_fp4")
 
         # Prepare additional information for profiling in case padding is applied when using alltoall.
         # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -853,8 +844,6 @@ class CutlassFusedMoE(MoE):
                 output_dtype)
 
         # Call extracted run_moe method
-        dump(x.clone(), _layer, "moe_x")
-        dump(token_final_scales.clone(), _layer, "moe_token_final_scales")
         final_hidden_states = self.run_moe(
             x=x,
             token_selected_experts=token_selected_slots,
@@ -866,7 +855,6 @@ class CutlassFusedMoE(MoE):
             tuner_top_k=tuner_top_k,
             moe_output=moe_output,
         )
-        dump(final_hidden_states.clone(), _layer, "moe_output_after_run_moe")
 
         self._load_balancer_start_set_cpu_stage(is_last_call)
 
@@ -901,7 +889,6 @@ class CutlassFusedMoE(MoE):
                 )
 
         self._load_balancer_done_set_cpu_stage(is_last_call)
-        dump(final_hidden_states.clone(), _layer, "moe_output")
 
         return final_hidden_states
 
@@ -957,7 +944,6 @@ class CutlassFusedMoE(MoE):
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
-            dump(outputs.clone(), _layer, "moe_final_after_reducescatter")
         else:
             if self.use_dp:
                 all_rank_chunk_size_list = [
@@ -1041,8 +1027,6 @@ class CutlassFusedMoE(MoE):
         if self.use_dp and self.parallel_size > 1:
             rank = self.parallel_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
-        if num_chunks > 1:
-            dump(outputs.clone(), _layer, "moe_final_after_reducescatter")
         self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
 

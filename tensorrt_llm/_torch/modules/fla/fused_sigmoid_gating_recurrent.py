@@ -81,13 +81,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n).to(tl.int64)
+        idx = tl.load(h0_indices + i_n).to(tl.int64) # prevent int32 overflow
         if idx >= 0:
-            if idx >= h0_dim0:
-                tl.device_print("OOB load: idx=", idx)
-                tl.device_print("  h0_dim0=", h0_dim0)
-                tl.device_print("  i_n=", i_n)
-            tl.device_assert(idx < h0_dim0, "idx out of bounds in h0_source load")
             p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V +
                     o_k[:, None] * V + o_v[None, :])
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
