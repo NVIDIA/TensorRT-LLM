@@ -285,7 +285,7 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
-        tllmRunnerParams.mMultiCtasKvMode = true;
+        tllmRunnerParams.mMultiCtasKvMode = false;
         // Assume same head size for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSize;
@@ -494,6 +494,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mLayerIdx = params.layer_idx;
         tllmRunnerParams.seqlensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
+        tllmRunnerParams.mPackedMaskMaxSeqLenQ = params.spec_decoding_max_generation_length;
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;

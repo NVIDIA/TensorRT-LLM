@@ -274,6 +274,7 @@ public:
                 continue;
             }
             // Prepare custom mask for spec-decoding generation kernels.
+            // Only run at layer 0 - layers 1-N reuse the same mask/offsets.
             if (params.mLayerIdx == 0 && params.mIsSpecDecTree)
             {
                 runPrepareCustomMask(kernelMeta, params, params.stream);

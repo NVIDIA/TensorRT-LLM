@@ -528,6 +528,12 @@ class TrtllmAttentionWrapper:
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
+        # Zero bl_tree_mask only at layer transitions (local layer_idx==0)
+        # to clear stale bits from atomicOr. Layers 1-31 reuse layer 0's mask;
+        # eagle head (also local_idx==0) gets fresh mask.
+        if self.spec_decoding_bl_tree_mask is not None and self.layer_idx == 0:
+            self.spec_decoding_bl_tree_mask.zero_()
+
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
@@ -1461,6 +1467,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def spec_decoding_param_prepare_for_blackwell(self) -> None:
         """
         Prepare the blackwell parameters for the speculative decoding (Medusa and Eagle) generation-phase attention kernels.
+        Uses persistent buffers (only allocate if None) for CUDA graph compatibility.
         """
         if self.spec_decoding_bl_tree_mask_offset is None:
             self.spec_decoding_bl_tree_mask_offset = torch.zeros(
@@ -1469,18 +1476,32 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
             )
 
-        self.update_blackwell_first_sparse_mask_offset()
+        if self.spec_bl_tree_first_sparse_mask_offset_kv is None:
+            self.spec_bl_tree_first_sparse_mask_offset_kv = torch.zeros(
+                [self.max_num_requests],
+                dtype=torch.int32,
+                device='cuda',
+            )
+
+        # Only update first_sparse offset when seq lens are available
+        # (not during CUDA graph warmup when _seq_lens_cuda is None)
+        if self._seq_lens_cuda is not None:
+            self.update_blackwell_first_sparse_mask_offset()
 
         if self.spec_decoding_bl_tree_mask is None:
-            # Use upper bound from packed_mask shape for sizing
+            # Custom mask covers the tree region (seqLenQ x seqLenQ).
+            # The mask buffer needs extra room for tile boundary crossing:
+            # when firstSparse is not aligned to stepKv (=tileSizeKv*numInstsKv),
+            # the mask can span one extra KV tile. Adding (stepKv - 1) to
+            # max_kv_len guarantees the upper-bound tile count is correct.
             seqLenQ = self.spec_decoding_packed_mask.shape[
                 1] if self.spec_decoding_packed_mask is not None else 1
-            max_kv_len = self.kv_lens[:self.num_seqs].max()
             tile_size_kv = 128
             tile_size_q = 128
             num_instances_q = 1
             num_instances_kv = 2
             tile_size_kv_per_cta = tile_size_kv * num_instances_kv
+            max_kv_len = seqLenQ + tile_size_kv_per_cta - 1
             tile_size_q_per_cta = tile_size_q * num_instances_q
             max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
                 max_kv_len, 0, tile_size_kv_per_cta)
@@ -1529,9 +1550,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             runtime_draft_len: Optional[int] = None, the current runtime draft length for dynamic draft length support in linear tree mode.
         '''
 
-        # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
-        self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
-            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
@@ -1971,6 +1990,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and not metadata._flash_mla_metadata_valid):
             self._compute_flash_mla_metadata(metadata)
             metadata._flash_mla_metadata_valid = True
+
+        # Option A: Zero + update first_sparse only at layer transitions
+        # (local layer_idx==0 for both base model layer 0 and eagle head).
+        # Layers 1-31 reuse layer 0's mask; eagle head gets fresh mask.
+        layer_idx = self.get_local_layer_idx(metadata)
+        if layer_idx == 0:
+            if metadata.spec_decoding_bl_tree_mask is not None:
+                metadata.spec_decoding_bl_tree_mask.zero_()
+            if (metadata.spec_bl_tree_first_sparse_mask_offset_kv is not None
+                    and metadata._seq_lens_cuda is not None):
+                metadata.update_blackwell_first_sparse_mask_offset()
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
