@@ -52,7 +52,7 @@ accuracy:
   env_var:
     HF_HOME: <hf_home_path>
   tasks:
-    gsm8k:
+    gsm8k_local:
       model: "local-completions"
       model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
       extra_kwargs:
