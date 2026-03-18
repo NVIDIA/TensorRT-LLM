@@ -1531,7 +1531,11 @@ class Indexer(nn.Module):
                 # This is because rowEnd = seq_len - next_n + offset + 1
                 gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
-                # TODO: Note, cute dsl top_k requires extra memory.
+                # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
+                # memory. Beyond 256 tokens the extra memory becomes significant,
+                # so we cap it at 256 for now and fall back to the CUDA C++
+                # indexer_topk_decode. This limit can be removed if GPU memory
+                # is not a bottleneck.
                 if self.use_cute_dsl_topk and num_gen_tokens <= 256:
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, gen_kv_lens_cuda,
