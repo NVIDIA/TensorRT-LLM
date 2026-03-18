@@ -21,6 +21,14 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 
 ## Tech Blogs
 
+
+
+* [03/16] Optimizing MoE Communication with One-Sided AlltoAll Over NVLink
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.md)
+
+* [03/04] Sparse Attention in TensorRT LLM
+✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html)
+
 * [02/06] Accelerating Long-Context Inference with Skip Softmax Attention
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html)
 
