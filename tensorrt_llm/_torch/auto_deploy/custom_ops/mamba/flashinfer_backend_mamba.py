@@ -19,7 +19,7 @@ import torch
 from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
-from ..attention_interface import AttentionRegistry, MHACallable, ResourceHandlerDict
+from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable, ResourceHandlerDict
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
@@ -58,7 +58,8 @@ def _flashinfer_cached_ssm(
         hidden_states, B, C, dt
     )
     ssm_state_size = B.shape[3]
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
     # Preallocate output tensor (zeros so padding positions are clean)

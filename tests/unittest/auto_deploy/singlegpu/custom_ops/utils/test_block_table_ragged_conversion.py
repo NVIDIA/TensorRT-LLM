@@ -344,13 +344,17 @@ def test_adjust_append_ragged(max_batch_size, max_blocks_per_seq):
     delta_full = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
     delta_full[:num_sequences] = delta
 
+    ei_ref = extra_idx.clone()
     cl_ref = cache_loc_base.clone()
     cu_ref = cu_base.clone()
-    total_ref = ops.adjust_ragged_torch(cl_ref, cu_ref, extra_idx, delta_full, num_sequences)
+    ops.adjust_ragged_torch(cl_ref, cu_ref, ei_ref, delta_full, num_sequences, max_blocks_per_seq)
+    total_ref = int(cu_ref[num_sequences].item())
 
+    ei_tri = extra_idx.clone()
     cl_tri = cache_loc_base.clone()
     cu_tri = cu_base.clone()
-    total_tri = ops.adjust_ragged_triton(cl_tri, cu_tri, extra_idx, delta_full, num_sequences)
+    ops.adjust_ragged_triton(cl_tri, cu_tri, ei_tri, delta_full, num_sequences, max_blocks_per_seq)
+    total_tri = int(cu_tri[num_sequences].item())
 
     assert total_ref == total_tri, f"Total mismatch: {total_ref} vs {total_tri}"
     torch.testing.assert_close(
@@ -389,7 +393,7 @@ def test_adjust_all_zero_delta(max_batch_size, max_blocks_per_seq):
     ops.block_table_to_ragged_torch(bt_before, nb_before, cache_loc, cu, num_sequences)
     cl_before = cache_loc.clone()
     cu_before = cu.clone()
-    ops.adjust_ragged_triton(cache_loc, cu, extra_idx, delta, num_sequences)
+    ops.adjust_ragged_triton(cache_loc, cu, extra_idx, delta, num_sequences, max_blocks_per_seq)
     old_total = int(cu_before[num_sequences].item())
     torch.testing.assert_close(cache_loc[:old_total], cl_before[:old_total], rtol=0, atol=0)
     torch.testing.assert_close(
@@ -430,10 +434,12 @@ def test_adjust_all_append(max_batch_size, max_blocks_per_seq):
     cu_base = torch.zeros(max_batch_size + 1, device=device, dtype=torch.int32)
     ops.block_table_to_ragged_torch(bt, num_blocks, cache_loc_base, cu_base, num_sequences)
 
-    cl_ref, cu_ref = cache_loc_base.clone(), cu_base.clone()
-    cl_tri, cu_tri = cache_loc_base.clone(), cu_base.clone()
-    total_ref = ops.adjust_ragged_torch(cl_ref, cu_ref, extra_idx, delta, num_sequences)
-    total_tri = ops.adjust_ragged_triton(cl_tri, cu_tri, extra_idx, delta, num_sequences)
+    ei_ref, cl_ref, cu_ref = extra_idx.clone(), cache_loc_base.clone(), cu_base.clone()
+    ei_tri, cl_tri, cu_tri = extra_idx.clone(), cache_loc_base.clone(), cu_base.clone()
+    ops.adjust_ragged_torch(cl_ref, cu_ref, ei_ref, delta, num_sequences, max_blocks_per_seq)
+    ops.adjust_ragged_triton(cl_tri, cu_tri, ei_tri, delta, num_sequences, max_blocks_per_seq)
+    total_ref = int(cu_ref[num_sequences].item())
+    total_tri = int(cu_tri[num_sequences].item())
     assert total_ref == total_tri
     torch.testing.assert_close(cl_tri[:total_ref], cl_ref[:total_ref], rtol=0, atol=0)
 
@@ -462,17 +468,20 @@ def test_adjust_append_roundtrip(max_batch_size, max_blocks_per_seq):
     delta_full[:num_sequences] = delta
     max_capacity = max_batch_size * max_blocks_per_seq + num_sequences
 
+    ei_a = extra_idx.clone()
     bt_a = bt.clone()
     nb_a = num_blocks.clone()
-    ops.adjust_block_table_torch(bt_a, nb_a, extra_idx, delta_full, num_sequences)
+    ops.adjust_block_table_torch(bt_a, nb_a, ei_a, delta_full, num_sequences)
     cl_a = torch.zeros(max_capacity, device=device, dtype=torch.int32)
     cu_a = torch.zeros(max_batch_size + 1, device=device, dtype=torch.int32)
     total_a = ops.block_table_to_ragged_torch(bt_a, nb_a, cl_a, cu_a, num_sequences)
 
+    ei_b = extra_idx.clone()
     cl_b = torch.zeros(max_capacity, device=device, dtype=torch.int32)
     cu_b = torch.zeros(max_batch_size + 1, device=device, dtype=torch.int32)
     ops.block_table_to_ragged_torch(bt, num_blocks, cl_b, cu_b, num_sequences)
-    total_b = ops.adjust_ragged_torch(cl_b, cu_b, extra_idx, delta_full, num_sequences)
+    ops.adjust_ragged_torch(cl_b, cu_b, ei_b, delta_full, num_sequences, max_blocks_per_seq)
+    total_b = int(cu_b[num_sequences].item())
 
     assert total_a == total_b, f"Total mismatch: {total_a} vs {total_b}"
     torch.testing.assert_close(cl_a[:total_a], cl_b[:total_b], rtol=0, atol=0)
@@ -505,15 +514,18 @@ def test_adjust_remove_block_table(max_batch_size, max_blocks_per_seq):
     extra_idx = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
     delta = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
 
+    ei_ref = extra_idx.clone()
     bt_ref = bt.clone()
     nb_ref = num_blocks.clone()
-    ops.adjust_block_table_torch(bt_ref, nb_ref, extra_idx, delta, num_sequences)
+    ops.adjust_block_table_torch(bt_ref, nb_ref, ei_ref, delta, num_sequences)
 
+    ei_tri = extra_idx.clone()
     bt_tri = bt.clone()
     nb_tri = num_blocks.clone()
-    ops.adjust_block_table_triton(bt_tri, nb_tri, extra_idx, delta, num_sequences)
+    ops.adjust_block_table_triton(bt_tri, nb_tri, ei_tri, delta, num_sequences)
 
     torch.testing.assert_close(nb_tri[:num_sequences], nb_ref[:num_sequences], rtol=0, atol=0)
+    torch.testing.assert_close(ei_tri[:num_sequences], ei_ref[:num_sequences], rtol=0, atol=0)
     assert (nb_ref[:num_sequences] == num_blocks[:num_sequences] - 1).all()
 
 
@@ -543,13 +555,17 @@ def test_adjust_remove_ragged(max_batch_size, max_blocks_per_seq):
     extra_idx = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
     delta = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
 
+    ei_ref = extra_idx.clone()
     cl_ref = cache_loc_base.clone()
     cu_ref = cu_base.clone()
-    total_ref = ops.adjust_ragged_torch(cl_ref, cu_ref, extra_idx, delta, num_sequences)
+    ops.adjust_ragged_torch(cl_ref, cu_ref, ei_ref, delta, num_sequences, max_blocks_per_seq)
+    total_ref = int(cu_ref[num_sequences].item())
 
+    ei_tri = extra_idx.clone()
     cl_tri = cache_loc_base.clone()
     cu_tri = cu_base.clone()
-    total_tri = ops.adjust_ragged_triton(cl_tri, cu_tri, extra_idx, delta, num_sequences)
+    ops.adjust_ragged_triton(cl_tri, cu_tri, ei_tri, delta, num_sequences, max_blocks_per_seq)
+    total_tri = int(cu_tri[num_sequences].item())
 
     assert total_ref == total_tri, f"Total mismatch: {total_ref} vs {total_tri}"
     torch.testing.assert_close(
@@ -588,16 +604,19 @@ def test_adjust_mixed_delta_block_table(max_batch_size, max_blocks_per_seq):
     extra_idx = _make_extra_idx(max_batch_size, num_sequences, valid_fraction=1.0, device=device)
     delta = _make_mixed_delta(num_sequences, max_batch_size, device=device)
 
+    ei_ref = extra_idx.clone()
     bt_ref = bt.clone()
     nb_ref = num_blocks.clone()
-    ops.adjust_block_table_torch(bt_ref, nb_ref, extra_idx, delta, num_sequences)
+    ops.adjust_block_table_torch(bt_ref, nb_ref, ei_ref, delta, num_sequences)
 
+    ei_tri = extra_idx.clone()
     bt_tri = bt.clone()
     nb_tri = num_blocks.clone()
-    ops.adjust_block_table_triton(bt_tri, nb_tri, extra_idx, delta, num_sequences)
+    ops.adjust_block_table_triton(bt_tri, nb_tri, ei_tri, delta, num_sequences)
 
     torch.testing.assert_close(bt_tri[:num_sequences], bt_ref[:num_sequences], rtol=0, atol=0)
     torch.testing.assert_close(nb_tri[:num_sequences], nb_ref[:num_sequences], rtol=0, atol=0)
+    torch.testing.assert_close(ei_tri[:num_sequences], ei_ref[:num_sequences], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -626,13 +645,17 @@ def test_adjust_mixed_delta_ragged(max_batch_size, max_blocks_per_seq):
     extra_idx = _make_extra_idx(max_batch_size, num_sequences, valid_fraction=1.0, device=device)
     delta = _make_mixed_delta(num_sequences, max_batch_size, device=device)
 
+    ei_ref = extra_idx.clone()
     cl_ref = cache_loc_base.clone()
     cu_ref = cu_base.clone()
-    total_ref = ops.adjust_ragged_torch(cl_ref, cu_ref, extra_idx, delta, num_sequences)
+    ops.adjust_ragged_torch(cl_ref, cu_ref, ei_ref, delta, num_sequences, max_blocks_per_seq)
+    total_ref = int(cu_ref[num_sequences].item())
 
+    ei_tri = extra_idx.clone()
     cl_tri = cache_loc_base.clone()
     cu_tri = cu_base.clone()
-    total_tri = ops.adjust_ragged_triton(cl_tri, cu_tri, extra_idx, delta, num_sequences)
+    ops.adjust_ragged_triton(cl_tri, cu_tri, ei_tri, delta, num_sequences, max_blocks_per_seq)
+    total_tri = int(cu_tri[num_sequences].item())
 
     assert total_ref == total_tri, f"Total mismatch: {total_ref} vs {total_tri}"
     torch.testing.assert_close(
@@ -663,21 +686,142 @@ def test_adjust_mixed_roundtrip(max_batch_size, max_blocks_per_seq):
     delta = _make_mixed_delta(num_sequences, max_batch_size, device=device)
     max_capacity = max_batch_size * max_blocks_per_seq + num_sequences
 
+    ei_a = extra_idx.clone()
     bt_a = bt.clone()
     nb_a = num_blocks.clone()
-    ops.adjust_block_table_torch(bt_a, nb_a, extra_idx, delta, num_sequences)
+    ops.adjust_block_table_torch(bt_a, nb_a, ei_a, delta, num_sequences)
     cl_a = torch.zeros(max_capacity, device=device, dtype=torch.int32)
     cu_a = torch.zeros(max_batch_size + 1, device=device, dtype=torch.int32)
     total_a = ops.block_table_to_ragged_torch(bt_a, nb_a, cl_a, cu_a, num_sequences)
 
+    ei_b = extra_idx.clone()
     cl_b = torch.zeros(max_capacity, device=device, dtype=torch.int32)
     cu_b = torch.zeros(max_batch_size + 1, device=device, dtype=torch.int32)
     ops.block_table_to_ragged_torch(bt, num_blocks, cl_b, cu_b, num_sequences)
-    total_b = ops.adjust_ragged_torch(cl_b, cu_b, extra_idx, delta, num_sequences)
+    ops.adjust_ragged_torch(cl_b, cu_b, ei_b, delta, num_sequences, max_blocks_per_seq)
+    total_b = int(cu_b[num_sequences].item())
 
     assert total_a == total_b, f"Total mismatch: {total_a} vs {total_b}"
     torch.testing.assert_close(cl_a[:total_a], cl_b[:total_b], rtol=0, atol=0)
     torch.testing.assert_close(cu_a[: num_sequences + 1], cu_b[: num_sequences + 1], rtol=0, atol=0)
+
+
+# ========================================================================================
+# Visualization test -- remove page, save to extra_idx, then reinsert
+# ========================================================================================
+
+
+def test_adjust_remove_saves_to_extra_idx_and_reinserts():
+    """Demonstrate the remove-then-reinsert cycle via extra_idx for both ragged and block_table.
+
+    Uses deterministic data and prints intermediate state so the 'lost page' recovery is visible.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
+    device = "cuda"
+    num_sequences = 3
+    max_batch_size = num_sequences
+    max_blocks_per_seq = 8
+
+    # --- Deterministic block table ---
+    # Seq 0: pages [10, 20, 30]
+    # Seq 1: pages [40, 50]
+    # Seq 2: pages [60, 70, 80, 90]
+    block_table = torch.zeros(max_batch_size, max_blocks_per_seq, device=device, dtype=torch.int32)
+    block_table[0, :3] = torch.tensor([10, 20, 30], device=device, dtype=torch.int32)
+    block_table[1, :2] = torch.tensor([40, 50], device=device, dtype=torch.int32)
+    block_table[2, :4] = torch.tensor([60, 70, 80, 90], device=device, dtype=torch.int32)
+    num_blocks = torch.tensor([3, 2, 4], device=device, dtype=torch.int32)
+
+    # --- Convert to ragged format ---
+    buf_cap = max_batch_size * max_blocks_per_seq + max_batch_size
+    cache_loc = torch.zeros(buf_cap, device=device, dtype=torch.int32)
+    cu = torch.zeros(max_batch_size + 1, device=device, dtype=torch.int32)
+    ops.block_table_to_ragged_torch(block_table, num_blocks, cache_loc, cu, num_sequences)
+    total = int(cu[num_sequences].item())
+
+    print("\n=== INITIAL STATE ===")
+    print(f"  cache_loc:     {cache_loc[:total].tolist()}")
+    print(f"  cu_num_blocks: {cu[: num_sequences + 1].tolist()}")
+
+    # --- Step 1: Remove last page from every sequence (delta=-1) ---
+    extra_idx = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
+    delta = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
+
+    print("\n--- Step 1: Remove (delta=-1) ---")
+    print(f"  extra_idx BEFORE removal: {extra_idx[:num_sequences].tolist()}")
+
+    ops.adjust_ragged_torch(cache_loc, cu, extra_idx, delta, num_sequences, max_blocks_per_seq)
+    total = int(cu[num_sequences].item())
+
+    print(
+        f"  extra_idx AFTER  removal: {extra_idx[:num_sequences].tolist()}  "
+        f"<-- saved removed pages [30, 50, 90]"
+    )
+    print(f"  cache_loc:     {cache_loc[:total].tolist()}")
+    print(f"  cu_num_blocks: {cu[: num_sequences + 1].tolist()}")
+
+    assert extra_idx[:num_sequences].tolist() == [30, 50, 90], (
+        f"Expected removed pages [30, 50, 90], got {extra_idx[:num_sequences].tolist()}"
+    )
+
+    # --- Step 2: Re-insert the saved pages (delta=+1) ---
+    delta = torch.ones(max_batch_size, device=device, dtype=torch.int32)
+
+    print("\n--- Step 2: Re-insert (delta=+1) using saved extra_idx ---")
+    print(f"  extra_idx used for append: {extra_idx[:num_sequences].tolist()}")
+
+    ops.adjust_ragged_torch(cache_loc, cu, extra_idx, delta, num_sequences, max_blocks_per_seq)
+    total = int(cu[num_sequences].item())
+
+    print(f"  cache_loc:     {cache_loc[:total].tolist()}")
+    print(f"  cu_num_blocks: {cu[: num_sequences + 1].tolist()}")
+    print("  --> Original pages restored!")
+
+    assert cache_loc[:total].tolist() == [10, 20, 30, 40, 50, 60, 70, 80, 90]
+
+    # --- Verify Triton matches Torch for the same cycle ---
+    print("\n--- Triton consistency check ---")
+    cache_loc_tri = torch.zeros(buf_cap, device=device, dtype=torch.int32)
+    cu_tri = torch.zeros(max_batch_size + 1, device=device, dtype=torch.int32)
+    ops.block_table_to_ragged_torch(block_table, num_blocks, cache_loc_tri, cu_tri, num_sequences)
+
+    extra_idx_tri = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
+    delta_remove = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
+    ops.adjust_ragged_triton(
+        cache_loc_tri, cu_tri, extra_idx_tri, delta_remove, num_sequences, max_blocks_per_seq
+    )
+    print(f"  Triton extra_idx after removal: {extra_idx_tri[:num_sequences].tolist()}")
+    assert extra_idx_tri[:num_sequences].tolist() == [30, 50, 90]
+
+    delta_append = torch.ones(max_batch_size, device=device, dtype=torch.int32)
+    ops.adjust_ragged_triton(
+        cache_loc_tri, cu_tri, extra_idx_tri, delta_append, num_sequences, max_blocks_per_seq
+    )
+    total_tri = int(cu_tri[num_sequences].item())
+    print(f"  Triton cache_loc after reinsert: {cache_loc_tri[:total_tri].tolist()}")
+    assert cache_loc_tri[:total_tri].tolist() == [10, 20, 30, 40, 50, 60, 70, 80, 90]
+
+    # --- Also verify block_table path saves removed pages ---
+    print("\n--- Block-table path check ---")
+    bt = block_table.clone()
+    nb = num_blocks.clone()
+    ei_bt = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
+    delta_remove_bt = torch.full((max_batch_size,), -1, device=device, dtype=torch.int32)
+
+    ops.adjust_block_table_torch(bt, nb, ei_bt, delta_remove_bt, num_sequences)
+    print(f"  Block-table extra_idx after removal: {ei_bt[:num_sequences].tolist()}")
+    assert ei_bt[:num_sequences].tolist() == [30, 50, 90]
+
+    delta_append_bt = torch.ones(max_batch_size, device=device, dtype=torch.int32)
+    ops.adjust_block_table_torch(bt, nb, ei_bt, delta_append_bt, num_sequences)
+    print(
+        f"  Block-table after reinsert: {[bt[i, : nb[i]].tolist() for i in range(num_sequences)]}"
+    )
+    torch.testing.assert_close(bt[:num_sequences], block_table[:num_sequences], rtol=0, atol=0)
+    torch.testing.assert_close(nb[:num_sequences], num_blocks[:num_sequences], rtol=0, atol=0)
+    print("  --> All paths produce identical round-trip results!")
 
 
 # ========================================================================================
@@ -870,12 +1014,14 @@ def test_benchmark_adjust_ragged(max_batch_size, max_blocks_per_seq):
     def run_torch():
         cl = cache_loc_base.clone()
         cu = cu_base.clone()
-        ops.adjust_ragged_torch(cl, cu, extra_idx, delta, num_sequences)
+        ei = extra_idx.clone()
+        ops.adjust_ragged_torch(cl, cu, ei, delta, num_sequences, max_blocks_per_seq)
 
     def run_triton():
         cl = cache_loc_base.clone()
         cu = cu_base.clone()
-        ops.adjust_ragged_triton(cl, cu, extra_idx, delta, num_sequences)
+        ei = extra_idx.clone()
+        ops.adjust_ragged_triton(cl, cu, ei, delta, num_sequences, max_blocks_per_seq)
 
     torch_us = _benchmark_fn(run_torch)
     triton_us = _benchmark_fn(run_triton)

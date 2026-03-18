@@ -45,6 +45,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -229,7 +230,8 @@ def torch_cached_gated_delta_rule(
 
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
 
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]

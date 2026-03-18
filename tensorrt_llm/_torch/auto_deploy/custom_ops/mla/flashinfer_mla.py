@@ -35,6 +35,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
@@ -393,7 +394,8 @@ def prepare_flashinfer_mla_metadata(
     the standard FlashInfer attention preparation.
     """
     # retrieve host-side metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
@@ -434,7 +436,8 @@ def prepare_flashinfer_mla_metadata_host(
     For decode-only batches, this function pre-plans the cached CUDA graph
     wrappers to avoid planning during graph capture/replay.
     """
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
 
     if num_prefill == 0:
         _GlobalFlashInferMLAPlanner.plan_generate_only(
@@ -510,7 +513,8 @@ def flashinfer_mla_with_cache(
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
     # Get batch info
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 

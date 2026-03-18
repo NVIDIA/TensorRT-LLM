@@ -31,6 +31,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -226,7 +227,8 @@ def flattened_mha_with_cache(
     NOTE: this op can also handle seq_len==0, which might be useful for CUDAGRAPH.
     """
     # Extract batch info from batch_info_host
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 

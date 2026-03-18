@@ -191,18 +191,16 @@ class _InsertCachedOperator(BaseTransform):
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
-        for idx, attn_node in enumerate(source_attn_nodes):
+        for attn_node in source_attn_nodes:
             # pick out GEMMs
             qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
-            # setup + store cache initializers and caches as input nodes
-            cache_in_nodes = []
-            for k, resource_handler in attn_descriptor.get_cache_initializers(
-                attn_node, cm.kv_cache_config
-            ).items():
-                k_indexed = f"{k}_{idx}"
-                cm.add_resource(k_indexed, resource_handler)
-                cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
+            # setup + store cache resource handlers and caches as input nodes
+            resources_dict = attn_descriptor.get_cache_initializers(attn_node, cm.kv_cache_config)
+            cache_in_nodes = [
+                self._process_cache_node(gm, cm.add_resource(k, resource_handler))
+                for k, resource_handler in resources_dict.items()
+            ]
 
             # allow backend-specific prep before constants are extracted
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
@@ -276,7 +274,11 @@ class ResizeKVCache(BaseTransform):
         # Run a forward pass to get the extra memory usage
         cm.info.set_max_num_tokens_sample()
         try:
-            mod(**cm.named_args)
+            # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
+            if getattr(mod, "_requires_csi", False):
+                mod(cache_seq_interface=cm)
+            else:
+                mod(**cm.named_args)
         except torch.OutOfMemoryError as e:
             self._log_info(
                 f"OutOfMemoryError in forward pass while trying to resize the kv-cache:\n{e}"

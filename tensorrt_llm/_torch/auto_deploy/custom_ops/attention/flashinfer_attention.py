@@ -31,6 +31,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     KVPagedResourceHandler,
     MHACallable,
@@ -264,7 +265,8 @@ def prepare_flashinfer_metadata(
     to understand the convention.
     """
     # retrieve host-side metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
@@ -304,7 +306,8 @@ def prepare_flashinfer_metadata_host(
     cache_loc_host: torch.Tensor,
     last_page_len_host: torch.Tensor,
 ) -> None:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
 
     if num_prefill == 0:
         _GlobalFlashInferPlanner.plan_generate_only(
@@ -351,7 +354,8 @@ def flashinfer_mha_with_cache(
     v = v.reshape(b * s, -1, head_dim).contiguous()
 
     # convert to flashinfer-style metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 

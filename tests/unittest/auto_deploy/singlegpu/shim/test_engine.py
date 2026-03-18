@@ -77,8 +77,9 @@ def test_engine(engine_cls: Type[ADEngine], tokens_per_block: int):
             input_ids=input_ids_list,
             cu_seqlen=[0, len(input_ids_list)],
             input_pos=[0],
+            gather_context_logits=True,
         )
-        logits = engine._compute_logits()
+        logits = engine._run_forward()["logits"]
         assert logits is not None, "Logits are None"
 
         mock_input = None
@@ -122,7 +123,7 @@ def test_demo_engine_sampling(tokens_per_block: int):
             cu_seqlen=[0, len(input_ids_list)],
             input_pos=[0],
         )
-        logits = engine._compute_logits()
+        logits = engine._run_forward()["logits"]
 
         vocab_size = logits.size(-1)
         sampling_params = SamplingParams(top_k=5, temperature=1.0)
@@ -177,6 +178,7 @@ class _DummyRequest:
         self.context_current_position = begin
         self.context_chunk_size = size
         self.seq_slot = seq_slot
+        self.py_seq_slot = seq_slot
         self.py_batch_idx = None
         self.py_multimodal_data = None
 
@@ -291,6 +293,7 @@ class _DummyRequestWithRequestId:
         self.context_current_position = begin
         self.context_chunk_size = size
         self.seq_slot = seq_slot
+        self.py_seq_slot = seq_slot
         self.py_request_id = request_id
         self.py_batch_idx = None
         self.py_multimodal_data = None
@@ -394,11 +397,15 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
 
     resource_manager = _HybridResourceManager(hybrid_manager)
 
+    # Disable overlap scheduler since we pass new_tokens=None
+    engine._disable_overlap_scheduler = True
+
     # Create generation request
     class _GenRequest:
         def __init__(self, request_id: int, seq_slot: int, num_tokens: int):
             self.py_request_id = request_id
             self.seq_slot = seq_slot
+            self.py_seq_slot = seq_slot
             self.py_batch_idx = None
             self.is_dummy = False
             self.py_draft_tokens = []
