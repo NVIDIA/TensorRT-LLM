@@ -175,6 +175,16 @@ class KimiK25Config(PretrainedConfig):
         self.use_unified_vision_chunk = use_unified_vision_chunk
         self.video_placeholder = video_placeholder
 
+        # Expose text model attributes at the top level so that model_config.py
+        # (and other infrastructure that accesses pretrained_config.hidden_size etc.)
+        # can find them without knowing about the VLM wrapper structure.
+        self.hidden_size = text_config.hidden_size
+        self.num_hidden_layers = text_config.num_hidden_layers
+        self.num_attention_heads = text_config.num_attention_heads
+        self.num_key_value_heads = text_config.num_key_value_heads
+        self.vocab_size = text_config.vocab_size
+        self.intermediate_size = text_config.intermediate_size
+
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
 
