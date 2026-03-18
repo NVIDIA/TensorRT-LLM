@@ -83,12 +83,18 @@ def _adjust_block_table_kernel(
     delta_ptr,
     M: tl.constexpr,
 ):
-    """Adjust one block_table row: append (delta=+1), remove last (delta=-1), or no-op (delta=0)."""
+    """Adjust one block_table row: append (delta=+1), remove last (delta=-1), or no-op (delta=0).
+
+    On removal (delta=-1), saves the removed page index to extra_idx so it can be re-inserted later.
+    """
     seq_id = tl.program_id(0)
     d = tl.load(delta_ptr + seq_id)
 
     if d != 0:
         n = tl.load(num_blocks_ptr + seq_id)
+        if d < 0:
+            removed = tl.load(block_table_ptr + seq_id * M + n - 1)
+            tl.store(extra_idx_ptr + seq_id, removed)
         if d > 0:
             extra = tl.load(extra_idx_ptr + seq_id)
             tl.store(block_table_ptr + seq_id * M + n, extra)
@@ -105,7 +111,10 @@ def _adjust_ragged_kernel(
     delta_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Copy one sequence's segment, adjusting length by delta: +1 appends, -1 drops last."""
+    """Copy one sequence's segment, adjusting length by delta: +1 appends, -1 drops last.
+
+    On removal (delta=-1), saves the removed page index to extra_idx so it can be re-inserted later.
+    """
     seq_id = tl.program_id(0)
 
     old_start = tl.load(old_cu_ptr + seq_id)
@@ -116,6 +125,10 @@ def _adjust_ragged_kernel(
 
     d = tl.load(delta_ptr + seq_id)
     n_copy = n_old + tl.minimum(d, 0)
+
+    if d < 0:
+        removed = tl.load(cache_loc_ptr + old_start + n_old - 1)
+        tl.store(extra_idx_ptr + seq_id, removed)
 
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < n_copy
@@ -290,7 +303,7 @@ def _ragged_to_block_table_triton_fake(
 
 
 @torch.library.custom_op(
-    "auto_deploy::adjust_block_table_torch", mutates_args=("block_table", "num_blocks")
+    "auto_deploy::adjust_block_table_torch", mutates_args=("block_table", "num_blocks", "extra_idx")
 )
 def adjust_block_table_torch(
     block_table: torch.Tensor,
@@ -299,13 +312,21 @@ def adjust_block_table_torch(
     delta: torch.Tensor,
     num_sequences: int,
 ) -> None:
-    """Adjust block_table per sequence: append (delta=+1), remove last (delta=-1), or no-op."""
+    """Adjust block_table per sequence: append (delta=+1), remove last (delta=-1), or no-op.
+
+    On removal (delta=-1), saves the removed page index to extra_idx so it can be re-inserted later.
+    """
     N = num_sequences
     if N == 0:
         return
 
     device = block_table.device
     seq_idx = torch.arange(N, device=device)
+
+    remove_mask = delta[:N] < 0
+    row_remove = seq_idx[remove_mask]
+    col_remove = (num_blocks[row_remove] - 1).long()
+    extra_idx[row_remove] = block_table[row_remove, col_remove]
 
     append_mask = delta[:N] > 0
     row_append = seq_idx[append_mask]
@@ -329,7 +350,7 @@ def _adjust_block_table_torch_fake(
 
 
 @torch.library.custom_op(
-    "auto_deploy::adjust_ragged_torch", mutates_args=("cache_loc", "cu_num_blocks")
+    "auto_deploy::adjust_ragged_torch", mutates_args=("cache_loc", "cu_num_blocks", "extra_idx")
 )
 def adjust_ragged_torch(
     cache_loc: torch.Tensor,
@@ -337,13 +358,18 @@ def adjust_ragged_torch(
     extra_idx: torch.Tensor,
     delta: torch.Tensor,
     num_sequences: int,
-) -> int:
-    """Adjust ragged cache_loc per sequence: append (+1), remove last (-1), or no-op (0)."""
+    max_blocks_per_seq: int,
+) -> None:
+    """Adjust ragged cache_loc per sequence: append (+1), remove last (-1), or no-op (0).
+
+    On removal (delta=-1), saves the removed page index to extra_idx so it can be re-inserted
+    later. Uses max_blocks_per_seq as upper bound to avoid host-device syncs.
+    """
     N = num_sequences
     device = cache_loc.device
 
     if N == 0:
-        return 0
+        return
 
     d = delta[:N]
 
@@ -352,23 +378,22 @@ def adjust_ragged_torch(
 
     new_cu = torch.zeros(N + 1, device=device, dtype=cu_num_blocks.dtype)
     new_cu[1:] = torch.cumsum(new_lens, dim=0)
-    total_new = int(new_cu[N].item())
 
-    if total_new == 0:
-        cu_num_blocks[: N + 1] = new_cu
-        return 0
+    # Save pages being removed BEFORE overwriting cache_loc
+    remove_mask = d < 0
+    remove_idx = torch.arange(N, device=device)[remove_mask]
+    remove_pos = (cu_num_blocks[1 : N + 1][remove_mask] - 1).long()
+    extra_idx[remove_idx] = cache_loc[remove_pos]
 
     copy_lens = old_lens + torch.clamp(d, max=0)
-    max_new_len = int(new_lens.max().item())
-    col = torch.arange(max_new_len, device=device)
+    col = torch.arange(max_blocks_per_seq + 1, device=device)
 
     copy_mask = col.unsqueeze(0) < copy_lens.unsqueeze(1)
     append_mask = (col.unsqueeze(0) == old_lens.unsqueeze(1)) & (d > 0).unsqueeze(1)
 
     old_cu = cu_num_blocks[:N]
     src = old_cu.unsqueeze(1) + col.unsqueeze(0)
-    old_total = int(cu_num_blocks[N].item())
-    src_safe = src.clamp(max=max(old_total - 1, 0))
+    src_safe = src.clamp(max=cache_loc.numel() - 1)
 
     zero = torch.zeros(1, device=device, dtype=cache_loc.dtype)
     vals = torch.where(copy_mask, cache_loc[src_safe], zero)
@@ -377,13 +402,11 @@ def adjust_ragged_torch(
     dst = new_cu[:N].unsqueeze(1) + col.unsqueeze(0)
 
     write_mask = copy_mask | append_mask
-    temp = torch.zeros(total_new, device=device, dtype=cache_loc.dtype)
+    temp = torch.zeros(cache_loc.numel(), device=device, dtype=cache_loc.dtype)
     temp[dst[write_mask].long()] = vals[write_mask]
 
-    cache_loc[:total_new] = temp
+    cache_loc.copy_(temp)
     cu_num_blocks[: N + 1] = new_cu
-
-    return total_new
 
 
 @adjust_ragged_torch.register_fake
@@ -393,8 +416,9 @@ def _adjust_ragged_torch_fake(
     extra_idx: torch.Tensor,
     delta: torch.Tensor,
     num_sequences: int,
-) -> int:
-    return 0
+    max_blocks_per_seq: int,
+) -> None:
+    pass
 
 
 @torch.library.custom_op(
@@ -429,7 +453,7 @@ def _adjust_block_table_triton_fake(
 
 
 @torch.library.custom_op(
-    "auto_deploy::adjust_ragged_triton", mutates_args=("cache_loc", "cu_num_blocks")
+    "auto_deploy::adjust_ragged_triton", mutates_args=("cache_loc", "cu_num_blocks", "extra_idx")
 )
 def adjust_ragged_triton(
     cache_loc: torch.Tensor,
@@ -437,41 +461,33 @@ def adjust_ragged_triton(
     extra_idx: torch.Tensor,
     delta: torch.Tensor,
     num_sequences: int,
-) -> int:
-    """Adjust ragged cache_loc using Triton. Uses temp buffer + copy back."""
+    max_blocks_per_seq: int,
+) -> None:
+    """Adjust ragged cache_loc using Triton. Uses temp buffer + copy back.
+
+    No host-device syncs: uses max_blocks_per_seq for BLOCK_SIZE and writes into a temp buffer
+    sized to the full cache_loc capacity.
+    """
     N = num_sequences
     device = cache_loc.device
 
     if N == 0:
-        return 0
+        return
 
-    d = delta[:N]
-    old_lens = (cu_num_blocks[1 : N + 1] - cu_num_blocks[:N]).to(torch.int32)
-    new_lens = old_lens + d
+    old_cu = cu_num_blocks[: N + 1]
+    new_cu = old_cu.clone()
+    new_cu[1:] += torch.cumsum(delta[:N], dim=0)
 
-    old_cu = cu_num_blocks[: N + 1].clone()
+    temp = torch.zeros(cache_loc.numel(), device=device, dtype=cache_loc.dtype)
 
-    new_cu = torch.zeros(N + 1, device=device, dtype=cu_num_blocks.dtype)
-    new_cu[1:] = torch.cumsum(new_lens, dim=0)
-    total_new = int(new_cu[N].item())
-
-    if total_new == 0:
-        cu_num_blocks[: N + 1] = new_cu
-        return 0
-
-    temp = torch.zeros(total_new, device=device, dtype=cache_loc.dtype)
-
-    max_old_len = int(old_lens.max().item())
-    BLOCK_SIZE = triton.next_power_of_2(max(max_old_len, 1))
+    BLOCK_SIZE = triton.next_power_of_2(max(max_blocks_per_seq, 1))
 
     _adjust_ragged_kernel[(N,)](
         cache_loc, temp, old_cu, new_cu, extra_idx, delta, BLOCK_SIZE=BLOCK_SIZE
     )
 
-    cache_loc[:total_new] = temp
-    cu_num_blocks[: N + 1] = new_cu
-
-    return total_new
+    cache_loc.copy_(temp)
+    old_cu.copy_(new_cu)
 
 
 @adjust_ragged_triton.register_fake
@@ -481,5 +497,6 @@ def _adjust_ragged_triton_fake(
     extra_idx: torch.Tensor,
     delta: torch.Tensor,
     num_sequences: int,
-) -> int:
-    return 0
+    max_blocks_per_seq: int,
+) -> None:
+    pass

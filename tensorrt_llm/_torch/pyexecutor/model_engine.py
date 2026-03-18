@@ -50,6 +50,8 @@ from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
+                           prepare_attn_metadata_for_draft_replay,
+                           restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
@@ -201,10 +203,15 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
 
+        input_processor_kwargs = {}
+        if llm_args.video_pruning_rate is not None:
+            input_processor_kwargs[
+                'video_pruning_rate'] = llm_args.video_pruning_rate
         self.input_processor = create_input_processor(
             model_path,
             tokenizer=None,
-            checkpoint_format=llm_args.checkpoint_format)
+            checkpoint_format=llm_args.checkpoint_format,
+            **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
@@ -3715,12 +3722,24 @@ class PyTorchModelEngine(ModelEngine):
                             enable_spec_decode=self.enable_spec_decode,
                             postprocess_fn=capture_postprocess_fn)
 
-                        # here we don't need to use context since cuda graph capture didn't run kernel.
-                        # maybe we need a cleaner way to do this.
-                        outputs = self.cuda_graph_runner.replay(key, inputs)
-                    else:
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                        # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
+                        saved_draft = prepare_attn_metadata_for_draft_replay(
+                            attn_metadata, draft_kv_cache_manager)
+                        try:
                             outputs = self.cuda_graph_runner.replay(key, inputs)
+                        finally:
+                            restore_attn_metadata_after_draft_replay(
+                                attn_metadata, saved_draft)
+                    else:
+                        saved_draft = prepare_attn_metadata_for_draft_replay(
+                            attn_metadata, draft_kv_cache_manager)
+                        try:
+                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                                outputs = self.cuda_graph_runner.replay(
+                                    key, inputs)
+                        finally:
+                            restore_attn_metadata_after_draft_replay(
+                                attn_metadata, saved_draft)
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
