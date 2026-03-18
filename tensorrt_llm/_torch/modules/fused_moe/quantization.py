@@ -420,8 +420,6 @@ class FusedMoEMethodBase(ABC):
                 raise NotImplementedError(
                     f"Partial loading is not supported for {type(self).__name__}"
                 )
-        module._allow_partial_loading = allow_partial_loading
-
         additional_kargs = {}
         if "allow_partial_loading" in inspect.getfullargspec(
                 self.load_expert_weights_to_dst).args:
@@ -3028,10 +3026,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             num_elts_per_sf: int = 16):
         """Apply trtllm-gen specific shuffle + interleave to w2 weight scale buffer."""
         orig_shape = dst_w2_weight_scale_gpu.shape
-        epilogue_tile_m = 128  # FIXME
-
-        # trtllm-gen specific block scales preprocessing logics
-        epilogue_tile_m = 128  # FIXME: read from kernel
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
 
         # Assert should only be removed during debugging
         assert dst_w2_weight_scale_gpu.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
