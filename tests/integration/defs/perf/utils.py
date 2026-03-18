@@ -27,9 +27,9 @@ from typing import Dict, List, NamedTuple, Optional
 
 from _pytest.nodes import Item
 from _pytest.python import Function
-from defs.trt_test_alternative import check_output, print_error, print_info
+from defs.trt_test_alternative import print_error, print_info
 
-from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
+from ..common import get_trt_llm_lib_dir
 from ..local_venv import PythonVenvRunnerImpl
 from ..test_list_parser import parse_test_list
 from .data_export import (GPU_MONITORING_FORMAT_KEYS, write_csv,
@@ -135,7 +135,6 @@ class PerfBenchScriptTestCmds(NamedTuple):
     build_cmd: List[str]
     benchmark_cmds: List[List[str]]
     mpi_cmd: List[str]
-    is_python: bool
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -166,14 +165,6 @@ class PerfBenchScriptTestCmds(NamedTuple):
             #running build
             if len(self.build_cmd) == 0:
                 pass
-            elif self.build_cmd[0].endswith('.py'):
-                print_info(
-                    f'Running engine building command: "{build_cmd_str}"')
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd,
-                                                    self.build_cmd)
-                else:
-                    output += venv.run_cmd(self.build_cmd, caller=check_output)
             else:
                 envs = copy.deepcopy(os.environ)
                 print_info(
@@ -184,37 +175,23 @@ class PerfBenchScriptTestCmds(NamedTuple):
             #running throughput
             print_info(f'Now running benchmarking command: "{current_cmd_str}"')
             command = self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)]
-            if self.is_python:
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd, command)
-                else:
-                    output += venv.run_cmd(command, caller=check_output)
-            else:
-                envs = copy.deepcopy(os.environ)
-                # Set LD_LIBRARY_PATH to the directory where the binary is located to find libtensorrt_llm.so and
-                # libnvinfer_plugin_tensorrt_llm.so.x.
-                envs[
-                    "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
-                print(
-                    f'Augmented cpp runtime LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}'
-                )
-                benchmark_cmd = mpi_cmd + command
-                output += subprocess.check_output(benchmark_cmd,
-                                                  env=envs).decode()
-                # write config.json to output log
-                match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
-                if match:
-                    engine_dir = match.group(1)
-                    print_info(
-                        f'writing config.json in {engine_dir} to output log')
-                    with open(os.path.join(engine_dir, "config.json"),
-                              "r") as f:
-                        config_content = f.read()
-                        output += "\n" + "=" * 50 + "\n"
-                        output += "ENGINE CONFIG:\n"
-                        output += "=" * 50 + "\n"
-                        output += config_content
-                        output += "\n" + "=" * 50 + "\n"
+            envs = copy.deepcopy(os.environ)
+            envs[
+                "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
+            print(f'Augmented LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}')
+            benchmark_cmd = mpi_cmd + command
+            output += subprocess.check_output(benchmark_cmd, env=envs).decode()
+            match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
+            if match:
+                engine_dir = match.group(1)
+                print_info(f'writing config.json in {engine_dir} to output log')
+                with open(os.path.join(engine_dir, "config.json"), "r") as f:
+                    config_content = f.read()
+                    output += "\n" + "=" * 50 + "\n"
+                    output += "ENGINE CONFIG:\n"
+                    output += "=" * 50 + "\n"
+                    output += config_content
+                    output += "\n" + "=" * 50 + "\n"
         return output
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
@@ -222,16 +199,13 @@ class PerfBenchScriptTestCmds(NamedTuple):
                        " ") if len(self.mpi_cmd) > 0 else ""
         if cmd_idx <= len(self.data_cmds) - 1:
             cmd_str = " ".join(self.data_cmds[cmd_idx])
-        elif cmd_idx == len(self.data_cmds):  #for trtllm-bench build command
+        elif cmd_idx == len(self.data_cmds):
             if len(self.build_cmd) == 0:
                 cmd_str = ''
-            elif self.build_cmd[0].endswith('.py'):
-                cmd_str = mpi_cmd_str + "python3 " + " ".join(self.build_cmd)
             else:
-                cmd_str = mpi_cmd_str + "  " + " ".join(self.build_cmd)
+                cmd_str = mpi_cmd_str + " ".join(self.build_cmd)
         else:
-            python_str = "python3 " if self.is_python else ""
-            cmd_str = mpi_cmd_str + python_str + " ".join(
+            cmd_str = mpi_cmd_str + " ".join(
                 self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)])
 
         return cmd_str
@@ -240,6 +214,8 @@ class PerfBenchScriptTestCmds(NamedTuple):
 def _wait_for_server_ready(url: str,
                            timeout: int = 600,
                            server_proc: subprocess.Popen = None) -> None:
+    import requests
+
     start = time.monotonic()
     while time.monotonic() - start < timeout:
         if server_proc is not None:
@@ -250,11 +226,10 @@ def _wait_for_server_ready(url: str,
                 )
         try:
             time.sleep(1)
-            import requests
             if requests.get(url, timeout=5).status_code == 200:
                 print_info(f"Server endpoint {url} is ready")
                 return
-        except Exception:
+        except requests.exceptions.RequestException:
             pass
     raise RuntimeError(f"Server {url} did not become ready within {timeout}s")
 

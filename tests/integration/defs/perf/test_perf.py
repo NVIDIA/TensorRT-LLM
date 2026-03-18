@@ -23,7 +23,6 @@ from typing import Dict, List, NamedTuple
 
 import pytest
 import yaml
-from defs.common import get_cpp_benchmark
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
@@ -424,8 +423,8 @@ PERF_METRIC_THRESHOLD = {
     PerfMetricType.TOKEN_THROUGHPUT: (
         -0.1, 10
     ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
-    PerfMetricType.TOTAL_TOKEN_THROUGHPUT: (0.1, 10),
-    PerfMetricType.USER_THROUGHPUT: (0.1, 10),
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.USER_THROUGHPUT: (-0.1, 10),
     PerfMetricType.SEQ_THROUGHPUT: (
         -0.1, 10
     ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
@@ -777,8 +776,8 @@ class PerfTestConfig:
         if len(labels) > 0 and labels[0].startswith("subtype:"):
             self.device_subtype = labels.pop(0).replace("subtype:", "")
 
-        assert labels[0] in ["cpp", "serve", "bench"], \
-            f"Invalid runtime {labels[0]}!"
+        assert labels[0] in ["serve", "bench"], \
+            f"Unsupported runtime '{labels[0]}'; only 'serve' and 'bench' are supported."
         self.runtime = labels.pop(0)
 
         self.api = labels.pop(0) if labels[0] == "exe" else ""
@@ -898,9 +897,9 @@ class PerfTestConfig:
             allowed_models = allowed_configs.get_allowed_models()
             assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
 
-        # Validate runtime type.
-        VALID_RUNTIMES = ["cpp", "serve", "bench"]
-        assert self.runtime in VALID_RUNTIMES, f"Invalid runtime {self.runtime}!"
+        VALID_RUNTIMES = ["serve", "bench"]
+        assert self.runtime in VALID_RUNTIMES, \
+            f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
 
         # Validate plugin mode.
         VALID_MODES = ["plugin", "ootb", "ootb_except_mha"]
@@ -1064,13 +1063,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                             output_dir,
                             perf_cache_fpath,
                             gpu_clock_lock=None) -> None:
-        if self._config.runtime == "cpp":
-            if not self._config.is_bert_like():
-                raise ValueError(
-                    f"Invalid config: '{self._config.runtime}' is only supported for bert-like models!"
-                )
-            benchmark_script = get_cpp_benchmark("bertBenchmark", llm_root)
-        elif self._config.runtime == "serve":
+        if self._config.runtime == "serve":
             benchmark_script = "trtllm-serve"
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
@@ -1448,15 +1441,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return client_cmd
 
     def get_commands(self):
-        # Whether this is python or cpp runtime perf test.
-        is_python = self._config.runtime == "python"
         num_gpus = self._config.num_gpus
 
-        if is_python and num_gpus > 1:
-            # TODO: Fix https://nvbugs/4449875
-            pytest.skip(
-                "multi-gpu tests with python runtime is skipped because of hanging issue. See https://nvbugs/4449875"
-            )
         if is_windows() and num_gpus > 1:
             pytest.skip(
                 "multi-gpu not supported on Windows yet, skipped for now")
@@ -1520,7 +1506,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         if self._build_script == "trtllm-bench":
             return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
-                                           mpi_cmd, is_python)
+                                           mpi_cmd)
         else:
             pytest.skip("only support trtllm-bench and serve runtime")
 
