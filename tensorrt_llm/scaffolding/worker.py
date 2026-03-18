@@ -5,6 +5,7 @@ import os
 from abc import ABC
 from enum import Enum
 from typing import Callable, List, Optional
+from urllib.parse import urlencode
 
 import httpx
 import openai
@@ -45,6 +46,14 @@ class Worker(ABC):
 
     task_handlers = {}
 
+    async def on_scope_end(self, scope_id: str) -> None:
+        """Called when an :class:`ExecutionScope` finishes.
+
+        Override in subclasses to release resources (SSE connections,
+        sandboxes, etc.) that were acquired under *scope_id*.  The
+        default implementation is a no-op.
+        """
+
     def shutdown(self):
         pass
 
@@ -54,7 +63,7 @@ class Worker(ABC):
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
 
@@ -482,3 +491,180 @@ class MCPWorker(Worker):
         return TaskStatus.SUCCESS
 
     task_handlers = {MCPCallTask: call_handler}
+
+
+class ApiaryMCPWorker(Worker):
+    """MCP worker with per-scope SSE connections for Apiary sandbox isolation.
+
+    Unlike :class:`MCPWorker` which maintains a single shared SSE connection,
+    ``ApiaryMCPWorker`` creates a separate SSE connection (and therefore a
+    separate Apiary sandbox session) for each :class:`ExecutionScope`.
+    The scope is read from the :data:`current_scope` ContextVar that
+    :class:`ScaffoldingLlm` sets automatically for every request and
+    parallel branch.  Connections are released when the scope ends.
+
+    Usage::
+
+        worker = ApiaryMCPWorker("http://localhost:8082/sse")
+        # No init_in_asyncio_event_loop() needed -- connections are lazy.
+    """
+
+    class _ToolCall:
+
+        def __init__(self, tool_name: str, args: dict):
+            self.tool_name = tool_name
+            self.args = args
+            self.ready = asyncio.Event()
+            self.result: Optional[str] = None
+            self.error: bool = False
+
+        def set_result(self, result: Optional[str], *, error: bool = False):
+            self.result = result
+            self.error = error
+            self.ready.set()
+
+    class _ConnState:
+        __slots__ = ("queue", "task", "ready")
+
+        def __init__(self, queue: asyncio.Queue, task: asyncio.Task,
+                     ready: asyncio.Event):
+            self.queue = queue
+            self.task = task
+            self.ready = ready
+
+    def __init__(self, base_url: str, max_connections: int = 200):
+        self.base_url = base_url.rstrip("/")
+        self._max_connections = max_connections
+        self._conns: dict[str, ApiaryMCPWorker._ConnState] = {}
+        self._scope_params: dict[str, dict[str, str]] = {}
+        # Lazy-init for asyncio primitives (must be created inside the loop).
+        self._lock: Optional[asyncio.Lock] = None
+        self._sem: Optional[asyncio.Semaphore] = None
+
+    def _ensure_primitives(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+            self._sem = asyncio.Semaphore(self._max_connections)
+
+    def set_scope_params(self, request_id: str, **params: str) -> None:
+        """Associate extra SSE URL query parameters with *request_id*.
+
+        These parameters are appended to the SSE URL when the connection
+        for this request (or any of its child scopes) is created.  Call
+        this **after** :meth:`ScaffoldingLlm.generate_async` returns, using
+        ``result.id`` as the *request_id*.
+
+        Typical usage for SWE-bench::
+
+            result = llm.generate_async(prompt)
+            mcp_worker.set_scope_params(result.id, base_image="/path/to/rootfs")
+        """
+        self._scope_params[request_id] = params
+
+    async def _conn_loop(self, url: str, queue: asyncio.Queue,
+                         ready: asyncio.Event):
+        try:
+            async with sse_client(url) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    ready.set()
+                    while True:
+                        tc = await queue.get()
+                        if tc is None:
+                            return
+                        try:
+                            resp = await session.call_tool(
+                                tc.tool_name, tc.args)
+                            tc.set_result(resp.content[0].text)
+                        except Exception as exc:
+                            tc.set_result(f"Error: {exc}", error=True)
+        except Exception:
+            ready.set()  # unblock waiters even on connection failure
+
+    @staticmethod
+    def _root_request_id(scope_id: str) -> str:
+        """Extract the root request_id from a scope_id.
+
+        Child scopes have the format ``request_id:branch.path``.
+        """
+        return scope_id.split(":")[0]
+
+    async def _get_conn(self, scope_id: str) -> "_ConnState":
+        self._ensure_primitives()
+        async with self._lock:
+            if scope_id in self._conns:
+                conn = self._conns[scope_id]
+            else:
+                await self._sem.acquire()
+                url = f"{self.base_url}?client_id=coder-{scope_id}"
+                extra = self._scope_params.get(self._root_request_id(scope_id),
+                                               {})
+                if extra:
+                    url += "&" + urlencode(extra)
+                queue: asyncio.Queue = asyncio.Queue()
+                ready = asyncio.Event()
+                task = asyncio.create_task(self._conn_loop(url, queue, ready))
+                conn = self._ConnState(queue=queue, task=task, ready=ready)
+                self._conns[scope_id] = conn
+        await conn.ready.wait()
+        return conn
+
+    async def release_connection(self, scope_id: str) -> None:
+        """Close the SSE connection for *scope_id* and release the slot."""
+        self._ensure_primitives()
+        async with self._lock:
+            conn = self._conns.pop(scope_id, None)
+        if conn is None:
+            return
+        conn.queue.put_nowait(None)
+        try:
+            await asyncio.wait_for(conn.task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            conn.task.cancel()
+        self._sem.release()
+        root_id = self._root_request_id(scope_id)
+        if scope_id == root_id:
+            self._scope_params.pop(root_id, None)
+
+    async def call_handler(self, task: MCPCallTask) -> TaskStatus:
+        from .execution_scope import current_scope
+        scope = current_scope.get()
+        scope_id = scope.scope_id if scope is not None else "default"
+
+        conn = await self._get_conn(scope_id)
+
+        tc = self._ToolCall(task.tool_name, json.loads(task.args))
+        conn.queue.put_nowait(tc)
+        await tc.ready.wait()
+
+        if tc.result is not None:
+            task.result_str = tc.result
+
+        if tc.error:
+            return TaskStatus.WORKER_EXECEPTION
+        return TaskStatus.SUCCESS
+
+    task_handlers = {MCPCallTask: call_handler}
+
+    async def on_scope_end(self, scope_id: str) -> None:
+        await self.release_connection(scope_id)
+
+    async def async_shutdown(self):
+        """Close all SSE connections and wait for background tasks."""
+        self._ensure_primitives()
+        async with self._lock:
+            ids = list(self._conns.keys())
+        for rid in ids:
+            await self.release_connection(rid)
+
+    def shutdown(self):
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(self.async_shutdown(),
+                                                       loop)
+                fut.result(timeout=30)
+            else:
+                loop.run_until_complete(self.async_shutdown())
+        except Exception:
+            pass

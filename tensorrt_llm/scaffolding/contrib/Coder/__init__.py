@@ -1,12 +1,13 @@
 """Coder agent for the Scaffolding framework.
 
 This module provides a coding agent that can read, write, and modify code
-using the TensorRT-LLM Scaffolding framework. It uses MCP (Model Context Protocol)
-for tool execution via the CoderMCP server.
+using the TensorRT-LLM Scaffolding framework.  Tool execution is backed by
+the Coder Apiary MCP server (``coder_apiary_mcp.py``), which runs each
+agent request in an isolated Apiary sandbox.
 
 Example usage:
     ```python
-    from tensorrt_llm.scaffolding.worker import TRTOpenaiWorker, MCPWorker
+    from tensorrt_llm.scaffolding.worker import TRTOpenaiWorker, ApiaryMCPWorker
     from tensorrt_llm.scaffolding.contrib.Coder import create_coder_scaffolding_llm
 
     # Create workers
@@ -19,7 +20,7 @@ Example usage:
     # Start CoderMCP server first:
     # python examples/scaffolding/mcp/coder/coder_mcp.py --port 8083
 
-    mcp_worker = MCPWorker(urls=["http://localhost:8083/sse"])
+    mcp_worker = ApiaryMCPWorker("http://localhost:8083/sse")
 
     # Create the Coder agent
     coder = create_coder_scaffolding_llm(
@@ -34,6 +35,7 @@ Example usage:
 """
 
 from .coder import Coder, CoderTask, create_coder_scaffolding_llm
+from .swebench import SWEBENCH_SYSTEM_PROMPT, SWEBenchCoder, create_swebench_coder_scaffolding_llm
 from .tools import (
     ALL_CODER_TOOLS,
     FILE_TOOLS,
@@ -41,10 +43,10 @@ from .tools import (
     SHELL_TOOLS,
     apply_patch_tool,
     complete_task_tool,
+    exec_tool,
     grep_files_tool,
     list_dir_tool,
     read_file_tool,
-    shell_command_tool,
     shell_tool,
     think_tool,
     update_plan_tool,
@@ -56,6 +58,10 @@ __all__ = [
     "CoderTask",
     # Factory function
     "create_coder_scaffolding_llm",
+    # SWE-bench
+    "SWEBenchCoder",
+    "SWEBENCH_SYSTEM_PROMPT",
+    "create_swebench_coder_scaffolding_llm",
     # Tool definitions
     "ALL_CODER_TOOLS",
     "FILE_TOOLS",
@@ -66,8 +72,8 @@ __all__ = [
     "grep_files_tool",
     "apply_patch_tool",
     "update_plan_tool",
+    "exec_tool",
     "shell_tool",
-    "shell_command_tool",
     "think_tool",
     "complete_task_tool",
 ]

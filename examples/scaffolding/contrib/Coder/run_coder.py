@@ -4,8 +4,8 @@ import asyncio
 from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import (
+    ApiaryMCPWorker,
     ChatTokenCounter,
-    MCPWorker,
     QueryCollector,
     TaskMetricsCollector,
     TaskTimer,
@@ -25,7 +25,13 @@ def parse_arguments():
         "--mcp_url",
         type=str,
         default="http://0.0.0.0:8083/sse",
-        help="URL for the CoderMCP server",
+        help="URL for the Coder Apiary MCP server (coder_apiary_mcp.py)",
+    )
+    parser.add_argument(
+        "--max_mcp_connections",
+        type=int,
+        default=200,
+        help="Maximum concurrent sandbox connections",
     )
     parser.add_argument(
         "--prompt",
@@ -56,8 +62,10 @@ async def main():
 
     generation_worker = TRTOpenaiWorker(client, args.model)
 
-    mcp_worker = MCPWorker.init_with_urls([args.mcp_url])
-    await mcp_worker.init_in_asyncio_event_loop()
+    mcp_worker = ApiaryMCPWorker(
+        args.mcp_url,
+        max_connections=args.max_mcp_connections,
+    )
 
     llm = create_coder_scaffolding_llm(
         generation_worker,
@@ -67,7 +75,6 @@ async def main():
         enable_statistics=args.enable_statistics,
     )
 
-    # Use custom prompt or default example
     if args.prompt:
         prompt = args.prompt
     else:
@@ -93,10 +100,9 @@ async def main():
         QueryCollector.get_global_info()
         print("Query info dumped to query_result.json!")
 
+    await mcp_worker.async_shutdown()
     llm.shutdown()
     generation_worker.shutdown()
-    mcp_worker.shutdown()
-    return
 
 
 if __name__ == "__main__":

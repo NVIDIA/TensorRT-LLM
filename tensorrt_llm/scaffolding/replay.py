@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from transformers import AutoTokenizer
 
 from .controller import Controller, NativeGenerationController
+from .execution_scope import current_scope
 from .execution_trace import ExecutionTrace, TraceEvent
 from .scaffolding_llm import ScaffoldingLlm
 from .task import (
@@ -32,7 +33,6 @@ from .task import (
     Task,
     TaskStatus,
 )
-from .task_collection import current_branch_path
 from .worker import Worker
 
 
@@ -118,7 +118,8 @@ class TraceReplayEngine:
         if not tasks:
             return
 
-        path = current_branch_path.get()
+        scope = current_scope.get()
+        path = scope.branch_path_list if scope is not None else []
         event = self._consume_next_event(path)
 
         if event.event_type == "parallel_start" and event.children is not None:

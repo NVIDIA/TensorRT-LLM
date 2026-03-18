@@ -78,10 +78,15 @@ class Coder(Controller):
         self.chat_with_tools_controller = chat_with_tools_controller
 
     def clone(self):
-        """Create a copy of this controller for parallel execution."""
-        return Coder(
-            chat_with_tools_controller=self.chat_with_tools_controller.clone(),
-        )
+        """Create a copy of this controller for parallel execution.
+
+        Each clone runs in its own :class:`ExecutionScope` (assigned
+        automatically by :class:`ScaffoldingLlm` when entering a
+        ``ParallelProcess`` branch), so ``ApiaryMCPWorker`` routes its
+        tool calls to a dedicated SSE connection without manual wiring.
+        """
+        cloned_ctrl = self.chat_with_tools_controller.clone()
+        return Coder(chat_with_tools_controller=cloned_ctrl)
 
     def process(self, tasks: List[Task], **kwargs):
         """Process a list of tasks through the coding agent workflow.
@@ -148,7 +153,7 @@ def create_coder_scaffolding_llm(
 
     Example:
         ```python
-        from tensorrt_llm.scaffolding.worker import TRTOpenaiWorker, MCPWorker
+        from tensorrt_llm.scaffolding.worker import TRTOpenaiWorker, ApiaryMCPWorker
         from tensorrt_llm.scaffolding.contrib.Coder import create_coder_scaffolding_llm
 
         # Create workers
@@ -161,7 +166,7 @@ def create_coder_scaffolding_llm(
         # Start CoderMCP server first:
         # python examples/scaffolding/mcp/coder/coder_mcp.py --port 8083
 
-        mcp_worker = MCPWorker(urls=["http://localhost:8083/sse"])
+        mcp_worker = ApiaryMCPWorker("http://localhost:8083/sse")
 
         # Create the Coder agent
         coder = create_coder_scaffolding_llm(

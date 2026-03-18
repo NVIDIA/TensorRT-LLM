@@ -116,13 +116,13 @@ update_plan_tool = OpenAIToolDescription(
 )
 
 # Shell Tools
-shell_tool = OpenAIToolDescription(
-    name="shell",
+exec_tool = OpenAIToolDescription(
+    name="exec",
     description=(
-        "Runs a shell command via execvp() and returns its output. "
+        "Execute a command array directly via execvp (no shell interpretation). "
         "The command is passed as an array of strings, with the first element being "
         "the program to execute and the rest being arguments. "
-        "Always set the workdir parameter when using shell."
+        "Always set the workdir parameter."
     ),
     parameters={
         "command": {
@@ -141,17 +141,16 @@ shell_tool = OpenAIToolDescription(
     },
 )
 
-shell_command_tool = OpenAIToolDescription(
-    name="shell_command",
+shell_tool = OpenAIToolDescription(
+    name="shell",
     description=(
-        "Runs a shell command as a single string in the user's default shell and returns its output. "
-        "This is simpler than shell tool for one-liner commands. "
+        "Run a shell command string (pipes, redirects, &&, etc. all work). "
         "Always set the workdir parameter."
     ),
     parameters={
         "command": {
             "type": "string",
-            "description": "The shell script to execute in the user's default shell.",
+            "description": "The shell command to execute.",
         },
         "workdir": {
             "type": "string",
@@ -199,13 +198,13 @@ ALL_CODER_TOOLS = [
     grep_files_tool,
     apply_patch_tool,
     update_plan_tool,
+    exec_tool,
     shell_tool,
-    shell_command_tool,
     think_tool,
     complete_task_tool,
 ]
 
 # Commonly used tool subsets
 FILE_TOOLS = [read_file_tool, list_dir_tool, grep_files_tool, apply_patch_tool]
-SHELL_TOOLS = [shell_tool, shell_command_tool]
+SHELL_TOOLS = [exec_tool, shell_tool]
 PLANNING_TOOLS = [update_plan_tool, think_tool, complete_task_tool]

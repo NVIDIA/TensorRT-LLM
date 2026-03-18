@@ -1,24 +1,18 @@
 import asyncio
-import contextvars
+import logging
 import threading
 import traceback
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Generator, List, Mapping, Optional, Union
+from typing import Any, Generator, List, Mapping, Union
+
+logger = logging.getLogger(__name__)
 
 from .controller import Controller, ParallelProcess
+from .execution_scope import ExecutionScope, current_scope
 from .result import ScaffoldingResult
 from .task import Task
 from .worker import Worker
-
-# Public ContextVar holding the :class:`ScaffoldingResult` for the request
-# currently being processed.  Set automatically by
-# :meth:`ScaffoldingLlm._handle_single_request` and propagated to every
-# ``asyncio.create_task`` in the processing chain.  Workers can read this
-# to obtain per-request routing information (e.g. ``result.id``).
-current_scaffolding_result: contextvars.ContextVar[
-    Optional[ScaffoldingResult]] = contextvars.ContextVar(
-        'current_scaffolding_result', default=None)
 
 
 @dataclass(frozen=True)
@@ -60,7 +54,7 @@ class ScaffoldingLlm:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
     def _get_loop(self):
@@ -100,22 +94,53 @@ class ScaffoldingLlm:
     async def _handle_parallel_process(self,
                                        tasks: ParallelProcess,
                                        request: ScaffoldingRequest = None):
-        """Handle parallel execution of multiple generators."""
+        """Handle parallel execution of multiple generators.
+
+        Creates a child :class:`ExecutionScope` for each branch so that
+        downstream code (workers, tracers, replay) can distinguish
+        concurrent branches.  Resources acquired under a child scope are
+        automatically released when the branch completes.
+        """
+        parent_scope = current_scope.get()
         async_tasks = [
             asyncio.create_task(
-                self._handle_controller_generator(sub_gen, request))
-            for sub_gen in tasks.sub_gens
+                self._handle_branch(sub_gen, request, parent_scope.child(idx)))
+            for idx, sub_gen in enumerate(tasks.sub_gens)
         ]
         await asyncio.gather(*async_tasks)
+
+    async def _handle_branch(self, gen: Generator, request: ScaffoldingRequest,
+                             scope: ExecutionScope):
+        """Run a single parallel branch under its own scope."""
+        token = current_scope.set(scope)
+        try:
+            await self._handle_controller_generator(gen, request)
+        finally:
+            current_scope.reset(token)
+            await self._notify_scope_end(scope)
+
+    async def _notify_scope_end(self, scope: ExecutionScope):
+        """Inform all workers that *scope* has finished."""
+        for worker in self.workers.values():
+            try:
+                await worker.on_scope_end(scope.scope_id)
+            except Exception:
+                logger.warning(
+                    "Worker %s.on_scope_end(%s) failed",
+                    type(worker).__name__,
+                    scope.scope_id,
+                    exc_info=True,
+                )
 
     async def _handle_single_request(self, request: ScaffoldingRequest):
         """Process a single scaffolding request.
 
-        Sets :data:`current_scaffolding_result` so that every downstream
+        Sets :data:`current_scope` so that every downstream
         ``asyncio.create_task`` (workers, parallel sub-generators, etc.)
-        inherits the per-request :class:`ScaffoldingResult`.
+        inherits the per-request execution scope.
         """
-        token = current_scaffolding_result.set(request.result)
+        scope = ExecutionScope(request_id=request.result.id)
+        token = current_scope.set(scope)
         try:
             gen = self._create_controller_generator(request)
             await self._handle_controller_generator(gen, request)
@@ -125,7 +150,8 @@ class ScaffoldingLlm:
             request.result.set_output(None)
             raise
         finally:
-            current_scaffolding_result.reset(token)
+            current_scope.reset(token)
+            await self._notify_scope_end(scope)
             self.running_req_count -= 1
             self._maybe_schedule()
 
@@ -198,8 +224,7 @@ class ScaffoldingLlm:
             A :class:`ScaffoldingResult` whose ``aresult()`` /
             ``result()`` methods block until execution completes.
             The result carries a unique :pyattr:`ScaffoldingResult.id`
-            and a :pyattr:`ScaffoldingResult.metadata` dict that
-            workers can read via :data:`current_scaffolding_result`.
+            that workers can read via :data:`current_scope`.
         """
         result = ScaffoldingResult()
 

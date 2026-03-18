@@ -21,6 +21,7 @@ from tensorrt_llm.scaffolding import TaskMetricsCollector
 from .agent_benchmark import async_agent_benchmark, async_burst_agent_benchmark
 from .benchmark_utils import run_benchmark_in_thread
 from .chat_benchmark import async_chat_benchmark
+from .coder_benchmark import async_coder_benchmark
 from .multiround_chat_benchmark import async_multiround_chat_benchmark
 
 
@@ -127,6 +128,49 @@ def parse_arguments():
         "--enable_query_collector",
         action="store_true",
         help="[Agent only] Enable query collector for debugging",
+    )
+
+    # Coder agent parameters
+    parser.add_argument(
+        "--enable_coder",
+        action="store_true",
+        help="Enable Coder agent benchmark (uses Apiary sandboxes via ApiaryMCPWorker)",
+    )
+    parser.add_argument(
+        "--coder_concurrency",
+        type=int,
+        default=32,
+        help="Concurrency for Coder agent benchmark (default: 32)",
+    )
+    parser.add_argument(
+        "--coder_prompt_num",
+        type=int,
+        default=8,
+        help="Number of prompts for Coder benchmark (default: 8)",
+    )
+    parser.add_argument(
+        "--coder_max_iterations",
+        type=int,
+        default=50,
+        help="Max tool-calling iterations per Coder request (default: 50)",
+    )
+    parser.add_argument(
+        "--coder_max_connections",
+        type=int,
+        default=200,
+        help="Max concurrent Apiary sandbox connections for Coder (default: 200)",
+    )
+    parser.add_argument(
+        "--mcp_url",
+        type=str,
+        default="http://0.0.0.0:8083/sse",
+        help="Coder Apiary MCP server URL (default: http://0.0.0.0:8083/sse)",
+    )
+    parser.add_argument(
+        "--coder_rate",
+        type=float,
+        default=1.0,
+        help="[Rate mode] Poisson arrival rate (req/s) for Coder benchmark. Default: 1.0.",
     )
 
     # Burst agent parameters
@@ -456,6 +500,7 @@ def parse_arguments():
 # Benchmark registry: (async_func, display_name, flag_name)
 BENCHMARK_REGISTRY = [
     (async_agent_benchmark, "Agent-Benchmark", "enable_normal_agent"),
+    (async_coder_benchmark, "Coder-Benchmark", "enable_coder"),
     (async_burst_agent_benchmark, "Burst-Agent-Benchmark", "enable_burst_agent"),
     (async_chat_benchmark, "Chat-Benchmark", "enable_chat"),
     (async_multiround_chat_benchmark, "Multiround-Chat-Benchmark", "enable_multiround_chat"),
@@ -497,8 +542,8 @@ def main():
 
     if not enabled_benchmarks:
         print(
-            "No benchmark enabled. Use --enable_normal_agent, --enable_burst_agent, "
-            "--enable_chat, or --enable_multiround_chat"
+            "No benchmark enabled. Use --enable_normal_agent, --enable_coder, "
+            "--enable_burst_agent, --enable_chat, or --enable_multiround_chat"
         )
         sys.exit(1)
 

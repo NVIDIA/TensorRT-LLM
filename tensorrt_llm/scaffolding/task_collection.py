@@ -1,4 +1,3 @@
-import contextvars
 import json
 import os
 import time
@@ -6,17 +5,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from .controller import Controller, ParallelProcess
+from .execution_scope import current_scope
 from .execution_trace import ExecutionTrace, TraceEvent
 from .task import ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask, Task
-
-# Tracks the current parallel-branch nesting path.  Defaults to [] (root /
-# main trunk).  Elements are zero-based branch indices appended at each
-# parallel fork.  E.g. [1, 0] means "branch 0 inside branch 1 of the
-# first parallel section off the trunk".
-# Set automatically by TaskCollectionWrapper when iterating sub-generators
-# of a ParallelProcess; read by ExecutionTracer and TraceReplayEngine.
-current_branch_path: contextvars.ContextVar[List[int]] = contextvars.ContextVar(
-    'current_branch_path', default=[])
 
 
 class TaskCollection:
@@ -59,35 +50,23 @@ def with_task_collection(name: str, task_collection_cls: Type[TaskCollection],
 
             class TaskCollectionWrapper:
 
-                def __init__(self, task_collection, gen, branch_idx=None):
+                def __init__(self, task_collection, gen):
                     self.task_collection = task_collection
                     self.gen = gen
-                    self.branch_idx = branch_idx
 
                 def __call__(self):
-                    if self.branch_idx is not None:
-                        parent_path = current_branch_path.get()
-                        current_branch_path.set(parent_path + [self.branch_idx])
-
                     for obj in self.gen:
                         if isinstance(obj, ParallelProcess):
                             num_branches = len(obj.sub_gens)
-                            new_sub_gens = []
-                            already_branched = getattr(obj, '_branch_path_set',
-                                                       False)
-                            for idx, sub_gen in enumerate(obj.sub_gens):
-                                new_sub_gen = TaskCollectionWrapper(
-                                    self.task_collection,
-                                    sub_gen,
-                                    branch_idx=None
-                                    if already_branched else idx)
-                                new_sub_gens.append(new_sub_gen)
-                            obj.sub_gens = new_sub_gens
-                            obj._branch_path_set = True
+                            obj.sub_gens = [
+                                TaskCollectionWrapper(self.task_collection,
+                                                      sub_gen)
+                                for sub_gen in obj.sub_gens
+                            ]
                             self.task_collection.on_parallel_start(num_branches)
                             yield obj
                             self.task_collection.on_parallel_end(num_branches)
-                        else:  # obj is a list of tasks
+                        else:
                             self.task_collection.before_yield(obj)
                             yield obj
                             self.task_collection.after_yield(obj)
@@ -605,7 +584,7 @@ class ExecutionTracer(TaskCollection):
 
                 conv_id = self._get_conversation_id(task_id)
                 last_recorded = self._last_recorded_counts.get(task_id, 0)
-                branch_path = current_branch_path.get()
+                branch_path = self._get_branch_path()
                 now = time.time()
                 for msg in task.messages[last_recorded:pre_count]:
                     self.events.append(
@@ -640,7 +619,7 @@ class ExecutionTracer(TaskCollection):
             self.events.append(
                 TraceEvent(
                     event_type="parallel_start",
-                    branch_path=current_branch_path.get(),
+                    branch_path=self._get_branch_path(),
                     timestamp=now,
                     duration_ms=max_duration_ms,
                     num_branches=len(assistant_events),
@@ -653,15 +632,20 @@ class ExecutionTracer(TaskCollection):
                 event_type="parallel_start",
                 timestamp=time.time(),
                 num_branches=num_branches,
-                branch_path=current_branch_path.get(),
+                branch_path=self._get_branch_path(),
             ))
+
+    @staticmethod
+    def _get_branch_path() -> List[int]:
+        scope = current_scope.get()
+        return scope.branch_path_list if scope is not None else []
 
     def _build_yield_event(self, task: Task, task_id: int, duration_ms: float,
                            timestamp: float) -> TraceEvent:
         """Build the consumable event emitted at a yield point."""
         worker_tag = str(task.worker_tag.value if hasattr(
             task.worker_tag, 'value') else task.worker_tag)
-        branch_path = current_branch_path.get()
+        branch_path = self._get_branch_path()
 
         if isinstance(task, ChatTask):
             pre_count = self._pre_message_counts.pop(task_id, 0)
