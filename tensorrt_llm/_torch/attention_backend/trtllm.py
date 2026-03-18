@@ -14,8 +14,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import (get_sm_version, is_sm_120f,
-                                  maybe_pin_memory, prefer_pinned)
+from tensorrt_llm._utils import (get_sm_version, is_sm_120f, maybe_pin_memory,
+                                 prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -33,8 +33,8 @@ from .trtllm_gen import trtllm_gen_attention
 # Enable TRTLLM-Gen attention backend via environment variable.
 # Lazily resolved: SM120/SM121 lack trtllm-gen cubins, so the env var is
 # silently ignored on those architectures (checked on first use).
-_TRTLLM_GEN_ENV_REQUESTED = os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
+_TRTLLM_GEN_ENV_REQUESTED = os.environ.get("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION",
+                                           "0") == "1"
 _TRTLLM_GEN_SM_CHECKED = False
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = False
 
@@ -546,7 +546,8 @@ class TrtllmAttentionWrapper:
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
         helix_active = self.helix_position_offsets is not None
-        if _is_trtllm_gen_attention_enabled() and not helix_active and trtllm_gen.is_supported(
+        if _is_trtllm_gen_attention_enabled(
+        ) and not helix_active and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
