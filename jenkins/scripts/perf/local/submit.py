@@ -450,7 +450,7 @@ def main():
     parser.add_argument(
         "--mpi-type",
         default="",
-        help="MPI type for srun (e.g. pmix, pmi2). If not set, --mpi is not added to srun args.",
+        help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
     )
 
     args = parser.parse_args()
