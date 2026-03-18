@@ -24,6 +24,69 @@
 #include <limits>
 #include <stdexcept>
 
+namespace
+{
+
+// RAII guard for cudaMalloc — frees the pointer on destruction, logging a warning on failure.
+struct CudaMallocGuard
+{
+    void* ptr{nullptr};
+
+    explicit CudaMallocGuard(void* p) noexcept
+        : ptr(p)
+    {
+    }
+
+    ~CudaMallocGuard()
+    {
+        if (ptr)
+        {
+            TLLM_CUDA_CHECK_WARN(cudaFree(ptr));
+        }
+    }
+
+    void* release() noexcept
+    {
+        void* p = ptr;
+        ptr = nullptr;
+        return p;
+    }
+
+    CudaMallocGuard(CudaMallocGuard const&) = delete;
+    CudaMallocGuard& operator=(CudaMallocGuard const&) = delete;
+};
+
+// RAII guard for ncclMemAlloc — frees the pointer on destruction, logging a warning on failure.
+struct NcclMemGuard
+{
+    void* ptr{nullptr};
+
+    explicit NcclMemGuard(void* p) noexcept
+        : ptr(p)
+    {
+    }
+
+    ~NcclMemGuard()
+    {
+        if (ptr)
+        {
+            TLLM_NCCL_CHECK_WARN(ncclMemFree(ptr));
+        }
+    }
+
+    void* release() noexcept
+    {
+        void* p = ptr;
+        ptr = nullptr;
+        return p;
+    }
+
+    NcclMemGuard(NcclMemGuard const&) = delete;
+    NcclMemGuard& operator=(NcclMemGuard const&) = delete;
+};
+
+} // namespace
+
 namespace tensorrt_llm::common::nccl_util
 {
 
@@ -403,11 +466,9 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
 {
-    NCCLWindowBuffer buffer;
-    buffer.handle = handle;
-
-    // Allocate device memory using ncclMemAlloc (per-rank, non-collective — can fail asymmetrically)
-    ncclResult_t allocResult = ncclMemAlloc(&buffer.ptr, size);
+    // Step 1: Allocate symmetric memory (per-rank, non-collective — can fail asymmetrically).
+    void* ncclPtr = nullptr;
+    ncclResult_t allocResult = ncclMemAlloc(&ncclPtr, size);
     int localAllocOk = (allocResult == ncclSuccess) ? 1 : 0;
     if (!localAllocOk)
     {
@@ -416,98 +477,43 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
             "synchronizing with other ranks before aborting window registration.",
             allocResult, size);
     }
+    NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
 
-    // ncclCommWindowRegister is collective: if any rank skips it, all other ranks hang.
-    // Synchronize the per-rank alloc status across all ranks before proceeding.
-    // Use a small cudaMalloc buffer (not ncclMemAlloc) so OOM on symmetric memory
-    // does not prevent us from allocating the flag.
+    // Step 2: ncclCommWindowRegister is collective — if any rank skips it, all other ranks hang.
+    // Synchronize the per-rank alloc status using a small cudaMalloc flag (not ncclMemAlloc, so
+    // OOM on symmetric memory does not prevent us from allocating the flag).
     int* rankSyncFlag = nullptr;
     if (cudaMalloc(&rankSyncFlag, sizeof(int)) != cudaSuccess)
     {
-        // This should be essentially impossible (4 bytes of regular device memory),
-        // but if it happens we cannot safely coordinate — abort on this rank.
-        if (localAllocOk)
-        {
-            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
-            if (freeResult != ncclSuccess)
-            {
-                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during cudaMalloc error cleanup: %d", freeResult);
-            }
-        }
         TLLM_THROW("[NCCLUtil] cudaMalloc for rank-sync flag failed; cannot coordinate safely across ranks.");
     }
+    CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
 
-    // Populate flag on device, reduce with min (0 if any rank failed), then read back.
+    // Step 3: Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    cudaError_t memcpyErr = cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice);
-    if (memcpyErr != cudaSuccess)
-    {
-        cudaError_t freeErr = cudaFree(rankSyncFlag);
-        if (freeErr != cudaSuccess)
-        {
-            TLLM_LOG_WARNING(
-                "[NCCLUtil] cudaFree failed during H2D memcpy error cleanup: %s", cudaGetErrorString(freeErr));
-        }
-        if (localAllocOk)
-        {
-            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
-            if (freeResult != ncclSuccess)
-            {
-                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during H2D memcpy error cleanup: %d", freeResult);
-            }
-        }
-        TLLM_THROW("[NCCLUtil] cudaMemcpy H2D for rank-sync flag failed: %s", cudaGetErrorString(memcpyErr));
-    }
+    TLLM_CUDA_CHECK(cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice));
+
     ncclResult_t reduceResult = ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream);
     if (reduceResult != ncclSuccess)
     {
-        cudaError_t freeErr = cudaFree(rankSyncFlag);
-        if (freeErr != cudaSuccess)
-        {
-            TLLM_LOG_WARNING(
-                "[NCCLUtil] cudaFree failed during ncclAllReduce error cleanup: %s", cudaGetErrorString(freeErr));
-        }
-        if (localAllocOk)
-        {
-            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
-            if (freeResult != ncclSuccess)
-            {
-                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during ncclAllReduce error cleanup: %d", freeResult);
-            }
-        }
         TLLM_LOG_WARNING(
             "[NCCLUtil] ncclAllReduce for rank-sync flag failed (error: %d); "
             "aborting window registration on this rank.",
             reduceResult);
-        return NCCLWindowBuffer();
+        return NCCLWindowBuffer{}; // guards free rankSyncFlag and ncclPtr
     }
-    cudaError_t syncErr = cudaStreamSynchronize(stream);
-    if (syncErr != cudaSuccess)
-    {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] cudaStreamSynchronize failed after ncclAllReduce: %s", cudaGetErrorString(syncErr));
-    }
+    TLLM_CUDA_CHECK_WARN(cudaStreamSynchronize(stream));
+
     int allAllocOk = 0;
-    memcpyErr = cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaError_t freeErr = cudaFree(rankSyncFlag);
-    if (freeErr != cudaSuccess)
-    {
-        TLLM_LOG_WARNING("[NCCLUtil] cudaFree failed for rank-sync flag: %s", cudaGetErrorString(freeErr));
-    }
-    if (memcpyErr != cudaSuccess)
+    cudaError_t d2hErr = cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost);
+    if (d2hErr != cudaSuccess)
     {
         TLLM_LOG_WARNING("[NCCLUtil] cudaMemcpy D2H for rank-sync flag failed: %s; assuming allocation failed.",
-            cudaGetErrorString(memcpyErr));
-        if (localAllocOk)
-        {
-            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
-            if (freeResult != ncclSuccess)
-            {
-                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during D2H memcpy error cleanup: %d", freeResult);
-            }
-        }
-        return NCCLWindowBuffer();
+            cudaGetErrorString(d2hErr));
+        return NCCLWindowBuffer{}; // guards free rankSyncFlag and ncclPtr
     }
+    // flagGuard frees rankSyncFlag here at end of its scope
+
     if (!allAllocOk)
     {
         if (localAllocOk)
@@ -516,34 +522,24 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
                 "[NCCLUtil] ncclMemAlloc failed on at least one other rank; "
                 "freeing local allocation (size=%zu) and aborting window registration on all ranks.",
                 size);
-            ncclResult_t freeResult = ncclMemFree(buffer.ptr);
-            if (freeResult != ncclSuccess)
-            {
-                TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed during !allAllocOk cleanup: %d", freeResult);
-            }
         }
-        // Return an empty buffer — callers fall back to regular (non-symmetric) allreduce.
-        return NCCLWindowBuffer();
+        return NCCLWindowBuffer{}; // ncclGuard frees ncclPtr
     }
 
-    buffer.size = size;
-
-    // Register the buffer with NCCL as a window (collective — all ranks must reach this call)
-    ncclResult_t regResult = ncclCommWindowRegister(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
+    // Step 4: Register with NCCL as a window (collective — all ranks must reach this call).
+    ncclWindow_t window = nullptr;
+    ncclResult_t regResult = ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC);
     if (regResult != ncclSuccess)
     {
-        ncclResult_t freeResult = ncclMemFree(buffer.ptr);
-        if (freeResult != ncclSuccess)
-        {
-            TLLM_LOG_WARNING(
-                "[NCCLUtil] ncclMemFree failed during ncclCommWindowRegister error cleanup: %d", freeResult);
-        }
         TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
+        // ncclGuard frees ncclPtr during stack unwinding
     }
 
+    // Step 5: Success — transfer ownership to the returned buffer.
+    ncclGuard.release();
+    NCCLWindowBuffer buffer{ncclPtr, handle, size, window};
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
-        handle, buffer.ptr, size, static_cast<void*>(buffer.window));
-
+        handle, buffer.ptr, buffer.size, static_cast<void*>(buffer.window));
     return buffer;
 }
 
