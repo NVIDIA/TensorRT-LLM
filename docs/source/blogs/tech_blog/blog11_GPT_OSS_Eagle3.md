@@ -17,9 +17,9 @@ Expected directory layout on the host (example):
   └─ eagle/         # Eagle3 speculative decoding assets
 ```
 
-### Get the TensorRT LLM Container (1.1.0rc0)
+### Get the TensorRT LLM Container
 
-If required by your environment, log into NGC and pull the image:
+If required by your environment, log into NGC and pull the image. Check the [NGC catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) for the latest available release tag:
 
 ```bash
 # Create an API key at https://ngc.nvidia.com (if you don't have one)
@@ -27,7 +27,8 @@ docker login nvcr.io
 # Username: $oauthtoken
 # Password: <your NGC API key>
 
-docker pull nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0
+# Replace <version> with the latest release tag from the NGC catalog
+docker pull nvcr.io/nvidia/tensorrt-llm/release:<version>
 ```
 
 ### Start the TensorRT LLM Container
@@ -41,7 +42,7 @@ docker run --rm --ipc=host -it \
   --gpus all \
   -p 8000:8000 \
   -v /path/to/models:/config/models:rw \
-  nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0 \
+  nvcr.io/nvidia/tensorrt-llm/release:<version> \
   /bin/bash
 ```
 
@@ -84,12 +85,12 @@ kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
 speculative_config:
-  decoding_type: Eagle3
+  decoding_type: Eagle
   max_draft_len: 3
   speculative_model_dir: /config/models/eagle/
 cuda_graph_config:
   max_batch_size: 10
-use_torch_sampler: true
+sampler_type: TorchSampler
 moe_config:
   backend: TRTLLM
 EOF
@@ -98,14 +99,14 @@ EOF
 Notes:
 - Ensure your base model directory is `/config/models/gpt-oss-120b`.
 - Ensure your Eagle3 assets are present under `/config/models/eagle/`.
-- If you are running on Top of Tree, replace `use_torch_sampler: true` with `sampler_type: TorchSampler`.
+- On older releases (pre-1.1.0), replace `sampler_type: TorchSampler` with `use_torch_sampler: true`.
 
 ### Launch the Server (Eagle3 Speculative Decoding)
 
 Run the following command inside the container to start the endpoint:
 
 ```bash
-TRTLLM_ENABLE_PDL=1 trtllm-serve /config/models/gpt-oss-120b --host 0.0.0.0 --port 8000 --max_batch_size 10  --tp_size 8 --ep_size 4 --trust_remote_code --config /config/models/eagle/eagle.yaml --max_num_tokens 131072 --max_seq_len 131072
+TRTLLM_ENABLE_PDL=1 trtllm-serve /config/models/gpt-oss-120b --host 0.0.0.0 --port 8000 --max_batch_size 10  --tp_size 8 --ep_size 4 --trust_remote_code --extra_llm_api_options /config/models/eagle/eagle.yaml --max_num_tokens 131072 --max_seq_len 131072
 ```
 
 The server initializes, loads, and optimizes the models. After it is ready, it listens on port 8000.

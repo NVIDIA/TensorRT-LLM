@@ -114,7 +114,7 @@ Run DeepSeek-V3/R1 models with MTP, use [examples/llm-api/quickstart_advanced.py
 
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
 To benchmark min-latency performance with MTP, you need to follow [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation) to prepare your dataset, then follow the steps below:
@@ -122,7 +122,7 @@ To benchmark min-latency performance with MTP, you need to follow [this document
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./config.yml<<EOF
+cat >./extra-llm-api-config.yml<<EOF
 cuda_graph_config: {}
 moe_config:
   backend: TRTLLM
@@ -142,7 +142,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --config ./config.yml
+    --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 
 ## MTP optimization - Relaxed Acceptance
@@ -170,7 +170,7 @@ Run DeepSeek-R1 models with MTP Relaxed Acceptance, use [examples/llm-api/quicks
 
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 10 --relaxed_delta 0.6
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N --use_relaxed_acceptance_for_thinking --relaxed_topk 10 --relaxed_delta 0.6
 ```
 
 To benchmark min-latency performance with MTP Relaxed Acceptance, you need to follow [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation) to prepare your dataset, then follow the steps below:
@@ -178,7 +178,7 @@ To benchmark min-latency performance with MTP Relaxed Acceptance, you need to fo
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./config.yml<<EOF
+cat >./extra-llm-api-config.yml<<EOF
 cuda_graph_config: {}
 moe_config:
   backend: TRTLLM
@@ -201,7 +201,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --config ./config.yml
+    --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 
 ## Evaluation
