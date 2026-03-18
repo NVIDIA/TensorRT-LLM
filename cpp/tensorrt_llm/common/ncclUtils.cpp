@@ -504,9 +504,15 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     }
 
     // Step 4: Register with NCCL as a window (collective — all ranks must reach this call).
-    // ncclGuard frees ncclPtr during stack unwinding on throw.
+    // Failure here is non-fatal: warn and fall back to regular allreduce.
+    // ncclGuard frees ncclPtr on return.
     ncclWindow_t window = nullptr;
-    TLLM_NCCL_CHECK(ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC));
+    ncclResult_t const regResult = ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC);
+    TLLM_NCCL_CHECK_WARN(regResult);
+    if (regResult != ncclSuccess)
+    {
+        return NCCLWindowBuffer{};
+    }
 
     // Step 5: Success — transfer ownership to the returned buffer.
     ncclGuard.release();
