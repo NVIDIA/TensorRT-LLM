@@ -1017,8 +1017,8 @@ class Indexer(nn.Module):
             self.hidden_size,
             self.head_dim,
             bias=False,
-            dtype=dtype,
-            quant_config=quant_config,
+            dtype=torch.float32,
+            quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
@@ -1030,6 +1030,10 @@ class Indexer(nn.Module):
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
+
+        # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
+        # (populated in post_load_weights; maps to TF32 tensor cores on Ampere+)
+        self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
         indexer_rope_interleave = getattr(sparse_attention_config,
                                           'indexer_rope_interleave', False)
@@ -1046,7 +1050,12 @@ class Indexer(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
-        self._enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+    def post_load_weights(self):
+        """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
+        # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
+        # → fused: [head_dim + n_heads, hidden_size]
+        self._fused_wk_wp_weight = torch.cat(
+            [self.wk.weight.data, self.weights_proj.weight.data], dim=0)
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1753,18 +1762,26 @@ class Indexer(nn.Module):
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor, indexer_k: torch.Tensor):
+                position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        q_and_k, weights = maybe_execute_in_parallel(
-            lambda: self._qk_projection_and_rope(qr, indexer_k, position_ids),
-            lambda: self.weights_proj(_to_float(hidden_states)),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        q_pe, q_nope, k_pe, k_nope = q_and_k
+        # Single fused FP32 cuBLAS GEMM (TF32 on Ampere+): wk + weights_proj
+        # hidden_states (FP32) @ fused_weight^T -> [N, head_dim + n_heads]
+        assert self._fused_wk_wp_weight is not None, \
+            "post_load_weights() must be called before forward()"
+        hidden_float = _to_float(hidden_states)
+        fused_out = torch.ops.trtllm.cublas_mm(hidden_float,
+                                               self._fused_wk_wp_weight.t(),
+                                               None,
+                                               out_dtype=None)
+        indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
+                                             dim=-1)
+        # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
+        indexer_k = indexer_k.to(hidden_states.dtype)
+
+        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
+            qr, indexer_k, position_ids)
         q, k = maybe_execute_in_parallel(
             lambda: self._prep_q_or_k(q_pe, q_nope),
             lambda: self._prep_q_or_k(k_pe, k_nope),

@@ -1632,15 +1632,11 @@ class MLA(nn.Module):
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
         else:
-            # Defer indexer.wk projection to here so the short-MHA skip
-            # path above avoids the extra GEMM when indexer is not needed.
-            indexer_k = self.indexer.wk(hidden_states)
             topk_indices = self.indexer(
                 qr,
                 hidden_states,
                 attn_metadata,
                 position_ids,
-                indexer_k=indexer_k,
             )
 
         assert q.shape[
