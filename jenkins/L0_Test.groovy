@@ -2533,7 +2533,7 @@ REUSED_TESTS_EOF
     }
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -2845,13 +2845,44 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
     }
+
+    // Run type checking
+    if (typeCheck && cpver != "cp310") {
+        stage ("[${stageName}] Run type check")
+        {
+            // Type checking tests if 'tensorrt_llm.bindings' can be imported. This requires
+            // a GPU which is not available during the Build stage. The cpver check ensures
+            // type checking uses the same Python version which is used in the dev containers,
+            // '!=' avoids silent regression upon future Python upgrades.
+
+            echo "-- Running mypy type check with compiled bindings..."
+	    // copy build artifacts to make sure 'tensorrt_llm' is importable from ${llmSrc}
+            sh """
+                TRTLLM_PATH=`python3 -c 'import tensorrt_llm; print(tensorrt_llm.__path__[0])' | tail -n 1`
+                echo "\$TRTLLM_PATH"
+                # https://superuser.com/a/266429
+                cd "\$TRTLLM_PATH" && tar -c \
+                    libs/ bindings/ bindings.*.so \
+                    runtime/kv_cache_manager_v2/rawref/_rawref.*.so \
+                    runtime/kv_cache_manager_v2/rawref/*.pyi \
+                    deep_gemm_cpp_tllm.*.so \
+                    deep_gemm_cpp_tllm.pyi \
+                    tensorrt_llm_transfer_agent_binding.*.so \
+                    deep_gemm/ \
+                    | tar -C "${llmSrc}/tensorrt_llm" -xv
+            """
+            withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
+                sh "cd ${llmSrc} && python3 -m pre_commit run type-check --all-files || (cat /root/.cache/pre-commit/pre-commit.log && /bin/false)"
+            }
+	}
+    }
 }
 
 
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="")
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -3629,7 +3660,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null, "-SubJob-RunTest")
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest", true)
                         }
                     })
                 }
@@ -3863,7 +3894,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage")
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage", true)
                 })
             }
         } else {

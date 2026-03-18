@@ -415,7 +415,7 @@ void initRequestBindings(nb::module_& m)
         kvCacheRetentionConfig, "TokenRangeRetentionConfig")
         .def(nb::init<SizeType32, std::optional<SizeType32>, tle::RetentionPriority,
                  std::optional<std::chrono::milliseconds>>(),
-            nb::arg("token_start"), nb::arg("token_end") = nb::none(), nb::arg("priority"),
+            nb::arg("token_start"), nb::arg("token_end").none(), nb::arg("priority"),
             nb::arg("duration_ms") = nb::none())
         .def_rw("token_start", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenStart)
         .def_rw("token_end", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenEnd)
