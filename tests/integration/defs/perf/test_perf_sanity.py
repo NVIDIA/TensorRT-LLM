@@ -830,11 +830,16 @@ class DisaggTestCmds(NamedTuple):
                 acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
                 if acc_cfg_json:
                     import json as _json
+
                     acc_cfg = _json.loads(acc_cfg_json)
                     if acc_cfg.get("enable_accuracy_test"):
                         _run_accuracy_tests(
-                            acc_cfg, self.model_name, disagg_server_hostname, disagg_server_port,
-                            self.test_output_dir, server_idx,
+                            acc_cfg,
+                            self.model_name,
+                            disagg_server_hostname,
+                            disagg_server_port,
+                            self.test_output_dir,
+                            server_idx,
                         )
 
             finally:
@@ -847,8 +852,14 @@ class DisaggTestCmds(NamedTuple):
         return ["multi-node disaggregated server tests, please check config files"]
 
 
-def _run_accuracy_tests(accuracy_cfg: dict, model_name: str, server_hostname: str, server_port: int,
-                        output_dir: str, server_idx: int) -> None:
+def _run_accuracy_tests(
+    accuracy_cfg: dict,
+    model_name: str,
+    server_hostname: str,
+    server_port: int,
+    output_dir: str,
+    server_idx: int,
+) -> None:
     """Run lm_eval against the running disagg server. Saves results only — no validation."""
     endpoint_map = {
         "local-completions": "v1/completions",
@@ -868,14 +879,24 @@ def _run_accuracy_tests(accuracy_cfg: dict, model_name: str, server_hostname: st
         log_file = os.path.join(output_dir, f"accuracy_eval_{task_name}.{server_idx}.log")
         os.makedirs(acc_output_dir, exist_ok=True)
 
-        cmd = ["lm_eval", "--model", model_type, "--tasks", task_name,
-               "--model_args", model_args, "--log_samples", "--output_path", acc_output_dir]
+        cmd = [
+            "lm_eval",
+            "--model",
+            model_type,
+            "--tasks",
+            task_name,
+            "--model_args",
+            model_args,
+            "--log_samples",
+            "--output_path",
+            acc_output_dir,
+        ]
         if "include_path" in extra_kwargs:
             cmd += ["--include_path", extra_kwargs["include_path"]]
         for k, v in extra_kwargs.items():
             if k == "include_path":
                 continue
-            cmd += ([f"--{k}"] if isinstance(v, bool) and v else [f"--{k}", str(v)])
+            cmd += [f"--{k}"] if isinstance(v, bool) and v else [f"--{k}", str(v)]
 
         run_env = copy.deepcopy(os.environ)
         run_env.update({k: str(v) for k, v in env_var.items()})

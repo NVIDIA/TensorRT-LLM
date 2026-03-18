@@ -735,9 +735,7 @@ def main():
                     if not os.path.isabs(cfg_path):
                         cfg_path = os.path.join(llm_src, cfg_path)
                     extra["include_path"] = replace_env_in_file(work_dir, cfg_path, env_sub)
-            script_prefix_lines.append(
-                f"export ACCURACY_CONFIG_JSON='{json.dumps(processed)}'"
-            )
+            script_prefix_lines.append(f"export ACCURACY_CONFIG_JSON='{json.dumps(processed)}'")
             srun_args_lines.append("--container-env=ACCURACY_CONFIG_JSON")
 
     # Remove whitespace lines
