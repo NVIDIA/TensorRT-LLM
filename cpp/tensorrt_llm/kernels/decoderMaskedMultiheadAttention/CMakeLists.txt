@@ -31,7 +31,6 @@ add_library(decoder_attention_src OBJECT)
 filter_source_cuda_architectures(
   SOURCE_LIST SRC_CPP
   ARCHS 80 86 89 90 120
-  TARGET decoder_attention_src
   IMPLICIT_FAMILY)
 
 set(basic_heads 32 64 128)

@@ -3592,12 +3592,17 @@ def get_cubin_header(kernel_traits, specs_names):
         else:
             assert False, 'Something terrible happened'
 
+    def render_sm(sm):
+        if int(sm) >= 100:
+            return f"{sm}F"
+        return sm
+
     metadata_v1 = ',\n'.join(metadata_v1)
     # Add macros to only include needed cubins during compilation.
     if bool(metadata_v2_dict):
         metadata_v2 = ''
         for sm in metadata_v2_dict.keys():
-            macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
+            macro_begin = f"#ifndef EXCLUDE_SM_{render_sm(sm)}"
             macro_end = f"#endif\n\n"
             metadata_v2 += macro_begin + '\n' + (',\n'.join(
                 metadata_v2_dict[sm]))
@@ -3613,7 +3618,7 @@ def get_cubin_header(kernel_traits, specs_names):
             list(launchers_dict.keys())))
 
     for sm in all_sms:
-        macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
+        macro_begin = f"#ifndef EXCLUDE_SM_{render_sm(sm)}"
         macro_end = f"#endif\n"
 
         # Add cubin array declarations

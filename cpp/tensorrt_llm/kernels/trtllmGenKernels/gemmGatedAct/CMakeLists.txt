@@ -19,10 +19,7 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
 add_library(trtllm_gen_gemm_gated_act OBJECT)
-filter_source_cuda_architectures(
-  SOURCE_LIST SRC_CPP
-  ARCHS 100f
-  TARGET trtllm_gen_gemm_gated_act)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100f)
 
 target_sources(trtllm_gen_gemm_gated_act PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(trtllm_gen_gemm_gated_act

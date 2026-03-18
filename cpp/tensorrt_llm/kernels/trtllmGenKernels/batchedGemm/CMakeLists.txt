@@ -19,10 +19,7 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
 add_library(trtllm_gen_batched_gemm OBJECT)
-filter_source_cuda_architectures(
-  SOURCE_LIST SRC_CPP
-  ARCHS 100 103 100f
-  TARGET trtllm_gen_batched_gemm)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 100f)
 
 target_sources(trtllm_gen_batched_gemm PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(trtllm_gen_batched_gemm

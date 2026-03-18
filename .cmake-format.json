@@ -11,7 +11,6 @@
         ],
         "kwargs": {
           "SOURCE_LIST": "1",
-          "TARGET": "1",
           "ARCHS": "+"
         }
       },

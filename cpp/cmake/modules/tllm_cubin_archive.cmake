@@ -111,13 +111,10 @@ function(tllm_add_cubin_archive_sources TARGET ARCHIVE_DIR)
       filter_source_cuda_architectures(
         SOURCE_LIST _ARCHIVES
         ARCHS ${_ARG_ARCHS}
-        TARGET ${TARGET}
         IMPLICIT_FAMILY)
     else()
-      filter_source_cuda_architectures(
-        SOURCE_LIST _ARCHIVES
-        ARCHS ${_ARG_ARCHS}
-        TARGET ${TARGET})
+      filter_source_cuda_architectures(SOURCE_LIST _ARCHIVES
+                                       ARCHS ${_ARG_ARCHS})
     endif()
     if(NOT _ARCHIVES)
       message(

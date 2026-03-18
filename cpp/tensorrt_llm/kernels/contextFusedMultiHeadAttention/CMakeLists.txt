@@ -24,7 +24,6 @@ add_library(context_attention_src OBJECT)
 filter_source_cuda_architectures(
   SOURCE_LIST SRC_CPP
   ARCHS 80 86 89 90 100 120
-  TARGET context_attention_src
   IMPLICIT_FAMILY)
 
 target_sources(context_attention_src PRIVATE ${SRC_CPP} ${SRC_CU})

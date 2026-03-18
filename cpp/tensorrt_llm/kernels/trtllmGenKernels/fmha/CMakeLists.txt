@@ -49,10 +49,9 @@ configure_file(
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-filter_source_cuda_architectures(
-  SOURCE_LIST SRC_CPP
-  ARCHS 100 103 100f
-  TARGET trtllm_gen_fmha_interface)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 100f)
+
+add_library(trtllm_gen_fmha_interface INTERFACE)
 target_include_directories(
   trtllm_gen_fmha_interface
   INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export)
