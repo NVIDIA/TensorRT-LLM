@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version, is_blackwell, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,

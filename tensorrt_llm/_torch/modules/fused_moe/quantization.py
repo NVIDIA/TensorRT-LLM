@@ -1099,7 +1099,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
     def _needs_e8m0_resmooth(self):
-        return is_sm_100f() or get_sm_version() == 120
+        return is_sm_100f() or get_sm_version() in (120, 121)
 
     def post_load_weights(self, module: torch.nn.Module):
         if self._needs_e8m0_resmooth():
