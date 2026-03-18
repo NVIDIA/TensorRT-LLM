@@ -46,14 +46,23 @@ def get_moe_cls(
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
     elif moe_backend.upper() == "TRTLLM":
-        if quant_config is not None and (
-                quant_config.quant_mode.has_fp8_block_scales()
-                or quant_config.quant_mode.has_nvfp4()
-                or quant_config.quant_mode.has_w4a16_mxfp4()
-                or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
-                or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
-                or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
+        has_quant = quant_config is not None and quant_config.quant_mode.has_any_quant(
+            exclude_kv_cache=True)
+        if has_quant and (quant_config.quant_mode.has_fp8_block_scales()
+                          or quant_config.quant_mode.has_nvfp4()
+                          or quant_config.quant_mode.has_w4a16_mxfp4()
+                          or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
+                          or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
+                          or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
             return TRTLLMGenFusedMoE
+        if not has_quant and model_config.pretrained_config is not None and getattr(
+                model_config.pretrained_config, "torch_dtype",
+                None) == torch.bfloat16:
+            if TRTLLMGenFusedMoE._is_flashinfer_fused_moe_available():
+                return TRTLLMGenFusedMoE
+            raise RuntimeError(
+                "TRTLLMGenFusedMoE BF16 path requires FlashInfer fused MoE with "
+                "trtllm_bf16_moe support, but it is not available.")
         else:
             logger.warning(
                 "TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_nvfp4_fp8, w4a8_mxfp4_fp8, and w4a8_mxfp4_mxfp8. "

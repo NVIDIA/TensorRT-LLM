@@ -38,10 +38,10 @@ from .moe_op_backend import MoEOpBackend, get_op_backend
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEBaseMethod,
-    NVFP4TRTLLMGenFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
-    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
-    W4A16MXFP4TRTLLMGenFusedMoEMethod)
+    BF16TRTLLMGenFusedMoEMethod, DeepSeekFP8BlockScalesFusedMoEMethod,
+    NVFP4TRTLLMGenFusedMoEBaseMethod, NVFP4TRTLLMGenFusedMoEMethod,
+    W4A8MXFP4FP8TRTLLMGenFusedMoEMethod, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
+    W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DefaultMoeRoutingMethod)
@@ -115,7 +115,8 @@ class TRTLLMGenFusedMoE(MoE):
         - W4A8_MXFP4_FP8
         - W4A8_MXFP4_MXFP8
 
-        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
+        Unquantized BF16 path is supported only with FlashInfer fused MoE backend.
+        Output dtype is hardcoded to bfloat16.
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
@@ -143,10 +144,12 @@ class TRTLLMGenFusedMoE(MoE):
                 f"TRTLLMGenFusedMoE only supports bfloat16 activation, got {dtype_activation}"
             )
 
-        # TRTLLMGenFusedMoE does NOT support unquantized mode
         if quant_algo is None:
-            return _warn_and_return(
-                "TRTLLMGenFusedMoE does not support unquantized mode")
+            if not cls._is_flashinfer_fused_moe_available():
+                return _warn_and_return(
+                    "TRTLLMGenFusedMoE unquantized BF16 path requires FlashInfer fused MoE "
+                    "with trtllm_bf16_moe support.")
+            return True, None
 
         # Check if quant_algo is supported
         if quant_algo not in cls._SUPPORTED_QUANT_ALGOS:
@@ -210,7 +213,14 @@ class TRTLLMGenFusedMoE(MoE):
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
-        self.use_flashinfer = self._check_op_backend_support()
+        self.use_flashinfer = self._check_flashinfer_backend_support()
+        if (self.quant_config is None
+                or not self.quant_config.layer_quant_mode.has_any_quant(
+                    exclude_kv_cache=True)) and not self.use_flashinfer:
+            raise NotImplementedError(
+                "TRTLLMGenFusedMoE BF16 path requires FlashInfer fused MoE. "
+                "Please install a FlashInfer build with trtllm_bf16_moe support."
+            )
         backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
         self.op_backend: MoEOpBackend = get_op_backend(backend_name)
 
@@ -292,7 +302,38 @@ class TRTLLMGenFusedMoE(MoE):
         else:
             raise ValueError(f"Unsupported activation type: {activation_type}")
 
-    def _check_op_backend_support(self) -> bool:
+    @staticmethod
+    def _is_flashinfer_fused_moe_available() -> bool:
+        try:
+            from flashinfer.fused_moe import core as _core
+        except (ImportError, ModuleNotFoundError):
+            return False
+        return (hasattr(_core, "trtllm_bf16_moe")
+                and hasattr(_core, "trtllm_bf16_routed_moe"))
+
+    def _is_unquantized_path(self) -> bool:
+        return self.quant_config is None or not self.quant_config.layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True)
+
+    def _requires_separated_routing(self) -> bool:
+        """Whether this backend instance expects precomputed top-k routing."""
+        # FIXME: ban FlashInfer BF16 MoE direct routing as it appears to have accuracy bug
+        return self.use_flashinfer and self._is_unquantized_path()
+
+    def _check_flashinfer_backend_support(self) -> bool:
+        # For BF16 (unquantized) path, we will use FlashInfer regardless whether
+        # env TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER=1 is set or not as it's the only way.
+        if self._is_unquantized_path():
+            if not self._is_flashinfer_fused_moe_available():
+                return False
+            if self.activation_type != ActivationType.Swiglu:
+                return False
+            if isinstance(
+                    self.routing_method,
+                (DeepSeekV3MoeRoutingMethod, DefaultMoeRoutingMethod)):
+                return False
+            return True
+
         use_flashinfer = os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER",
                                         "0")
         if use_flashinfer != "1":
@@ -311,8 +352,6 @@ class TRTLLMGenFusedMoE(MoE):
         if type(quant_method) is NVFP4TRTLLMGenFusedMoEBaseMethod:
             return True
 
-        if self.quant_config is None:
-            return False
         mode = self.quant_config.layer_quant_mode
 
         # These quant modes are never supported via op backend
@@ -365,7 +404,14 @@ class TRTLLMGenFusedMoE(MoE):
         return AlltoallMethodType.NVLinkOneSided
 
     def _supports_load_balancer(self) -> bool:
-        """TRTLLMGenFusedMoE supports load balancer."""
+        """Whether separated routing (top-k outside the kernel) is used.
+
+        ConfigurableMoE uses this flag to decide whether routing is separated
+        (top-k ids/scales computed outside backend) or fused inside the kernel.
+        BF16 FlashInfer path always requires separated routing.
+        """
+        if self._requires_separated_routing():
+            return True
         return self.use_dp and self.parallel_size > 1
 
     @cached_property
@@ -375,9 +421,17 @@ class TRTLLMGenFusedMoE(MoE):
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
     def _check_configs(self):
-        assert self.has_deepseek_fp8_block_scales \
+        assert not self.has_any_quant \
+            or self.has_deepseek_fp8_block_scales \
             or self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8 \
-            or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
+            or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, \
+            "TRTLLMGenFusedMoE only supports bf16 (FlashInfer), fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
+
+        if not self.has_any_quant:
+            assert self.activation_type == ActivationType.Swiglu, \
+                "TRTLLMGenFusedMoE BF16 path only supports Swiglu activation."
+            assert not self.bias and self.swiglu_alpha is None and self.swiglu_beta is None and self.swiglu_limit is None, \
+                "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
 
         if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
             assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
@@ -405,8 +459,7 @@ class TRTLLMGenFusedMoE(MoE):
                     f"Unsupported quantization method by TRTLLMGenFusedMoE: {self.quant_config.quant_mode}"
                 )
         else:
-            raise NotImplementedError(
-                "TRTLLMGenFusedMoE doesn't support fp16/bf16/fp32 MoE.")
+            return BF16TRTLLMGenFusedMoEMethod()
 
     def create_weights(self):
         if self._weights_created:
@@ -467,6 +520,8 @@ class TRTLLMGenFusedMoE(MoE):
         - scaling_vector_size is typically the group size for block-wise quantization
         """
         x_sf = None
+        if not self.has_any_quant:
+            return x, x_sf
         if self.has_w4a8_mxfp4_fp8:
             pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
             x = torch.nn.functional.pad(x, (0, pad_size))
@@ -526,7 +581,7 @@ class TRTLLMGenFusedMoE(MoE):
         return x, x_sf
 
     def supports_moe_output_in_alltoall_workspace(self):
-        return True
+        return self.has_any_quant and not self.use_flashinfer
 
     def run_moe(
         self,
@@ -542,8 +597,8 @@ class TRTLLMGenFusedMoE(MoE):
         Run MoE computation with TRTLLMGen backend.
 
         This method encapsulates the core MoE computation logic, handling different
-        quantization schemes (fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_nvfp4_fp8,
-        w4a8_mxfp4_fp8, w4a8_mxfp4_mxfp8).
+        quantization schemes (bf16, fp8_block_scales, nvfp4, w4a16_mxfp4,
+        w4a8_nvfp4_fp8, w4a8_mxfp4_fp8, w4a8_mxfp4_mxfp8).
 
         Args:
             # Standard MoE interface parameters:
@@ -592,7 +647,37 @@ class TRTLLMGenFusedMoE(MoE):
             ) == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
             x_sf = x_sf.flatten()
 
-        if self.has_deepseek_fp8_block_scales:
+        if not self.has_any_quant:
+            result = self.op_backend.run_bf16_moe(
+                router_logits=router_logits,
+                routing_bias=routing_bias,
+                hidden_states=x,
+                gemm1_weights=self.w3_w1_weight,
+                gemm2_weights=self.w2_weight,
+                num_experts=self.num_slots,
+                top_k=top_k,
+                n_group=n_group,
+                topk_group=topk_group,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.slot_start,
+                local_num_experts=self.expert_size_per_partition,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.routing_method.routing_method_type,
+                topk_weights=token_final_scales,
+                topk_ids=token_selected_experts,
+                gated_act_type=self._to_trtllm_gen_activation_type(
+                    self.activation_type),
+                output=moe_output,
+                use_shuffled_weight=getattr(self.quant_method,
+                                            "use_shuffled_weight", False),
+                weight_layout=getattr(self.quant_method, "weight_layout", 0),
+                do_finalize=do_finalize,
+            )
+            if not do_finalize:
+                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
+                return result
+            final_hidden_states = result
+        elif self.has_deepseek_fp8_block_scales:
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
             # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
             if x_sf is None:

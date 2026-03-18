@@ -874,7 +874,8 @@ def should_skip_to_accelerate_ci(
     all combinations run (local exhaustive testing).
 
     Rules applied (in order):
-    0. Skip unquantized (quant=None) — quantized paths are the focus of CI
+    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
+       unquantized coverage enabled.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -900,8 +901,13 @@ def should_skip_to_accelerate_ci(
     if model_config is None:
         return None
 
-    # --- Rule 0: Skip gated and unquantized (quant=None) ---
-    if quant_algo is None and is_gated_activation(activation_type):
+    # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
+    # Keep TRTLLM BF16 unquantized enabled to cover FlashInfer BF16 TRTLLM MoE.
+    if (
+        quant_algo is None
+        and is_gated_activation(activation_type)
+        and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
+    ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
     is_large_model = model_config.num_experts >= 256 and model_config.hidden_size >= 7168

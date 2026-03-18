@@ -5856,12 +5856,17 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         chat_template_kwargs=dict(enable_thinking=False),
     )
 
-    def test_bf16(self):
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+    def test_bf16(self, moe_backend):
+        if moe_backend == "TRTLLM" and get_sm_version() not in (100, 103):
+            pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
+
         world_size = 1
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128])
+        moe_config = MoeConfig(backend=moe_backend)
 
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=world_size,
@@ -5871,7 +5876,8 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  max_batch_size=128,
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
-                 cuda_graph_config=cuda_graph_config) as llm:
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=moe_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)

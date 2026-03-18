@@ -49,6 +49,10 @@ FUSED_MOE_MXFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
+# TRTLLM-Gen MatrixLayout enum values.
+TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_K = 0
+TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_MN = 1
+TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K = 2
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -162,6 +166,28 @@ def trtllmgen_maybe_get_cached_w2_permute_indices(
         cache_permute_indices[key] = permute_indices
     permute_indices = cache_permute_indices[key]
     return permute_indices
+
+
+def _convert_to_block_major_k_layout(input_tensor: torch.Tensor,
+                                     block_k: int) -> torch.Tensor:
+    if input_tensor.dim() != 2:
+        raise ValueError(
+            f"input_tensor must be 2D for BlockMajorK conversion, got shape={tuple(input_tensor.shape)}"
+        )
+    m, k = input_tensor.shape
+    if k % block_k != 0:
+        raise ValueError(
+            f"K dimension ({k}) must be divisible by block_k ({block_k}) for BlockMajorK layout."
+        )
+    return input_tensor.view(m, k // block_k, block_k).permute(1, 0,
+                                                               2).contiguous()
+
+
+def _prepare_bf16_weight_for_trtllm_gen(weight: torch.Tensor,
+                                        permute_indices: torch.Tensor,
+                                        block_k: int) -> torch.Tensor:
+    shuffled_weight = weight[permute_indices.to(weight.device)].contiguous()
+    return _convert_to_block_major_k_layout(shuffled_weight, block_k)
 
 
 def maybe_pad_for_mxfp4(weight: torch.Tensor,
@@ -643,6 +669,58 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
+
+
+class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
+    # BlockMajorK uses 128-byte K blocks. BF16 has 2 bytes per element.
+    block_k = 64
+    use_shuffled_weight = True
+    weight_layout = TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
+    _cache_permute_indices: Dict[tuple[tuple[int, ...], str, int],
+                                 torch.Tensor] = {}
+
+    def _get_w3_w1_permute_indices(
+            self,
+            w3_w1_weight: torch.Tensor,
+            is_gated_act_gemm: bool = True) -> torch.Tensor:
+        return trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            w3_w1_weight.view(torch.uint8),
+            self._cache_permute_indices,
+            epilogue_tile_m=128,
+            is_gated_act_gemm=is_gated_act_gemm)
+
+    def _get_w2_permute_indices(self, w2_weight: torch.Tensor) -> torch.Tensor:
+        return trtllmgen_maybe_get_cached_w2_permute_indices(
+            w2_weight.view(torch.uint8),
+            self._cache_permute_indices,
+            epilogue_tile_m=128)
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        if module.w3_w1_weight.numel() == 0 or module.w2_weight.numel() == 0:
+            return
+
+        w3_w1_permute_indices = self._get_w3_w1_permute_indices(
+            module.w3_w1_weight.data[0],
+            is_gated_act_gemm=getattr(module, "is_gated_activation", True))
+        w2_permute_indices = self._get_w2_permute_indices(
+            module.w2_weight.data[0])
+
+        processed_w3_w1 = torch.stack([
+            _prepare_bf16_weight_for_trtllm_gen(expert, w3_w1_permute_indices,
+                                                self.block_k)
+            for expert in module.w3_w1_weight.data
+        ])
+        processed_w2 = torch.stack([
+            _prepare_bf16_weight_for_trtllm_gen(expert, w2_permute_indices,
+                                                self.block_k)
+            for expert in module.w2_weight.data
+        ])
+
+        replace_parameter_and_save_metadata(module, "w3_w1_weight",
+                                            processed_w3_w1,
+                                            module.rebuild_tensor_metadata)
+        replace_parameter_and_save_metadata(module, "w2_weight", processed_w2,
+                                            module.rebuild_tensor_metadata)
 
 
 def load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
