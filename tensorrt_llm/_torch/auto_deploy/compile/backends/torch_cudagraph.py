@@ -261,11 +261,13 @@ class PiecewiseCapturedGraph(nn.Module):
         model: nn.Module,
         piecewise_num_tokens: Optional[List[int]] = None,
         capture_lm_head: bool = False,
+        max_batch_size: Optional[int] = None,
     ):
         super().__init__()
         self.original_model = model
         self.piecewise_num_tokens = piecewise_num_tokens or []
         self.capture_lm_head = capture_lm_head
+        self.max_batch_size = max_batch_size
         self.split_info: Optional[SplitInfo] = None
         self.split_gm: Optional[GraphModule] = None
         self._is_prepared = False
@@ -364,7 +366,7 @@ class PiecewiseCapturedGraph(nn.Module):
 
                 if not needs_out_buffer(submod):
                     if is_metadata_prep(submod):
-                        wrapper = MetadataWrapper(submod)
+                        wrapper = MetadataWrapper(submod, max_batch_size=self.max_batch_size)
                         setattr(self.split_gm, submod_name, wrapper)
                         num_metadata_wrapped += 1
                         ad_logger.info(
@@ -728,6 +730,11 @@ class TorchCudagraphCompiler(CompilerBackend):
             piecewise = PiecewiseCapturedGraph(
                 model=self.model,
                 piecewise_num_tokens=self.piecewise_num_tokens,
+                max_batch_size=(
+                    self.piecewise_seq_info.max_batch_size
+                    if self.piecewise_seq_info is not None
+                    else None
+                ),
             )
             piecewise.prepare()
 

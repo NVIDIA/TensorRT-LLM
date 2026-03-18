@@ -80,6 +80,91 @@ class SegmentEntry:
     input_addresses: List[Optional[int]] = field(default_factory=list)
 
 
+_METADATA_PAD_ALIGN = 64
+_MAMBA_METADATA_OP_NAME = "mamba_ssm_prepare_metadata"
+
+
+def _contains_mamba_metadata_prep(submodule: nn.Module) -> bool:
+    graph = getattr(submodule, "graph", None)
+    if graph is None:
+        return False
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        target = node.target
+        name = target.name() if hasattr(target, "name") else str(target)
+        if _MAMBA_METADATA_OP_NAME in name:
+            return True
+    return False
+
+
+def _align_up(value: int, align: int) -> int:
+    if align <= 1:
+        return value
+    return ((value + align - 1) // align) * align
+
+
+def _alloc_stable_metadata_tensor(
+    tensor: torch.Tensor,
+    num_tokens: int,
+    max_batch_size: int,
+    pad_for_mamba_metadata: bool,
+) -> torch.Tensor:
+    """Allocate one stable metadata tensor with optional Mamba headroom."""
+    if tensor.ndim == 0:
+        return tensor.clone()
+
+    # Only Mamba metadata prep has known runtime growth beyond capture shape
+    # due to misaligned sequence boundaries.
+    extra = max(0, max_batch_size - 1) if pad_for_mamba_metadata else 0
+
+    if tensor.ndim == 1:
+        padded_len = _align_up(tensor.shape[0] + extra, _METADATA_PAD_ALIGN)
+        buf = torch.zeros((padded_len,), dtype=tensor.dtype, device=tensor.device)
+        buf[: tensor.shape[0]].copy_(tensor)
+        return buf
+
+    # Common metadata shape: [1, N] (e.g., seq_idx_prefill). Grow only token dim.
+    if tensor.ndim == 2 and tensor.shape[0] == 1:
+        padded_len = min(
+            _align_up(tensor.shape[1] + extra, _METADATA_PAD_ALIGN),
+            _align_up(max(num_tokens, tensor.shape[1]), _METADATA_PAD_ALIGN),
+        )
+        buf = torch.zeros((1, padded_len), dtype=tensor.dtype, device=tensor.device)
+        buf[:, : tensor.shape[1]].copy_(tensor)
+        return buf
+
+    # Fallback: only grow the leading dimension.
+    padded_shape = list(tensor.shape)
+    padded_shape[0] = _align_up(tensor.shape[0] + extra, _METADATA_PAD_ALIGN)
+    buf = torch.zeros(tuple(padded_shape), dtype=tensor.dtype, device=tensor.device)
+    slices = (slice(0, tensor.shape[0]),) + tuple(slice(None) for _ in range(tensor.ndim - 1))
+    buf[slices].copy_(tensor)
+    return buf
+
+
+def _alloc_stable_metadata_result(
+    result: Any,
+    num_tokens: int,
+    max_batch_size: int,
+    pad_for_mamba_metadata: bool,
+) -> Tuple[torch.Tensor, ...]:
+    if isinstance(result, torch.Tensor):
+        return (
+            _alloc_stable_metadata_tensor(
+                result, num_tokens, max_batch_size, pad_for_mamba_metadata
+            ),
+        )
+    if isinstance(result, (tuple, list)):
+        return tuple(
+            _alloc_stable_metadata_tensor(t, num_tokens, max_batch_size, pad_for_mamba_metadata)
+            if isinstance(t, torch.Tensor)
+            else t
+            for t in result
+        )
+    return ()
+
+
 class MetadataWrapper(nn.Module):
     """Wraps a metadata-prep dynamic op to give its outputs stable addresses.
 
@@ -87,16 +172,25 @@ class MetadataWrapper(nn.Module):
     freshly allocated tensors.  After torch.cuda.empty_cache(), those addresses
     change, which breaks any downstream CUDA graph that captured them.
 
-    Fix: on the capture pass we clone the outputs (tiny int32 metadata tensors)
-    and return the clones so the downstream CUDA graph records *clone* addresses.
-    On replay we run the op eagerly, copy_() the real results into the clones,
-    and return the clones — same addresses, correct data.
+    Fix: on the capture pass we allocate stable buffers larger than the observed
+    capture output when wrapping Mamba metadata prep
+    (auto_deploy::mamba_ssm_prepare_metadata). For this op, runtime output can
+    exceed capture output by up to (max_batch_size - 1) due to extra logical
+    chunks from misaligned sequence boundaries in multi-sequence batches.
+    On replay we copy_() the real results into those stable buffers and return
+    the full padded tensors — same address and shape as capture time.
+    Downstream dynamic ops determine how much to read from batch metadata
+    (cu_seqlens, batch_info_host), so extra zeros are never accessed.
     """
 
-    def __init__(self, submodule: nn.Module):
+    def __init__(self, submodule: nn.Module, max_batch_size: Optional[int] = None):
         super().__init__()
         self.submodule = submodule
-        # {num_tokens: tuple of cloned output tensors}
+        self.max_batch_size = (
+            max_batch_size if max_batch_size is not None and max_batch_size > 0 else 1
+        )
+        self._pad_for_mamba_metadata = _contains_mamba_metadata_prep(submodule)
+        # {num_tokens: tuple of stable output tensors (sized to bucket upper bound)}
         self._stable_outputs: Dict[int, Tuple[torch.Tensor, ...]] = {}
 
     def forward(self, *args, **kwargs) -> Any:
@@ -109,9 +203,9 @@ class MetadataWrapper(nn.Module):
             return result
 
         if phase == "capture":
-            clones = self._clone_result(result)
-            self._stable_outputs[nt] = clones
-            return self._rebuild_result(result, clones)
+            padded = self._alloc_padded(result, nt)
+            self._stable_outputs[nt] = padded
+            return self._rebuild_result(result, padded)
 
         # replay
         saved = self._stable_outputs.get(nt)
@@ -120,13 +214,13 @@ class MetadataWrapper(nn.Module):
         self._copy_into_saved(result, saved)
         return self._rebuild_result(result, saved)
 
-    @staticmethod
-    def _clone_result(result: Any) -> Tuple[torch.Tensor, ...]:
-        if isinstance(result, torch.Tensor):
-            return (result.clone(),)
-        if isinstance(result, (tuple, list)):
-            return tuple(t.clone() if isinstance(t, torch.Tensor) else t for t in result)
-        return ()
+    def _alloc_padded(self, result: Any, num_tokens: int) -> Tuple[torch.Tensor, ...]:
+        return _alloc_stable_metadata_result(
+            result=result,
+            num_tokens=num_tokens,
+            max_batch_size=self.max_batch_size,
+            pad_for_mamba_metadata=self._pad_for_mamba_metadata,
+        )
 
     @staticmethod
     def _copy_into_saved(result: Any, saved: Tuple[torch.Tensor, ...]) -> None:
@@ -143,7 +237,14 @@ class MetadataWrapper(nn.Module):
 
     @staticmethod
     def _rebuild_result(original: Any, saved: Tuple[torch.Tensor, ...]) -> Any:
-        """Return saved tensors in the same container type as the original."""
+        """Return saved tensors in the same container type as the original.
+
+        The saved tensors are returned at their full (padded) shape — no
+        truncation.  Downstream static CUDA graph segments record this padded
+        shape at capture time and replay with the same shape.  Dynamic ops
+        (SSM kernels) determine how much to read from batch_info / cu_seqlens,
+        so extra zero-padded elements are never accessed.
+        """
         if isinstance(original, torch.Tensor):
             return saved[0]
         if isinstance(original, tuple):
