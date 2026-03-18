@@ -6363,6 +6363,38 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_device_not_contain(["GB200"])
+    def test_nvfp4_4gpus_online_eplb(self):
+
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="float16",
+            free_gpu_memory_fraction=0.5,
+        )
+        eplb_config = MoeLoadBalancerConfig(num_slots=576,
+                                            layer_updates_per_iter=2)
+        pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
+            max_batch_size=32, enable_padding=True),
+                              moe_config=MoeConfig(backend="WIDEEP",
+                                                   load_balancer=eplb_config))
+
+        with LLM(
+                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                kv_cache_config=kv_cache_config,
+                max_batch_size=32,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                enable_attention_dp=True,
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
     @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(40000)
