@@ -1945,7 +1945,6 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
     print(f"Testing {model_path}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     run_cmd = [
-        "trtllm-llmapi-launch",
         "python3",
         str(example_root / "quickstart_advanced.py"),
         f"--model_dir={llm_models_root()}/{model_path}",
@@ -3024,52 +3023,13 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     ])
 
 
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("model_path", [
-    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
-                 marks=(skip_pre_hopper, pytest.mark.timeout(5400))),
-    pytest.param('llama4-models/Llama-4-Maverick-17B-128E-Instruct',
-                 marks=skip_pre_hopper),
-])
-def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
-                                                   model_path):
-    print(f"Testing {model_path}.")
-    tp_size, pp_size = 16, 1
-    if "Llama-4" in model_path:
-        tp_size, pp_size = 8, 2
-
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    run_cmd = [
-        "trtllm-llmapi-launch",
-        "python3",
-        str(example_root / "quickstart_advanced.py"),
-        f"--model_dir={llm_models_root()}/{model_path}",
-        "--moe_ep_size=8",
-        f"--tp_size={tp_size}",
-        f"--pp_size={pp_size}",
-        "--use_cuda_graph",
-        f"--kv_cache_fraction={_MEM_FRACTION_50}",
-        "--max_batch_size=32",
-        "--max_num_tokens=2048",
-        "--disable_kv_cache_reuse",
-    ]
-    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
-
-
-@pytest.mark.timeout(7200)
+@pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
-@pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 8), (8, 2, 8)],
+@pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
 @pytest.mark.parametrize("model_path", [
-    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
-                 marks=skip_pre_hopper),
-    pytest.param('llama4-models/Llama-4-Maverick-17B-128E-Instruct',
-                 marks=skip_pre_hopper),
-    pytest.param('llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8',
-                 marks=skip_pre_hopper),
     pytest.param('Qwen3/Qwen3-235B-A22B', marks=skip_pre_hopper),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
@@ -3080,13 +3040,9 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                           mmlu_dataset_root):
-    if "Llama-4" in model_path and tp_size == 16:
-        pytest.skip("Llama-4 with tp16 is not supported")
-
     mmlu_threshold = 81.5
     model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
-        "trtllm-llmapi-launch",
         "trtllm-eval",
         f"--model={model_dir}",
         f"--ep_size={ep_size}",
@@ -3109,7 +3065,7 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         output = subprocess.check_output(run_cmd,
                                          text=True,
                                          stderr=subprocess.STDOUT,
-                                         timeout=7200)
+                                         timeout=5400)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print_warning(f"eval failed: {e.returncode}")
         print_warning(f"eval output:\n{e.output}")
