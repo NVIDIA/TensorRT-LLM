@@ -20,7 +20,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
 
 
@@ -44,6 +44,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
     def page_table(self) -> KVCachePageTable:
         return self._page_table
 
+    @nvtx_range("KVRegionExtractorV1.extract")
     def extract(
         self,
         region_ids: np.ndarray,
