@@ -183,9 +183,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
                 )
                 if not self.kv_cache_manager.prepare_context(req):
-                    logger.debug(
-                        "prepare_context failed for encoder request %s",
-                        req.py_request_id)
+                    logger.debug("prepare_context failed for encoder request %s", req.py_request_id)
                     break
                 if self.kv_cache_manager.resize_context(req, req_tokens):
                     self._commit_peft(req, peft_pages)
@@ -222,8 +220,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     # context_remaining_length before budget check.
                     if not self.kv_cache_manager.prepare_context(req):
                         logger.debug(
-                            "prepare_context failed for context request %s",
-                            req.py_request_id)
+                            "prepare_context failed for context request %s", req.py_request_id
+                        )
                         break
 
                     context_tokens = req.context_remaining_length
@@ -322,9 +320,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # 2. Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug(
-                "prepare_context failed for chunked context request %s",
-                req.py_request_id)
+            logger.debug("prepare_context failed for chunked context request %s", req.py_request_id)
             return
 
         # 3. Calculate chunk size from remaining budget
