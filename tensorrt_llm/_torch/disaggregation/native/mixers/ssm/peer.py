@@ -8,6 +8,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegion,
     SpecRegionPair,
 )
+from tensorrt_llm._utils import nvtx_range
 
 
 class MambaHeadMatchMapper(RegionMapperBase):
@@ -36,6 +37,7 @@ class MambaHeadMatchMapper(RegionMapperBase):
         self._dst_layer_off = dst_layer_off
         self._block_bytes = block_bytes_per_layer
 
+    @nvtx_range("MambaHeadMatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -105,6 +107,7 @@ class MambaHeadMismatchMapper(RegionMapperBase):
             self._bytes_cont_heads,
         )
 
+    @nvtx_range("MambaHeadMismatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -186,6 +189,7 @@ class ConvStateMismatchMapper(RegionMapperBase):
         self._section_src_offs = np.array([p[0] for p in self._section_plans], dtype=np.int64)
         self._section_dst_offs = np.array([p[1] for p in self._section_plans], dtype=np.int64)
 
+    @nvtx_range("ConvStateMismatchMapper.map")
     def map(
         self,
         src_regions: SpecRegion,

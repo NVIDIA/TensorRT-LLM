@@ -9,6 +9,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.utils import PoolRole
+from tensorrt_llm._utils import nvtx_range
 
 
 class IdentityMapper(RegionMapperBase):
@@ -23,6 +24,7 @@ class IdentityMapper(RegionMapperBase):
     dst_ptrs: [ D0 ] [ D1 ] [ D2 ] ...
     """
 
+    @nvtx_range("IdentityMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -88,6 +90,7 @@ class HeadMatchMapper(RegionMapperBase):
             dst_layer_off, slot_size_per_layer=slot_size_per_layer
         )
 
+    @nvtx_range("HeadMatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -164,36 +167,68 @@ class HeadMismatchMapper(RegionMapperBase):
             peer_tp_rank,
             self._bytes_cont_heads,
         )
-        self._layer_indices = np.arange(transfer_layers, dtype=np.int64)
-        self._kv_indices = np.arange(kv_factor, dtype=np.int64)
         self._peer_layer_off = peer_layer_off
 
+        # --- Pre-compute flat 1D offset arrays ---
+        #
+        # Each KV cache block (slot) is laid out as:
+        #
+        #   block_base ──► [layer_0 kv_0] [layer_0 kv_1] [layer_1 kv_0] [layer_1 kv_1] ...
+        #                   ◄─ layer_kv ─► ◄─ layer_kv ─►
+        #                   ◄────── layer_num (= layer_kv * kv_factor) ──────►
+        #
+        # To address fragment (layer=j, kv=k) within a block at base_ptr:
+        #
+        #   frag_ptr = base_ptr
+        #            + layer_num * (layer_off + j)    # skip to the right layer
+        #            + layer_kv  * k                  # skip to key or value
+        #            + head_off                       # head offset for TP mismatch
+        #
+        # The original code computed this as a 3D broadcast in map():
+        #   bases[:, None, None] + layer_offsets[None, :, None]
+        #                        + kv_offsets[None, None, :] + head_off
+        # producing shape (n_blocks, transfer_layers, kv_factor) then .ravel().
+        #
+        # Optimization: since the (layer, kv) offsets are independent of the
+        # per-call block base pointers, we pre-compute them here as a flat 1D
+        # array of length (transfer_layers * kv_factor).  At map() time we only
+        # need np.add.outer(bases, flat_offsets).ravel(), which produces the
+        # same result in the same C-order traversal (blocks outer, offsets inner)
+        # but with fewer intermediate allocations.
+        layer_indices = np.arange(transfer_layers, dtype=np.int64)
+        kv_indices = np.arange(kv_factor, dtype=np.int64)
+
+        src_layer_kv_num = self._get_layer_kv_num(self._ri)
+        src_layer_num = src_layer_kv_num * kv_factor
+        # Shape (transfer_layers, kv_factor) → ravel to 1D
+        self._src_flat_offsets = (
+            src_layer_num * (src_layer_off + layer_indices)[:, None]
+            + src_layer_kv_num * kv_indices[None, :]
+            + self._src_head_off
+        ).ravel()
+
+        dst_layer_kv_num = self._get_layer_kv_num(self._peer_ri)
+        dst_layer_num = dst_layer_kv_num * kv_factor
+        self._dst_flat_offsets = (
+            dst_layer_num * (peer_layer_off + layer_indices)[:, None]
+            + dst_layer_kv_num * kv_indices[None, :]
+            + self._dst_head_off
+        ).ravel()
+
+    @nvtx_range("HeadMismatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
         assert src_group.ptrs.size == dst_group.ptrs.size, (
             f"Number of regions of src({src_group.ptrs.size}) and dst({dst_group.ptrs.size}) must match"
         )
-        src_bases = np.array(src_group.ptrs, dtype=np.int64)
-        dst_bases = np.array(dst_group.ptrs, dtype=np.int64)
-        src_frags = self._get_frags(
-            bases=src_bases,
-            layer_indices=self._src_layer_off + self._layer_indices,
-            layer_kv_num=self._get_layer_kv_num(self._ri),
-            kv_indices=self._kv_indices,
-            head_off=self._src_head_off,
-            kv_factor=self._kv_indices.size,
-        )
-        dst_frags = self._get_frags(
-            bases=dst_bases,
-            layer_indices=self._peer_layer_off + self._layer_indices,
-            layer_kv_num=self._get_layer_kv_num(self._peer_ri),
-            kv_indices=self._kv_indices,
-            head_off=self._dst_head_off,
-            kv_factor=self._kv_indices.size,
-        )
-        all_src_ptrs = src_frags.ravel()
-        all_dst_ptrs = dst_frags.ravel()
+        # np.add.outer(ptrs, offsets) produces every (base + offset) combination:
+        #   shape (n_blocks, transfer_layers * kv_factor)
+        # .ravel() flattens in C-order: for each block, emit all layer×kv fragments.
+        # This is equivalent to the original 3D broadcast + ravel, but the per-(layer,kv)
+        # offsets are pre-computed in __init__ so map() does a single vectorized add.
+        all_src_ptrs = np.add.outer(src_group.ptrs, self._src_flat_offsets).ravel()
+        all_dst_ptrs = np.add.outer(dst_group.ptrs, self._dst_flat_offsets).ravel()
         new_src = MemRegionGroup(ptrs=all_src_ptrs, bytes_per_region=self._bytes_cont_heads)
         new_dst = MemRegionGroup(ptrs=all_dst_ptrs, bytes_per_region=self._bytes_cont_heads)
         return SpecRegionPair(
@@ -226,16 +261,6 @@ class HeadMismatchMapper(RegionMapperBase):
             * ri.attention.element_bytes
         )
 
-    @staticmethod
-    def _get_frags(bases, layer_indices, layer_kv_num, kv_indices, head_off, kv_factor):
-        layer_num = layer_kv_num * kv_factor
-        return (
-            bases[:, None, None]
-            + layer_num * layer_indices[None, :, None]
-            + layer_kv_num * kv_indices[None, None, :]
-            + head_off
-        )
-
 
 class IndexerKCacheHeadMatchMapper(RegionMapperBase):
     """
@@ -263,6 +288,7 @@ class IndexerKCacheHeadMatchMapper(RegionMapperBase):
         self._src_block_off = block_size_per_layer * src_layer_off
         self._dst_block_off = block_size_per_layer * dst_layer_off
 
+    @nvtx_range("IndexerKCacheHeadMatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
