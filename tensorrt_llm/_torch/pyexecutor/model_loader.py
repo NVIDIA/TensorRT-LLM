@@ -499,8 +499,11 @@ class ModelLoader:
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
         # Store allreduce pre-allocation config for AllReduce module access
         config.extra_attrs['allreduce_max_num_tokens'] = config.max_num_tokens
-        config.extra_attrs[
-            'allreduce_hidden_size'] = config.pretrained_config.hidden_size
+        # VLM wrapper configs (e.g. NemotronH_Nano_VL_V2_Config, KimiK25Config)
+        # may not expose hidden_size at the top level.  The consumer in ops.py
+        # already handles None gracefully, so skip pre-allocation rather than crash.
+        config.extra_attrs['allreduce_hidden_size'] = getattr(
+            config.pretrained_config, 'hidden_size', None)
         config.extra_attrs[
             'allreduce_dtype'] = config.pretrained_config.torch_dtype
 
