@@ -9,7 +9,7 @@ metadata:
   benchmark_type: 1k1k
   accuracy:
     datasets:
-    - dataset_name: gsm8k
+    - dataset_name: gsm8k_local
       expected_value: 0.9454
       threshold_type: hypothesis_test
       filter_type: flexible-extract
