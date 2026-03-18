@@ -334,9 +334,7 @@ class KVCacheAwareADPRouter(ADPRouter):
 
     needs_prefix_matches: bool = True
 
-    def __init__(
-        self, dist: "Distributed", kv_cache_manager, load_balance_weight: float = 1.0
-    ):
+    def __init__(self, dist: "Distributed", kv_cache_manager, load_balance_weight: float = 1.0):
         super().__init__(dist)
         self.kv_cache_manager = kv_cache_manager
         self.load_balance_weight = load_balance_weight
