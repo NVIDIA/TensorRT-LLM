@@ -89,6 +89,102 @@ uv pip install --no-build-isolation .   # Build and install
 
 ## Run
 
-Copy `inference.py` and `multiview.py` to Cosmos Predict2.5's [exmaples folder](https://github.com/nvidia-cosmos/cosmos-predict2.5/tree/main/examples). They will overwrite the original files so that you can see what we modified by `git diff`.
+Copy `inference.py` and `multiview.py` to Cosmos Predict2.5's [examples folder](https://github.com/nvidia-cosmos/cosmos-predict2.5/tree/main/examples). They will overwrite the original files so that you can see what we modified by `git diff`.
 
 After that, you can run the codes follow Cosmos's [guide](https://github.com/nvidia-cosmos/cosmos-predict2.5/blob/main/docs/inference.md#example),
+
+
+## DGX Spark (Beta)
+
+The `Dockerfile` in this directory builds a self-contained environment on top of
+`nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4`, which already ships TensorRT-LLM,
+PyTorch, CUDA, TransformerEngine, and flashinfer-python. This is the recommended
+path for DGX Spark (GB10 Blackwell).
+
+### Prerequisites
+
+- Hugging Face access token (read permission)
+- License agreements accepted on Hugging Face for:
+  - [nvidia/Cosmos-Predict2.5-2B](https://huggingface.co/nvidia/Cosmos-Predict2.5-2B)
+  - [nvidia/Cosmos-Reason1-7B](https://huggingface.co/nvidia/Cosmos-Reason1-7B)
+  - [nvidia/Cosmos-Guardrail1](https://huggingface.co/nvidia/Cosmos-Guardrail1)
+
+### Build
+
+Run from the `visual_gen` root:
+
+```bash
+cd tensorrt_llm/visual_gen
+
+docker build \
+  -f examples/cosmos_predict2.5/Dockerfile \
+  -t cosmos-env .
+```
+
+Build arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `BASE_IMAGE` | `nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4` | Base container |
+| `COSMOS_PREDICT_REF` | `07563da955076ac5fac18617f7d5751e92cf0a04` | cosmos-predict2.5 commit |
+| `COSMOS_TRANSFER_REF` | `3f38bef7c5baaa2cffc24af08137cfbda7482b82` | cosmos-transfer2.5 v1.3.2 commit |
+| `VISUAL_GEN_REF` | `feat/visual_gen` | TensorRT-LLM branch for visual_gen |
+
+### Run the container
+
+```bash
+docker run --rm -it \
+  --runtime=nvidia \
+  --ipc=host \
+  -v /your/hf-cache:/root/.cache/huggingface \
+  -e HF_TOKEN="$HF_TOKEN" \
+  cosmos-env
+```
+
+### Inference
+
+Model checkpoints are downloaded automatically from Hugging Face on first run.
+Mount a persistent cache (`-v /your/hf-cache:/root/.cache/huggingface`) to avoid
+re-downloading across runs.
+
+Inside the container:
+```bash
+# Pull sample assets (LFS objects not included in the image)
+git -C /opt/cosmos-predict2.5 lfs pull
+
+# Copy the visual_gen inference script
+cp /opt/visual_gen/examples/cosmos_predict2.5/inference.py \
+   /opt/cosmos-predict2.5/examples/inference.py
+
+cd /opt/cosmos-predict2.5
+
+# TEXT2WORLD
+python examples/inference.py \
+  -i assets/base/snowy_stop_light.json \
+  -o outputs/text2world \
+  --inference-type=TEXT2WORLD
+
+# VIDEO2WORLD
+python examples/inference.py \
+  -i assets/base/robot_pouring.json \
+  -o outputs/video2world \
+  --inference-type=VIDEO2WORLD
+
+# IMAGE2WORLD
+python examples/inference.py \
+  -i assets/base/robot_welding.json \
+  -o outputs/image2world \
+  --inference-type=IMAGE2WORLD
+```
+
+### What's inside the image
+
+| Component | Location |
+|---|---|
+| cosmos-predict2.5 | `/opt/cosmos-predict2.5` |
+| cosmos-transfer2.5 | `/opt/cosmos-transfer2.5` |
+| visual_gen | `/opt/visual_gen` |
+| SageAttention | system Python |
+| TensorRT-LLM | system Python (from base image) |
+| TransformerEngine | system Python (from base image) |
+| flashinfer-python | system Python (from base image) |

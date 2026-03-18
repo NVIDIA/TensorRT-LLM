@@ -21,6 +21,9 @@ from typing import Annotated, Optional
 import pydantic
 import torch
 import tyro
+
+# ADDED BY US #
+import visual_gen
 from cosmos_oss.init import cleanup_environment, init_environment, init_output_dir
 from cosmos_predict2.config import handle_tyro_exception, is_rank0
 from cosmos_predict2.multiview_config import (
@@ -32,10 +35,7 @@ from cosmos_predict2.multiview_config import (
 )
 from einops import rearrange
 from pydantic import model_validator
-
-# ADDED BY US #
-import visual_gen
-from visual_gen.layers import ditAttnProcessor, apply_visual_gen_linear
+from visual_gen.layers import apply_visual_gen_linear, ditAttnProcessor
 
 
 class ditCosmosAttention(torch.nn.Module):
@@ -62,7 +62,9 @@ class ditCosmosAttention(torch.nn.Module):
         return rearrange(results, "b ... h l -> b ... (h l)")
 
 
-def enable_visual_gen(pipe, args, cp_method="ulysses"):
+def enable_visual_gen(
+    pipe, args, attn_type=None, linear_type=None, recipe=None, cp_method="ulysses"
+):
     cp_size = args.context_parallel_size
     # we supported 3 cp methods: cp(allgather kv), ring, ulysses
     if cp_method == "cp":
@@ -74,18 +76,28 @@ def enable_visual_gen(pipe, args, cp_method="ulysses"):
     else:
         raise ValueError(f"Invalid cp method: {cp_method}")
 
-    # The perf may different on different SM versions and shapes. We recommend some examples here.
+    # The perf may differ on different SM versions and shapes. We recommend some examples here.
     sm_version = torch.cuda.get_device_capability()
-    attn_type = "default"  # `default`: pytorch bf16 attn. Hopper: `sage-attn`, `trtllm-attn`, `te`, `te-fp8`; Blackwell: `te`, `te-fp8`, `flash-attn4`.
-    if sm_version <= (9, 0):
-        attn_type = "sage-attn"
-    else:
-        attn_type = "te-fp8"
-    linear_type = "default"  # `default`: pytorch bf16 linear. Hopper: `trtllm-fp8-blockwise`, `trtllm-fp8-per-tensor`, `te-fp8-blockwise`, `te-fp8-per-tensor`; Blackwell: `trtllm-nvfp4`, `te-fp8-per-tensor`
-    if sm_version <= (9, 0):
-        linear_type = "trtllm-fp8-blockwise"
-    else:
-        linear_type = "te-fp8-per-tensor"
+    if attn_type is None:
+        attn_type = "default"  # `default`: pytorch bf16 attn.
+        if sm_version <= (9, 0):  # Hopper: `sage-attn`, `trtllm-attn`, `te`, `te-fp8`
+            attn_type = "sage-attn"
+        elif sm_version >= (12, 0):  # Blackwell SM120: `sage-attn`, `te`
+            attn_type = "sage-attn"
+        else:  # Blackwell: `te`, `te-fp8`, `flash-attn4`
+            attn_type = "te-fp8"
+    if linear_type is None:
+        linear_type = "default"  # `default`: pytorch bf16 linear.
+        if (
+            sm_version <= (9, 0)
+        ):  # Hopper: `trtllm-fp8-blockwise`, `trtllm-fp8-per-tensor`, `te-fp8-blockwise`, `te-fp8-per-tensor`
+            linear_type = "trtllm-fp8-blockwise"
+        elif sm_version >= (12, 0):  # Blackwell SM120: `trtllm-fp8-per-tensor`, `te-fp8-per-tensor`
+            linear_type = "trtllm-fp8-per-tensor"
+        else:  # Blackwell: `trtllm-nvfp4`, `te-fp8-per-tensor`
+            linear_type = "te-fp8-per-tensor"
+    if recipe is None:
+        recipe = "static"
 
     visual_gen.setup_configs(
         parallel={
@@ -95,7 +107,8 @@ def enable_visual_gen(pipe, args, cp_method="ulysses"):
             "type": attn_type,
         },
         linear={
-            "type": linear_type,  # `default`: pytorch bf16 linear. Hopper: `trtllm-fp8-blockwise`, `trtllm-fp8-per-tensor`, `te-fp8-blockwise`, `te-fp8-per-tensor`; Blackwell: `trtllm-nvfp4`, `te-fp8-per-tensor`
+            "type": linear_type,
+            "recipe": recipe,
         },
     )
     # replace the attention with visual_gen_cosmos_attention
@@ -122,10 +135,21 @@ class Args(pydantic.BaseModel):
     setup: MultiviewSetupArguments
     """Setup arguments. These can only be provided via CLI."""
     overrides: MultiviewInferenceOverrides
-    """Inference parameter overrides. These can either be provided in the input json file or via CLI. CLI overrides will overwrite the values in the input file."""
+    """Inference parameter overrides. These can either be provided in the input json file or via CLI.
+    CLI overrides will overwrite the values in the input file."""
     control: ViewConfig | None = None
-    """Run control:view-config --help for more information about view controls for each view in { front_wide, rear, rear_left, rear_right, cross_left, cross_right, front_tele}.
+    """Run control:view-config --help for more information about view controls for each view in
+    { front_wide, rear, rear_left, rear_right, cross_left, cross_right, front_tele}.
     These can only be provided via the json input file."""
+
+    # ADDED BY US #
+    attn_type: Optional[str] = None
+    """Attention kernel. Auto-selected by SM version if unset."""
+    linear_type: Optional[str] = None
+    """Linear kernel. Auto-selected by SM version if unset."""
+    recipe: Optional[str] = None
+    """Quantization recipe for the linear kernel (e.g. static, dynamic). Defaults to static if unset."""
+    # END OF US CODES #
 
     @model_validator(mode="after")
     def check_xor(self) -> "Args":
@@ -155,7 +179,9 @@ def main(
 
     multiview_inference = MultiviewInference(args.setup)
     # ADDED BY US #
-    enable_visual_gen(multiview_inference.pipe, args.setup)
+    enable_visual_gen(
+        multiview_inference.pipe, args.setup, args.attn_type, args.linear_type, args.recipe
+    )
     # END OF US CODES #
     multiview_inference.generate(inference_samples, output_dir=args.setup.output_dir)
 

@@ -1,0 +1,18 @@
+# tyro deps
+docstring-parser
+typeguard
+#
+# boto3 deps
+botocore
+jmespath
+s3transfer
+#
+# iopath deps
+portalocker
+#
+# multi-storage-client deps
+opentelemetry-api
+prettytable
+wcmatch
+bracex  # wcmatch dep
+xattr
