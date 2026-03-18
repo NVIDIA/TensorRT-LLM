@@ -136,14 +136,22 @@ template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typenam
 __device__ __forceinline__ void fused_op(
     PackedType const& val, int access_id, int token_id, int access_id_in_token, AllReduceFusionParams& params)
 {
-    float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
     float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
-    residual_val = add128<DType>(val, residual_val);
-    if constexpr (ResidualOut)
+    float4 norm_input;
+    if (params.residual_in)
     {
-        reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
+        float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
+        norm_input = add128<DType>(val, residual_val);
+        if constexpr (ResidualOut)
+        {
+            reinterpret_cast<float4*>(params.residual_out)[access_id] = norm_input;
+        }
     }
-    float4 norm_val = rms_norm<DType>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+    else
+    {
+        norm_input = val;
+    }
+    float4 norm_val = rms_norm<DType>(norm_input, gamma_val, params.rms_eps, params.hidden_dim);
     if constexpr (NormOut)
     {
         reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
@@ -443,7 +451,7 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }
 
-    TLLM_CHECK(params.residual_in && params.rms_gamma);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input
         && params.moe_reduction_token_input);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
@@ -731,6 +739,7 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
     }
 
     TLLM_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
     if (params.residual_out && not params.norm_out && params.quant_out)
