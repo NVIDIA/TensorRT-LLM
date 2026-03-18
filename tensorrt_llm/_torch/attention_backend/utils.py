@@ -2,6 +2,9 @@ from typing import Optional, Type
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
+from tensorrt_llm.logger import logger
+
 from ...models.modeling_utils import QuantConfig
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
@@ -10,6 +13,22 @@ from .sparse import (get_flashinfer_sparse_attn_attention_backend,
                      get_vanilla_sparse_attn_attention_backend)
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
+
+_SM120_FMHA_WARNING_LOGGED = False
+
+
+def _log_sm120_fmha_fallback_warning():
+    """Log a one-time warning that trtllm-gen FMHA is unavailable on SM120/SM121."""
+    global _SM120_FMHA_WARNING_LOGGED
+    if _SM120_FMHA_WARNING_LOGGED:
+        return
+    _SM120_FMHA_WARNING_LOGGED = True
+
+    sm = get_sm_version()
+    logger.warning(
+        "trtllm-gen FMHA cubins are not available for SM%d (Blackwell SM120 "
+        "family). The TRTLLM attention backend will use FMHA v2 fallback "
+        "kernels. Performance may differ from SM100/SM103 (B100/B200).", sm)
 
 
 def get_attention_backend(
@@ -21,6 +40,8 @@ def get_attention_backend(
             return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
         return VanillaAttention
     elif backend_name == "TRTLLM":
+        if is_sm_120f():
+            _log_sm120_fmha_fallback_warning()
         if sparse_attn_config is not None:
             return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
         return TrtllmAttention

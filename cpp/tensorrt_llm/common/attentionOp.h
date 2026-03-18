@@ -548,7 +548,8 @@ private:
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
     int mSM = tensorrt_llm::common::getSMVersion();
-    bool mUseTllmGen = (mSM >= 100) && (mSM != 120);
+    // SM120/SM121 (DGX Spark) lack trtllm-gen FMHA cubins; use FMHA v2 fallback.
+    bool mUseTllmGen = tensorrt_llm::common::isSM100Family();
     bool mForceMultiBlockWarned = false;
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();

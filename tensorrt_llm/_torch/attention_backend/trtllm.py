@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import get_sm_version, is_sm_120f, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -30,8 +30,30 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable.
-_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
+# Lazily resolved: SM120/SM121 lack trtllm-gen cubins, so the env var is
+# silently ignored on those architectures (checked on first use).
+_TRTLLM_GEN_ENV_REQUESTED = os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
+_TRTLLM_GEN_SM_CHECKED = False
+_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = False
+
+
+def _is_trtllm_gen_attention_enabled() -> bool:
+    """Check if trtllm-gen attention is enabled and available on this GPU."""
+    global _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION, _TRTLLM_GEN_SM_CHECKED
+    if _TRTLLM_GEN_SM_CHECKED:
+        return _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION
+    _TRTLLM_GEN_SM_CHECKED = True
+    if _TRTLLM_GEN_ENV_REQUESTED and is_sm_120f():
+        sm = get_sm_version()
+        logger.warning(
+            "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 is set but trtllm-gen FMHA "
+            "cubins are not available for SM%d (Blackwell SM120 family). "
+            "Ignoring the flag; attention will use thop FMHA v2 fallback.", sm)
+        _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = False
+    else:
+        _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = _TRTLLM_GEN_ENV_REQUESTED
+    return _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION
 
 
 @dataclass(kw_only=True, init=False)
@@ -523,7 +545,7 @@ class TrtllmAttentionWrapper:
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
         helix_active = self.helix_position_offsets is not None
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
+        if _is_trtllm_gen_attention_enabled() and not helix_active and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
