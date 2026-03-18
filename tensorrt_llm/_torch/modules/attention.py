@@ -914,12 +914,16 @@ class Attention(nn.Module):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
-        attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
-                                                  attn_metadata,
-                                                  all_reduce_params,
-                                                  self.mapping, self.mapping_o,
-                                                  self.layer_idx, lora_params,
-                                                  prefer_window_output=prefer_window_output)
+        attn_output = _helix_cp_output_projection(
+            self.o_proj,
+            attn_output,
+            attn_metadata,
+            all_reduce_params,
+            self.mapping,
+            self.mapping_o,
+            self.layer_idx,
+            lora_params,
+            prefer_window_output=prefer_window_output)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
