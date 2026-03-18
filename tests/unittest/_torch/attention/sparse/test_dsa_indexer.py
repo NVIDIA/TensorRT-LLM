@@ -5,8 +5,10 @@ This file tests:
 1. fp8_mqa_logits operation from the DeepGEMM library
 2. fp8_paged_mqa_logits operation with paged KV cache
 3. compute_cu_seqlen_kv_bounds utility for batched causal attention
+4. prepare/restore attention metadata for draft replay
 """
 
+import builtins
 import random
 from unittest.mock import Mock, patch
 
@@ -20,6 +22,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager, DSAtrtllmAttentionMetadata, Indexer,
     compute_cu_seqlen_kv_bounds_with_cache, split_prefill_chunks)
+from tensorrt_llm._torch.speculative.interface import (
+    prepare_attn_metadata_for_draft_replay,
+    restore_attn_metadata_after_draft_replay)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -2409,3 +2414,53 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
         assert avg_similarity >= 0.95, \
             f"Custom vs indexer skip differ: avg similarity {avg_similarity:.4f} < 0.95"
+
+
+class TestPrepareRestoreAttnMetadataForDraftReplay:
+    """Tests for prepare_attn_metadata_for_draft_replay and
+    restore_attn_metadata_after_draft_replay."""
+
+    @staticmethod
+    def _make_mock_metadata():
+        meta = Mock()
+        meta.kv_cache_manager = Mock(name="target_kv_cache_manager")
+        meta.kv_cache_block_offsets = torch.tensor([10, 20, 30])
+        meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
+        meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        return meta
+
+    @staticmethod
+    def _make_mock_draft_manager():
+        mgr = Mock(name="draft_kv_cache_manager")
+        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        return mgr
+
+    def test_prepare_swaps_and_restore_recovers(self):
+        from tensorrt_llm._torch.attention_backend.trtllm import \
+            TrtllmAttentionMetadata
+
+        meta = self._make_mock_metadata()
+        mgr = self._make_mock_draft_manager()
+        original_kv_mgr = meta.kv_cache_manager
+        original_offsets = meta.kv_cache_block_offsets.clone()
+        original_host_offsets = meta.host_kv_cache_block_offsets.clone()
+
+        with patch('tensorrt_llm._torch.speculative.interface.isinstance',
+                   side_effect=lambda obj, cls:
+                   (obj is meta if cls is TrtllmAttentionMetadata else False
+                    if cls.__name__ == 'DSAtrtllmAttentionMetadata' else
+                    builtins.isinstance(obj, cls))):
+            saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
+
+        assert saved is not None
+        assert saved['target_kv_cache_manager'] is original_kv_mgr
+        assert meta.kv_cache_manager is mgr
+        assert 'saved_dsa_state' not in saved
+
+        restore_attn_metadata_after_draft_replay(meta, saved)
+
+        assert meta.kv_cache_manager is original_kv_mgr
+        torch.testing.assert_close(meta.kv_cache_block_offsets,
+                                   original_offsets)
+        torch.testing.assert_close(meta.host_kv_cache_block_offsets,
+                                   original_host_offsets)

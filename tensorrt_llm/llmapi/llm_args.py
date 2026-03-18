@@ -2748,6 +2748,8 @@ class BaseLlmArgs(StrictBaseModel):
             TOKENIZER_ALIASES = {
                 'deepseek_v32':
                 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+                'glm_moe_dsa':
+                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
             }
 
             tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,

@@ -39,6 +39,89 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     return spec_config._allow_separate_draft_kv_cache
 
 
+def prepare_attn_metadata_for_draft_replay(attn_metadata,
+                                           draft_kv_cache_manager):
+    """
+    Prepare attention metadata for CUDA graph replay when using separate draft KV cache.
+    Swaps to draft manager and (for DSA) re-prepares indexer slot mappings for the current
+    batch. Call restore_attn_metadata_after_draft_replay after replay in a finally block.
+    Returns saved state or None if no-op.
+    """
+    if draft_kv_cache_manager is None:
+        return None
+    if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+        return None
+    draft_block_offsets = getattr(attn_metadata, 'draft_kv_cache_block_offsets',
+                                  None)
+    if draft_block_offsets is None:
+        return None
+
+    saved = {
+        'target_kv_cache_manager':
+        attn_metadata.kv_cache_manager,
+        'target_kv_cache_block_offsets':
+        attn_metadata.kv_cache_block_offsets,
+        'target_host_kv_cache_block_offsets':
+        attn_metadata.host_kv_cache_block_offsets,
+    }
+    attn_metadata.kv_cache_manager = draft_kv_cache_manager
+    attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+    attn_metadata.host_kv_cache_block_offsets = (
+        draft_kv_cache_manager.host_kv_cache_block_offsets)
+
+    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                Indexer)
+    if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
+            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
+        m = attn_metadata
+        saved['saved_dsa_state'] = {
+            'host_indexer_k_cache_block_offsets':
+            m.host_indexer_k_cache_block_offsets.clone(),
+            'indexer_k_cache_block_offsets':
+            m.indexer_k_cache_block_offsets.clone(),
+            'host_slot_mapping_fp8':
+            m.host_slot_mapping_fp8.clone(),
+            'host_slot_mapping_scale':
+            m.host_slot_mapping_scale.clone(),
+            'slot_mapping_fp8':
+            m.slot_mapping_fp8.clone(),
+            'slot_mapping_scale':
+            m.slot_mapping_scale.clone(),
+        }
+        block_ids_per_seq = draft_kv_cache_manager.get_block_ids_per_seq(
+            m.request_ids)
+        num_blocks = block_ids_per_seq.shape[1]
+        m.host_indexer_k_cache_block_offsets[:len(
+            block_ids_per_seq), :num_blocks].copy_(block_ids_per_seq)
+        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
+            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
+            non_blocking=True)
+        Indexer.recompute_slot_mappings(m)
+    return saved
+
+
+def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
+    """Restore attention metadata after draft replay. No-op if saved_state is None."""
+    if saved_state is None:
+        return
+    attn_metadata.kv_cache_manager = saved_state['target_kv_cache_manager']
+    attn_metadata.kv_cache_block_offsets = (
+        saved_state['target_kv_cache_block_offsets'])
+    attn_metadata.host_kv_cache_block_offsets = (
+        saved_state['target_host_kv_cache_block_offsets'])
+    saved_dsa = saved_state.get('saved_dsa_state')
+    if saved_dsa is not None:
+        m = attn_metadata
+        m.host_indexer_k_cache_block_offsets.copy_(
+            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
+        m.indexer_k_cache_block_offsets.copy_(
+            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
+        m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
+        m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
+        m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
+        m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+
+
 def get_force_num_accepted_tokens() -> int:
     """
     Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment variable.

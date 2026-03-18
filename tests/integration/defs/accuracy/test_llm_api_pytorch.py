@@ -6550,3 +6550,34 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestGLM5FP8(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5-FP8"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5-FP8"
+
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    @pytest.mark.skip_less_device(8)
+    def test_8gpus(self, tp_size, ep_size):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="DEEPGEMM"),
+            speculative_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+            enable_chunked_prefill=True,
+            custom_tokenizer="glm_moe_dsa",
+        )
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
