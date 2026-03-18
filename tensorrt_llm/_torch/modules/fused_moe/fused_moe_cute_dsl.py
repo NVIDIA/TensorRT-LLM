@@ -385,7 +385,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if quant_algo == QuantAlgo.NVFP4:
             if sm_version not in {100, 103, 120, 121}:
                 return _warn_and_return(
-                    f"NVFP4 requires Blackwell (SM100/103/120/121), got SM{sm_version}")
+                    f"NVFP4 requires Blackwell (SM100/103/120/121), got SM{sm_version}"
+                )
             return True, None
 
         return _warn_and_return(
