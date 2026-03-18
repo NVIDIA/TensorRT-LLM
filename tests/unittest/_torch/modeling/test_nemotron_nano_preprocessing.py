@@ -1,13 +1,16 @@
 """Preprocessing unit tests for modeling_nemotron_nano.py."""
 
 import random
+from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
+    AUDIO_PLACEHOLDER,
     DynamicResolutionImageTiler,
     DynamicResolutionParams,
     NanoV2VLInputProcessor,
@@ -162,12 +165,26 @@ def test_compute_params_raises_on_unconvergeable():
 
 def _make_processor(**overrides):
     """Create a NanoV2VLInputProcessor with mocked heavy dependencies."""
+    return _make_nano_processor(sound_config=None, **overrides)
+
+
+def _make_nano_processor(*, sound_config, **overrides):
+    """Shared factory for NanoV2VLInputProcessor with mocked heavy deps.
+
+    Args:
+        sound_config: Value for config.sound_config (None disables audio).
+        **overrides: Forwarded to config fields and hf_processor attributes.
+    """
     hf_processor = mock.Mock()
     hf_processor.max_num_tiles = overrides.get("max_num_tiles", 6)
     hf_processor.use_thumbnail = overrides.get("use_thumbnail", True)
 
     tokenizer = mock.Mock()
-    tokenizer.encode = mock.Mock(side_effect=lambda text, **kw: list(range(len(text))))
+    tokenizer.encode = mock.Mock(
+        side_effect=lambda text, **kw: torch.tensor(list(range(len(text))))
+        if kw.get("return_tensors") == "pt"
+        else list(range(len(text)))
+    )
 
     config = mock.Mock()
     config.torch_dtype = torch.bfloat16
@@ -187,6 +204,8 @@ def _make_processor(**overrides):
         "min_num_patches": overrides.get("min_num_patches", 1024),
         "max_num_patches": overrides.get("max_num_patches", 13312),
     }
+    config.sound_config = sound_config
+    config.sound_context_token = AUDIO_PLACEHOLDER
 
     with mock.patch(
         "tensorrt_llm._torch.models.modeling_nemotron_nano.transformers"
@@ -337,3 +356,96 @@ def test_forward_fixed_tile_path(vision_encoder):
 
     vision_encoder.extract_feature.assert_called_once()
     vision_encoder.extract_feature_dynamic.assert_not_called()
+
+
+# Audio-related helpers and tests.
+def _make_extractor_config(**overrides):
+    """Return a mock PretrainedConfig with small, realistic extractor values."""
+    defaults = dict(
+        num_mel_bins=80,
+        sampling_rate=16000,
+        subsampling_factor=8,
+        subsampling_conv_kernel_size=5,
+        subsampling_conv_stride=3,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _make_audio_processor(**overrides):
+    """Create a NanoV2VLInputProcessor with audio support and mocked deps."""
+    return _make_nano_processor(sound_config=_make_extractor_config(), **overrides)
+
+
+class TestAudioInputProcessor:
+    def test_expand_audio_placeholders_single(self):
+        proc = _make_audio_processor()
+        audio = np.random.randn(16000).astype(np.float32)
+        ext = proc._audio_extractor
+        n_tokens = ext.audio_token_count(len(audio))
+
+        text = f"Hello {AUDIO_PLACEHOLDER} world"
+        result = proc._expand_audio_placeholders(text, [audio], ext)
+
+        expected_inner = AUDIO_PLACEHOLDER * n_tokens
+        assert f"<so_start>{expected_inner}<so_end>" in result
+        assert result.startswith("Hello ")
+        assert result.endswith(" world")
+
+    def test_expand_audio_placeholders_multiple(self):
+        proc = _make_audio_processor()
+        ext = proc._audio_extractor
+        audios = [
+            np.random.randn(8000).astype(np.float32),
+            np.random.randn(32000).astype(np.float32),
+        ]
+        text = f"A {AUDIO_PLACEHOLDER} B {AUDIO_PLACEHOLDER} C"
+        result = proc._expand_audio_placeholders(text, audios, ext)
+
+        # Both placeholders should be expanded.
+        assert result.count("<so_start>") == 2
+        assert result.count("<so_end>") == 2
+
+    def test_expand_audio_placeholders_mismatch_raises(self):
+        proc = _make_audio_processor()
+        ext = proc._audio_extractor
+        audios = [np.random.randn(8000).astype(np.float32)]
+        text = f"{AUDIO_PLACEHOLDER} {AUDIO_PLACEHOLDER}"
+        with pytest.raises(ValueError, match="does not match"):
+            proc._expand_audio_placeholders(text, audios, ext)
+
+    def test_resample_audios_passthrough(self):
+        audio = np.random.randn(16000).astype(np.float32)
+        result = NanoV2VLInputProcessor._resample_audios([(audio, 16000)], target_sr=16000)
+        np.testing.assert_array_equal(result[0], audio)
+
+    def test_resample_audios_resamples(self):
+        pytest.importorskip("librosa")
+        audio = np.random.randn(16000).astype(np.float32)
+        result = NanoV2VLInputProcessor._resample_audios([(audio, 44100)], target_sr=16000)
+        # Resampled length should differ from the original.
+        assert len(result[0]) < len(audio)
+
+    def test_resample_audios_bare_array_uses_target_sr(self):
+        audio = np.random.randn(16000).astype(np.float32)
+        result = NanoV2VLInputProcessor._resample_audios([audio], target_sr=16000)
+        np.testing.assert_array_equal(result[0], audio)
+
+    def test_process_audio_returns_expected_keys(self):
+        proc = _make_audio_processor()
+        audio = np.random.randn(16000).astype(np.float32)
+        text = f"Listen: {AUDIO_PLACEHOLDER}"
+        input_ids, audio_inputs = proc._process_audio(text, [(audio, 16000)])
+
+        assert isinstance(input_ids, torch.Tensor)
+        assert {
+            "input_audio_features",
+            "feature_attention_mask",
+            "audio_feature_lengths",
+        } <= audio_inputs.keys()
+
+    def test_process_audio_raises_without_sound_config(self):
+        proc = _make_audio_processor()
+        proc._audio_extractor = None
+        with pytest.raises(ValueError, match="no audio preprocessing"):
+            proc._process_audio("test", [np.zeros(100)])

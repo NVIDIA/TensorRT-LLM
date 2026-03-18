@@ -2,8 +2,9 @@
 import copy
 import math
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -37,12 +38,16 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model
 
 VIDEO_PRUNING_RATIO = float(os.getenv("TLLM_VIDEO_PRUNING_RATIO", "0"))
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
+IMAGE_PLACEHOLDER = "<image>"
+VIDEO_PLACEHOLDER = "<video>"
+AUDIO_PLACEHOLDER = "<so_embedding>"
 
 
 @dataclass
@@ -476,8 +481,9 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
 
         for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst):
             data = multimodal_data[modality_type]
-            # Dynamic resolution path is indicated by the presence of "image_sizes".
-            if "image_sizes" in data:
+            # Dynamic resolution path is indicated by the presence of "image_sizes". For now, it is
+            # only meant to be applied to images.
+            if modality_type == "image" and "image_sizes" in data:
                 pixel_values_flat = data["pixel_values"]
                 image_sizes = data["image_sizes"]
                 embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
@@ -590,6 +596,35 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             )
             logger.info("Dynamic resolution enabled for NanoV2VL input processor")
 
+        self._audio_extractor = None
+        self._sound_context_token = getattr(config, "sound_context_token", AUDIO_PLACEHOLDER)
+        # At time of writing (03/09/2026), these were not included in the config.
+        self._sound_start = "<so_start>"
+        self._sound_end = "<so_end>"
+        self._sound_context_token_id = getattr(config, "sound_context_token_id", None)
+        self._sound_start_token_id = None
+        self._sound_end_token_id = None
+        sound_config = getattr(config, "sound_config", None)
+        if sound_config is not None:
+            try:
+                import librosa  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "Audio support requires the `librosa` package. "
+                    "Install it with: pip install librosa"
+                )
+            self._audio_extractor = ParakeetExtractor(sound_config)
+            if self._sound_context_token_id is None:
+                self._sound_context_token_id = self.tokenizer.encode(
+                    self._sound_context_token, add_special_tokens=False
+                )[0]
+            self._sound_start_token_id = self.tokenizer.encode(
+                self._sound_start, add_special_tokens=False
+            )[0]
+            self._sound_end_token_id = self.tokenizer.encode(
+                self._sound_end, add_special_tokens=False
+            )[0]
+
     @property
     def config(self) -> transformers.PretrainedConfig:
         return self._config
@@ -615,10 +650,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         "Return multimodal special token ids for NanoV2VL."
-        return torch.tensor([self.image_start_token_id, self.image_end_token_id])
+        ids = [self.image_start_token_id, self.image_end_token_id]
+        if self._sound_start_token_id is not None:
+            ids.extend([self._sound_start_token_id, self._sound_end_token_id])
+        return torch.tensor(ids)
 
     def get_mm_token_ids(self):
-        return torch.tensor([self.img_context_token_id], dtype=torch.int32)
+        ids = [self.img_context_token_id]
+        if self._sound_context_token_id is not None:
+            ids.append(self._sound_context_token_id)
+        return torch.tensor(ids, dtype=torch.int32)
 
     def get_num_tokens_per_image(
         self,
@@ -991,12 +1032,14 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         text_prompt, mm_data = inputs.get("prompt"), inputs.get("multi_modal_data", {})
         images = mm_data.get("image", None)
         videos = mm_data.get("video", None)
-        if images is not None and videos is not None:
+        audios = mm_data.get("audio", None)
+        # TODO(TRTLLM-11390): Functionally support multiple modalities in the same request.
+        if sum([images is not None, videos is not None, audios is not None]) > 1:
             raise ValueError(
-                "NanoV2VL does not support both images and videos in the same prompt yet."
+                "NanoV2VL does not support different modalities in the same prompt yet."
             )
 
-        if images is None and videos is None:
+        if images is None and videos is None and audios is None:
             input_ids = self.tokenizer.encode(
                 text_prompt, add_special_tokens=False, return_tensors="pt"
             )
@@ -1059,6 +1102,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             modality_data["num_patches"] = processed_images["num_patches"].sum(dim=0, keepdim=True)
             modality_data["video_size"] = processed_images["video_size"]
             modality_data["evs_ids"] = evs_ids
+        elif audios is not None:
+            modality_type = "audio"
+            input_ids, modality_data = self._process_audio(text_prompt, audios)
 
         # Will package inputs for language model forward in AGGREGATE mode.
         multimodal_data = {}
@@ -1068,6 +1114,89 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "multimodal_data": multimodal_data,
         }
 
+    def _process_audio(
+        self,
+        text: str,
+        audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._audio_extractor is None:
+            raise ValueError(
+                "Audio inputs were passed in, but no audio preprocessing was configured "
+                "due to the absence of a `sound_config` in the model config."
+            )
+
+        extractor = self._audio_extractor
+        target_sr = extractor.sampling_rate
+        audios = self._resample_audios(audios, target_sr)
+
+        expanded_text = self._expand_audio_placeholders(text, audios, extractor)
+
+        audio_inputs = extractor(
+            audios,
+            sampling_rate=extractor.sampling_rate,
+            return_tensors="pt",
+        )
+        input_audio_features = audio_inputs.input_features
+        feature_attention_mask = audio_inputs.attention_mask
+        audio_feature_lengths = feature_attention_mask.sum(dim=1)
+        audio_inputs = {
+            "input_audio_features": input_audio_features,
+            "feature_attention_mask": feature_attention_mask,
+            "audio_feature_lengths": audio_feature_lengths,
+        }
+
+        input_ids = self.tokenizer.encode(
+            expanded_text, add_special_tokens=False, return_tensors="pt"
+        )
+        return input_ids, audio_inputs
+
+    def _expand_audio_placeholders(
+        self,
+        text: str,
+        audios: List[np.ndarray],
+        extractor: "ParakeetExtractor",
+    ) -> str:
+        """Replace each audio placeholder token with the expanded start/context/end sequence."""
+        parts = [x for x in re.split(f"({re.escape(self._sound_context_token)})", text) if x]
+        token_count = parts.count(self._sound_context_token)
+        if token_count != len(audios):
+            raise ValueError(
+                "Number of audio tokens in text does not match the number "
+                f"of audios (tokens={token_count}, audios={len(audios)})."
+            )
+        audio_idx = 0
+        for idx, part in enumerate(parts):
+            if part == self._sound_context_token:
+                audio = audios[audio_idx]
+                num_tokens = extractor.audio_token_count(len(audio))
+                expanded = (
+                    f"{self._sound_start}{self._sound_context_token * num_tokens}{self._sound_end}"
+                )
+                parts[idx] = expanded
+                audio_idx += 1
+        return "".join(parts)
+
+    @staticmethod
+    def _resample_audios(
+        audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]],
+        target_sr: int,
+    ):
+        resampled_audios: List[np.ndarray] = []
+        for item in audios:
+            if isinstance(item, tuple):
+                audio_data, orig_sr = item
+            else:
+                audio_data = item
+                orig_sr = target_sr
+
+            if orig_sr != target_sr:
+                import librosa
+
+                audio_data = librosa.resample(audio_data, orig_sr=orig_sr, target_sr=target_sr)
+            resampled_audios.append(audio_data)
+
+        return resampled_audios
+
 
 @register_auto_model("NemotronH_Nano_VL_V2")
 @register_input_processor(
@@ -1075,11 +1204,12 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     model_type="NemotronH_Nano_VL_V2",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
-            "image": "<image>",
-            "video": "<video>",
+            "image": IMAGE_PLACEHOLDER,
+            "video": VIDEO_PLACEHOLDER,
+            "audio": AUDIO_PLACEHOLDER,
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        placeholders_separator="",
+        placeholders_separator="\n",
     ),
 )
 class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
@@ -1099,6 +1229,15 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if not _is_disagg():
             self.vision_encoder = NanoV2VLVisionEncoder(model_config).eval()
 
+        self.sound_encoder: ProjectedParakeet | None = None
+        sound_config = getattr(config, "sound_config", None)
+        if sound_config is not None:
+            self.sound_encoder = ProjectedParakeet(
+                sound_config,
+                llm_hidden_size=config.llm_config.hidden_size,
+                dtype=getattr(config, "torch_dtype", torch.bfloat16),
+            ).eval()
+
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
@@ -1107,6 +1246,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self.img_context_token_id = config.img_context_token_id
         self.video_context_token_id = config.video_context_token_id
+        self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.post_config()
         self.is_loaded = True
         self.video_pruning_ratio = VIDEO_PRUNING_RATIO
@@ -1114,6 +1254,10 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
     def load_weights(self, weights):
         # Load vision encoder weights.
         self.vision_encoder.load_weights(weights)
+
+        # Load sound encoder weights.
+        if self.sound_encoder is not None:
+            self.sound_encoder.load_weights(weights)
 
         # Load language model weights.
         filtered_weights = {
@@ -1196,6 +1340,52 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         return input_ids
 
+    def _encode_audio(self, param: MultimodalParams) -> torch.Tensor:
+        """Encode audio features into LLM-space embeddings."""
+        data = param.multimodal_data["audio"]
+        input_features = data["input_audio_features"]  # [num_clips, time, mel_bins]
+        attention_mask = data["feature_attention_mask"]  # [num_clips, time]
+
+        target_device = next(self.sound_encoder.parameters()).device
+        input_features = input_features.to(dtype=self.model_dtype, device=target_device)
+        attention_mask = attention_mask.to(device=target_device)
+
+        # Encode: [num_clips, time, llm_hidden_size]
+        sound_embeds = self.sound_encoder(input_features, attention_mask)
+
+        # Truncate each clip to its valid (non-padding) output length.
+        valid_input_lens = attention_mask.sum(dim=1)
+        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+            valid_input_lens
+        )
+
+        truncated = []
+        for i in range(sound_embeds.shape[0]):
+            valid_len = int(valid_output_lens[i].item())
+            truncated.append(sound_embeds[i, :valid_len])
+
+        result = torch.cat(truncated, dim=0)  # [total_tokens, llm_hidden_size]
+        return result
+
+    def _encode_multimodal(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> Tuple[List[torch.Tensor], List[Optional[List[int]]]]:
+        """Dispatch multimodal encoding to the appropriate encoder."""
+        mm_embeddings = []
+        mm_num_tokens = []
+        for param in multimodal_params:
+            modality_type = param.multimodal_data["modality_type"]
+            if modality_type in ("image", "video"):
+                embs, num_tokens = self.vision_encoder([param])
+                mm_embeddings.append(embs[0])
+                mm_num_tokens.append(num_tokens[0])
+            elif modality_type == "audio":
+                mm_embeddings.append(self._encode_audio(param))
+                mm_num_tokens.append(None)
+            else:
+                raise ValueError(f"Unknown modality: {modality_type}")
+        return mm_embeddings, mm_num_tokens
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1222,7 +1412,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if len(multimodal_params) > 0:
             if not _is_disagg():
                 mm_embedding, num_tokens_in_videos = get_multimodal_embeddings(
-                    encoder_forward_fn=self.vision_encoder.forward,
+                    encoder_forward_fn=self._encode_multimodal,
                     multimodal_params=multimodal_params[:num_context_requests],
                 )
             else:
@@ -1241,11 +1431,15 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             mm_embedding = find_input_mm_embeds(
                 mm_embedding, multimodal_params[:num_context_requests]
             )
+
+        mm_token_ids_list = [self.img_context_token_id]
+        if self.sound_context_token_id is not None:
+            mm_token_ids_list.append(self.sound_context_token_id)
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=torch.tensor([self.img_context_token_id], dtype=torch.int32),
+            mm_token_ids=torch.tensor(mm_token_ids_list, dtype=torch.int32),
         )
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,

@@ -1012,7 +1012,9 @@ class RADIOVisionModel(PreTrainedModel):
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
-            if not u.startswith('model.blocks.'):
+            # TODO(TRTLLM-11269): Add support for the conv3d layer.
+            if not u.startswith(
+                ('model.blocks.', 'model.patch_generator.video_embedder')):
                 raise ValueError(f"Unexpected key: {u}")
 
         # Load weights for vision transformer module.
