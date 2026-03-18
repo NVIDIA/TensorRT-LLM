@@ -12,6 +12,7 @@ import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
 import com.nvidia.bloom.Utils
 import com.nvidia.bloom.ContainerRuntime
+import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
@@ -104,20 +105,16 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName, Boolean stageIsInterrupted) {
-    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
-        def remote = [
-            ip           : randomLoginNode,
-            host         : randomLoginNode,
-            port         : cluster.sshPort?:22,
-            user         : "${pipeline.USERNAME}",
-            passwd       : "${pipeline.PASSWORD}",
-            allowAnyHosts: true,
-        ]
+def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
+    String portOpt = remote.port ? "-P ${remote.port} " : ""
+    if (remote.privateKeyPath) {
+        return "scp -i ${remote.privateKeyPath} ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
+    }
+    return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
+}
 
-        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted) {
+    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
@@ -126,7 +123,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             sh "mkdir -p ${stageName}"
             // Download timeout test results
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
-            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
@@ -138,7 +135,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             }
             // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
-            downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+            downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
 
             // Download perf test results
             def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
@@ -155,9 +152,9 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             echo "Perf Result Folders: ${perfFolders}"
             if (perfFolders) {
                 def scpSources = perfFolders.size() == 1
-                    ? "${remote.user}@${remote.host}:${perfResultsBasePath}/${perfFolders[0]}"
-                    : "${remote.user}@${remote.host}:{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
-                downloadPerfResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${scpSources} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+                    ? "${perfResultsBasePath}/${perfFolders[0]}"
+                    : "{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
+                downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             }
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
@@ -243,6 +240,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
     def originalTestLines = readFile(file: testDBList).readLines()
+
     def cleanedTestLines = []
     def isolationTestLines = []
 
@@ -432,18 +430,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
     }
 }
 
-def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
-    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
-        def remote = [
-            ip           : randomLoginNode,
-            host         : randomLoginNode,
-            port         : cluster.sshPort,
-            user         : "${pipeline.USERNAME}",
-            passwd       : "${pipeline.PASSWORD}",
-            allowAnyHosts: true,
-        ]
-
+def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
+    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
@@ -494,26 +482,16 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
 }
 
 // Methods to run Slurm job with Jenkins Agent
-def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, String slurmJobID) {
-    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
-        def remote = [
-            ip           : randomLoginNode,
-            host         : randomLoginNode,
-            port         : cluster.sshPort,
-            user         : "${pipeline.USERNAME}",
-            passwd       : "${pipeline.PASSWORD}",
-            allowAnyHosts: true,
-        ]
+def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String slurmJobID) {
+    Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
 
-        Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
+    CloudManager.destroyNode(nodeName)
 
-        CloudManager.destroyNode(nodeName)
+    Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
 
-        Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
+    Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
-        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-
+    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
         Utils.exec(
@@ -561,18 +539,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
-        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
-            def remote = [
-                    ip           : randomLoginNode,
-                    host         : randomLoginNode,
-                    port         : cluster.sshPort,
-                    user         : "${pipeline.USERNAME}",
-                    passwd       : "${pipeline.PASSWORD}",
-                    allowAnyHosts: true,
-            ]
-
-            Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+        CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
             stage('Request Node Via Slurm') {
                 println("Selected Cluster: ${cluster.name}")
 
@@ -623,16 +590,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
 
         stage('Check If Node Is Online') {
-            withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
-                def remote = [
-                        ip           : randomLoginNode,
-                        host         : randomLoginNode,
-                        port         : cluster.sshPort,
-                        user         : "${pipeline.USERNAME}",
-                        passwd       : "${pipeline.PASSWORD}",
-                        allowAnyHosts: true,
-                ]
+            CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
                 def counter = 0
                 // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
                 // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
@@ -658,10 +616,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
                     }
                 }
-            }
 
-            if (CloudManager.isNodeOnline(nodeName)) {
-                node(nodeName) {
+                if (CloudManager.isNodeOnline(nodeName)) {
+                    node(nodeName) {
                     sh """
                         env | sort
                         pwd && ls -alh
@@ -715,8 +672,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "--cap-add=SYSLOG"
 
                 echo "Final dockerArgs: ${dockerArgs}"
-            } else {
-                error "The Slurm node does not come online in the waiting period. Terminating the job."
+                } else {
+                    error "The Slurm node does not come online in the waiting period. Terminating the job."
+                }
             }
         }
 
@@ -736,7 +694,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
                 try {
-                    cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
+                    cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
                 } catch (Exception e) {
                     error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
                 }
@@ -923,24 +881,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
-        withCredentials([
-            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
-            usernamePassword(
-                credentialsId: 'svc_tensorrt',
-                usernameVariable: 'USERNAME',
-                passwordVariable: 'PASSWORD'
-            )
-        ]) {
-            def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
-            def remote = [
-                    ip           : randomLoginNode,
-                    host         : randomLoginNode,
-                    port         : cluster.sshPort,
-                    user         : "${pipeline.USERNAME}",
-                    passwd       : "${pipeline.PASSWORD}",
-                    allowAnyHosts: true,
-            ]
-            Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+        withCredentials([string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN')]) {
+            CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
@@ -1390,17 +1332,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
             }
             echo "Finished test stage execution."
-        }
+            }  // end CloudManager.withSlurmSshCredentials
+        }  // end withCredentials
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
     } finally {
-        uploadResults(pipeline, cluster, jobUID, stageName, stageIsInterrupted)
+        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
                 try {
-                    cleanUpSlurmResources(pipeline, cluster, jobUID)
+                    cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
                 } catch (Exception e) {
                     error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
                 }
@@ -2174,8 +2117,12 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
         // At this point, only tests with backend=autodeploy or unspecified backend will be run
         makoArgs += ["backend=autodeploy"]
+    } else if (stageName.contains("-Verl-")) {
+        // If stageName contains "-Verl-", add "backend=verl" to makoArgs
+        // At this point, only tests with backend=verl or unspecified backend will be run
+        makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", "-FMHA-", or "-AutoDeploy-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", "-FMHA-", "-AutoDeploy-", or "-Verl-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -3311,6 +3258,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 4, 1, true],
         "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
+        "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
@@ -3390,7 +3338,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU2-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2",
-        2,
+        3,
         8,
         2
     )
@@ -3398,7 +3346,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        3,
+        4,
         8,
         2
     )
@@ -3411,6 +3359,14 @@ def launchTestJobs(pipeline, testFilter)
         2
     )
     // 3 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
+        1,
+        12,
+        3
+    )
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
@@ -3427,6 +3383,15 @@ def launchTestJobs(pipeline, testFilter)
         1,
         16,
         4
+    )
+    // 6 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX2-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx2_node1_gpu4_gen1_node4_gpu16",
+        4,
+        24,
+        6
     )
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -3632,9 +3597,9 @@ def launchTestJobs(pipeline, testFilter)
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
                             if (k8s_arch == "amd64") {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                             } else {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                             }
                         }
 
