@@ -209,7 +209,17 @@ class ModelConfig(BaseModel):
 
 
 class NemotronHybridConfig(ModelConfig):
-    hybrid_override_pattern: str
+    hybrid_override_pattern: str = Field(validation_alias=AliasChoices(
+        "hybrid_override_pattern",
+        AliasPath("text_config", "hybrid_override_pattern"),
+        AliasPath("language_config", "hybrid_override_pattern"),
+    ))
+    num_hidden_layers: int = Field(validation_alias=AliasChoices(
+        "num_hidden_layers",
+        "n_layer",
+        AliasPath("text_config", "num_hidden_layers"),
+        AliasPath("language_config", "num_hidden_layers"),
+    ))
     d_state: int = Field(validation_alias=AliasChoices(
         "d_state",
         "mamba_d_state",
@@ -254,3 +264,34 @@ class NemotronHybridConfig(ModelConfig):
 
     def set_mamba_ssm_cache_dtype(self, mamba_ssm_cache_dtype: str):
         self.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
+
+    @classmethod
+    def from_hf(cls, model_hf_name, hf_model_path):
+        pretrained_config = load_pretrained_config(hf_model_path
+                                                   or model_hf_name,
+                                                   trust_remote_code=True)
+        hf_config = pretrained_config.to_dict()
+        param_count = cls.get_param_count(model_hf_name, hf_model_path)
+
+        # HuggingFace PretrainedConfig.to_dict() only serializes attributes known to
+        # the base class; custom configs (e.g. NemotronHConfig) have num_hidden_layers
+        # and hybrid_override_pattern on the object but to_dict() omits them. Fill
+        # from the config object (and nested text_config/language_config if present).
+        sub_config = getattr(pretrained_config, "text_config", None) or getattr(
+            pretrained_config, "language_config", None)
+        for key in (
+                "num_hidden_layers",
+                "hybrid_override_pattern",
+        ):
+            if hf_config.get(key) is None:
+                value = None
+                if sub_config is not None:
+                    value = getattr(sub_config, key, None)
+                if value is None:
+                    value = getattr(pretrained_config, key, None)
+                if value is None and key == "num_hidden_layers":
+                    value = getattr(pretrained_config, "n_layer", None)
+                if value is not None:
+                    hf_config[key] = value
+
+        return cls(name=model_hf_name, param_count=param_count, **hf_config)
