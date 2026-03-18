@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Distributed radix top-k kernel using FlashInfer-style fused multi-CTA approach.
+"""Single-pass multi-CTA radix top-k kernel using FlashInfer-style fused multi-CTA approach.
 
 All CTAs in a group cooperatively find the global pivot via multi-round radix
 select with global histogram merging, then each CTA collects results from its
@@ -145,10 +145,10 @@ def barrier_inter_cta(arrival_counter_ptr, target, tidx):
 
 
 # ---------------------------------------------------------------------------
-# DistributedRadixTopKKernel
+# SinglePassMultiCTARadixTopKKernel
 # ---------------------------------------------------------------------------
-class DistributedRadixTopKKernel:
-    """FlashInfer-style distributed radix top-k kernel.
+class SinglePassMultiCTARadixTopKKernel:
+    """FlashInfer-style single-pass multi-CTA radix top-k kernel.
 
     All CTAs in a *group* cooperatively process one row at a time.  The groups
     are persistent and iterate over rows in round-robin fashion.
@@ -881,7 +881,7 @@ class DistributedRadixTopKKernel:
     # Main kernel
     # ------------------------------------------------------------------
     @cute.kernel
-    def distributed_topk_kernel(
+    def single_pass_multi_cta_topk_kernel(
         self,
         input_data: cute.Tensor,
         row_states: cute.Tensor,
@@ -889,7 +889,7 @@ class DistributedRadixTopKKernel:
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
     ):
-        """Main distributed radix top-k kernel.
+        """Main single-pass multi-CTA radix top-k kernel.
 
         Grid: (total_ctas, 1, 1) where total_ctas = num_groups * ctas_per_group
         Each group processes one row at a time in persistent round-robin fashion.
@@ -1288,7 +1288,7 @@ class DistributedRadixTopKKernel:
         num_groups = min(self.num_sms // ctas_per_group, num_rows)
         total_ctas = num_groups * ctas_per_group
 
-        self.distributed_topk_kernel(
+        self.single_pass_multi_cta_topk_kernel(
             input_data,
             row_states,
             seqlen,
