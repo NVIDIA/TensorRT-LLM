@@ -15,15 +15,21 @@
  */
 
 // ============================================================================
-// heuristic_topk.cuh — V2d: V2c + skip 4a + skip Pass A + 256-bin + snap3
+// heuristic_topk.cuh — V2e: V2d + OPT5 (safety-guard done!=1) +
+//                           OPT6 (NUM_BINS=2048 + parallel Phase 4b K-th bin search) +
+//                           OPT7 (Phase 3 sub-pass 1 elimination via per-thread count cache)
 // Heuristic-Guided TopK — Sort-Free, Histogram-Based Selection
 // Optimised for NVIDIA B200 (Blackwell, sm_100), single thread-block kernel
 //
 // V2d: ballot-free Phase 3, skip-4a, skip-PassA, 256-bin, snap≤3
 //      OPT3 (__ldg), OPT4 (redux.sync)
+// V2e: +OPT5 (skip Phase 3 blockCountGE re-scan when done==1)
+//      +OPT6 (NUM_BINS=2048 + parallel 2-step K-th bin search in Phase 4b)
+//      +OPT7 (reuse per-thread counts cached by last blockCountGE; eliminates
+//             Phase 3 sub-pass 1 full-N rescan)
 //
 // Define HEURISTIC_TOPK_PROFILE before including to enable per-phase printf.
-// Shared memory: ~50 KB (no CUB dependency)
+// Shared memory: ~59 KB (no CUB dependency)
 // ============================================================================
 
 #pragma once
@@ -50,22 +56,23 @@ constexpr int SAFETY_MARGIN = 2048;
 constexpr int MAX_CANDIDATES = TOP_K + SAFETY_MARGIN * 2; // 6144
 
 constexpr int MAX_REFINE_ITERS = 15;
-constexpr int NUM_BINS = 256;
+constexpr int NUM_BINS = 2048;
 
 static_assert(TOP_K % BLOCK_SIZE == 0);
 static_assert(MAX_CANDIDATES % BLOCK_SIZE == 0);
 
 // ============================================================================
-// Shared Memory Layout (~26 KB)
+// Shared Memory Layout (~59 KB)
 // ============================================================================
 
 struct KernelSmem
 {
-    alignas(16) float keys[MAX_CANDIDATES]; // 12 KB
-    alignas(16) int vals[MAX_CANDIDATES];   // 12 KB
+    alignas(16) float keys[MAX_CANDIDATES]; // 24 KB
+    alignas(16) int vals[MAX_CANDIDATES];   // 24 KB
 
     int warp_counts[NUM_WARPS];             // 64 B
-    int histogram[NUM_BINS];                // 1 KB
+    int histogram[NUM_BINS];                // 8 KB
+    int per_thread_counts[BLOCK_SIZE];      // 2 KB — OPT7: cached from last blockCountGE
 
     float threshold;
     int cand_count;
@@ -157,6 +164,9 @@ __device__ __forceinline__ void blockCountGE(
     }
     for (int i = (N & ~3) + tid; i < N; i += BLOCK_SIZE)
         c += (__ldg(&input[i]) >= threshold);
+
+    // OPT7: cache per-thread count for Phase 3 sub-pass 1 reuse
+    smem->per_thread_counts[tid] = c;
 
     c = warpReduceSum(c);
 
@@ -425,6 +435,9 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
     // Phase 3 — Ballot-free collect
     // ================================================================
 
+    // OPT5: when done==1, Phase 2 already verified count in [TOP_K, MAX_CANDIDATES];
+    //        skip the redundant full-N blockCountGE re-check entirely.
+    if (smem->done != 1)
     {
         blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
         if (tid == 0 && smem->cand_count > MAX_CANDIDATES)
@@ -455,17 +468,9 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         }
     }
 
-    int my_total_qual = 0;
-    {
-        float const thr = smem->threshold;
-        for (int i = tid * 4; i + 3 < N; i += BLOCK_SIZE * 4)
-        {
-            float4 v4 = __ldg(reinterpret_cast<float4 const*>(input + i));
-            my_total_qual += (v4.x >= thr) + (v4.y >= thr) + (v4.z >= thr) + (v4.w >= thr);
-        }
-        for (int i = (N & ~3) + tid; i < N; i += BLOCK_SIZE)
-            my_total_qual += (__ldg(&input[i]) >= thr);
-    }
+    // OPT7: reuse per-thread counts cached by the last blockCountGE call;
+    //        saves one full N-scan (blockCountGE's __syncthreads guarantees visibility).
+    int my_total_qual = smem->per_thread_counts[tid];
 
     int thread_prefix = my_total_qual;
 #pragma unroll
@@ -585,14 +590,55 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         }
         __syncthreads();
 
+        // OPT6: Parallel K-th bin search (2-step).
+        // Each warp sums BINS_PER_WARP consecutive bins (high→low); tid=0 locates the
+        // target warp in NUM_WARPS steps; one thread in that warp scans BINS_PER_WARP bins.
+        // Total serial depth: NUM_WARPS + BINS_PER_WARP = 16 + 128 = 144 steps vs 2048.
+        {
+            constexpr int BINS_PER_WARP = NUM_BINS / NUM_WARPS;
+            static_assert(NUM_BINS % NUM_WARPS == 0, "NUM_BINS must be divisible by NUM_WARPS");
+            // Step 1: each warp accumulates its slice of bins (high→low)
+            int warp_bin_sum = 0;
+            for (int j = 0; j < BINS_PER_WARP; j++)
+                warp_bin_sum += smem->histogram[NUM_BINS - 1 - warp_id * BINS_PER_WARP - j];
+            if (lane == 0)
+                smem->warp_counts[warp_id] = warp_bin_sum;
+        }
+        __syncthreads(); // S-4b3a
+
+        // Step 2: tid=0 finds which warp contains the K-th element
         if (tid == 0)
         {
-            int cum = 0;
-            float thr = block_min;
-            for (int b = NUM_BINS - 1; b >= 0; b--)
+            int cum = 0, tw = NUM_WARPS - 1;
+            for (int w = 0; w < NUM_WARPS; w++)
             {
-                cum += smem->histogram[b];
+                cum += smem->warp_counts[w];
                 if (cum >= TOP_K)
+                {
+                    tw = w;
+                    break;
+                }
+            }
+            // Recompute prefix before target warp for step 3
+            cum = 0;
+            for (int w = 0; w < tw; w++)
+                cum += smem->warp_counts[w];
+            smem->cnt_lo = cum; // prefix count before target warp
+            smem->cnt_hi = tw;  // target warp index
+        }
+        __syncthreads();        // S-4b3b
+
+        // Step 3: one thread in target warp scans its BINS_PER_WARP bins
+        if (warp_id == smem->cnt_hi && lane == 0)
+        {
+            constexpr int BINS_PER_WARP = NUM_BINS / NUM_WARPS;
+            int base_cum = smem->cnt_lo;
+            float thr = block_min;
+            for (int j = 0; j < BINS_PER_WARP; j++)
+            {
+                int b = NUM_BINS - 1 - smem->cnt_hi * BINS_PER_WARP - j;
+                base_cum += smem->histogram[b];
+                if (base_cum >= TOP_K)
                 {
                     thr = block_min + (float) b * range1 / (float) NUM_BINS;
                     break;
@@ -600,7 +646,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
             }
             smem->threshold = thr;
         }
-        __syncthreads();
+        __syncthreads(); // S-4b3c
 
         bool snap_converged = false;
         int snap_limit = (cand_count > 128 ? cand_count / 4 : 32);
