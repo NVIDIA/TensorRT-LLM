@@ -38,7 +38,7 @@ For container images, see [NGC containers](docs/source/installation/containers.m
 
 ### Reference Configs
 
-`examples/configs/database/` contains 170+ pareto-optimized serving configurations
+`examples/configs/database/` contains pareto-optimized serving configurations
 across multiple models, GPUs, ISL/OSL combinations, and concurrency levels.
 Use these as starting points for deployment and benchmarking rather than hand-tuning parameters.
 See [deployment guides](docs/source/deployment-guide/) for model-specific walkthroughs.
@@ -51,9 +51,11 @@ See [architecture diagram](.github/tava_architecture_diagram.md) for the full Me
 
 | Backend | Status | Entry Point | Key Path |
 |---------|--------|-------------|----------|
-| **PyTorch** | Default | `LLM(backend="pytorch")` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
-| **AutoDeploy** | Beta | `LLM(backend="_autodeploy")` | `_torch/auto_deploy/` → `ADExecutor` → graph transforms + torch.export |
-| **TensorRT** | Legacy | `LLM(backend="tensorrt")` | `builder.py` → `trtllm.Executor` → TensorRT Engine |
+| **PyTorch** | Default | `TorchLlmArgs` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
+| **AutoDeploy** | Beta | `_torch/auto_deploy/` shim | `_torch/auto_deploy/shim/ad_executor.py` → adapts `PyExecutor` → graph transforms + torch.export |
+| **TensorRT** | Legacy | `TrtLlmArgs` | `builder.py` → `trtllm.Executor` → TensorRT Engine |
+
+> **Note:** The `LLM(backend="...")` parameter still works but is **deprecated**. Prefer using `TorchLlmArgs` or `TrtLlmArgs` directly.
 
 ### Shared C++ Core (via Nanobind)
 
@@ -82,26 +84,29 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 | `tensorrt_llm/models/modeling_utils.py` | Base classes for all models (`PretrainedConfig`, `PretrainedModel`) |
 | `tensorrt_llm/executor/executor.py` | Execution abstraction (`GenerationExecutor`) |
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
+| `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from `models/` used by TensorRT backend) |
+| `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
 
 | Pattern | Key Points |
 |---------|------------|
-| **Config hierarchy** | `LlmArgs` → `TrtLlmArgs` / `TorchLlmArgs`, model-specific defaults override generics, Pydantic validation |
+| **Config hierarchy** | `BaseLlmArgs` → `TrtLlmArgs` / `TorchLlmArgs`, model-specific defaults override generics, Pydantic validation |
 | **Model architecture** | Each model: `Config` (inherits `PretrainedConfig`) + `ForCausalLM` (inherits `PretrainedModel`) |
 | **Model defaults** | Architecture-specific overrides in `llm_utils.py` (attention kernels, quant, spec decoding, cache) |
+| **Attention backends** | `TorchLlmArgs.attn_backend` selects kernel: `TRTLLM` (default), `FlashInfer`, `FlashAttention` |
 | **Distributed execution** | Tensor/pipeline parallelism via `Mapping` class, multiple backends (MPI, Ray, RPC) |
 | **Auto-discovery** | Models self-register via `automodel.py`, resolved by HF config `architectures` field |
 
 ## Anti-Patterns / Gotchas
 
 - **Pre-commit modifies files in-place** — if hooks fail, files are already modified. Re-stage (`git add`) and commit again.
-- **Protected APIs exist** — changes to LLM API signatures will fail `tests/api_stability` tests. Get code owner review.
+- **Protected APIs exist** — changes to LLM API signatures will fail `tests/unittest/api_stability` tests. Get code owner review.
 - **Integration tests need GPUs + models** — always set `LLM_MODELS_ROOT` and ensure GPU access. Unit tests don't.
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
-- **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `LlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
+- **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
 ## Development Workflow
 
@@ -115,7 +120,6 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 - Branches should always be pushed to the user-specified fork (usually `origin`)
 - If pushing fails to due pre-push pre-commits hooks getting updated, just re-push immediately
 - PRs should be opened on the main repository
-   - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
    - Target `main` unless fixing a release branch bug
    - See `CONTRIBUTING.md` for full PR policies
 
@@ -126,7 +130,7 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Layer | Location | Notes |
 |-------|----------|-------|
 | Unit tests | `tests/unittest/` | Run in pre-merge CI; some tests require GPU |
-| API stability | `tests/api_stability/` | Protects committed API signatures |
+| API stability | `tests/unittest/api_stability/` | Protects committed API signatures |
 | Integration tests | `tests/integration/defs/` | Requires GPU + `LLM_MODELS_ROOT` |
 | Test lists | `tests/integration/test_lists/test-db/` | Per-GPU YAML files (`l0_a10.yml`, `l0_h100.yml`, etc.) |
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
@@ -143,82 +147,13 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 
 ### Retrieving CI Test Failures from a PR
 
-CI tests run on internal NVIDIA Jenkins infrastructure (`blossom-ci`). To retrieve failed test cases from a PR:
+See the CI failure retrieval skill (`.claude/skills/ci-failure-retrieval/SKILL.md`) for step-by-step scripts to query Jenkins test results via the API.
 
-**Step 1: Get the Jenkins build number from PR comments**
-
-The CI bot (`tensorrt-cicd`) posts comments with links to the Jenkins build. Extract the `L0_MergeRequest_PR` build number:
-```bash
-PR_NUM=<pr_number>
-BUILD_NUM=$(gh api "repos/NVIDIA/TensorRT-LLM/issues/${PR_NUM}/comments" --jq \
-  '[.[] | select(.user.login == "tensorrt-cicd") | select(.body | test("L0_MergeRequest_PR"))] | last | .body' \
-  | grep -oP 'L0_MergeRequest_PR/\K\d+')
-```
-
-**Step 2: Query the Jenkins testReport API for failures**
-
-Resolve the Jenkins base URL dynamically from the internal shortcut (requires corporate network):
-```bash
-JENKINS_BASE="$(curl -skI 'https://nv/trt-llm-cicd' 2>/dev/null | grep -i '^location:' | sed 's/^[Ll]ocation: *//;s/[[:space:]]*$//')job/main/job/L0_MergeRequest_PR"
-```
-
-```bash
-curl -s "${JENKINS_BASE}/${BUILD_NUM}/testReport/api/json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(f'Summary: {data[\"passCount\"]} passed, {data[\"failCount\"]} failed, {data[\"skipCount\"]} skipped')
-failed = []
-for suite in data.get('suites', []):
-    for case in suite.get('cases', []):
-        if case.get('status') in ('FAILED', 'REGRESSION'):
-            failed.append(case)
-if not failed:
-    print('No test failures!')
-else:
-    print(f'Failed tests ({len(failed)}):')
-    for f in failed:
-        print(f'  - {f[\"className\"]}.{f[\"name\"]}')
-        err = (f.get('errorDetails') or '')[:200]
-        if err:
-            print(f'    Error: {err}')
-"
-```
-
-**Step 3 (if needed): Get full stdout/stderr for a specific failure**
-
-The `errorStackTrace` can be incomplete when errors originate from subprocesses. In that case, fetch `stdout` and `stderr` for the specific test case to find the real error:
-```bash
-curl -s "${JENKINS_BASE}/${BUILD_NUM}/testReport/api/json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for suite in data.get('suites', []):
-    for case in suite.get('cases', []):
-        if case.get('status') in ('FAILED', 'REGRESSION'):
-            name = f'{case[\"className\"]}.{case[\"name\"]}'
-            if '<search_term>' in name:
-                print(f'=== {name} ===')
-                print('--- Error ---')
-                print(case.get('errorDetails', ''))
-                print('--- Stack Trace ---')
-                print(case.get('errorStackTrace', ''))
-                print('--- Stdout (last 3000 chars) ---')
-                print((case.get('stdout') or '')[-3000:])
-                print('--- Stderr (last 3000 chars) ---')
-                print((case.get('stderr') or '')[-3000:])
-                break
-"
-```
-
-**Available fields per failed test case** (from Jenkins testReport API):
-- `className`, `name`: test identifier
-- `status`: `FAILED` or `REGRESSION`
-- `errorDetails`: error message
-- `errorStackTrace`: full stack trace (may be incomplete for subprocess errors)
-- `stdout`, `stderr`: full test output (can be large, check these when stack trace is insufficient)
 ## Key Documentation
 
 | Topic | Path |
 |-------|------|
+| Coding guidelines | `CODING_GUIDELINES.md` |
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |

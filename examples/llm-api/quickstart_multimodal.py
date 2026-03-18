@@ -132,6 +132,11 @@ def add_multimodal_args(parser):
         type=int,
         default=2,
         help="Number of conversation turns for automated testing.")
+    parser.add_argument("--video_pruning_rate",
+                        type=float,
+                        default=None,
+                        help="Pruning rate for video frames (EVS). "
+                        "None disables EVS, values in [0, 1) enable pruning.")
     return parser
 
 
@@ -181,7 +186,9 @@ def main():
         lora_config.max_loras = 2
         lora_config.max_cpu_loras = 2
 
-    llm, sampling_params = setup_llm(args, lora_config=lora_config)
+    llm, sampling_params = setup_llm(args,
+                                     lora_config=lora_config,
+                                     video_pruning_rate=args.video_pruning_rate)
 
     image_format = args.image_format
     if args.model_type is not None:
