@@ -296,6 +296,8 @@ def _init_mla_weights(mla):
         mla.mqa.indexer.wq_b.weight.normal_(mean=0.0, std=NN_INIT_STD)
         mla.mqa.indexer.wk.weight.normal_(mean=0.0, std=NN_INIT_STD)
         mla.mqa.indexer.weights_proj.weight.normal_(mean=0.0, std=NN_INIT_STD)
+        # Build fused wk+weights_proj weight after random init
+        mla.mqa.indexer.post_load_weights()
 
 
 def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device):
@@ -466,7 +468,6 @@ def test_standard_path_when_exceeds_threshold():
         hidden_states,
         metadata,
         position_ids,
-        indexer_k=mla.mqa.indexer.wk(hidden_states),
     )
 
     output = _run_forward(
@@ -502,6 +503,8 @@ def test_agrees_with_absorption_path():
             mla_absorb.mqa.indexer.named_parameters(),
         ):
             pa.data.copy_(ps.data)
+    # Build fused wk+weights_proj weight after copying params
+    mla_absorb.mqa.indexer.post_load_weights()
 
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
     hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
@@ -522,7 +525,6 @@ def test_agrees_with_absorption_path():
                 hidden_states.clone(),
                 meta,
                 position_ids.clone(),
-                indexer_k=mla_module.mqa.indexer.wk(hidden_states.clone()),
             )
         out = _run_forward(
             mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, topk

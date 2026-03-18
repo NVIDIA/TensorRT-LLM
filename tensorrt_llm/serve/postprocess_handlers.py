@@ -600,12 +600,17 @@ def chat_harmony_post_processor(
 @nvtx_range_debug("chat_harmony_streaming_post_processor")
 def chat_harmony_streaming_post_processor(
         rsp: GenerationResult, args: ChatCompletionPostprocArgs) -> List[str]:
+    # Read the request ID directly from rsp.id instead of args.request_id.
+    # Both are the same executor-assigned ID, but args.request_id is set too
+    # late (after generate_async returns) for the postprocess worker path:
+    # the worker receives a copy of args before the ID is assigned, so
+    # args.request_id is always None with num_postprocess_workers > 0.
     response = handle_streaming_response(
         tools=args.tools,
         tool_choice=args.tool_choice,
         result=rsp,
         model=args.model,
-        request_id=args.request_id,
+        request_id=str(rsp.id),
         done=rsp._done,
         num_prompt_tokens=args.num_prompt_tokens,
         first_iteration=args.first_iteration,
