@@ -2871,6 +2871,29 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         return 0; // cross KV cache doesn't grow after the initial context phase
     }
 
+    if (windowSize == LinearAttentionMetadata::kRecurrentStates)
+    {
+        if (req.isGenerationInProgressState())
+        {
+            return 0; // no need to allocate blocks for recurrent states during generation
+        }
+        else if (!req.isContextFinished())
+        {
+            std::scoped_lock lck(mSequencesMtx);
+            auto const seqIt = mSequences.find(req.mRequestId);
+            if (seqIt != mSequences.end())
+            {
+                return 0;
+            }
+            if (mEnableBlockReuse)
+            {
+                return req.getPromptLen() / mBlockManager.getLinearAttentionMetadata()->statesSnapshotInterval + 1
+                    + (mBlockManager.getLinearAttentionMetadata()->saveLastSnapshot ? 1 : 0);
+            }
+            return 1;
+        }
+    }
+    
     auto const temporaryAttentionWindow = mBlockManager.getWindowSizeMetadata(windowSize).temporaryAttentionWindow;
 
     SizeType32 const numContextBlocks
@@ -3076,7 +3099,7 @@ void KVCacheManager::addSequence(
     SizeType32 const numAllocNewBlocksPreRequest = mBlockManager.getNumAllocNewBlocks();
     SizeType32 const numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
     SizeType32 const numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
-    TLLM_LOG_INFO("call addSequence for request %lu, inputLength = %d, beamWidth = %d", requestId, inputLength, beamWidth);
+    // TLLM_LOG_INFO("call addSequence for request %lu, inputLength = %d, beamWidth = %d", requestId, inputLength, beamWidth);
 
     if (!mBlockManager.isSequenceHeld(requestId))
     {
@@ -3185,7 +3208,7 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
 std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
-    TLLM_LOG_INFO("call removeSequence for request %lu", requestId);
+    // TLLM_LOG_INFO("call removeSequence for request %lu", requestId);
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     auto sequenceNode = [this, requestId]
     {

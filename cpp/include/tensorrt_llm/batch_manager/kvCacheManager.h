@@ -1533,6 +1533,11 @@ public:
         return mWindowSizeToMetadata.at(windowSize);
     }
 
+    [[nodiscard]] std::optional<LinearAttentionMetadata> const& getLinearAttentionMetadata() const noexcept
+    {
+        return mLinearAttentionMetadata;
+    }
+
     [[nodiscard]] bool isVariableWindow() const noexcept
     {
         return mIsVariableWindow;
