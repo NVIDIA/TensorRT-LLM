@@ -27,6 +27,7 @@ from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
+    BatchInfo,
     Constant,
     PrepareMetadataCallable,
     ResourceHandlerDict,
@@ -49,7 +50,8 @@ def _mamba_ssm_prepare_metadata(
     Returns a tuple of (chunk_indices, chunk_offsets, seq_idx_prefill).
     """
     device = cu_seqlen.device
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
 
     if num_prefill > 0:
         chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
@@ -131,7 +133,8 @@ def _run_ssm_prefill(
     chunk_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], int, int, int, int]:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
