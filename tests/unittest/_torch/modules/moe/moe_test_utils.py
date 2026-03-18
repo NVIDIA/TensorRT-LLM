@@ -292,8 +292,10 @@ def should_skip_trtllm(
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
-        # Flaky observed: e60_k4_h2048_i1408, seq=8, bfloat16, tactic[26] with tile
-        # config [32, 34] produces 10.05% element mismatch (threshold: 3%).
+        # NVFP4 flaky tactic failures with large model configs at seq=8.
+        # For example of observed failures:
+        #   - act=Relu2-e60_k4_h2048_i1408-seq=8: tactic[28] tile [32,36],
+        #     12.79% mismatch, 187/188 tactics pass.
         if (
             num_experts >= 60
             and model_config.top_k >= 4
