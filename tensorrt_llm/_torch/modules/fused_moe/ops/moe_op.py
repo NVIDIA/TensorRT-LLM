@@ -223,11 +223,11 @@ class MoEOpSelector:
         from .moe_op_deepgemm import DeepGemmMoEOp
 
         # Check if we should use DeepGemm op
-        # Blackwell has SM version 100
-        is_blackwell = is_sm_100f()
+        # DeepGemm supports SM100/SM103 (datacenter Blackwell) only
+        use_deepgemm_arch = is_sm_100f()
         has_block_fp8 = module.has_deepseek_fp8_block_scales
 
-        if is_blackwell and has_block_fp8:
+        if use_deepgemm_arch and has_block_fp8:
             # Use DeepGemm op for Blackwell with block FP8
             return DeepGemmMoEOp()
         else:
