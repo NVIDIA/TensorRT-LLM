@@ -109,6 +109,17 @@ def _register_fake():
     def _(input, sizes, group, process_group):
         return allgather(input, sizes, group)
 
+    @torch.library.register_fake("trtllm::cublas_scaled_mm_out")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+        bias,
+        out: torch.Tensor,
+    ):
+        return out
+
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
     def _(
         mat_a: torch.Tensor,

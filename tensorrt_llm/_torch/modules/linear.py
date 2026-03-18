@@ -486,9 +486,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply_out(self, module: Linear, input: torch.Tensor,
                   bias: Optional[torch.Tensor], out: torch.Tensor):
-        # Only called when use_custom_cublas_mm=True (see Linear.forward).
         # torch.matmul(out=) is not used: it produces auto_functionalized(aten.mm.out)
         # under torch.compile which breaks the piecewise CUDA-graph optimizer.
+        # cublas_mm_out requires use_custom_cublas_mm=True (weight in cuBLAS layout).
+        if not module.use_custom_cublas_mm:
+            return self.apply(module, input, bias)
         return torch.ops.trtllm.cublas_mm_out(input, module.weight.t(), bias,
                                               out)
 
@@ -658,14 +660,30 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             output = output + bias
         return output
 
-    def apply_window_output(self, module: Linear, input: torch.Tensor,
-                            bias: Optional[torch.Tensor]):
-        group = module.mapping.tp_group if module.mapping is not None else None
-        return self.apply(module,
-                          input,
-                          bias,
-                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
-                          group=group)
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], out: torch.Tensor):
+        # Pre-quantize input (same path as apply()).
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+        cur_input_scale = module.input_scale
+        if input.dtype != torch.float8_e4m3fn:
+            if module.input_scale is not None and not module.force_dynamic_quantization:
+                qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    input, module.input_scale)
+            else:
+                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+                    input)
+                cur_input_scale = cur_input_scale.to(torch.float32)
+        else:
+            qinput = input
+        out_2d = out.reshape(-1, out.shape[-1]) if out.dim() > 2 else out
+        torch.ops.trtllm.cublas_scaled_mm_out(qinput, module.weight.t(),
+                                              cur_input_scale,
+                                              module.weight_scale, bias, out_2d)
+        if len(original_shape) > 2:
+            out = out_2d.reshape(*original_shape[:-1], out_2d.shape[-1])
+        return out
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -2796,14 +2814,12 @@ class Linear(nn.Module):
                                               "apply_window_output"):
                         output = self.quant_method.apply_window_output(
                             self, input, bias)
-                    elif (use_window and hasattr(self.quant_method, "apply_out")
-                          and self.use_custom_cublas_mm):
-                        # Window output is only used when use_custom_cublas_mm=True
-                        # because the fallback path in apply_out uses
-                        # torch.matmul(out=), which introduces
-                        # auto_functionalized(aten.mm.out) into the AOT graph
-                        # and breaks the piecewise CUDA-graph optimizer.
-                        # cublas_mm_out is a functional custom op and is safe.
+                    elif (use_window
+                          and hasattr(self.quant_method, "apply_out")):
+                        # Each quant method's apply_out is responsible for
+                        # deciding whether it can write into the pre-allocated
+                        # window buffer (e.g. requires use_custom_cublas_mm for
+                        # the unquantized path; FP8 always uses cuBLAS).
                         output_shape = list(input.shape)
                         output_shape[-1] = self.out_features
                         window_out = self.all_reduce.get_nccl_window_for_shape(
