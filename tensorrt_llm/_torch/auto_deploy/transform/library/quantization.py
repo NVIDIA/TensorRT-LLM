@@ -376,11 +376,10 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
 
     def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
         m, n = original_weight_shape
-        n = n // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-        padded_m, padded_n = self._pad_m_n(m, n)
+        n_blocks = n // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.float8_e4m3fn),
+            "weight_scale": torch.empty((m, n_blocks), dtype=torch.float8_e4m3fn),
             "weight_scale_2": torch.tensor(1.0 / 6.0),
         }
 
@@ -388,10 +387,9 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         return ([scales["input_scale"]], [scales["weight_scale"], scales["weight_scale_2"]], [], [])
 
     def _scale_buffer_key(self, weight_name: str, prefix: str = "") -> str:
-        """Key for the weight_scale buffer (get_scale_name('weight_scale') = attrname + '_weight_scale')."""
-        modname, _, attrname = weight_name.rpartition(".")
-        scale_buffer_name = attrname + "_weight_scale"
-        return prefix + modname + "." + scale_buffer_name
+        """Key for the weight_scale buffer registered as 'weight_scale' on the linear module."""
+        modname = weight_name.rsplit(".", 1)[0]
+        return prefix + modname + ".weight_scale"
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
         if weight_name in state_dict:
