@@ -537,10 +537,10 @@ class AttentionDpConfig(StrictBaseModel):
         description="The number of iterations to wait for batching.")
     enable_kv_cache_aware_routing: bool = Field(
         default=False,
-        description=
-        "Use KV cache-aware routing for attention DP request distribution. "
-        "When enabled, routes requests to ranks that already have matching "
-        "prefix KV cache, reducing redundant prefill computation. ")
+        description="Enable internal KV cache-aware routing for attention DP. "
+        "When enabled, distributes requests among ranks within a single "
+        "instance's attention DP group, routing them to the rank with the "
+        "matching prefix KV cache to reduce redundant prefill computation.")
     kv_cache_routing_load_balance_weight: float = Field(
         default=1.0,
         description=

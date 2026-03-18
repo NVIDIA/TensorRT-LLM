@@ -58,6 +58,15 @@ class RankState:
 class ADPRouter(ABC):
     """Abstract interface for distributing new requests across ADP ranks.
 
+    This is an **instance-level** router: it distributes requests across the
+    DP ranks within a single instance (e.g., one mpirun job controlling 8 GPUs
+    that together form a single logical server).
+
+    In disaggregated serving architectures, a separate higher-level router
+    orchestrates traffic across multiple instances (e.g., routing between
+    prefill and decode instances). That cross-instance routing is outside
+    the scope of this class.
+
     Interface:
         Input:  list[RankState], list[Request]
         Output: dict[rank, list[Request]]
@@ -387,6 +396,28 @@ class KVCacheAwareADPRouter(ADPRouter):
                 matches[req_id] = rank_data[i + 1]
             self._all_ranks_prefix_matches.append(matches)
 
+    def _score_rank(
+        self,
+        req_tokens: int,
+        match_len: int,
+        rank_active_tokens: float,
+        load_denom: float,
+    ) -> float:
+        """Score a candidate rank for a request (lower is better).
+
+        Args:
+            req_tokens: Total input tokens of the request.
+            match_len: Prefix match length on this rank's radix tree.
+            rank_active_tokens: Active tokens currently on this rank.
+            load_denom: Normalization denominator for the load term.
+
+        Returns:
+            Score combining cache miss cost and load penalty.
+        """
+        effective = req_tokens - match_len
+        normalized_load = rank_active_tokens / load_denom * req_tokens
+        return effective + self.load_balance_weight * normalized_load
+
     @staticmethod
     def _prefix_fingerprint(token_ids, num_tokens: int = 64) -> tuple:
         """Return a hashable fingerprint from the first num_tokens tokens.
@@ -463,7 +494,6 @@ class KVCacheAwareADPRouter(ADPRouter):
             if all_ranks_num_active_requests[rank] < expected_num_active_requests
         ]
 
-        beta = self.load_balance_weight
         prefix_matches = self._all_ranks_prefix_matches
 
         for req_item in remaining_unscheduled:
@@ -491,10 +521,8 @@ class KVCacheAwareADPRouter(ADPRouter):
 
             for rank in eligible_ranks:
                 match_len = prefix_matches[rank].get(req_id, 0) if rank < len(prefix_matches) else 0
-                effective = req_tokens - match_len
-                # Normalized load: maps rank's share of total load to [0, req_tokens]
-                normalized_load = all_ranks_num_active_tokens[rank] / load_denom * req_tokens
-                score = effective + beta * normalized_load
+                score = self._score_rank(req_tokens, match_len,
+                                         all_ranks_num_active_tokens[rank], load_denom)
                 if score < best_score:
                     best_score = score
                     best_rank = rank
