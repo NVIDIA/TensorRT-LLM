@@ -335,7 +335,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
         .saveLastSnapshot = true,
     };
 
-    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool*2, blocksInSecondaryPool}},
         {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
@@ -398,6 +398,9 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     ASSERT_EQ(idSetPositive.size(), occupiedBlocksLinear);
     ASSERT_EQ(idSetNegative.size(), placeholderBlocks);
 
+    // pretend the prefill is done
+    llmRequest0->setContextCurrentPosition(inputLength);
+    llmRequest0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
     blockManager.storeContextBlocks(seq0, *llmRequest0);
     blockManager.releaseBlocks(seq0);
     ASSERT_EQ(blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], blocksInPrimaryPool);

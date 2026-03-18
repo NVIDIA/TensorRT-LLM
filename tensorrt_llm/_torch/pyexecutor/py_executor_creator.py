@@ -36,7 +36,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
+from .config_utils import is_hybrid_linear, is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
@@ -575,6 +575,10 @@ def create_py_executor(
     else:
         ctx_chunk_config = None
 
+    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+        print(f"use FORCE_CHUNK for hybrid linear model")
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, kv_cache_config.mamba_prefix_cache_step)
+
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
@@ -694,7 +698,7 @@ def create_py_executor(
         # Disagg for hybrid models is currently only supported with C++ RnnStateManager
         config = model_engine.model.model_config.pretrained_config
         if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
-            if is_nemotron_hybrid(config) or is_qwen3_next(config):
+            if is_hybrid_linear(config):
                 logger.info("Disaggregated serving with hybrid model detected. "
                             "Enabling C++ MambaCacheManager automatically.")
                 os.environ['TRTLLM_USE_CPP_MAMBA'] = '1'
