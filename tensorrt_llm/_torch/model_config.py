@@ -254,12 +254,12 @@ class ModelConfig(Generic[TConfig]):
         if architecture == "GptOssForCausalLM":
             sm_version = get_sm_version()
             # Select the best performing backend based on SM version
-            if 100 <= sm_version < 120:  # Blackwell
+            if 100 <= sm_version < 120 or sm_version in (120, 121):  # Blackwell
                 return "TRTLLM"
             elif 90 <= sm_version < 100:  # Hopper
                 return "TRITON"
             else:
-                return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
+                return "CUTLASS"  # Fallback for other SM versions
 
         return "CUTLASS"
 
