@@ -512,11 +512,16 @@ def safe_allgather(comm, obj, chunk_size: int = 4 * 1024 * 1024):
     if (lengths < 0).any():
         raise RuntimeError("Serialization failed on at least one rank")
 
+    # Fast path: if every rank's payload fits within chunk_size, fall back
+    # to the simple comm.allgather which avoids the chunked-loop overhead.
+    if int(lengths.max()) <= chunk_size:
+        return comm.allgather(obj)
+
     displs = np.zeros(size, dtype=np.int64)
     if size > 1:
         displs[1:] = np.cumsum(lengths[:-1])
     # -- Prepare buffers --
-    sendbuf_full = np.frombuffer(payload, dtype=np.uint8, count=my_n)
+    sendbuf_full = np.frombuffer(payload, dtype=np.uint8)
     recvbuf = np.empty(lengths.sum(), dtype=np.uint8)
 
     # -- Chunked Allgatherv loop --
@@ -550,7 +555,6 @@ def safe_allgather(comm, obj, chunk_size: int = 4 * 1024 * 1024):
 
         send_part = sendbuf_full[sent_so_far[rank]:sent_so_far[rank] +
                                  counts_this_round[rank]]
-
         comm.Allgatherv(
             [send_part, MPI.BYTE],
             [round_recvbuf, counts_this_round, round_displs, MPI.BYTE])
@@ -566,21 +570,10 @@ def safe_allgather(comm, obj, chunk_size: int = 4 * 1024 * 1024):
             src_offset += n
 
     # -- Deserialize on all ranks --
-    out = []
-    for i in range(size):
-        sz = lengths[i]
-        if sz == 0:
-            out.append(None)
-            continue
-        start = displs[i]
-        blob = recvbuf[start:start + sz].tobytes()
-        try:
-            out.append(pickle.loads(blob))  # nosec B301
-        except Exception as e:
-            raise RuntimeError(
-                f"Deserialization failed for rank {i}: {e}") from e
-
-    return out
+    return [
+        pickle.loads(recvbuf[displs[i]:displs[i] + lengths[i]])  # nosec B301
+        if lengths[i] > 0 else None for i in range(size)
+    ]
 
 
 class MPIDist(Distributed):
