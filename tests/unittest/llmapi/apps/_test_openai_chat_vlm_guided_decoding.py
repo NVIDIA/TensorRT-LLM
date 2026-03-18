@@ -35,7 +35,7 @@ from test_llm import get_model_path
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+_MODEL_NAME = "Qwen3/Qwen3-VL-8B-Instruct"
 _IMAGE_URL = str(llm_models_root() / "multimodals" / "test_data" / "seashore.png")
 
 _SCHEMA = {
