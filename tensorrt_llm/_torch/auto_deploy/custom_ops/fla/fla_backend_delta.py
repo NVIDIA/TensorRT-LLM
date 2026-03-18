@@ -32,6 +32,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -73,7 +74,8 @@ def fla_cached_delta_rule(
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
     y_flat = y.view(b * s, num_heads, -1)
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
 
     # clean up metadata
