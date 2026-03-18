@@ -2491,7 +2491,7 @@ SizeType32 KVCacheManager::countReusableBlocks(
     return mBlockManager.countReusableBlocks(uniqueTokens, llmRequest, onlyAllocated);
 }
 
-bool KVCacheManager::addSequence(
+void KVCacheManager::addSequence(
     RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
 {
     // TODO: add streamLLM support
@@ -2505,12 +2505,7 @@ bool KVCacheManager::addSequence(
         return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
             mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
     }();
-
-    if (!emplaceDone)
-    {
-        return false;
-    }
-
+    TLLM_CHECK(emplaceDone);
     auto& sequence = seqIt->second;
 
     // Get statistics for block allocations/reuse pre request.
@@ -2585,8 +2580,6 @@ bool KVCacheManager::addSequence(
         llmRequest->updateReusedBlocksPerRequest(mBlockManager.getNumReusedBlocks() - numReusedBlocksPreRequest);
         llmRequest->updateMissedBlocksPerRequest(mBlockManager.getNumMissedBlocks() - numMissedBlocksPreRequest);
     }
-
-    return true;
 }
 
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)

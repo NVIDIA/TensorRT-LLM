@@ -441,6 +441,7 @@ class VisualGenParams:
     num_frames: int = 81
     frame_rate: float = 24.0
     input_reference: Optional[str] = None
+    image_cond_strength: float = 1.0
 
     # Image-specific parameters
     num_images_per_prompt: int = 1
@@ -452,6 +453,14 @@ class VisualGenParams:
     # Advanced parameters
     guidance_rescale: float = 0.0
     output_type: str = "pt"
+
+    # LTX-2 multi-modal guidance (STG / modality guidance)
+    stg_scale: float = 0.0
+    stg_blocks: Optional[List[int]] = None
+    modality_scale: float = 1.0
+    rescale_scale: float = 0.0
+    guidance_skip_step: int = 0
+    enhance_prompt: bool = False
 
     # Wan-specific parameters
     guidance_scale_2: Optional[float] = None
@@ -525,14 +534,39 @@ class VisualGen:
         req_id = self.req_counter
         self.req_counter += 1
 
+        # Normalize inputs to (prompt: List[str], negative_prompt: Optional[str])
+        # so DiffusionRequest.prompt is always a list.
         if isinstance(inputs, dict):
-            prompt = inputs.get("prompt")
+            prompt = [inputs.get("prompt")]
             negative_prompt = inputs.get("negative_prompt", None)
         elif isinstance(inputs, str):
-            prompt = inputs
+            prompt = [inputs]
             negative_prompt = None
+        elif isinstance(inputs, (list, tuple)):
+            # Batch generation: list of prompts
+            if not inputs:
+                raise ValueError("Batch inputs must contain at least one item")
+
+            prompt = []
+            negative_prompts = []
+            for idx, inp in enumerate(inputs):
+                if isinstance(inp, str):
+                    prompt.append(inp)
+                    negative_prompts.append(None)
+                elif isinstance(inp, dict):
+                    item_prompt = inp.get("prompt")
+                    if item_prompt is None:
+                        raise ValueError(f"Batch input at index {idx} is missing 'prompt'")
+                    prompt.append(item_prompt)
+                    negative_prompts.append(inp.get("negative_prompt"))
+                else:
+                    raise ValueError(f"Invalid batch item type at index {idx}: {type(inp)}")
+
+            unique_negatives = {p for p in negative_prompts if p is not None}
+            if len(unique_negatives) > 1:
+                raise ValueError("Per-item negative_prompt is not supported for batch inputs")
+            negative_prompt = next(iter(unique_negatives), None)
         else:
-            # TODO: Support batch generation
             raise ValueError(f"Invalid inputs type: {type(inputs)}")
 
         request = DiffusionRequest(
@@ -550,7 +584,14 @@ class VisualGen:
             num_images_per_prompt=params.num_images_per_prompt,
             guidance_rescale=params.guidance_rescale,
             output_type=params.output_type,
+            stg_scale=params.stg_scale,
+            stg_blocks=params.stg_blocks,
+            modality_scale=params.modality_scale,
+            rescale_scale=params.rescale_scale,
+            guidance_skip_step=params.guidance_skip_step,
+            enhance_prompt=params.enhance_prompt,
             image=params.input_reference,
+            image_cond_strength=params.image_cond_strength,
             guidance_scale_2=params.guidance_scale_2,
             boundary_ratio=params.boundary_ratio,
             last_image=params.last_image,

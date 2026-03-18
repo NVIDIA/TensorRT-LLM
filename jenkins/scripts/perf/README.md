@@ -84,6 +84,80 @@ Shared module imported by `get_post_merge_html.py`, `get_pre_merge_html.py`, and
 - **HTML dashboard**: `generate_post_merge_html()` produces a full interactive
   report with three-way cascading filters and click-to-inspect data-point popups.
 
+## MPI/PMI Handling in Disaggregated Tests
+
+### Background
+
+Disaggregated tests run four srun steps within a single SLURM job. Only CTX/GEN workers
+need MPI (they use `trtllm-llmapi-launch`). The disagg server (`trtllm-serve
+disaggregated`) and benchmark client are single-process, non-MPI tasks.
+
+When srun launches a process with `--mpi=pmix`, it sets PMI/PMIx environment variables.
+If the launched process imports libraries with MPI support (e.g., PyTorch links Open MPI),
+`MPI_Init` may be triggered automatically. If the container's MPI build lacks SLURM PMI
+support, this causes:
+```
+PMI2_Init failed to initialize.  Return code: 14
+```
+
+### Solution
+
+The `--mpi=pmix` flag is added **only** to the CTX/GEN worker srun commands in
+`slurm_launch_draft.sh`, not to the shared `srunArgs` array. This way, the disagg server
+and benchmark srun steps never see MPI flags.
+
+**Where MPI is configured:**
+- `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` — `--mpi=pmix` on
+  ctx/gen srun commands only
+- `jenkins/scripts/perf/local/submit.py` — `--mpi=pmi2` for aggregated mode only,
+  no MPI flag for disaggregated mode (handled by the draft template)
+- `jenkins/L0_Test.groovy` — `--mpi=pmi2` for non-disagg multi-node only
+
+### Key Rules
+
+When modifying disaggregated SLURM scripts, keep these invariants:
+
+1. **srunArgs are shared**: All srun steps in `slurm_launch_draft.sh` use the same
+   `"${srunArgs[@]}"`. Never add MPI flags to srunArgs for disaggregated mode.
+2. **Only CTX/GEN workers need MPI**: Add `--mpi=pmix` directly on their srun command
+   lines in `slurm_launch_draft.sh`, not in the shared srunArgs.
+3. **Non-MPI roles must stay MPI-free**: The disagg server and benchmark steps must
+   not receive `--mpi` flags. If adding a new srun step, consider whether it needs MPI.
+
+## Adding or Re-enabling Perf Sanity Tests in CI
+
+When adding or re-enabling perf sanity tests, two files must be updated:
+
+1. **Test-db YAML** in `tests/integration/test_lists/test-db/` — add or uncomment the test case line
+2. **`jenkins/L0_Test.groovy`** — update or add the CI stage in `launchTestJobs()`
+
+### Where to Find CI Stage Definitions
+
+In `jenkins/L0_Test.groovy`, search for `launchTestJobs`. Perf sanity stages are grouped by test type:
+
+| Config Variable | Test Type | Platform |
+|-----------------|-----------|----------|
+| `x86SlurmTestConfigs` | Single-node aggregated perf sanity (x86) | `"auto:h100-cr-x8"` etc. |
+| `SBSASlurmTestConfigs` | Single-node aggregated perf sanity (SBSA/Grace) | `"auto:gb200-x4"` etc. |
+| `multiNodesSBSAConfigs` | Multi-node aggregated **and** disaggregated perf sanity | `"auto:gb200-flex"` etc. |
+
+### `buildStageConfigs` Function
+
+Disaggregated and multi-node perf sanity stages use `buildStageConfigs()`:
+
+```groovy
+def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
+```
+
+- `testlist`: test-db YAML filename without `.yml` extension
+- `testCount`: must equal the number of **active (uncommented)** tests in the test-db file (each disagg test gets its own CI stage)
+- `gpuCount`: total GPUs allocated per stage = `total_nodes * gpus_per_node`
+- `nodeCount`: total SLURM nodes per stage
+
+When adding a test, either increment `testCount` on an existing entry or add a new `buildStageConfigs` block. Stages are grouped by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
+
+For the full step-by-step guide including how to derive test-db filenames and GPU/node counts from disaggregated config YAMLs, see [`tests/scripts/perf-sanity/README.md`](../../tests/scripts/perf-sanity/README.md) ("Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests").
+
 ## Post-Processing and Triage
 
 ### `get_pre_merge_html.py`

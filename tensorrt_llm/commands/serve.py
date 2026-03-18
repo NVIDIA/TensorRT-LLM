@@ -151,9 +151,10 @@ def get_llm_args(
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
-        fail_fast_on_attention_window_too_large: bool = False,
+        fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
+        video_pruning_rate: Optional[float] = None,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -236,6 +237,8 @@ def get_llm_args(
         otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "video_pruning_rate":
+        video_pruning_rate,
     }
 
     llm_args = {
@@ -372,6 +375,8 @@ def launch_grpc_server(host: str,
                 ("grpc.max_receive_message_length", -1),  # Unlimited
                 ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
                 ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
+                ("grpc.keepalive_permit_without_calls", True),
+                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
             ], )
 
         # Add servicer to server
@@ -602,12 +607,15 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help=help_info_with_stability_tag("expert parallelism size",
                                                 "beta"))
-@click.option("--moe_cluster_parallel_size",
-              "--cluster_size",
-              type=int,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "expert cluster parallelism size", "beta"))
+@click.option(
+    "--moe_cluster_parallel_size",
+    "--cluster_size",
+    type=int,
+    default=None,
+    help=help_info_with_stability_tag(
+        "[Deprecated] Expert cluster parallelism size. "
+        "This option is no longer supported and will be removed in a future release.",
+        "deprecated"))
 @click.option(
     "--gpus_per_node",
     type=int,
@@ -659,7 +667,7 @@ class ChoiceWithAlias(click.Choice):
         "prototype"))
 @click.option(
     "--reasoning_parser",
-    type=click.Choice(ReasoningParserFactory.parsers.keys()),
+    type=click.Choice(ReasoningParserFactory.keys()),
     default=None,
     help=help_info_with_stability_tag(
         "Specify the parser for reasoning models.", "prototype"),
@@ -686,10 +694,12 @@ class ChoiceWithAlias(click.Choice):
 @click.option(
     "--fail_fast_on_attention_window_too_large",
     is_flag=True,
-    default=False,
+    default=True,
     help=help_info_with_stability_tag(
-        "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.",
-        "prototype"))
+        "[Deprecated] Exit with runtime error when attention window is too large "
+        "to fit even a single sequence in the KV cache. Now defaults to True. "
+        "This flag only affects the TRT backend and will be removed in a future release.",
+        "deprecated"))
 @click.option("--otlp_traces_endpoint",
               type=str,
               default=None,
@@ -711,6 +721,14 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help=help_info_with_stability_tag(
                   "Keyword arguments for media I/O.", "prototype"))
+@click.option("--video_pruning_rate",
+              type=float,
+              default=None,
+              help=help_info_with_stability_tag(
+                  "Pruning rate for video frames in multimodal models. "
+                  "Applied by Efficient Video Sampling (EVS). "
+                  "None disables EVS, values in [0, 1) enable pruning.",
+                  "prototype"))
 @click.option("--chat_template",
               type=str,
               default=None,
@@ -753,14 +771,27 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str],
-        grpc: bool, served_model_name: Optional[str],
+        video_pruning_rate: Optional[float], custom_module_dirs: list[Path],
+        chat_template: Optional[str], grpc: bool,
+        served_model_name: Optional[str],
         extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if moe_cluster_parallel_size is not None:
+        logger.warning(
+            "--moe_cluster_parallel_size / --cluster_size is deprecated and "
+            "no longer supported. This option will be removed in a future release."
+        )
+
+    if "--fail_fast_on_attention_window_too_large" in sys.argv:
+        logger.warning(
+            "--fail_fast_on_attention_window_too_large is deprecated. "
+            "It now defaults to True and will be removed in a future release. "
+            "This flag only affects the TRT backend.")
 
     for custom_module_dir in custom_module_dirs:
         try:
@@ -796,7 +827,8 @@ def serve(
             fail_fast_on_attention_window_too_large=
             fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
-            enable_chunked_prefill=enable_chunked_prefill)
+            enable_chunked_prefill=enable_chunked_prefill,
+            video_pruning_rate=video_pruning_rate)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
@@ -994,8 +1026,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     "--metrics-log-interval",
     type=int,
     default=0,
-    help=
-    "The interval of logging metrics in seconds. Set to 0 to disable metrics logging."
+    help="[Deprecated] The interval of logging metrics in seconds. "
+    "This option is not connected to any functionality and will be removed in a future release."
 )
 def disaggregated(
     config_file: Optional[str],
@@ -1008,6 +1040,11 @@ def disaggregated(
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)
+
+    if metrics_log_interval != 0:
+        logger.warning(
+            "--metrics-log-interval is deprecated and not connected to any "
+            "functionality. This option will be removed in a future release.")
 
     disagg_cfg = parse_disagg_config_file(config_file)
 

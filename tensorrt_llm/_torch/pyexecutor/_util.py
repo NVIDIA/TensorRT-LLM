@@ -121,13 +121,10 @@ class KvCacheCreator:
         if self._kv_cache_manager_cls == KVCacheManagerV2:
             if kv_connector_manager is not None or (
                     max_beam_width is not None and max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
                 logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
                     "Falling back to KVCacheManager.")
-                self._kv_cache_manager_cls = KVCacheManager
         self._draft_config = draft_config
         self._skip_est = skip_est
 
@@ -143,12 +140,26 @@ class KvCacheCreator:
                 mapping,
                 tokens_per_block=self._tokens_per_block)
         elif self._should_create_separate_draft_kv_cache():
-            # One-model draft with separate KV cache layout
+            # One-model draft with separate KV cache layout.
+            # Pass num_layers explicitly since the HF config may report a
+            # different layer count than what is actually used at runtime
+            # (e.g. EAGLE3: config says 1, runtime uses 4).
+            # For PP, draft layers are only on the last rank (see
+            # get_pp_layers), so only that rank should include draft cost.
             effective_draft_config = self._get_effective_draft_config()
-            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
-                effective_draft_config,
-                mapping,
-                tokens_per_block=self._tokens_per_block)
+            if self._speculative_config.spec_dec_mode.is_external_drafter():
+                # External drafter: layers start from 0, normal PP distribution
+                kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                    effective_draft_config,
+                    mapping,
+                    tokens_per_block=self._tokens_per_block)
+            elif mapping.is_last_pp_rank():
+                # EAGLE3/MTP: draft layers only on last PP rank
+                kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                    effective_draft_config,
+                    mapping,
+                    tokens_per_block=self._tokens_per_block,
+                    num_layers=self._get_num_draft_layers())
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -604,9 +615,21 @@ class KvCacheCreator:
         # layers as well.
         return self._model_engine.model.model_config
 
+    def _get_num_draft_layers(self) -> int:
+        """Return the actual number of draft KV cache layers.
+
+        This must stay in sync with the num_layers passed to the draft KV
+        cache manager constructor in _create_one_model_draft_kv_cache_manager.
+        """
+        if self._speculative_config.spec_dec_mode.is_external_drafter():
+            return self._draft_config.pretrained_config.num_hidden_layers
+        return get_num_spec_layers(self._speculative_config)
+
     def _create_one_model_draft_kv_cache_manager(
-            self,
-            estimating_kv_cache: bool = False) -> Optional[KVCacheManager]:
+        self,
+        estimating_kv_cache: bool = False,
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+    ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
         when target and draft have different KV cache layouts.
@@ -618,11 +641,10 @@ class KvCacheCreator:
 
         # PARD, External Drafter: draft is a separate model, layers start from 0.
         # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
+        num_draft_layers = self._get_num_draft_layers()
         if self._speculative_config.spec_dec_mode.is_external_drafter():
-            num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_draft_layers
         else:
-            num_draft_layers = get_num_spec_layers(self._speculative_config)
             spec_dec_layer_mask = [False] * target_num_layers + [
                 True
             ] * num_draft_layers
@@ -648,16 +670,22 @@ class KvCacheCreator:
                 draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
+        # the draft layers share the same architecture as the target model and need
+        # the sparse_attention_config. Get it from effective_draft_config which
+        # falls back to the target model's config for MTP mode.
+        sparse_attn_config = effective_draft_config.sparse_attention_config
+        draft_kv_config = kv_cache_config_override if kv_cache_config_override is not None else self._kv_cache_config
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
-            kv_cache_config=self._kv_cache_config,
+            kv_cache_config=draft_kv_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=None,  # Not applicable for draft in one-model mode
+            sparse_attn_config=sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
@@ -671,12 +699,62 @@ class KvCacheCreator:
             num_layers=num_draft_layers,
         )
 
+    def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
+        """Split max_gpu_total_bytes between target and draft KV caches.
+
+        When using KVCacheManagerV2 with a separate draft KV cache,
+        max_gpu_total_bytes represents the total budget for both target and
+        draft combined.  This method splits the budget proportionally based
+        on their per-token KV cache sizes.
+
+        Returns a cloned KvCacheConfig for the draft, or None if no split is
+        needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
+        in-place for the target.
+        """
+        total_budget = self._kv_cache_config.max_gpu_total_bytes
+        if total_budget is None or total_budget <= 0:
+            return None
+
+        total_kv = self._get_kv_size_per_token()
+        target_kv = self._kv_cache_manager_cls.get_cache_size_per_token(
+            self._model_engine.model.model_config,
+            self._mapping,
+            tokens_per_block=self._tokens_per_block)
+        draft_kv = total_kv - target_kv
+        if total_kv <= 0 or draft_kv <= 0:
+            return None
+
+        draft_budget = int(total_budget * draft_kv / total_kv)
+        target_budget = total_budget - draft_budget
+
+        logger.info(
+            f"Splitting KV cache budget: total={total_budget / GB:.2f} GiB, "
+            f"target={target_budget / GB:.2f} GiB ({target_kv}B/tok), "
+            f"draft={draft_budget / GB:.2f} GiB ({draft_kv}B/tok)")
+
+        self._kv_cache_config.max_gpu_total_bytes = target_budget
+
+        draft_kv_cache_config = self._kv_cache_config.model_copy()
+        draft_kv_cache_config.max_gpu_total_bytes = draft_budget
+        return draft_kv_cache_config
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         if self._skip_est:
             self.configure_kv_cache_capacity()
+
+        # For V2 with separate one-model draft KV cache, split the total budget
+        # between target and draft before creating either manager.
+        # Only split for the final managers, not during estimation — estimation
+        # uses max_tokens-based logic and must not have its config mutated.
+        # Two-model draft is excluded: V2 does not support two-model mode.
+        draft_kv_cache_config = None
+        if (not estimating_kv_cache
+                and self._should_create_separate_draft_kv_cache()
+                and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
+            draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine, estimating_kv_cache)
@@ -689,12 +767,16 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
+            assert draft_kv_cache_config is None, (
+                "KVCacheManagerV2 does not support two-model speculative decoding "
+                "with separate draft KV cache budget splitting.")
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine, estimating_kv_cache)
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
-                estimating_kv_cache)
+                estimating_kv_cache,
+                kv_cache_config_override=draft_kv_cache_config)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
@@ -1078,22 +1160,64 @@ def create_py_executor_instance(
             # all layers have the same number of KV heads
             num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
 
+        pretrained_config = model_engine.model.model_config.pretrained_config
+
+        # Derive shared expert intermediate size from the LoRA adapter
+        # weights, which are the source of truth for dimension validation.
+        # The model config's shared_expert_intermediate_size may not match
+        # the adapter (e.g., upcycled models).
+        shared_expert_hidden_size = 0
+        if lora_config.lora_dir:
+            shared_expert_global = _infer_shared_expert_size_from_adapter(
+                lora_config.lora_dir[0])
+            if shared_expert_global > 0:
+                shared_expert_hidden_size = shared_expert_global // mapping.tp_size
+
+        moe_hidden_size = 0
+        moe_intermediate = getattr(pretrained_config, 'moe_intermediate_size',
+                                   None)
+        if moe_intermediate is not None and moe_intermediate > 0:
+            moe_hidden_size = moe_intermediate // mapping.tp_size
+
+        # For MoE models with shared experts: replace mlp_* target modules with
+        # shared_expert_* equivalents. The shared expert uses different LoRA
+        # module types with their own intermediate size. For pure MoE models
+        # (no dense MLP layers), mlp_* modules don't exist in the model.
+        target_modules = list(lora_config.lora_target_modules)
+        if shared_expert_hidden_size > 0:
+            has_dense_mlp = bool(
+                getattr(pretrained_config, 'mlp_only_layers', None))
+            mlp_to_shared_expert = {
+                'mlp_h_to_4h': 'shared_expert_h_to_4h',
+                'mlp_4h_to_h': 'shared_expert_4h_to_h',
+                'mlp_gate': 'shared_expert_gate',
+            }
+            for mlp_mod, se_mod in mlp_to_shared_expert.items():
+                if mlp_mod in target_modules:
+                    if se_mod not in target_modules:
+                        target_modules.append(se_mod)
+                    if not has_dense_mlp:
+                        target_modules.remove(mlp_mod)
+
         lora_modules = LoraModule.create_lora_modules(
-            lora_module_names=lora_config.lora_target_modules,
+            lora_module_names=target_modules,
             hidden_size=model_binding_config.hidden_size,
             mlp_hidden_size=model_binding_config.mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
             num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
             tp_size=mapping.tp_size,
-            num_experts=num_experts)
+            num_experts=num_experts,
+            shared_expert_hidden_size=shared_expert_hidden_size,
+            moe_hidden_size=moe_hidden_size)
+
         model_binding_config.use_lora_plugin = True
         model_binding_config.lora_modules = lora_modules
         model_binding_config.max_lora_rank = lora_config.max_lora_rank
 
         max_lora_rank = lora_config.max_lora_rank
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
-            len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
+            len(target_modules + lora_config.missing_qkv_modules)
 
         peft_cache_config_model = PeftCacheConfig(
         ) if peft_cache_config is None else peft_cache_config
@@ -1121,8 +1245,7 @@ def create_py_executor_instance(
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
-            lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules,
+            target_modules, lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
         if isinstance(model_engine, PyTorchModelEngine):
             model_engine._init_cuda_graph_lora_manager(lora_config)
@@ -1330,6 +1453,38 @@ def get_decoding_mode(
         decoding_mode = DecodingMode.TopKTopP()
 
     return decoding_mode
+
+
+def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
+    """Infer shared expert intermediate size from LoRA adapter weights.
+
+    Scans the adapter for shared_expert.down_proj lora_A weights and
+    returns the global (unsharded) intermediate size. This is more reliable
+    than the model config, which may not match the adapter (e.g., upcycled
+    models).
+    """
+    import json
+
+    try:
+        from tensorrt_llm.lora_manager import get_model_path, load_state_dict
+        model_path = get_model_path(adapter_dir, "adapter_model")
+        if model_path is None:
+            return 0
+        adapter_weights = load_state_dict(model_path)
+        if adapter_weights is None:
+            return 0
+        for key, tensor in adapter_weights.items():
+            if 'shared_expert' in key and 'down_proj' in key and 'lora_A' in key:
+                adapter_config_path = os.path.join(adapter_dir,
+                                                   "adapter_config.json")
+                with open(adapter_config_path) as f:
+                    rank = json.load(f).get("r", 0)
+                if rank > 0:
+                    return tensor.shape[1] if tensor.shape[
+                        0] == rank else tensor.shape[0]
+    except Exception as e:
+        logger.debug(f"Failed to infer shared expert size from adapter: {e}")
+    return 0
 
 
 def _try_infer_num_experts(model_config: ModelConfig) -> int:

@@ -36,6 +36,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     ParallelConfig,
     TeaCacheConfig,
+    TorchCompileConfig,
     VisualGenArgs,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import WanImageToVideoPipeline
@@ -1067,6 +1068,76 @@ class TestWanI2VRobustness:
         finally:
             del pipeline
             torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Batch Generation Tests (I2V)
+# =============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.i2v
+class TestWanI2VBatchGeneration:
+    """Batch generation tests for WAN I2V pipeline (Wan 2.1 and Wan 2.2).
+
+    Tests that passing a list of prompts produces batched output
+    and matches sequential generation with the same seeds.
+    """
+
+    @pytest.fixture(scope="class")
+    def i2v_full_pipeline(self):
+        """Load full I2V pipeline (all components) for batch tests."""
+        if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
+            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH.")
+
+        args = VisualGenArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        yield pipeline
+        del pipeline
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_single_prompt_backward_compat(self, i2v_full_pipeline, test_image):
+        """Single prompt returns (T, H, W, C) for backward compatibility."""
+        result = i2v_full_pipeline.forward(
+            prompt="a cat walking",
+            image=test_image,
+            height=480,
+            width=832,
+            num_frames=9,
+            num_inference_steps=4,
+            guidance_scale=5.0,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 1 and H == 480 and W == 832 and C == 3
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_batch_prompt_shape(self, i2v_full_pipeline, test_image):
+        """List of prompts returns (B, T, H, W, C)."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+        result = i2v_full_pipeline.forward(
+            prompt=prompts,
+            image=test_image,
+            height=480,
+            width=832,
+            num_frames=9,
+            num_inference_steps=4,
+            guidance_scale=5.0,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 2 and H == 480 and W == 832 and C == 3
 
 
 # ============================================================================
