@@ -16,6 +16,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile
@@ -1021,16 +1022,16 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-        self.use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+        self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
+                                  and IS_CUTLASS_DSL_AVAILABLE)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
-        logger.info(
-            f"Indexer layer {layer_idx}: using_cute_dsl_topk={self.use_cute_dsl_topk} for decode top-k"
-        )
 
         if self.use_cute_dsl_topk and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+            # the dtype of topk input tensor, which is float32 now.
+            # Note, need to update it if the dtype of topk input tensor is changed.
             cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
-                dtype=dtype, top_k=self.index_topk)
+                dtype=torch.float32, top_k=self.index_topk)
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1633,7 +1634,8 @@ class Indexer(nn.Module):
                     torch.ops.trtllm.indexer_topk_decode(
                         logits_decode, gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                            num_gen_tokens, :], next_n)
+                                            num_gen_tokens, :], next_n,
+                        self.index_topk)
             else:
                 # padded
                 positions = torch.arange(

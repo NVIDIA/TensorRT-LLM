@@ -2986,16 +2986,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
 
-            cls._compile(
-                dtype,
-                bucketed_num_cols,
-                top_k,
-                next_n,
-                return_val,
-                num_copy_bits,
-                load_balance,
-                large_occupancy,
-            )
             key = (
                 dtype,
                 bucketed_num_cols,
@@ -3006,6 +2996,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 load_balance,
                 large_occupancy,
             )
+            cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
 
             # Prepare output tensors
@@ -3024,12 +3015,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Prepare buffer
             # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
-            # maximum: 256 * 2 * 8192 * 4 bytes = 8388608 bytes = 8 MB
-            # maximum: 256 * 2 * 16384 * 4 bytes = 16777216 bytes = 16 MB
-            # maximum: 256 * 2 * 32768 * 4 bytes = 33554432 bytes = 32 MB
-            # maximum: 256 * 2 * 65536 * 4 bytes = 67108864 bytes = 64 MB
-            # maximum: 256 * 2 * 131072 * 4 bytes = 134217728 bytes = 128 MB
-            # maximum: 256 * 2 * 262144 * 4 bytes = 268435456 bytes = 256 MB
+            # fp32: up to 256 MB (256 * 2 * 262144 * 4)
+            # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
             if dtype == cutlass.Float32:
                 buffer_numbers = 2
             else:
@@ -3348,18 +3335,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
             merge_cols = num_ctas_per_row * top_k
 
-            cls._compile(
-                dtype,
-                top_k,
-                next_n,
-                return_val,
-                num_copy_bits,
-                load_balance,
-                large_occupancy,
-                chunk_size_per_cta,
-                num_ctas_per_row,
-                dynamic,
-            )
             key = (
                 dtype,
                 top_k,
@@ -3372,6 +3347,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_ctas_per_row,
                 dynamic,
             )
+            cls._compile(*key)
             compiled_kernel_first, compiled_kernel_second = \
                 cls.kernel_cache[key]
 
@@ -3523,10 +3499,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         @classmethod
         def _compute_max_chunk(cls,
                                dtype,
-                               num_copy_bits: int = 256,
-                               max_smem: int = 227 * 1024):
+                               num_copy_bits: int = 256):
             """Compute the maximum chunk_size a single CTA can handle."""
-            overhead = 256 * 4 * 2 + 16 + 8 * 4
+            max_smem = cutlass.utils.get_smem_capacity_in_bytes()
+            # Fixed shared memory overhead (excludes shared_ordered[chunk_size]):
+            # local_histogram[256]*4 + prefix_buf[256]*4 + scalars[4]*4 + warp_sums[8]*4
+            overhead = 256 * 4 * 2 + 4 * 4 + 8 * 4
             if dtype == cutlass.Float32:
                 ordered_elem_size = 4
             else:
@@ -3647,10 +3625,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if num_groups < 1:
                 num_groups = 1
 
-            cls._compile(dtype, chunk_size, top_k, next_n, num_copy_bits,
-                         ctas_per_group, num_sms, return_val)
             key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
                    ctas_per_group, num_sms, return_val)
+            cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
 
             # Allocate row_states once with num_sms rows — large enough for
@@ -4191,6 +4168,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_copy_bits: int = 256,
         min_seq_len_log2: int = 10,
         max_seq_len_log2: int = 18,
+        single_pass_multi_cta: bool = False,
     ) -> None:
         """Pre-compile all CuTE DSL top-k kernel variants for every
         power-of-2 bucketed_num_cols in [2^min_seq_len_log2, 2^max_seq_len_log2].
@@ -4237,62 +4215,64 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     large_occupancy=large_occupancy,
                 )
 
-        # MultiCTA: enumerate all possible num_ctas_per_row values
-        # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)
-        # fp32: num_cols in [65536, 262144] → num_ctas_per_row in [4, 16]
-        # fp16/bf16: num_cols in [131072, 262144] → num_ctas_per_row in [8, 16]
-        min_ctas = math.ceil(multi_cta_threshold / chunk_size_per_cta)
-        max_ctas = math.ceil((1 << max_seq_len_log2) / chunk_size_per_cta)
-        for num_ctas_per_row in range(min_ctas, max_ctas + 1):
-            for large_occupancy in (False, True):
-                CuteDSLTopKDecodeMultiCTARunner._compile(
-                    cutlass_dtype,
-                    top_k,
-                    next_n,
-                    return_val,
-                    num_copy_bits,
-                    load_balance=False,
-                    large_occupancy=large_occupancy,
-                    chunk_size_per_cta=chunk_size_per_cta,
-                    num_ctas_per_row=num_ctas_per_row,
-                    dynamic=True,
-                )
-
-        # Single-pass multi-CTA: enumerate all (chunk_size, ctas_per_group) pairs.
-        # chunk_size is snapped to power-of-2 (+ max_chunk clamp), so
-        # the set of possible values is small and deterministic.
-        num_sms = _get_num_sms()
-        possible_chunks = CuteDSLTopKDecodeSinglePassMultiCTARunner._get_possible_chunk_sizes(
-            cutlass_dtype, num_copy_bits)
-        max_chunk, vec_size = CuteDSLTopKDecodeSinglePassMultiCTARunner._compute_max_chunk(
-            cutlass_dtype, num_copy_bits)
-        single_pass_multi_cta_configs = set()
-        for cs in possible_chunks:
+        if single_pass_multi_cta:
+            # Single-pass multi-CTA: enumerate all (chunk_size, ctas_per_group)
+            # pairs.  chunk_size is snapped to power-of-2 (+ max_chunk clamp),
+            # so the set of possible values is small and deterministic.
+            num_sms = _get_num_sms()
+            possible_chunks = CuteDSLTopKDecodeSinglePassMultiCTARunner._get_possible_chunk_sizes(
+                cutlass_dtype, num_copy_bits)
+            max_chunk, vec_size = CuteDSLTopKDecodeSinglePassMultiCTARunner._compute_max_chunk(
+                cutlass_dtype, num_copy_bits)
+            single_pass_multi_cta_configs = set()
+            for cs in possible_chunks:
+                for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                    num_cols = 1 << log2_n
+                    ctas = math.ceil(num_cols / cs)
+                    if ctas >= 1:
+                        single_pass_multi_cta_configs.add((cs, ctas))
+            # Also cover FlashInfer-style fallback path (large batch):
+            # ctas_per_group = ceil(num_cols / max_chunk), chunk_size aligned
             for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
                 num_cols = 1 << log2_n
-                ctas = math.ceil(num_cols / cs)
+                ctas = math.ceil(num_cols / max_chunk)
                 if ctas >= 1:
+                    cs = math.ceil(num_cols / ctas)
+                    cs = ((cs + vec_size - 1) // vec_size) * vec_size
+                    if cs > max_chunk:
+                        cs = max_chunk
                     single_pass_multi_cta_configs.add((cs, ctas))
-        # Also cover FlashInfer-style fallback path (large batch):
-        # ctas_per_group = ceil(num_cols / max_chunk), chunk_size aligned
-        for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
-            num_cols = 1 << log2_n
-            ctas = math.ceil(num_cols / max_chunk)
-            if ctas >= 1:
-                cs = math.ceil(num_cols / ctas)
-                cs = ((cs + vec_size - 1) // vec_size) * vec_size
-                if cs > max_chunk:
-                    cs = max_chunk
-                single_pass_multi_cta_configs.add((cs, ctas))
-        for cs, ctas in sorted(single_pass_multi_cta_configs):
-            CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
-                cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas, num_sms,
-                return_val)
+            for cs, ctas in sorted(single_pass_multi_cta_configs):
+                CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
+                    cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
+                    num_sms, return_val)
+            multi_cta_info = (
+                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs)")
+        else:
+            # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
+            # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)
+            # fp32: num_cols in [65536, 262144] → num_ctas_per_row in [4, 16]
+            # fp16/bf16: num_cols in [131072, 262144] → num_ctas_per_row in [8, 16]
+            min_ctas = math.ceil(multi_cta_threshold / chunk_size_per_cta)
+            max_ctas = math.ceil((1 << max_seq_len_log2) / chunk_size_per_cta)
+            for num_ctas_per_row in range(min_ctas, max_ctas + 1):
+                for large_occupancy in (False, True):
+                    CuteDSLTopKDecodeMultiCTARunner._compile(
+                        cutlass_dtype,
+                        top_k,
+                        next_n,
+                        return_val,
+                        num_copy_bits,
+                        load_balance=False,
+                        large_occupancy=large_occupancy,
+                        chunk_size_per_cta=chunk_size_per_cta,
+                        num_ctas_per_row=num_ctas_per_row,
+                        dynamic=True,
+                    )
+            multi_cta_info = (
+                f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}]")
 
         logger.info(
             f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
             f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
-            f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}], "
-            f"SinglePassMultiCTA chunk_sizes={possible_chunks} "
-            f"({len(single_pass_multi_cta_configs)} configs), "
-            f"top_k={top_k}, next_n={next_n}")
+            f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")
