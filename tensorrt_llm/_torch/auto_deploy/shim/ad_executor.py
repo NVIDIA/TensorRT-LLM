@@ -842,7 +842,7 @@ class ADEngine(ModelEngine):
             ordered_requests=ordered_requests,
             input_pos=input_pos,
             cu_seqlen=cu_seqlen,
-            num_prefill_seqs=num_prefill_seqs,
+            num_prefill_seqs=num_prefill,
             extra_args=extra_args,
         )
 
