@@ -1705,9 +1705,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
 
-        # When max_tokens is explicitly set, store it so get_num_available_tokens
-        # can cap results to GPU-only capacity.
-        self._gpu_max_tokens = kv_cache_config.max_tokens  # None if not set
+        # Defensive cap for get_num_available_tokens: when host cache is
+        # enabled, clamp_max_seq_len_for_mem may return a value that spans
+        # both GPU and host tiers.  Storing the explicit max_tokens (if set)
+        # lets us cap the result to GPU-only capacity so callers like CUDA
+        # graph warmup don't over-allocate beyond the GPU pool.
+        # None when max_tokens is not explicitly configured — other config
+        # paths (max_gpu_total_bytes, free_gpu_memory_fraction) are already
+        # bounded by the GPU quota passed to GpuCacheTierConfig.
+        self._gpu_max_tokens = kv_cache_config.max_tokens
 
         max_num_tokens = self.get_num_available_tokens(
             token_num_upper_bound=max_seq_len)
