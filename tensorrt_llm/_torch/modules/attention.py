@@ -1601,11 +1601,8 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        q, compressed_kv, k_pe, indexer_k = self.kv_a_proj_with_mqa(
-            hidden_states).split([
-                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
-                self.indexer.head_dim
-            ], -1)
+        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
 
         # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
@@ -1635,13 +1632,15 @@ class MLA(nn.Module):
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
         else:
-            # Indexer
+            # Defer indexer.wk projection to here so the short-MHA skip
+            # path above avoids the extra GEMM when indexer is not needed.
+            indexer_k = self.indexer.wk(hidden_states)
             topk_indices = self.indexer(
                 qr,
                 hidden_states,
                 attn_metadata,
                 position_ids,
-                indexer_k=indexer_k,  # indexer K proj
+                indexer_k=indexer_k,
             )
 
         assert q.shape[
