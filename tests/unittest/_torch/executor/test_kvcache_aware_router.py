@@ -19,16 +19,14 @@ These tests use mock objects and do NOT require GPU.
 
 from unittest.mock import MagicMock, Mock
 
-import pytest
-
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
     KVCacheAwareADPRouter,
     RankState,
 )
 
-
 # ---- Helpers ----
+
 
 def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
     """Create a mock Distributed object for testing."""
@@ -39,8 +37,9 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
     return dist
 
 
-def _make_request_item(req_id, num_tokens=10, target_dp_rank=None,
-                       attention_dp_relax=True, lora_task_id=None):
+def _make_request_item(
+    req_id, num_tokens=10, target_dp_rank=None, attention_dp_relax=True, lora_task_id=None
+):
     """Create a mock RequestQueueItem for testing."""
     item = MagicMock()
     item.id = req_id
@@ -79,6 +78,7 @@ def _mock_kv_cache_manager(probe_results=None):
 
 
 # ---- Tests for KVCacheAwareADPRouter ----
+
 
 class TestKVCacheAwareADPRouter:
     """Tests for the KV cache-aware ADP router."""
@@ -188,7 +188,7 @@ class TestKVCacheAwareADPRouter:
 
         router._all_ranks_prefix_matches = [
             {1: 80},  # rank 0: 80 tokens cached
-            {1: 0},   # rank 1: no cache
+            {1: 0},  # rank 1: no cache
         ]
 
         states = [
@@ -223,8 +223,7 @@ class TestKVCacheAwareADPRouter:
         """Heavy load on cached rank → routes to idle rank despite no cache."""
         dist = _mock_dist(tp_rank=0, tp_size=2)
         mgr = _mock_kv_cache_manager()
-        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr,
-                                        load_balance_weight=10.0)
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, load_balance_weight=10.0)
 
         router._all_ranks_prefix_matches = [{1: 80}, {1: 0}]
 
@@ -253,8 +252,7 @@ class TestKVCacheAwareADPRouter:
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
         ]
-        req = _make_request_item(1, num_tokens=100, target_dp_rank=1,
-                                 attention_dp_relax=False)
+        req = _make_request_item(1, num_tokens=100, target_dp_rank=1, attention_dp_relax=False)
 
         result, _ = router.route_requests(states, [req], max_num_active_requests=10)
         assert len(result[1]) == 1  # forced to rank 1
@@ -276,7 +274,7 @@ class TestKVCacheAwareADPRouter:
         # Requests 1,2 have cache on rank 0; requests 3,4 have no cache
         router._all_ranks_prefix_matches = [
             {1: 80, 2: 80, 3: 0, 4: 0},  # rank 0
-            {1: 0, 2: 0, 3: 0, 4: 0},    # rank 1
+            {1: 0, 2: 0, 3: 0, 4: 0},  # rank 1
         ]
 
         states = [
@@ -329,8 +327,7 @@ class TestKVCacheAwareADPRouter:
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
         router._all_ranks_prefix_matches = [{}, {}, {}, {}]
 
-        states = [RankState(rank=i, num_active_requests=0, num_active_tokens=0)
-                  for i in range(4)]
+        states = [RankState(rank=i, num_active_requests=0, num_active_tokens=0) for i in range(4)]
         reqs = [_make_request_item(i, num_tokens=10) for i in range(8)]
 
         result, _ = router.route_requests(states, reqs, max_num_active_requests=10)
@@ -365,7 +362,7 @@ class TestKVCacheAwareADPRouter:
         # req 1 has cache on rank 0, req 2 has no cache anywhere
         router._all_ranks_prefix_matches = [
             {1: 80, 2: 0},  # rank 0
-            {1: 0, 2: 0},   # rank 1
+            {1: 0, 2: 0},  # rank 1
         ]
 
         states = [
@@ -390,6 +387,7 @@ class TestKVCacheAwareADPRouter:
 
 # ---- Tests for V1 KVCacheManager.probe_prefix_match_length ----
 
+
 class TestProbeOnV1KVCacheManager:
     """Test probe_prefix_match_length on v1 (C++) KVCacheManager using mocks."""
 
@@ -399,8 +397,7 @@ class TestProbeOnV1KVCacheManager:
         mgr = Mock(spec=KVCacheManager)
         mgr.enable_block_reuse = False
 
-        result = KVCacheManager.probe_prefix_match_length(
-            mgr, input_tokens=[1, 2, 3])
+        result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=[1, 2, 3])
         assert result == 0
 
     def test_variable_window_returns_zero(self):
@@ -411,8 +408,7 @@ class TestProbeOnV1KVCacheManager:
         mgr.impl = Mock()
         mgr.impl.is_variable_window = True
 
-        result = KVCacheManager.probe_prefix_match_length(
-            mgr, input_tokens=[1, 2, 3])
+        result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=[1, 2, 3])
         assert result == 0
         # count_reusable_blocks should NOT be called (would crash)
         mgr.impl.count_reusable_blocks.assert_not_called()
@@ -425,8 +421,7 @@ class TestProbeOnV1KVCacheManager:
         mgr.impl = Mock()
         mgr.impl.is_variable_window = False
 
-        result = KVCacheManager.probe_prefix_match_length(
-            mgr, input_tokens=[])
+        result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=[])
         assert result == 0
 
     def test_block_to_token_conversion(self):
@@ -440,6 +435,5 @@ class TestProbeOnV1KVCacheManager:
         mgr.impl.count_reusable_blocks = Mock(return_value=3)
         mgr.tokens_per_block = 64
 
-        result = KVCacheManager.probe_prefix_match_length(
-            mgr, input_tokens=list(range(200)))
+        result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=list(range(200)))
         assert result == 192  # 3 blocks * 64 tokens/block

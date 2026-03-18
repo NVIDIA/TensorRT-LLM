@@ -18,14 +18,11 @@ Includes:
 from __future__ import annotations
 
 import heapq
-import logging
 import os
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING, Dict, List, Tuple
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
@@ -67,12 +64,15 @@ class ADPRouter(ABC):
         Output: dict[rank, list[Request]]
     """
 
+    needs_prefix_matches: bool = False
+
     def __init__(self, dist: Distributed):
         self.dist = dist
 
     @classmethod
-    def create(cls, dist: "Distributed", kv_cache_manager=None,
-               attention_dp_config=None) -> "ADPRouter":
+    def create(
+        cls, dist: "Distributed", kv_cache_manager=None, attention_dp_config=None
+    ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
         Args:
@@ -85,12 +85,13 @@ class ADPRouter(ABC):
             kv_cache_manager has block reuse enabled; DefaultADPRouter
             otherwise.
         """
-        if (attention_dp_config is not None
-                and attention_dp_config.enable_kv_cache_aware_routing
-                and kv_cache_manager is not None
-                and kv_cache_manager.enable_block_reuse):
-            return KVCacheAwareADPRouter(
-                dist=dist, kv_cache_manager=kv_cache_manager)
+        if (
+            attention_dp_config is not None
+            and attention_dp_config.enable_kv_cache_aware_routing
+            and kv_cache_manager is not None
+            and kv_cache_manager.enable_block_reuse
+        ):
+            return KVCacheAwareADPRouter(dist=dist, kv_cache_manager=kv_cache_manager)
 
         return DefaultADPRouter(dist=dist)
 
@@ -324,27 +325,22 @@ class KVCacheAwareADPRouter(ADPRouter):
     ranks (floored at req_tokens) so that both terms remain on the same
     scale regardless of absolute load levels.
 
-    Requires a KV cache manager with enable_block_reuse=True and
-    probe_prefix_match_length() support (both v1 and v2 managers).
+    Requires a KV cache manager with enable_block_reuse=True.
     Falls back to load-based routing when no cache hits exist.
     """
 
-    def __init__(self, dist: "Distributed", kv_cache_manager,
-                 load_balance_weight: float | None = None):
+    needs_prefix_matches: bool = True
+
+    def __init__(
+        self, dist: "Distributed", kv_cache_manager, load_balance_weight: float | None = None
+    ):
         super().__init__(dist)
         self.kv_cache_manager = kv_cache_manager
         if load_balance_weight is not None:
             self.load_balance_weight = load_balance_weight
         else:
-            self.load_balance_weight = float(
-                os.environ.get("TRTLLM_CACHE_ROUTER_BETA", "1.0"))
+            self.load_balance_weight = float(os.environ.get("TRTLLM_CACHE_ROUTER_BETA", "1.0"))
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
-        self._debug = os.environ.get("TRTLLM_CACHE_ROUTER_DEBUG", "0") == "1"
-        self._route_count = 0
-        if self._debug:
-            logger.info(
-                "KVCacheAwareADPRouter: beta=%.3f, debug=True",
-                self.load_balance_weight)
 
     def create_rank_state(
         self,
@@ -376,13 +372,11 @@ class KVCacheAwareADPRouter(ADPRouter):
             if req is None:
                 local_matches.extend([req_item.id, 0])
                 continue
-            input_tokens = getattr(req, 'input_token_ids', None) or []
+            input_tokens = getattr(req, "input_token_ids", None) or []
             probe_tokens = input_tokens[:-1] if len(input_tokens) > 1 else []
-            lora_config = getattr(req, 'lora_config', None)
+            lora_config = getattr(req, "lora_config", None)
             lora_task_id = lora_config.task_id if lora_config is not None else None
-            match_len = self.kv_cache_manager.probe_prefix_match_length(
-                probe_tokens, lora_task_id
-            )
+            match_len = self.kv_cache_manager.probe_prefix_match_length(probe_tokens, lora_task_id)
             local_matches.extend([req_item.id, match_len])
 
         all_data = self.dist.tp_allgather(local_matches)
@@ -458,8 +452,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         # request A (conv X, turn 5) is routed to rank R, request B (conv X,
         # turn 3) is processed next and the load tracker still favours rank R.
         def _sort_key(req_item):
-            tokens = (getattr(req_item.request, "input_token_ids", [])
-                      if req_item.request else [])
+            tokens = getattr(req_item.request, "input_token_ids", []) if req_item.request else []
             fp = self._prefix_fingerprint(tokens)
             # Negate length so longer requests come first within each group
             return (fp, -len(tokens))
@@ -467,31 +460,25 @@ class KVCacheAwareADPRouter(ADPRouter):
         remaining_unscheduled = sorted(remaining_unscheduled, key=_sort_key)
 
         eligible_ranks = [
-            rank for rank in range(tp_size)
+            rank
+            for rank in range(tp_size)
             if all_ranks_num_active_requests[rank] < expected_num_active_requests
         ]
 
         beta = self.load_balance_weight
         prefix_matches = self._all_ranks_prefix_matches
 
-        cache_routed = 0  # requests where cache match influenced routing
-        total_routed = 0
-        total_cache_tokens_saved = 0
-
         for req_item in remaining_unscheduled:
             if not eligible_ranks:
                 break
 
             req_tokens = (
-                len(getattr(req_item.request, "input_token_ids", []))
-                if req_item.request else 0
+                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
             )
             req_id = req_item.id
 
             best_rank = eligible_ranks[0]
-            best_score = float('inf')
-            best_match = 0
-            max_match = 0
+            best_score = float("inf")
 
             # --- Normalize load term ---
             # Normalize each rank's active_tokens by the total load across all
@@ -505,46 +492,25 @@ class KVCacheAwareADPRouter(ADPRouter):
             load_denom = max(total_load, float(req_tokens))
 
             for rank in eligible_ranks:
-                match_len = (prefix_matches[rank].get(req_id, 0)
-                             if rank < len(prefix_matches) else 0)
+                match_len = prefix_matches[rank].get(req_id, 0) if rank < len(prefix_matches) else 0
                 effective = req_tokens - match_len
                 # Normalized load: maps rank's share of total load to [0, req_tokens]
-                normalized_load = (
-                    all_ranks_num_active_tokens[rank] / load_denom * req_tokens
-                )
+                normalized_load = all_ranks_num_active_tokens[rank] / load_denom * req_tokens
                 score = effective + beta * normalized_load
                 if score < best_score:
                     best_score = score
                     best_rank = rank
-                    best_match = match_len
-                if match_len > max_match:
-                    max_match = match_len
-
-            if best_match > 0:
-                cache_routed += 1
-                total_cache_tokens_saved += best_match
-            total_routed += 1
 
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
 
-            match_len = (prefix_matches[best_rank].get(req_id, 0)
-                         if best_rank < len(prefix_matches) else 0)
+            match_len = (
+                prefix_matches[best_rank].get(req_id, 0) if best_rank < len(prefix_matches) else 0
+            )
             effective_added = req_tokens - match_len
             all_ranks_num_active_tokens[best_rank] += effective_added
 
             if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
                 eligible_ranks.remove(best_rank)
-
-        if self._debug and total_routed > 0:
-            self._route_count += 1
-            if self._route_count <= 20 or self._route_count % 50 == 0:
-                per_rank_counts = {r: len(reqs)
-                                   for r, reqs in all_ranks_new_requests.items()}
-                logger.info(
-                    "CacheRouter iter=%d: routed=%d cache_influenced=%d "
-                    "cache_tokens_saved=%d per_rank=%s beta=%.3f",
-                    self._route_count, total_routed, cache_routed,
-                    total_cache_tokens_saved, per_rank_counts, beta)
 
         return all_ranks_new_requests, expected_num_active_requests

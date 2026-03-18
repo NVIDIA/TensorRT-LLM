@@ -21,8 +21,7 @@ This module contains:
 """
 
 # Re-export from scheduler.py
-from .adp_router import (ADPRouter, DefaultADPRouter,
-                         KVCacheAwareADPRouter, RankState)
+from .adp_router import ADPRouter, DefaultADPRouter, KVCacheAwareADPRouter, RankState
 from .scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,

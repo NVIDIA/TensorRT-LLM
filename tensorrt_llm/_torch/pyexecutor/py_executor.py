@@ -67,7 +67,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, KVCacheAwareADPRouter
+from .scheduler.adp_router import ADPRouter
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -2526,7 +2526,7 @@ class PyExecutor:
 
         # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
-            if isinstance(self.adp_router, KVCacheAwareADPRouter):
+            if self.adp_router.needs_prefix_matches:
                 self.adp_router.gather_prefix_matches(new_requests)
 
             all_ranks_new_requests, self.expected_num_active_requests = \
