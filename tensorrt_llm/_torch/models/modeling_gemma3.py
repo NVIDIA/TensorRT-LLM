@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Dict, Optional, Tuple
 
@@ -26,6 +27,20 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
+# This decorator selectively disables inference_mode()
+# to avoid conflicts with torch.dynamo tracing.
+def inference_mode_unless_compiling(func):
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
 class Gemma3TextScaledWordEmbedding(Embedding):
 
     def __init__(
@@ -47,7 +62,7 @@ class Gemma3TextScaledWordEmbedding(Embedding):
         )
         self.embed_scale = torch.sqrt(torch.tensor(hidden_size)).to(self.dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(self, input_ids):
         return super().forward(input_ids) * self.embed_scale
 
@@ -90,7 +105,7 @@ class Gemma3Attention(QKNormRoPEAttention):
             q_scaling=q_scaling,
         )
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         position_ids: Optional[torch.IntTensor],
@@ -163,7 +178,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -222,7 +237,7 @@ class Gemma3TextModel(DecoderModel):
                             eps=config.pretrained_config.rms_norm_eps,
                             dtype=config.pretrained_config.torch_dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -392,7 +407,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             context_mask_list.append(mask_i.flatten())
         return torch.cat(context_mask_list, dim=0).contiguous()
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         attn_metadata: AttentionMetadata,
