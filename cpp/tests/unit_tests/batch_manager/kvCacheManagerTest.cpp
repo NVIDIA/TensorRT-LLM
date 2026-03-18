@@ -147,7 +147,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
 
     auto constexpr requestId = 42;
     GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     blockManager.addSequence(seq0, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false);
     auto constexpr occupiedBlocks = (numBlocksPerBeam - 1) + beamWidth;
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - occupiedBlocks);
@@ -180,18 +180,18 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     EXPECT_NO_THROW(
         blockManager.addSequence(seq0, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false));
     GenerationRequest seq1{requestId + 1, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     EXPECT_NO_THROW(
         blockManager.addSequence(seq1, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false));
     // same requestId not allowed
     GenerationRequest seq2{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     EXPECT_THROW(
         blockManager.addSequence(seq2, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false),
         std::runtime_error);
     // no more blocks
     GenerationRequest seq3{requestId + 2, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     EXPECT_THROW(
         blockManager.addSequence(seq3, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false),
         std::runtime_error);
@@ -305,7 +305,7 @@ void runPartialCopyTest()
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0
         = blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -345,7 +345,7 @@ void runPartialCopyTest()
         EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
     }
     blockManager.releaseBlocks(seq0, llmRequest0);
-    blockManager.releaseSequence(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
 
     // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
     auto inputTokens1 = inputTokens;
@@ -355,7 +355,7 @@ void runPartialCopyTest()
     GenerationRequest seq1{requestId, inputLength1, beamWidth, blockManager.getWindowSizesMetadata()};
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1
         = blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -382,7 +382,7 @@ void runPartialCopyTest()
     GenerationRequest seq2{requestId, inputLength2, beamWidth, blockManager.getWindowSizesMetadata()};
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2
         = blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
@@ -427,8 +427,8 @@ void runPartialCopyTest()
 
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseBlocks(seq2, llmRequest2);
-    blockManager.releaseSequence(seq1.getRequestId());
-    blockManager.releaseSequence(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
 
     if constexpr (transferMode == KvCacheTransferMode::GDS)
         fs::remove_all(directory);
@@ -761,7 +761,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0
         = blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -777,7 +777,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     // blocks 0, 1, 2 are stored for reuse (blocks contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9])
     blockManager.releaseBlocks(seq0, llmRequest0);
-    blockManager.releaseSequence(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -790,7 +790,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // reuse blocks 0, 1 ([0, 1, 2, 3], [4, 5, 6, 7]) and get new block 3
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1
         = blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -804,7 +804,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     // block 3 matches block 2 and will be freed (blocks contain [8, 9])
     blockManager.releaseBlocks(seq1, llmRequest1);
-    blockManager.releaseSequence(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -819,7 +819,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
         seq0_dup.getRequestId(), maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq0_dup.getRequestId());
     prepopulatedPromptLen0
         = blockManager.addSequence(seq0_dup, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -837,7 +837,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
         seq1_dup.getRequestId(), maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq1_dup.getRequestId());
     prepopulatedPromptLen1
         = blockManager.addSequence(seq1_dup, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -849,12 +849,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     // block 2 is stored for reuse (block contains [8]). nb! Last token of last block is never stored
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
-    blockManager.releaseSequence(seq0_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block is never stored
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
-    blockManager.releaseSequence(seq1_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -872,7 +872,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // reuse block 0 ([0, 1, 2, 3]), get new block 5
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2
         = blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
@@ -896,7 +896,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // reuse blocks 0, 1, 4(p) ([0, 1, 2, 3], [4, 5, 6, 7], [8, 9])
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     auto prepopulatedPromptLen3
         = blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
@@ -911,10 +911,10 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     // block 5 is not stored since it is last block and has only one token
     blockManager.releaseBlocks(seq2, llmRequest2);
-    blockManager.releaseSequence(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
     // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block not stored
     blockManager.releaseBlocks(seq3, llmRequest3);
-    blockManager.releaseSequence(seq3.getRequestId());
+    blockManager.releaseSequenceValidity(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -931,7 +931,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // reuse blocks 0, 1, 4(p) ([0, 1, 2, 3], [4, 5, 6, 7], [8,9])
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq4.getRequestId());
+    blockManager.initializeSequenceValidity(seq4.getRequestId());
     auto prepopulatedPromptLen4
         = blockManager.addSequence(seq4, promptLen4, numContextBlocks4, *llmRequest4, maxAttentionWindow);
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
@@ -949,7 +949,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // blocks 0 and 1 ([0, 1, 2, 3], [4, 5, 6, 7]) are already stored,
     // block 4 is freed
     blockManager.releaseBlocks(seq4, llmRequest4Short);
-    blockManager.releaseSequence(seq4.getRequestId());
+    blockManager.releaseSequenceValidity(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -965,7 +965,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
         seq4_dup.getRequestId(), maxNewTokens, inputTokens4, samplingConfig, isStreaming);
     promptLen4 = llmRequest4->getNumTokens(beamIdx);
     numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq4_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq4_dup.getRequestId());
     prepopulatedPromptLen4
         = blockManager.addSequence(seq4_dup, promptLen4, numContextBlocks4, *llmRequest4, maxAttentionWindow);
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
@@ -977,7 +977,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     blockManager.releaseBlocks(seq4_dup, llmRequest4);
-    blockManager.releaseSequence(seq4_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq4_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -994,7 +994,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // no reuse, all blocks need to be freed
     auto promptLen5 = llmRequest5->getNumTokens(beamIdx);
     auto numContextBlocks5 = tc::ceilDiv(promptLen5, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq5.getRequestId());
+    blockManager.initializeSequenceValidity(seq5.getRequestId());
     auto prepopulatedPromptLen5
         = blockManager.addSequence(seq5, promptLen5, numContextBlocks5, *llmRequest5, maxAttentionWindow);
     llmRequest5->setPrepopulatedPromptLen(prepopulatedPromptLen5, blockManager.getTokensPerBlock());
@@ -1005,7 +1005,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 
     blockManager.releaseBlocks(seq5, llmRequest5);
-    blockManager.releaseSequence(seq5.getRequestId());
+    blockManager.releaseSequenceValidity(seq5.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1021,7 +1021,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // no reuse, all blocks need to be freed
     auto promptLen6 = llmRequest6->getNumTokens(beamIdx);
     auto numContextBlocks6 = tc::ceilDiv(promptLen6, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq6.getRequestId());
+    blockManager.initializeSequenceValidity(seq6.getRequestId());
     auto prepopulatedPromptLen6
         = blockManager.addSequence(seq6, promptLen6, numContextBlocks6, *llmRequest6, maxAttentionWindow);
     llmRequest6->setPrepopulatedPromptLen(prepopulatedPromptLen6, blockManager.getTokensPerBlock());
@@ -1033,7 +1033,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - 1);
 
     blockManager.releaseBlocks(seq6, llmRequest6);
-    blockManager.releaseSequence(seq6.getRequestId());
+    blockManager.releaseSequenceValidity(seq6.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
@@ -1093,7 +1093,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0
         = blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -1109,7 +1109,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
 
     // blocks 0, 1, 2 are stored for reuse (block 2 contains [(2, 0), (3, 0)])
     blockManager.releaseBlocks(seq0, llmRequest0);
-    blockManager.releaseSequence(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1127,7 +1127,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     // reuse blocks 0, 1 and get new block 3
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1
         = blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -1140,7 +1140,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
 
     // block 3 matches block 2 and will be freed
     blockManager.releaseBlocks(seq1, llmRequest1);
-    blockManager.releaseSequence(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1156,7 +1156,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds, numReturnSequences);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq0_dup.getRequestId());
     prepopulatedPromptLen0
         = blockManager.addSequence(seq0_dup, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -1180,7 +1180,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
         std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds1, numReturnSequences);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq1_dup.getRequestId());
     prepopulatedPromptLen1
         = blockManager.addSequence(seq1_dup, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -1191,12 +1191,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
-    blockManager.releaseSequence(seq0_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 2 is stored for reuse (block contains [(2, 0), (3, 0), (4, 0)])
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
-    blockManager.releaseSequence(seq1_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1216,7 +1216,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     // no reuse, get new block 5, 6, 7
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2
         = blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
@@ -1244,7 +1244,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     // reuse block 0, get new block 8, 9
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     auto prepopulatedPromptLen3
         = blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
@@ -1258,8 +1258,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
 
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseBlocks(seq3, llmRequest3);
-    blockManager.releaseSequence(seq2.getRequestId());
-    blockManager.releaseSequence(seq3.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
@@ -1324,7 +1324,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0
         = blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -1345,7 +1345,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // Block 1: [104, 105, 0, 1]     ← Contains multimodal (104, 105)
     // Block 2: [2, 3, 4]            ← No multimodal
     blockManager.releaseBlocks(seq0, llmRequest0);
-    blockManager.releaseSequence(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1364,7 +1364,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // should reuse blocks 0, 1 and get new block 3
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1
         = blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -1376,7 +1376,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // block 3 matches block 2 and will be freed
     blockManager.releaseBlocks(seq1, llmRequest1);
-    blockManager.releaseSequence(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1402,7 +1402,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // no reuse, get new blocks 4, 5, 6
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2
         = blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
@@ -1438,7 +1438,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // reuse block 0, get new blocks 7, 8
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     auto prepopulatedPromptLen3
         = blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
@@ -1454,8 +1454,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // clean up
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseBlocks(seq3, llmRequest3);
-    blockManager.releaseSequence(seq2.getRequestId());
-    blockManager.releaseSequence(seq3.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
@@ -1511,7 +1511,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
     // get new blocks 0, 1, 2 ([0,1,2,3], [4,5,6,7], [8])
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0
         = blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -1527,7 +1527,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     // store blocks 0, 1, 2 for reuse ([0,1,2,3], [4,5,6,7], [8,9])
     blockManager.releaseBlocks(seq0, llmRequest0);
-    blockManager.releaseSequence(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1543,7 +1543,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // reuse blocks 0, 1 and get new block 3
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1
         = blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -1556,7 +1556,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     // store block 3 for reuse ([8,9])
     blockManager.releaseBlocks(seq1, llmRequest1);
-    blockManager.releaseSequence(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1571,7 +1571,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
         loraTaskId);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq0_dup.getRequestId());
     prepopulatedPromptLen0
         = blockManager.addSequence(seq0_dup, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -1596,7 +1596,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
     // reuse 0, 1, 2(p) ([0,1,2,3], [4,5,6,7], [8])
-    blockManager.holdSequence(seq1_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq1_dup.getRequestId());
     prepopulatedPromptLen1
         = blockManager.addSequence(seq1_dup, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -1608,12 +1608,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     // store block 4 for reuse ([8])
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
-    blockManager.releaseSequence(seq0_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 2 is stored for reuse (block contains [8, 9]). nb! Last token of last block is not stored
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
-    blockManager.releaseSequence(seq1_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1630,7 +1630,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // no reuse, get new block 5, 6, 7
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2
         = blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
@@ -1644,7 +1644,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // store blocks 5, 6, 7 for reuse ([0,1,2,3], [4,5,6,7], [8]) with loraTaskId 1
     blockManager.releaseBlocks(seq2, llmRequest2);
-    blockManager.releaseSequence(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1661,7 +1661,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // reuse blocks 5, 6, 7(p) ([0,1,2,3], [4,5,6,7], [8])
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     auto prepopulatedPromptLen3
         = blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
@@ -1674,7 +1674,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // store block 7 for reuse ([8,9]) with loraTaskId 1
     blockManager.releaseBlocks(seq3, llmRequest3);
-    blockManager.releaseSequence(seq3.getRequestId());
+    blockManager.releaseSequenceValidity(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1693,7 +1693,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // reuse blocks 0, get new block 8
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq4.getRequestId());
+    blockManager.initializeSequenceValidity(seq4.getRequestId());
     auto prepopulatedPromptLen4
         = blockManager.addSequence(seq4, promptLen4, numContextBlocks4, *llmRequest4, maxAttentionWindow);
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
@@ -1706,7 +1706,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 8 is stored with [4] and loraTaskId 0
     blockManager.releaseBlocks(seq4, llmRequest4);
-    blockManager.releaseSequence(seq4.getRequestId());
+    blockManager.releaseSequenceValidity(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1720,7 +1720,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // no reuse, get new block 9, 10, 11
     auto promptLen5 = llmRequest5->getNumTokens(beamIdx);
     auto numContextBlocks5 = tc::ceilDiv(promptLen5, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq5.getRequestId());
+    blockManager.initializeSequenceValidity(seq5.getRequestId());
     auto prepopulatedPromptLen5
         = blockManager.addSequence(seq5, promptLen5, numContextBlocks5, *llmRequest5, maxAttentionWindow);
     llmRequest5->setPrepopulatedPromptLen(prepopulatedPromptLen5, blockManager.getTokensPerBlock());
@@ -1733,7 +1733,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 9, 10, 11 are stored without loraTaskId
     blockManager.releaseBlocks(seq5, llmRequest5);
-    blockManager.releaseSequence(seq5.getRequestId());
+    blockManager.releaseSequenceValidity(seq5.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
@@ -1793,7 +1793,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0
         = blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -1809,7 +1809,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
 
     // blocks 0, 1, 2 are stored for reuse (block 2 contains [(2, 0), (3, 0)] with loraTaskId 1)
     blockManager.releaseBlocks(seq0, llmRequest0);
-    blockManager.releaseSequence(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1828,7 +1828,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     // no reuse, get new block 3, 4, 5
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1
         = blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -1841,7 +1841,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
 
     // blocks 3, 4, 5 are stored for reuse (block 5 contains [(2, 0), (3, 0)] with loraTaskId 2)
     blockManager.releaseBlocks(seq1, llmRequest1);
-    blockManager.releaseSequence(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1857,7 +1857,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
     // reuse blocks 0, 1 and get new block 6
-    blockManager.holdSequence(seq0_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq0_dup.getRequestId());
     prepopulatedPromptLen0
         = blockManager.addSequence(seq0_dup, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -1881,7 +1881,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
         std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds1);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1_dup.getRequestId());
+    blockManager.initializeSequenceValidity(seq1_dup.getRequestId());
     prepopulatedPromptLen1
         = blockManager.addSequence(seq1_dup, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -1892,11 +1892,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
-    blockManager.releaseSequence(seq0_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
-    blockManager.releaseSequence(seq1_dup.getRequestId());
+    blockManager.releaseSequenceValidity(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -1916,7 +1916,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     // no reuse, get new block 7, 8, 9
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2
         = blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
@@ -1944,7 +1944,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     // reuse block 0, get new block 10, 11
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     auto prepopulatedPromptLen3
         = blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
@@ -1971,7 +1971,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     // reuse block 3, get new block 12, 13
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq4.getRequestId());
+    blockManager.initializeSequenceValidity(seq4.getRequestId());
     auto prepopulatedPromptLen4
         = blockManager.addSequence(seq4, promptLen4, numContextBlocks4, *llmRequest4, maxAttentionWindow);
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
@@ -1986,9 +1986,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseBlocks(seq4, llmRequest4);
-    blockManager.releaseSequence(seq2.getRequestId());
-    blockManager.releaseSequence(seq3.getRequestId());
-    blockManager.releaseSequence(seq4.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq3.getRequestId());
+    blockManager.releaseSequenceValidity(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
@@ -2052,7 +2052,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0
         = blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -2070,7 +2070,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
 
     // Release blocks to make them available for reuse
     blockManager.releaseBlocks(seq0, llmRequest0);
-    blockManager.releaseSequence(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -2092,7 +2092,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     // Should NOT reuse blocks despite same tokens, because cache_salt_id is different
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1
         = blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -2106,7 +2106,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
 
     // Release blocks
     blockManager.releaseBlocks(seq1, llmRequest1);
-    blockManager.releaseSequence(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -2127,7 +2127,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     // SHOULD reuse blocks because both tokens and cache_salt_id match
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2
         = blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
@@ -2141,7 +2141,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
 
     // Release blocks
     blockManager.releaseBlocks(seq2, llmRequest2);
-    blockManager.releaseSequence(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
@@ -2163,7 +2163,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     // Should NOT reuse blocks from any previous request because cache_salt_id is different
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     auto prepopulatedPromptLen3
         = blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
@@ -2192,7 +2192,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     // Should reuse blocks from request0 (blocks 0,1) because both have no cache_salt_id
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq4.getRequestId());
+    blockManager.initializeSequenceValidity(seq4.getRequestId());
     auto prepopulatedPromptLen4
         = blockManager.addSequence(seq4, promptLen4, numContextBlocks4, *llmRequest4, maxAttentionWindow);
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
@@ -2208,8 +2208,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     // Clean up
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseBlocks(seq4, llmRequest4);
-    blockManager.releaseSequence(seq3.getRequestId());
-    blockManager.releaseSequence(seq4.getRequestId());
+    blockManager.releaseSequenceValidity(seq3.getRequestId());
+    blockManager.releaseSequenceValidity(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
@@ -2316,7 +2316,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
             20));
     GenerationRequest seq0{0, inputLength0, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks0 = tc::ceilDiv(inputLength0, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq0.getRequestId());
+    blockManager.initializeSequenceValidity(seq0.getRequestId());
     auto prepopulatedPromptLen0 = blockManager.addSequence(
         seq0, llmRequest0->getNumTokens(0), numContextBlocks0, *llmRequest0, maxAttentionWindow);
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
@@ -2327,7 +2327,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     GenerationRequest seq1{1, inputLength1, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks1 = tc::ceilDiv(inputLength1, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq1.getRequestId());
+    blockManager.initializeSequenceValidity(seq1.getRequestId());
     auto prepopulatedPromptLen1 = blockManager.addSequence(
         seq1, llmRequest1->getNumTokens(0), numContextBlocks1, *llmRequest1, maxAttentionWindow);
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
@@ -2335,8 +2335,8 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     // Release both sequences
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseBlocks(seq1, llmRequest1);
-    blockManager.releaseSequence(seq0.getRequestId());
-    blockManager.releaseSequence(seq1.getRequestId());
+    blockManager.releaseSequenceValidity(seq0.getRequestId());
+    blockManager.releaseSequenceValidity(seq1.getRequestId());
 
     // Add and then release another sequence
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{16, 17, 18, 19, 20, 21, 22, 23});
@@ -2346,12 +2346,12 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 20)}, 20));
     GenerationRequest seq2{2, inputLength2, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks2 = tc::ceilDiv(inputLength2, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq2.getRequestId());
+    blockManager.initializeSequenceValidity(seq2.getRequestId());
     auto prepopulatedPromptLen2 = blockManager.addSequence(
         seq2, llmRequest2->getNumTokens(0), numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
     blockManager.releaseBlocks(seq2, llmRequest2);
-    blockManager.releaseSequence(seq2.getRequestId());
+    blockManager.releaseSequenceValidity(seq2.getRequestId());
 
     // Check that request 1 blocks were overwritten
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{8, 9, 10, 11, 12, 13, 14, 15});
@@ -2359,7 +2359,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     GenerationRequest seq3{3, inputLength3, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks3 = tc::ceilDiv(inputLength3, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq3.getRequestId());
+    blockManager.initializeSequenceValidity(seq3.getRequestId());
     auto prepopulatedPromptLen3 = blockManager.addSequence(
         seq3, llmRequest3->getNumTokens(0), numContextBlocks3, *llmRequest3, maxAttentionWindow);
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
@@ -2367,7 +2367,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
 
     blockManager.releaseBlocks(seq3, llmRequest3);
-    blockManager.releaseSequence(seq3.getRequestId());
+    blockManager.releaseSequenceValidity(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 4);
 
     // Check that request 0 blocks weren't overwritten
@@ -2376,7 +2376,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     auto llmRequest4 = std::make_shared<LlmRequest>(4, maxNewTokens, inputTokens4, samplingConfig, isStreaming);
     GenerationRequest seq4{4, inputLength3, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks4 = tc::ceilDiv(inputLength4, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq4.getRequestId());
+    blockManager.initializeSequenceValidity(seq4.getRequestId());
     auto prepopulatedPromptLen4 = blockManager.addSequence(
         seq4, llmRequest4->getNumTokens(0), numContextBlocks4, *llmRequest4, maxAttentionWindow);
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
@@ -2389,7 +2389,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     auto llmRequest5 = std::make_shared<LlmRequest>(5, maxNewTokens, inputTokens5, samplingConfig, isStreaming);
     GenerationRequest seq5{5, inputLength5, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks5 = tc::ceilDiv(inputLength5, blockManager.getTokensPerBlock());
-    blockManager.holdSequence(seq5.getRequestId());
+    blockManager.initializeSequenceValidity(seq5.getRequestId());
     auto prepopulatedPromptLen5 = blockManager.addSequence(
         seq5, llmRequest5->getNumTokens(0), numContextBlocks5, *llmRequest5, maxAttentionWindow);
     llmRequest5->setPrepopulatedPromptLen(prepopulatedPromptLen5, blockManager.getTokensPerBlock());
