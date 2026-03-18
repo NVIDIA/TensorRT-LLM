@@ -318,12 +318,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
-    from ..cute_dsl_kernels.blackwell.top_k.distributed_radix_topk import \
-        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
-    from ..cute_dsl_kernels.blackwell.top_k.distributed_radix_topk import \
-        DistributedRadixTopKKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
         FilteredTopKKernelVarlenDecode
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
+        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
+        SinglePassMultiCTARadixTopKKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -3431,8 +3431,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return output_indices_torch, output_values_torch
 
-    class CuteDSLTopKDecodeDistributedRunner:
-        """Runner for distributed radix top-k (FlashInfer-style fused multi-CTA).
+    class CuteDSLTopKDecodeSinglePassMultiCTARunner:
+        """Runner for single-pass multi-CTA radix top-k (FlashInfer-style fused multi-CTA).
 
         All CTAs in a group cooperatively find the global pivot via multi-round
         radix select with global histogram merging, then each CTA collects
@@ -3452,7 +3452,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         @classmethod
         def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
                      ctas_per_group, num_sms, return_val):
-            """Compile and cache a distributed radix top-k kernel."""
+            """Compile and cache a single-pass multi-CTA radix top-k kernel."""
             key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
                    ctas_per_group, num_sms, return_val)
             if key in cls.kernel_cache:
@@ -3495,7 +3495,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
-            kernel_obj = DistributedRadixTopKKernel(
+            kernel_obj = SinglePassMultiCTARadixTopKKernel(
                 dtype=dtype,
                 chunk_size=chunk_size,
                 top_k=top_k,
@@ -3623,7 +3623,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             chunk_size: Optional[int] = None,
             output_indices: Optional[torch.Tensor] = None,
         ):
-            """Execute distributed radix top-k selection.
+            """Execute single-pass multi-CTA radix top-k selection.
 
             Args:
                 chunk_size: Optional chunk size per CTA. If None, uses the
@@ -3798,36 +3798,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
-        distributed: bool = False,
+        single_pass_multi_cta: bool = False,
     ) -> None:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
-        distributed (single-pass multi-CTA). When distributed=True, it selects between single-CTA
-        and multi-CTA (1-pass multi-CTA). When distributed=False, it selects between single-CTA
-        and multi-CTA (2-pass multi-CTA).
+        single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
+        and multi-CTA (1-pass multi-CTA). When single_pass_multi_cta=False, it selects between
+        single-CTA and multi-CTA (2-pass multi-CTA).
 
         Writes results directly into the pre-allocated ``output_indices`` buffer.
 
-        Dispatch logic (``distributed=True`` path):
+        Dispatch logic (``single_pass_multi_cta=True`` path):
 
-        The key insight is that the distributed kernel wins when all CTAs fit
+        The key insight is that the single-pass multi-CTA kernel wins when all CTAs fit
         in a single SM wave (no inter-CTA barrier serialization across waves).
         For fp32, the 4 radix rounds double the sync overhead vs fp16/bf16's
         2 rounds, so the crossover favors single-CTA much earlier.
 
-        - **ctas_per_group >= 2** (multi-CTA distributed):
-          Use distributed when ``num_rows * ctas_per_group <= num_sms``
+        - **ctas_per_group >= 2** (single-pass multi-CTA):
+          Use single-pass multi-CTA when ``num_rows * ctas_per_group <= num_sms``
           (single wave). For fp32, additionally require ``vocab >= 65536``
           since smaller vocab doesn't benefit enough from parallelism.
-        - **ctas_per_group == 1** (effectively single-CTA distributed):
-          fp16/bf16: use distributed when ``num_rows <= num_sms`` (no
-          inter-CTA sync, distributed kernel is faster due to better
+        - **ctas_per_group == 1** (effectively single-CTA single-pass multi-CTA):
+          fp16/bf16: use single-pass multi-CTA when ``num_rows <= num_sms`` (no
+          inter-CTA sync, single-pass multi-CTA kernel is faster due to better
           memory access patterns).
-          fp32: always use single-CTA (distributed overhead not worth it).
+          fp32: always use single-CTA (single-pass multi-CTA overhead not worth it).
 
         Benchmark: overhead vs oracle ~2.4%, speedup vs always-single ~1.14x
         (Blackwell SM100 148 SMs, top_k=2048, fp32/bf16/fp16).
 
-        Legacy dispatch (``distributed=False``) uses the original vocab
+        Legacy dispatch (``single_pass_multi_cta=False``) uses the original vocab
         threshold + SM utilization heuristic for the 2-pass multi-CTA kernel.
 
         Args:
@@ -3838,52 +3838,54 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
-            distributed: Use distributed radix top-k (fused single-pass multi-CTA)
+            single_pass_multi_cta: Use single-pass multi-CTA radix top-k
         """
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
 
-        if distributed:
-            # --- heuristic for single-CTA vs distributed ---
-            # Determines whether the distributed (single-pass multi-CTA) kernel
+        if single_pass_multi_cta:
+            # --- heuristic for single-CTA vs single-pass multi-CTA ---
+            # Determines whether the single-pass multi-CTA kernel
             # is faster than single-CTA based on SM wave occupancy analysis.
             #
             # Core rules:
-            # 1. ctas_per_group >= 2: distributed wins iff all CTAs fit in one
+            # 1. ctas_per_group >= 2: single-pass multi-CTA wins iff all CTAs fit in one
             #    SM wave (num_rows * ctas_per_group <= num_sms). Multi-wave
             #    causes inter-CTA barrier serialization → perf collapse.
             #    For fp32, also require vocab >= 65536 (small vocab: sync
             #    overhead from 4 radix rounds > parallelism benefit).
             # 2. ctas_per_group == 1: no inter-CTA sync needed.
-            #    fp16/bf16: distributed wins when num_rows <= num_sms.
-            #    fp32: single-CTA always wins (distributed overhead too high).
+            #    fp16/bf16: single-pass multi-CTA wins when num_rows <= num_sms.
+            #    fp32: single-CTA always wins (single-pass multi-CTA overhead too high).
             is_fp32 = (input_values.dtype == torch.float32)
 
             # Short-circuit: fp32 with small vocab never benefits from
-            # distributed (sync overhead from 4 radix rounds > parallelism
+            # single-pass multi-CTA (sync overhead from 4 radix rounds > parallelism
             # gain). Skip _get_chunk_config entirely.
             if is_fp32 and num_tokens < 65536:
-                use_distributed = False
+                use_single_pass_multi_cta = False
             else:
                 num_sms = _get_num_sms()
                 cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[input_values.dtype]
                 _, ctas_per_group, _ = (
-                    CuteDSLTopKDecodeDistributedRunner._get_chunk_config(
+                    CuteDSLTopKDecodeSinglePassMultiCTARunner._get_chunk_config(
                         cutlass_dtype,
                         num_tokens,
                         num_copy_bits=num_copy_bits,
                         num_rows=num_rows))
 
                 if ctas_per_group >= 2:
-                    use_distributed = (num_rows * ctas_per_group <= num_sms)
+                    use_single_pass_multi_cta = (num_rows * ctas_per_group
+                                                 <= num_sms)
                     if is_fp32:
-                        use_distributed = (use_distributed
-                                           and num_tokens >= 65536)
+                        use_single_pass_multi_cta = (use_single_pass_multi_cta
+                                                     and num_tokens >= 65536)
                 else:  # ctas_per_group == 1
-                    use_distributed = (not is_fp32 and num_rows <= num_sms)
+                    use_single_pass_multi_cta = (not is_fp32
+                                                 and num_rows <= num_sms)
 
-            if use_distributed:
-                CuteDSLTopKDecodeDistributedRunner.forward(
+            if use_single_pass_multi_cta:
+                CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
                     input_values=input_values,
                     seq_lens=seq_lens,
                     top_k=top_k,
@@ -3904,7 +3906,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
         else:
             # --- 2-pass multi-CTA dispatch ---
-            # Kept for A/B comparison and as fallback when distributed=False.
+            # Kept for A/B comparison and as fallback when single_pass_multi_cta=False.
             # Uses vocab threshold + SM utilization < 25% heuristic.
             chunk_size_per_cta = 16384
 
@@ -3955,7 +3957,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
-        distributed: bool = False,
+        single_pass_multi_cta: bool = False,
     ) -> None:
         return None
 
@@ -4033,21 +4035,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     dynamic=True,
                 )
 
-        # Distributed: enumerate all (chunk_size, ctas_per_group) pairs.
+        # Single-pass multi-CTA: enumerate all (chunk_size, ctas_per_group) pairs.
         # chunk_size is snapped to power-of-2 (+ max_chunk clamp), so
         # the set of possible values is small and deterministic.
         num_sms = _get_num_sms()
-        possible_chunks = CuteDSLTopKDecodeDistributedRunner._get_possible_chunk_sizes(
+        possible_chunks = CuteDSLTopKDecodeSinglePassMultiCTARunner._get_possible_chunk_sizes(
             cutlass_dtype, num_copy_bits)
-        max_chunk, vec_size = CuteDSLTopKDecodeDistributedRunner._compute_max_chunk(
+        max_chunk, vec_size = CuteDSLTopKDecodeSinglePassMultiCTARunner._compute_max_chunk(
             cutlass_dtype, num_copy_bits)
-        distributed_configs = set()
+        single_pass_multi_cta_configs = set()
         for cs in possible_chunks:
             for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
                 num_cols = 1 << log2_n
                 ctas = math.ceil(num_cols / cs)
                 if ctas >= 1:
-                    distributed_configs.add((cs, ctas))
+                    single_pass_multi_cta_configs.add((cs, ctas))
         # Also cover FlashInfer-style fallback path (large batch):
         # ctas_per_group = ceil(num_cols / max_chunk), chunk_size aligned
         for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
@@ -4058,17 +4060,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cs = ((cs + vec_size - 1) // vec_size) * vec_size
                 if cs > max_chunk:
                     cs = max_chunk
-                distributed_configs.add((cs, ctas))
-        for cs, ctas in sorted(distributed_configs):
-            CuteDSLTopKDecodeDistributedRunner._compile(cutlass_dtype, cs,
-                                                        top_k, next_n,
-                                                        num_copy_bits, ctas,
-                                                        num_sms, return_val)
+                single_pass_multi_cta_configs.add((cs, ctas))
+        for cs, ctas in sorted(single_pass_multi_cta_configs):
+            CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
+                cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas, num_sms,
+                return_val)
 
         logger.info(
             f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
             f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
             f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}], "
-            f"Distributed chunk_sizes={possible_chunks} "
-            f"({len(distributed_configs)} configs), "
+            f"SinglePassMultiCTA chunk_sizes={possible_chunks} "
+            f"({len(single_pass_multi_cta_configs)} configs), "
             f"top_k={top_k}, next_n={next_n}")

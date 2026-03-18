@@ -406,14 +406,17 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_distributed(batch_size, next_n, index_topk, num_tokens, dtype):
+def test_cute_dsl_topk_decode_single_pass_multi_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype
+):
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
         index_topk,
         num_tokens,
         dtype,
-        lambda logits, seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeDistributedRunner.forward(
+        lambda logits,
+        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
             input_values=logits,
             seq_lens=seq_lens,
             top_k=index_topk,
