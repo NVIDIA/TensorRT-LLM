@@ -618,7 +618,8 @@ std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
     int64_t minTotal = 0;
     for (auto g : minPoolGrains)
         minTotal += g;
-    pgGrains = std::max(pgGrains, minTotal);
+    if (pgGrains < minTotal)
+        return {0, 0};
 
     int numSlots = INT_MAX;
     int64_t remainingPgGrains = pgGrains;
@@ -643,7 +644,7 @@ std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
     }
     assert(remainingPgGrains == 0);
     assert(numSlots > 0);
-    return {numSlots, pgGrains};
+    return {numSlots, grainsForSlots(numSlots, slotSizeList, granularity)};
 }
 
 // ---------------------------------------------------------------------------
@@ -675,94 +676,104 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
 
     int g = granularity;
 
-    // Step 0: compute unconstrained slot counts from ratio.
-    std::vector<int> unconstrained(static_cast<size_t>(numPg), 0);
-    std::vector<int64_t> grains(static_cast<size_t>(numPg), 0);
-    int64_t remaining = totalGrains;
+    std::vector<int> slotCntList(static_cast<size_t>(numPg), 0);
+    int64_t remainingGrains = totalGrains;
+    std::vector<int> activePgs(static_cast<size_t>(numPg));
+    std::iota(activePgs.begin(), activePgs.end(), 0);
 
-    // Sort pool groups by ratio ascending.
-    std::vector<int> pgOrder(static_cast<size_t>(numPg));
-    std::iota(pgOrder.begin(), pgOrder.end(), 0);
-    std::sort(pgOrder.begin(), pgOrder.end(), [&](int a, int b) { return ratioList[a] < ratioList[b]; });
-
-    for (size_t i = 0; i < pgOrder.size(); ++i)
+    // Iteratively peel off constrained PGs until all active PGs are
+    // unconstrained:
+    //   1. Distribute remaining quota among active PGs by ratio.
+    //   2. Any PG with slots <= min_slots is constrained — pin it to
+    //      min_slots and subtract its grains from the budget.
+    //   3. Repeat with the remaining PGs and re-normalized ratios.
+    // Each iteration removes at least one PG, so this terminates.
+    while (!activePgs.empty())
     {
-        int pg = pgOrder[i];
-        float ratioSum = 0.f;
-        for (size_t j = i; j < pgOrder.size(); ++j)
-            ratioSum += ratioList[pgOrder[j]];
-        float pct = (ratioSum > 0.f) ? ratioList[pg] / ratioSum : 1.f;
+        // Distribute remainingGrains among active PGs by ratio.
+        size_t nActive = activePgs.size();
+        std::vector<float> activeRatio(nActive);
+        for (size_t i = 0; i < nActive; ++i)
+            activeRatio[i] = ratioList[activePgs[i]];
 
-        auto [slots, used] = grainsToSlots(std::llround(remaining * pct), sizeLists[pg], g);
-        unconstrained[pg] = slots;
-        grains[pg] = used;
-        remaining -= used;
-    }
-    assert(remaining == 0);
+        std::vector<int> slotsForActive(nActive, 0);
+        std::vector<int64_t> grainsForActive(nActive, 0);
+        int64_t budget = remainingGrains;
 
-    // Step 1: identify constrained pool groups (unconstrained < min_slots).
-    std::set<int> constrainedPgs;
-    for (int pg = 0; pg < numPg; ++pg)
-    {
-        if (unconstrained[pg] < minSlots[pg])
-            constrainedPgs.insert(pg);
-    }
-    if (constrainedPgs.empty())
-        return unconstrained;
+        // Sort indices by ratio ascending.
+        std::vector<size_t> idxLst(nActive);
+        std::iota(idxLst.begin(), idxLst.end(), size_t{0});
+        std::sort(idxLst.begin(), idxLst.end(), [&](size_t a, size_t b) { return activeRatio[a] < activeRatio[b]; });
 
-    // Step 2: floor constrained PGs to min_slots, compute extra grains needed.
-    auto slotCntList = unconstrained;
-    int64_t extraNeeded = 0;
-    for (int pg : constrainedPgs)
-    {
-        auto [slots, used] = grainsToSlots(grainsForSlots(minSlots[pg], sizeLists[pg], g), sizeLists[pg], g);
-        extraNeeded += used - grains[pg];
-        slotCntList[pg] = slots;
-        grains[pg] = used;
-    }
-
-    // Step 3: unconstrained PGs pay the extra cost proportionally by ratio.
-    std::vector<int> freePgs;
-    for (int pg = 0; pg < numPg; ++pg)
-    {
-        if (constrainedPgs.find(pg) == constrainedPgs.end())
-            freePgs.push_back(pg);
-    }
-    std::sort(freePgs.begin(), freePgs.end(), [&](int a, int b) { return ratioList[a] < ratioList[b]; });
-
-    while (extraNeeded > 0 && !freePgs.empty())
-    {
-        std::unordered_map<int, int64_t> spares;
-        int64_t totalSpare = 0;
-        for (int pg : freePgs)
+        for (size_t i = 0; i < idxLst.size(); ++i)
         {
-            int64_t spare = grains[pg] - grainsForSlots(minSlots[pg], sizeLists[pg], g);
-            spares[pg] = spare;
-            totalSpare += std::max<int64_t>(0, spare);
+            size_t idx = idxLst[i];
+            float ratioSum = 0.f;
+            for (size_t j = i; j < idxLst.size(); ++j)
+                ratioSum += activeRatio[idxLst[j]];
+            float pct = (ratioSum > 0.f) ? activeRatio[idx] / ratioSum : 1.f;
+            auto [slots, used] = grainsToSlots(std::llround(budget * pct), sizeLists[activePgs[idx]], g);
+            slotsForActive[idx] = slots;
+            grainsForActive[idx] = used;
+            budget -= used;
         }
-        assert(totalSpare > 0 && "Insufficient quota to satisfy min_slots constraints");
+        assert(budget >= 0);
 
-        float totalRatio = 0.f;
-        for (int pg : freePgs)
-            totalRatio += ratioList[pg];
-
-        std::vector<int> newFreePgs;
-        // Use signed math for still_needed (as Python comment suggests).
-        int64_t stillNeeded = extraNeeded;
-        for (int pg : freePgs)
+        // Identify constrained PGs (slots <= min_slots).
+        std::vector<size_t> constrained;
+        std::vector<size_t> unconstrained;
+        for (size_t idx = 0; idx < nActive; ++idx)
         {
-            int64_t share = std::llround(extraNeeded * (static_cast<double>(ratioList[pg]) / totalRatio));
-            int64_t give = std::min(share, std::max<int64_t>(0, spares[pg]));
-            int64_t newGrains = grains[pg] - give;
-            auto [slots, used] = grainsToSlots(newGrains, sizeLists[pg], g);
-            stillNeeded -= grains[pg] - used;
+            int pg = activePgs[idx];
+            if (slotsForActive[idx] <= minSlots[pg])
+                constrained.push_back(idx);
+            else
+                unconstrained.push_back(idx);
+        }
+
+        if (constrained.empty())
+        {
+            // All active PGs are unconstrained — accept their allocations.
+            for (size_t idx = 0; idx < nActive; ++idx)
+                slotCntList[activePgs[idx]] = slotsForActive[idx];
+            break;
+        }
+
+        // Pin constrained PGs to min_slots and subtract from budget.
+        for (size_t idx : constrained)
+        {
+            int pg = activePgs[idx];
+            int64_t minGrains = grainsForSlots(minSlots[pg], sizeLists[pg], g);
+            auto [slots, used] = grainsToSlots(minGrains, sizeLists[pg], g);
             slotCntList[pg] = slots;
-            grains[pg] = used;
-            if (used > grainsForSlots(minSlots[pg], sizeLists[pg], g))
-                newFreePgs.push_back(pg);
+            remainingGrains -= used;
         }
-        extraNeeded = std::max<int64_t>(0, stillNeeded);
-        freePgs = std::move(newFreePgs);
+
+        if (unconstrained.empty())
+        {
+            // All PGs are constrained — nothing left to redistribute.
+            break;
+        }
+
+        if (remainingGrains <= 0)
+            throw std::runtime_error("Insufficient quota to satisfy min_slots constraints");
+
+        // Continue with unconstrained PGs only.
+        std::vector<int> newActivePgs;
+        newActivePgs.reserve(unconstrained.size());
+        for (size_t idx : unconstrained)
+            newActivePgs.push_back(activePgs[idx]);
+        activePgs = std::move(newActivePgs);
+    }
+
+    // _g2s may under-count slots due to imperfect grain distribution
+    // across pools. Try bumping each PG's slot count while it still fits
+    // within the same grain budget.
+    for (int pg = 0; pg < numPg; ++pg)
+    {
+        int64_t grainsNow = grainsForSlots(slotCntList[pg], sizeLists[pg], g);
+        while (grainsForSlots(slotCntList[pg] + 1, sizeLists[pg], g) <= grainsNow)
+            slotCntList[pg] += 1;
     }
 
     return slotCntList;

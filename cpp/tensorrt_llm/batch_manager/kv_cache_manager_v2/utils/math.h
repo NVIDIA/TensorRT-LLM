@@ -94,6 +94,18 @@ struct HalfOpenRange
     {
         return beg < end;
     }
+
+    bool operator==(HalfOpenRange const& o) const noexcept
+    {
+        if (beg >= end && o.beg >= o.end)
+            return true;
+        return beg == o.beg && end == o.end;
+    }
+
+    bool operator!=(HalfOpenRange const& o) const noexcept
+    {
+        return !(*this == o);
+    }
 };
 
 // Returns the intersection of two half-open ranges.

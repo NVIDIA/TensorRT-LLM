@@ -362,9 +362,6 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
     if (newHist == mHistoryLength)
         return true;
     // Check if stale range changes for any lifecycle.
-    // Use Python-style floor division (round toward -inf) for negative values.
-    auto floorDiv = [](int a, int b) -> int { return a / b - (a % b != 0 && (a ^ b) < 0); };
-
     for (auto [lcId, lc] : mManager->lifeCycles())
     {
         bool changed = std::visit(
@@ -372,14 +369,17 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
             {
                 using T = std::decay_t<decltype(v)>;
                 if constexpr (std::is_same_v<T, SsmLifeCycle>)
-                    return newHist / mTokensPerBlock != mHistoryLength / mTokensPerBlock;
+                {
+                    // history_length change does not impact blocks at all.
+                    return false;
+                }
                 else
                 {
+                    static_assert(std::is_same_v<T, AttnLifeCycle>);
                     if (!v.windowSize.has_value())
                         return false;
-                    int w = *v.windowSize;
-                    return floorDiv(newHist + 1 - w, mTokensPerBlock)
-                        != floorDiv(mHistoryLength + 1 - w, mTokensPerBlock);
+                    return v.getStaleRange(newHist, mTokensPerBlock)
+                        != v.getStaleRange(mHistoryLength, mTokensPerBlock);
                 }
             },
             lc);
