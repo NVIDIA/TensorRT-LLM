@@ -35,8 +35,8 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
-    BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, FinishReason,
-    beam_search_sampling_batch)
+    BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, beam_search_sampling_batch)
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
@@ -80,7 +80,7 @@ def with_cuda_graph_and_overlap(request):
     return request.param
 
 
-def _build_llm(fixed_params, input_prompts, llm_kwargs):
+def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
     if "max_batch_size" not in llm_kwargs:
         llm_kwargs = llm_kwargs | dict(
             max_batch_size=fixed_params["max_beam_width"] * len(
@@ -90,7 +90,7 @@ def _build_llm(fixed_params, input_prompts, llm_kwargs):
     return LLM(
         **llm_kwargs,
         kv_cache_config=KvCacheConfig(
-            max_tokens=10000,  # type: ignore
+            max_tokens=10000,  # pyright: ignore
         ),
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
@@ -117,21 +117,25 @@ def llm(fixed_params, input_prompts, model_kwargs, single_process: bool,
     gc.collect(
         2)  # force destruction of any other LLM instances (cf. comment above)
     with _single_process_context() if single_process else nullcontext():
+        llm_kwargs: dict[
+            str,
+            Any] = deepcopy(  # LLM.shutdown resets checkpoint_loader.config_loader
+                model_kwargs)
+        if not with_cuda_graph_and_overlap:
+            llm_kwargs |= dict(
+                disable_overlap_scheduler=True,
+                cuda_graph_config=None,
+            )
+        else:
+            llm_kwargs |= dict(
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                                  enable_padding=True),
+            )
         llm = _build_llm(
             fixed_params,
             input_prompts,
-            llm_kwargs=(
-                (dict(
-                    disable_overlap_scheduler=True,
-                    cuda_graph_config=None,
-                ) if not with_cuda_graph_and_overlap else dict(
-                    disable_overlap_scheduler=False,
-                    cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
-                                                      enable_padding=True),
-                ))
-                |
-                deepcopy(  # LLM.shutdown resets checkpoint_loader.config_loader
-                    model_kwargs)),
+            llm_kwargs=llm_kwargs,
         )
     with llm:
         yield llm
@@ -242,7 +246,7 @@ def check_context_logits(output: GenerationResult,
 
 @pytest.fixture(scope="module", params=[False, True])
 def single_process(request) -> bool:
-    return request.param
+    return cast(bool, request.param)
 
 
 def validate_output(output: GenerationResult, input_prompt: list[int],
@@ -353,13 +357,11 @@ def test_beam_search_e2e(
     single_process: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    llm_args = cast(TorchLlmArgs, llm.args)
+    llm_args = cast(TorchLlmArgs, llm.args)  # type: ignore[redundant-cast]
     check_no_sync = single_process  # single_process only used for sync check
-    if check_no_sync and cast(TorchLlmArgs,
-                              llm.args).sampler_type != "TorchSampler":
+    if check_no_sync and llm_args.sampler_type != "TorchSampler":
         pytest.skip("Sync check only supported for TorchSampler")
-    if check_no_sync and (cast(TorchLlmArgs, llm.args).sampler_type
-                          == "TorchSampler") and stop_token_ids is not None:
+    if check_no_sync and llm_args.sampler_type == "TorchSampler" and stop_token_ids is not None:
         # FIXME: Fix TorchSampler._are_stop_words
         pytest.skip("Stop word handling in TorchSampler syncs")
 
@@ -910,12 +912,12 @@ class TestParameterValidation:
     @pytest.fixture(scope="module", params=[1, 4])
     @staticmethod
     def batch_size(request) -> int:
-        return request.param
+        return cast(int, request.param)
 
     @pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
     @staticmethod
     def sampler_type(request) -> str:
-        return request.param
+        return cast(str, request.param)
 
     @pytest.fixture(scope="module")
     @staticmethod
@@ -941,7 +943,7 @@ class TestParameterValidation:
         )
 
     def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
-                               fixed_params: dict):
+                               fixed_params: dict[str, Any]):
         _ = llm.generate(input_prompts,
                          sampling_params=SamplingParams(
                              max_tokens=fixed_params["max_tokens"],
@@ -957,7 +959,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -984,8 +986,8 @@ class TestParameterValidation:
     @pytest.mark.timeout(120)
     @pytest.mark.threadleak(enabled=False)
     def test_use_beam_search_ommitted(self, llm: LLM, input_prompts: list[str],
-                                      fixed_params: dict, batch_size: int,
-                                      sampler_type: str):
+                                      fixed_params: dict[str, Any],
+                                      batch_size: int, sampler_type: str):
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
         if sampler_type == "TorchSampler":
@@ -1011,7 +1013,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -1040,7 +1042,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -1069,7 +1071,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
