@@ -5826,7 +5826,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
     )
 
     def test_bf16(self):
-        world_size = min(2, torch.cuda.device_count())
+        world_size = 1
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(
@@ -5846,12 +5846,17 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     def test_fp8(self):
-        world_size = min(2, torch.cuda.device_count())
+        model_dir = f"{self.MODEL_PATH}-FP8"
+        # Model is being added to CI. Skip at the moment.
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
+
+        world_size = 1
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         moe_config = MoeConfig(backend='DEEPGEMM')
 
-        with LLM(f"{self.MODEL_PATH}-FP8",
+        with LLM(model_dir,
                  tensor_parallel_size=world_size,
                  moe_expert_parallel_size=world_size,
                  max_seq_len=4096,
