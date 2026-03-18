@@ -1392,7 +1392,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             if modality_type in ("image", "video"):
                 embs, num_tokens = self.vision_encoder([param])
                 mm_embeddings.append(embs[0])
-                mm_num_tokens.append(num_tokens[0])
+                mm_num_tokens.append(num_tokens[0] if num_tokens is not None else None)
             elif modality_type == "audio":
                 mm_embeddings.append(self._encode_audio(param))
                 mm_num_tokens.append(None)
