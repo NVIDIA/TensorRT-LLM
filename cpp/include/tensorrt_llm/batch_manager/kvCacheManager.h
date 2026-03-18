@@ -710,6 +710,11 @@ public:
     bool containsBlockScales;
     bool containsIndexerKCache;
 
+    // When true, pool tensor is laid out as {numLayers, numBlocks, kvFactor, blockSize}
+    // instead of the default {numBlocks, numLayers, kvFactor, blockSize}.
+    // Used for recurrent state (linear attention) pools.
+    bool layerFirstLayout;
+
     KVCacheBlockPool(SizeType32 numLayers, SizeType32 kvFactor, SizeType32 numKvHeads, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, runtime::ITensor::SharedPtr primaryPtr = nullptr,
         runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false,
@@ -724,6 +729,7 @@ public:
         , secondaryPtr(std::move(secondaryPtr))
         , containsBlockScales(containsBlockScales)
         , containsIndexerKCache(containsIndexerKCache)
+        , layerFirstLayout(false)
     {
     }
 
@@ -739,6 +745,7 @@ public:
         , secondaryPtr(std::move(secondaryPtr))
         , containsBlockScales(false)
         , containsIndexerKCache(false)
+        , layerFirstLayout(false)
     {
     }
 };
@@ -1471,6 +1478,13 @@ public:
         return windowManagerByLayer(layerIdx).getPoolLayerIdx(layerIdx);
     }
 
+    [[nodiscard]] bool isPoolLayerFirst(SizeType32 layerIdx) const
+    {
+        auto const& manager = windowManagerByLayer(layerIdx);
+        auto const relativePoolIndex = manager.getLayerPoolIdx(layerIdx);
+        return manager.getPool(relativePoolIndex).layerFirstLayout;
+    }
+
     [[nodiscard]] SizeType32 getTokensPerBlock() const noexcept
     {
         return mTokensPerBlock;
@@ -1894,6 +1908,7 @@ public:
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getIndexerKCachePool() const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
+    [[nodiscard]] virtual bool isPoolLayerFirst(SizeType32 layer_idx) const = 0;
 
     virtual void syncTransferManagerWithBufferManager() = 0;
     virtual void refreshBlocks() = 0;
@@ -2320,6 +2335,11 @@ public:
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         return mBlockManager.getPoolLayerIdx(layer_idx);
+    }
+
+    bool isPoolLayerFirst(SizeType32 layer_idx) const override
+    {
+        return mBlockManager.isPoolLayerFirst(layer_idx);
     }
 
     void syncTransferManagerWithBufferManager() override

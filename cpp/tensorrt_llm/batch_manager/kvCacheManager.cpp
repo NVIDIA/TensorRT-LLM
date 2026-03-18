@@ -660,6 +660,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             {
                 auto const [fullPrimaryBlocks, unusedSecondaryBlocks] = blocksPerWindow.at(maxSequenceLength);
                 numPlaceholderBlocks = fullPrimaryBlocks - allottedPrimaryBlocks;
+                numPlaceholderBlocks = std::max(numPlaceholderBlocks, fullPrimaryBlocks);
                 TLLM_CHECK_WITH_INFO(numPlaceholderBlocks >= 0,
                     "Full-attention primary blocks (%d) must be >= linear-attention primary blocks (%d)",
                     fullPrimaryBlocks, allottedPrimaryBlocks);
@@ -1037,12 +1038,21 @@ void WindowBlockManager::allocatePools(bool useUvm)
         }
 
         nvinfer1::Dims cacheShape;
-        cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
+        if (isRecurrentState())
+        {
+            // Layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}
+            cacheShape = ITensor::makeShape({pool.numLayers, mNumPrimaryBlocks, mKVFactor, blockSize});
+            pool.layerFirstLayout = true;
+        }
+        else
+        {
+            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
+        }
 
         TLLM_LOG_INFO(
-            "[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads, shape={%d, %d, %d, %d}",
-            mLogPrefix.c_str(), mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads, mNumPrimaryBlocks, pool.numLayers,
-            mKVFactor, blockSize);
+            "[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads, shape={%d, %d, %d, %d}%s",
+            mLogPrefix.c_str(), mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads, cacheShape.d[0], cacheShape.d[1],
+            cacheShape.d[2], cacheShape.d[3], pool.layerFirstLayout ? " (layer-first)" : "");
 
         if (useUvm)
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
@@ -1054,8 +1064,17 @@ void WindowBlockManager::allocatePools(bool useUvm)
             static_cast<char*>(pool.primaryPtr->data()) + pool.primaryPtr->getSizeInBytes());
         if (mNumSecondaryBlocks > 0)
         {
-            nvinfer1::Dims const cacheShapeOffload
-                = ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
+            nvinfer1::Dims cacheShapeOffload;
+            if (isRecurrentState())
+            {
+                cacheShapeOffload
+                    = ITensor::makeShape({pool.numLayers, mNumSecondaryBlocks, mKVFactor, blockSize});
+            }
+            else
+            {
+                cacheShapeOffload
+                    = ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
+            }
             TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
                 mLogPrefix.c_str(), mNumSecondaryBlocks, pool.numLayers, pool.numKvHeads);
             pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
@@ -1217,10 +1236,22 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
             auto constexpr layerIdx = 0;
             auto const offsetIndex = tensorrt_llm::common::flat_index(offsetsShape.d, poolIdx, beamIdx, xIdx, blockIdx);
             auto const fieldIdx = (mCacheType == CacheType::kSELFKONLY || isRecurrentState()) ? 0 : xIdx;
-            auto const blockIndex = block->isPlaceholder()
-                ? tk::KVCacheIndex::nullIndex
-                : tk::KVCacheIndex{common::flat_index3(
+            auto const blockIndex = [&]() -> tk::KVCacheIndex
+            {
+                if (block->isPlaceholder())
+                {
+                    return tk::KVCacheIndex::nullIndex;
+                }
+                if (pool.layerFirstLayout)
+                {
+                    // Layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}
+                    // Flat index: layerIdx * numBlocks * kvFactor + blockIdx * kvFactor + fieldIdx
+                    return tk::KVCacheIndex{common::flat_index3(
+                        layerIdx, block->getMemoryPoolBlockIndex(), fieldIdx, mNumPrimaryBlocks, mKVFactor)};
+                }
+                return tk::KVCacheIndex{common::flat_index3(
                     block->getMemoryPoolBlockIndex(), layerIdx, fieldIdx, pool.numLayers, mKVFactor)};
+            }();
             if ((!block->isPlaceholder()) && block->getMemoryPoolBlockIndex() >= mNumPrimaryBlocks)
             {
                 TLLM_LOG_ERROR(

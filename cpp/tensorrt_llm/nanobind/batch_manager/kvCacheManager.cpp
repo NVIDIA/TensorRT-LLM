@@ -441,6 +441,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             {
                 auto pool = tr::Torch::tensor(self.getPrimaryPool(layer_idx));
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
+                if (self.isPoolLayerFirst(layer_idx))
+                {
+                    // Layer-first layout: pool[pool_layer_idx, :]
+                    return pool.index({pool_layer_idx});
+                }
+                // Standard layout: pool[:, pool_layer_idx]
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             },
             nb::call_guard<nb::gil_scoped_release>())
