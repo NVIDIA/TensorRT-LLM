@@ -585,6 +585,7 @@ def _test_moe_worker_impl(
 
             # Create reference module
             ref_fused_moe = quantize_util.create_ref_module(routing_method)
+            ref_fused_moe.moe_tp_size = mapping.moe_tp_size
             ref_fused_moe.load_weights([ref_weights])
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
