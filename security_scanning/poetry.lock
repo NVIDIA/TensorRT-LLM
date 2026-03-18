@@ -3842,14 +3842,14 @@ typing_extensions = ">=4.10"
 
 [[package]]
 name = "openai"
-version = "2.28.0"
+version = "2.29.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "openai-2.28.0-py3-none-any.whl", hash = "sha256:79aa5c45dba7fef84085701c235cf13ba88485e1ef4f8dfcedc44fc2a698fc1d"},
-    {file = "openai-2.28.0.tar.gz", hash = "sha256:bb7fdff384d2a787fa82e8822d1dd3c02e8cf901d60f1df523b7da03cbb6d48d"},
+    {file = "openai-2.29.0-py3-none-any.whl", hash = "sha256:b7c5de513c3286d17c5e29b92c4c98ceaf0d775244ac8159aeb1bddf840eb42a"},
+    {file = "openai-2.29.0.tar.gz", hash = "sha256:32d09eb2f661b38d3edd7d7e1a2943d1633f572596febe64c0cd370c86d52bec"},
 ]
 
 [package.dependencies]
@@ -3860,7 +3860,7 @@ jiter = ">=0.10.0,<1"
 pydantic = ">=1.9.0,<3"
 sniffio = "*"
 tqdm = ">4"
-typing-extensions = ">=4.11,<5"
+typing-extensions = ">=4.14,<5"
 
 [package.extras]
 aiohttp = ["aiohttp", "httpx-aiohttp (>=0.1.9)"]
@@ -5866,14 +5866,14 @@ files = [
 
 [[package]]
 name = "smg-grpc-proto"
-version = "0.4.2"
+version = "0.4.3"
 description = "SMG gRPC proto definitions for SGLang, vLLM, and TRT-LLM"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "smg_grpc_proto-0.4.2-py3-none-any.whl", hash = "sha256:3ffaef3c15e8d03a2b075dad2510775421dce10683b3caf55710638bcc402dc7"},
-    {file = "smg_grpc_proto-0.4.2.tar.gz", hash = "sha256:be80b940b4a286896581ebd92a906d8369ebe14d363cf411ae250077dd6e3a80"},
+    {file = "smg_grpc_proto-0.4.3-py3-none-any.whl", hash = "sha256:a42e1ffe5e2700c0ff341ab0c53d0d43435bd6a03a42c4725934873b776a12a9"},
+    {file = "smg_grpc_proto-0.4.3.tar.gz", hash = "sha256:3bd9025678432ca2218ff5fc4411bd00ce44034e592d51748356a157b8296fbe"},
 ]
 
 [package.dependencies]
@@ -6950,4 +6950,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "c4b2a61ec8fbed07aba8b77bf29d66fe4161f880d30ca97019405fe195fe13f0"
+content-hash = "0224ccb226f88c4681aa0c2d2a176204b989c0103a5b4c763c65801c3d6238a6"
