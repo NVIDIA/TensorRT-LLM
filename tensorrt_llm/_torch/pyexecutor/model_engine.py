@@ -50,6 +50,8 @@ from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
+                           prepare_attn_metadata_for_draft_replay,
+                           restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
@@ -3715,12 +3717,24 @@ class PyTorchModelEngine(ModelEngine):
                             enable_spec_decode=self.enable_spec_decode,
                             postprocess_fn=capture_postprocess_fn)
 
-                        # here we don't need to use context since cuda graph capture didn't run kernel.
-                        # maybe we need a cleaner way to do this.
-                        outputs = self.cuda_graph_runner.replay(key, inputs)
-                    else:
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                        # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
+                        saved_draft = prepare_attn_metadata_for_draft_replay(
+                            attn_metadata, draft_kv_cache_manager)
+                        try:
                             outputs = self.cuda_graph_runner.replay(key, inputs)
+                        finally:
+                            restore_attn_metadata_after_draft_replay(
+                                attn_metadata, saved_draft)
+                    else:
+                        saved_draft = prepare_attn_metadata_for_draft_replay(
+                            attn_metadata, draft_kv_cache_manager)
+                        try:
+                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                                outputs = self.cuda_graph_runner.replay(
+                                    key, inputs)
+                        finally:
+                            restore_attn_metadata_after_draft_replay(
+                                attn_metadata, saved_draft)
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
