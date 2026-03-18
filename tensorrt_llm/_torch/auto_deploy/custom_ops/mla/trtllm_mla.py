@@ -64,6 +64,7 @@ from tensorrt_llm.quantization import QuantMode
 
 from .....llmapi.llm_args import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -666,20 +667,15 @@ def _handle_prefill_thop(
     dtype = q_nope_flat.dtype
     device = q_nope_flat.device
 
-    q = torch.empty(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
-    q[:, :, :qk_nope_head_dim] = q_nope_flat
-    q[:, :, qk_nope_head_dim:] = q_pe_flat
-    q = q.view(num_tokens, num_heads * qk_head_dim)
+    q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
     kv = torch.nn.functional.linear(compressed_kv_flat, kv_b_proj_weight)
     kv = kv.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
     k_nope = kv[:, :, :qk_nope_head_dim]
     v = kv[:, :, qk_nope_head_dim:].contiguous().view(num_tokens, num_heads * v_head_dim)
 
-    k = torch.empty(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
-    k[:, :, :qk_nope_head_dim] = k_nope
-    k[:, :, qk_nope_head_dim:] = kpe_flat.view(num_tokens, 1, qk_rope_head_dim)
-    k = k.view(num_tokens, num_heads * qk_head_dim)
+    kpe_expanded = kpe_flat.view(num_tokens, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
+    k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
@@ -1518,10 +1514,5 @@ class TrtllmMLAAttention(AttentionDescriptor):
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
-        # scale is at positional index 6 in torch_mla(q_nope, q_pe, compressed_kv,
-        # kpe, kv_b_proj_weight, is_causal, scale, layout); fall back to kwargs.
-        if len(source_attn_node.args) > 6:
-            scale = source_attn_node.args[6]
-        else:
-            scale = source_attn_node.kwargs.get("scale", None)
+        (scale,) = extract_op_args(source_attn_node, "scale")
         return [scale, kv_lora_rank]

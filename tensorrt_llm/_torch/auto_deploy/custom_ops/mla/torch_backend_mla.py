@@ -25,6 +25,7 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -561,11 +562,6 @@ class TorchBackendMLAAttention(AttentionDescriptor):
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
 
-        # scale is at positional index 6 in torch_mla(q_nope, q_pe, compressed_kv,
-        # kpe, kv_b_proj_weight, is_causal, scale, layout); fall back to kwargs.
-        if len(source_attn_node.args) > 6:
-            scale = source_attn_node.args[6]
-        else:
-            scale = source_attn_node.kwargs.get("scale", None)
+        (scale,) = extract_op_args(source_attn_node, "scale")
 
         return [scale, kv_lora_rank]
