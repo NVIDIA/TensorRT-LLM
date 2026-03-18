@@ -55,9 +55,9 @@ MODEL_PATH_DICT = {
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
+    "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
-    "super_nvfp4": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
 }
 
 SUPPORTED_GPU_MAPPING = {
