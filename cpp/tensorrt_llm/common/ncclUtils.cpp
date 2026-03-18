@@ -468,25 +468,15 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
 {
     // Step 1: Allocate symmetric memory (per-rank, non-collective — can fail asymmetrically).
     void* ncclPtr = nullptr;
-    ncclResult_t allocResult = ncclMemAlloc(&ncclPtr, size);
-    int localAllocOk = (allocResult == ncclSuccess) ? 1 : 0;
-    if (!localAllocOk)
-    {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] ncclMemAlloc failed on this rank (error: %d, size=%zu); "
-            "synchronizing with other ranks before aborting window registration.",
-            allocResult, size);
-    }
+    TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
+    int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
     NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
 
     // Step 2: ncclCommWindowRegister is collective — if any rank skips it, all other ranks hang.
     // Synchronize the per-rank alloc status using a small cudaMalloc flag (not ncclMemAlloc, so
     // OOM on symmetric memory does not prevent us from allocating the flag).
     int* rankSyncFlag = nullptr;
-    if (cudaMalloc(&rankSyncFlag, sizeof(int)) != cudaSuccess)
-    {
-        TLLM_THROW("[NCCLUtil] cudaMalloc for rank-sync flag failed; cannot coordinate safely across ranks.");
-    }
+    TLLM_CUDA_CHECK(cudaMalloc(&rankSyncFlag, sizeof(int)));
     CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
 
     // Step 3: Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
@@ -527,13 +517,9 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     }
 
     // Step 4: Register with NCCL as a window (collective — all ranks must reach this call).
+    // ncclGuard frees ncclPtr during stack unwinding on throw.
     ncclWindow_t window = nullptr;
-    ncclResult_t regResult = ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC);
-    if (regResult != ncclSuccess)
-    {
-        TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
-        // ncclGuard frees ncclPtr during stack unwinding
-    }
+    TLLM_NCCL_CHECK(ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC));
 
     // Step 5: Success — transfer ownership to the returned buffer.
     ncclGuard.release();
