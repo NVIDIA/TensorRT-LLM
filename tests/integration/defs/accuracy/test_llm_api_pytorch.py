@@ -6321,8 +6321,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device_memory(64000)
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
         "tp_size, ep_size, attention_dp, overlap_scheduler, cuda_graph",
