@@ -104,8 +104,11 @@ bool LRUEvictionPolicy::verifyQueueIntegrity()
     return !queueCompromised;
 }
 
-std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel)
+std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
+    TLLM_CHECK_WITH_INFO(!wantPlaceholder,
+        "LRUEvictionPolicy does not manage placeholder blocks. Use MaybePlaceholderLRUEvictionPolicy.");
+
     for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
     {
         // Find the first non-empty queue, and return the first block.
@@ -123,45 +126,6 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
     TLLM_THROW("No free block found. This shouldn't happen!");
 }
 
-BlockPtr LRUEvictionPolicy::getPlaceholderBlock(WindowSizeType windowSize)
-{
-    BlockPtr candidate = nullptr;
-    // TODO: this may be slow
-    for (auto const& block : mPlaceholderBlockPool)
-    {
-        if (block->getLookupNode() == nullptr)
-        {
-            candidate = block;
-            break;
-        }
-    }
-    if (candidate != nullptr)
-    {
-        mPlaceholderBlockPool.erase(candidate);
-        return candidate;
-    }
-
-    TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::getPlaceholderBlock :: Creating new placeholder block with id=%d",
-        __FILE__, __LINE__, mNextPlaceholderBlockId);
-    auto block = KVCacheBlock::createPlaceholder(mNextPlaceholderBlockId--, windowSize);
-    mAllPlaceholders[block->getBlockId()] = block;
-    TLLM_CHECK(block->getLookupNode() == nullptr);
-    return block;
-}
-
-BlockPtr LRUEvictionPolicy::findPlaceholderBlockById(KVCacheBlock::IdType blockId)
-{
-    auto it = mAllPlaceholders.find(blockId);
-    if (it != mAllPlaceholders.end())
-    {
-        return it->second;
-    }
-    else
-    {
-        TLLM_THROW("Placeholder block with id %d not found", blockId);
-    }
-}
-
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 {
     releaseBlock(block, false);
@@ -174,23 +138,18 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     TLLM_CHECK_WITH_INFO(
         block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
         "Attempted to release the cached-blocks root into the eviction queue");
-    if (block->isPlaceholder())
-    {
-        mPlaceholderBlockPool.insert(block);
-        return;
-    }
     SizeType32 const cacheLevel = getCacheLevel(block);
-    SizeType32 const id = block->getBlockId();
+    SizeType32 const idx = blockIdx(block->getBlockId());
 
     // If there are no children, this is a leaf block. Insert into a queue.
     auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
     if (toFront)
     {
-        mFreeBlockIterators[id] = q.insert(q.begin(), block);
+        mFreeBlockIterators[idx] = q.insert(q.begin(), block);
     }
     else
     {
-        mFreeBlockIterators[id] = q.insert(q.end(), block);
+        mFreeBlockIterators[idx] = q.insert(q.end(), block);
     }
 
     mNumFreeBlocksPerLevel[cacheLevel]++;
@@ -217,23 +176,16 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block)
 void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
     std::optional<std::chrono::milliseconds> durationMs)
 {
-    if (block->isPlaceholder())
-    {
-        TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::claimBlock :: blockId=%d is a placeholder block, popped.", __FILE__,
-            __LINE__, block->getBlockId());
-        mPlaceholderBlockPool.erase(block);
-        return;
-    }
-    SizeType32 const id = block->getBlockId();
+    SizeType32 const idx = blockIdx(block->getBlockId());
     SizeType32 const cacheLevel = getCacheLevel(block);
 
-    if (mFreeBlockIterators[id] != std::nullopt)
+    if (mFreeBlockIterators[idx] != std::nullopt)
     {
-        mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
+        mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[idx]);
         mNumFreeBlocksPerLevel[cacheLevel] -= 1;
     }
 
-    mFreeBlockIterators[id] = std::nullopt;
+    mFreeBlockIterators[idx] = std::nullopt;
 
     if (priority.has_value())
     {
@@ -259,20 +211,186 @@ void LRUEvictionPolicy::refresh()
             break;
         }
 
-        auto const id = block->getBlockId();
+        auto const idx = blockIdx(block->getBlockId());
         auto const level = getCacheLevel(block);
 
         mExpiringBlockHeap.erase(mExpiringBlockHeap.begin());
 
-        if (mFreeBlockIterators[id] != std::nullopt)
+        if (mFreeBlockIterators[idx] != std::nullopt)
         {
             // This is already in another queue. Delete it, and bring it down to the default queue
-            mFreeQueues[level][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
+            mFreeQueues[level][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[idx]);
             auto& q = mFreeQueues[level][getPriorityIdx(kDefaultPriority)];
-            mFreeBlockIterators[id] = q.insert(q.end(), block);
+            mFreeBlockIterators[idx] = q.insert(q.end(), block);
         }
         block->setPriority(kDefaultPriority);
     }
+}
+
+// ---- PlaceholderInnerLRUEvictionPolicy ----
+// Manages pre-allocated placeholder blocks (with negative IDs starting at -2) via the standard queue
+// system. Overrides blockIdx() to map negative IDs to 0-based queue indices, and overrides
+// releaseBlock/claimBlock to bypass the placeholder-pool path used by the base LRUEvictionPolicy.
+namespace
+{
+class PlaceholderInnerLRUEvictionPolicy : public LRUEvictionPolicy
+{
+protected:
+    SizeType32 blockIdx(KVCacheBlock::IdType blockId) const override
+    {
+        // blockId is negative: -2 → 0, -3 → 1, ...
+        TLLM_CHECK_WITH_INFO(blockId < -1, "PlaceholderInnerLRUEvictionPolicy expects blockId < -1, got %d", blockId);
+        return -blockId - 2;
+    }
+
+public:
+    void releaseBlock(BlockPtr block) override
+    {
+        releaseBlock(block, false);
+    }
+
+    void releaseBlock(BlockPtr block, bool toFront) override
+    {
+        TLLM_CHECK_WITH_INFO(block->isPlaceholder(),
+            "PlaceholderInnerLRUEvictionPolicy should only manage placeholder blocks, got blockId=%d",
+            block->getBlockId());
+        auto const idx = blockIdx(block->getBlockId());
+        auto& q = mFreeQueues[kPrimaryLevel][getPriorityIdx(block->getPriority())];
+        if (toFront)
+        {
+            mFreeBlockIterators[idx] = q.insert(q.begin(), block);
+        }
+        else
+        {
+            mFreeBlockIterators[idx] = q.insert(q.end(), block);
+        }
+        mNumFreeBlocksPerLevel[kPrimaryLevel]++;
+    }
+
+    void claimBlock(BlockPtr block) override
+    {
+        claimBlock(block, std::nullopt, std::nullopt);
+    }
+
+    void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+        std::optional<std::chrono::milliseconds> durationMs) override
+    {
+        TLLM_CHECK_WITH_INFO(block->isPlaceholder(),
+            "PlaceholderInnerLRUEvictionPolicy should only manage placeholder blocks, got blockId=%d",
+            block->getBlockId());
+        auto const idx = blockIdx(block->getBlockId());
+        if (mFreeBlockIterators[idx] != std::nullopt)
+        {
+            mFreeQueues[kPrimaryLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[idx]);
+            mNumFreeBlocksPerLevel[kPrimaryLevel] -= 1;
+        }
+        mFreeBlockIterators[idx] = std::nullopt;
+    }
+
+    bool verifyQueueIntegrity() override
+    {
+        bool queueCompromised = false;
+        for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
+        {
+            for (auto const& block : mFreeQueues[kPrimaryLevel][level])
+            {
+                if (!block->isPlaceholder())
+                {
+                    TLLM_LOG_WARNING("Found non-placeholder block (id %d) in PlaceholderInnerLRUEvictionPolicy",
+                        block->getBlockId());
+                    queueCompromised = true;
+                }
+                if (block->hasRefs())
+                {
+                    TLLM_LOG_WARNING("Found placeholder block (id %d) with references in placeholder policy",
+                        block->getBlockId());
+                    queueCompromised = true;
+                }
+            }
+        }
+        return !queueCompromised;
+    }
+};
+} // anonymous namespace
+
+// ---- MaybePlaceholderLRUEvictionPolicy ----
+
+void MaybePlaceholderLRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById,
+    SizeType32 numPlaceholderBlocks, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
+{
+    mPlaceholderEvictionPolicy = std::make_shared<PlaceholderInnerLRUEvictionPolicy>();
+
+    // Extract the actual placeholder blocks from allPlaceholderBlocksById[2..numPlaceholderBlocks+1]
+    // so the inner policy's mFreeBlockIterators[i] corresponds to blockId = -(i+2).
+    std::vector<BlockPtr> placeholderBlocks(allPlaceholderBlocksById.begin() + 2,
+        allPlaceholderBlocksById.begin() + numPlaceholderBlocks + 2);
+
+    mPlaceholderEvictionPolicy->initialize(placeholderBlocks, {numPlaceholderBlocks, 0}, secondaryOffloadMinPriority);
+}
+
+std::tuple<BlockPtr, bool> MaybePlaceholderLRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
+{
+    if (wantPlaceholder)
+    {
+        TLLM_CHECK_WITH_INFO(mPlaceholderEvictionPolicy != nullptr,
+            "Placeholder eviction policy not initialized. Call initializePlaceholders() first.");
+        return mPlaceholderEvictionPolicy->getFreeBlock(kPrimaryLevel);
+    }
+    return LRUEvictionPolicy::getFreeBlock(cacheLevel);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::releaseBlock(BlockPtr block)
+{
+    releaseBlock(block, false);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
+{
+    if (block->isPlaceholder())
+    {
+        TLLM_CHECK_WITH_INFO(mPlaceholderEvictionPolicy != nullptr,
+            "Placeholder eviction policy not initialized. Call initializePlaceholders() first.");
+        mPlaceholderEvictionPolicy->releaseBlock(block, toFront);
+        return;
+    }
+    LRUEvictionPolicy::releaseBlock(block, toFront);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::claimBlock(BlockPtr block)
+{
+    claimBlock(block, std::nullopt, std::nullopt);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+    std::optional<std::chrono::milliseconds> durationMs)
+{
+    if (block->isPlaceholder())
+    {
+        TLLM_CHECK_WITH_INFO(mPlaceholderEvictionPolicy != nullptr,
+            "Placeholder eviction policy not initialized. Call initializePlaceholders() first.");
+        mPlaceholderEvictionPolicy->claimBlock(block, priority, durationMs);
+        return;
+    }
+    LRUEvictionPolicy::claimBlock(block, priority, durationMs);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::refresh()
+{
+    LRUEvictionPolicy::refresh();
+    if (mPlaceholderEvictionPolicy)
+    {
+        mPlaceholderEvictionPolicy->refresh();
+    }
+}
+
+bool MaybePlaceholderLRUEvictionPolicy::verifyQueueIntegrity()
+{
+    bool ok = LRUEvictionPolicy::verifyQueueIntegrity();
+    if (mPlaceholderEvictionPolicy)
+    {
+        ok = mPlaceholderEvictionPolicy->verifyQueueIntegrity() && ok;
+    }
+    return ok;
 }
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy

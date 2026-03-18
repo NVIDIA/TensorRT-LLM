@@ -114,11 +114,6 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             auto srcPtr = computeBlockPointer(src, pools, poolIdx);
             auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
 
-            TLLM_LOG_DEBUG("src: id %d, addr %p, dst: id %d, addr %p", src->getBlockId(), srcPtr->data(),
-                dst->getBlockId(), dstPtr->data());
-
-            // TLLM_LOG_INFO("copying to dst: id %d, addr %p", dst->getBlockId(), dstPtr->data());
-
             // Does it contain block scales?
             auto containsBlockScales = pools[poolIdx].containsBlockScales;
 
@@ -141,7 +136,6 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 }
                 else
                 {
-                    // kRecurrentStates should never reach here, as they always copy full blocks.
                     auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
                     int const numLayers = pools[poolIdx].numLayers;
                     int const kvFactor = pools[poolIdx].kvFactor;

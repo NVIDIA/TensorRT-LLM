@@ -131,6 +131,10 @@ struct LinearAttentionMetadata
     SizeType32 statesSnapshotInterval; // Only used for SSM_CONV_STATE
     bool saveLastSnapshot;             // Take additional snapshot of recurrent states at the end of the input sequence
 
+    // Optional: explicit number of placeholder blocks for this kRecurrentStates manager.
+    // If set, overrides the automatic computation (fullAttention.primaryBlocks - this.primaryBlocks).
+    std::optional<SizeType32> numPlaceholderBlocks;
+
     [[nodiscard]] bool shouldAllocateRecurrentStates(
         SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen, SizeType32 tokensPerBlock) const
     {
@@ -776,7 +780,8 @@ public:
         radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        SizeType32 numPlaceholderBlocks = 0);
 
     ~WindowBlockManager();
 
@@ -1136,10 +1141,12 @@ private:
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
+    //! \param wantPlaceholder If true, return a pre-allocated placeholder block instead of a normal block
     [[nodiscard]] BlockPtr getFreeBlock(GenerationRequest& sequence,
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
-        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
+        bool wantPlaceholder = false);
 
     //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
     void freeLeafBlock(BlockPtr const& block);
@@ -1188,6 +1195,10 @@ private:
     bool mIsSWA;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
+    // Pre-allocated placeholder blocks for linear attention (recurrent state) managers.
+    // Indexed by abs(blockId): mAllPlaceholderBlocksById[abs(blockId)] gives the block with that negative ID.
+    // Indices 0 and 1 are unused (nullptr); valid blocks start at index 2 (blockId == -2).
+    std::vector<BlockPtr> mAllPlaceholderBlocksById;
     // Pointer to the shared radix lookup tree owned by BlockManager.
     // All WindowBlockManager instances under the same BlockManager share one tree,
     // using window size as the value key so their nodes coexist in the same trie.
