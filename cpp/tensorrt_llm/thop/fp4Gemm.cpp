@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -62,7 +62,9 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4
     {
         if (sm >= 120)
         {
-            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x256B,
+            // Use the smallest SM120 tile as default; the autotuner will select
+            // the optimal config (including larger tiles) for the current device.
+            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x128B,
                 tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
                 tkc::ClusterShape::ClusterShape_1x1x1);
         }

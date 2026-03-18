@@ -107,3 +107,30 @@ def test_rmsnorm_fusion_nemotron_h():
     # Only the triton backend supports the nemotron h rmsnorm
     model = TestModel(eps=1e-6, use_nemotron_h=True)
     _run_test(model, torch.ops.auto_deploy.triton_rms_norm, variant="triton")
+
+
+def test_fuse_rmsnorm_preserves_node_metadata():
+    model = TestModel(eps=1e-6)
+    x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
+    dynamic_shapes = {0: Dim.DYNAMIC}
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
+            },
+            "fuse_rmsnorm": {
+                "stage": "post_load_fusion",
+                "gated_rmsnorm_backend": "triton",
+                "rmsnorm_backend": "flashinfer",
+            },
+        },
+    )(None, gm)
+
+    rms_nodes = [
+        n for n in gm_transformed.graph.nodes if is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm)
+    ]
+    assert len(rms_nodes) >= 1
+    assert all("val" in n.meta and hasattr(n.meta["val"], "dtype") for n in rms_nodes)
