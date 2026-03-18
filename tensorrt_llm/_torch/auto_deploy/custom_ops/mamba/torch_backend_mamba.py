@@ -33,6 +33,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -160,7 +161,8 @@ def _torch_cached_ssm(
     num_seq = seq_len.shape[0]
 
     # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_total_tokens = num_prefill_tokens + num_decode
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]

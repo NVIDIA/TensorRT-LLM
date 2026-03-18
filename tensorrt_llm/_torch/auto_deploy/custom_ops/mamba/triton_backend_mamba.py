@@ -19,7 +19,7 @@ import torch
 
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 
-from ..attention_interface import AttentionRegistry, MHACallable
+from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
@@ -59,7 +59,8 @@ def _triton_cached_ssm(
         hidden_states, B, C, dt
     )
     ssm_state_size = B.shape[3]
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
