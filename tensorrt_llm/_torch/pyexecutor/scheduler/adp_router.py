@@ -521,8 +521,9 @@ class KVCacheAwareADPRouter(ADPRouter):
 
             for rank in eligible_ranks:
                 match_len = prefix_matches[rank].get(req_id, 0) if rank < len(prefix_matches) else 0
-                score = self._score_rank(req_tokens, match_len,
-                                         all_ranks_num_active_tokens[rank], load_denom)
+                score = self._score_rank(
+                    req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
+                )
                 if score < best_score:
                     best_score = score
                     best_rank = rank
