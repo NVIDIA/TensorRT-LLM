@@ -3,6 +3,7 @@ import torch
 from torch_attention_reference import TorchAttentionReference
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 @pytest.mark.parametrize("num_generate_ratio", [0.0, 0.5, 1.0])
@@ -52,9 +53,17 @@ def test_flat_gqa_op(
     k = torch.randn(1, seq_len.sum(), n_kv_heads * D_HEAD, **dtype_kwargs)
     v = torch.randn(1, seq_len.sum(), n_kv_heads * D_HEAD, **dtype_kwargs)
 
-    # create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     num_prefill_tokens = seq_len[:num_context].sum()
-    batch_info_host = torch.tensor([num_context, num_prefill_tokens, num_generate], **int_kwargs)
+    nc = int(num_context.item()) if isinstance(num_context, torch.Tensor) else num_context
+    ng = int(num_generate.item()) if isinstance(num_generate, torch.Tensor) else num_generate
+    npt = (
+        int(num_prefill_tokens.item())
+        if isinstance(num_prefill_tokens, torch.Tensor)
+        else num_prefill_tokens
+    )
+    _bi = BatchInfo()
+    _bi.update([nc, npt, 0, 0, ng, ng])
+    batch_info_host = _bi.serialize()
 
     # run op
     output = torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache(
