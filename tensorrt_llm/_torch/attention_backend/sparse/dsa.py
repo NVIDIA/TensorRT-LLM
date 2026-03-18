@@ -32,7 +32,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import triton_convert_req_index_to_global_index
+from .kernel import (fused_gather_k_cache,
+                     triton_convert_req_index_to_global_index)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -1502,10 +1503,23 @@ class Indexer(nn.Module):
                     tp_rank = metadata.mapping.tp_rank
                     tp_size = metadata.mapping.tp_size
 
+                # Use the 2D pool data directly (contiguous) instead of the
+                # 4D view, because the 4D view may have strides that
+                # prevent flattening via .view(-1).
+                layer_offset = metadata.kv_cache_manager.layer_offsets[
+                    self.layer_idx]
+                gather_k_cache_pool = metadata.kv_cache_manager.indexer_k_cache_pool_per_layer[
+                    layer_offset]
+
                 for chunk in metadata.indexer_prefill_chunks:
-                    # Gather K from cache for this chunk (dual to _update_k_cache)
-                    chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(
-                        metadata, chunk)
+                    chunk_k_fp8, chunk_k_scale = fused_gather_k_cache(
+                        gather_k_cache_pool,
+                        metadata.slot_mapping_fp8_fullkv,
+                        metadata.slot_mapping_scale_fullkv,
+                        chunk.k_token_start,
+                        chunk.k_token_end,
+                        self.head_dim,
+                    )
 
                     chunk_num_token = chunk.token_end - chunk.token_start
                     apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
