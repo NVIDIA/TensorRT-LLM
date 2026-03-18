@@ -4760,6 +4760,7 @@ class RopeEmbeddingUtils:
             scale_type: RotaryScalingType = RotaryScalingType.none,
             # Other scaling configs that only used by certain scaling types.
             rope_scaling_config: dict = None,
+            duplicate_data: bool = False,
             dtype=np.float32):
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
@@ -4785,6 +4786,8 @@ class RopeEmbeddingUtils:
                                                 inv_freq,
                                                 dtype=dtype),
                                       axis=-1)
+        if duplicate_data:
+            sinusoid_inp = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
         # fuse cos/sin into float2 (cos, sin).
         concat = np.concatenate(
             (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
@@ -4879,15 +4882,15 @@ class RopeEmbeddingUtils:
                         scaling_long_factors, False, True), short_mscale
 
     @staticmethod
-    def create_sinusoidal_positions_long_rope(
-            num_pos: int,
-            dim: int,
-            theta: float,
-            original_max_pos: int,
-            short_factor: List[float],
-            long_factor: List[float],
-            dtype=np.float32,
-            max_seq_len: Optional[int] = None):
+    def create_sinusoidal_positions_long_rope(num_pos: int,
+                                              dim: int,
+                                              theta: float,
+                                              original_max_pos: int,
+                                              short_factor: List[float],
+                                              long_factor: List[float],
+                                              dtype=np.float32,
+                                              max_seq_len: Optional[int] = None,
+                                              duplicate_data: bool = False):
         short_factor = np.array(short_factor, dtype=np.float32)
         long_factor = np.array(long_factor, dtype=np.float32)
 
@@ -4907,6 +4910,9 @@ class RopeEmbeddingUtils:
         else:
             scaling_factor = np.sqrt(1.0 +
                                      np.log(scale) / np.log(original_max_pos))
+
+        if duplicate_data:
+            sinusoid_inp = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
 
         # fuse cos/sin into float2 (cos, sin).
         concat = np.concatenate(
