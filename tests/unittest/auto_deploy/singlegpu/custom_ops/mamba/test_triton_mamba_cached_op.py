@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 def _random_params(device, dtype, batch, seq, num_heads, head_dim, n_groups, ssm_state_size):
@@ -50,9 +51,10 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
     )
     ssm_state_cache_triton = ssm_state_cache_torch.clone()
 
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, batch, batch])
+    batch_info_host = _bi.serialize()
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
     cu_seqlen = torch.zeros(batch + 1, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
@@ -155,8 +157,9 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         torch.arange(len(lens), device=device, dtype=torch.int32),
         seq_len,
     ).view(1, -1)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32, device=device)
+    _bi = BatchInfo()
+    _bi.update([len(lens), sum(lens), 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
