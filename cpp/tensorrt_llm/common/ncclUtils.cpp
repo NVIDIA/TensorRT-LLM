@@ -480,28 +480,15 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
 
     // Step 3: Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
+    // H2D failure is non-fatal: warn and continue — device flag may be stale but the allreduce
+    // must still be reached by all ranks. allreduce and D2H failures are catastrophic (throw).
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    TLLM_CUDA_CHECK(cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice));
-
-    ncclResult_t reduceResult = ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream);
-    if (reduceResult != ncclSuccess)
-    {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] ncclAllReduce for rank-sync flag failed (error: %d); "
-            "aborting window registration on this rank.",
-            reduceResult);
-        return NCCLWindowBuffer{}; // guards free rankSyncFlag and ncclPtr
-    }
+    TLLM_CUDA_CHECK_WARN(cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice));
+    TLLM_NCCL_CHECK(ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream));
     TLLM_CUDA_CHECK_WARN(cudaStreamSynchronize(stream));
 
     int allAllocOk = 0;
-    cudaError_t d2hErr = cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost);
-    if (d2hErr != cudaSuccess)
-    {
-        TLLM_LOG_WARNING("[NCCLUtil] cudaMemcpy D2H for rank-sync flag failed: %s; assuming allocation failed.",
-            cudaGetErrorString(d2hErr));
-        return NCCLWindowBuffer{}; // guards free rankSyncFlag and ncclPtr
-    }
+    TLLM_CUDA_CHECK(cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost));
     // flagGuard frees rankSyncFlag here at end of its scope
 
     if (!allAllocOk)
