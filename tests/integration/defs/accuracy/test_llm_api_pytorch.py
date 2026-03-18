@@ -6393,7 +6393,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             layer_updates_per_iter=0)
         cuda_graph_config = CudaGraphConfig(max_batch_size=32,
                                             enable_padding=True)
-        moe_config = MoeConfig(backend="WIDEEP", oad_balancer=eplb_config)
+        moe_config = MoeConfig(backend="WIDEEP", load_balancer=eplb_config)
         pytorch_config = dict(cuda_graph_config=cuda_graph_config,
                               moe_config=moe_config)
         with LLM(
@@ -6427,7 +6427,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                             layer_updates_per_iter=2)
         cuda_graph_config = CudaGraphConfig(max_batch_size=32,
                                             enable_padding=True)
-        moe_config = MoeConfig(backend="WIDEEP", oad_balancer=eplb_config)
+        moe_config = MoeConfig(backend="WIDEEP", load_balancer=eplb_config)
         pytorch_config = dict(cuda_graph_config=cuda_graph_config,
                               moe_config=moe_config)
 
