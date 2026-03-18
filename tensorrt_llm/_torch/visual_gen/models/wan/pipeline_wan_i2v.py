@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import diffusers
 import PIL.Image
@@ -395,7 +395,7 @@ class WanImageToVideoPipeline(BasePipeline):
     def forward(
         self,
         image: Union[PIL.Image.Image, torch.Tensor, str],
-        prompt: str,
+        prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
         height: int = 480,
         width: int = 832,
@@ -409,6 +409,25 @@ class WanImageToVideoPipeline(BasePipeline):
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
         pipeline_start = time.time()
+
+        # Validate image input — only single image is supported for batch generation
+        if not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+            raise ValueError(
+                f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+                f"got {type(image)}. Batch of different images is not supported; "
+                f"use a single image with multiple prompts instead."
+            )
+
+        # Determine batch size
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        batch_size = len(prompt)
+        if batch_size > 1:
+            logger.info(
+                f"Batch generation: {batch_size} prompts with a single input image. "
+                "All videos will be conditioned on the same image."
+            )
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
@@ -479,6 +498,9 @@ class WanImageToVideoPipeline(BasePipeline):
             # Wan 2.1 I2V: Compute CLIP image embeddings
             image_embeds = self._encode_image(image, last_image)
             image_embeds = image_embeds.to(self.dtype)
+            # Repeat for batch: single image, multiple prompts
+            if batch_size > 1:
+                image_embeds = image_embeds.repeat(batch_size, 1, 1)
         else:
             # Wan 2.2 I2V: No image embeddings needed
             image_embeds = None
@@ -487,7 +509,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         # Prepare Latents with image conditioning (I2V-specific)
         latents, condition_data = self._prepare_latents(
-            image, height, width, num_frames, generator, last_image
+            batch_size, image, height, width, num_frames, generator, last_image
         )
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
@@ -547,11 +569,20 @@ class WanImageToVideoPipeline(BasePipeline):
             # Forward pass with I2V conditioning
             # Wan 2.1: image_embeds is not None (CLIP embeddings)
             # Wan 2.2 14B: image_embeds is None (no CLIP)
+            # Handle CFG: duplicate image_embeds if batch dimension doubled
+            image_embeds_to_use = image_embeds
+            if (
+                image_embeds_to_use is not None
+                and latents_input.shape[0] != image_embeds_to_use.shape[0]
+            ):
+                repeat_factor = latents_input.shape[0] // image_embeds_to_use.shape[0]
+                image_embeds_to_use = image_embeds_to_use.repeat(repeat_factor, 1, 1)
+
             return current_model(
                 hidden_states=latent_model_input,
                 timestep=timestep_input,
                 encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_image=image_embeds,
+                encoder_hidden_states_image=image_embeds_to_use,
             )
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
@@ -612,9 +643,8 @@ class WanImageToVideoPipeline(BasePipeline):
 
         return MediaOutput(video=video)
 
-    def _encode_prompt(self, prompt, negative_prompt, max_sequence_length):
+    def _encode_prompt(self, prompt: List[str], negative_prompt, max_sequence_length):
         """Encode text prompts to embeddings (same as T2V)."""
-        prompt = [prompt] if isinstance(prompt, str) else prompt
 
         def get_embeds(texts):
             text_inputs = self.tokenizer(
@@ -682,6 +712,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
     def _prepare_latents(
         self,
+        batch_size: int,
         image: Union[PIL.Image.Image, torch.Tensor, str],
         height: int,
         width: int,
@@ -695,8 +726,7 @@ class WanImageToVideoPipeline(BasePipeline):
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
 
-        # Create random noise latents
-        shape = (1, num_channels_latents, num_latent_frames, latent_height, latent_width)
+        shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
         latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
         # Load and preprocess image(s)
@@ -779,10 +809,15 @@ class WanImageToVideoPipeline(BasePipeline):
 
         # Concatenate mask and condition along channel dimension
         condition = torch.cat([mask_lat_size, latent_condition], dim=1)
+
+        # Repeat condition for batch (single image, multiple prompts)
+        if batch_size > 1:
+            condition = condition.repeat(batch_size, 1, 1, 1, 1)
+
         return latents, condition
 
     def _decode_latents(self, latents):
-        """Decode latents to video (same as T2V)."""
+        """Decode latents to video."""
         latents = latents.to(self.vae.dtype)
 
         # Denormalization
@@ -806,7 +841,7 @@ class WanImageToVideoPipeline(BasePipeline):
         # VAE decode: returns (B, C, T, H, W)
         video = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process video tensor: (B, C, T, H, W) -> (T, H, W, C) uint8
-        video = postprocess_video_tensor(video, remove_batch_dim=True)
+        # Post-process video tensor: (B, C, T, H, W) -> (B, T, H, W, C)
+        video = postprocess_video_tensor(video)
 
         return video

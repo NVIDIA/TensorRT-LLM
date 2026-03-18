@@ -70,6 +70,8 @@ EOF
 trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
 --host 0.0.0.0 \
 --port 8000 \
+--reasoning_parser nano-v3 \
+--tool_parser qwen3_coder \
 --config nemotron_super_v3.yaml
 ```
 
@@ -119,6 +121,8 @@ EOF
 trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
 --host 0.0.0.0 \
 --port 8000 \
+--reasoning_parser nano-v3 \
+--tool_parser qwen3_coder \
 --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 
@@ -155,6 +159,8 @@ EOF
 trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
 --host 0.0.0.0 \
 --port 8000 \
+--reasoning_parser nano-v3 \
+--tool_parser qwen3_coder \
 --config nemotron_super_v3_mtp.yaml
 ```
 

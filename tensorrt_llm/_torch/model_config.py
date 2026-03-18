@@ -508,6 +508,8 @@ class ModelConfig(Generic[TConfig]):
                         0] == "DeepseekV32ForCausalLM":
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
+                    indexer_rope_interleave = getattr(
+                        pretrained_config, 'indexer_rope_interleave', False)
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
@@ -533,7 +535,8 @@ class ModelConfig(Generic[TConfig]):
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
                             use_cute_dsl_topk=use_cute_dsl_topk,
-                            q_split_threshold=q_split_threshold)
+                            q_split_threshold=q_split_threshold,
+                            indexer_rope_interleave=indexer_rope_interleave)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

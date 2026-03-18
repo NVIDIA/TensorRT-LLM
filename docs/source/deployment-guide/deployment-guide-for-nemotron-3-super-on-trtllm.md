@@ -88,7 +88,7 @@ Below are example commands to launch the TensorRT LLM server with the Nemotron v
 **NVFP4 model (recommended, lowest memory footprint):**
 
 ```shell
-trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 --host 0.0.0.0 --port 8000 --config ${EXTRA_LLM_API_FILE}
+trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 --host 0.0.0.0 --port 8000 --reasoning_parser nano-v3 --tool_parser qwen3_coder --config ${EXTRA_LLM_API_FILE}
 ```
 
 
