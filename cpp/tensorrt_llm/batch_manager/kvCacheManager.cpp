@@ -2831,15 +2831,15 @@ std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
 
     // On unified memory systems (e.g. Grace Blackwell / DGX Spark), CPU and GPU share the same
     // physical memory pool. The secondary (host) cache tier is redundant because there is no
-    // separate host DRAM to offload to -- all memory is equally accessible. Fold any configured
-    // host_cache_size budget into the primary pool so the block manager sees a single, larger tier.
+    // separate host DRAM to offload to -- all memory is equally accessible.
+    // Do NOT add host_cache_size to freePrimaryMemBytes: cudaMemGetInfo already reports the full
+    // unified pool, so adding host_cache_size would double-count and risk OOM.
     if (tc::isUnifiedMemorySystem() && freeSecondaryMemBytes > 0)
     {
-        TLLM_LOG_INFO("Unified memory detected: folding secondary cache budget (%" PRIu64
-                      " bytes) "
-                      "into primary pool. Offload memcpy will be skipped at runtime.",
+        TLLM_LOG_INFO("Unified memory detected: ignoring host_cache_size (%" PRIu64
+                      " bytes) -- system memory is already included in GPU memory budget. "
+                      "Offload memcpy will be skipped at runtime.",
             static_cast<uint64_t>(freeSecondaryMemBytes));
-        freePrimaryMemBytes += freeSecondaryMemBytes;
         freeSecondaryMemBytes = 0;
     }
 

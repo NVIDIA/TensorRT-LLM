@@ -2167,10 +2167,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     enable_unified_memory_optimization: Optional[bool] = Field(
         default=None,
         description=
-        "Enable KV cache optimizations for unified memory systems (e.g. DGX Spark / Grace Blackwell). "
-        "When None (default), auto-detects at runtime. On unified memory, the secondary (host) cache "
-        "tier is folded into the primary pool and offload memcpy is skipped, since CPU and GPU share "
-        "the same physical memory. Set to False to disable even on unified memory systems."
+        "Informational flag indicating unified memory system detection. "
+        "When None (default), auto-detects via is_device_integrated(). "
+        "The C++ runtime independently detects unified memory and applies optimizations "
+        "(skipping offload memcpy, ignoring host_cache_size). This field provides "
+        "visibility into the detection result but does not control C++ behavior."
     )
 
     tokens_per_block: int = Field(default=32,
@@ -2282,9 +2283,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             try:
                 unified = is_device_integrated()
             except RuntimeError:
-                logger.debug(
-                    "Unified-memory auto-detection failed; "
-                    "defaulting to disabled")
+                logger.debug("Unified-memory auto-detection failed; "
+                             "defaulting to disabled")
                 unified = False
             object.__setattr__(self, 'enable_unified_memory_optimization',
                                unified)
