@@ -145,10 +145,12 @@ class TrtllmGenSupportChecker:
         sm = get_sm_version()
         if not is_sm_100f(sm):
             if sm in (120, 121):
-                return (False,
+                return (
+                    False,
                     f"trtllm-gen FMHA cubins are not available for SM{sm} "
                     f"(Blackwell SM120 family). SM120/SM121 use different ISA "
-                    f"instructions than SM100/SM103. Falling back to FMHA v2.")
+                    f"instructions than SM100/SM103. Falling back to FMHA v2.",
+                )
             return (False, f"trtllm-gen requires SM100 or SM103 (Blackwell). Current: SM{sm}.")
 
         if (

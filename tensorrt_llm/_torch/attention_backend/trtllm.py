@@ -14,7 +14,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_sm_version, is_sm_120f, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_sm_version, is_sm_120f,
+                                  maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
