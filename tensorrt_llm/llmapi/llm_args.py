@@ -541,6 +541,12 @@ class AttentionDpConfig(StrictBaseModel):
         "Use KV cache-aware routing for attention DP request distribution. "
         "When enabled, routes requests to ranks that already have matching "
         "prefix KV cache, reducing redundant prefill computation. ")
+    kv_cache_routing_load_balance_weight: float = Field(
+        default=1.0,
+        description=
+        "Weight (beta) for the load-balance term in KV cache-aware routing. "
+        "Higher values prioritize load balance over cache affinity. "
+        "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':

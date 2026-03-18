@@ -18,7 +18,6 @@ Includes:
 from __future__ import annotations
 
 import heapq
-import os
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import astuple, dataclass
@@ -91,7 +90,11 @@ class ADPRouter(ABC):
             and kv_cache_manager is not None
             and kv_cache_manager.enable_block_reuse
         ):
-            return KVCacheAwareADPRouter(dist=dist, kv_cache_manager=kv_cache_manager)
+            return KVCacheAwareADPRouter(
+                dist=dist,
+                kv_cache_manager=kv_cache_manager,
+                load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
+            )
 
         return DefaultADPRouter(dist=dist)
 
@@ -332,14 +335,11 @@ class KVCacheAwareADPRouter(ADPRouter):
     needs_prefix_matches: bool = True
 
     def __init__(
-        self, dist: "Distributed", kv_cache_manager, load_balance_weight: float | None = None
+        self, dist: "Distributed", kv_cache_manager, load_balance_weight: float = 1.0
     ):
         super().__init__(dist)
         self.kv_cache_manager = kv_cache_manager
-        if load_balance_weight is not None:
-            self.load_balance_weight = load_balance_weight
-        else:
-            self.load_balance_weight = float(os.environ.get("TRTLLM_CACHE_ROUTER_BETA", "1.0"))
+        self.load_balance_weight = load_balance_weight
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
 
     def create_rank_state(
