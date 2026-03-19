@@ -1814,7 +1814,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         generation_num_splits = metadata.flash_mla_num_splits[:num_generations +
                                                               1]
 
-        s_q = self.wrapper.predicted_tokens_per_seq
+        s_q = int(metadata.seq_lens[metadata.num_contexts].item())
 
         thop.compute_flash_mla_metadata(
             generation_kv_lens,
