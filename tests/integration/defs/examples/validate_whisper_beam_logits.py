@@ -183,8 +183,14 @@ def main():
         )
     torch.cuda.synchronize()
 
+    generation_logits = outputs["generation_logits"]
+    assert generation_logits.shape[1] == args.num_beams, (
+        f"Expected generation_logits beam dimension to be {args.num_beams}, "
+        f"got {generation_logits.shape[1]}"
+    )
+
     passed = validate_logits_alignment(
-        outputs["output_ids"].cpu(), outputs["generation_logits"].cpu(), input_len, eot_id
+        outputs["output_ids"].cpu(), generation_logits.cpu(), input_len, eot_id
     )
 
     if passed:

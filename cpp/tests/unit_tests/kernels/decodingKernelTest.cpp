@@ -26,6 +26,8 @@
 #include <curand_kernel.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstring>
 #include <random>
 #include <unordered_set>
 
@@ -690,6 +692,195 @@ TEST_F(TestGatherTree, GatherTreeWithSwap)
     cudaDeviceSynchronize();
 
     EXPECT_TRUE(checkResult());
+}
+
+// Test that generation logits are correctly reordered after gatherTree finalization.
+// Uses the same hardcoded beam search data as GatherTreeNoSwap, creates sentinel logits
+// where logits[slot][g][v] = slot (so we can verify which slot each beam's logits came from),
+// then runs the reorder algorithm and checks the result.
+TEST_F(TestGatherTree, GenerationLogitsReorder)
+{
+    createBuffers();
+    hardcodeBuffersLen10();
+    cudaDeviceSynchronize();
+    kernels::gatherTree(
+        mDecodingState->getJointDecodingOutput(), mDecodingState->getJointDecodingInput(), mSamplingConfig, *mStream);
+    cudaDeviceSynchronize();
+
+    // Verify gatherTree worked first
+    ASSERT_TRUE(checkResult());
+
+    // Now test the generation logits reordering algorithm.
+    // Copy ids, parentIds, and gatheredIds to host.
+    auto idsHost = mBufferManager->copyFrom(*mDecodingState->getIds(0), MemoryType::kCPU);
+    auto parentIdsHost = mBufferManager->copyFrom(*ITensor::at(mDecodingState->getParentIds(), {0}), MemoryType::kCPU);
+    auto gatheredIdsHost = mBufferManager->copyFrom(*mDecodingState->getGatheredIds(0), MemoryType::kCPU);
+    auto seqLengthsHost = mBufferManager->copyFrom(*mDecodingState->getSequenceLengths(0), MemoryType::kCPU);
+
+    auto const* idsData = bufferCast<TokenIdType>(*idsHost);
+    auto const* parentIdsData = bufferCast<TokenIdType>(*parentIdsHost);
+    auto const* gatheredIdsData = bufferCast<TokenIdType>(*gatheredIdsHost);
+    auto const* seqLengthsData = bufferCast<SizeType32>(*seqLengthsHost);
+
+    SizeType32 const promptLen = 3; // matches inputLengths in hardcodeBuffersLen10
+
+    // Create sentinel generation logits: logits[slot][g][v] = slot for all v.
+    // This lets us verify which slot's logits end up at each beam position after reorder.
+    SizeType32 const vocabSizePadded = 8; // small for testing
+    SizeType32 const maxNewTokens = maxSeqLen - promptLen;
+    // Shape: [beamWidth, maxNewTokens, vocabSizePadded]
+    std::vector<float> logits(beamWidth * maxNewTokens * vocabSizePadded, 0.0f);
+    for (SizeType32 slot = 0; slot < beamWidth; ++slot)
+    {
+        for (SizeType32 g = 0; g < maxNewTokens; ++g)
+        {
+            for (SizeType32 v = 0; v < vocabSizePadded; ++v)
+            {
+                logits[(slot * maxNewTokens + g) * vocabSizePadded + v] = static_cast<float>(slot);
+            }
+        }
+    }
+
+    // Run the same algorithm as reorderGenerationLogitsForBeamSearch:
+    // 1. Build slot trace (post-reassignment)
+    // 2. Convert to pre-reassignment via parentIds
+    // 3. Reorder logits
+
+    std::vector<std::vector<SizeType32>> slotTrace(beamWidth, std::vector<SizeType32>(maxNewTokens, 0));
+
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const seqLen = seqLengthsData[beam];
+        auto const genLen = seqLen - promptLen;
+        if (genLen <= 0)
+        {
+            continue;
+        }
+
+        // Find starting slot by matching backtracked sequence
+        SizeType32 startSlot = -1;
+        for (SizeType32 s = 0; s < beamWidth; ++s)
+        {
+            SizeType32 slot = s;
+            bool matches = true;
+            for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+            {
+                if (idsData[slot * maxSeqLen + t] != gatheredIdsData[beam * maxSeqLen + t])
+                {
+                    matches = false;
+                    break;
+                }
+                if (t > promptLen)
+                {
+                    slot = parentIdsData[slot * maxSeqLen + t];
+                }
+            }
+            if (matches)
+            {
+                startSlot = s;
+                break;
+            }
+        }
+        ASSERT_GE(startSlot, 0) << "Could not find starting slot for beam " << beam;
+
+        // Build post-reassignment slot trace
+        SizeType32 slot = startSlot;
+        slotTrace[beam][genLen - 1] = slot;
+        for (SizeType32 t = seqLen - 1; t > promptLen; --t)
+        {
+            slot = parentIdsData[slot * maxSeqLen + t];
+            slotTrace[beam][t - 1 - promptLen] = slot;
+        }
+
+        // Convert to pre-reassignment slot
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            slotTrace[beam][g] = parentIdsData[slotTrace[beam][g] * maxSeqLen + (promptLen + g)];
+        }
+    }
+
+    // Reorder logits using a temp buffer (same approach as the production code)
+    auto const stepSize = static_cast<size_t>(vocabSizePadded) * sizeof(float);
+    std::vector<float> temp(beamWidth * vocabSizePadded);
+    auto* logitsPtr = reinterpret_cast<uint8_t*>(logits.data());
+    auto* tempPtr = reinterpret_cast<uint8_t*>(temp.data());
+
+    std::vector<SizeType32> genLens(beamWidth);
+    SizeType32 maxGenLen = 0;
+    for (SizeType32 b = 0; b < beamWidth; ++b)
+    {
+        genLens[b] = std::max(SizeType32{0}, seqLengthsData[b] - promptLen);
+        maxGenLen = std::max(maxGenLen, genLens[b]);
+    }
+
+    for (SizeType32 g = 0; g < maxGenLen; ++g)
+    {
+        bool stepNeedsReorder = false;
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g < genLens[b] && slotTrace[b][g] != b)
+            {
+                stepNeedsReorder = true;
+                break;
+            }
+        }
+        if (!stepNeedsReorder)
+        {
+            continue;
+        }
+
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            auto const offset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            std::memcpy(tempPtr + static_cast<size_t>(b) * stepSize, logitsPtr + offset, stepSize);
+        }
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g >= genLens[b])
+            {
+                continue;
+            }
+            auto const dstOffset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            auto const srcSlot = slotTrace[b][g];
+            std::memcpy(logitsPtr + dstOffset, tempPtr + static_cast<size_t>(srcSlot) * stepSize, stepSize);
+        }
+    }
+
+    // Verify: after reorder, logits[beam][g][0] should equal the pre-reassignment slot
+    // that the model computed logits from for that beam at that step.
+    // Since our sentinel set logits[slot][g][v] = slot, the reordered value tells us
+    // which slot's logits were assigned to each beam.
+    bool allCorrect = true;
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const genLen = genLens[beam];
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            auto const reorderedSlot = static_cast<SizeType32>(logits[(beam * maxNewTokens + g) * vocabSizePadded]);
+            auto const expectedSlot = slotTrace[beam][g];
+            if (reorderedSlot != expectedSlot)
+            {
+                TLLM_LOG_ERROR("Beam %d, step %d: expected slot %d, got slot %d", beam, g, expectedSlot, reorderedSlot);
+                allCorrect = false;
+            }
+        }
+    }
+    EXPECT_TRUE(allCorrect);
+
+    // Also verify that at least some reordering happened (the test data should cause beam swaps)
+    bool anyReorder = false;
+    for (SizeType32 beam = 0; beam < beamWidth && !anyReorder; ++beam)
+    {
+        for (SizeType32 g = 0; g < genLens[beam]; ++g)
+        {
+            if (slotTrace[beam][g] != beam)
+            {
+                anyReorder = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(anyReorder) << "Test data should cause at least some beam reordering";
 }
 
 enum AcceptKernelMode
