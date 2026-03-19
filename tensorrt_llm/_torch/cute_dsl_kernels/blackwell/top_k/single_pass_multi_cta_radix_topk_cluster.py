@@ -583,9 +583,7 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
                 else:
                     # ---- Multi-CTA (cluster) path ----
                     for r in cutlass.range_constexpr(self.num_rounds):
-                        shift = cutlass.const_expr(
-                            self.ordered_bits - (r + 1) * self.radix_bits
-                        )
+                        shift = cutlass.const_expr(self.ordered_bits - (r + 1) * self.radix_bits)
                         prefix, remaining_k = self._radix_round_cluster(
                             r,
                             shift,
