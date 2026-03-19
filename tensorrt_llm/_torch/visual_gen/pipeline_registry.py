@@ -50,6 +50,18 @@ class AutoPipeline:
         # Detect pipeline type from model_index.json or from model safetensors
         pipeline_type = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
 
+        # Upgrade to two-stage pipeline when upsampler + distilled LoRA are provided
+        if (
+            pipeline_type == "LTX2Pipeline"
+            and config.extra_attrs.get("spatial_upsampler_path")
+            and config.extra_attrs.get("distilled_lora_path")
+        ):
+            pipeline_type = "LTX2TwoStagesPipeline"
+            logger.info(
+                "AutoPipeline: Upgrading to LTX2TwoStagesPipeline "
+                "(spatial_upsampler_path + distilled_lora_path provided)"
+            )
+
         if pipeline_type not in PIPELINE_REGISTRY:
             raise ValueError(
                 f"Unknown pipeline: '{pipeline_type}'. "

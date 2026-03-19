@@ -133,6 +133,30 @@ def parse_args():
         help="Use Gemma3 to enhance the text prompt before encoding",
     )
 
+    # Two-stage pipeline
+    parser.add_argument(
+        "--spatial_upsampler_path",
+        "--spatial-upsampler-path",
+        type=str,
+        default="",
+        help=(
+            "Path to the learned LatentUpsampler checkpoint (.safetensors). "
+            "When provided, the pipeline uses two-stage generation: stage 1 "
+            "at half resolution, learned 2x upsample, stage 2 refinement."
+        ),
+    )
+    parser.add_argument(
+        "--distilled_lora_path",
+        "--distilled-lora-path",
+        type=str,
+        default="",
+        help=(
+            "Path to the distilled LoRA checkpoint (.safetensors) for "
+            "stage 2 refinement. The LoRA weights are merged into the "
+            "transformer for stage 2 and un-merged afterwards."
+        ),
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -219,6 +243,10 @@ def _build_diffusion_args(args) -> VisualGenArgs:
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     )
+    if args.spatial_upsampler_path:
+        kwargs["spatial_upsampler_path"] = args.spatial_upsampler_path
+    if args.distilled_lora_path:
+        kwargs["distilled_lora_path"] = args.distilled_lora_path
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
@@ -227,6 +255,13 @@ def _build_diffusion_args(args) -> VisualGenArgs:
 
 def main():
     args = parse_args()
+
+    if bool(args.spatial_upsampler_path) != bool(args.distilled_lora_path):
+        missing = "--distilled_lora_path" if args.spatial_upsampler_path else "--spatial_upsampler_path"
+        raise ValueError(
+            f"Two-stage pipeline requires both --spatial_upsampler_path and "
+            f"--distilled_lora_path, but {missing} was not provided."
+        )
 
     diffusion_args = _build_diffusion_args(args)
 
