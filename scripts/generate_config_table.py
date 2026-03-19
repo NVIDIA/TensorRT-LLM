@@ -30,7 +30,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from examples.configs.database.database import (  # noqa: E402
+    CURATED_LIST_PATH,
     DATABASE_LIST_PATH,
+    CuratedRecipeList,
     RecipeList,
     assign_profile,
 )
@@ -44,9 +46,37 @@ MODEL_INFO = {
         "display_name": "DeepSeek-R1 (NVFP4)",
         "url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
     },
+    "nvidia/DeepSeek-R1-FP4": {
+        "display_name": "DeepSeek-R1 (NVFP4)",
+        "url": "https://huggingface.co/nvidia/DeepSeek-R1-FP4",
+    },
+    "nvidia/DeepSeek-R1-FP4-v2": {
+        "display_name": "DeepSeek-R1 (NVFP4)",
+        "url": "https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2",
+    },
     "openai/gpt-oss-120b": {
         "display_name": "gpt-oss-120b",
         "url": "https://huggingface.co/openai/gpt-oss-120b",
+    },
+    "Qwen/Qwen3-Next-80B-A3B-Thinking": {
+        "display_name": "Qwen3-Next-80B",
+        "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking",
+    },
+    "Qwen/Qwen3-30B-A3B": {
+        "display_name": "Qwen3-30B-A3B",
+        "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B",
+    },
+    "nvidia/Llama-3.3-70B-Instruct-FP8": {
+        "display_name": "Llama-3.3-70B (FP8)",
+        "url": "https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP8",
+    },
+    "nvidia/Llama-4-Scout-17B-16E-Instruct-FP8": {
+        "display_name": "Llama 4 Scout (FP8)",
+        "url": "https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8",
+    },
+    "nvidia/Kimi-K2-Thinking-NVFP4": {
+        "display_name": "Kimi-K2-Thinking (NVFP4)",
+        "url": "https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4",
     },
 }
 
@@ -70,11 +100,55 @@ class RecipeRow:
     config_raw_url: str
 
 
+@dataclass(frozen=True)
+class CuratedRow:
+    model: str
+    model_display_name: str
+    model_url: str
+    scenario: str
+    gpu_compatibility: str
+    config_path: str
+    config_filename: str
+    config_github_url: str
+    config_raw_url: str
+    command: str
+
+
 def _model_display_and_url(model: str) -> tuple[str, str]:
     if model in MODEL_INFO:
         info = MODEL_INFO[model]
         return info["display_name"], info["url"]
     return model, ""
+
+
+def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
+    """Parse curated recipe YAML and return CuratedRow entries for JSON serialization."""
+    curated_list = CuratedRecipeList.from_yaml(Path(yaml_path))
+    rows: list[CuratedRow] = []
+    for entry in curated_list:
+        if entry.disagg:
+            continue
+        model_display_name, model_url = _model_display_and_url(entry.model)
+        config_path = entry.config_path
+        config_filename = os.path.basename(config_path)
+        config_github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{config_path}"
+        config_raw_url = f"https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/{config_path}"
+        command = f"trtllm-serve {entry.model} --config ${{TRTLLM_DIR}}/{config_path}"
+        rows.append(
+            CuratedRow(
+                model=entry.model,
+                model_display_name=model_display_name,
+                model_url=model_url,
+                scenario=entry.scenario,
+                gpu_compatibility=entry.gpu_compatibility,
+                config_path=config_path,
+                config_filename=config_filename,
+                config_github_url=config_github_url,
+                config_raw_url=config_raw_url,
+                command=command,
+            )
+        )
+    return rows
 
 
 def build_rows(yaml_path) -> list[RecipeRow]:
@@ -145,7 +219,7 @@ def build_rows(yaml_path) -> list[RecipeRow]:
     return rows
 
 
-def generate_json(yaml_path, output_file):
+def generate_json(yaml_path: Path, output_file: Path, curated_yaml_path: Path | None = None):
     rows = build_rows(yaml_path)
 
     source_path = Path(yaml_path)
@@ -162,10 +236,22 @@ def generate_json(yaml_path, output_file):
                 "url": row.model_url,
             }
 
+    curated_entries = []
+    if curated_yaml_path and curated_yaml_path.exists():
+        curated_rows = build_curated_rows(curated_yaml_path)
+        curated_entries = [asdict(r) for r in curated_rows]
+        for crow in curated_rows:
+            if crow.model not in models:
+                models[crow.model] = {
+                    "display_name": crow.model_display_name,
+                    "url": crow.model_url,
+                }
+
     payload = {
         "source": source,
         "models": models,
         "entries": [asdict(r) for r in rows],
+        "curated_entries": curated_entries,
     }
 
     with open(output_file, "w") as f:
@@ -179,4 +265,5 @@ if __name__ == "__main__":
         print(f"Error: YAML file not found at {yaml_path}", file=sys.stderr)
         sys.exit(1)
     json_output_path = REPO_ROOT / "docs/source/_static/config_db.json"
-    generate_json(yaml_path, output_file=json_output_path)
+    curated_path = CURATED_LIST_PATH if CURATED_LIST_PATH.exists() else None
+    generate_json(yaml_path, output_file=json_output_path, curated_yaml_path=curated_path)

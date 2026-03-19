@@ -474,6 +474,25 @@
       .replaceAll("'", "&#039;");
   }
 
+  function highlightBash(text) {
+    return String(text).split("\n").map(function (line) {
+      var html = escapeHtml(line);
+      // export keyword
+      html = html.replace(/^(export)\b/, '<span class="bash-kw">$1</span>');
+      // variable expansion ${...}
+      html = html.replace(/\$\{([^}]+)\}/g, '<span class="bash-var">${$1}</span>');
+      // flags --word
+      html = html.replace(/(--\w[\w-]*)/g, '<span class="bash-flag">$1</span>');
+      // command name (trtllm-serve at start of line or after newline)
+      html = html.replace(/^(trtllm-serve)/, '<span class="bash-cmd">$1</span>');
+      // line continuation backslash
+      html = html.replace(/\\$/, '<span class="bash-cont">\\</span>');
+      // comment
+      html = html.replace(/(#.*)$/, '<span class="bash-comment">$1</span>');
+      return html;
+    }).join("\n");
+  }
+
   function highlightYaml(yamlText) {
     const lines = String(yamlText).split("\n");
     const out = [];
@@ -539,13 +558,19 @@
   }
 
   function formatCommand(entry) {
-    const model = entry.model || "";
+    const model = entry._hfModel || entry.model || "";
     const configPath = entry.config_path || "";
     if (!model || !configPath) return entry.command || "";
     return [
+      `export TRTLLM_DIR=/app/tensorrt_llm`,
       `trtllm-serve ${model} \\`,
       `  --config \${TRTLLM_DIR}/${configPath}`,
     ].join("\n");
+  }
+
+  function curatedEntriesForModel(curatedEntries, model) {
+    if (!model || !curatedEntries || !curatedEntries.length) return [];
+    return curatedEntries.filter((entry) => entry.model === model);
   }
 
   function parseCsvModels(s) {
@@ -561,17 +586,37 @@
     const allowedModels = parseCsvModels(container.getAttribute("data-models"));
 
     const allEntries = Array.isArray(payload.entries) ? payload.entries : [];
-    const entries = allowedModels
-      ? allEntries.filter((e) => allowedModels.includes(e.model))
-      : allEntries.slice();
-
+    const allCurated = Array.isArray(payload.curated_entries) ? payload.curated_entries : [];
     const modelsInfo = payload.models || {};
 
+    // Filter by allowed models (using original HF IDs), then normalize
+    // model field to display_name so the view-model groups by friendly name.
+    // _hfModel preserves the original HF ID for command generation.
+    function normalizeEntry(e) {
+      const info = modelsInfo[e.model];
+      const displayName = (info && info.display_name) || e.model;
+      return { ...e, _hfModel: e.model, model: displayName };
+    }
+
+    const entries = (allowedModels
+      ? allEntries.filter((e) => allowedModels.includes(e.model))
+      : allEntries
+    ).map(normalizeEntry);
+
+    const curatedEntries = (allowedModels
+      ? allCurated.filter((e) => allowedModels.includes(e.model))
+      : allCurated
+    ).map(normalizeEntry);
+
+    // curatedIndex lives outside normalizeState's scope — it is preserved
+    // across Object.assign(state, view.state) because normalizeState only
+    // touches the four filter keys.
     const state = {
       model: "",
       topology: "",
       islOsl: "",
       concurrency: "",
+      curatedIndex: null,
     };
 
     container.innerHTML = "";
@@ -642,6 +687,23 @@
     const selConc = mkSelectField("Concurrency", `trtllm-conc-${id}`, 4);
 
     form.appendChild(selModel.wrap);
+
+    const curatedPanel = el("div", { class: "trtllm-config-selector__curated" });
+    curatedPanel.hidden = true;
+    const curatedHeading = el("div", { class: "trtllm-config-selector__curatedHeading" }, [
+      el("span", { text: "Recommended Configs" }),
+      el("span", { class: "trtllm-config-selector__curatedBadge", text: "Curated" }),
+    ]);
+    const curatedGrid = el("div", { class: "trtllm-config-selector__curatedGrid" });
+    const curatedHint = el("div", {
+      class: "trtllm-config-selector__curatedHint",
+      text: "or choose specific GPU & workload below",
+    });
+    curatedPanel.appendChild(curatedHeading);
+    curatedPanel.appendChild(curatedGrid);
+    curatedPanel.appendChild(curatedHint);
+    form.appendChild(curatedPanel);
+
     form.appendChild(selTopo.wrap);
     form.appendChild(selSeq.wrap);
     form.appendChild(selConc.wrap);
@@ -807,8 +869,52 @@
     }
 
     function applySelection(key, option) {
+      state.curatedIndex = null;
       Object.assign(state, nextStateAfterSelection(state, key, option));
       render();
+    }
+
+    function applyCuratedSelection(index) {
+      if (state.curatedIndex === index) {
+        state.curatedIndex = null;
+      } else {
+        state.curatedIndex = index;
+      }
+      render();
+    }
+
+    function renderCuratedCards(cards, selectedIndex) {
+      curatedGrid.innerHTML = "";
+      for (let i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        const isActive = selectedIndex === i;
+        const btn = el("button", {
+          class: "trtllm-config-selector__curatedCard",
+          type: "button",
+          "data-status": isActive ? "active" : "available",
+          "aria-pressed": isActive ? "true" : "false",
+          title: `${card.scenario} — ${card.gpu_compatibility}`,
+        });
+        btn.appendChild(el("span", {
+          class: "trtllm-config-selector__curatedScenario",
+          text: card.scenario,
+        }));
+        const gpuText = (card.gpu_compatibility && card.gpu_compatibility !== "Any")
+          ? card.gpu_compatibility : "";
+        if (gpuText) {
+          btn.appendChild(el("span", {
+            class: "trtllm-config-selector__curatedGpu",
+            text: gpuText,
+          }));
+        }
+        btn.appendChild(el("span", {
+          class: "trtllm-config-selector__curatedFile",
+          text: card.config_filename || "",
+        }));
+        const idx = i;
+        btn.addEventListener("click", () => applyCuratedSelection(idx));
+        curatedGrid.appendChild(btn);
+      }
     }
 
     function setOptionButtons(groupEl, key, group) {
@@ -888,26 +994,96 @@
       );
     }
 
-    function render() {
+    function render(depth) {
+      if (depth === undefined) depth = 0;
+      if (depth > 5) return;
       const focusDescriptor = captureFocusDescriptor();
       const view = createSelectorViewModel(entries, modelsInfo, state);
       if (!statesEqual(state, view.state)) {
         Object.assign(state, view.state);
-        return render();
+        return render(depth + 1);
       }
-      errorBox.textContent = view.message;
-      errorBox.hidden = !view.message;
 
-      setOptionButtons(selModel.options, "model", view.groups.model);
+      // Augment model group with curated-only models not in the database
+      const dbModelValues = new Set(view.groups.model.options.map((o) => o.value));
+      const curatedOnlyModels = uniqBy(
+        curatedEntries.filter((e) => !dbModelValues.has(e.model)),
+        (e) => e.model
+      );
+      if (curatedOnlyModels.length) {
+        const augmented = { ...view.groups.model };
+        augmented.options = augmented.options.slice();
+        for (const ce of curatedOnlyModels) {
+          const opt = modelOption(ce.model, modelsInfo);
+          const isSelected = view.state.model === ce.model;
+          augmented.options.push({
+            ...opt,
+            status: isSelected ? "active" : "available",
+            selected: isSelected,
+          });
+        }
+        augmented.options.sort((a, b) => sortStrings(a.label, b.label));
+        setOptionButtons(selModel.options, "model", augmented);
+      } else {
+        setOptionButtons(selModel.options, "model", view.groups.model);
+      }
+
+      const modelCurated = curatedEntriesForModel(curatedEntries, view.state.model);
+      const hasCurated = modelCurated.length > 0;
+      const curatedSelected = state.curatedIndex != null && state.curatedIndex < modelCurated.length;
+
+      curatedPanel.hidden = !hasCurated;
+      if (hasCurated) {
+        renderCuratedCards(modelCurated, curatedSelected ? state.curatedIndex : null);
+      }
+
+      if (curatedSelected) {
+        form.classList.add("trtllm-config-selector__form--dimmed");
+      } else {
+        form.classList.remove("trtllm-config-selector__form--dimmed");
+      }
+
       setOptionButtons(selTopo.options, "topology", view.groups.topology);
       setOptionButtons(selSeq.options, "islOsl", view.groups.islOsl);
       setSelectOptions(selConc.select, view.groups.concurrency);
 
       const code = cmdPre.querySelector("code");
-      if (view.resolvedEntry) {
+      if (curatedSelected) {
+        const ce = modelCurated[state.curatedIndex];
+        const cmdText = formatCommand(ce);
+        code.innerHTML = highlightBash(cmdText);
+        code.dataset.raw = cmdText;
+        cmdCopyBtn.disabled = !cmdText;
+        meta.textContent = "";
+        const ceGpu = (ce.gpu_compatibility && ce.gpu_compatibility !== "Any") ? ce.gpu_compatibility : "";
+        const metaPrefix = ceGpu
+          ? `Scenario: ${ce.scenario || "N/A"} \u00b7 GPU: ${ceGpu} \u00b7 Config: `
+          : `Scenario: ${ce.scenario || "N/A"} \u00b7 Config: `;
+        meta.appendChild(el("span", { text: metaPrefix }));
+        const cfgHref = ce.config_github_url || ce.config_raw_url || "";
+        if (cfgHref) {
+          meta.appendChild(
+            el("a", {
+              class: "trtllm-config-selector__configLink",
+              href: cfgHref,
+              target: "_blank",
+              rel: "noopener",
+              text: ce.config_path || cfgHref,
+            })
+          );
+        } else {
+          meta.appendChild(el("span", { text: ce.config_path || "" }));
+        }
+
+        currentEntry = ce;
+        resetYamlPanel();
+        errorBox.textContent = "";
+        errorBox.hidden = true;
+      } else if (view.resolvedEntry) {
         const e = view.resolvedEntry;
-        code.textContent = view.commandText;
-        cmdCopyBtn.disabled = !code.textContent;
+        code.innerHTML = highlightBash(view.commandText);
+        code.dataset.raw = view.commandText;
+        cmdCopyBtn.disabled = !view.commandText;
         meta.textContent = "";
         meta.appendChild(el("span", { text: `Profile: ${e.performance_profile || "N/A"} \u00b7 Config: ` }));
         const cfgHref = e.config_github_url || e.config_raw_url || "";
@@ -927,12 +1103,16 @@
 
         currentEntry = e;
         resetYamlPanel();
+        errorBox.textContent = view.message;
+        errorBox.hidden = !view.message;
       } else {
         code.textContent = "";
         cmdCopyBtn.disabled = true;
         meta.textContent = "";
         currentEntry = null;
         resetYamlPanel();
+        errorBox.textContent = view.message;
+        errorBox.hidden = !view.message;
       }
 
       restoreFocusDescriptor(focusDescriptor);
@@ -945,7 +1125,7 @@
 
     cmdCopyBtn.addEventListener("click", async () => {
       const code = $(cmdPre, "code");
-      const txt = (code && code.textContent) || "";
+      const txt = (code && (code.dataset.raw || code.textContent)) || "";
       if (!txt) return;
       try {
         await copyText(txt);
@@ -991,8 +1171,10 @@
       buildCompatibilityGroups,
       buildDomains,
       createSelectorViewModel,
+      curatedEntriesForModel,
       filterEntriesByState,
       formatCommand,
+      formatCuratedCommand: formatCommand,
       nextStateAfterSelection,
       normalizeState,
     };

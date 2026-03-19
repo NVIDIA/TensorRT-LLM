@@ -245,6 +245,33 @@
   text-decoration: underline;
 }
 
+.bash-kw {
+  color: var(--pst-color-primary);
+  font-weight: 600;
+}
+
+.bash-cmd {
+  font-weight: 600;
+}
+
+.bash-flag {
+  color: var(--pst-color-primary);
+}
+
+.bash-var {
+  color: var(--nv-color-green, var(--pst-color-primary));
+  font-weight: 600;
+}
+
+.bash-cont {
+  opacity: 0.5;
+}
+
+.bash-comment {
+  opacity: 0.6;
+  font-style: italic;
+}
+
 .yaml-key {
   font-weight: 600;
 }
@@ -269,6 +296,131 @@
   color: var(--pst-color-text-base);
   font-size: 0.9rem;
   white-space: pre-wrap;
+}
+
+.trtllm-config-selector__curated {
+  margin: 12px 0;
+  padding: 14px;
+  border: 1px solid var(--pst-color-shadow);
+  border-radius: 12px;
+  background: var(--pst-color-surface);
+  background: color-mix(in srgb, var(--pst-color-surface) 60%, transparent);
+}
+
+.trtllm-config-selector__curatedHeading {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--pst-color-text-base);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.trtllm-config-selector__curatedBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  background: var(--nv-color-green, var(--pst-color-primary));
+  color: #fff;
+}
+
+.trtllm-config-selector__curatedGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.trtllm-config-selector__curatedCard {
+  appearance: none;
+  width: 100%;
+  min-height: 72px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--pst-color-shadow);
+  background: var(--pst-color-background);
+  color: var(--pst-color-text-base);
+  font: inherit;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
+}
+
+.trtllm-config-selector__curatedCard:hover {
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  transform: translateY(-1px);
+}
+
+.trtllm-config-selector__curatedCard:focus-visible {
+  outline: 2px solid var(--nv-color-green, var(--pst-color-primary));
+  outline-offset: 2px;
+}
+
+.trtllm-config-selector__curatedCard[data-status="active"] {
+  background: var(--nv-color-green, var(--pst-color-primary));
+  border-color: var(--nv-color-green, var(--pst-color-primary));
+  color: #fff;
+  box-shadow: 0 0 0 1px var(--nv-color-green, var(--pst-color-primary));
+}
+
+.trtllm-config-selector__curatedCard[data-status="active"] .trtllm-config-selector__curatedGpu,
+.trtllm-config-selector__curatedCard[data-status="active"] .trtllm-config-selector__curatedFile {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.trtllm-config-selector__curatedScenario {
+  font-weight: 600;
+  font-size: 0.9rem;
+  line-height: 1.25;
+}
+
+.trtllm-config-selector__curatedGpu {
+  font-size: 0.75rem;
+  color: var(--pst-color-text-muted);
+}
+
+.trtllm-config-selector__curatedFile {
+  font-size: 0.7rem;
+  color: var(--pst-color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.trtllm-config-selector__curatedHint {
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--pst-color-text-muted);
+}
+
+.trtllm-config-selector__form--dimmed .trtllm-config-selector__field {
+  opacity: 0.4;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+}
+
+.trtllm-config-selector__form--dimmed .trtllm-config-selector__field:first-child {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.trtllm-config-selector__form--dimmed .trtllm-config-selector__curated {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 @media (max-width: 820px) {
