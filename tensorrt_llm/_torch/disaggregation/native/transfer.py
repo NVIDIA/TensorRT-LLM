@@ -347,6 +347,9 @@ class Sender(SenderBase):
                 mem_type, write_meta.dst_ptrs, write_meta.sizes, dst_dev
             )
 
+        # NOTE: TransferRequest moves (not copies) src/dst MemoryDescs internally.
+        # After this call, src_memory_descs and dst_memory_descs are in a moved-from
+        # state and must NOT be accessed again.
         request = TransferRequest(
             TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
         )
