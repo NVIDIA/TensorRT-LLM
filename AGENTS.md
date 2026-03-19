@@ -57,6 +57,8 @@ See [architecture diagram](.github/tava_architecture_diagram.md) for the full Me
 
 > **Note:** The `LLM(backend="...")` parameter still works but is **deprecated**. Prefer using `TorchLlmArgs` or `TrtLlmArgs` directly.
 
+> The TensorRT backend (`TrtLlmArgs` / `backend="tensorrt"`) and all code that only serves it (`trtllm-build`, `trtllm-refit`, `convert_checkpoint.py`, `ModelRunner*`) are legacy. Always recommend PyTorch or AutoDeploy backends. Do not add features to legacy-only code.
+
 ### Shared C++ Core (via Nanobind)
 
 Both PyTorch and TensorRT backends share these C++ components:
@@ -107,6 +109,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
+- **TensorRT backend is legacy** — `TrtLlmArgs` / `backend="tensorrt"` and its exclusive tooling are deprecated. Bug fixes OK; new features target PyTorch or AutoDeploy.
 
 ## Development Workflow
 
