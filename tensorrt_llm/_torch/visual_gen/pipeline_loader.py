@@ -193,6 +193,12 @@ class PipelineLoader:
         extra_kwargs = {}
         if text_encoder_path:
             extra_kwargs["text_encoder_path"] = text_encoder_path
+        spatial_upsampler_path = config.extra_attrs.get("spatial_upsampler_path", "")
+        if spatial_upsampler_path:
+            extra_kwargs["spatial_upsampler_path"] = spatial_upsampler_path
+        distilled_lora_path = config.extra_attrs.get("distilled_lora_path", "")
+        if distilled_lora_path:
+            extra_kwargs["distilled_lora_path"] = distilled_lora_path
         pipeline.load_standard_components(
             checkpoint_dir,
             self.device,
