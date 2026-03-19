@@ -1648,6 +1648,10 @@ class NVFP4LinearMethod(LinearMethodBase):
             copy_weight(module.input_scale, input_scale)
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
+        else:
+            # Dynamic activation quantization: input_scale not provided.
+            # Explicitly set to None so _input_prepare uses dynamic mode.
+            module.input_scale = None
         if weight_scale_2_raw is not None:
             copy_weight(module.weight_scale_2, weight_scale_2_raw.float())
 
@@ -1788,6 +1792,10 @@ class NVFP4LinearMethod(LinearMethodBase):
             copy_weight(module.input_scale, input_scale)
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
+        else:
+            # Dynamic activation quantization: input_scale not provided.
+            # Explicitly set to None so _input_prepare uses dynamic mode.
+            module.input_scale = None
         if weight_scale_2_raw is not None:
             copy_weight(module.weight_scale_2, weight_scale_2_raw.float())
 
