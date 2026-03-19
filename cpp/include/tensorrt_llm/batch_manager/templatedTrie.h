@@ -165,9 +165,9 @@ public:
     {
     }
 
-    //! \brief Print subtree in Unix `tree` style (├──, └──, │). NodeKey must support operator<<(std::ostream&, NodeKey).
-    void printTree(int depth = 0, std::string const& prefix = "",
-        std::optional<bool> isLast = std::nullopt) const
+    //! \brief Print subtree in Unix `tree` style (├──, └──, │). NodeKey must support operator<<(std::ostream&,
+    //! NodeKey).
+    void printTree(int depth = 0, std::string const& prefix = "", std::optional<bool> isLast = std::nullopt) const
     {
         (void) depth;
         bool const isRoot = mPrevNode.expired();

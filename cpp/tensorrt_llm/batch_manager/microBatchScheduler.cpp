@@ -150,7 +150,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 {
     if (maxContextLength && maxContextLength.value() < chunkUnitSize)
     {
-        TLLM_THROW("The forced chunk size (%d) exceeds the max context length (%d)", chunkUnitSize, maxContextLength.value());
+        TLLM_THROW(
+            "The forced chunk size (%d) exceeds the max context length (%d)", chunkUnitSize, maxContextLength.value());
     }
     SizeType32 totalTokens{0};
     for (auto& llmReq : contextsToBeChunked)

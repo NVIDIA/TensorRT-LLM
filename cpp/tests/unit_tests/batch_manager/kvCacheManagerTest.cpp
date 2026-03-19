@@ -335,13 +335,14 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
         .saveLastSnapshot = true,
     };
 
-    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool*2, blocksInSecondaryPool}},
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool * 2, blocksInSecondaryPool}},
         {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
-        maxNumSequences, stream, maxAttentionWindow, beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow},
-        std::nullopt, nvinfer1::DataType::kHALF, 0, onboardBlocks, CacheType::kSELF, std::nullopt, nullptr, false, true,
-        nullptr, std::nullopt, false, 128, 0, linearAttentionMetadata);
+        maxNumSequences, stream, maxAttentionWindow, beamWidth,
+        std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, std::nullopt,
+        nvinfer1::DataType::kHALF, 0, onboardBlocks, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr,
+        std::nullopt, false, 128, 0, linearAttentionMetadata);
     blockManager.allocatePools(false);
 
     auto inputTokens0 = std::make_shared<VecTokens>();
@@ -357,8 +358,8 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     GenerationRequest seq0{requestId, numTokens0, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.addSequence(
         seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, linearWindowSizeCode);
-        blockManager.addSequence(
-            seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, maxAttentionWindow);
+    blockManager.addSequence(
+        seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, maxAttentionWindow);
     blockManager.holdSequence(seq0.getRequestId());
     ASSERT_EQ(llmRequest0->getContextCurrentPosition(), 0);
     int regularSnapshots = numTokens0 / linearAttentionMetadata.statesSnapshotInterval;
@@ -374,7 +375,8 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     auto totalBlocks = tc::ceilDiv(numTokens0, tokensPerBlock) + contextFinalState - 1;
     auto placeholderBlocks = totalBlocks - occupiedBlocksLinear;
     TLLM_LOG_DEBUG("==========================================================");
-    ASSERT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], occupiedBlocksLinear);
+    ASSERT_EQ(
+        blocksInPrimaryPool - blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], occupiedBlocksLinear);
 
     auto ids0 = seq0.getCacheBlockIds(linearWindowSizeCode); // copy
     std::set<std::int32_t> idSetPositive{};
@@ -410,7 +412,8 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     {
         inputTokensNoise->push_back(10000 + i);
     }
-    auto llmRequestNoise = std::make_shared<LlmRequest>(9999, numTokens1, inputTokensNoise, samplingConfig, isStreaming);
+    auto llmRequestNoise
+        = std::make_shared<LlmRequest>(9999, numTokens1, inputTokensNoise, samplingConfig, isStreaming);
     GenerationRequest seqNoise{9999, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.addSequence(
         seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, linearWindowSizeCode);
@@ -438,7 +441,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
         seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, linearWindowSizeCode);
     blockManager.addSequence(
         seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, maxAttentionWindow);
-    
+
     blockManager.holdSequence(seq1.getRequestId());
 
     blockManager.storeContextBlocks(seq1, *llmRequest1);

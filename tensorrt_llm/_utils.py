@@ -94,9 +94,10 @@ class TensorDumpState:
         )
         torch.save(
             tensor.clone(),
-            os.path.join(directory, f"rank{rank}_layer{layer}_{self.index:02d}_{name}.pt"),
+            os.path.join(directory,
+                         f"rank{rank}_layer{layer}_{self.index:02d}_{name}.pt"),
         )
-    
+
     def set_prefix(self, prefix):
         self.prefix = prefix
         if prefix != "":
@@ -111,18 +112,22 @@ class TensorDumpState:
     def enable(self):
         # self.log(f"Enabling tensor dump")
         self.enabled = True
+
     def disable(self):
         # self.log(f"Disabling tensor dump")
         self.enabled = False
+
     def reset_iter(self, iter_count=0):
         # self.log(f"Resetting tensor dump iter to {iter_count}")
         self.iter_count = iter_count
+
     def inc_iter(self):
         # self.log(f"Incrementing tensor dump iter to {self.iter_count + 1}")
         self.iter_count += 1
 
     def __call__(self, tensor, layer, name):
         self.dump(tensor, layer, name)
+
 
 dump = TensorDumpState()
 

@@ -139,13 +139,14 @@ class LmEvalWrapper(TemplateLM):
             prompt, gen_kwargs = request.args
             sampling_params = self._get_sampling_params(gen_kwargs)
             if submit_twice:
-                output = self.llm.generate_async(prompt,
-                                                sampling_params=sampling_params,
-                                                streaming=self.streaming)
+                output = self.llm.generate_async(
+                    prompt,
+                    sampling_params=sampling_params,
+                    streaming=self.streaming)
                 throwaway_outputs.append(output)
             output2 = self.llm.generate_async(prompt,
-                                             sampling_params=sampling_params,
-                                             streaming=self.streaming)
+                                              sampling_params=sampling_params,
+                                              streaming=self.streaming)
             # results.append(output)
             results.append(output2)
 
@@ -502,12 +503,12 @@ class LmEvalEvaluator(Evaluator):
 
         # Normalize scores to range 0~100
         scores = results["results"][self.task_name]
-        log_samples = results["samples"][self.task_name]
-        for idx, sample in enumerate(log_samples):
-            str = f"sample {idx}: "
-            for metric in sample["metrics"]:
-                str += f"{metric}: {sample[metric]} "
-            print(str)
+        # log_samples = results["samples"][self.task_name]
+        # for idx, sample in enumerate(log_samples):
+        #     str = f"sample {idx}: "
+        #     for metric in sample["metrics"]:
+        #         str += f"{metric}: {sample[metric]} "
+        #     print(str)
 
         for metric in scores.keys():
             if isinstance(scores[metric], (float, int)):

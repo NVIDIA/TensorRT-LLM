@@ -14,7 +14,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.pyexecutor.llm_request import LlmResponse
-from .._utils import (dump, global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
+from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig

@@ -36,7 +36,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear, is_mla, is_nemotron_hybrid, is_qwen3_next
+from .config_utils import is_hybrid_linear, is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
@@ -577,7 +577,8 @@ def create_py_executor(
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
         print(f"use FORCE_CHUNK for hybrid linear model")
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, kv_cache_config.mamba_prefix_cache_step)
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
+                            kv_cache_config.mamba_prefix_cache_step)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:

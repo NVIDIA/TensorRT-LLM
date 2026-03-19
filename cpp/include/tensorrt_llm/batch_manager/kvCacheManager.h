@@ -1050,8 +1050,8 @@ public:
     //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,OptionalRef<LlmRequest const> llmRequest,
-        bool pinBlocks = false);
+        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+        OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity();
 
@@ -1167,7 +1167,6 @@ private:
         return mLinearAttentionMetadata.has_value()
             && LinearAttentionMetadata::hasRecurrentStatesCache(mLinearAttentionMetadata->cacheType);
     }
-
 
 private:
     nvinfer1::DataType mDataType;
@@ -1815,7 +1814,8 @@ public:
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
 
-    /// @brief Get the number of tokens for a request at KVCacheManager's sight. Sometimes it is different from LlmRequest::getNumTokens.
+    /// @brief Get the number of tokens for a request at KVCacheManager's sight. Sometimes it is different from
+    /// LlmRequest::getNumTokens.
     [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;
 
     /// @brief Add new request to the KV cache manager.
@@ -1935,7 +1935,9 @@ public:
         }
         TLLM_LOG_DEBUG("[calculateCacheSizePerTokenForSingleWindowSize] nkvh: %s", ss.str().c_str());
         auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
-        TLLM_LOG_DEBUG("[calculateCacheSizePerTokenForSingleWindowSize] sumLocalHeads: %d, kvFactor: %d, sizePerHead: %d", sumLocalHeads, kvFactor, modelConfig.getSizePerHead());
+        TLLM_LOG_DEBUG(
+            "[calculateCacheSizePerTokenForSingleWindowSize] sumLocalHeads: %d, kvFactor: %d, sizePerHead: %d",
+            sumLocalHeads, kvFactor, modelConfig.getSizePerHead());
         // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
         // address it here
         // consider only local layers for the calculation

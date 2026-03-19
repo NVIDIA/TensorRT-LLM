@@ -302,8 +302,8 @@ public:
                 }
                 if (block->hasRefs())
                 {
-                    TLLM_LOG_WARNING("Found placeholder block (id %d) with references in placeholder policy",
-                        block->getBlockId());
+                    TLLM_LOG_WARNING(
+                        "Found placeholder block (id %d) with references in placeholder policy", block->getBlockId());
                     queueCompromised = true;
                 }
             }
@@ -322,8 +322,8 @@ void MaybePlaceholderLRUEvictionPolicy::initializePlaceholders(std::vector<Block
 
     // Extract the actual placeholder blocks from allPlaceholderBlocksById[2..numPlaceholderBlocks+1]
     // so the inner policy's mFreeBlockIterators[i] corresponds to blockId = -(i+2).
-    std::vector<BlockPtr> placeholderBlocks(allPlaceholderBlocksById.begin() + 2,
-        allPlaceholderBlocksById.begin() + numPlaceholderBlocks + 2);
+    std::vector<BlockPtr> placeholderBlocks(
+        allPlaceholderBlocksById.begin() + 2, allPlaceholderBlocksById.begin() + numPlaceholderBlocks + 2);
 
     mPlaceholderEvictionPolicy->initialize(placeholderBlocks, {numPlaceholderBlocks, 0}, secondaryOffloadMinPriority);
 }

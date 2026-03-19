@@ -203,7 +203,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        _layer = self.layer_idx if self.layer_idx is not None else 0
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
@@ -250,7 +249,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
         if not do_finalize:
             return routed_output[0]
-        
+
         router_logits, routed_output = routed_output
 
         final_hidden_states = routed_output + shared_expert_output
@@ -645,9 +644,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             softplus_threshold=20.0,
             layer_idx=self.layer_idx,
         )
-        # print(f"Layer {self.layer_idx} core_attn_out: {hex(core_attn_out.data_ptr())} \n{core_attn_out[0:3, 0:5]}")
-
-
 
         return core_attn_out
 
@@ -672,7 +668,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_prefill = kwargs["num_prefill"]
 
         conv_states_to_use = conv_states
-        
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         if num_decode_tokens > 0:
@@ -796,12 +791,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if num_prefills > 0:
             # only select state_indices_p where has_initial_states is False
             has_initial_states_p = has_initial_states[:num_prefills]
-            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros((),
-                                                      dtype=ssm_states.dtype,
-                                                      device=ssm_states.device)
-            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros((),
-                                                      dtype=conv_states.dtype,
-                                                      device=conv_states.device)
+            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
+                (), dtype=ssm_states.dtype, device=ssm_states.device)
+            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
+                (), dtype=conv_states.dtype, device=conv_states.device)
 
         def _compute_projected_states_qkvz():
             return self.in_proj_qkvz(hidden_states)

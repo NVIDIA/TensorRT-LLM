@@ -590,7 +590,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         # 2. Verify Chunking Fits
         if max_num_tokens is not None and num_chunked_tokens > (max_num_tokens - batch_num_tokens):
             all_context_requests_fit = False
-        
+
         need_chunking = not all_context_requests_fit and contexts_to_be_chunked
         if ctx_chunk_config and ctx_chunk_config[0] == ChunkingPolicy.FORCE_CHUNK:
             need_chunking = True
@@ -752,7 +752,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 req.context_chunk_size = 0
             total_tokens += req.context_chunk_size
         if total_tokens > capacity:
-            logger.warning(f"Total tokens {total_tokens} exceeds capacity {capacity} but FORCE_CHUNK is used")
+            logger.warning(
+                f"Total tokens {total_tokens} exceeds capacity {capacity} but FORCE_CHUNK is used"
+            )
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         # Calculate tokens already taken by the batch so far

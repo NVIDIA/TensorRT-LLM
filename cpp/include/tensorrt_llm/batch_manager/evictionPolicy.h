@@ -123,7 +123,8 @@ public:
     /// @brief Initialize the placeholder eviction policy with pre-allocated placeholder blocks.
     /// @param allPlaceholderBlocksById Vector of placeholder blocks indexed by abs(blockId).
     ///        Indices 0 and 1 are unused (nullptr); index abs(blockId) holds the block with that ID.
-    /// @param numPlaceholderBlocks Number of placeholder blocks (determines valid index range [2, numPlaceholderBlocks+1]).
+    /// @param numPlaceholderBlocks Number of placeholder blocks (determines valid index range [2,
+    /// numPlaceholderBlocks+1]).
     /// @param secondaryOffloadMinPriority Secondary offload priority threshold (passed to inner policy).
     void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById, SizeType32 numPlaceholderBlocks,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority);

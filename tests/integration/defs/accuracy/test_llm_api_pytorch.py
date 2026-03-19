@@ -5678,7 +5678,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                        overlap_scheduler, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        mamba_prefix_cache_step = 256,
+                                        mamba_prefix_cache_step=256,
                                         enable_block_reuse=True)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -5729,9 +5729,10 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
 
         enable_block_reuse = os.environ.get("DBG_BLOCK_REUSE", "1") == "1"
-        mem_fraction = float(os.environ.get("DBG_FREE_GPU_MEMORY_FRACTION", "0.8"))
+        mem_fraction = float(
+            os.environ.get("DBG_FREE_GPU_MEMORY_FRACTION", "0.8"))
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=mem_fraction,
-                                        mamba_prefix_cache_step = 256,
+                                        mamba_prefix_cache_step=256,
                                         enable_block_reuse=enable_block_reuse)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               max_batch_size=2048,
@@ -6274,7 +6275,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         ],
         ids=["TP4", "TEP4", "TP4_ADP"],
     )
-    def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size, mamba_prefix_cache_step, attention_dp):
+    def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
+                                     mamba_prefix_cache_step, attention_dp):
         with LLM(
                 f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
                 kv_cache_config=KvCacheConfig(

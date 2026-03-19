@@ -12,8 +12,7 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
-                                                         load_pretrained_config)
+from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -675,6 +674,7 @@ class ModelConfig(Generic[TConfig]):
 
         num_key_value_heads = getattr(self.pretrained_config,
                                       "num_key_value_heads", num_heads)
+
         def ceil_div(a, b):
             return (a + b - 1) // b
 
@@ -686,7 +686,8 @@ class ModelConfig(Generic[TConfig]):
             ]
             model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
         else:
-            num_kv_heads = ceil_div(num_key_value_heads, attn_tp_size * attn_cp_size)
+            num_kv_heads = ceil_div(num_key_value_heads,
+                                    attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
@@ -784,4 +785,4 @@ class ModelConfig(Generic[TConfig]):
         #     # we need to calculate the number of fullattention layers
         #     return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
         # else:
-            return self.pretrained_config.num_hidden_layers
+        return self.pretrained_config.num_hidden_layers

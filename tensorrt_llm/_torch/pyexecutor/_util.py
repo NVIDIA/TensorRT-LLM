@@ -28,7 +28,8 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import is_hybrid_linear, is_mla, is_nemotron_hybrid, is_qwen3_next
+from .config_utils import (is_hybrid_linear, is_mla, is_nemotron_hybrid,
+                           is_qwen3_next)
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -539,7 +540,9 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        print(f"creating kv cache manager with actual type = {self._kv_cache_manager_cls.__name__}")
+        print(
+            f"creating kv cache manager with actual type = {self._kv_cache_manager_cls.__name__}"
+        )
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=self._kv_cache_manager_cls,
@@ -920,8 +923,8 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
-            model_config=model_engine.model.model_config.get_bindings_model_config(
-                tokens_per_block=tokens_per_block),
+            model_config=model_engine.model.model_config.
+            get_bindings_model_config(tokens_per_block=tokens_per_block),
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1008,8 +1011,8 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_config=model_engine.model.model_config.get_bindings_model_config(
-                tokens_per_block=tokens_per_block),
+            model_config=model_engine.model.model_config.
+            get_bindings_model_config(tokens_per_block=tokens_per_block),
         )
     elif is_qwen3_next(config):
         if max_beam_width > 1:
@@ -1060,8 +1063,8 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_config=model_engine.model.model_config.get_bindings_model_config(
-                tokens_per_block=tokens_per_block),
+            model_config=model_engine.model.model_config.
+            get_bindings_model_config(tokens_per_block=tokens_per_block),
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager

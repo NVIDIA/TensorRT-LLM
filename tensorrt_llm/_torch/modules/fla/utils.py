@@ -170,13 +170,18 @@ contiguous = input_guard
 
 
 def input_guard_exclude(exclude_args: list[str]):
-    def decorator(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+
+    def decorator(
+            fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            contiguous_args = (i if (not isinstance(i, torch.Tensor) or i in exclude_args) else
-                            i.contiguous() for i in args)
+            contiguous_args = (i if (not isinstance(i, torch.Tensor)
+                                     or i in exclude_args) else i.contiguous()
+                               for i in args)
             contiguous_kwargs = {
-                k: (v if (not isinstance(v, torch.Tensor) or k in exclude_args) else v.contiguous())
+                k: (v if (not isinstance(v, torch.Tensor) or k in exclude_args)
+                    else v.contiguous())
                 for k, v in kwargs.items()
             }
 
@@ -200,7 +205,9 @@ def input_guard_exclude(exclude_args: list[str]):
                 return fn(*contiguous_args, **contiguous_kwargs)
 
         return wrapper
+
     return decorator
+
 
 def require_version(version, hint):
     """

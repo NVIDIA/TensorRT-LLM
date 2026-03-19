@@ -518,7 +518,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         //          TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
         //          for (size_t i = 0; i < requestIds.size(); ++i)
         //          {
-        //              self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i], LinearAttentionMetadata::kRecurrentStates);
+        //              self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i],
+        //              LinearAttentionMetadata::kRecurrentStates);
         //          }
         //      },
         //      nb::call_guard<nb::gil_scoped_release>())
@@ -587,8 +588,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
-            nb::arg("indexer_k_cache_index_head_dim") = 0,
-            nb::arg("linear_attention_metadata").none() = std::nullopt,
+            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("linear_attention_metadata").none() = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "scheduling_has_free_blocks",

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import atexit
 import os
 from dataclasses import dataclass
 from functools import reduce
@@ -33,7 +32,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, ModelConfigCpp,
     get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, prefer_pinned, torch_dtype_to_binding, mpi_rank
+from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheConnectorManager, LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -730,7 +730,10 @@ class MambaHybridCacheManagerV1(KVCacheManager, MambaCacheManager):
                                               num_accepted_tokens)
 
 
-def calc_context_stop_positions(prompt_len: int, tokens_per_block: int, mamba_prefix_cache_step: int, save_last_snapshot: bool = False) -> list[int]:
+def calc_context_stop_positions(prompt_len: int,
+                                tokens_per_block: int,
+                                mamba_prefix_cache_step: int,
+                                save_last_snapshot: bool = False) -> list[int]:
     stop_positions = range(0, prompt_len, mamba_prefix_cache_step)
     stop_positions = list(stop_positions)
     last_ckpt = prompt_len // tokens_per_block * tokens_per_block
@@ -740,7 +743,6 @@ def calc_context_stop_positions(prompt_len: int, tokens_per_block: int, mamba_pr
         stop_positions.append(prompt_len)
     return stop_positions
 
-    
 
 class LinearHybridCacheManager(KVCacheManager):
 
@@ -804,12 +806,15 @@ class LinearHybridCacheManager(KVCacheManager):
 
         self.use_fake_pool = os.getenv("USE_FAKE_POOL", "0") == "1"
 
-        print(f"conv_state_shape: {self.conv_state_shape}, ssm_state_shape: {self.ssm_state_shape}, conv_bytes: {self.conv_bytes}, ssm_bytes: {self.ssm_bytes}")
+        print(
+            f"conv_state_shape: {self.conv_state_shape}, ssm_state_shape: {self.ssm_state_shape}, conv_bytes: {self.conv_bytes}, ssm_bytes: {self.ssm_bytes}"
+        )
         self.linear_attention_metadata = LinearAttentionMetadata()
         # TODO(xiweny): confirm if this is needed
         # self.linear_attention_metadata.linear_layer_indices = [0, 1]
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
-        self.linear_attention_metadata.all_recurrent_states_bytes = 1 if self.use_fake_pool else (self.ssm_bytes + self.conv_bytes)
+        self.linear_attention_metadata.all_recurrent_states_bytes = 1 if self.use_fake_pool else (
+            self.ssm_bytes + self.conv_bytes)
         self.linear_attention_metadata.input_features_bytes_per_token = 0
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_prefix_cache_step
         # self.linear_attention_metadata.save_last_snapshot = True
@@ -820,13 +825,18 @@ class LinearHybridCacheManager(KVCacheManager):
             )
             kv_cache_config.enable_partial_reuse = False
         kv_cache_config.max_attention_window = []
-        layer_mask = [mamba_layer_mask[i] or layer_mask[i] for i, _ in enumerate(mamba_layer_mask)]
+        layer_mask = [
+            mamba_layer_mask[i] or layer_mask[i]
+            for i, _ in enumerate(mamba_layer_mask)
+        ]
         for i in range(len(layer_mask)):
             if layer_mask[i]:
                 kv_cache_config.max_attention_window.append(
                     LinearCacheType.RECURRENT_STATES.
                     value if mamba_layer_mask[i] else max_seq_len)
-        print(f"kv_cache_config.max_attention_window: {kv_cache_config.max_attention_window}")
+        print(
+            f"kv_cache_config.max_attention_window: {kv_cache_config.max_attention_window}"
+        )
         # pass remaining arguments to super class
         super().__init__(
             kv_cache_config,
@@ -874,7 +884,8 @@ class LinearHybridCacheManager(KVCacheManager):
         self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.linear_pp_layers[0]][0]
-        print(f"recurrent_states_pool_index: {self.recurrent_states_pool_index}")
+        print(
+            f"recurrent_states_pool_index: {self.recurrent_states_pool_index}")
         print(f"kv_cache_pool_mapping: {self.kv_cache_pool_mapping}")
         print(f"layer_offsets: {self.layer_offsets}")
         # for layer_id in self.linear_pp_layers:
@@ -885,14 +896,23 @@ class LinearHybridCacheManager(KVCacheManager):
                                                device="cuda")
         self.kv_cache_config = kv_cache_config
         if self.use_fake_pool:
-            self.fake_state_indices = torch.arange(self.max_batch_size, dtype=torch.int32, device="cuda")
+            self.fake_state_indices = torch.arange(self.max_batch_size,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
             block_num = 128
-            self.fake_ssm_states = torch.empty([self.num_linear_layers, block_num, *self.ssm_state_shape], dtype=self.ssm_state_dtype, device="cuda")
-            self.fake_conv_states = torch.empty([self.num_linear_layers, block_num, *self.conv_state_shape], dtype=self.conv_state_dtype, device="cuda")
+            self.fake_ssm_states = torch.empty(
+                [self.num_linear_layers, block_num, *self.ssm_state_shape],
+                dtype=self.ssm_state_dtype,
+                device="cuda")
+            self.fake_conv_states = torch.empty(
+                [self.num_linear_layers, block_num, *self.conv_state_shape],
+                dtype=self.conv_state_dtype,
+                device="cuda")
 
         # Pool layout is layer-first: {numLayers, numBlocks, 1, blockSize}
-        self.pool = self.impl.get_recurrent_states_pool().view(torch.uint8).reshape(
-            self.num_linear_layers, -1, self.ssm_bytes + self.conv_bytes)
+        self.pool = self.impl.get_recurrent_states_pool().view(
+            torch.uint8).reshape(self.num_linear_layers, -1,
+                                 self.ssm_bytes + self.conv_bytes)
         print(f"shape of self.pool: {self.pool.shape}")
         torch.fill_(self.pool, 0)
         self.ssm_states_mapping = {}
@@ -903,8 +923,12 @@ class LinearHybridCacheManager(KVCacheManager):
             self.ssm_states_mapping[layer_id] = ssm_states
             self.conv_states_mapping[layer_id] = conv_states
         pool_ref = self.impl.get_recurrent_states_pool()
-        print(f"address range of linear pool: {hex(self.pool.data_ptr())} to {hex(self.pool.data_ptr() + self.pool.numel() * self.pool.itemsize)}")
-        print(f"address range of linear pool: {hex(pool_ref.data_ptr())} to {hex(pool_ref.data_ptr() + pool_ref.numel() * pool_ref.itemsize)}")
+        print(
+            f"address range of linear pool: {hex(self.pool.data_ptr())} to {hex(self.pool.data_ptr() + self.pool.numel() * self.pool.itemsize)}"
+        )
+        print(
+            f"address range of linear pool: {hex(pool_ref.data_ptr())} to {hex(pool_ref.data_ptr() + pool_ref.numel() * pool_ref.itemsize)}"
+        )
 
         self._request_block_ids = {}
         self.iter = 0
@@ -955,17 +979,18 @@ class LinearHybridCacheManager(KVCacheManager):
         return requests
 
     def update_resources(self,
-                    scheduled_batch: ScheduledRequests,
-                    attn_metadata: "AttentionMetadata" = None,
-                    kv_cache_dtype_byte_size: float = None):
+                         scheduled_batch: ScheduledRequests,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
         # print(f"iter {self.iter}: update_resources with {len(scheduled_batch.context_requests)} context requests and {len(scheduled_batch.generation_requests)} generation requests")
-        super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+        super().update_resources(scheduled_batch, attn_metadata,
+                                 kv_cache_dtype_byte_size)
 
     @nvtx_range("hybrid_prepare_resources")
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
         # print(
         #     f"iter {self.iter}: prepare_resources with {len(scheduled_batch.context_requests)} context requests and {len(scheduled_batch.generation_requests)} generation requests")
-        self.iter+=1
+        self.iter += 1
         self.requests = scheduled_batch.context_requests + \
             scheduled_batch.generation_requests
         for req in self.requests:
@@ -993,9 +1018,11 @@ class LinearHybridCacheManager(KVCacheManager):
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         return self.conv_states_mapping[layer_idx]
 
-    def mamba_layer_cache(self,
-                          layer_idx: int) -> Union[PythonMambaCacheManager.State, None]:
-        ret = PythonMambaCacheManager.State(conv=self.conv_states_mapping[layer_idx], temporal=self.ssm_states_mapping[layer_idx])
+    def mamba_layer_cache(
+            self, layer_idx: int) -> Union[PythonMambaCacheManager.State, None]:
+        ret = PythonMambaCacheManager.State(
+            conv=self.conv_states_mapping[layer_idx],
+            temporal=self.ssm_states_mapping[layer_idx])
         return ret
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
@@ -1012,7 +1039,8 @@ class LinearHybridCacheManager(KVCacheManager):
             if req.is_context_finished:
                 next_step = self.get_num_tokens(req) - 1
             elif self.kv_cache_config.enable_block_reuse:
-                next_step = (req.context_current_position - 1 + req.context_chunk_size)
+                next_step = (req.context_current_position - 1 +
+                             req.context_chunk_size)
             else:
                 next_step = req.prompt_len - 1
             block_indices.append(next_step // self.tokens_per_block)
@@ -1065,9 +1093,9 @@ class LinearHybridCacheManager(KVCacheManager):
             assert current == 0, f"Expected context_current_position to be 0 when block reuse is disabled, but got {current}"
             return prompt_len - current
         step = self.linear_attention_metadata.states_snapshot_interval
-        stop_positions = calc_context_stop_positions(
-            prompt_len, self.tokens_per_block, step
-        )
+        stop_positions = calc_context_stop_positions(prompt_len,
+                                                     self.tokens_per_block,
+                                                     step)
         stop_positions = sorted(set(stop_positions))
         for pos in stop_positions:
             if pos > current:
@@ -1079,17 +1107,17 @@ class LinearHybridCacheManager(KVCacheManager):
         if self.use_fake_pool:
             return self.fake_ssm_states[self.linear_layer_offsets[layer_idx]]
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
-        pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(torch.uint8).reshape(
-            self.num_linear_layers, -1, self.ssm_bytes + self.conv_bytes)
+        pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
+            torch.uint8).reshape(self.num_linear_layers, -1,
+                                 self.ssm_bytes + self.conv_bytes)
         layer_idx = self.linear_layer_offsets[layer_idx]
         # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
         layer_pool = pool[layer_idx]
         flat = layer_pool.view(self.ssm_state_dtype)
         assert flat.data_ptr() == layer_pool.data_ptr()
-        total_elems_per_block = (self.ssm_bytes + self.conv_bytes) // self.ssm_state_dtype.itemsize
-        target_shape = [
-            flat.shape[0], *self.ssm_state_shape
-        ]
+        total_elems_per_block = (
+            self.ssm_bytes + self.conv_bytes) // self.ssm_state_dtype.itemsize
+        target_shape = [flat.shape[0], *self.ssm_state_shape]
         target_strides = [
             total_elems_per_block,
             self.ssm_state_shape[1] * self.ssm_state_shape[2],
@@ -1106,26 +1134,24 @@ class LinearHybridCacheManager(KVCacheManager):
         if self.use_fake_pool:
             return self.fake_conv_states[self.linear_layer_offsets[layer_idx]]
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
-        pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(torch.uint8).reshape(
-            self.num_linear_layers, -1, self.ssm_bytes + self.conv_bytes)
+        pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
+            torch.uint8).reshape(self.num_linear_layers, -1,
+                                 self.ssm_bytes + self.conv_bytes)
         layer_idx = self.linear_layer_offsets[layer_idx]
         # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
         layer_pool = pool[layer_idx]
         flat = layer_pool.view(self.conv_state_dtype)
         assert flat.data_ptr() == layer_pool.data_ptr()
-        total_elems_per_block = (self.ssm_bytes + self.conv_bytes) // self.conv_state_dtype.itemsize
+        total_elems_per_block = (
+            self.ssm_bytes + self.conv_bytes) // self.conv_state_dtype.itemsize
         offset = self.ssm_bytes // self.conv_state_dtype.itemsize
-        target_shape = [
-            flat.shape[0], *self.conv_state_shape
-        ]
-        target_strides = [
-            total_elems_per_block, self.conv_state_shape[-1],
-            1
-        ]
+        target_shape = [flat.shape[0], *self.conv_state_shape]
+        target_strides = [total_elems_per_block, self.conv_state_shape[-1], 1]
         my_conv_states = torch.as_strided(flat,
                                           target_shape,
                                           target_strides,
-                                          storage_offset=offset + flat.storage_offset())
+                                          storage_offset=offset +
+                                          flat.storage_offset())
         return my_conv_states
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
@@ -1139,15 +1165,13 @@ class _MambaHybridCacheManagerMeta(type):
     def __instancecheck__(cls, instance):
         if cls is MambaHybridCacheManager:
             return isinstance(
-                instance,
-                (MambaHybridCacheManagerV1, LinearHybridCacheManager))
+                instance, (MambaHybridCacheManagerV1, LinearHybridCacheManager))
         return super().__instancecheck__(instance)
 
     def __subclasscheck__(cls, subclass):
         if cls is MambaHybridCacheManager:
             return issubclass(
-                subclass,
-                (MambaHybridCacheManagerV1, LinearHybridCacheManager))
+                subclass, (MambaHybridCacheManagerV1, LinearHybridCacheManager))
         return super().__subclasscheck__(subclass)
 
     def __getattr__(cls, name):
@@ -1188,23 +1212,27 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
         **kwargs,
     ):
         positional_args = (
-            mamba_d_state, mamba_d_conv, mamba_num_heads, mamba_n_groups,
-            mamba_head_dim, mamba_num_layers, mamba_layer_mask,
-            mamba_cache_dtype, mamba_ssm_cache_dtype, kv_cache_config,
+            mamba_d_state,
+            mamba_d_conv,
+            mamba_num_heads,
+            mamba_n_groups,
+            mamba_head_dim,
+            mamba_num_layers,
+            mamba_layer_mask,
+            mamba_cache_dtype,
+            mamba_ssm_cache_dtype,
+            kv_cache_config,
             kv_cache_type,
         )
 
         spec_config = kwargs.get('spec_config', None)
-        use_v1 = (use_cpp_mamba_cache_manager()
-                  or spec_config is not None)
+        use_v1 = (use_cpp_mamba_cache_manager() or spec_config is not None)
 
         if use_v1:
             logger.info(
-                "Using MambaHybridCacheManagerV1 for hybrid cache management"
-            )
+                "Using MambaHybridCacheManagerV1 for hybrid cache management")
             return MambaHybridCacheManagerV1(*positional_args, **kwargs)
         else:
             logger.info(
-                "Using LinearHybridCacheManager for hybrid cache management"
-            )
+                "Using LinearHybridCacheManager for hybrid cache management")
             return LinearHybridCacheManager(*positional_args, **kwargs)
