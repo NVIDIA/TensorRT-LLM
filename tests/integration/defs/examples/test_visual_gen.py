@@ -132,6 +132,7 @@ def _visual_gen_deps(llm_venv):
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "git+https://github.com/huggingface/diffusers.git"])
     # Install ffmpeg system package required by MediaStorage.save_video for MP4 encoding
+    check_call(["apt-get", "update", "-y"], shell=False)
     check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
