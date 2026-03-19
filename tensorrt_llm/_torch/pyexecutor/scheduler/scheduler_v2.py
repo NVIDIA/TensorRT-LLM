@@ -19,7 +19,7 @@ from typing import Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, LlmRequestState
+from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .scheduler import RequestList, RequestScheduler, SchedulerOutput
 
 
@@ -337,24 +337,20 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
+        draft_len = get_draft_token_length(req)
+        req_tokens = context_tokens + draft_len
 
-        if not budget.can_fit_tokens(context_tokens):
+        if not budget.can_fit_tokens(req_tokens):
             return ScheduleAction.STOP, 0, False
 
         assert self.max_context_length is None or context_tokens <= self.max_context_length, (
             f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
         )
 
-        if not self.kv_cache_manager.resize_context(req, context_tokens):
+        # V2 resizes KV cache directly in the scheduler (no separate
+        # prepareResources for main cache), so include draft tokens.
+        if not self.kv_cache_manager.resize_context(req, req_tokens):
             return ScheduleAction.SKIP, 0, False
-
-        req_tokens = context_tokens
-        if req.has_draft_tokens:
-            req.context_chunk_size = context_tokens
-            remaining = budget.remaining_tokens
-            budget_after = (remaining - context_tokens) if remaining is not None else None
-            self._fit_draft_tokens_single(req, budget_after)
-            req_tokens += req.num_draft_tokens
 
         return ScheduleAction.SCHEDULED, req_tokens, False
 
@@ -403,22 +399,18 @@ class KVCacheV2Scheduler(RequestScheduler):
             # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
-        # Resize to chunk size
-        if not self.kv_cache_manager.resize_context(req, chunk_size):
-            return ScheduleAction.SKIP, 0, False
-
         req.context_chunk_size = chunk_size
 
-        # Draft tokens for last chunk
-        if req.is_last_context_chunk and req.has_draft_tokens:
-            budget_after_chunk = (
-                (remaining_budget - chunk_size) if remaining_budget is not None else None
-            )
-            self._fit_draft_tokens_single(req, budget_after_chunk)
+        # Draft tokens for last chunk (included in both budget and resize)
+        draft_len = get_draft_token_length(req)
+        chunk_tokens = chunk_size
+        if req.is_last_context_chunk and draft_len > 0:
+            chunk_tokens += draft_len
 
-        chunk_tokens = req.context_chunk_size
-        if req.is_last_context_chunk and req.has_draft_tokens:
-            chunk_tokens += req.num_draft_tokens
+        # V2 resizes KV cache directly in the scheduler, so include
+        # draft tokens for last chunk.
+        if not self.kv_cache_manager.resize_context(req, chunk_tokens):
+            return ScheduleAction.SKIP, 0, False
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
@@ -439,7 +431,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
         """
         beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
-        req_tokens = beam_width + req.num_draft_tokens
+        req_tokens = beam_width + get_draft_token_length(req)
 
         if not budget.can_fit_tokens(req_tokens):
             return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
@@ -541,27 +533,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 return req_it_end, True
 
         return req_it_end, False
-
-    # ---- Draft tokens ----
-
-    def _fit_draft_tokens_single(self, req, budget_after_chunk):
-        """Fit draft tokens into the last allocated page's remaining space."""
-        chunk_size = req.context_chunk_size
-        # Draft tokens should
-        # fit within already-allocated pages to avoid extra page allocation.
-        remainder = chunk_size % self.tokens_per_block
-        remaining_space = 0 if remainder == 0 else self.tokens_per_block - remainder
-
-        if self.max_context_length is not None:
-            remaining_context_len = self.max_context_length - chunk_size
-            remaining_space = min(remaining_space, remaining_context_len)
-
-        if budget_after_chunk is not None:
-            remaining_space = min(remaining_space, budget_after_chunk)
-
-        draft_discard = req.num_draft_tokens - min(req.num_draft_tokens, remaining_space)
-        if draft_discard > 0 and hasattr(req, "discard_draft_tokens"):
-            req.discard_draft_tokens(draft_discard)
 
     # ---- Sorting ----
 

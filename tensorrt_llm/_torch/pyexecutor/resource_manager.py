@@ -2114,8 +2114,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
+                draft_len = get_draft_token_length(req)
                 capacity = (req.context_current_position +
-                            req.context_chunk_size + self.num_extra_kv_tokens)
+                            req.context_chunk_size + draft_len +
+                            self.num_extra_kv_tokens)
                 if not kv_cache.resize(capacity):
                     raise RuntimeError(
                         f"Draft KV cache context resize failed for request "
