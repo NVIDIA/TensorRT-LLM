@@ -41,7 +41,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
                  max_num_requests: int,
                  sa_manager=None):
         self.dtype = dtype
-        self.num_nextn_predict_layers = config.max_draft_len
+        self.num_draft_slots = config.max_draft_len
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
@@ -54,12 +54,12 @@ class MTPHiddenStatesManager(BaseResourceManager):
 
         # Since golden token's hidden state will always be generated after target model
         self.mtp_past_hidden_states_pool = torch.zeros(
-            (slot_pool_size, self.num_nextn_predict_layers, self.hidden_size),
+            (slot_pool_size, self.num_draft_slots, self.hidden_size),
             device='cuda',
             dtype=self.dtype,
         )
         self.mtp_past_tokens_pool = torch.zeros(
-            (slot_pool_size, self.num_nextn_predict_layers),
+            (slot_pool_size, self.num_draft_slots),
             device='cuda',
             dtype=torch.int,
         )

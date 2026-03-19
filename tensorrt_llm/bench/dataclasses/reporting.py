@@ -778,7 +778,6 @@ class ReportUtility:
             spec_config = self.kwargs["speculative_config"]
             # Handle both dict (from YAML) and object types
             if isinstance(spec_config, dict):
-                # num_nextn_predict_layers kept for backward compat with old configs
                 draft_len = spec_config.get("max_draft_len")
                 return draft_len or 0
             return spec_config.max_draft_len or 0
