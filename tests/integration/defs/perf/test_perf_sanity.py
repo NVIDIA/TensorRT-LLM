@@ -296,6 +296,7 @@ class ServerConfig:
             "b_enable_chunked_prefill",
             "b_enable_attention_dp",
             "b_enable_lm_head_tp_in_adp",
+            "s_serving_backend",
             # attention_dp_config
             "b_attention_dp_balance",
             # cuda_graph_config

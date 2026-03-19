@@ -9,13 +9,8 @@ server_configs:
   - name: "super_ad_ws4_1k1k"
     model_name: "super_nvfp4"
     backend: "_autodeploy"
-    extra_llm_api_config_path: "examples/auto_deploy/super_v3.yaml"
+    extra_llm_api_config_path: "examples/auto_deploy/model_registry/configs/super_v3.yaml"
     world_size: 4
-    max_batch_size: 384
-    max_seq_len: 65536
-    enable_chunked_prefill: true
-    kv_cache_config:
-      free_gpu_memory_fraction: 0.88
     client_configs:
       - name: "con64_iter10_1k1k"
         concurrency: 64
