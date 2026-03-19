@@ -2001,6 +2001,8 @@ void TrtGptModelInflightBatching::reorderGenerationLogitsForBeamSearch(LlmReques
     auto const generationLogitsHost = llmReq.getGenerationLogitsHost();
     auto const& logitsShape = generationLogitsHost->getShape();
     // Non-streaming shape: [beamWidth, maxNewTokens, vocabSizePadded]
+    TLLM_CHECK_WITH_INFO(logitsShape.d[0] == reqBeamWidth,
+        "Generation logits beam dimension (%d) does not match beam width (%d).", logitsShape.d[0], reqBeamWidth);
     auto const maxNewTokens = logitsShape.d[1];
     auto const vocabSizePadded = logitsShape.d[2];
 
