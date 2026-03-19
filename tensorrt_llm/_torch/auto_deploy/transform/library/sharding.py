@@ -175,6 +175,14 @@ class ShardingTransformConfig(TransformConfig):
         description="When True, apply simple shard (column split + all_gather) to "
         "'leftover' linear nodes that are not part of any layer subgraph.",
     )
+    simple_shard_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of substrings to filter which unprocessed linear "
+        "nodes are simple-sharded. A node is included if its name contains ANY of the "
+        "listed keywords. Example: 'lm_head,shared_expert'. "
+        "Only effective when shard_all_unprocessed is True. "
+        "When None, all unprocessed linear nodes are sharded.",
+    )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
         description="AllReduce strategy for distributed operations. "
@@ -3190,8 +3198,15 @@ def detect_column_row_shard(
 
     # simple shard remaining linear nodes
     if config.shard_all_unprocessed:
+        shard_filter = None
+        if config.simple_shard_filter is not None:
+            keywords = [k.strip() for k in config.simple_shard_filter.split(",")]
+
+            def shard_filter(n, _kw=keywords):
+                return any(kw in n.name for kw in _kw)
+
         num_simple_shards += _process_simple_shard(
-            unprocessed_linear_nodes, transform_container, key_filter=lambda n: "lm_head" in n.name
+            unprocessed_linear_nodes, transform_container, key_filter=shard_filter
         )
     num_column_row_shards += num_ssm_shards + num_mla_shards
     num_shards = num_simple_shards + num_column_row_shards
