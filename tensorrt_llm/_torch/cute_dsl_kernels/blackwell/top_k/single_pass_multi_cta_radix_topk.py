@@ -878,6 +878,67 @@ class SinglePassMultiCTARadixTopKKernel:
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
 
     # ------------------------------------------------------------------
+    # Single-CTA radix select + collect (shared by parent and subclasses)
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _single_cta_radix_select_and_collect(
+        self,
+        shared_ordered,
+        actual_chunk_size,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        left_size,
+        local_histogram,
+        prefix_buf,
+        s_scalars,
+        s_warp_sums,
+        top_k,
+        num_threads,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Run all radix rounds (single-CTA) and collect output."""
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            prefix = cutlass.Uint32(0)
+        else:
+            prefix = cutlass.Uint16(0)
+        remaining_k = cutlass.Int32(top_k)
+
+        for r in cutlass.range_constexpr(self.num_rounds):
+            shift = cutlass.const_expr(self.ordered_bits - (r + 1) * self.radix_bits)
+            prefix, remaining_k = self._radix_round_single_cta(
+                r,
+                shift,
+                shared_ordered,
+                actual_chunk_size,
+                prefix,
+                remaining_k,
+                local_histogram,
+                prefix_buf,
+                s_scalars,
+                s_warp_sums,
+                num_threads,
+                tidx,
+            )
+
+        self.collect_output_single_cta(
+            shared_ordered,
+            actual_chunk_size,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            prefix,
+            top_k,
+            local_histogram,
+            output_indices_row,
+            output_values_row,
+            tidx,
+        )
+
+    # ------------------------------------------------------------------
     # Main kernel
     # ------------------------------------------------------------------
     @cute.kernel
@@ -1025,79 +1086,19 @@ class SinglePassMultiCTARadixTopKKernel:
 
                 if cutlass.const_expr(ctas_per_group == 1):
                     # ---- Single-CTA path: no global state, no barriers ----
-                    # Round 0
-                    prefix, remaining_k = self._radix_round_single_cta(
-                        0,
-                        self.ordered_bits - 1 * self.radix_bits,
-                        shared_ordered,
-                        actual_chunk_size,
-                        prefix,
-                        remaining_k,
-                        local_histogram,
-                        prefix_buf,
-                        s_scalars,
-                        s_warp_sums,
-                        num_threads,
-                        tidx,
-                    )
-                    # Round 1
-                    prefix, remaining_k = self._radix_round_single_cta(
-                        1,
-                        self.ordered_bits - 2 * self.radix_bits,
-                        shared_ordered,
-                        actual_chunk_size,
-                        prefix,
-                        remaining_k,
-                        local_histogram,
-                        prefix_buf,
-                        s_scalars,
-                        s_warp_sums,
-                        num_threads,
-                        tidx,
-                    )
-                    if cutlass.const_expr(self.num_rounds > 2):
-                        # Round 2 (fp32 only)
-                        prefix, remaining_k = self._radix_round_single_cta(
-                            2,
-                            self.ordered_bits - 3 * self.radix_bits,
-                            shared_ordered,
-                            actual_chunk_size,
-                            prefix,
-                            remaining_k,
-                            local_histogram,
-                            prefix_buf,
-                            s_scalars,
-                            s_warp_sums,
-                            num_threads,
-                            tidx,
-                        )
-                        # Round 3 (fp32 only)
-                        prefix, remaining_k = self._radix_round_single_cta(
-                            3,
-                            self.ordered_bits - 4 * self.radix_bits,
-                            shared_ordered,
-                            actual_chunk_size,
-                            prefix,
-                            remaining_k,
-                            local_histogram,
-                            prefix_buf,
-                            s_scalars,
-                            s_warp_sums,
-                            num_threads,
-                            tidx,
-                        )
-
-                    # Step 3: Collect output (smem counter, no inter-CTA sync)
-                    self.collect_output_single_cta(
+                    self._single_cta_radix_select_and_collect(
                         shared_ordered,
                         actual_chunk_size,
                         chunk_start,
                         prologue_elems,
                         aligned_size,
                         left_size,
-                        prefix,
-                        top_k,
                         local_histogram,
+                        prefix_buf,
+                        s_scalars,
+                        s_warp_sums,
+                        top_k,
+                        num_threads,
                         output_indices_row,
                         output_values_row,
                         tidx,
