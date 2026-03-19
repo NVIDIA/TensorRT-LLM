@@ -43,8 +43,7 @@ from .quantization import (
     W4A8MXFP4FP8TRTLLMGenFusedMoEMethod, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
     W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
-from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
-                      DefaultMoeRoutingMethod)
+from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -328,10 +327,6 @@ class TRTLLMGenFusedMoE(MoE):
                 return False
             if self.activation_type != ActivationType.Swiglu:
                 return False
-            if isinstance(
-                    self.routing_method,
-                (DeepSeekV3MoeRoutingMethod, DefaultMoeRoutingMethod)):
-                return False
             return True
 
         use_flashinfer = os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER",
@@ -341,9 +336,6 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Unsupported activation type or routing method
         if self.activation_type == ActivationType.Relu2:
-            return False
-        if isinstance(self.routing_method,
-                      (DeepSeekV3MoeRoutingMethod, DefaultMoeRoutingMethod)):
             return False
 
         quant_method = self._get_quant_method()
@@ -408,7 +400,6 @@ class TRTLLMGenFusedMoE(MoE):
 
         ConfigurableMoE uses this flag to decide whether routing is separated
         (top-k ids/scales computed outside backend) or fused inside the kernel.
-        BF16 FlashInfer path always requires separated routing.
         """
         if self._requires_separated_routing():
             return True

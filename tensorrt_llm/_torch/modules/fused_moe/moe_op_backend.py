@@ -25,10 +25,100 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
 from ...utils import ActType_TrtllmGen
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
+
+
+if triton is not None:
+
+    @triton.jit
+    def pack_topk_ids_kernel(
+        expert_ids_ptr,
+        expert_weights_ptr,
+        output_ptr,
+        local_expert_offset,
+        stride_ids_row,
+        stride_ids_col,
+        stride_weights_row,
+        stride_weights_col,
+        n_rows,
+        n_cols,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        linear_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        row_idx = linear_idx // n_cols
+        col_idx = linear_idx % n_cols
+
+        mask = linear_idx < (n_rows * n_cols)
+
+        ids_offset = row_idx * stride_ids_row + col_idx * stride_ids_col
+        weights_offset = row_idx * stride_weights_row + col_idx * stride_weights_col
+
+        expert_ids = tl.load(expert_ids_ptr + ids_offset, mask=mask)
+        local_ids = expert_ids - local_expert_offset
+
+        expert_weights = tl.load(expert_weights_ptr + weights_offset, mask=mask)
+        expert_weights_bf16 = expert_weights.to(tl.bfloat16)
+        expert_weights_int16 = expert_weights_bf16.to(tl.int16, bitcast=True)
+        expert_weights_int32 = expert_weights_int16.to(tl.int32) & 0xFFFF
+
+        packed_topk_ids = (local_ids.to(tl.int32) << 16) | expert_weights_int32
+        tl.store(output_ptr + linear_idx, packed_topk_ids, mask=mask)
+
+
+def pack_topk_ids(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    local_expert_offset: int,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Pack expert ids and routing weights into TRTLLM-Gen's routed MoE format."""
+    if topk_ids.ndim != 2 or topk_weights.ndim != 2:
+        raise ValueError("Expected 2D top-k ids and weights tensors.")
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            f"Mismatched top-k ids and weights shapes: {topk_ids.shape} vs {topk_weights.shape}."
+        )
+
+    if output is None:
+        output = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+
+    # Fallback to CPU just in case
+    if triton is None or not topk_ids.is_cuda or not topk_weights.is_cuda:
+        packed_topk_ids = ((topk_ids.to(torch.int32) - local_expert_offset) << 16) | (
+            topk_weights.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+        )
+        output.copy_(packed_topk_ids)
+        return output
+
+    n_rows, n_cols = topk_ids.shape
+    n_elements = n_rows * n_cols
+    block_size = 1024
+    grid = (triton.cdiv(n_elements, block_size),)
+
+    pack_topk_ids_kernel[grid](
+        topk_ids,
+        topk_weights,
+        output,
+        local_expert_offset,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        n_rows,
+        n_cols,
+        BLOCK_SIZE=block_size,
+    )
+    return output
 
 
 def register_op_backend(name: str):
@@ -607,7 +697,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
+            packed_topk_ids = pack_topk_ids(topk_ids, topk_weights, local_expert_offset)
             # Run with pre-computed routing (packed format)
             return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
                 topk_ids=packed_topk_ids,
@@ -707,9 +797,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
-                torch.int16
-            )
+            packed_tensor = pack_topk_ids(topk_ids, topk_weights, local_expert_offset)
             outputs = self._fused_moe.trtllm_fp4_block_scale_routed_moe(
                 packed_tensor,
                 routing_bias,
@@ -807,9 +895,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
-                torch.bfloat16
-            ).contiguous().view(torch.int16).to(torch.int32)
+            packed_topk_ids = pack_topk_ids(topk_ids, topk_weights, local_expert_offset)
             result = self._fused_moe.trtllm_bf16_routed_moe(
                 packed_topk_ids,
                 hidden_states,
