@@ -297,6 +297,16 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     return tuple(num_token_buckets[::-1])
 
 
+def deep_gemm_gen_tuning_buckets(x: int):
+    buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
+    if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
+        buckets += tuple(range(128, x, 128))
+    return buckets
+
+
 def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     """Calculate the dimensions of the fp4 scale tensor.
     """

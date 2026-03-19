@@ -16,7 +16,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import (fp4_scale_infer_shape, fp8_scale_infer_shape,
+from ..utils import (deep_gemm_gen_tuning_buckets, fp4_scale_infer_shape,
+                     fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
@@ -2942,12 +2943,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if key not in self.tuning_config_cache:
                 self.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
-                        0, 0, get_last_power_of_2_num_tokens_buckets,
-                        last_positive_power_of_2), ),
+                        0, 0, deep_gemm_gen_tuning_buckets), ),
                     constraint_specs=(ConstraintSpec(2, 0,
                                                      fp4_scale_infer_shape), ),
                     use_cold_l2_cache=True,
-                    tune_max_num_tokens=256,
+                    tune_max_num_tokens=512,
                     distributed_tuning_strategy=DistributedTuningStrategy.
                     PARALLEL,
                 )
