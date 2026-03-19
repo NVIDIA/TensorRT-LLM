@@ -50,6 +50,8 @@ def parse_visual_gen_params(
     elif isinstance(request, VideoGenerationRequest):
         if request.num_inference_steps is not None:
             params.num_inference_steps = request.num_inference_steps
+        if request.n is not None:
+            params.num_images_per_prompt = request.n
         if request.input_reference is not None:
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")

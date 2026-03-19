@@ -193,6 +193,71 @@ class TestExplicitFormatSaveVideo:
             assert "MP4 format requires ffmpeg" in str(exc_info.value)
 
 
+class TestSaveImagesBatch:
+    """Test MediaStorage.save_images() batch saving."""
+
+    def test_save_single_image_via_batch(self, tmp_path):
+        """A single (H, W, C) tensor should be saved as one file."""
+        image = torch.randint(0, 256, (64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "single")
+        paths = MediaStorage.save_images(image, prefix)
+        assert len(paths) == 1
+        assert os.path.exists(paths[0])
+        assert "single_0.png" in paths[0]
+
+    def test_save_batch_of_images(self, tmp_path):
+        """A (B, H, W, C) tensor should produce B files."""
+        images = torch.randint(0, 256, (3, 64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "batch")
+        paths = MediaStorage.save_images(images, prefix)
+        assert len(paths) == 3
+        for i, p in enumerate(paths):
+            assert os.path.exists(p)
+            assert f"batch_{i}.png" in p
+
+    def test_save_images_custom_format(self, tmp_path):
+        """Explicit format should be reflected in the extension."""
+        images = torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "fmt")
+        paths = MediaStorage.save_images(images, prefix, format="JPEG")
+        assert len(paths) == 2
+        for p in paths:
+            assert p.endswith(".jpg")
+            assert os.path.exists(p)
+
+
+class TestSaveVideosBatch:
+    """Test MediaStorage.save_videos() batch saving."""
+
+    def test_save_single_video_via_batch(self, tmp_path):
+        """A single (T, H, W, C) tensor should produce one file."""
+        video = _make_dummy_video_tensor()
+        prefix = str(tmp_path / "single_vid")
+        paths = MediaStorage.save_videos(video, prefix, format="avi")
+        assert len(paths) == 1
+        assert os.path.exists(paths[0])
+
+    def test_save_batch_of_videos(self, tmp_path):
+        """A (B, T, H, W, C) tensor should produce B files."""
+        videos = torch.randint(0, 256, (2, 4, 64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "batch_vid")
+        paths = MediaStorage.save_videos(videos, prefix, format="avi")
+        assert len(paths) == 2
+        for p in paths:
+            assert os.path.exists(p)
+
+    def test_save_videos_mp4_without_ffmpeg_raises(self, tmp_path):
+        """Requesting mp4 without ffmpeg should raise for each video."""
+        videos = torch.randint(0, 256, (1, 4, 64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "mp4_vid")
+        with patch(
+            "tensorrt_llm.serve.media_storage.get_video_encoder",
+            return_value=PurePythonEncoder(),
+        ):
+            with pytest.raises(RuntimeError):
+                MediaStorage.save_videos(videos, prefix, format="mp4")
+
+
 class TestVideoGenerationRequestOutputFormat:
     """Test VideoGenerationRequest output_format field."""
 
