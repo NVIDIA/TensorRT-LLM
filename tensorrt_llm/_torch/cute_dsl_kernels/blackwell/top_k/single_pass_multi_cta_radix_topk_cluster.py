@@ -774,6 +774,8 @@ class SinglePassMultiCTARadixTopKClusterKernel:
                     output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
                     if cutlass.const_expr(output_values_row is not None):
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
+        # TODO: move this part before line 822? for elems equal to pivot,
+        # small indices values could be put early if want to keep stable.
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
             if ordered == ordered_pivot:
@@ -961,6 +963,12 @@ class SinglePassMultiCTARadixTopKClusterKernel:
             output_counter_ptr = row_states.iterator + cutlass.Int32(
                 group_id * state_size
             )
+            # Defensive init: ensure output_counter is 0 before the first
+            # row, even if row_states was allocated with torch.empty.
+            # No barrier needed — the round-0 cluster barrier in the first
+            # row will make this store visible to all CTAs.
+            if cta_in_group == 0 and tidx == 0:
+                st_release_gpu(output_counter_ptr, cutlass.Int32(0))
 
         # ---- Persistent loop: round-robin over rows ----
         row_idx = group_id
@@ -1094,14 +1102,6 @@ class SinglePassMultiCTARadixTopKClusterKernel:
 
                 else:
                     # ---- Multi-CTA (cluster) path ----
-                    # Initial cluster barrier for this row.
-                    cute.arch.cluster_arrive_relaxed()
-                    cute.arch.cluster_wait()
-
-                    # CTA 0 resets output counter after barrier
-                    if cta_in_group == 0 and tidx == 0:
-                        st_release_gpu(output_counter_ptr, cutlass.Int32(0))
-
                     # Round 0
                     prefix, remaining_k = self._radix_round_cluster(
                         0,
@@ -1188,6 +1188,15 @@ class SinglePassMultiCTARadixTopKClusterKernel:
                     # moving to the next row.
                     cute.arch.cluster_arrive_relaxed()
                     cute.arch.cluster_wait()
+
+                    # Reset output counter for next row.  All CTAs are
+                    # synchronized by the barrier above.  The reset will
+                    # be visible to every CTA by the time they reach
+                    # collect_output in the next row, because at least
+                    # 2 (fp16/bf16) or 4 (fp32) radix-round cluster
+                    # barriers intervene.
+                    if cta_in_group == 0 and tidx == 0:
+                        st_release_gpu(output_counter_ptr, cutlass.Int32(0))
 
             # Advance to next row (round-robin).
             row_idx = row_idx + num_groups

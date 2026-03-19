@@ -437,19 +437,25 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta(
 def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits,
-        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
+
+    def run_fn(logits, seq_lens):
+        result = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
             input_values=logits,
             seq_lens=seq_lens,
             top_k=index_topk,
             next_n=next_n,
             return_val=False,
             num_copy_bits=256,
-        )[0],
+        )
+        if result[0] is None:
+            pytest.skip("Problem size exceeds cluster kernel capacity")
+        return result[0]
+
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        run_fn,
     )

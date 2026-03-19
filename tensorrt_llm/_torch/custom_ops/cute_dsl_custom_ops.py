@@ -328,6 +328,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
         SinglePassMultiCTARadixTopKClusterKernel
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
+        _query_max_cluster_size
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -3772,12 +3774,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                               num_rows: int = 1):
             """Resolve chunk_size and ctas_per_group.
 
-            Same heuristic as the non-cluster runner.
+            Same heuristic as the non-cluster runner, but clamped to the
+            hardware max cluster size.  Returns None for all fields when
+            the problem size exceeds what the cluster kernel can handle.
 
             Returns:
-                (chunk_size, ctas_per_group, vec_size)
+                (chunk_size, ctas_per_group, vec_size) or (None, None, None)
             """
             max_chunk, vec_size = cls._compute_max_chunk(dtype, num_copy_bits)
+            hw_max_cluster = _query_max_cluster_size()
 
             if chunk_size is not None:
                 chunk_size = min(chunk_size, max_chunk)
@@ -3809,6 +3814,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     chunk_size = snap_up
 
             ctas_per_group = math.ceil(num_cols / chunk_size)
+
+            # Clamp to hardware max cluster size
+            if ctas_per_group > hw_max_cluster:
+                chunk_size = math.ceil(num_cols / hw_max_cluster)
+                chunk_size = ((chunk_size + vec_size - 1) // vec_size) * vec_size
+                if chunk_size > max_chunk:
+                    logger.warning(
+                        f"Cluster top-k: num_cols={num_cols} requires "
+                        f"chunk_size={chunk_size} which exceeds max shared "
+                        f"memory capacity ({max_chunk}). Cannot handle this "
+                        f"problem size with cluster kernel.")
+                    return None, None, None
+                ctas_per_group = math.ceil(num_cols / chunk_size)
+
             return chunk_size, ctas_per_group, vec_size
 
         @classmethod
@@ -3834,14 +3853,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             chunk_size: Optional[int] = None,
             output_indices: Optional[torch.Tensor] = None,
         ):
-            """Execute cluster-accelerated single-pass multi-CTA radix top-k."""
+            """Execute cluster-accelerated single-pass multi-CTA radix top-k.
+
+            Returns (None, None) if the problem size exceeds what the cluster
+            kernel can handle (caller should fall back to the non-cluster runner).
+            """
             torch_dtype = input_values.dtype
             dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
             num_rows, num_cols = input_values.shape
             num_sms = _get_num_sms()
 
+            max_chunk, _ = cls._compute_max_chunk(dtype, num_copy_bits)
+            hw_max_cluster = _query_max_cluster_size()
+            max_supported_cols = max_chunk * hw_max_cluster
+            if num_cols > max_supported_cols:
+                logger.warning(
+                    f"Cluster top-k does not support num_cols={num_cols} "
+                    f"(max supported: {max_supported_cols} = "
+                    f"max_chunk={max_chunk} x max_cluster={hw_max_cluster} "
+                    f"for dtype={torch_dtype}). "
+                    f"Falling back to non-cluster runner.")
+                return None, None
+
             chunk_size, ctas_per_group, _ = cls._get_chunk_config(
                 dtype, num_cols, chunk_size, num_copy_bits, num_rows=num_rows)
+
+            if chunk_size is None:
+                return None, None
 
             num_groups = min(num_sms // ctas_per_group, num_rows)
             if num_groups < 1:
@@ -3997,6 +4035,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_copy_bits: int = 256,
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
+        single_pass_multi_cta_cluster: bool = False,
     ) -> None:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
         single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
@@ -4022,6 +4061,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
           memory access patterns).
           fp32: always use single-CTA (single-pass multi-CTA overhead not worth it).
 
+        When ``single_pass_multi_cta_cluster=True`` (requires ``single_pass_multi_cta=True``),
+        the cluster-accelerated variant (DSMEM + cluster barriers) is used unconditionally
+        instead of the auto cluster/distributed heuristic.
+
         Benchmark: overhead vs oracle ~2.4%, speedup vs always-single ~1.14x
         (Blackwell SM100 148 SMs, top_k=2048, fp32/bf16/fp16).
 
@@ -4037,6 +4080,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
             single_pass_multi_cta: Use single-pass multi-CTA radix top-k
+            single_pass_multi_cta_cluster: Force cluster-accelerated variant
+                (only effective when single_pass_multi_cta=True)
         """
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
@@ -4083,15 +4128,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                  and num_rows <= num_sms)
 
             if use_single_pass_multi_cta:
-                CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
-                    input_values=input_values,
-                    seq_lens=seq_lens,
-                    top_k=top_k,
-                    next_n=next_n,
-                    return_val=False,
-                    num_copy_bits=num_copy_bits,
-                    output_indices=output_indices,
-                )
+                # Use cluster variant when explicitly requested or when
+                # SM resources are sufficient (small batch); fall back to
+                # distributed (global memory atomics) for large batch.
+                # TODO:
+                # use_cluster = (single_pass_multi_cta_cluster
+                #                or num_rows * ctas_per_group <= num_sms * 2)
+                use_cluster = (single_pass_multi_cta_cluster)
+                if use_cluster:
+                    CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
+                        input_values=input_values,
+                        seq_lens=seq_lens,
+                        top_k=top_k,
+                        next_n=next_n,
+                        return_val=False,
+                        num_copy_bits=num_copy_bits,
+                        output_indices=output_indices,
+                    )
+                else:
+                    CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
+                        input_values=input_values,
+                        seq_lens=seq_lens,
+                        top_k=top_k,
+                        next_n=next_n,
+                        return_val=False,
+                        num_copy_bits=num_copy_bits,
+                        output_indices=output_indices,
+                    )
             else:
                 CuteDSLTopKDecodeSingleCTARunner.forward(
                     input_values=input_values,
@@ -4156,6 +4219,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_copy_bits: int = 256,
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
+        single_pass_multi_cta_cluster: bool = False,
     ) -> None:
         return None
 
@@ -4167,6 +4231,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         min_seq_len_log2: int = 10,
         max_seq_len_log2: int = 18,
         single_pass_multi_cta: bool = False,
+        single_pass_multi_cta_cluster: bool = False,
     ) -> None:
         """Pre-compile all CuTE DSL top-k kernel variants for every
         power-of-2 bucketed_num_cols in [2^min_seq_len_log2, 2^max_seq_len_log2].
@@ -4244,8 +4309,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
                     cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
                     num_sms, return_val)
+
+            # Cluster variant: enumerate configs using the cluster runner's
+            # _get_chunk_config (which clamps to hw max cluster size).
+            cluster_configs = set()
+            if single_pass_multi_cta_cluster:
+                for log2_n in range(min_seq_len_log2,
+                                    max_seq_len_log2 + 1):
+                    num_cols = 1 << log2_n
+                    for nr in [1, 4, 16, 64, 256]:
+                        cfg = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._get_chunk_config(
+                            cutlass_dtype, num_cols,
+                            num_copy_bits=num_copy_bits, num_rows=nr)
+                        if cfg[0] is not None:
+                            cluster_configs.add((cfg[0], cfg[1]))
+                for cs, ctas in sorted(cluster_configs):
+                    CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._compile(
+                        cutlass_dtype, cs, top_k, next_n, num_copy_bits,
+                        ctas, num_sms, return_val)
+
             multi_cta_info = (
-                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs)"
+                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs"
+                f", cluster {len(cluster_configs)} configs)"
             )
         else:
             # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
