@@ -65,6 +65,15 @@ void BlockPool::shrink(std::size_t newNumBlocks)
         throw std::invalid_argument(
             "BlockPool::shrink(): newNumBlocks must be less than the current block_count.");
 
+    // Refuse to release any block that is still referenced.
+    for (std::size_t i = newNumBlocks; i < blocks_.size(); ++i)
+    {
+        if (!blocks_[i].isFree())
+            throw std::runtime_error(
+                "BlockPool::shrink(): block " + std::to_string(blocks_[i].offset)
+                + " has non-zero reference count (" + std::to_string(blocks_[i].refCount()) + ").");
+    }
+
     // Drop tail metadata before releasing physical pages.
     blocks_.erase(blocks_.begin() + static_cast<std::ptrdiff_t>(newNumBlocks), blocks_.end());
 

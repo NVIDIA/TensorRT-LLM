@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/cudaVmmArena.h"
 
 #include <cstddef>
+#include <stdexcept>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::state_manager {
@@ -30,6 +31,11 @@ namespace tensorrt_llm::batch_manager::state_manager {
 /// at byte offset `offset * block_size_bytes` from the arena base pointer.
 /// The offset is 0-based and monotonically increasing: block 0 starts at the
 /// arena base, block 1 immediately follows it, and so on.
+///
+/// Each Block carries a reference count that starts at 0. Callers must
+/// increment the count before using a block and decrement it when done.
+/// BlockPool::shrink() refuses to release any block whose reference count
+/// is non-zero.
 class Block {
 public:
     /// Index of this block within the pool (0-based).
@@ -37,7 +43,29 @@ public:
     std::size_t offset;
 
     explicit Block(std::size_t offset) noexcept
-        : offset(offset) {}
+        : offset(offset)
+        , refCount_(0) {}
+
+    /// Increment the reference count by 1.
+    void incRef() noexcept { ++refCount_; }
+
+    /// Decrement the reference count by 1.
+    /// @throws std::underflow_error if the count is already 0.
+    void decRef()
+    {
+        if (refCount_ == 0)
+            throw std::underflow_error("Block::decRef(): reference count is already 0.");
+        --refCount_;
+    }
+
+    /// Return true if the reference count is 0 (block is unreferenced).
+    bool isFree() const noexcept { return refCount_ == 0; }
+
+    /// Current reference count (for diagnostics / assertions).
+    std::size_t refCount() const noexcept { return refCount_; }
+
+private:
+    std::size_t refCount_;
 };
 
 /// Manages a pool of fixed-size memory blocks backed by a CudaVmmArena.
@@ -92,7 +120,8 @@ public:
     /// Shrink the pool to `newNumBlocks` total blocks.
     /// Removes tail Block metadata objects, then shrinks the underlying arena
     /// to release the corresponding physical pages.
-    /// Throws if newNumBlocks >= block_count().
+    /// Throws if newNumBlocks >= block_count(), or if any block that would be
+    /// removed has a non-zero reference count.
     void shrink(std::size_t newNumBlocks);
 
     // -----------------------------------------------------------------------
