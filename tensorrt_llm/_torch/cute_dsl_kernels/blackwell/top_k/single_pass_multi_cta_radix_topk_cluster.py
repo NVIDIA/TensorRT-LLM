@@ -23,6 +23,8 @@ all GPU-scope acquire/release PTX for barriers.  Only the output counter
 (1 int32 in GMEM) is retained for atomicAdd during output collection.
 """
 
+import functools
+
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver
@@ -37,6 +39,7 @@ from cutlass.utils.smem_allocator import SmemAllocator
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel, st_release_gpu
 
 
+@functools.lru_cache(maxsize=1)
 def _query_max_cluster_size() -> int:
     """Query the hardware max cluster size using an empty kernel.
 
