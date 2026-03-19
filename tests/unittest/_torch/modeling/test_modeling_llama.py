@@ -20,7 +20,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, _update_kv_cache_draft_token_location)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.utils import SpecDecodingTensor
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -534,10 +533,6 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
             num_heads_per_kv=num_heads_per_kv,
         )
-        spec_decoding_tensor = SpecDecodingTensor(
-            position_offsets=spec_decoding_position_offsets,
-            packed_mask=spec_decoding_packed_mask)
-
         attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
@@ -546,8 +541,8 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_tree=is_spec_dec_tree,
             max_draft_len=max_total_draft_tokens,
             max_total_draft_tokens=max_total_draft_tokens,
+            is_target_model=True,
             model_is_wrapped=False,
-            spec_decoding_tensor=spec_decoding_tensor,
         )
 
         gen_position_ids_0 = [
@@ -602,6 +597,7 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_1.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
+            is_target_model=True,
             model_is_wrapped=False)
 
         gen_position_ids_1 = [
@@ -657,6 +653,7 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_ref.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
+            is_target_model=True,
             model_is_wrapped=False)
 
         gen_position_ids_ref = [
