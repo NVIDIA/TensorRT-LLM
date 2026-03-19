@@ -20,8 +20,10 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
+#include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
+#include "tensorrt_llm/thop/attentionOp.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <cuda_bf16.h>
@@ -146,9 +148,6 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     TLLM_CHECK_WITH_INFO(
         host_kv_cache_pool_mapping.has_value(), "KV cache pool mapping is required for MLA generation.");
 
-    bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
-        && host_kv_cache_pool_mapping.has_value();
-
     int32_t const num_seqs = host_context_lengths.size(0);
 
     int32_t const num_tokens = fused_q.size(0);
@@ -195,65 +194,25 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     int32_t const q_pe_ld = q_pe.strides()[1];
     int32_t const q_pe_stride = q_pe.strides()[0];
 
-    // kv cache related
-    auto const block_size = tokens_per_block * num_kv_heads * head_size;
-    int32_t const elem_bytes
-        = kv_cache_quant_mode.hasFp8KvCache() ? sizeof(__nv_fp8_e4m3) : static_cast<int32_t>(fused_q.element_size());
-
-    int32_t const bytes_per_token = num_kv_heads * head_size * elem_bytes;
-
-    auto const bytes_per_block = block_size * elem_bytes;
-    int32_t const kv_factor = 1; // 1 for mla, 2 for mha/gqa
     bool const fp8_context_fmha = kv_cache_quant_mode.hasFp8KvCache();
-    // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
-    // unless each layer has different attention window sizes.
-    // the kv_cache capacity.
-    // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
-    // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
-    int const cyclic_attention_window_size = attention_window_size;
-    int const max_cyclic_attention_window_size = cyclic_attention_window_size;
-    bool const can_use_one_more_block = beam_width > 1;
+    int32_t const batch_beam = beam_width * num_generations;
 
-    // kv cache pool related
-    int32_t const max_blocks_per_sequence
-        = use_kv_cache && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
-    int32_t const pool_index = use_kv_cache && host_kv_cache_pool_mapping.has_value()
-        ? host_kv_cache_pool_mapping.value().index({layer_idx, 0}).item<int32_t>()
-        : 0;
-    int32_t const layer_idx_in_cache_pool = use_kv_cache && host_kv_cache_pool_mapping.has_value()
-        ? host_kv_cache_pool_mapping.value().index({layer_idx, 1}).item<int32_t>()
-        : 0;
-    auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
+    auto kv_cache_buffer = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets,
+        host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_cache_quant_mode, layer_idx, batch_beam,
+        tokens_per_block, num_kv_heads, head_size, attention_window_size, attention_window_size, sink_token_length,
+        beam_width, seq_offset, true /*is_mla_enable*/, static_cast<size_t>(fused_q.element_size()))
+                               .kvCacheBuffer;
 
-    tk::KVBlockArray::DataType* block_offsets
-        = static_cast<tk::KVBlockArray::DataType*>(use_kv_cache && kv_cache_block_offsets.has_value()
-                ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
-                : nullptr);
+    tk::KvCacheDataType cache_type = tk::cacheTypeFromQuantMode(kv_cache_quant_mode);
 
-    void* host_primary_pool_pointer{nullptr};
-    void* host_secondary_pool_pointer{nullptr};
-
-    if (use_kv_cache)
-    {
-        TORCH_CHECK(host_kv_cache_pool_pointers.value().dim() == 2);
-        host_primary_pool_pointer = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
-            + intra_pool_offset);
-        host_secondary_pool_pointer = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
-            + intra_pool_offset);
-    }
-
-    float const* kv_scale_orig_quant_ptr = nullptr; // qk quant scale
-    float const* kv_scale_quant_orig_ptr = nullptr; // bmm quant scale
+    float const* kv_scale_orig_quant_ptr = nullptr;
+    float const* kv_scale_quant_orig_ptr = nullptr;
     if (kv_cache_quant_mode.hasKvCacheQuant() && kv_scale_orig_quant.has_value() && kv_scale_quant_orig.has_value())
     {
         kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
         kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
     }
 
-    // Prepare scalars for MLA params and wrapper
-    // For FP8 output, out_scale represents the output scale.
     float const* quant_scale_o_ptr
         = (fp8_context_fmha && out_scale.has_value()) ? out_scale.value().data_ptr<float>() : nullptr;
     float const host_bmm1_scale = 1.f / (q_scaling * sqrt(static_cast<float>(qk_nope_head_dim + qk_rope_head_dim)));
@@ -264,16 +223,7 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     }
     int const* block_ids_per_seq_ptr = use_gen_flash_mla && block_ids_per_seq.has_value()
         ? static_cast<int*>(block_ids_per_seq->data_ptr())
-        : nullptr; // only used for flash mla
-
-    int32_t const batch_beam = beam_width * num_generations;
-
-    tk::KvCacheDataType cache_type
-        = (kv_cache_quant_mode.hasFp8KvCache() ? tk::KvCacheDataType::FP8 : tk::KvCacheDataType::BASE);
-
-    auto kv_cache_buffer = tk::KVBlockArray(batch_beam, max_blocks_per_sequence, tokens_per_block, bytes_per_token,
-        cyclic_attention_window_size, max_cyclic_attention_window_size, sink_token_length, can_use_one_more_block,
-        host_primary_pool_pointer, host_secondary_pool_pointer, block_offsets);
+        : nullptr;
 
     // Currently NVFP4 KV cache is not supported for MLA
     MlaRopeGenArgs args{q_pe_ld, q_pe_stride, rotary_cos_sin_ptr, num_generations, num_gen_tokens,

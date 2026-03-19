@@ -448,7 +448,9 @@ def prepare_flashinfer_mla_metadata_host(
         )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_mla_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::flashinfer_mla_with_cache", mutates_args=("ckv_cache", "kpe_cache")
+)
 def flashinfer_mla_with_cache(
     # 5 tensor args (matching torch_mla source op)
     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
@@ -474,6 +476,7 @@ def flashinfer_mla_with_cache(
     # Constants
     scale: Optional[float],
     kv_lora_rank: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FlashInfer MLA attention with paged cache.
 
@@ -549,8 +552,10 @@ def flashinfer_mla_with_cache(
         last_page_len[:num_seq],
     )
 
-    # Pre-allocate output as zeros so padding positions are clean
-    y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
+    if out is not None:
+        y = out.view(bs, num_heads, v_head_dim)
+    else:
+        y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
 
     # =========================================================================
     # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper for regular prefill
@@ -752,6 +757,13 @@ def flashinfer_mla_with_cache(
 
         y[num_prefill_tokens:num_total_tokens] = y_decode
 
+    if out is not None:
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y.view(b, s, num_heads, v_head_dim)
 
 
@@ -776,8 +788,12 @@ def flashinfer_mla_with_cache_fake(
     kpe_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for flashinfer_mla_with_cache."""
+    if out is not None:
+        return out.new_empty(0)
+
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[-1]
     out_features = kv_b_proj_weight.shape[0]
