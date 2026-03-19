@@ -154,6 +154,7 @@ def get_llm_args(
         fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
+        enable_attention_dp: bool = False,
         video_pruning_rate: Optional[float] = None,
         **llm_args_extra_dict: Any):
 
@@ -229,6 +230,8 @@ def get_llm_args(
         num_postprocess_workers,
         "enable_chunked_prefill":
         enable_chunked_prefill,
+        "enable_attention_dp":
+        enable_attention_dp,
         "revision":
         revision,
         "reasoning_parser":
@@ -513,11 +516,13 @@ class ChoiceWithAlias(click.Choice):
 
 @click.command("serve")
 @click.argument("model", type=str)
-@click.option("--tokenizer",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag("Path | Name of the tokenizer.",
-                                                "beta"))
+@click.option(
+    "--tokenizer",
+    type=str,
+    default=None,
+    help=help_info_with_stability_tag(
+        "Path or name of the tokenizer. When using the PyTorch backend, "
+        "this replaces the default HuggingFace tokenizer.", "beta"))
 @click.option(
     "--custom_tokenizer",
     type=str,
@@ -649,12 +654,15 @@ class ChoiceWithAlias(click.Choice):
               default=False,
               help=help_info_with_stability_tag("Flag for HF transformers.",
                                                 "beta"))
-@click.option("--revision",
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
               type=str,
               default=None,
               help=help_info_with_stability_tag(
                   "The revision to use for the HuggingFace model "
-                  "(branch name, tag name, or commit id).", "beta"))
+                  "(branch name, tag name, or commit id). "
+                  "Prefer --hf_revision over --revision.", "beta"))
 @click.option(
     "--config",
     "--extra_llm_api_options",
@@ -689,8 +697,10 @@ class ChoiceWithAlias(click.Choice):
     type=str,
     default=None,
     help=help_info_with_stability_tag(
-        "Server role. Specify this value only if running in disaggregated mode.",
-        "prototype"))
+        "Server role for disaggregated serving. "
+        "CONTEXT=prefill (prompt processing), GENERATION=decode (token generation), "
+        "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
+        "Required when using service registry.", "prototype"))
 @click.option(
     "--fail_fast_on_attention_window_too_large",
     is_flag=True,
@@ -716,6 +726,11 @@ class ChoiceWithAlias(click.Choice):
               default=False,
               help=help_info_with_stability_tag("Enable chunked prefill",
                                                 "prototype"))
+@click.option("--enable_attention_dp",
+              is_flag=True,
+              default=False,
+              help=help_info_with_stability_tag(
+                  "Enable attention data parallel.", "beta"))
 @click.option("--media_io_kwargs",
               type=str,
               default=None,
@@ -770,10 +785,10 @@ def serve(
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        video_pruning_rate: Optional[float], custom_module_dirs: list[Path],
-        chat_template: Optional[str], grpc: bool,
-        served_model_name: Optional[str],
+        enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
+        media_io_kwargs: Optional[str], video_pruning_rate: Optional[float],
+        custom_module_dirs: list[Path], chat_template: Optional[str],
+        grpc: bool, served_model_name: Optional[str],
         extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -792,6 +807,9 @@ def serve(
             "--fail_fast_on_attention_window_too_large is deprecated. "
             "It now defaults to True and will be removed in a future release. "
             "This flag only affects the TRT backend.")
+
+    if "--revision" in sys.argv:
+        logger.warning("--revision is deprecated, use --hf_revision instead.")
 
     for custom_module_dir in custom_module_dirs:
         try:
@@ -828,6 +846,7 @@ def serve(
             fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
+            enable_attention_dp=enable_attention_dp,
             video_pruning_rate=video_pruning_rate)
 
         llm_args_extra_dict = {}
@@ -955,12 +974,31 @@ def serve(
               default=False,
               help="Flag for HF transformers.")
 @click.option(
+    "--config",
     "--extra_encoder_options",
+    "extra_encoder_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
+    "Prefer --config over --extra_encoder_options.")
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--free_gpu_memory_fraction",
+              type=float,
+              default=0.9,
+              help="Free GPU memory fraction reserved for KV Cache, "
+              "after allocating model weights and buffers.")
+@click.option("--tensor_parallel_size",
+              "--tp_size",
+              type=int,
+              default=1,
+              help="Tensor parallelism size.")
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -968,7 +1006,8 @@ def serve(
 def serve_encoder(model: str, host: str, port: int, log_level: str,
                   max_batch_size: int, max_num_tokens: int,
                   gpus_per_node: Optional[int], trust_remote_code: bool,
-                  extra_encoder_options: Optional[str],
+                  extra_encoder_options: Optional[str], revision: Optional[str],
+                  free_gpu_memory_fraction: float, tensor_parallel_size: int,
                   metadata_server_config_file: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -976,12 +1015,19 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     """
     logger.set_level(log_level)
 
-    # TODO: expose more arguments progressively
-    llm_args, _ = get_llm_args(model=model,
-                               max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               gpus_per_node=gpus_per_node,
-                               trust_remote_code=trust_remote_code)
+    if "--extra_encoder_options" in sys.argv:
+        logger.warning(
+            "--extra_encoder_options is deprecated, use --config instead.")
+
+    llm_args, _ = get_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        gpus_per_node=gpus_per_node,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        tensor_parallel_size=tensor_parallel_size)
 
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
@@ -998,10 +1044,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
 
 @click.command("disaggregated")
 @click.option("-c",
+              "--config",
               "--config_file",
+              "config_file",
               type=str,
               default=None,
-              help="Specific option for disaggregated mode.")
+              help="Path to the disaggregated serving configuration YAML file.")
 @click.option("-m",
               "--metadata_server_config_file",
               type=str,
@@ -1045,6 +1093,9 @@ def disaggregated(
         logger.warning(
             "--metrics-log-interval is deprecated and not connected to any "
             "functionality. This option will be removed in a future release.")
+
+    if "--config_file" in sys.argv:
+        logger.warning("--config_file is deprecated, use --config instead.")
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
@@ -1098,10 +1149,12 @@ def set_cuda_device():
 
 @click.command("disaggregated_mpi_worker")
 @click.option("-c",
+              "--config",
               "--config_file",
+              "config_file",
               type=str,
               default=None,
-              help="Specific option for disaggregated mode.")
+              help="Path to the disaggregated serving configuration YAML file.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
