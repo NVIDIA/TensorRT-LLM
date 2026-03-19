@@ -348,27 +348,23 @@ class TestTokenBudget:
 class TestDraftTokenBudget:
     def test_ctx_fits_draft_exceeds_budget(self):
         """ctx(80) fits in budget=100, but 80+30=110 > 100.
-        Should schedule ctx and discard excess drafts via _fit_draft_tokens_single.
+        V2 scheduler checks ctx+draft as a single unit, so this breaks.
         """
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=100)
         req = make_ctx_request(0, context_remaining_length=80, num_draft_tokens=30)
         out = sched.schedule_request([req], set())
-        assert len(out.context_requests) == 1
-        # _fit_draft_tokens_single should have been called, possibly discarding some drafts
-        assert req.context_chunk_size == 80
+        assert len(out.context_requests) == 0
 
     def test_ctx_fits_exactly_draft_pushes_over(self):
         """ctx(100) fits in budget=100, but 100+5=105 > 100.
-        Should schedule ctx, discard all drafts (100%64=36, space=28, but budget_remaining=0).
+        V2 scheduler checks ctx+draft as a single unit, so this breaks.
         """
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=100)
         req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=5)
         out = sched.schedule_request([req], set())
-        assert len(out.context_requests) == 1
-        # Budget remaining after ctx = 0, so all 5 drafts discarded
-        req.discard_draft_tokens.assert_called_once_with(5)
+        assert len(out.context_requests) == 0
 
     def test_ctx_plus_draft_fits_exactly(self):
         """ctx(80) + draft(20) = 100 == budget. Should schedule with all drafts."""
@@ -1222,44 +1218,48 @@ class TestDraftTokenFitting:
         req.discard_draft_tokens.assert_not_called()
 
     def test_draft_exceeds_page_remainder(self):
-        """chunk=128, tokens_per_block=64. 128%64=0, space=0. draft=5 all discarded."""
+        """chunk=128, tokens_per_block=64. V2 scheduler adds full draft_len
+        to chunk_tokens without page-remainder trimming."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
         req = make_ctx_request(0, context_remaining_length=128, num_draft_tokens=5)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
-        req.discard_draft_tokens.assert_called_once_with(5)
+        # V2 does not trim drafts to page remainder — full draft_len included
+        req.discard_draft_tokens.assert_not_called()
 
     def test_draft_partially_fits(self):
-        """chunk=100, tokens_per_block=64. space=28. draft=30 → discard 2."""
+        """chunk=100, tokens_per_block=64. V2 scheduler adds full draft_len
+        to chunk_tokens without page-remainder trimming."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
         req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=30)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
-        req.discard_draft_tokens.assert_called_once_with(2)
+        # V2 does not trim drafts — full draft_len included
+        req.discard_draft_tokens.assert_not_called()
 
     def test_budget_limits_draft_space(self):
-        """chunk=100, budget_after=10, draft=20. space=min(28,10)=10. discard 10."""
+        """chunk=100, draft=20, budget=110. V2 scheduler adds full draft_len
+        to chunk_tokens (100+20=120) which passes resize but budget tracks 120."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=110, ctx_chunk_config=(None, 64))
         req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=20)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
-        req.discard_draft_tokens.assert_called_once_with(10)
+        # V2 does not trim drafts — full draft_len included
+        req.discard_draft_tokens.assert_not_called()
 
     def test_max_context_length_limits_draft(self):
-        """max_context_length=110, chunk=100. remaining_space=min(28, 10)=10."""
+        """max_context_length=110, chunk=100, draft=20. V2 scheduler adds
+        full draft_len to chunk_tokens without trimming."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
-        # max_context_length = max_num_tokens = 110
         sched = make_scheduler(mgr, max_num_tokens=110, ctx_chunk_config=(None, 64))
         req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=20)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
-        # space = 28 (page remainder), but max_context_length remaining = 110-100=10
-        # budget_after = 110-100=10, space = min(28, 10, 10) = 10
-        # discard = 20 - 10 = 10
-        req.discard_draft_tokens.assert_called_once_with(10)
+        # V2 does not trim drafts — full draft_len included
+        req.discard_draft_tokens.assert_not_called()
 
     def test_draft_tokens_add_to_batch_budget(self):
         """Last chunk with draft: batch_num_tokens += chunk_size + num_draft_tokens."""
