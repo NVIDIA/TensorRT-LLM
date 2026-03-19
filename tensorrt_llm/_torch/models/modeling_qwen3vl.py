@@ -1036,15 +1036,15 @@ class Qwen3VLModelBase(PreTrainedModel):
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,
         ).to("cuda")
-        # self.mrope_position_ids_padding_cuda = torch.zeros(
-        #     (
-        #         3,
-        #         1,
-        #         config.max_position_embeddings,
-        #     ),
-        #     dtype=torch.int32,
-        #     device="cuda",
-        # )
+        self.mrope_position_ids_padding_cuda = torch.zeros(
+            (
+                3,
+                1,
+                config.max_position_embeddings,
+            ),
+            dtype=torch.int32,
+            device="cuda",
+        )
 
     @nvtx_range("Qwen3-VL prepare_mrope_config")
     def prepare_mrope_config(
@@ -1062,7 +1062,10 @@ class Qwen3VLModelBase(PreTrainedModel):
                 ctx_position_ids = position_ids[:, :, :-num_generation_requests]
             else:
                 ctx_position_ids = position_ids
-            cos, sin = self.rotary_emb.get_cos_sin(ctx_position_ids)
+            self.mrope_position_ids_padding_cuda[:, :, : ctx_position_ids.shape[-1]] = (
+                ctx_position_ids
+            )
+            cos, sin = self.rotary_emb.get_cos_sin(self.mrope_position_ids_padding_cuda)
             mrope_rotary_cos_sin = torch.stack((cos, sin), dim=-1).flatten(1)
         for multimodal_param in multimodal_params[num_context_requests:]:
             if multimodal_param.multimodal_data.get("mrope_config") is not None:

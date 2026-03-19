@@ -736,8 +736,11 @@ class KVCacheManager(BaseResourceManager):
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
             if use_mrope:
-                dummy_mrope_position_ids = torch.arange(
-                    0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
+                dummy_mrope_position_ids = torch.arange(0,
+                                                        token_num,
+                                                        dtype=torch.int32,
+                                                        device="cuda").expand(
+                                                            3, 1, -1).clone()
                 req.py_multimodal_data = {
                     "mrope_config": {
                         "mrope_position_ids": dummy_mrope_position_ids
@@ -745,7 +748,7 @@ class KVCacheManager(BaseResourceManager):
                 }
                 if is_gen:
                     dummy_mrope_position_deltas = torch.zeros(
-                        1, dtype=torch.int32).unsqueeze(0)
+                        1, dtype=torch.int32, device="cuda").unsqueeze(0)
                     req.py_multimodal_data["mrope_config"][
                         "mrope_position_deltas"] = dummy_mrope_position_deltas
             requests.append(req)
