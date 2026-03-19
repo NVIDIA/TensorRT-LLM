@@ -476,33 +476,28 @@ class UnquantizedLinearMethod(LinearMethodBase):
               output_buffer_kind: int = int(BufferKind.DEFAULT),
               group: Optional[List[int]] = None):
         if module.use_custom_cublas_mm:
-            output = torch.ops.trtllm.cublas_mm(input,
-                                                module.weight.t(),
-                                                bias,
-                                                out_dtype=None)
+            output = torch.ops.trtllm.cublas_mm(
+                input,
+                module.weight.t(),
+                bias,
+                out_dtype=None,
+                output_buffer_kind=output_buffer_kind,
+                group=group)
         else:
             output = F.linear(input, module.weight, bias)
         return output
 
-    def apply_out_uses_out(self, module: 'Linear') -> bool:
-        """Return True if apply_out() will write the result into the `out` buffer.
-
-        When False, Linear.forward skips the NCCL window allocation entirely so
-        that create_nccl_window_tensor never appears in the torch.compile FX
-        graph (avoiding piecewise CUDA-graph optimizer failures caused by the
-        dead side-effectful op).
-        """
-        return module.use_custom_cublas_mm
-
-    def apply_out(self, module: Linear, input: torch.Tensor,
-                  bias: Optional[torch.Tensor], out: torch.Tensor):
-        # torch.matmul(out=) is not used: it produces auto_functionalized(aten.mm.out)
-        # under torch.compile which breaks the piecewise CUDA-graph optimizer.
-        # cublas_mm_out requires use_custom_cublas_mm=True (weight in cuBLAS layout).
-        if not module.use_custom_cublas_mm:
-            return self.apply(module, input, bias)
-        return torch.ops.trtllm.cublas_mm_out(input, module.weight.t(), bias,
-                                              out)
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        # cublas_mm supports output_buffer_kind natively (no alias annotation).
+        # Falls back to apply() without window if use_custom_cublas_mm=False,
+        # since F.linear does not support output_buffer_kind.
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
+                          group=group)
 
     def load_weights_vanilla(self,
                              module: Linear,
@@ -669,34 +664,6 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
-
-    def apply_out_uses_out(self, module: 'Linear') -> bool:
-        return True  # cublas_scaled_mm_out always writes into `out`
-
-    def apply_out(self, module: Linear, input: torch.Tensor,
-                  bias: Optional[torch.Tensor], out: torch.Tensor):
-        # Pre-quantize input (same path as apply()).
-        original_shape = input.shape
-        if input.dim() > 2:
-            input = input.reshape(-1, input.shape[-1])
-        cur_input_scale = module.input_scale
-        if input.dtype != torch.float8_e4m3fn:
-            if module.input_scale is not None and not module.force_dynamic_quantization:
-                qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    input, module.input_scale)
-            else:
-                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
-                    input)
-                cur_input_scale = cur_input_scale.to(torch.float32)
-        else:
-            qinput = input
-        out_2d = out.reshape(-1, out.shape[-1]) if out.dim() > 2 else out
-        torch.ops.trtllm.cublas_scaled_mm_out(qinput, module.weight.t(),
-                                              cur_input_scale,
-                                              module.weight_scale, bias, out_2d)
-        if len(original_shape) > 2:
-            out = out_2d.reshape(*original_shape[:-1], out_2d.shape[-1])
-        return out
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -989,19 +956,6 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
-
-    def apply_out(self, module: Linear, input: torch.Tensor,
-                  bias: Optional[torch.Tensor], out: torch.Tensor):
-        return self.apply(module, input, bias)
-
-    def apply_window_output(self, module: Linear, input: torch.Tensor,
-                            bias: Optional[torch.Tensor]):
-        group = module.mapping.tp_group if module.mapping is not None else None
-        return self.apply(module,
-                          input,
-                          bias,
-                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
-                          group=group)
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
@@ -2827,25 +2781,6 @@ class Linear(nn.Module):
                                               "apply_window_output"):
                         output = self.quant_method.apply_window_output(
                             self, input, bias)
-                    elif (use_window and hasattr(self.quant_method, "apply_out")
-                          and self.quant_method.apply_out_uses_out(self)):
-                        # apply_out_uses_out() confirms that apply_out() will
-                        # actually write into the pre-allocated window buffer.
-                        # Skip this branch when apply_out() would ignore `out`
-                        # (e.g. UnquantizedLinearMethod without cuBLAS layout,
-                        # FP8BlockScalesLinearMethod) to avoid tracing the
-                        # side-effectful create_nccl_window_tensor op into the
-                        # FX graph unnecessarily.
-                        output_shape = list(input.shape)
-                        output_shape[-1] = self.out_features
-                        window_out = self.all_reduce.get_nccl_window_for_shape(
-                            tuple(output_shape),
-                            all_reduce_params=all_reduce_params,
-                            like_tensor=input)
-                        output = (self.quant_method.apply_out(
-                            self, input, bias, window_out) if window_out
-                                  is not None else self.apply_linear(
-                                      input, bias, lora_params, layer_idx))
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)

@@ -305,12 +305,14 @@ Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at
 }
 
 Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias,
-    std::optional<c10::ScalarType> out_dtype)
+    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
+    c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
-    Tensor out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
+    Tensor out = torch_ext::allocate_output(
+        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
     return cublas_mm_out(mat_a, mat_b, bias, out);
 }
 
@@ -325,16 +327,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
         " -> (Tensor out)");
     m.def(
-        "cublas_scaled_mm_out(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " Tensor(a!) out) -> Tensor(a!)");
-    m.def("cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype) -> (Tensor out)");
-    m.def("cublas_mm_out(Tensor mat_a, Tensor mat_b, Tensor? bias, Tensor out) -> (Tensor out)");
+        "cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
+        " int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("cublas_scaled_mm", &tensorrt_llm::torch_ext::cublas_scaled_mm);
-    m.impl("cublas_scaled_mm_out", &tensorrt_llm::torch_ext::cublas_scaled_mm_out);
     m.impl("cublas_mm", &tensorrt_llm::torch_ext::cublas_mm);
-    m.impl("cublas_mm_out", &tensorrt_llm::torch_ext::cublas_mm_out);
 }

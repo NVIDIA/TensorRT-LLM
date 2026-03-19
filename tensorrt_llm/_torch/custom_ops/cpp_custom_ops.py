@@ -109,17 +109,6 @@ def _register_fake():
     def _(input, sizes, group, process_group):
         return allgather(input, sizes, group)
 
-    @torch.library.register_fake("trtllm::cublas_scaled_mm_out")
-    def _(
-        mat_a: torch.Tensor,
-        mat_b: torch.Tensor,
-        scale_a: torch.Tensor,
-        scale_b: torch.Tensor,
-        bias,
-        out: torch.Tensor,
-    ):
-        return out
-
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
     def _(
         mat_a: torch.Tensor,
@@ -153,16 +142,17 @@ def _register_fake():
         return ret
 
     @torch.library.register_fake("trtllm::cublas_mm")
-    def _(mat_a, mat_b, bias, out_dtype):
+    def _(mat_a,
+          mat_b,
+          bias,
+          out_dtype,
+          output_buffer_kind: int = 0,
+          group: Optional[List[int]] = None):
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
-
-    @torch.library.register_fake("trtllm::cublas_mm_out")
-    def _(mat_a, mat_b, bias, out):
-        return out
 
     @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
