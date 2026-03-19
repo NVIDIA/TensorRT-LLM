@@ -401,11 +401,12 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         req.context_chunk_size = chunk_size
 
-        # Draft tokens for last chunk (included in both budget and resize)
-        draft_len = get_draft_token_length(req)
+        # Draft tokens only matter for last chunk (budget + resize)
         chunk_tokens = chunk_size
-        if req.is_last_context_chunk and draft_len > 0:
-            chunk_tokens += draft_len
+        if req.is_last_context_chunk:
+            draft_len = get_draft_token_length(req)
+            if draft_len > 0:
+                chunk_tokens += draft_len
 
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
