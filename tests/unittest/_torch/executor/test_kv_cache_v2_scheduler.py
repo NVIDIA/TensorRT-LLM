@@ -48,6 +48,7 @@ def make_gen_request(
     req.get_beam_width_by_iter.return_value = beam_width
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
+    req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
     req.lora_task_id = lora_task_id
     req.is_context_init_state = False
     req.is_generation_in_progress_state = True
@@ -74,6 +75,7 @@ def make_ctx_request(
     req.context_current_position = 0
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
+    req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
     req.is_first_context_chunk = is_first_context_chunk
     req.is_last_context_chunk = is_last_context_chunk
     req.context_chunk_size = 0

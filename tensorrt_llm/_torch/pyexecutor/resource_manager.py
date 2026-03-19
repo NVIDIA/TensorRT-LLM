@@ -1957,17 +1957,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
-        Grows *current_capacity* by 1 + draft tokens, then clamps to at
-        least the minimum required by the attention kernel (which adds
-        ``num_extra_kv_tokens`` for one-model MTP).  After
-        ``update_resources`` rewinds rejected draft tokens, capacity may
-        drop below this minimum.
+        Grows *current_capacity* by 1 + draft tokens.
         """
         draft_len = get_draft_token_length(req)
-        new_capacity = current_capacity + 1 + draft_len
-        min_required = (req.max_beam_num_tokens + 1 + draft_len +
-                        self.num_extra_kv_tokens)
-        return max(new_capacity, min_required)
+        return current_capacity + 1 + draft_len
 
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
