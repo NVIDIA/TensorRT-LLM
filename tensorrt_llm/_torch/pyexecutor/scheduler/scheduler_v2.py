@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
@@ -20,6 +21,86 @@ from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState
 from .scheduler import RequestList, RequestScheduler, SchedulerOutput
+
+
+class ScheduleAction(enum.Enum):
+    """Result of a per-request scheduling attempt."""
+
+    SCHEDULED = "scheduled"  # success — payload contains tokens etc.
+    SKIP = "skip"  # skip this request, continue the loop
+    STOP = "stop"  # stop the scheduling loop
+
+
+class BudgetTracker:
+    """Tracks token, request, and PEFT budgets for one scheduling iteration.
+
+    Centralizes the budget logic that was previously spread across the main
+    scheduling loop.  Designed for future extensibility to multiple memory
+    pools (e.g. Rubin) — callers interact through ``can_fit_tokens`` /
+    ``remaining_tokens`` / ``commit`` / ``peft_pages_needed`` without knowing the underlying pool
+    topology.
+    """
+
+    def __init__(
+        self,
+        max_num_tokens: Optional[int],
+        max_num_requests: int,
+        peft_cache_manager=None,
+    ):
+        self.max_num_tokens = max_num_tokens
+        self.max_num_requests = max_num_requests
+        self.num_tokens = 0
+        self.num_requests = 0
+
+        # PEFT accounting
+        self._peft_cache_manager = peft_cache_manager
+        self._max_peft_pages = (
+            peft_cache_manager.max_device_pages if peft_cache_manager is not None else 0
+        )
+        self._claimed_peft_pages = 0
+        self._seen_peft_task_ids: set[int] = set()
+
+    # ---- Token / request budget ----
+
+    @property
+    def requests_full(self) -> bool:
+        return self.num_requests >= self.max_num_requests
+
+    def can_fit_tokens(self, num_tokens: int) -> bool:
+        """Check if *num_tokens* fits within the remaining token budget."""
+        if self.max_num_tokens is not None and (self.num_tokens + num_tokens > self.max_num_tokens):
+            return False
+        return True
+
+    @property
+    def remaining_tokens(self) -> Optional[int]:
+        """Remaining token budget, or ``None`` if unlimited."""
+        if self.max_num_tokens is None:
+            return None
+        return self.max_num_tokens - self.num_tokens
+
+    def commit(self, req: LlmRequest, num_tokens: int, peft_pages: int) -> None:
+        """Record a successfully scheduled request's token and PEFT consumption."""
+        self.num_tokens += num_tokens
+        self.num_requests += 1
+        if peft_pages > 0:
+            lora_task_id = getattr(req, "lora_task_id", None)
+            self._claimed_peft_pages += peft_pages
+            self._seen_peft_task_ids.add(lora_task_id)
+
+    # ---- PEFT budget ----
+
+    def peft_pages_needed(self, req: LlmRequest) -> Optional[int]:
+        """Return PEFT pages needed for *req*, or ``None`` if budget exceeded."""
+        if self._peft_cache_manager is None:
+            return 0
+        lora_task_id = getattr(req, "lora_task_id", None)
+        if lora_task_id is None or lora_task_id in self._seen_peft_task_ids:
+            return 0
+        required = self._peft_cache_manager.determine_num_pages(req)
+        if self._claimed_peft_pages + required > self._max_peft_pages:
+            return None
+        return required
 
 
 class KVCacheV2Scheduler(RequestScheduler):
@@ -88,15 +169,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
 
-        # PEFT config (constant after construction)
-        self._max_peft_pages = (
-            peft_cache_manager.max_device_pages if peft_cache_manager is not None else 0
-        )
-
-        # PEFT accounting — reset at the start of each scheduling iteration
-        self._claimed_peft_pages = 0
-        self._seen_peft_task_ids: set[int] = set()
-
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
@@ -116,19 +188,22 @@ class KVCacheV2Scheduler(RequestScheduler):
             num_fitting_requests=len(scheduled_ctx) + len(scheduled_gen),
         )
 
+    # ---- Main scheduling loop ----
+
     def _schedule_loop(self, active_requests, inflight_request_ids):
         scheduled_ctx: RequestList = []
         scheduled_gen: RequestList = []
         evicted: RequestList = []
         disagg_candidates: RequestList = []
-        batch_num_tokens = 0
-        max_num_tokens = self.max_num_tokens
-        num_scheduled = 0
         scheduled_beam_width = 0
         has_chunking = False
-        # Reset PEFT accounting for this iteration
-        self._claimed_peft_pages = 0
-        self._seen_peft_task_ids.clear()
+
+        budget = BudgetTracker(
+            self.max_num_tokens,
+            self.max_num_requests,
+            self.peft_cache_manager,
+        )
+
         # TODO: block reuse skip optimization (_beneficial_to_skip).
         # V1 skips first-chunk ctx requests whose next block overlaps with
         # an executing chunked ctx's current chunk. Waiting one iteration
@@ -143,7 +218,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it = 0
 
         while req_it < req_it_end:
-            if num_scheduled >= self.max_num_requests:
+            if budget.requests_full:
                 break
 
             req = requests_list[req_it]
@@ -168,162 +243,144 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req_it += 1
                 continue
 
-            scheduled = False
-
-            peft_pages = self._check_peft(req)
-            if peft_pages < 0:
+            peft_pages = budget.peft_pages_needed(req)
+            if peft_pages is None:
                 break
 
-            # --- Encoder ---
+            # --- Dispatch by request type ---
             if req_state_value == self._encoder_init_state_value:
-                req_tokens = req.encoder_output_len
-                if max_num_tokens is not None and (batch_num_tokens + req_tokens > max_num_tokens):
+                action, tokens = self._try_schedule_encoder(req, budget)
+                if action is ScheduleAction.STOP:
                     break
-                assert self.max_context_length is None or req_tokens <= self.max_context_length, (
-                    f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
-                )
-                if not self.kv_cache_manager.prepare_context(req):
-                    logger.debug("prepare_context failed for encoder request %s", req.py_request_id)
-                    break
-                if self.kv_cache_manager.resize_context(req, req_tokens):
-                    self._commit_peft(req, peft_pages)
-                    scheduled_ctx.append(req)
-                    batch_num_tokens += req_tokens
-                    num_scheduled += 1
-                    scheduled = True
-                else:
-                    break
+                scheduled_ctx.append(req)
+                budget.commit(req, tokens, peft_pages)
 
-            # --- Context ---
             elif req_state_value == self._context_init_state_value:
-                if self.chunking_enabled:
-                    # Chunking uses implicit continue on failure (not break):
-                    # a ctx that can't be chunked small enough is skipped,
-                    # allowing subsequent gen requests (needing only ~1 token)
-                    # to still be scheduled.
-                    prev_len = len(scheduled_ctx)
-                    self._schedule_context_chunked(
-                        req, scheduled_ctx, batch_num_tokens, max_num_tokens, peft_pages
-                    )
-                    if len(scheduled_ctx) > prev_len:
-                        chunk_tokens = req.context_chunk_size
-                        if req.is_last_context_chunk and req.has_draft_tokens:
-                            chunk_tokens += req.num_draft_tokens
-                        has_chunking = has_chunking or (
-                            req.context_chunk_size < req.context_remaining_length
-                        )
-                        batch_num_tokens += chunk_tokens
-                        num_scheduled += 1
-                        scheduled = True
-                else:
-                    # Non-chunking: prepare first so block reuse updates
-                    # context_remaining_length before budget check.
-                    if not self.kv_cache_manager.prepare_context(req):
-                        logger.debug(
-                            "prepare_context failed for context request %s", req.py_request_id
-                        )
-                        break
-
-                    context_tokens = req.context_remaining_length
-
-                    if max_num_tokens is not None and (
-                        batch_num_tokens + context_tokens > max_num_tokens
-                    ):
-                        break
-
-                    assert (
-                        self.max_context_length is None or context_tokens <= self.max_context_length
-                    ), (
-                        f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
-                    )
-                    if self.kv_cache_manager.resize_context(req, context_tokens):
-                        self._commit_peft(req, peft_pages)
-                        req_tokens = context_tokens
-                        if req.has_draft_tokens:
-                            req.context_chunk_size = context_tokens
-                            budget_remaining = (
-                                (max_num_tokens - batch_num_tokens - context_tokens)
-                                if max_num_tokens is not None
-                                else None
-                            )
-                            self._fit_draft_tokens_single(req, budget_remaining)
-                            req_tokens += req.num_draft_tokens
-                        scheduled_ctx.append(req)
-                        batch_num_tokens += req_tokens
-                        num_scheduled += 1
-                        scheduled = True
-
-            # --- Generation ---
-            else:
-                beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
-                req_tokens = beam_width + req.num_draft_tokens
-
-                if max_num_tokens is not None and (batch_num_tokens + req_tokens > max_num_tokens):
+                action, tokens, chunking_flag = self._try_schedule_context(req, budget)
+                if action is ScheduleAction.STOP:
                     break
-
-                if scheduled_beam_width == 0:
-                    scheduled_beam_width = beam_width
-                elif scheduled_beam_width != beam_width:
+                if action is ScheduleAction.SKIP:
                     req_it += 1
                     continue
+                has_chunking = has_chunking or chunking_flag
+                scheduled_ctx.append(req)
+                budget.commit(req, tokens, peft_pages)
 
-                success = self.kv_cache_manager.try_allocate_generation(req)
-
-                if not success:
-                    req_it_end, success = self._try_evict_for_gen(
-                        req, requests_list, req_it, req_it_end, evicted
-                    )
-
-                if success:
-                    self._commit_peft(req, peft_pages)
-                    scheduled_gen.append(req)
-                    batch_num_tokens += req_tokens
-                    num_scheduled += 1
-                    scheduled = True
-                else:
-                    # Self-eviction: suspend this gen request to free its
-                    # GPU pages so other requests can resume().
-                    # Skip if already suspended — suspending again is a no-op
-                    # that frees no pages.
-                    if self.kv_cache_manager.is_request_active(req.py_request_id):
-                        logger.debug(
-                            "[V2Scheduler] Self-evicting request %s (state=%s) to free GPU pages",
-                            req.py_request_id,
-                            req.state,
-                        )
-                        self._suspend_request(req)
-                        evicted.append(req)
-
-            if scheduled:
-                req_it += 1
-            elif req_state_value == self._context_init_state_value:
-                # Context failure: skip and try next request — a
-                # smaller ctx behind this one may still fit.
-                req_it += 1
             else:
-                # Gen/encoder failure (including self-eviction): stop.
-                break
+                action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
+                    req,
+                    budget,
+                    requests_list,
+                    req_it,
+                    req_it_end,
+                    evicted,
+                    scheduled_beam_width,
+                )
+                if action is ScheduleAction.STOP:
+                    break
+                if action is ScheduleAction.SKIP:
+                    req_it += 1
+                    continue
+                scheduled_gen.append(req)
+                budget.commit(req, tokens, peft_pages)
+
+            req_it += 1
 
         return scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking
 
-    def _schedule_context_chunked(
-        self, req, scheduled_ctx, batch_num_tokens, max_num_tokens, peft_pages
-    ):
-        """FCFS interleaved chunking for a single context request."""
-        remaining_budget = (
-            (max_num_tokens - batch_num_tokens) if max_num_tokens is not None else None
+    # ---- Per-type scheduling methods ----
+
+    def _try_schedule_encoder(
+        self, req: LlmRequest, budget: BudgetTracker
+    ) -> tuple[ScheduleAction, int]:
+        """Try to schedule an encoder request.
+
+        Returns ``(action, tokens)`` where *tokens* is meaningful only
+        when *action* is ``SCHEDULED``.
+        """
+        req_tokens = req.encoder_output_len
+        if not budget.can_fit_tokens(req_tokens):
+            return ScheduleAction.STOP, 0
+        assert self.max_context_length is None or req_tokens <= self.max_context_length, (
+            f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
+        )
+        if not self.kv_cache_manager.prepare_context(req):
+            logger.debug("prepare_context failed for encoder request %s", req.py_request_id)
+            return ScheduleAction.STOP, 0
+        if not self.kv_cache_manager.resize_context(req, req_tokens):
+            return ScheduleAction.STOP, 0
+        return ScheduleAction.SCHEDULED, req_tokens
+
+    def _try_schedule_context(
+        self, req: LlmRequest, budget: BudgetTracker
+    ) -> tuple[ScheduleAction, int, bool]:
+        """Try to schedule a context request (chunked or non-chunked).
+
+        Returns ``(action, tokens, chunking_flag)``.  *tokens* and
+        *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
+        """
+        if self.chunking_enabled:
+            return self._try_schedule_context_chunked(req, budget)
+        return self._try_schedule_context_full(req, budget)
+
+    def _try_schedule_context_full(
+        self, req: LlmRequest, budget: BudgetTracker
+    ) -> tuple[ScheduleAction, int, bool]:
+        """Try to schedule a non-chunked context request.
+
+        Returns ``(action, tokens, chunking_flag)``.
+        """
+        # Prepare first so block reuse updates context_remaining_length
+        # before budget check.
+        if not self.kv_cache_manager.prepare_context(req):
+            logger.debug("prepare_context failed for context request %s", req.py_request_id)
+            return ScheduleAction.STOP, 0, False
+
+        context_tokens = req.context_remaining_length
+
+        if not budget.can_fit_tokens(context_tokens):
+            return ScheduleAction.STOP, 0, False
+
+        assert self.max_context_length is None or context_tokens <= self.max_context_length, (
+            f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
         )
 
-        # 1. Min budget check — need at least one chunk unit
-        if remaining_budget is not None and remaining_budget < self.chunk_unit_size:
-            return
+        if not self.kv_cache_manager.resize_context(req, context_tokens):
+            return ScheduleAction.SKIP, 0, False
 
-        # 2. Prepare context (create _KVCache, block reuse, resume — no resize)
+        req_tokens = context_tokens
+        if req.has_draft_tokens:
+            req.context_chunk_size = context_tokens
+            remaining = budget.remaining_tokens
+            budget_after = (remaining - context_tokens) if remaining is not None else None
+            self._fit_draft_tokens_single(req, budget_after)
+            req_tokens += req.num_draft_tokens
+
+        return ScheduleAction.SCHEDULED, req_tokens, False
+
+    def _try_schedule_context_chunked(
+        self, req: LlmRequest, budget: BudgetTracker
+    ) -> tuple[ScheduleAction, int, bool]:
+        """FCFS interleaved chunking for a single context request.
+
+        Returns ``(action, chunk_tokens, chunking_flag)``.
+
+        Chunking uses implicit skip on failure (not break): a ctx that can't
+        be chunked small enough is skipped, allowing subsequent gen requests
+        (needing only ~1 token) to still be scheduled.
+        """
+        remaining_budget = budget.remaining_tokens
+
+        # Min budget check — need at least one chunk unit
+        if remaining_budget is not None and remaining_budget < self.chunk_unit_size:
+            return ScheduleAction.SKIP, 0, False
+
+        # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self.kv_cache_manager.prepare_context(req):
             logger.debug("prepare_context failed for chunked context request %s", req.py_request_id)
-            return
+            return ScheduleAction.SKIP, 0, False
 
-        # 3. Calculate chunk size from remaining budget
+        # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
         context_remaining = req.context_remaining_length
         chunk_size = (
@@ -344,11 +401,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             # GPU pages. Currently we skip without suspend to avoid
             # pathological suspend/resume cycles. suspend_request is
             # only called from eviction (_try_evict_for_gen).
-            return
+            return ScheduleAction.SKIP, 0, False
 
-        # 5. Resize to chunk size
+        # Resize to chunk size
         if not self.kv_cache_manager.resize_context(req, chunk_size):
-            return
+            return ScheduleAction.SKIP, 0, False
 
         req.context_chunk_size = chunk_size
 
@@ -359,29 +416,63 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
             self._fit_draft_tokens_single(req, budget_after_chunk)
 
-        self._commit_peft(req, peft_pages)
-        scheduled_ctx.append(req)
+        chunk_tokens = req.context_chunk_size
+        if req.is_last_context_chunk and req.has_draft_tokens:
+            chunk_tokens += req.num_draft_tokens
+        chunking_flag = req.context_chunk_size < req.context_remaining_length
 
-    # ---- PEFT helpers ----
+        return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
 
-    def _check_peft(self, req: LlmRequest) -> int:
-        """Check PEFT pages. Returns required pages (>= 0) if fits, -1 if not."""
-        if self.peft_cache_manager is None:
-            return 0
-        lora_task_id = getattr(req, "lora_task_id", None)
-        if lora_task_id is None or lora_task_id in self._seen_peft_task_ids:
-            return 0
-        required = self.peft_cache_manager.determine_num_pages(req)
-        if self._claimed_peft_pages + required > self._max_peft_pages:
-            return -1
-        return required
+    def _try_schedule_generation(
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        requests_list: list,
+        req_it: int,
+        req_it_end: int,
+        evicted: RequestList,
+        scheduled_beam_width: int,
+    ) -> tuple[ScheduleAction, int, int, int]:
+        """Try to schedule a generation request.
 
-    def _commit_peft(self, req: LlmRequest, peft_pages: int) -> None:
-        """Commit PEFT page accounting after successful scheduling."""
-        if peft_pages > 0:
-            lora_task_id = getattr(req, "lora_task_id", None)
-            self._claimed_peft_pages += peft_pages
-            self._seen_peft_task_ids.add(lora_task_id)
+        Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
+        *tokens* is meaningful only when *action* is ``SCHEDULED``.
+        """
+        beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
+        req_tokens = beam_width + req.num_draft_tokens
+
+        if not budget.can_fit_tokens(req_tokens):
+            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+
+        if scheduled_beam_width == 0:
+            scheduled_beam_width = beam_width
+        elif scheduled_beam_width != beam_width:
+            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
+
+        success = self.kv_cache_manager.try_allocate_generation(req)
+
+        if not success:
+            req_it_end, success = self._try_evict_for_gen(
+                req, requests_list, req_it, req_it_end, evicted
+            )
+
+        if success:
+            return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
+
+        # Self-eviction: suspend this gen request to free its
+        # GPU pages so other requests can resume().
+        # Skip if already suspended — suspending again is a no-op
+        # that frees no pages.
+        if self.kv_cache_manager.is_request_active(req.py_request_id):
+            logger.debug(
+                "[V2Scheduler] Self-evicting request %s (state=%s) to free GPU pages",
+                req.py_request_id,
+                req.state,
+            )
+            self._suspend_request(req)
+            evicted.append(req)
+
+        return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
     # ---- Eviction ----
 
@@ -456,7 +547,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _fit_draft_tokens_single(self, req, budget_after_chunk):
         """Fit draft tokens into the last allocated page's remaining space."""
         chunk_size = req.context_chunk_size
-        # Use tokens_per_block (not _chunk_align_unit): draft tokens should
+        # Draft tokens should
         # fit within already-allocated pages to avoid extra page allocation.
         remainder = chunk_size % self.tokens_per_block
         remaining_space = 0 if remainder == 0 else self.tokens_per_block - remainder
