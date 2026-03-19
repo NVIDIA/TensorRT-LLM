@@ -3428,6 +3428,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
         # buffer_cache is used to cache the row_states and output buffers.
         buffer_cache = dict()
+        _kernel_class = SinglePassMultiCTARadixTopKKernel
+        _state_size = DISTRIBUTED_TOPK_STATE_SIZE
 
         @classmethod
         def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
@@ -3450,7 +3452,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             row_states_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
-                (n_groups, DISTRIBUTED_TOPK_STATE_SIZE),
+                (n_groups, cls._state_size),
                 stride_order=(1, 0),
                 assumed_align=32,
             )
@@ -3475,7 +3477,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
-            kernel_obj = SinglePassMultiCTARadixTopKKernel(
+            kernel_obj = cls._kernel_class(
                 dtype=dtype,
                 chunk_size=chunk_size,
                 top_k=top_k,
@@ -3635,11 +3637,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # across calls without re-zeroing (FlashInfer pattern).
             # extra buffer: 148 * 770 * 4 bytes = 452960 bytes = 440 KB
             if "row_states" not in cls.buffer_cache:
-                cls.buffer_cache["row_states"] = torch.zeros(
-                    num_sms,
-                    DISTRIBUTED_TOPK_STATE_SIZE,
-                    dtype=torch.int32,
-                    device="cuda")
+                cls.buffer_cache["row_states"] = torch.zeros(num_sms,
+                                                             cls._state_size,
+                                                             dtype=torch.int32,
+                                                             device="cuda")
             row_states = cls.buffer_cache["row_states"]
 
             # Allocate outputs
@@ -3667,101 +3668,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return output_indices_torch, output_values
 
-    class CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner:
+    class CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner(
+            CuteDSLTopKDecodeSinglePassMultiCTARunner):
         """Runner for cluster-accelerated single-pass multi-CTA radix top-k.
 
         Uses Blackwell cluster barriers and DSMEM for inter-CTA histogram
         merging instead of global memory atomics.  Only 1 int32 per group
         is needed in global memory (the output counter).
 
-        All methods are class-level — no instantiation needed.
+        Inherits compile, chunk heuristics, and forward from the base runner;
+        overrides _get_chunk_config (cluster-size clamping) and forward
+        (unsupported-size fallback).
         """
         kernel_cache = dict()
         buffer_cache = dict()
-
-        @classmethod
-        def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
-                     ctas_per_group, num_sms, return_val):
-            """Compile and cache a cluster top-k kernel."""
-            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
-                   ctas_per_group, num_sms, return_val)
-            if key in cls.kernel_cache:
-                return
-            n_rows = cute.sym_int()
-            n_cols = cute.sym_int()
-            n_batch = cute.sym_int()
-            n_groups = cute.sym_int()
-
-            input_fake = cute.runtime.make_fake_compact_tensor(
-                dtype,
-                (n_rows, n_cols),
-                stride_order=(1, 0),
-                assumed_align=32,
-            )
-            row_states_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_groups, CLUSTER_TOPK_STATE_SIZE),
-                stride_order=(1, 0),
-                assumed_align=32,
-            )
-            seqlen_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_batch, ),
-                stride_order=(0, ),
-            )
-            output_indices_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_rows, top_k),
-                stride_order=(1, 0),
-            )
-            if return_val:
-                output_values_fake = cute.runtime.make_fake_compact_tensor(
-                    dtype,
-                    (n_rows, top_k),
-                    stride_order=(1, 0),
-                )
-            else:
-                output_values_fake = None
-            fake_stream = cute.runtime.make_fake_stream(
-                use_tvm_ffi_env_stream=True)
-
-            kernel_obj = SinglePassMultiCTARadixTopKClusterKernel(
-                dtype=dtype,
-                chunk_size=chunk_size,
-                top_k=top_k,
-                next_n=next_n,
-                num_copy_bits=num_copy_bits,
-                ctas_per_group=ctas_per_group,
-                num_sms=num_sms,
-            )
-            compiled_kernel = cute.compile(
-                kernel_obj,
-                input_fake,
-                row_states_fake,
-                seqlen_fake,
-                output_indices_fake,
-                output_values_fake,
-                stream=fake_stream,
-                options="--enable-tvm-ffi",
-            )
-            cls.kernel_cache[key] = compiled_kernel
-
-        @classmethod
-        def _compute_max_chunk(cls,
-                               dtype,
-                               num_copy_bits: int = 256,
-                               max_smem: int = 227 * 1024):
-            """Compute the maximum chunk_size a single CTA can handle."""
-            # Overhead: local_histogram[256] + prefix_buf[256] + scalars[4] + warp_sums[8]
-            overhead = 256 * 4 * 2 + 16 + 8 * 4
-            if dtype == cutlass.Float32:
-                ordered_elem_size = 4
-            else:
-                ordered_elem_size = 2
-            vec_size = num_copy_bits // dtype.width
-            max_chunk = (max_smem - overhead) // ordered_elem_size
-            max_chunk = (max_chunk // vec_size) * vec_size
-            return max_chunk, vec_size
+        _kernel_class = SinglePassMultiCTARadixTopKClusterKernel
+        _state_size = CLUSTER_TOPK_STATE_SIZE
 
         @classmethod
         def _get_chunk_config(cls,
@@ -3770,51 +3692,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                               chunk_size: Optional[int] = None,
                               num_copy_bits: int = 256,
                               num_rows: int = 1):
-            """Resolve chunk_size and ctas_per_group.
-
-            Same heuristic as the non-cluster runner, but clamped to the
-            hardware max cluster size.  Returns None for all fields when
-            the problem size exceeds what the cluster kernel can handle.
+            """Resolve chunk_size and ctas_per_group, clamped to hw max cluster.
 
             Returns:
                 (chunk_size, ctas_per_group, vec_size) or (None, None, None)
             """
-            max_chunk, vec_size = cls._compute_max_chunk(dtype, num_copy_bits)
+            chunk_size, ctas_per_group, vec_size = super()._get_chunk_config(
+                dtype, num_cols, chunk_size, num_copy_bits, num_rows)
+
             hw_max_cluster = _query_max_cluster_size()
-
-            if chunk_size is not None:
-                chunk_size = min(chunk_size, max_chunk)
-                chunk_size = (chunk_size // vec_size) * vec_size
-                if chunk_size < vec_size:
-                    chunk_size = vec_size
-            else:
-                num_sms = _get_num_sms()
-                ideal_ctas_per_group = max(1, num_sms // max(num_rows, 1))
-
-                if ideal_ctas_per_group <= 1:
-                    ctas_per_group = math.ceil(num_cols / max_chunk)
-                    if ctas_per_group < 1:
-                        ctas_per_group = 1
-                    chunk_size = math.ceil(num_cols / ctas_per_group)
-                    chunk_size = (
-                        (chunk_size + vec_size - 1) // vec_size) * vec_size
-                    if chunk_size > max_chunk:
-                        chunk_size = max_chunk
-                else:
-                    chunk_size = math.ceil(num_cols / ideal_ctas_per_group)
-                    chunk_size = max(chunk_size, 8192)
-                    ctas_per_group = math.ceil(num_cols / chunk_size)
-                    if ctas_per_group == 2 and chunk_size < 32768:
-                        chunk_size = num_cols
-                    snap_up = 1 << math.ceil(math.log2(max(chunk_size, 1)))
-                    if snap_up > max_chunk:
-                        snap_up = 1 << int(math.log2(max_chunk))
-                    chunk_size = snap_up
-
-            ctas_per_group = math.ceil(num_cols / chunk_size)
-
-            # Clamp to hardware max cluster size
             if ctas_per_group > hw_max_cluster:
+                max_chunk, vec_size = cls._compute_max_chunk(
+                    dtype, num_copy_bits)
                 chunk_size = math.ceil(num_cols / hw_max_cluster)
                 chunk_size = (
                     (chunk_size + vec_size - 1) // vec_size) * vec_size
@@ -3828,17 +3717,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ctas_per_group = math.ceil(num_cols / chunk_size)
 
             return chunk_size, ctas_per_group, vec_size
-
-        @classmethod
-        def _get_possible_chunk_sizes(cls, dtype, num_copy_bits: int = 256):
-            """Return all possible chunk_size values the auto heuristic can produce."""
-            max_chunk, _ = cls._compute_max_chunk(dtype, num_copy_bits)
-            sizes = []
-            cs = 8192
-            while cs <= max_chunk:
-                sizes.append(cs)
-                cs *= 2
-            return sizes
 
         @classmethod
         def forward(
@@ -3859,8 +3737,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """
             torch_dtype = input_values.dtype
             dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
-            num_rows, num_cols = input_values.shape
-            num_sms = _get_num_sms()
+            num_cols = input_values.shape[1]
 
             max_chunk, _ = cls._compute_max_chunk(dtype, num_copy_bits)
             hw_max_cluster = _query_max_cluster_size()
@@ -3874,54 +3751,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"Falling back to non-cluster runner.")
                 return None, None
 
-            chunk_size, ctas_per_group, _ = cls._get_chunk_config(
-                dtype, num_cols, chunk_size, num_copy_bits, num_rows=num_rows)
-
-            if chunk_size is None:
+            result = super().forward(input_values, seq_lens, top_k, next_n,
+                                     return_val, num_copy_bits, chunk_size,
+                                     output_indices)
+            if result[0] is None:
                 return None, None
-
-            num_groups = min(num_sms // ctas_per_group, num_rows)
-            if num_groups < 1:
-                num_groups = 1
-
-            cls._compile(dtype, chunk_size, top_k, next_n, num_copy_bits,
-                         ctas_per_group, num_sms, return_val)
-            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
-                   ctas_per_group, num_sms, return_val)
-            compiled_kernel = cls.kernel_cache[key]
-
-            # Cluster kernel uses only 1 int32 per group (output counter).
-            if "row_states" not in cls.buffer_cache:
-                cls.buffer_cache["row_states"] = torch.zeros(
-                    num_sms,
-                    CLUSTER_TOPK_STATE_SIZE,
-                    dtype=torch.int32,
-                    device="cuda")
-            row_states = cls.buffer_cache["row_states"]
-
-            if output_indices is not None:
-                output_indices_torch = output_indices
-            else:
-                output_indices_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_indices", (num_rows, top_k),
-                    torch.int32)
-            if return_val:
-                output_values = _get_or_alloc_buffer(cls.buffer_cache,
-                                                     "output_values",
-                                                     (num_rows, top_k),
-                                                     torch_dtype)
-            else:
-                output_values = None
-
-            compiled_kernel(
-                input_values,
-                row_states,
-                seq_lens,
-                output_indices_torch,
-                output_values,
-            )
-
-            return output_indices_torch, output_values
+            return result
 
     @torch.library.custom_op("trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
                              mutates_args=(),
