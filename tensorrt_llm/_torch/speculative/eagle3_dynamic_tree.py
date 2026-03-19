@@ -208,15 +208,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         return output
 
     def _relocate_kv_eagerly(self, attn_metadata, batch_size):
-        """Move accepted draft tokens' KV from tree to linear positions.
-
-        Uses pre-allocated buffers to avoid per-call GPU allocations
-        (required for CUDA graph compatibility).
-        """
-        if self._last_num_accepted is None:
-            return
+        """Move accepted draft tokens' KV from tree to linear positions."""
         cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
-        if cache_mgr is None:
+        if self._last_num_accepted is None or cache_mgr is None:
             return
 
         num_contexts = attn_metadata.num_contexts
