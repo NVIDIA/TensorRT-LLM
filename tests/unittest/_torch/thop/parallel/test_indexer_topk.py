@@ -437,7 +437,6 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta(
 def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
-
     def run_fn(logits, seq_lens):
         result = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
             input_values=logits,

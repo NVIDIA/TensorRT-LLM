@@ -67,10 +67,9 @@ def _query_max_cluster_size() -> int:
     config.numAttrs = 0
     config.attrs = []
 
-    cluster_size = hw._checkCudaErrors(
-        driver.cuOccupancyMaxPotentialClusterSize(func, config)
-    )
+    cluster_size = hw._checkCudaErrors(driver.cuOccupancyMaxPotentialClusterSize(func, config))
     return cluster_size
+
 
 # ---------------------------------------------------------------------------
 # Global-state layout constants (cluster variant)
@@ -153,9 +152,7 @@ def mapa_shared_cluster(smem_ptr, peer_rank):
 
 
 @dsl_user_op
-def _ld_shared_cluster_i32(
-    mapped_addr: CuteInt32, *, loc=None, ip=None
-) -> CuteInt32:
+def _ld_shared_cluster_i32(mapped_addr: CuteInt32, *, loc=None, ip=None) -> CuteInt32:
     """Load int32 from cluster SMEM address.
 
     PTX: ld.shared::cluster.u32 $0, [$1];
@@ -960,9 +957,7 @@ class SinglePassMultiCTARadixTopKClusterKernel:
         # ---- Global state pointer (output counter only) ----
         if cutlass.const_expr(ctas_per_group > 1):
             state_size = cutlass.const_expr(STATE_SIZE)
-            output_counter_ptr = row_states.iterator + cutlass.Int32(
-                group_id * state_size
-            )
+            output_counter_ptr = row_states.iterator + cutlass.Int32(group_id * state_size)
             # Defensive init: ensure output_counter is 0 before the first
             # row, even if row_states was allocated with torch.empty.
             # No barrier needed — the round-0 cluster barrier in the first

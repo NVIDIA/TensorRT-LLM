@@ -326,10 +326,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         SinglePassMultiCTARadixTopKKernel
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
-    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
-        SinglePassMultiCTARadixTopKClusterKernel
-    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
-        _query_max_cluster_size
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
+        SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -3818,7 +3816,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Clamp to hardware max cluster size
             if ctas_per_group > hw_max_cluster:
                 chunk_size = math.ceil(num_cols / hw_max_cluster)
-                chunk_size = ((chunk_size + vec_size - 1) // vec_size) * vec_size
+                chunk_size = (
+                    (chunk_size + vec_size - 1) // vec_size) * vec_size
                 if chunk_size > max_chunk:
                     logger.warning(
                         f"Cluster top-k: num_cols={num_cols} requires "
@@ -4314,24 +4313,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # _get_chunk_config (which clamps to hw max cluster size).
             cluster_configs = set()
             if single_pass_multi_cta_cluster:
-                for log2_n in range(min_seq_len_log2,
-                                    max_seq_len_log2 + 1):
+                for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
                     num_cols = 1 << log2_n
                     for nr in [1, 4, 16, 64, 256]:
                         cfg = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._get_chunk_config(
-                            cutlass_dtype, num_cols,
-                            num_copy_bits=num_copy_bits, num_rows=nr)
+                            cutlass_dtype,
+                            num_cols,
+                            num_copy_bits=num_copy_bits,
+                            num_rows=nr)
                         if cfg[0] is not None:
                             cluster_configs.add((cfg[0], cfg[1]))
                 for cs, ctas in sorted(cluster_configs):
                     CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._compile(
-                        cutlass_dtype, cs, top_k, next_n, num_copy_bits,
-                        ctas, num_sms, return_val)
+                        cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
+                        num_sms, return_val)
 
             multi_cta_info = (
                 f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs"
-                f", cluster {len(cluster_configs)} configs)"
-            )
+                f", cluster {len(cluster_configs)} configs)")
         else:
             # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
             # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)
