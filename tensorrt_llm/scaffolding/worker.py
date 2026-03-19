@@ -20,7 +20,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from .result import ScaffoldingOutput
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
-                   MCPCallTask, StreamGenerationTask, Task, TaskStatus)
+                   MCPCallTask, StreamGenerationTask, Task, TaskStatus,
+                   TokenizeTask)
 
 ExecutorCls = GenerationExecutor
 
@@ -225,10 +226,28 @@ class OpenaiWorker(Worker):
             return TaskStatus.WORKER_EXECEPTION
         return TaskStatus.SUCCESS
 
+    async def tokenize_handler(self, task: TokenizeTask) -> TaskStatus:
+        base_url = str(self.async_client.base_url)
+        if not base_url.endswith("/"):
+            base_url += "/"
+        url = base_url + "tokenize"
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url,
+                                             json={"prompt": task.content})
+            if response.status_code != 200:
+                return TaskStatus.WORKER_EXECEPTION
+            task.token_count = response.json().get("count", 0)
+            return TaskStatus.SUCCESS
+        except Exception as e:
+            print('Tokenize request got exception: ' + str(e))
+            return TaskStatus.WORKER_EXECEPTION
+
     task_handlers = {
         GenerationTask: generation_handler,
         ChatTask: chat_handler,
-        DropKVCacheTask: drop_kv_cache_handler
+        DropKVCacheTask: drop_kv_cache_handler,
+        TokenizeTask: tokenize_handler,
     }
 
 

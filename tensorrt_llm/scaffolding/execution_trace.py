@@ -54,6 +54,9 @@ class TraceEvent:
     num_branches: Optional[int] = None
     children: Optional[List["TraceEvent"]] = None
 
+    # -- tokenization annotation (filled by tokenize_trace_scope) --
+    tokenize_count: Optional[int] = None
+
 
 @dataclass
 class ExecutionTrace:

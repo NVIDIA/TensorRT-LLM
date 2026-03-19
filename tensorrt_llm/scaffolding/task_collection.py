@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 from .controller import Controller, ParallelProcess
 from .execution_scope import current_scope
 from .execution_trace import ExecutionTrace, TraceEvent
-from .task import ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask, Task
+from .task import (ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask,
+                   Task, TokenizeTask)
 
 
 class TaskCollection:
@@ -868,5 +869,123 @@ def drop_kv_cache_scope():
 
         controller_cls_with_chat_collection.process = new_process
         return controller_cls_with_chat_collection
+
+    return decorator
+
+
+class TokenizeWorkerTag(Enum):
+    TOKENIZE = "tokenize"
+
+
+def _collect_tokenizable_events(events: List[TraceEvent]) -> List[TraceEvent]:
+    """Collect all user/system message events, including children of parallel_start."""
+    result = []
+    for event in events:
+        if event.event_type == "message" and event.role in ("system", "user"):
+            result.append(event)
+        if event.children:
+            result.extend(_collect_tokenizable_events(event.children))
+    return result
+
+
+def _collect_all_message_events(
+        events: List[TraceEvent]) -> List[TraceEvent]:
+    """Collect all message events (any role), including children of parallel_start."""
+    result = []
+    for event in events:
+        if event.event_type == "message":
+            result.append(event)
+        if event.children:
+            result.extend(_collect_all_message_events(event.children))
+    return result
+
+
+def _correct_system_tokenize_counts(events: List[TraceEvent]) -> None:
+    """Correct the tokenize_count of system messages using assistant prompt_tokens.
+
+    For each conversation_id, find the first assistant message with
+    prompt_tokens, then subtract the tokenize_count of each preceding
+    user message. The remainder is assigned to the first system message,
+    capturing hidden tokens (e.g. tool definitions) that the naive
+    per-content tokenization misses.
+    """
+    all_msgs = _collect_all_message_events(events)
+
+    # Group by conversation_id (skip events without one)
+    convs: Dict[int, List[TraceEvent]] = {}
+    for msg in all_msgs:
+        cid = msg.conversation_id
+        if cid is None:
+            continue
+        convs.setdefault(cid, []).append(msg)
+
+    for cid, msgs in convs.items():
+        # Find the first assistant message that has prompt_tokens
+        first_assistant = None
+        assistant_idx = -1
+        for idx, m in enumerate(msgs):
+            if m.role == "assistant" and m.prompt_tokens is not None:
+                first_assistant = m
+                assistant_idx = idx
+                break
+        if first_assistant is None:
+            continue
+
+        remaining = first_assistant.prompt_tokens
+
+        # Walk backwards from just before the assistant to the first
+        # system message, subtracting user tokenize_counts
+        first_system = None
+        for m in reversed(msgs[:assistant_idx]):
+            if m.role == "user" and m.tokenize_count is not None:
+                remaining -= m.tokenize_count
+            elif m.role == "system":
+                first_system = m
+                break
+
+        if first_system is not None and remaining >= 0:
+            first_system.tokenize_count = remaining
+
+
+def tokenize_trace_scope():
+
+    def decorator(controller_cls: Type["Controller"]):
+        original_process = controller_cls.process
+
+        def new_process(self, tasks: List[Task], **kwargs):
+
+            def wrapper():
+                yield from original_process(self, tasks, **kwargs)
+
+                tracer = self.task_collections.get("execution_tracer")
+                if tracer is None:
+                    return
+
+                tokenizable_events = _collect_tokenizable_events(tracer.events)
+                if not tokenizable_events:
+                    return
+
+                tokenize_tasks = []
+                for event in tokenizable_events:
+                    tokenize_tasks.append(
+                        TokenizeTask(
+                            content=event.content,
+                            event=event,
+                            worker_tag=TokenizeWorkerTag.TOKENIZE,
+                        ))
+                yield tokenize_tasks
+
+                for task in tokenize_tasks:
+                    if task.token_count is not None and task.event is not None:
+                        task.event.tokenize_count = task.token_count
+
+                # Correct system message token counts using assistant
+                # prompt_tokens to account for tool definitions, etc.
+                _correct_system_tokenize_counts(tracer.events)
+
+            return wrapper()
+
+        controller_cls.process = new_process
+        return controller_cls
 
     return decorator

@@ -14,12 +14,13 @@ from .scaffolding_llm import ScaffoldingLlm
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, OpenAIToolDescription, RewardTask,
                    StreamGenerationTask, SystemMessage, Task, TaskStatus,
-                   UserMessage)
+                   TokenizeTask, UserMessage)
 from .task_collection import (ChatTokenCounter, DropKVCacheWorkerTag,
                               ExecutionTracer, GenerationTokenCounter,
                               QueryCollector, TaskCollection,
                               TaskMetricsCollector, TaskTimer,
-                              drop_kv_cache_scope, sub_request_node,
+                              TokenizeWorkerTag, drop_kv_cache_scope,
+                              sub_request_node, tokenize_trace_scope,
                               with_execution_tracing, with_task_collection)
 from .worker import (ApiaryMCPWorker, MCPWorker, OpenaiWorker, TRTLLMWorker,
                      TRTOpenaiWorker, Worker)
@@ -71,6 +72,9 @@ __all__ = [
     "ScaffoldingBenchRequest",
     "DropKVCacheWorkerTag",
     "drop_kv_cache_scope",
+    "TokenizeTask",
+    "TokenizeWorkerTag",
+    "tokenize_trace_scope",
     "ExecutionTrace",
     "TraceEvent",
     "ExecutionTracer",

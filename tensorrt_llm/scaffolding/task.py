@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Union
 
 import openai
 import torch
@@ -9,6 +11,9 @@ import torch
 from tensorrt_llm.executor.result import TokenLogprobs
 
 from .result import ScaffoldingOutput
+
+if TYPE_CHECKING:
+    from .execution_trace import TraceEvent
 
 
 @dataclass
@@ -365,3 +370,10 @@ class DropKVCacheTask(Task):
             message for message in chat_task.messages
             if message.role in ("system", "user")
         ]
+
+
+@dataclass
+class TokenizeTask(Task):
+    content: Optional[str] = None
+    event: Optional[TraceEvent] = None
+    token_count: Optional[int] = None

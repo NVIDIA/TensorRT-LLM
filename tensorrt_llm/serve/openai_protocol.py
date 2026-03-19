@@ -115,6 +115,26 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class TokenizeRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    prompt: Optional[str] = None
+    messages: Optional[List[OpenAIChatCompletionMessageParam]] = None
+
+    @model_validator(mode="after")
+    def check_prompt_or_messages(self):
+        if self.prompt is None and self.messages is None:
+            raise ValueError("Either 'prompt' or 'messages' must be provided")
+        if self.prompt is not None and self.messages is not None:
+            raise ValueError(
+                "Only one of 'prompt' or 'messages' should be provided")
+        return self
+
+
+class TokenizeResponse(OpenAIBaseModel):
+    count: int
+    tokens: Optional[List[int]] = None
+
+
 class ResponseFormat(OpenAIBaseModel):
     type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]

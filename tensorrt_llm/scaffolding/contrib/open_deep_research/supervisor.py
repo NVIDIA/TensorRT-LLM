@@ -36,8 +36,10 @@ from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     QueryCollector,
     TaskMetricsCollector,
+    TokenizeWorkerTag,
     drop_kv_cache_scope,
     sub_request_node,
+    tokenize_trace_scope,
     with_execution_tracing,
     with_task_collection,
 )
@@ -281,6 +283,7 @@ def create_open_deep_research_controller(
 
     if enable_tracing:
         supervisor_type = with_execution_tracing("Supervisor")(supervisor_type)
+        supervisor_type = tokenize_trace_scope()(supervisor_type)
 
     research_chat_with_tools_controller = chat_with_mcp_type(
         gerneration_controller, max_iterations=1
@@ -324,13 +327,17 @@ def create_open_deep_research_scaffolding_llm(
         enable_tracing=enable_tracing,
     )
 
+    workers = {
+        NativeGenerationController.WorkerTag.GENERATION: generation_worker,
+        ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
+        DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
+    }
+    if enable_tracing:
+        workers[TokenizeWorkerTag.TOKENIZE] = generation_worker
+
     scaffolding_llm = ScaffoldingLlm(
         supervisor_controller,
-        {
-            NativeGenerationController.WorkerTag.GENERATION: generation_worker,
-            ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
-            DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
-        },
+        workers,
         max_parallel_requests=max_parallel_requests,
     )
 
