@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -33,7 +33,6 @@ target_compile_definitions(context_attention_src PRIVATE USE_DEMO_BERT_PARAMS=1
 set_target_properties(
   context_attention_src PROPERTIES POSITION_INDEPENDENT_CODE ON
                                    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(context_attention_src PUBLIC trtllm_gen_fmha_interface)
 
 foreach(arch IN ITEMS 80 86 89 90 100 120)
   set(ARCH_ENABLED FALSE)

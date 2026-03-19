@@ -4,7 +4,7 @@ import torch
 
 
 @torch.compile
-def postprocess_video_tensor(video: torch.Tensor, remove_batch_dim: bool = True) -> torch.Tensor:
+def postprocess_video_tensor(video: torch.Tensor) -> torch.Tensor:
     """Post-process video tensor from VAE decoder output to final format.
 
     This is a more efficient implementation than using VideoProcessor for single-batch cases,
@@ -12,13 +12,9 @@ def postprocess_video_tensor(video: torch.Tensor, remove_batch_dim: bool = True)
 
     Args:
         video: Video tensor in (B, C, T, H, W) format from VAE decoder
-        remove_batch_dim: Whether to remove batch dimension. Default True for typical
-                         single-batch video generation.
 
     Returns:
-        Post-processed video tensor:
-        - If remove_batch_dim=True: (T, H, W, C) uint8 tensor
-        - If remove_batch_dim=False: (B, T, H, W, C) uint8 tensor
+        Post-processed video tensor in (B, T, H, W, C) uint8 format.
 
     Note:
         Assumes video values are in [-1, 1] range (standard VAE decoder output).
@@ -31,10 +27,6 @@ def postprocess_video_tensor(video: torch.Tensor, remove_batch_dim: bool = True)
 
     # Convert to uint8
     video = (video * 255).round().to(torch.uint8)
-
-    # Remove batch dimension if requested
-    if remove_batch_dim:
-        video = video[0]  # (B, T, H, W, C) -> (T, H, W, C)
 
     return video
 

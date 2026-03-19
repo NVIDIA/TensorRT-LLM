@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +31,7 @@ from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
+from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
 
 # Test fixtures for common tools
@@ -1447,6 +1448,48 @@ class TestDeepSeekV32Parser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+
+    def test_encode_messages_multi_turn_with_tool_calls(self):
+        """NVBug 5937478: encode_messages must handle dict-typed tool_call arguments.
+
+        chat_utils deserializes arguments to dict; encode_arguments_to_dsml
+        must not call json.loads() on it again.
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": "list files"
+            },
+            {
+                "role":
+                "assistant",
+                "content":
+                None,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": {
+                            "command": "ls"
+                        },  # dict, not str
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "content": "a.py b.py",
+                "tool_call_id": "c1"
+            },
+            {
+                "role": "user",
+                "content": "open a.py"
+            },
+        ]
+        result = encode_messages(messages, thinking_mode="chat")
+        assert '<｜DSML｜invoke name="bash">' in result
+        assert 'name="command"' in result
+        assert ">ls<" in result
 
 
 # ============================================================================

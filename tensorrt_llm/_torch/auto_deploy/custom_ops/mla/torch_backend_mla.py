@@ -29,6 +29,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -321,7 +322,7 @@ def _torch_mla_context_with_expansion(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=("mla_cache",))
 def torch_backend_mla_with_cache(
     # 5 tensor args (get_num_qkv_args = 5)
     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
@@ -340,6 +341,7 @@ def torch_backend_mla_with_cache(
     # Constants
     scale: Optional[float] = None,
     kv_lora_rank: int = 512,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Torch backend MLA with FlashInfer-compatible compressed cache.
 
@@ -364,7 +366,8 @@ def torch_backend_mla_with_cache(
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
     # Get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]
@@ -377,6 +380,9 @@ def torch_backend_mla_with_cache(
 
     # Define output shape: [B, S, N, v_head_dim]
     output_shape = (b, s, num_heads, v_head_dim)
+
+    num_total_tokens = num_prefill_tokens + num_decode
+    bs = b * s
 
     if s == 1:
         # =====================================================================
@@ -400,13 +406,11 @@ def torch_backend_mla_with_cache(
             v_head_dim,
             y,
         )
-
-        return y.unsqueeze(1)  # [B, 1, N, v_head_dim]
     else:
         # =====================================================================
         # Context phase: Expand and compute normal attention
         # =====================================================================
-        bs_view = (b * s,)
+        bs_view = (bs,)
 
         q_nope_flat = q_nope.contiguous().view(*bs_view, num_heads, qk_nope_head_dim)
         q_pe_flat = q_pe.contiguous().view(*bs_view, num_heads, qk_rope_head_dim)
@@ -434,7 +438,16 @@ def torch_backend_mla_with_cache(
             y,
         )
 
-        return y.view(*output_shape)
+    if out is not None:
+        out_flat = out.view(bs, num_heads, v_head_dim)
+        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
+        if num_total_tokens < bs:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
+    if s == 1:
+        return y.unsqueeze(1)  # [B, 1, N, v_head_dim]
+    return y.view(*output_shape)
 
 
 @torch_backend_mla_with_cache.register_fake
@@ -452,8 +465,12 @@ def torch_backend_mla_with_cache_fake(
     mla_cache: torch.Tensor,
     scale: Optional[float] = None,
     kv_lora_rank: int = 512,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch_backend_mla_with_cache."""
+    if out is not None:
+        return out.new_empty(0)
+
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[-1]
     out_features = kv_b_proj_weight.shape[0]

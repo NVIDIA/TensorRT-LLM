@@ -163,7 +163,13 @@ class KVCacheManager:
         self._life_cycles = LifeCycleRegistry(config)
         self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
         storage_config = create_storage_config(config)
-        self._storage = StorageManager(self._life_cycles, storage_config, config.tokens_per_block)
+        self._storage = StorageManager(
+            self._life_cycles,
+            storage_config,
+            config.tokens_per_block,
+            typical_batch=config.typical_step,
+            constraints=config.constraints,
+        )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
@@ -510,7 +516,9 @@ class KVCacheManager:
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
         avg_history_length: int = round(self._avg_sqr_history_length.value**0.5)
         if avg_capacity > 0:
-            self._target_ratio_list_gpu = ratio_from_length(avg_history_length, avg_capacity)
+            self._target_ratio_list_gpu = storage.constrain_ratio(
+                ratio_from_length(avg_history_length, avg_capacity)
+            )
         if avg_reused_length > 0:
             self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
 
