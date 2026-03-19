@@ -54,7 +54,9 @@ def create_nemotron_h_llm(model_folder,
         cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
         disable_overlap_scheduler=disable_overlap_scheduler,
         kv_cache_config=KvCacheConfig(
-            mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+            free_gpu_memory_fraction=0.5)
         if mamba_ssm_cache_dtype is not None else KvCacheConfig(),
         sampler_type="TRTLLMSampler",
         enable_chunked_prefill=enable_chunked_prefill,
