@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, _update_kv_cache_draft_token_location)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -515,6 +516,20 @@ class TestLlama(unittest.TestCase):
         is_spec_dec_dynamic_tree = True
         max_total_draft_tokens = gen_input_ids_0.size(-1) - 1
 
+        spec_tree_mgr = SpecTreeManager(
+            max_num_requests=1,
+            use_dynamic_tree=is_spec_dec_dynamic_tree,
+            max_total_draft_tokens=max_total_draft_tokens,
+            max_draft_len=max_total_draft_tokens,
+            eagle_choices=None,
+            dynamic_tree_max_topK=10,
+        )
+        # Populate with test data
+        spec_tree_mgr.spec_dec_position_offsets[:1, :].copy_(
+            spec_decoding_position_offsets.unsqueeze(0))
+        spec_tree_mgr.spec_dec_packed_mask[:1, :, :].copy_(
+            spec_decoding_packed_mask)
+
         attn_metadata_gen_phase_0 = metadata_cls(
             seq_lens=torch.tensor([gen_input_ids_0.size(-1)], dtype=torch.int),
             num_contexts=0,
@@ -543,6 +558,7 @@ class TestLlama(unittest.TestCase):
             max_total_draft_tokens=max_total_draft_tokens,
             is_target_model=True,
             model_is_wrapped=False,
+            spec_tree_manager=spec_tree_mgr,
         )
 
         gen_position_ids_0 = [
