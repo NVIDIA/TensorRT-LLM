@@ -1953,6 +1953,22 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
 
+    def _required_gen_capacity(self, req: LlmRequest,
+                               current_capacity: int) -> int:
+        """Compute generation KV cache capacity for a request.
+
+        Grows *current_capacity* by 1 + draft tokens, then clamps to at
+        least the minimum required by the attention kernel (which adds
+        ``num_extra_kv_tokens`` for one-model MTP).  After
+        ``update_resources`` rewinds rejected draft tokens, capacity may
+        drop below this minimum.
+        """
+        draft_len = get_draft_token_length(req)
+        new_capacity = current_capacity + 1 + draft_len
+        min_required = (req.max_beam_num_tokens + 1 + draft_len +
+                        self.num_extra_kv_tokens)
+        return max(new_capacity, min_required)
+
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
 
@@ -1968,17 +1984,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
-        draft_len = get_draft_token_length(req)
-        new_capacity = kv_cache.capacity + 1 + draft_len
-        # Ensure capacity covers kv_lens used by the attention kernel,
-        # which adds num_extra_kv_tokens (for one-model MTP).  After
-        # update_resources rewinds rejected draft tokens, capacity may
-        # drop below max_beam_num_tokens + num_extra_kv_tokens.
-        min_required = (req.max_beam_num_tokens + 1 + draft_len +
-                        self.num_extra_kv_tokens)
-        if new_capacity < min_required:
-            new_capacity = min_required
-        return kv_cache.resize(new_capacity)
+        return kv_cache.resize(
+            self._required_gen_capacity(req, kv_cache.capacity))
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
@@ -2125,22 +2132,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
-                draft_len = get_draft_token_length(req)
-                old_cap = kv_cache.capacity
-                new_cap = (old_cap + 1 + draft_len)
-                # The model engine computes kv_lens as:
-                #   (max_beam_num_tokens - 1) + (1 + num_draft_tokens) + extra
-                # But max_beam_num_tokens may increase by tokens_per_first_draft
-                # (= max_draft_len + 1) between prepare_resources and forward,
-                # because the current iteration's accepted tokens are committed.
-                # Account for this growth to ensure sufficient block allocation.
-                max_draft_len = self.num_extra_kv_tokens + 1
-                tokens_per_first_draft = max_draft_len + 1
-                main_kv_len = req.max_beam_num_tokens
-                needed_cap = (main_kv_len + tokens_per_first_draft + draft_len +
-                              self.num_extra_kv_tokens)
-                if new_cap < needed_cap:
-                    new_cap = needed_cap
+                new_cap = self._required_gen_capacity(req, kv_cache.capacity)
                 if not kv_cache.resize(new_cap):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
