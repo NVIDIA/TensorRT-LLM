@@ -46,13 +46,16 @@ TODO: Support other variants:
 """
 
 import operator
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, DefaultDict, Dict, Optional, Sequence, Tuple, Type
 
 import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+# Reuse the canonical key defined in trtllm_attention. Imported lazily inside
+# methods that need it to avoid circular imports at module level.
+from ...custom_ops.attention.trtllm_attention import _TRTLLM_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
@@ -1109,3 +1112,245 @@ def _get_position_ids(
     )
     rope_position_ids_cache["position_ids"] = position_ids
     return position_ids
+
+
+def _convert_flashinfer_to_thop_cos_sin(
+    fi_cache: torch.Tensor, rotary_embedding_dim: int
+) -> torch.Tensor:
+    """Convert FlashInfer cos_sin_cache format to thop.attention format.
+
+    FlashInfer: ``[max_pos, head_dim]`` where each row is
+        ``[cos_0, ..., cos_{d/2-1}, sin_0, ..., sin_{d/2-1}]``
+    thop: ``[1, max_pos * dim]`` with interleaved
+        ``[cos_0, sin_0, cos_1, sin_1, ...]`` per position (float2 layout)
+    """
+    half = rotary_embedding_dim // 2
+    cos_part = fi_cache[:, :half]  # [max_pos, d/2]
+    sin_part = fi_cache[:, half:]  # [max_pos, d/2]
+    # Interleave: stack along last dim → [max_pos, d/2, 2] → reshape to [1, max_pos * dim]
+    thop_cache = torch.stack([cos_part, sin_part], dim=-1)  # [max_pos, d/2, 2]
+    return thop_cache.reshape(1, -1).float()
+
+
+@TransformRegistry.register("fuse_rope_into_trtllm_attention")
+class FuseRopeIntoTrtllmAttention(BaseTransform):
+    """Fuse RoPE into trtllm attention op by rewiring Q/K to pre-RoPE inputs.
+
+    After this transform, thop.attention applies RoPE internally via its
+    ``position_embedding_type`` and ``rotary_cos_sin`` parameters, eliminating the
+    separate FlashInfer RoPE kernel and preserving fused QKV memory layout from
+    GEMM fusion.
+
+    Only handles ``flashinfer_rope`` with static ``cos_sin_cache`` (``get_attr``).
+    Dynamic/triton RoPE is skipped — falls back to existing no-fusion behavior.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        graph = gm.graph
+        num_fused = 0
+        # Cache: rope_node → (thop_tensor, position_embedding_type, rotary_embedding_dim)
+        rope_cache_nodes: Dict[Node, Tuple[torch.Tensor, int, int]] = {}
+
+        for attn_node in list(graph.nodes):
+            if not is_op(attn_node, torch.ops.auto_deploy.torch_attention):
+                continue
+
+            result = self._try_fuse_one(gm, attn_node, rope_cache_nodes, cm)
+            if result:
+                num_fused += 1
+
+        info = TransformInfo(
+            skipped=num_fused == 0,
+            num_matches=num_fused,
+            is_clean=num_fused == 0,
+            has_valid_shapes=num_fused == 0,
+        )
+        return gm, info
+
+    def _try_fuse_one(
+        self,
+        gm: GraphModule,
+        attn_node: Node,
+        rope_cache_nodes: Dict[Node, Tuple[torch.Tensor, int, int]],
+        cm: CachedSequenceInterface,
+    ) -> bool:
+        """Try to fuse RoPE into a single torch_attention node. Returns True on success."""
+        # Step 1: Get Q and K input nodes from the attention node
+        q_input, k_input = extract_op_args(attn_node, "query", "key")
+
+        if not isinstance(q_input, Node) or not isinstance(k_input, Node):
+            return False
+
+        # Step 2: Trace Q/K through operator.getitem to find a flashinfer_rope node
+        rope_node_q, q_item_idx = self._trace_to_rope(q_input)
+        rope_node_k, k_item_idx = self._trace_to_rope(k_input)
+
+        if rope_node_q is None or rope_node_k is None:
+            return False
+
+        # Both must come from the same rope node
+        if rope_node_q is not rope_node_k:
+            return False
+
+        # flashinfer_rope returns (q_rope, k_rope). After layout transposes,
+        # the getitem indices may be swapped relative to torch_attention args.
+        # Just verify that Q and K each map to one of {0, 1}.
+        if sorted([q_item_idx, k_item_idx]) != [0, 1]:
+            return False
+
+        # Step 3: Extract info from the rope node
+        # flashinfer_rope(q, k, position_ids, cos_sin_cache, is_neox)
+        rope_args = rope_node_q.args
+        if len(rope_args) < 4:
+            return False
+
+        # rope_args[0] is the Q input to flashinfer_rope (getitem[0] output)
+        # rope_args[1] is the K input to flashinfer_rope (getitem[1] output)
+        # Map based on which getitem index feeds the attention query/key.
+        pre_rope_q = rope_args[q_item_idx]  # pre-RoPE input that became attention's Q
+        pre_rope_k = rope_args[k_item_idx]  # pre-RoPE input that became attention's K
+        cos_sin_cache_node = rope_args[3]  # cos_sin_cache
+        is_neox = rope_args[4] if len(rope_args) > 4 else True
+
+        if not isinstance(pre_rope_q, Node) or not isinstance(pre_rope_k, Node):
+            return False
+        if not isinstance(cos_sin_cache_node, Node):
+            return False
+
+        # Step 4: Get the cos_sin_cache tensor value.
+        # The cache may be a static buffer (get_attr) or a runtime-computed node
+        # with a real tensor in meta["val"] (e.g., from _build_fused_cos_sin_cache).
+        fi_cache_tensor = None
+        cache_source = _trace_to_buffer_source(cos_sin_cache_node)
+        if cache_source is not None and cache_source.op == "get_attr":
+            try:
+                fi_cache_tensor = _get_nested_attr(gm, cache_source.target)
+                if fi_cache_tensor.is_meta:
+                    fi_cache_tensor = None
+            except AttributeError:
+                pass
+
+        if fi_cache_tensor is None:
+            # Runtime path: cos_sin_cache was dynamically computed (e.g., Llama-3.1).
+            # BFS back to find inv_freq buffer and compute from scratch.
+            # Use Q's head_dim as hint for rotary_embedding_dim.
+            q_fake = pre_rope_q.meta.get("val", None)
+            head_dim_hint = q_fake.shape[-1] if q_fake is not None else 128
+            fi_cache_tensor = self._try_materialize_cos_sin_cache(
+                gm, cos_sin_cache_node, head_dim_hint, cm.info.max_seq_len
+            )
+
+        if fi_cache_tensor is None:
+            return False
+
+        # Determine rotary_embedding_dim from the cache shape
+        # FlashInfer cache: [max_pos, head_dim] where head_dim = rotary_embedding_dim
+        rotary_embedding_dim = fi_cache_tensor.shape[-1]
+
+        # Step 5: Determine position_embedding_type
+        # is_neox=True → rope_gpt_neox (2), is_neox=False → rope_gptj (1)
+        position_embedding_type = 2 if is_neox else 1
+
+        # Step 6: Compute thop cache tensor (reuse across layers sharing same rope node)
+        if rope_node_q not in rope_cache_nodes:
+            thop_cache = _convert_flashinfer_to_thop_cos_sin(fi_cache_tensor, rotary_embedding_dim)
+            rope_cache_nodes[rope_node_q] = (
+                thop_cache,
+                position_embedding_type,
+                rotary_embedding_dim,
+            )
+        else:
+            thop_cache, _, _ = rope_cache_nodes[rope_node_q]
+
+        # Step 7: Rewire Q/K to pre-RoPE inputs
+        args_list = list(attn_node.args)
+        args_list[0] = pre_rope_q
+        args_list[1] = pre_rope_k
+        attn_node.args = tuple(args_list)
+
+        # Step 8: Store rope info in meta for get_constants to pick up.
+        # cos_sin_tensor is materialized as a get_attr node during
+        # prepare_node_for_cache_insertion; scalar params flow as constants.
+        attn_node.meta[_TRTLLM_ROPE_INFO_KEY] = {
+            "cos_sin_tensor": thop_cache,
+            "position_embedding_type": position_embedding_type,
+            "rotary_embedding_dim": rotary_embedding_dim,
+        }
+
+        return True
+
+    @staticmethod
+    def _try_materialize_cos_sin_cache(
+        gm: GraphModule, cos_sin_node: Node, rotary_dim_hint: int, max_seq_len: int
+    ) -> Optional[torch.Tensor]:
+        """Try to materialize the cos_sin_cache tensor from a runtime-computed node.
+
+        BFS backward from ``cos_sin_node`` to find an ``inv_freq`` buffer (a 1-D
+        tensor of size ``rotary_dim_hint // 2``), then compute the FlashInfer-format
+        fused cos_sin_cache from it using ``max_seq_len`` as the number of positions.
+        """
+        half_dim = rotary_dim_hint // 2
+        max_bfs = 50
+        visited: set = set()
+        queue: deque = deque([cos_sin_node])
+        inv_freq_tensor = None
+
+        while queue and len(visited) < max_bfs:
+            current = queue.popleft()
+            if id(current) in visited:
+                continue
+            visited.add(id(current))
+            if not isinstance(current, Node):
+                continue
+
+            if current.op == "get_attr":
+                try:
+                    tensor = _get_nested_attr(gm, current.target)
+                    if not tensor.is_meta and tensor.dim() == 1 and tensor.shape[0] == half_dim:
+                        inv_freq_tensor = tensor
+                        break
+                except AttributeError:
+                    pass
+            elif current.op == "call_function":
+                for arg in current.args:
+                    if isinstance(arg, Node):
+                        queue.append(arg)
+                    elif isinstance(arg, (list, tuple)):
+                        for item in arg:
+                            if isinstance(item, Node):
+                                queue.append(item)
+
+        if inv_freq_tensor is None:
+            return None
+
+        # Compute FlashInfer-format cache: [max_seq_len, head_dim]
+        t = torch.arange(max_seq_len, dtype=inv_freq_tensor.dtype, device=inv_freq_tensor.device)
+        freqs = torch.outer(t, inv_freq_tensor)  # [max_seq_len, half_dim]
+        fused = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.float32)
+        return fused
+
+    @staticmethod
+    def _trace_to_rope(node: Node) -> Tuple[Optional[Node], Optional[int]]:
+        """Trace through operator.getitem to find a flashinfer_rope node.
+
+        Returns (rope_node, item_index) or (None, None).
+        """
+        if not is_op(node, operator.getitem):
+            return None, None
+
+        source = node.args[0]
+        item_idx = node.args[1]
+
+        if not isinstance(source, Node) or not isinstance(item_idx, int):
+            return None, None
+
+        if is_op(source, torch.ops.auto_deploy.flashinfer_rope):
+            return source, item_idx
+
+        return None, None

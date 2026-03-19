@@ -193,9 +193,6 @@ class _InsertCachedOperator(BaseTransform):
         num_cached_attn_replacements = 0
         cache_nodes_by_layer_idx = {}
         for idx, attn_node in enumerate(source_attn_nodes):
-            # pick out GEMMs
-            qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
-
             layer_idx = attn_descriptor.get_layer_idx(attn_node)
             shared_kv_source_layer_idx = attn_descriptor.get_shared_kv_source_layer_idx(attn_node)
 
@@ -234,6 +231,10 @@ class _InsertCachedOperator(BaseTransform):
 
             # allow backend-specific prep before constants are extracted
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
+
+            # pick out QKV args AFTER prepare_node_for_cache_insertion, since
+            # transforms like FuseRopeIntoTrtllmAttention may have rewired Q/K.
+            qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
