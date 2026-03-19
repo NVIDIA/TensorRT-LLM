@@ -484,6 +484,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = F.linear(input, module.weight, bias)
         return output
 
+    def apply_out_uses_out(self, module: 'Linear') -> bool:
+        """Return True if apply_out() will write the result into the `out` buffer.
+
+        When False, Linear.forward skips the NCCL window allocation entirely so
+        that create_nccl_window_tensor never appears in the torch.compile FX
+        graph (avoiding piecewise CUDA-graph optimizer failures caused by the
+        dead side-effectful op).
+        """
+        return module.use_custom_cublas_mm
+
     def apply_out(self, module: Linear, input: torch.Tensor,
                   bias: Optional[torch.Tensor], out: torch.Tensor):
         # torch.matmul(out=) is not used: it produces auto_functionalized(aten.mm.out)
@@ -659,6 +669,9 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_out_uses_out(self, module: 'Linear') -> bool:
+        return True  # cublas_scaled_mm_out always writes into `out`
 
     def apply_out(self, module: Linear, input: torch.Tensor,
                   bias: Optional[torch.Tensor], out: torch.Tensor):
@@ -2814,12 +2827,15 @@ class Linear(nn.Module):
                                               "apply_window_output"):
                         output = self.quant_method.apply_window_output(
                             self, input, bias)
-                    elif (use_window
-                          and hasattr(self.quant_method, "apply_out")):
-                        # Each quant method's apply_out is responsible for
-                        # deciding whether it can write into the pre-allocated
-                        # window buffer (e.g. requires use_custom_cublas_mm for
-                        # the unquantized path; FP8 always uses cuBLAS).
+                    elif (use_window and hasattr(self.quant_method, "apply_out")
+                          and self.quant_method.apply_out_uses_out(self)):
+                        # apply_out_uses_out() confirms that apply_out() will
+                        # actually write into the pre-allocated window buffer.
+                        # Skip this branch when apply_out() would ignore `out`
+                        # (e.g. UnquantizedLinearMethod without cuBLAS layout,
+                        # FP8BlockScalesLinearMethod) to avoid tracing the
+                        # side-effectful create_nccl_window_tensor op into the
+                        # FX graph unnecessarily.
                         output_shape = list(input.shape)
                         output_shape[-1] = self.out_features
                         window_out = self.all_reduce.get_nccl_window_for_shape(
