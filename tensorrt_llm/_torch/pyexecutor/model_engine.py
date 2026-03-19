@@ -1496,13 +1496,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
-        # For CUDA graph execution, reset per-forward-pass caches (e.g. FlashMLA
-        # tile-scheduler metadata) so their computation kernels are re-issued on
-        # every call to _forward_step.  During graph capture this ensures the
-        # kernel is recorded in the graph; during replay the graph runs it
-        # automatically, so _preprocess_inputs is never called.
         attn_meta = inputs.get('attn_metadata')
-        if attn_meta is not None and attn_meta.is_cuda_graph:
+        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
+        if attn_meta is not None:
             attn_meta.on_update_kv_lens()
 
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
