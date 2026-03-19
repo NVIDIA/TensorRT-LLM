@@ -147,9 +147,24 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             });
 
     // TransferRequest class
+    //
+    // NOTE: The constructor uses std::move to transfer ownership of src_descs / dst_descs
+    // into the TransferRequest.  This avoids an O(n) copy of the internal
+    // std::vector<MemoryDesc> (24 bytes * n).  For 40k descriptors this saves ~937 KB
+    // of memcpy and turns a ~58 us copy into an O(1) pointer swap (~0.4 us).
+    //
+    // IMPORTANT: After construction, the Python MemoryDescs objects passed as src_descs
+    // and dst_descs are left in a moved-from state — their internal descriptor list
+    // becomes empty.  Do NOT access them after passing to TransferRequest.
     nb::class_<kvc::TransferRequest>(m, "TransferRequest")
-        .def(nb::init<kvc::TransferOp, kvc::TransferDescs, kvc::TransferDescs, std::string const&,
-                 std::optional<kvc::SyncMessage>>(),
+        .def(
+            "__init__",
+            [](kvc::TransferRequest* self, kvc::TransferOp op, kvc::TransferDescs& srcDescs,
+                kvc::TransferDescs& dstDescs, std::string const& remoteName,
+                std::optional<kvc::SyncMessage> syncMessage) {
+                new (self) kvc::TransferRequest(
+                    op, std::move(srcDescs), std::move(dstDescs), remoteName, std::move(syncMessage));
+            },
             nb::arg("op"), nb::arg("src_descs"), nb::arg("dst_descs"), nb::arg("remote_name"),
             nb::arg("sync_message") = std::nullopt)
         .def_prop_ro("op", &kvc::TransferRequest::getOp)
