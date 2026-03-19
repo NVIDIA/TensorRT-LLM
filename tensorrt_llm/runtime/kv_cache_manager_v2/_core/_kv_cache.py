@@ -40,7 +40,7 @@ from .._common import (
 )
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
-from .._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycle, LifeCycleId
+from .._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycle, LifeCycleId, SsmLifeCycle
 from .._page import (
     BatchedLockTarget,
     BlockPage,
@@ -53,6 +53,7 @@ from .._page import (
 from .._storage_manager import StorageManager
 from .._utils import (
     CachedCudaEvent,
+    HalfOpenRange,
     TemporaryCudaStream,
     TypedIndexList,
     div_up,
@@ -959,13 +960,13 @@ class _KVCache:
         tokens_per_block: int,
         history_length: int,
         life_cycle: LifeCycle,
-    ) -> tuple[BlockOrdinal, BlockOrdinal]:
+    ) -> HalfOpenRange[BlockOrdinal]:
         """
         Range of the stale blocks. Stale blocks are no longer needed for inference. Stale pages should be
         held if we may commit them later, or droppable otherwise.
         """
         beg, end = life_cycle.get_stale_range(history_length, tokens_per_block)
-        return BlockOrdinal(beg), BlockOrdinal(end)
+        return HalfOpenRange(BlockOrdinal(beg), BlockOrdinal(end))
 
     def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]) -> None:
         if self.manager._life_cycles.has_ssm:
@@ -1163,16 +1164,14 @@ class _KVCache:
         tokens_per_block = self.tokens_per_block
 
         def no_side_effect(lc: LifeCycle) -> bool:
-            if not isinstance(lc, AttnLifeCycle):
-                # SsmLifeCycle: stale range changes when history_length // tpb changes
-                return (
-                    history_length // tokens_per_block == self._history_length // tokens_per_block
-                )
+            if type(lc) is SsmLifeCycle:
+                # history_length change does not impact blocks at all.
+                return True
+            assert type(lc) is AttnLifeCycle
             window = lc.window_size
-            return window is None or (
-                (history_length + 1 - window) // tokens_per_block
-                == (self._history_length + 1 - window) // tokens_per_block
-            )
+            return window is None or lc.get_stale_range(
+                history_length, tokens_per_block
+            ) == lc.get_stale_range(self.history_length, tokens_per_block)
 
         if all(no_side_effect(lc) for lc in self.manager._life_cycles):
             self._history_length = history_length
