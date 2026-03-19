@@ -301,6 +301,11 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
             prefix = prefix | cutlass.Uint16(cutlass.Uint16(found_bucket) << cutlass.Uint16(shift))
         remaining_k = found_remaining_k
 
+        # Cluster barrier: ensure all CTAs finish DSMEM reads before any
+        # CTA clears its local_histogram in the next round.
+        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_wait()
+
         return prefix, remaining_k
 
     # ------------------------------------------------------------------
