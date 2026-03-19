@@ -275,18 +275,6 @@ public:
         return dTypeSize * 8;
     }
 
-    struct KvCacheBuffers
-    {
-        kernels::KVBlockArray kvCacheBuffer;
-        kernels::KVBlockArray kvScaleCacheBuffer;
-    };
-
-    static KvCacheBuffers buildKvCacheBlockArrays(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock,
-        int32_t sizePerToken, int32_t cyclicAttentionWindowSize, int32_t maxCyclicAttentionWindowSize,
-        int32_t sinkTokenLen, bool canUseOneMoreBlock, void* primaryPoolPtr, void* secondaryPoolPtr,
-        void* primaryBlockScalePoolPtr, void* secondaryBlockScalePoolPtr, kernels::KVBlockArray::DataType* blockOffsets,
-        bool hasFp4KvCache);
-
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
     void prepareEnqueueGeneration(EnqueueGenerationParams<T> const& params);
@@ -576,6 +564,20 @@ private:
 
     UniqPtrWNullCopy<int32_t[], Deleter> mMultiBlockSemaphores = {};
 };
+
+template <typename KVCacheBuffer>
+struct KvCacheBuffers
+{
+    KVCacheBuffer kvCacheBuffer;
+    KVCacheBuffer kvScaleCacheBuffer;
+};
+
+template <typename KVCacheBuffer>
+KvCacheBuffers<KVCacheBuffer> buildKvCacheBuffers(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock,
+    int32_t sizePerToken, int32_t cyclicAttentionWindowSize, int32_t maxCyclicAttentionWindowSize, int32_t sinkTokenLen,
+    bool canUseOneMoreBlock, void* primaryPoolPtr, void* secondaryPoolPtr, void* primaryBlockScalePoolPtr,
+    void* secondaryBlockScalePoolPtr, kernels::KVBlockArray::DataType* blockOffsets, bool hasFp4KvCache,
+    int32_t maxAttentionWindowSize = 0, void* keyValueCache = nullptr);
 
 } // namespace common::op
 
