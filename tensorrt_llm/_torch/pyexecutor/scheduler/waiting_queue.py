@@ -1,3 +1,4 @@
+import bisect
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -114,6 +115,77 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         return super().__iter__()
 
 
+class PriorityWaitingQueue(WaitingQueue):
+    """A priority queue that serves higher-priority requests first.
+
+    Requests with equal priority are served in FCFS order.
+    Priority is read from ``item.request.priority``; requests whose priority
+    is ``None`` are treated as having the default priority of 0.5.
+    """
+
+    _DEFAULT_PRIORITY: float = 0.5
+
+    def __init__(self) -> None:
+        self._queue: list[RequestQueueItem] = []
+        # Parallel list of sort keys: (neg_priority, insertion_counter).
+        # bisect operates on this list so insertions stay O(log n).
+        self._keys: list[tuple] = []
+        self._insertion_counter: int = 0
+
+    def _get_priority(self, item: RequestQueueItem) -> float:
+        if item.request is not None and item.request.priority is not None:
+            return float(item.request.priority)
+        return self._DEFAULT_PRIORITY
+
+    def _insert(self, item: RequestQueueItem) -> None:
+        key = (-self._get_priority(item), self._insertion_counter)
+        self._insertion_counter += 1
+        idx = bisect.bisect_right(self._keys, key)
+        self._keys.insert(idx, key)
+        self._queue.insert(idx, item)
+
+    def add_request(self, request: RequestQueueItem) -> None:
+        self._insert(request)
+
+    def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
+        for request in requests:
+            self._insert(request)
+
+    def pop_request(self) -> RequestQueueItem:
+        self._keys.pop(0)
+        return self._queue.pop(0)
+
+    def peek_request(self) -> RequestQueueItem:
+        if not self._queue:
+            raise IndexError("peek from an empty queue")
+        return self._queue[0]
+
+    def prepend_request(self, request: RequestQueueItem) -> None:
+        """Re-insert the request at the position dictated by its priority."""
+        self._insert(request)
+
+    def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
+        """Re-insert requests at the positions dictated by their priorities."""
+        for request in requests:
+            self._insert(request)
+
+    def remove_by_ids(self, request_ids: set[int]) -> None:
+        pairs = [(k, r) for k, r in zip(self._keys, self._queue) if r.id not in request_ids]
+        if pairs:
+            self._keys, self._queue = map(list, zip(*pairs))
+        else:
+            self._keys, self._queue = [], []
+
+    def __bool__(self) -> bool:
+        return len(self._queue) > 0
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    def __iter__(self) -> Iterator[RequestQueueItem]:
+        return iter(self._queue)
+
+
 def create_waiting_queue(
     policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
     priority_fn: Optional[Callable[[RequestQueueItem], float]] = None,
@@ -121,14 +193,15 @@ def create_waiting_queue(
     """Create a waiting queue based on the specified policy.
 
     Args:
-        policy: The scheduling policy to use. Currently only FCFS is supported.
+        policy: The scheduling policy to use.
         priority_fn: Reserved for future use.
 
     Returns:
         A WaitingQueue instance.
     """
-    # Currently only FCFS is implemented
     if policy == WaitingQueuePolicy.FCFS:
         return FCFSWaitingQueue()
+    elif policy == WaitingQueuePolicy.PRIORITY:
+        return PriorityWaitingQueue()
     else:
         raise ValueError(f"Unsupported waiting queue policy: {policy}")

@@ -311,3 +311,64 @@ class TestExecutorRequestToLlmRequestPriority:
             "Hard-coded priority=0.5 should not appear in "
             "executor_request_to_llm_request; use executor_request.priority instead."
         )
+
+
+# ---------------------------------------------------------------------------
+# PriorityWaitingQueue – requests served in priority order
+# ---------------------------------------------------------------------------
+
+
+class TestPriorityWaitingQueueSchedulingOrder:
+    """Verify that PriorityWaitingQueue serves requests in descending priority order.
+
+    This is the key integration point: the waiting queue must dequeue
+    higher-priority requests before lower-priority ones so that the
+    downstream C++ capacity scheduler sees them in the right order.
+    """
+
+    def _make_queue_item(self, req_id: int, priority: float | None = None):
+        from unittest.mock import MagicMock
+
+        from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+
+        mock_req = MagicMock()
+        mock_req.priority = priority
+        return RequestQueueItem(id=req_id, request=mock_req)
+
+    def test_high_priority_served_before_low(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
+
+        q = PriorityWaitingQueue()
+        q.add_request(self._make_queue_item(1, priority=0.1))
+        q.add_request(self._make_queue_item(2, priority=0.9))
+        q.add_request(self._make_queue_item(3, priority=0.5))
+        served = [q.pop_request().id for _ in range(3)]
+        assert served == [2, 3, 1], "Requests must be served in descending priority order"
+
+    def test_equal_priority_falls_back_to_fcfs(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
+
+        q = PriorityWaitingQueue()
+        q.add_request(self._make_queue_item(10, priority=0.7))
+        q.add_request(self._make_queue_item(20, priority=0.7))
+        q.add_request(self._make_queue_item(30, priority=0.7))
+        served = [q.pop_request().id for _ in range(3)]
+        assert served == [10, 20, 30], (
+            "Requests with equal priority must be served in arrival (FCFS) order"
+        )
+
+    def test_create_waiting_queue_priority_policy(self):
+        """create_waiting_queue(PRIORITY) returns a PriorityWaitingQueue."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import (
+            PriorityWaitingQueue,
+            create_waiting_queue,
+        )
+        from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
+
+        q = create_waiting_queue(WaitingQueuePolicy.PRIORITY)
+        assert isinstance(q, PriorityWaitingQueue)
+
+        q.add_request(self._make_queue_item(1, priority=0.2))
+        q.add_request(self._make_queue_item(2, priority=0.8))
+        assert q.pop_request().id == 2
+        assert q.pop_request().id == 1
