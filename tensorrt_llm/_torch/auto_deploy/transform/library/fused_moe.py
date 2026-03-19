@@ -2528,23 +2528,49 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         w2_alpha_stacked = _stack(w2_alpha, dim=0).reshape(-1).to(torch.float32)
         w3_alpha_stacked = _stack(w3_alpha, dim=0).reshape(-1).to(torch.float32)
 
-        if is_gated_mlp and not allow_different_input_scales:
-            assert torch.allclose(w1_input_scale_stacked, w3_input_scale_stacked), (
-                "TRTLLM-Gen NVFP4 expects w1 and w3 input scales to match per expert. "
-                "Set allow_different_input_scales=True to override."
-            )
-
+        # Expect w1 (and w3 for gated) input scales to be the same across experts (like Cutlass).
+        w1_scales_same = torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0]).item()
         if is_gated_mlp:
+            w3_scales_same = torch.all(w3_input_scale_stacked == w3_input_scale_stacked[0]).item()
+            scales_same = w1_scales_same and w3_scales_same
+        else:
+            scales_same = w1_scales_same
+
+        if not scales_same:
+            if not allow_different_input_scales:
+                assert w1_scales_same, (
+                    "TRTLLM-Gen NVFP4 expects w1 input scales to match per expert. "
+                    "Set allow_different_input_scales=True to override."
+                )
+                if is_gated_mlp:
+                    assert w3_scales_same, (
+                        "TRTLLM-Gen NVFP4 expects w3 input scales to match per expert. "
+                        "Set allow_different_input_scales=True to override."
+                    )
+            else:
+                ad_logger.warning_once(
+                    "TRTLLM-Gen NVFP4 MoE: w1/w3 input scales differ across experts. Using min. "
+                    "Accuracy may suffer if scales differ significantly.",
+                    key="trtllm_gen_nvfp4_moe_different_w1_w3_scales",
+                )
+
+        if scales_same:
             fc1_act_global = (
-                torch.minimum(w1_input_scale_stacked.min(), w3_input_scale_stacked.min())
-                .reshape(1)
-                .to(device=device, dtype=torch.float32)
+                w1_input_scale_stacked[0].reshape(1).to(device=device, dtype=torch.float32)
             )
         else:
-            fc1_act_global = (
-                w1_input_scale_stacked.min().reshape(1).to(device=device, dtype=torch.float32)
-            )
-        fc2_input_scale_global = w2_input_scale_stacked.min().to(device=device, dtype=torch.float32)
+            # allow_different_input_scales: use minimum (safe for quantizing shared input).
+            if is_gated_mlp:
+                fc1_act_global = (
+                    torch.minimum(w1_input_scale_stacked.min(), w3_input_scale_stacked.min())
+                    .reshape(1)
+                    .to(device=device, dtype=torch.float32)
+                )
+            else:
+                fc1_act_global = (
+                    w1_input_scale_stacked.min().reshape(1).to(device=device, dtype=torch.float32)
+                )
+        w2_input_scale_f32 = w2_input_scale_stacked.to(device=device, dtype=torch.float32)
 
         fc1_act_global_1d = fc1_act_global.squeeze()
         gate_alpha = (
@@ -2560,17 +2586,14 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             ).to(dtype=torch.float32)
         else:
             up_alpha = gate_alpha
-        fc2_alpha = (
-            w2_alpha_stacked.to(device=device)
-            * w2_input_scale_stacked.to(device=device)
-            / fc2_input_scale_global
-        ).to(dtype=torch.float32)
+        # Pass per-expert fc2_alpha directly (no global normalization). Normalizing by
+        # min(w2_input_scale) distorted logits for mixed-precision checkpoints where
+        # w2_input_scale varies across experts; the kernel expects raw per-expert alpha.
+        fc2_alpha = w2_alpha_stacked.to(device=device, dtype=torch.float32)
         if is_gated_mlp:
             # SwiGLU: scale_c folds fc2 input quant and up-branch dequant.
-            fc1_scale_c = (fc2_input_scale_global * up_alpha).to(dtype=torch.float32)
+            fc1_scale_c = (w2_input_scale_f32 * up_alpha).to(dtype=torch.float32)
         else:
-            # Relu2/non-gated: keep per-expert fc2 input scales (matches previous AD behavior
-            # and avoids broadcasted stride-0 tensors being passed to the kernel).
             fc1_scale_c = w2_input_scale_stacked.to(device=device, dtype=torch.float32)
         fc1_alpha = gate_alpha
 
@@ -2636,9 +2659,9 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
 class FuseNVFP4MoeConfig(TransformConfig):
     """Configuration for NVFP4 MoE fusion transform."""
 
-    backend: Literal["trtllm", "trtllm_gen"] = Field(
-        default="trtllm",
-        description="Backend to use for NVFP4 MoE computation ('trtllm' or 'trtllm_gen').",
+    backend: Literal["cutlass", "trtllm_gen"] = Field(
+        default="cutlass",
+        description="Backend to use for NVFP4 MoE computation ('cutlass' or 'trtllm_gen').",
     )
     allow_different_input_scales: bool = Field(
         default=False,
@@ -2678,8 +2701,9 @@ class FuseNVFP4Moe(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        ad_logger.info(f"FuseNVFP4Moe: backend={self.config.backend}")
         with cuda_memory_tracker():
-            if self.config.backend == "trtllm":
+            if self.config.backend == "cutlass":
                 fused_key_counter = _stack_nvfp4_cutlass_moe_weights(
                     gm,
                     allow_different_input_scales=self.config.allow_different_input_scales,

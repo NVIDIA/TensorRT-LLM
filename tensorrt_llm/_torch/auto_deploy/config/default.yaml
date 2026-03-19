@@ -190,7 +190,7 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     allow_different_input_scales: false
-    backend: trtllm
+    backend: cutlass
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
