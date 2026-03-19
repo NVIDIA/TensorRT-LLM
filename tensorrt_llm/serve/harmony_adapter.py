@@ -1739,6 +1739,7 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         # Context only requests don't need a full response message,
         # the real response will be responded by generation server
         response_message = {"role": "assistant", "content": ""}
+        parsed_output = {}
 
     # Get reasoning text for token counting
     reasoning_text = parsed_output.get("reasoning", None)
