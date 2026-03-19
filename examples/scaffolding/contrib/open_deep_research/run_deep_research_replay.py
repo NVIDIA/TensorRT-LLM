@@ -55,7 +55,7 @@ async def main():
     )
 
     try:
-        future = llm.generate_async(trace.prompt)
+        future = llm.generate_async("")
         result = await future.aresult()
         assert result.outputs[0].text is not None
     finally:

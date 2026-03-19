@@ -14,6 +14,7 @@
 
 import asyncio
 import copy
+import uuid
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
 
@@ -228,8 +229,8 @@ class TraceReplayEngine:
         generation_worker: Worker,
     ) -> None:
         tokenizer = self._get_tokenizer(generation_worker)
-        target_output = max(0, event.output_token_count or 0)
-        target_input = self._get_generation_input_token_count(event, tokenizer)
+        target_output = max(0, event.completion_tokens or 0)
+        target_input = max(0, event.prompt_tokens or 0)
 
         synthetic = copy.deepcopy(task)
         synthetic.input_str = self._build_text_with_token_count(target_input, tokenizer)
@@ -246,24 +247,22 @@ class TraceReplayEngine:
             raise RuntimeError(f"Generation worker failed during GenerationTask replay: {status}")
 
         task.output_str = self._build_text_with_token_count(target_output, tokenizer)
-        task.output_tokens = _placeholder_token_ids(event.output_token_count)
+        task.output_tokens = _placeholder_token_ids(event.completion_tokens)
 
     async def _replay_mcp_task(
         self,
         task: MCPCallTask,
         event: TraceEvent,
     ) -> None:
-        """Inject the recorded MCP result and simulate the original call latency.
+        """Simulate the original MCP call latency.
 
-        Unlike ChatTask/GenerationTask which use the real generation worker,
-        MCP results are replayed from the trace.  The recorded duration is
-        honored so that concurrent yields (e.g. MCP + generation in parallel)
-        preserve realistic timing relationships.
+        The trace no longer stores MCP results, so replay can only
+        reproduce timing.  The task receives an empty result string.
         """
-        target_ms = event.duration_ms * self.latency_scale
+        target_ms = (event.duration_ms or 0.0) * self.latency_scale
         if target_ms > 0:
             await asyncio.sleep(target_ms / 1000)
-        task.result_str = event.result_str or ""
+        task.result_str = ""
 
     def _build_replay_assistant_message(
         self,
@@ -350,15 +349,6 @@ class TraceReplayEngine:
             payload, tokenize=True, add_generation_prompt=False
         )
         return len(token_ids)
-
-    @staticmethod
-    def _get_generation_input_token_count(
-        event: TraceEvent,
-        tokenizer,
-    ) -> int:
-        if event.input_str is None:
-            return 0
-        return len(tokenizer.encode(event.input_str, add_special_tokens=False))
 
     def _get_tokenizer(self, generation_worker: Worker):
         """Lazily obtain a tokenizer from the worker or its model name."""
@@ -475,14 +465,17 @@ def _extract_tool_calls(event: TraceEvent) -> Optional[List[_ReplayToolCall]]:
     is critical: controllers branch on ``tool_calls is not None``, so an
     empty list would incorrectly enter the tool-call code path and yield
     an empty task list with no matching trace event.
+
+    The trace stores tool_calls as a list of tool name strings.
+    A dummy id and empty arguments are synthesised for the replay objects.
     """
     if not event.tool_calls:
         return None
     return [
         _ReplayToolCall(
-            tool_call_id=tc["id"],
-            name=tc.get("function", {}).get("name", ""),
-            arguments=tc.get("function", {}).get("arguments", ""),
+            tool_call_id=str(uuid.uuid4()),
+            name=tc,
+            arguments="{}",
         )
         for tc in event.tool_calls
     ]

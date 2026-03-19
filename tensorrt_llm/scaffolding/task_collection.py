@@ -539,7 +539,7 @@ class ExecutionTracer(TaskCollection):
     events without ``children``.
 
     Attach via ``@with_execution_tracing`` decorator.
-    After execution, call ``export_trace(prompt)`` to obtain an
+    After execution, call ``export_trace()`` to obtain an
     ``ExecutionTrace`` that can be saved to JSON and later replayed.
     """
 
@@ -585,16 +585,14 @@ class ExecutionTracer(TaskCollection):
                 conv_id = self._get_conversation_id(task_id)
                 last_recorded = self._last_recorded_counts.get(task_id, 0)
                 branch_path = self._get_branch_path()
-                now = time.time()
                 for msg in task.messages[last_recorded:pre_count]:
                     self.events.append(
                         self._message_event_from_role_message(
-                            msg, conv_id, branch_path, now))
+                            msg, conv_id, branch_path))
                 self._last_recorded_counts[task_id] = pre_count
 
     def after_yield(self, tasks: List[Task]):
         assistant_events: List[TraceEvent] = []
-        max_duration_ms = 0.0
         now = time.time()
 
         for task in tasks:
@@ -603,11 +601,10 @@ class ExecutionTracer(TaskCollection):
                 continue
 
             duration_ms = (now - self._start_times[task_id]) * 1000
-            max_duration_ms = max(max_duration_ms, duration_ms)
             del self._start_times[task_id]
             self._mark_task_tracing_end(task)
 
-            event = self._build_yield_event(task, task_id, duration_ms, now)
+            event = self._build_yield_event(task, task_id, duration_ms)
             assistant_events.append(event)
 
         if not assistant_events:
@@ -620,8 +617,6 @@ class ExecutionTracer(TaskCollection):
                 TraceEvent(
                     event_type="parallel_start",
                     branch_path=self._get_branch_path(),
-                    timestamp=now,
-                    duration_ms=max_duration_ms,
                     num_branches=len(assistant_events),
                     children=assistant_events,
                 ))
@@ -630,7 +625,6 @@ class ExecutionTracer(TaskCollection):
         self.events.append(
             TraceEvent(
                 event_type="parallel_start",
-                timestamp=time.time(),
                 num_branches=num_branches,
                 branch_path=self._get_branch_path(),
             ))
@@ -640,11 +634,9 @@ class ExecutionTracer(TaskCollection):
         scope = current_scope.get()
         return scope.branch_path_list if scope is not None else []
 
-    def _build_yield_event(self, task: Task, task_id: int, duration_ms: float,
-                           timestamp: float) -> TraceEvent:
+    def _build_yield_event(self, task: Task, task_id: int,
+                           duration_ms: float) -> TraceEvent:
         """Build the consumable event emitted at a yield point."""
-        worker_tag = str(task.worker_tag.value if hasattr(
-            task.worker_tag, 'value') else task.worker_tag)
         branch_path = self._get_branch_path()
 
         if isinstance(task, ChatTask):
@@ -653,53 +645,24 @@ class ExecutionTracer(TaskCollection):
             new_messages = task.messages[pre_count:]
             self._last_recorded_counts[task_id] = len(task.messages)
 
-            tools = None
-            if task.tools is not None:
-                try:
-                    tools = [
-                        t.to_dict() if hasattr(t, 'to_dict') else t
-                        for t in task.tools
-                    ]
-                except (TypeError, AttributeError):
-                    pass
-
-            assistant_msg = new_messages[0] if new_messages else None
-            content = getattr(assistant_msg, "content",
-                              None) if assistant_msg else None
-
             return TraceEvent(
                 event_type="message",
                 branch_path=branch_path,
-                timestamp=timestamp,
-                duration_ms=duration_ms,
-                worker_tag=worker_tag,
                 conversation_id=conv_id,
                 role="assistant",
-                content=content,
                 tool_calls=self._extract_tool_calls(new_messages),
                 prompt_tokens=getattr(task, 'prompt_tokens_num', 0),
                 completion_tokens=getattr(task, 'completion_tokens_num', 0),
                 reasoning_tokens=getattr(task, 'reasoning_tokens_num', 0),
                 finish_reason=getattr(task, 'finish_reason', None),
-                tools=tools,
             )
         elif isinstance(task, MCPCallTask):
-            tool_args = task.args
-            if isinstance(task.args, str):
-                try:
-                    tool_args = json.loads(task.args)
-                except (json.JSONDecodeError, TypeError):
-                    pass
             return TraceEvent(
                 event_type="tool_call",
                 branch_path=branch_path,
-                timestamp=timestamp,
                 duration_ms=duration_ms,
-                worker_tag=worker_tag,
                 tool_call_id=task.tool_call_id,
                 tool_name=task.tool_name,
-                tool_args=tool_args,
-                result_str=task.result_str,
             )
         elif isinstance(task, GenerationTask):
             conv_id = self._conv_counter
@@ -709,85 +672,59 @@ class ExecutionTracer(TaskCollection):
                 TraceEvent(
                     event_type="message",
                     branch_path=branch_path,
-                    timestamp=timestamp,
                     conversation_id=conv_id,
                     role="user",
-                    content=task.input_str,
                 ))
 
             return TraceEvent(
                 event_type="message",
                 branch_path=branch_path,
-                timestamp=timestamp,
-                duration_ms=duration_ms,
-                worker_tag=worker_tag,
                 conversation_id=conv_id,
                 role="assistant",
-                content=task.output_str,
-                output_token_count=(len(task.output_tokens)
-                                    if task.output_tokens else 0),
+                prompt_tokens=(len(task.input_tokens)
+                               if task.input_tokens else 0),
+                completion_tokens=(len(task.output_tokens)
+                                   if task.output_tokens else 0),
+                reasoning_tokens=getattr(task, 'reasoning_tokens_num', 0),
             )
         elif isinstance(task, DropKVCacheTask):
             return TraceEvent(
                 event_type="drop_kv_cache",
                 branch_path=branch_path,
-                timestamp=timestamp,
-                duration_ms=duration_ms,
-                worker_tag=worker_tag,
             )
         else:
             return TraceEvent(
                 event_type="message",
                 branch_path=branch_path,
-                timestamp=timestamp,
-                duration_ms=duration_ms,
-                worker_tag=worker_tag,
                 role="assistant",
             )
 
     def _message_event_from_role_message(self, message, conversation_id: int,
-                                         branch_path: List[int],
-                                         timestamp: float) -> TraceEvent:
+                                         branch_path: List[int]) -> TraceEvent:
         """Convert a RoleMessage into a non-assistant message event."""
         role = getattr(message, "role", None)
-        content = getattr(message, "content", None)
         return TraceEvent(
             event_type="message",
             branch_path=branch_path,
-            timestamp=timestamp,
             conversation_id=conversation_id,
             role=role,
-            content=content,
         )
 
     @staticmethod
-    def _extract_tool_calls(output_messages) -> Optional[List[Dict[str, Any]]]:
-        """Extract tool_calls from the first assistant message, or None."""
+    def _extract_tool_calls(output_messages) -> Optional[List[str]]:
+        """Extract tool call names from the first assistant message, or None."""
         for msg in output_messages:
             if getattr(msg, "role", None) != "assistant":
                 continue
             tc_list = getattr(msg, "tool_calls", None)
             if not tc_list:
                 return None
-            return [{
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            } for tc in tc_list]
+            return [tc.function.name for tc in tc_list]
         return None
 
-    def export_trace(self,
-                     prompt: str,
-                     metadata: Dict[str, Any] = None) -> ExecutionTrace:
+    def export_trace(self) -> ExecutionTrace:
         """Build and return the complete ExecutionTrace for this request."""
-        return ExecutionTrace(
-            prompt=prompt,
-            events=list(self.events),
-            metadata=metadata or {},
-        )
+        return ExecutionTrace(events=list(self.events), )
 
 
 def with_execution_tracing(controller_name: str):

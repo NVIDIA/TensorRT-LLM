@@ -53,6 +53,13 @@ def parse_arguments():
     )
     parser.add_argument("--enable_statistics", action="store_true")
     parser.add_argument("--enable_query_collector", action="store_true")
+    parser.add_argument("--enable_tracing", action="store_true")
+    parser.add_argument(
+        "--trace_output",
+        type=str,
+        default="execution_trace.json",
+        help="Output path for the execution trace",
+    )
     return parser.parse_args()
 
 
@@ -73,6 +80,7 @@ async def main():
         max_tokens=args.max_tokens,
         max_iterations=args.max_iterations,
         enable_statistics=args.enable_statistics,
+        enable_tracing=args.enable_tracing,
     )
 
     if args.prompt:
@@ -99,6 +107,13 @@ async def main():
     if args.enable_query_collector:
         QueryCollector.get_global_info()
         print("Query info dumped to query_result.json!")
+
+    if result.task_collections:
+        tracer = result.task_collections.get("execution_tracer")
+        if tracer:
+            trace = tracer.export_trace()
+            trace.save(args.trace_output)
+            print(f"Execution trace saved to {args.trace_output}")
 
     await mcp_worker.async_shutdown()
     llm.shutdown()
