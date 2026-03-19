@@ -86,7 +86,7 @@ trtllm-bench \
     --backend pytorch \
     --tp ${num_gpus} \
     --ep 1 \
-    --extra_llm_api_options low_latency.yaml \
+    --config low_latency.yaml \
     --dataset gpt-oss-120b-1k2k.txt \
     --max_batch_size ${max_batch_size} \
     --concurrency ${max_batch_size} \
@@ -149,7 +149,7 @@ trtllm-bench \
     --backend pytorch \
     --tp ${num_gpus} \
     --ep ${num_gpus} \
-    --extra_llm_api_options max_throughput.yaml \
+    --config max_throughput.yaml \
     --dataset gpt-oss-120b-1k2k.txt \
     --max_batch_size ${max_batch_size} \
     --concurrency $((max_batch_size * num_gpus)) \
@@ -184,7 +184,7 @@ trtllm-serve  openai/gpt-oss-120b \
   --ep_size 8 \
   --max_batch_size 640 \
   --trust_remote_code \
-  --extra_llm_api_options max_throughput.yaml \
+  --config max_throughput.yaml \
   --kv_cache_free_gpu_memory_fraction 0.9
 ```
 </details>
@@ -201,7 +201,7 @@ trtllm-serve \
   --ep_size 4 \
   --max_batch_size 640 \
   --trust_remote_code \
-  --extra_llm_api_options max_throughput.yaml \
+  --config max_throughput.yaml \
   --kv_cache_free_gpu_memory_fraction 0.9
 ```
 </details>
@@ -223,7 +223,7 @@ OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT LLM 
 
 ### Selecting Triton as the MoE backend
 
-To use the Triton MoE backend with **trtllm-serve** (or other similar commands) add this snippet to the YAML file passed via `--extra_llm_api_options`:
+To use the Triton MoE backend with **trtllm-serve** (or other similar commands) add this snippet to the YAML file passed via `--config`:
 
 ```yaml
 moe_config:
@@ -347,7 +347,7 @@ OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM 
 
 ### Selecting Triton as the MoE backend
 
-To use the Triton MoE backend with **trtllm-serve** (or other commands), add this snippet to the YAML file passed via `--extra_llm_api_options`:
+To use the Triton MoE backend with **trtllm-serve** (or other commands), add this snippet to the YAML file passed via `--config`:
 
 ```yaml
 moe_config:
