@@ -405,7 +405,7 @@ class SinglePassMultiCTARadixTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def prefix_sum_and_find_threshold(
-        self, local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
+        self, histogram_input, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
     ):
         """Compute prefix sum over 256-bin histogram and find threshold bucket.
 
@@ -414,13 +414,16 @@ class SinglePassMultiCTARadixTopKKernel:
         largest elements.  The threshold bucket is the first one where:
           prefix_sum[b] >= remaining_k  AND  prefix_sum[b-1] < remaining_k
 
+        ``histogram_input`` is the source histogram (local_histogram for
+        single-CTA / distributed, prefix_buf for cluster after DSMEM merge).
+
         Results written to s_scalars:
           [0] = found_bucket
           [1] = found_remaining_k (remaining_k - prefix_sum[bucket-1])
         """
         # Step 1: Inclusive prefix sum directly on the histogram
         if tidx < self.radix:
-            val = local_histogram[tidx]
+            val = histogram_input[tidx]
             num_warps_scan = cutlass.const_expr(min(self.radix, 256) // 32)
             val, _ = block_prefix_sum_kernel(
                 val, s_warp_sums, tidx, self.radix, num_warps_scan, barrier_id=1
