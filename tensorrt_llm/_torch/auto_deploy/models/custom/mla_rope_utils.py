@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Shared MLA RoPE utilities for auto_deploy custom models.
 
@@ -10,16 +10,7 @@ from typing import Dict
 
 import torch
 
-_FLOAT8_DTYPES = tuple(
-    dtype
-    for dtype_name in (
-        "float8_e4m3fn",
-        "float8_e4m3fnuz",
-        "float8_e5m2",
-        "float8_e5m2fnuz",
-    )
-    if (dtype := getattr(torch, dtype_name, None)) is not None
-)
+from ...utils.quantization_utils import FLOAT8_DTYPES
 
 
 def _index_select_with_float8_cpu_workaround(
@@ -31,7 +22,7 @@ def _index_select_with_float8_cpu_workaround(
     This hook only needs to reorder checkpoint values, so for CPU float8 tensors we
     reorder the underlying bytes via a ``uint8`` view and reinterpret them back.
     """
-    if tensor.device.type != "cpu" or tensor.dtype not in _FLOAT8_DTYPES:
+    if tensor.device.type != "cpu" or tensor.dtype not in FLOAT8_DTYPES:
         return tensor.index_select(dim, index.to(device=tensor.device))
 
     uint8_view = tensor.view(torch.uint8)
