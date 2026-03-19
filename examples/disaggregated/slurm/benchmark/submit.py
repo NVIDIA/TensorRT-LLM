@@ -116,7 +116,8 @@ def allocate_gpus(
     return allocations
 
 
-def convert_allocations_to_server_config(allocations, server_port=8333):
+def convert_allocations_to_server_config(allocations, server_port=8333,
+                                         router_config=None):
     generation_servers = {}
     context_servers = {}
     server_hostname = None
@@ -130,6 +131,8 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
                 f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
 
         server_config_entry = {'num_instances': num_servers, 'urls': urls}
+        if router_config:
+            server_config_entry['router'] = router_config.copy()
 
         if server_type == "GEN":
             generation_servers = server_config_entry
@@ -484,7 +487,12 @@ def submit_job(config, log_dir, dry_run):
         json.dump(allocations, f, indent=2)
 
     # Generate disagg server config
-    server_config = convert_allocations_to_server_config(allocations)
+    router_config = config.get('router_config', None)
+    server_config = convert_allocations_to_server_config(
+        allocations, router_config=router_config)
+    # Merge server_config_extra into disagg server config
+    if 'server_config_extra' in config:
+        server_config.update(config['server_config_extra'])
     with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
     disagg_server_hostname = server_config['hostname']
@@ -606,7 +614,14 @@ def submit_job(config, log_dir, dry_run):
         benchmark_prefix = client_slurm_prefix + [
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]
-        if benchmark_config['use_nv_sa_benchmark']:
+        if benchmark_config.get('use_aiperf', False):
+            benchmark_cmd = [
+                f"bash {os.path.join(script_dir, 'run_benchmark_aiperf.sh')}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"&> {log_dir}/6_bench.log"
+            ]
+            client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+        elif benchmark_config['use_nv_sa_benchmark']:
             if benchmark_config['mode'] == "gen_only":
                 print(
                     f"[ERROR] SA benchmark client script is not supported for gen_only mode"

@@ -644,7 +644,27 @@ class KvCacheAwareRouter(Router):
         self._max_batch_size = max_batch_size
         self._tokens_per_block = tokens_per_block
 
+    def _get_tokenizer(self, model: str):
+        if model not in self._tokenizers:
+            self._tokenizers[model] = AutoTokenizer.from_pretrained(model)
+        return self._tokenizers[model]
+
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
+        # Handle ChatCompletionRequest (has messages, not prompt)
+        if isinstance(request, ChatCompletionRequest):
+            if request.prompt_token_ids is not None:
+                return [request.prompt_token_ids]
+            # TODO: send tokenize-only request instead of tokenizing locally
+            tokenizer = self._get_tokenizer(request.model)
+            messages = [{"role": m["role"], "content": m.get("content", "")}
+                        for m in request.messages
+                        if "role" in m]
+            text = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False)
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+            return [token_ids]
+
+        # Handle CompletionRequest (has prompt)
         prompts = request.prompt
         if isinstance(prompts, list) and isinstance(prompts[0], list):
             return prompts
@@ -656,10 +676,7 @@ class KvCacheAwareRouter(Router):
             assert isinstance(prompts, list) and isinstance(prompts[0], str)
 
         # TODO: send tokenize-only request instead of tokenizing locally
-        if request.model not in self._tokenizers:
-            self._tokenizers[request.model] = AutoTokenizer.from_pretrained(
-                request.model)
-        tokenizer = self._tokenizers[request.model]
+        tokenizer = self._get_tokenizer(request.model)
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
 
     async def get_next_server(
