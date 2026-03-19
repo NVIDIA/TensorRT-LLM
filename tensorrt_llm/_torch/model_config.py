@@ -131,6 +131,9 @@ class ModelConfig(Generic[TConfig]):
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
 
+    # Video pruning rate for VLM models (None = EVS disabled)
+    video_pruning_rate: Optional[float] = None
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.
@@ -360,10 +363,11 @@ class ModelConfig(Generic[TConfig]):
             quant_config.group_size = block_size[0]
 
             # Set default exclude_modules for FP8_BLOCK_SCALES
-            if moe_backend == 'TRTLLM':
-                default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
-            else:
-                default_exclude = ["*eh_proj"]
+            # kv_b_proj must always be excluded: FP8 128x128 block boundaries
+            # don't necessarily align with per-head dim boundaries (e.g. GLM-5
+            # has qk_nope_head_dim=192), so the scale tensor cannot be cleanly
+            # reshaped per-head. The dequant path handles this correctly.
+            default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
 
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
@@ -504,8 +508,9 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[
-                        0] == "DeepseekV32ForCausalLM":
+                if pretrained_config.architectures[0] in [
+                        "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
+                ]:
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
                     indexer_rope_interleave = getattr(
@@ -516,6 +521,7 @@ class ModelConfig(Generic[TConfig]):
                         index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                        use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
                         q_split_threshold = sparse_attention_config.q_split_threshold
                     else:
                         index_n_heads = pretrained_config.index_n_heads
@@ -523,6 +529,7 @@ class ModelConfig(Generic[TConfig]):
                         index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
+                        use_cute_dsl_topk = False
                         q_split_threshold = 8192
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
@@ -532,6 +539,7 @@ class ModelConfig(Generic[TConfig]):
                             indexer_max_chunk_size=indexer_max_chunk_size,
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
+                            use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave)
             else:

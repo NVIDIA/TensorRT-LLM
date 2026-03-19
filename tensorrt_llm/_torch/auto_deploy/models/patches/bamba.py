@@ -12,6 +12,7 @@ from transformers.models.bamba.modeling_bamba import (
     apply_mask_to_padding_states,
 )
 
+from ...custom_ops.attention_interface import BatchInfo
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
 
@@ -49,17 +50,12 @@ def _bamba_mixer_torch_forward(
         )
         slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
         use_initial_states_t = torch.zeros(batch_size, device=input_states.device, dtype=torch.bool)
-        # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-        # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0]
-        # For generate phase (seq_len == 1): [0, 0, batch_size]
+        _batch_info = BatchInfo()
         if seq_len == 1:
-            batch_info_host_t = torch.tensor(
-                [0, 0, batch_size], device=input_states.device, dtype=torch.int32
-            )
+            _batch_info.update([0, 0, 0, 0, batch_size, batch_size])
         else:
-            batch_info_host_t = torch.tensor(
-                [batch_size, batch_size * seq_len, 0], device=input_states.device, dtype=torch.int32
-            )
+            _batch_info.update([batch_size, batch_size * seq_len, 0, 0, 0, 0])
+        batch_info_host_t = _batch_info.serialize()
     if use_caching:
         hidden_states_B_C = self.act(
             torch.ops.auto_deploy.torch_cached_causal_conv1d(
