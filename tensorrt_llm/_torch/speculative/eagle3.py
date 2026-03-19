@@ -479,6 +479,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         else:
             self._saved_kv_lens_cuda = None
 
+        # Save spec-dec params that the drafting loop will overwrite.
+        # Without this, CUDA graph warmup's second iteration would run
+        # the target model attention with stale draft-layer masks
+        # instead of the correct target-tree masks.
+        if attn_metadata.spec_decoding_packed_mask is not None:
+            self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:
+                                                                              batch_size].clone(
+                                                                              )
+        else:
+            self._saved_packed_mask = None
+        if attn_metadata.spec_decoding_position_offsets is not None:
+            self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
+            )
+        else:
+            self._saved_position_offsets = None
+        if attn_metadata.spec_decoding_generation_lengths is not None:
+            self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
+            )
+        else:
+            self._saved_generation_lengths = None
+
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
         if self._saved_kv_lens_cuda is not None:
@@ -486,6 +507,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[:batch_size].copy_(
                 self._saved_kv_lens_cuda)
             self._saved_kv_lens_cuda = None
+
+        if self._saved_packed_mask is not None:
+            batch_size = self._saved_packed_mask.shape[0]
+            attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(
+                self._saved_packed_mask)
+            self._saved_packed_mask = None
+        if self._saved_position_offsets is not None:
+            attn_metadata.spec_decoding_position_offsets.copy_(
+                self._saved_position_offsets)
+            self._saved_position_offsets = None
+        if self._saved_generation_lengths is not None:
+            batch_size = self._saved_generation_lengths.shape[0]
+            attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
+                self._saved_generation_lengths)
+            self._saved_generation_lengths = None
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})

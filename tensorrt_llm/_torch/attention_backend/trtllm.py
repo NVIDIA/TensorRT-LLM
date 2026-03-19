@@ -1517,10 +1517,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
 
     def update_blackwell_first_sparse_mask_offset(self) -> None:
-        """Update first_sparse_mask_offset_kv for current batch."""
-        self.spec_bl_tree_first_sparse_mask_offset_kv = (
-            self.kv_lens_cuda[:self.num_seqs] -
-            self._seq_lens_cuda[:self.num_seqs]).to(torch.int32)
+        """Update first_sparse_mask_offset_kv for current batch.
+
+        Uses in-place copy to preserve tensor address for CUDA graph compatibility.
+        """
+        n = self.num_seqs
+        offset = (self.kv_lens_cuda[:n] - self._seq_lens_cuda[:n]).to(
+            torch.int32)
+        self.spec_bl_tree_first_sparse_mask_offset_kv[:n].copy_(offset)
 
     def update_spec_dec_param(
         self,
@@ -1567,7 +1571,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
             if is_spec_dec_tree and self.spec_decoding_position_offsets is None:
                 if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
-                    # Dynamic tree: 1D layout to match packed_mask design
+                    # Dynamic tree: 1D layout for flexible view() in drafting loop
                     self.spec_decoding_position_offsets = torch.empty(
                         (self.max_num_requests *
                          (max_total_draft_tokens + 1), ),
