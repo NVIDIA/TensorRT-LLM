@@ -11,12 +11,12 @@ from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile
@@ -995,8 +995,8 @@ class Indexer(nn.Module):
             self.hidden_size,
             self.head_dim,
             bias=False,
-            dtype=dtype,
-            quant_config=quant_config,
+            dtype=torch.float32,
+            quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
@@ -1008,6 +1008,10 @@ class Indexer(nn.Module):
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
+
+        # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
+        # (populated in post_load_weights; maps to TF32 tensor cores on Ampere+)
+        self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
         indexer_rope_interleave = getattr(sparse_attention_config,
                                           'indexer_rope_interleave', False)
@@ -1028,10 +1032,18 @@ class Indexer(nn.Module):
 
         if self.use_cute_dsl_topk and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
             # the dtype of topk input tensor, which is float32 now.
             # Note, need to update it if the dtype of topk input tensor is changed.
             cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
                 dtype=torch.float32, top_k=self.index_topk)
+
+    def post_load_weights(self):
+        """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
+        # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
+        # → fused: [head_dim + n_heads, hidden_size]
+        self._fused_wk_wp_weight = torch.cat(
+            [self.wk.weight.data, self.weights_proj.weight.data], dim=0)
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1140,6 +1152,57 @@ class Indexer(nn.Module):
         )
 
     @staticmethod
+    def recompute_slot_mappings(metadata: DSAtrtllmAttentionMetadata):
+        """Recompute only slot_mapping_fp8/scale from the current block offsets.
+
+        This is the subset of prepare() that maps each token to its flat cache
+        position.  It is safe to call in isolation (e.g. during draft KV-cache
+        replay) because it only touches slot-mapping buffers and reads
+        block-offset / sequence metadata that the caller has already set up.
+        """
+        kv_cache_manager = metadata.kv_cache_manager
+        if kv_cache_manager is None or not hasattr(kv_cache_manager,
+                                                   'index_head_dim'):
+            return
+
+        seq_lens = metadata.seq_lens
+        head_dim = kv_cache_manager.index_head_dim
+        tokens_per_block = kv_cache_manager.tokens_per_block
+        quant_block_size = kv_cache_manager.quant_block_size
+        cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
+        total_tokens = seq_lens.sum().item()
+
+        start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
+        batch_size = len(metadata.request_ids)
+
+        req_indices = torch.repeat_interleave(
+            torch.arange(batch_size, dtype=torch.int64, device='cpu'), seq_lens)
+
+        token_offsets = torch.cat([
+            torch.arange(seq_lens[i].item(), dtype=torch.int64, device='cpu')
+            for i in range(batch_size)
+        ])
+
+        global_positions = start_positions[req_indices] + token_offsets
+
+        fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
+            global_positions,
+            metadata.host_indexer_k_cache_block_offsets,
+            req_indices,
+            head_dim,
+            tokens_per_block,
+            quant_block_size,
+        )
+
+        metadata.host_slot_mapping_fp8[:total_tokens] = fp8_flat_indices
+        metadata.host_slot_mapping_scale[:total_tokens] = scale_flat_indices
+
+        metadata.slot_mapping_fp8[:total_tokens].copy_(
+            metadata.host_slot_mapping_fp8[:total_tokens], non_blocking=True)
+        metadata.slot_mapping_scale[:total_tokens].copy_(
+            metadata.host_slot_mapping_scale[:total_tokens], non_blocking=True)
+
+    @staticmethod
     def prepare(metadata: DSAtrtllmAttentionMetadata):
         """
         Prepare indexer for the forward pass.
@@ -1153,13 +1216,8 @@ class Indexer(nn.Module):
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
-        request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
-        head_dim = kv_cache_manager.index_head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
-        quant_block_size = kv_cache_manager.quant_block_size
-        cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-        total_tokens = seq_lens.sum().item()
 
         # Prepare for prefill phase if there are context requests
         if num_contexts > 0:
@@ -1167,6 +1225,7 @@ class Indexer(nn.Module):
             # cu_seqlen_ks[i]: start index in global KV for query token i
             # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
             host_seq_lens = seq_lens[:num_contexts]
+            cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
             host_cached_tokens = torch.tensor(cached_tokens[:num_contexts],
                                               dtype=torch.int32,
                                               device='cpu')
@@ -1244,43 +1303,20 @@ class Indexer(nn.Module):
                     scheduler_metadata_buffer_expanded, non_blocking=True)
 
         # Compute slot_mapping for all requests (both context and generation)
-        # This maps each token to its flat cache position for vectorized KV cache updates
-        start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
-
-        batch_size = len(request_ids)
-
-        req_indices = torch.repeat_interleave(
-            torch.arange(batch_size, dtype=torch.int64, device='cpu'), seq_lens)
-
-        token_offsets = torch.cat([
-            torch.arange(seq_lens[i].item(), dtype=torch.int64, device='cpu')
-            for i in range(batch_size)
-        ])
-
-        # Compute global positions for all tokens in the batch
-        global_positions = start_positions[req_indices] + token_offsets
-
-        fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
-            global_positions,
-            metadata.host_indexer_k_cache_block_offsets,
-            req_indices,
-            head_dim,
-            tokens_per_block,
-            quant_block_size,
-        )
-
-        metadata.host_slot_mapping_fp8[:total_tokens] = fp8_flat_indices
-        metadata.host_slot_mapping_scale[:total_tokens] = scale_flat_indices
-
-        metadata.slot_mapping_fp8[:total_tokens].copy_(
-            metadata.host_slot_mapping_fp8[:total_tokens], non_blocking=True)
-        metadata.slot_mapping_scale[:total_tokens].copy_(
-            metadata.host_slot_mapping_scale[:total_tokens], non_blocking=True)
+        Indexer.recompute_slot_mappings(metadata)
 
         # When chunked prefill or KVCache reuse is enabled, we need to gather the full KV for indexer's logit computation.
         # Indexer's own chunking does not need full KV gathering, instead it gathers only the current chunk with loop-based gathering.
         _need_full_kv_gathering = num_contexts > 0 and metadata.enable_context_mla_with_cached_kv
         if _need_full_kv_gathering:
+            head_dim = kv_cache_manager.index_head_dim
+            quant_block_size = kv_cache_manager.quant_block_size
+            cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
+            scale_size = head_dim // quant_block_size * 4
+            tokens_per_block * (head_dim + scale_size)
+            tokens_per_block * head_dim
+            start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
+
             total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
             total_kv_per_request = seq_lens[:
                                             num_contexts] + start_positions[:
@@ -1702,18 +1738,26 @@ class Indexer(nn.Module):
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor, indexer_k: torch.Tensor):
+                position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        q_and_k, weights = maybe_execute_in_parallel(
-            lambda: self._qk_projection_and_rope(qr, indexer_k, position_ids),
-            lambda: self.weights_proj(_to_float(hidden_states)),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        q_pe, q_nope, k_pe, k_nope = q_and_k
+        # Single fused FP32 cuBLAS GEMM (TF32 on Ampere+): wk + weights_proj
+        # hidden_states (FP32) @ fused_weight^T -> [N, head_dim + n_heads]
+        assert self._fused_wk_wp_weight is not None, \
+            "post_load_weights() must be called before forward()"
+        hidden_float = _to_float(hidden_states)
+        fused_out = torch.ops.trtllm.cublas_mm(hidden_float,
+                                               self._fused_wk_wp_weight.t(),
+                                               None,
+                                               out_dtype=None)
+        indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
+                                             dim=-1)
+        # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
+        indexer_k = indexer_k.to(hidden_states.dtype)
+
+        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
+            qr, indexer_k, position_ids)
         q, k = maybe_execute_in_parallel(
             lambda: self._prep_q_or_k(q_pe, q_nope),
             lambda: self._prep_q_or_k(k_pe, k_nope),
