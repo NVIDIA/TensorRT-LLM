@@ -40,6 +40,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
@@ -1586,7 +1587,7 @@ def qwen3_mrope_delta(
     video_grid_thw: Optional[torch.Tensor],
     spatial_merge_size: int,
 ) -> torch.Tensor:
-    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_prefill, _, num_decode = BatchInfo(batch_info_host).get_absorbed_info()
     num_seq = num_prefill + num_decode
     device = mm_item_cu_seqlen.device
     out = torch.zeros((num_seq, 1), dtype=torch.int32, device=device)
@@ -1635,7 +1636,7 @@ def qwen3_mrope_delta_fake(
     video_grid_thw: Optional[torch.Tensor],
     spatial_merge_size: int,
 ) -> torch.Tensor:
-    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_prefill, _, num_decode = BatchInfo(batch_info_host).get_absorbed_info()
     num_seq = num_prefill + num_decode
     return torch.zeros((num_seq, 1), dtype=torch.int32, device=batch_info_host.device)
 
@@ -1656,7 +1657,7 @@ def qwen3_mrope_delta_with_cache(
     mrope_delta_cache: torch.Tensor,
     spatial_merge_size: int,
 ) -> torch.Tensor:
-    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_prefill, _, num_decode = BatchInfo(batch_info_host).get_absorbed_info()
     num_seq = num_prefill + num_decode
     out = torch.zeros((num_seq, 1), dtype=torch.int32, device=mrope_delta_cache.device)
     video_grid_norm = _normalize_video_grid_for_mrope(video_grid_thw)
@@ -1731,7 +1732,7 @@ def qwen3_mrope_delta_with_cache_fake(
     mrope_delta_cache: torch.Tensor,
     spatial_merge_size: int,
 ) -> torch.Tensor:
-    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_prefill, _, num_decode = BatchInfo(batch_info_host).get_absorbed_info()
     num_seq = num_prefill + num_decode
     return torch.zeros((num_seq, 1), dtype=torch.int32, device=slot_idx.device)
 
@@ -2060,6 +2061,11 @@ class Qwen3_5MoeModel(nn.Module):
         mm_special_offsets = kwargs.get("mm_special_offsets")
         slot_idx = kwargs.get("slot_idx")
         mrope_delta_cache = kwargs.get("mrope_delta_cache")
+        if mrope_delta_cache is None:
+            for key, value in kwargs.items():
+                if key.endswith("_mrope_delta_cache"):
+                    mrope_delta_cache = value
+                    break
         has_chunk_mm_layout = (
             mm_item_cu_seqlen is not None
             and mm_item_types is not None
@@ -2210,7 +2216,7 @@ class Qwen3_5MoeModel(nn.Module):
                 flat_position_ids = position_ids.reshape(-1)
                 token_delta = torch.zeros_like(flat_position_ids)
                 if (
-                    delta is not None
+                    torch.is_tensor(delta)
                     and cu_seqlen is not None
                     and delta.ndim == 2
                     and delta.shape[0] == cu_seqlen.numel() - 1
@@ -2237,6 +2243,9 @@ class Qwen3_5MoeModel(nn.Module):
             "mrope_delta_cache",
         ):
             kwargs.pop(key, None)
+        for key in list(kwargs.keys()):
+            if key.endswith("_mrope_delta_cache"):
+                kwargs.pop(key, None)
 
         return self.language_model(
             inputs_embeds=inputs_embeds,
