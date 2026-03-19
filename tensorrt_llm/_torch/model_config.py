@@ -521,6 +521,7 @@ class ModelConfig(Generic[TConfig]):
                         index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                        use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
                         q_split_threshold = sparse_attention_config.q_split_threshold
                     else:
                         index_n_heads = pretrained_config.index_n_heads
@@ -528,6 +529,7 @@ class ModelConfig(Generic[TConfig]):
                         index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
+                        use_cute_dsl_topk = False
                         q_split_threshold = 8192
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
@@ -537,6 +539,7 @@ class ModelConfig(Generic[TConfig]):
                             indexer_max_chunk_size=indexer_max_chunk_size,
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
+                            use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave)
             else:
