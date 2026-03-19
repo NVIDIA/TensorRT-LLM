@@ -1795,8 +1795,7 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
-            if (self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver
-                    and not self.is_warmup
+            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
                     and not fitting_disagg_gen_init_requests):
                 stuck_init_requests = [
                     req for req in self.active_requests
@@ -1817,10 +1816,9 @@ class PyExecutor:
                     logger.error(error_msg)
                     # Fail all active and waiting requests so every
                     # client receives an error instead of hanging.
-                    all_requests = list(self.active_requests) + list(
-                        self.waiting_queue)
-                    self._handle_errors(error_msg, requests=all_requests)
-                    self.waiting_queue.clear()
+                    self._handle_errors(error_msg,
+                                        requests=self.active_requests)
+                    return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(

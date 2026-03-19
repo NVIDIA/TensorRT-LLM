@@ -1122,9 +1122,7 @@ class OpenAIServer:
                         "type": "server_error",
                         "code": None,
                         "param": None,
-                        "object": "error"
-                    },
-                    "object": "error",
+                    }
                 })
                 yield f"data: {error_data}\n\n"
                 yield "data: [DONE]\n\n"
