@@ -29,3 +29,5 @@ transforms:
     enabled: true
   gather_logits_before_lm_head:
     enabled: true
+  compile_model:
+    piecewise_enabled: true

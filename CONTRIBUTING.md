@@ -13,7 +13,7 @@ TensorRT-LLM Coding Style can be found [in this document](CODING_GUIDELINES.md).
 We use `pre-commit` for automatic code formatting and validation. Install the `pre-commit` package in your local Python environment.
 
 ```bash
-pip install pre-commit
+pip install pre-commit mypy
 pre-commit install
 ```
 
