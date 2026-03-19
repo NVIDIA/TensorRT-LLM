@@ -362,11 +362,16 @@ class PyTorchModelEngine(ModelEngine):
                 (self.batch_size, ), dtype=torch.int, device='cuda')
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
-            self.max_draft_len = spec_config.max_draft_len
-            # Mutable per-iteration draft length. Updated at each iteration if dynamic draft length is enabled;
-            # Otherwise stays at max_draft_len.
-            self.runtime_draft_len = spec_config.max_draft_len
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
+            # PARD uses 2K tokens per gen request (K accepted + K masks), so
+            # its per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            if spec_config.spec_dec_mode.is_pard():
+                self.max_draft_len = self.max_total_draft_tokens
+            else:
+                self.max_draft_len = spec_config.max_draft_len
+            # Mutable per-iteration draft length (updated each iteration when
+            # dynamic draft length is enabled; otherwise stays fixed).
+            self.runtime_draft_len = self.max_draft_len
 
         else:
             self.without_logits = False
