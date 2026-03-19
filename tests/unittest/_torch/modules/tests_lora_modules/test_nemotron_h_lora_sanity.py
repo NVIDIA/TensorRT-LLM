@@ -22,7 +22,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 from utils.llm_data import llm_models_root
-from utils.util import skip_gpu_memory_less_than_80gb, skip_num_gpus_less_than, skip_pre_hopper
+from utils.util import skip_gpu_memory_less_than_80gb, skip_num_gpus_less_than, skip_pre_blackwell
 
 import tensorrt_llm.bindings as _tb
 from tensorrt_llm import LLM, SamplingParams
@@ -120,7 +120,7 @@ def _get_lora_config(lora_dir):
     return config
 
 
-@skip_pre_hopper
+@skip_pre_blackwell
 @skip_gpu_memory_less_than_80gb
 class TestNemotronHLoRA:
     """E2E LoRA tests on the Super-V3 120B NVFP4 model."""
