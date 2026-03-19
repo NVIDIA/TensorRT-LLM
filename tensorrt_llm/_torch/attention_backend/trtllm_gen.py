@@ -167,8 +167,6 @@ class TrtllmGenSupportChecker:
             return False, "KV cache update cannot be disabled now."
         if cross_attention:
             return False, "Cross attention is not supported by trtllm-gen backend."
-        if is_spec_decoding:
-            return False, "Speculative decoding is not supported by trtllm-gen backend."
 
         has_fp4_kv = (
             quant_config.layer_quant_mode.has_fp4_kv_cache()
