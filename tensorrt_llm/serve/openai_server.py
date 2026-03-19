@@ -1585,20 +1585,8 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            # Normalise to a list of individual (H, W, C) tensors
             raw_images = output.image
-            if hasattr(raw_images, "dim"):
-                if raw_images.dim() == 4:
-                    # Batch tensor (B, H, W, C) → list of (H, W, C)
-                    output_images = [
-                        raw_images[i] for i in range(raw_images.shape[0])
-                    ]
-                else:
-                    output_images = [raw_images]
-            elif isinstance(raw_images, list):
-                output_images = raw_images
-            else:
-                output_images = [raw_images]
+            output_images = MediaStorage._normalize_image_batch(raw_images)
 
             # Persist every generated image to disk
             MediaStorage.save_images(
@@ -1663,19 +1651,8 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            # Normalise to a list of individual (H, W, C) tensors
             raw_images = output.image
-            if hasattr(raw_images, "dim"):
-                if raw_images.dim() == 4:
-                    output_images = [
-                        raw_images[i] for i in range(raw_images.shape[0])
-                    ]
-                else:
-                    output_images = [raw_images]
-            elif isinstance(raw_images, list):
-                output_images = raw_images
-            else:
-                output_images = [raw_images]
+            output_images = MediaStorage._normalize_image_batch(raw_images)
 
             # Persist every generated image to disk
             MediaStorage.save_images(
@@ -1758,7 +1735,10 @@ class OpenAIServer:
                 format=resolved_fmt,
             )
 
-            # Return the first video as a file download
+            # TODO(TRTLLM-11579): Return all generated videos, not just the
+            # first.  The OpenAI Videos API does not yet define a multi-file
+            # response, so for now we return only the first video as a file
+            # download while persisting all of them to disk.
             actual_output_path = saved_paths[0]
             actual_path = Path(actual_output_path)
             media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
@@ -1943,8 +1923,8 @@ class OpenAIServer:
             if job:
                 job.status = "completed"
                 job.completed_at = int(time.time())
-                # Store actual file path(s)
                 job.output_path = str(saved_paths[0])
+                job.output_paths = [str(p) for p in saved_paths]
                 await VIDEO_STORE.upsert(video_id, job)
 
         except Exception as e:

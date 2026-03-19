@@ -510,6 +510,50 @@ def get_video_encoder() -> Optional["VideoEncoder"]:
 class MediaStorage:
     """Handler for storing images and videos in various formats."""
 
+    # Canonical format → extension mapping, shared by save_image and save_images.
+    _IMAGE_EXT_MAP = {
+        "PNG": ".png",
+        "JPEG": ".jpg",
+        "JPG": ".jpg",
+        "WEBP": ".webp",
+    }
+
+    @staticmethod
+    def _image_ext_for_format(format: Optional[str]) -> str:
+        """Return the file extension for a given image format string.
+
+        Args:
+            format: Image format name (e.g. ``"PNG"``, ``"JPEG"``).
+                If *None*, defaults to ``".png"``.
+
+        Returns:
+            Extension string including the leading dot.
+        """
+        if format is None:
+            return ".png"
+        return MediaStorage._IMAGE_EXT_MAP.get(format.upper(), ".png")
+
+    @staticmethod
+    def _normalize_image_batch(raw_images: Any) -> "List[Any]":
+        """Normalise raw image output to a list of individual tensors.
+
+        Handles batched tensors ``(B, H, W, C)``, single tensors ``(H, W, C)``,
+        plain lists, or scalar values.
+
+        Args:
+            raw_images: The raw ``output.image`` value from the generator.
+
+        Returns:
+            A list of individual image tensors / objects.
+        """
+        if hasattr(raw_images, "dim"):
+            if raw_images.dim() == 4:
+                return [raw_images[i] for i in range(raw_images.shape[0])]
+            return [raw_images]
+        if isinstance(raw_images, list):
+            return raw_images
+        return [raw_images]
+
     @staticmethod
     def save_image(
         image: Any, output_path: str, format: Optional[str] = None, quality: int = 95
@@ -579,11 +623,7 @@ class MediaStorage:
         Returns:
             List of paths where images were saved.
         """
-        # Determine extension from format
-        ext = ".png"
-        if format is not None:
-            ext_map = {"PNG": ".png", "JPEG": ".jpg", "JPG": ".jpg", "WEBP": ".webp"}
-            ext = ext_map.get(format.upper(), ".png")
+        ext = MediaStorage._image_ext_for_format(format)
 
         # Normalise to 4-D tensor
         if hasattr(images, "dim") and images.dim() == 3:
@@ -739,7 +779,10 @@ class MediaStorage:
                 saved as ``{prefix}_{index}.{ext}``.
             audios: Optional batched audio tensor.  When provided and the
                 tensor has a batch dimension matching *videos*, each audio
-                slice is paired with the corresponding video.
+                slice is paired with the corresponding video.  If the audio
+                tensor is unbatched (does not have a matching leading
+                dimension), it is attached to the **first** video only;
+                remaining videos receive no audio.
             frame_rate: Frames per second (default: 24.0).
             format: Video format (mp4, avi).  If *None*, defaults to mp4.
 
