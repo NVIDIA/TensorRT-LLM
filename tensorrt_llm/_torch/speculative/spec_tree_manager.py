@@ -320,6 +320,8 @@ class SpecTreeManager:
         bs, num_tokens, num_tokens_attend = mask_matrix.shape
         assert mask_matrix.ndim == 3, f"Expected 3D mask_matrix, got {mask_matrix.ndim}D"
         assert packed_mask.ndim == 3, f"Expected 3D packed_mask, got {packed_mask.ndim}D"
+        assert bs <= self._padded_mask_buf.shape[0], \
+            f"batch size {bs} exceeds pre-allocated buffer size {self._padded_mask_buf.shape[0]}"
         num_blocks = packed_mask.shape[-1]
 
         # Use cached bit weights

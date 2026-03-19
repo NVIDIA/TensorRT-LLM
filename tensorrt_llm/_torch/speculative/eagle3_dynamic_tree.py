@@ -93,7 +93,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accept_token = None
         self._last_num_accepted = None
         self._last_selected_parents = None
-        self._kv_byte_size = None  # Lazily set on first _relocate_kv_eagerly call
+        self._kv_head_bytes = None  # Lazily set on first _relocate_kv_eagerly call
 
         # Pre-allocated buffers for _relocate_kv_eagerly (avoid per-call allocations)
         self._reloc_n_acc_draft = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
@@ -242,18 +242,19 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         past_kv_lens = attn_metadata.kv_lens_cuda[:batch_size]
 
-        if self._kv_byte_size is None:
+        if self._kv_head_bytes is None:
             from tensorrt_llm.bindings import DataType
 
             dtype = cache_mgr.dtype
+            head_dim = cache_mgr.head_dim
             if dtype in (DataType.HALF, DataType.BF16):
-                self._kv_byte_size = 2.0
+                self._kv_head_bytes = head_dim * 2
             elif dtype == DataType.FLOAT:
-                self._kv_byte_size = 4.0
+                self._kv_head_bytes = head_dim * 4
             elif dtype in (DataType.FP8, DataType.INT8):
-                self._kv_byte_size = 1.0
+                self._kv_head_bytes = head_dim
             else:
-                self._kv_byte_size = 0.5  # INT4
+                self._kv_head_bytes = head_dim // 2  # INT4
 
         rewind_adj = self._reloc_rewind_adj[:batch_size]
         rewind_adj.zero_()
@@ -265,7 +266,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             True,  # use_paged_kv_cache
             cache_mgr.num_layers,
             cache_mgr.num_kv_heads,
-            int(cache_mgr.head_dim * self._kv_byte_size),
+            self._kv_head_bytes,
             cache_mgr.max_total_draft_tokens,
             cache_mgr.max_attention_window_vec[0],
             rewind_adj,

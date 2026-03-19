@@ -43,6 +43,7 @@ void build_dynamic_tree_op(th::Tensor& parentList, th::Tensor& selectedIndex, th
     int64_t batchSize = parentList.size(0);
     TORCH_CHECK(selectedIndex.size(0) == batchSize, "Batch size mismatch");
     TORCH_CHECK(selectedIndex.size(1) == numDraftTokens - 1, "selectedIndex size mismatch");
+    TORCH_CHECK(numDraftTokens <= 1024, "numDraftTokens (", numDraftTokens, ") exceeds CUDA block size limit of 1024");
 
     auto device = parentList.device();
     auto stream = at::cuda::getCurrentCUDAStream(device.index());
