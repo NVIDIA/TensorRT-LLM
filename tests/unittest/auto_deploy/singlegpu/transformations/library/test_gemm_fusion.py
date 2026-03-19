@@ -12,9 +12,12 @@ from _graph_test_helpers import count_buffers, run_test_transformed_gm
 from _model_test_utils import FakeFP8Linear
 from _torch_test_utils import all_close, fp8_compatible, reset_parameters
 
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 (registers torch_attention op)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 torch.manual_seed(0)
 
@@ -595,3 +598,339 @@ def test_fuse_gemms_mixed_children(dtype: str):
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)
     assert not all_close(y_model, y_random)
+
+
+# ===========================================================================
+# Tests for QKV fusion with TRT-LLM attention
+# ===========================================================================
+
+
+def _count_narrow_nodes(gm):
+    return sum(1 for n in gm.graph.nodes if n.op == "call_function" and n.target is torch.narrow)
+
+
+def _get_narrow_nodes(gm):
+    return [n for n in gm.graph.nodes if n.op == "call_function" and n.target is torch.narrow]
+
+
+def _get_linear_nodes(gm):
+    return [n for n in gm.graph.nodes if is_linear_op(n)]
+
+
+class QKVAttentionModel(TestModel):
+    """Model with separate Q, K, V projections feeding into torch_attention.
+
+    Mimics the attention pattern in transformer models where Q, K, V are
+    projected from the same input. fuse_gemms_mixed_children should fuse the
+    3 projections into one GEMM with 3 narrow views.
+    """
+
+    def __init__(
+        self,
+        batch_size=2,
+        seq_len=8,
+        hidden_size=64,
+        num_heads=4,
+        num_kv_heads=None,
+    ):
+        super().__init__()
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.q_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def get_input(self, **kwargs):
+        return torch.randn(self.batch_size, self.seq_len, self.hidden_size, **kwargs)
+
+    @property
+    def keys_to_pop(self):
+        return ("q_proj.weight", "k_proj.weight", "v_proj.weight")
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 2  # 1 fused QKV + 1 o_proj
+
+    @property
+    def expected_narrow_count(self) -> int:
+        return 3  # Q, K, V slices
+
+    def forward(self, x):
+        b, s, _ = x.shape
+        q = self.q_proj(x).view(b, s, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+
+        attn = torch.ops.auto_deploy.torch_attention.default(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=None,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        out = attn.reshape(b, s, self.hidden_size)
+        return self.o_proj(out)
+
+
+class SwiGLUModel(TestModel):
+    """MLP with gate + up projections sharing the same input (SwiGLU pattern).
+
+    fuse_gemms_mixed_children should fuse gate+up into one GEMM with 2 narrow
+    views.
+    """
+
+    def __init__(self, batch_size=2, seq_len=8, hidden_size=64, intermediate_size=128):
+        super().__init__()
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def get_input(self, **kwargs):
+        return torch.randn(self.batch_size, self.seq_len, self.hidden_size, **kwargs)
+
+    @property
+    def keys_to_pop(self):
+        return ("gate_proj.weight", "up_proj.weight")
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 2  # 1 fused gate+up + 1 down_proj
+
+    @property
+    def expected_narrow_count(self) -> int:
+        return 2  # gate, up slices
+
+    def forward(self, x):
+        gate = F.silu(self.gate_proj(x))
+        up = self.up_proj(x)
+        return self.down_proj(gate * up)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize(
+    "model_cls,model_kwargs",
+    [
+        (QKVAttentionModel, {}),
+        (QKVAttentionModel, {"num_kv_heads": 2}),
+        (SwiGLUModel, {}),
+    ],
+    ids=["qkv_mha", "qkv_gqa", "swiglu"],
+)
+@torch.inference_mode()
+def test_fuse_qkv_and_mlp_projections(model_cls, model_kwargs, dtype: str):
+    """Verify QKV and gate/up fusion: graph structure, narrow nodes, numerical correctness."""
+    torch_dtype = getattr(torch, dtype)
+    model = model_cls(**model_kwargs).to(device="cuda", dtype=torch_dtype)
+    x = model.get_input(device="cuda", dtype=torch_dtype)
+    y_model = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    num_linears = sum(is_linear_op(n) for n in gm_transformed.graph.nodes)
+    assert num_linears == model.num_gemms_after_fusion, (
+        f"Expected {model.num_gemms_after_fusion} linears after fusion, got {num_linears}"
+    )
+
+    narrow_count = _count_narrow_nodes(gm_transformed)
+    assert narrow_count == model.expected_narrow_count, (
+        f"Expected {model.expected_narrow_count} narrow nodes, got {narrow_count}"
+    )
+
+    y_transformed = gm_transformed(x)
+    assert all_close(y_model, y_transformed, atol=1e-3, rtol=1e-3)
+
+    reset_parameters(gm_transformed)
+    y_random = gm_transformed(x)
+    assert not all_close(y_model, y_random)
+
+
+@pytest.mark.parametrize(
+    "model_cls,model_kwargs",
+    [
+        (QKVAttentionModel, {}),
+        (QKVAttentionModel, {"num_kv_heads": 2}),
+        (SwiGLUModel, {}),
+    ],
+    ids=["qkv_mha", "qkv_gqa", "swiglu"],
+)
+@torch.inference_mode()
+def test_fuse_meta_val_propagation(model_cls, model_kwargs):
+    """Verify meta['val'] shapes are correct on fused linear and narrow nodes.
+
+    Without meta['val'] propagation, downstream transforms like sharding that
+    read node.meta['val'].shape would see None and crash.
+    """
+    model = model_cls(**model_kwargs).to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    for n in gm_transformed.graph.nodes:
+        if is_linear_op(n):
+            val = n.meta.get("val")
+            if val is not None:
+                assert val.shape[0] > 0, "Fused linear meta['val'] has invalid batch dim"
+                assert val.shape[-1] > 0, "Fused linear meta['val'] has invalid output dim"
+
+    narrow_nodes = _get_narrow_nodes(gm_transformed)
+    for narrow_node in narrow_nodes:
+        val = narrow_node.meta.get("val")
+        assert val is not None, "Narrow node is missing meta['val']"
+        expected_size = narrow_node.args[3]  # torch.narrow(tensor, dim, start, length)
+        assert val.shape[-1] == expected_size, (
+            f"Narrow node meta['val'] last dim {val.shape[-1]} != expected {expected_size}"
+        )
+
+    linear_nodes = _get_linear_nodes(gm_transformed)
+    for linear_node in linear_nodes:
+        narrow_users = [
+            u for u in linear_node.users if u.op == "call_function" and u.target is torch.narrow
+        ]
+        if not narrow_users:
+            continue
+        total_narrow_size = sum(u.args[3] for u in narrow_users)
+        fused_val = linear_node.meta.get("val")
+        assert fused_val is not None, "Fused linear is missing meta['val']"
+        assert fused_val.shape[-1] == total_narrow_size, (
+            f"Fused linear output dim {fused_val.shape[-1]} != "
+            f"sum of narrow sizes {total_narrow_size}"
+        )
+
+
+@torch.inference_mode()
+def test_fuse_qkv_with_trtllm_cache_insertion():
+    """Chain QKV fusion → TRT-LLM cache insertion and verify the pipeline works.
+
+    This tests that fuse_gemms_mixed_children produces correct meta['val']
+    shapes that the insert_cached_attention transform can consume when using
+    the TRT-LLM attention backend.
+    """
+    model = QKVAttentionModel(hidden_size=64, num_heads=4).to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    assert _count_narrow_nodes(gm) == 3
+    assert sum(is_linear_op(n) for n in gm.graph.nodes) == 2
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=128,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=64,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    gm = InferenceOptimizer(
+        None,
+        {"insert_cached_attention": {"stage": "cache_init", "backend": "trtllm"}},
+    )(cm, gm)
+
+    cached_attn_nodes = [
+        n
+        for n in gm.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
+    ]
+    assert len(cached_attn_nodes) == 1, (
+        f"Expected 1 trtllm_attention_mha_with_cache node, got {len(cached_attn_nodes)}"
+    )
+
+    prep_meta_nodes = [
+        n
+        for n in gm.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.trtllm_attention_prepare_metadata.default)
+    ]
+    assert len(prep_meta_nodes) == 1, (
+        f"Expected 1 prepare_metadata node, got {len(prep_meta_nodes)}"
+    )
+
+    assert _count_narrow_nodes(gm) == 3
+
+
+@torch.inference_mode()
+def test_fuse_qkv_gqa_with_trtllm_cache_insertion():
+    """Same pipeline but with GQA (num_kv_heads < num_heads).
+
+    Verifies that asymmetric Q/KV projection sizes work through the full
+    fusion → cache insertion pipeline.
+    """
+    model = QKVAttentionModel(
+        hidden_size=64,
+        num_heads=4,
+        num_kv_heads=2,
+    ).to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    assert _count_narrow_nodes(gm) == 3
+
+    narrow_sizes = sorted([n.args[3] for n in _get_narrow_nodes(gm)])
+    assert narrow_sizes == [32, 32, 64], f"Unexpected narrow sizes for GQA: {narrow_sizes}"
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=128,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=64,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    gm = InferenceOptimizer(
+        None,
+        {"insert_cached_attention": {"stage": "cache_init", "backend": "trtllm"}},
+    )(cm, gm)
+
+    cached_attn_nodes = [
+        n
+        for n in gm.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
+    ]
+    assert len(cached_attn_nodes) == 1

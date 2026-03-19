@@ -72,6 +72,7 @@ def _insert_fused_gemm(
     )
 
     fused_kwargs = dict(linear_nodes[0].kwargs)
+    ref_val = linear_nodes[0].meta.get("val")
 
     with gm.graph.inserting_before(linear_nodes[0]):
         get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
@@ -82,6 +83,11 @@ def _insert_fused_gemm(
             args=(parent_node, get_param_node, None),
             kwargs=fused_kwargs,
         )
+        if ref_val is not None:
+            fused_out_shape = (*ref_val.shape[:-1], sum(sizes_unfused))
+            fused_linear_node.meta["val"] = torch.empty(
+                fused_out_shape, dtype=ref_val.dtype, device="meta"
+            )
 
     if allow_not_contigous:
         offset = 0
@@ -91,6 +97,10 @@ def _insert_fused_gemm(
                 narrow_node = gm.graph.call_function(
                     torch.narrow, args=(fused_linear_node, -1, offset, size)
                 )
+                if ref_val is not None:
+                    narrow_node.meta["val"] = torch.empty(
+                        (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
+                    )
             n.replace_all_uses_with(narrow_node)
             offset += size
     else:
@@ -196,7 +206,7 @@ class QuantizationFusionMixin(ABC):
         for name, buf in buffers_fused.items():
             gm.register_buffer(f"{key_fused}_{name}", buf)
 
-        ad_logger.warning(
+        ad_logger.debug(
             f"Fusing {len(linear_nodes)} quantized GEMMs ({keys_unfused}) into {key_fused}"
         )
 

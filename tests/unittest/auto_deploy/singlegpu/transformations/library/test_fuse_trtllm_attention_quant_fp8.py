@@ -10,7 +10,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention impor
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
@@ -267,7 +267,7 @@ def test_insert_cached_attention_trtllm_materializes_out_scale_reciprocal():
     cached_nodes = _find_nodes(gm, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
     assert len(cached_nodes) == 1
 
-    out_scale_arg = cached_nodes[0].args[-1]
+    (out_scale_arg,) = extract_op_args(cached_nodes[0], "out_scale")
     assert isinstance(out_scale_arg, torch.fx.Node)
     assert is_op(out_scale_arg, torch.ops.aten.reciprocal.default)
     assert out_scale_arg is reciprocal_nodes[0]
@@ -312,4 +312,5 @@ def test_insert_cached_attention_trtllm_fallback_without_fp8_contract():
     assert len(_find_nodes(gm, torch.ops.aten.reciprocal.default)) == 0
     cached_nodes = _find_nodes(gm, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
     assert len(cached_nodes) == 1
-    assert cached_nodes[0].args[-1] is None
+    (out_scale_arg,) = extract_op_args(cached_nodes[0], "out_scale")
+    assert out_scale_arg is None
