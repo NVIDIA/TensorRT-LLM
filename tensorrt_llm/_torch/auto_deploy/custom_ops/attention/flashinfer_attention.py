@@ -318,7 +318,9 @@ def prepare_flashinfer_metadata_host(
         )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=("kv_cache",)
+)
 def flashinfer_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -342,6 +344,8 @@ def flashinfer_mha_with_cache(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    # OPTIONAL PRE-ALLOCATED OUTPUT
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # kv_cache shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
     head_dim = kv_cache.shape[-1]
@@ -381,10 +385,12 @@ def flashinfer_mha_with_cache(
         kv_layout=_GlobalFlashInferPlanner.kv_layout,
     )
 
-    # Pre-allocate output as zeros so padding positions are clean
-    y = torch.zeros_like(q)
+    bs = b * s
+    if out is not None:
+        y = out.view(-1, n_heads, head_dim)
+    else:
+        y = torch.zeros((bs, n_heads, head_dim), dtype=q.dtype, device=q.device)
 
-    # now run split prefill, decode
     if num_prefill > 0:
         q_prefill = q[:num_prefill_tokens]
 
@@ -408,14 +414,14 @@ def flashinfer_mha_with_cache(
             plan_params=pp_prefill,
         )
 
-        y_prefill = wrapper_prefill.run(
+        wrapper_prefill.run(
             q_prefill,
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
+            out=y[:num_prefill_tokens],
         )
-        y[:num_prefill_tokens] = y_prefill
 
     if num_decode > 0:
         q_decode = q[num_prefill_tokens:num_total_tokens]
@@ -431,7 +437,6 @@ def flashinfer_mha_with_cache(
             sm_scale=scale,
         )
 
-        # run the flashinfer planner and obtain the correct wrapper
         wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
             kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
             kv_page_indices=cache_loc,
@@ -439,14 +444,21 @@ def flashinfer_mha_with_cache(
             plan_params=pp_decode,
         )
 
-        y_decode = wrapper_decode.run(
+        wrapper_decode.run(
             q_decode,
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
+            out=y[num_prefill_tokens:num_total_tokens],
         )
-        y[num_prefill_tokens:num_total_tokens] = y_decode
+
+    if out is not None:
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
+        return out.new_empty(0)
 
     return y.view(q_shape_og)
 
@@ -475,7 +487,11 @@ def flashinfer_mha_with_cache_fake(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    # OPTIONAL PRE-ALLOCATED OUTPUT
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out.new_empty(0)
     return torch.empty_like(q.contiguous())
 
 

@@ -3677,45 +3677,42 @@ files = [
 
 [[package]]
 name = "nvtx"
-version = "0.2.14"
+version = "0.2.15"
 description = "Python NVTX - Python code annotation library"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "nvtx-0.2.14-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b70b2415ab97edf19514be226d5058898922c6b6bb1d7fdd5ef92d1e086f3e0f"},
-    {file = "nvtx-0.2.14-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:23ab874f9c70e5433f39e40ca318ffcfc14fb43ed6798e6be5a30f74e4ca831f"},
-    {file = "nvtx-0.2.14-cp310-cp310-win_amd64.whl", hash = "sha256:3a22be895546ca609e83e54614b56739200ab6f4d13e15f5685544082b1b7908"},
-    {file = "nvtx-0.2.14-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:227f6406d2fe1a4b890be17eb1f4c1f5bd4df8f7032dd1cb8c7651d379f35541"},
-    {file = "nvtx-0.2.14-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:0664aa75b24e2ad0abdd0fa52c49e9c8a120652f2194289c85dc2d93cbc6017f"},
-    {file = "nvtx-0.2.14-cp311-cp311-win_amd64.whl", hash = "sha256:10f5971661d61c1a90cd36c3069240452c904ecec4b3a08d0d6fdba1e5398165"},
-    {file = "nvtx-0.2.14-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:3ece46f555e725db879df06549980744f89db5923a77e6f7a5aecda75292421a"},
-    {file = "nvtx-0.2.14-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:17efe5d903996bceb0c8a12cae80fa9b66bee7ee895923bd9d8ec2a5af1aabd8"},
-    {file = "nvtx-0.2.14-cp312-cp312-win_amd64.whl", hash = "sha256:f40db4746714d525d3020c702a0df866c2335efd6a27c41e869e577402a53a4b"},
-    {file = "nvtx-0.2.14-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d8cd1f2b464675b4d3c2036b7bbaf975baa9307f0795107dc69c556c0c8d191d"},
-    {file = "nvtx-0.2.14-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6532556d81f782e24eb12c5e0c75e297493d6ab0431177c93c12bb29c523ea9e"},
-    {file = "nvtx-0.2.14-cp313-cp313-win_amd64.whl", hash = "sha256:cd86f78ed56aede301b03e5ab8cb1aaeb8ba0b5ed683f98f87fbe474996d73f2"},
-    {file = "nvtx-0.2.14-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:51d48a98db0c3f4b701d3422ef34bf34c0c9256036d036dd115d48c6286b7b82"},
-    {file = "nvtx-0.2.14-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:638f66b6119fb3adfe3f5e2ba2d0cca9580bc4a898cd702b639d727a4a405c59"},
-    {file = "nvtx-0.2.14-cp313-cp313t-win_amd64.whl", hash = "sha256:d5dfaf02a91fd2a123e104d59681dc768c07b66b05e4afc4c05ee125e45f6261"},
-    {file = "nvtx-0.2.14-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:12c21b01b426e85054606d5d8e78d08ab804f1231d4f24be6ded595f901b1125"},
-    {file = "nvtx-0.2.14-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:296aa978e572d2854a980506cb9de6fe641d496b46879b56c6e6df7467056303"},
-    {file = "nvtx-0.2.14-cp314-cp314-win_amd64.whl", hash = "sha256:e265cce4d7ecfb56b9e974be736bba308be47402edfc09dd6a5f91a8eafa90c3"},
-    {file = "nvtx-0.2.14-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:fc5522766fff59cf62e42c31324b1c405d308d7755e847e25d286f29e217f54a"},
-    {file = "nvtx-0.2.14-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:671b592464038054cc31a5d8c53a460d22fc38b066bbd055e086be8dd49fa43b"},
-    {file = "nvtx-0.2.14-cp314-cp314t-win_amd64.whl", hash = "sha256:2567ce29e905062c239a33ba91a46ca7307561c40fd7b37ec64c00cd78f9bdab"},
-    {file = "nvtx-0.2.14-cp38-cp38-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:62ab011dc6c4da7a309475681463da45ddfc83698fb44f4778c08a128f2f87ab"},
-    {file = "nvtx-0.2.14-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d884d23a9f75f2355cfbddb52a2aad40cb47fb165fd0a6861b7a02d87a238855"},
-    {file = "nvtx-0.2.14-cp38-cp38-win_amd64.whl", hash = "sha256:724f2b51a3ca7e8dc58ddb7b552388c3ba28ab9dff4c32d29fbc10ab843ad350"},
-    {file = "nvtx-0.2.14-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:96462e675252fcc98b26d6affeb261357fb6e4c0696df54f3133eeb5cb4140a4"},
-    {file = "nvtx-0.2.14-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4746c9afa51796e13c9e5ca976cc65a7429832f8a4932d9ad191ab980a5de5c6"},
-    {file = "nvtx-0.2.14-cp39-cp39-win_amd64.whl", hash = "sha256:01ab0047bcc8afa2ae4651a7e3113bfc1bce1c9b45a523b20ce669e8d2a6ae7f"},
-    {file = "nvtx-0.2.14.tar.gz", hash = "sha256:12945242a31bde70b1f15cae867f8706bdff290e2f808a11738e03ebefdf847f"},
+    {file = "nvtx-0.2.15-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a4f50832fd90a1b480a9deef6e4cd48015b61869095b54dd1a7afe87b4138c6a"},
+    {file = "nvtx-0.2.15-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5f3362f0db4252514719326c9d5662b0f93d254659ba97b9c8dbe556286e0e3e"},
+    {file = "nvtx-0.2.15-cp310-cp310-win_amd64.whl", hash = "sha256:d71f934e580d4572f382712b6da464ab69e4c212981506f781f927d5c6d935d6"},
+    {file = "nvtx-0.2.15-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:157b80ea9b4db6c8f47f8dbe2fa2e81e7a7f1445bb87f8268f43dec9210b78a1"},
+    {file = "nvtx-0.2.15-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:02bca69ee55e0be41eabf908de9dbcdd18e702c7f49f9aa63fd396ce684ff5d5"},
+    {file = "nvtx-0.2.15-cp311-cp311-win_amd64.whl", hash = "sha256:dbe41f78f5a811bd4cdad0a237e5b41a4937d8c2c6c9abdd161091671a598bc0"},
+    {file = "nvtx-0.2.15-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2cc530cd0f1a2c14a3a7e683833db509888ac5ed4ead94e5c9e2c7317c6937a7"},
+    {file = "nvtx-0.2.15-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3ca8030a6d197952318013dd1c12c22da1d4b9feb76ba72e0fcd449961183c2c"},
+    {file = "nvtx-0.2.15-cp312-cp312-win_amd64.whl", hash = "sha256:70a1e768964e0520b68ccabc4df391cc227537c45936a7eba6507bc65e617e00"},
+    {file = "nvtx-0.2.15-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d28660d9c46f8ba750d781572b6aa5a1e6221abba224ab32d7fb32c2d0fd67df"},
+    {file = "nvtx-0.2.15-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10749686633f880ad53dcdbb2179fad41b45dcf5b7631d4a1070a577577bd386"},
+    {file = "nvtx-0.2.15-cp313-cp313-win_amd64.whl", hash = "sha256:a6650b029263d12f8427a4dee8bd59cb9c91bccb60543bfcb20bc2b00fdcd672"},
+    {file = "nvtx-0.2.15-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:25813ead4fff4d3a6e04f69a72507b096a6bdbecefa369f1100b0e584767bca8"},
+    {file = "nvtx-0.2.15-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3741edac4678b92f03d22a3f0a2dfd469f422f85e63db71b038e02525b2404ad"},
+    {file = "nvtx-0.2.15-cp313-cp313t-win_amd64.whl", hash = "sha256:8be06c3c8c267eba56a0396366b9593092e0b75ea8d3702b303d48c0a1662f0e"},
+    {file = "nvtx-0.2.15-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b5171b8283dd3ea9ae688a86d16901b4c2c142c4eb0a4bdbf6c222f5f67f9524"},
+    {file = "nvtx-0.2.15-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3c6d0f27d4f8a2f479eb64a6b842c13aee32120348a1715d995b9bb9f75b35cf"},
+    {file = "nvtx-0.2.15-cp314-cp314-win_amd64.whl", hash = "sha256:9934fad0b441cfa6e896a848b092498ba23e2ff205c2b9a7b60520ff8367ffef"},
+    {file = "nvtx-0.2.15-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aca61135c76b8107ae3c994325613afa661e1336a991c59cc9c6176829b3b32c"},
+    {file = "nvtx-0.2.15-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:58653bf6fd8453947b9e5153da2ad7aeb0ceafa030de7f133efb3eada5da7ca7"},
+    {file = "nvtx-0.2.15-cp314-cp314t-win_amd64.whl", hash = "sha256:9d1d10db4fb4a3b0ffd6ed37bf25f0a966a3b4d34b3c9abb1f6572732959a6e5"},
+    {file = "nvtx-0.2.15-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c6c9e76d40eae128b6ad0bd44123df516dfcc26e2d6bb65ddd9336b35caeec7f"},
+    {file = "nvtx-0.2.15-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f862e22017b43edf7eaf8379091a034e88d99631bc16f3b6b11abf6d09a1177f"},
+    {file = "nvtx-0.2.15-cp39-cp39-win_amd64.whl", hash = "sha256:d2ec75546d37738ae41dea026bbd04ccf61c11a9acbf96b744a9478aa93a8c2f"},
+    {file = "nvtx-0.2.15.tar.gz", hash = "sha256:2287d3be05b85661deb386f878d1f536c2e532774aa9ec7a50c434942ed81ae5"},
 ]
 
 [package.extras]
 docs = ["nvidia_sphinx_theme", "sphinx"]
-test = ["Cython (>=3.1)", "pytest", "setuptools"]
+test = ["pytest", "setuptools"]
 
 [[package]]
 name = "omegaconf"
@@ -6950,4 +6947,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "0224ccb226f88c4681aa0c2d2a176204b989c0103a5b4c763c65801c3d6238a6"
+content-hash = "254e3d91005af1293c93b13e8d66043c08339f8aea51d767e296280f4d034159"
