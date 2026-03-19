@@ -166,8 +166,9 @@ class DeepEP(Communication):
         if token_final_scales is not None and token_final_scales.dtype != torch.float32:
             token_final_scales = token_final_scales.to(torch.float32)
 
-        if not self.supports_post_quant_dispatch():
-            # Pre-quant dispatch (unquantized data)
+        if not self.supports_post_quant_dispatch() or hidden_states_sf is None:
+            # Pre-quant dispatch (unquantized data, or post-quant not possible
+            # because backend did not produce scale factors)
             (
                 hidden_states,
                 recv_topk_idx,
@@ -198,11 +199,10 @@ class DeepEP(Communication):
         else:
             # Post-quant dispatch (quantized data, nvfp4 only)
 
-            if hidden_states_sf is not None:
-                # Adapter between `hidden_states_sf` and DeepEP
-                # TODO: remove the adapter by adding dtype support to DeepEP
-                sf_dtype = hidden_states_sf.dtype
-                hidden_states_sf = hidden_states_sf.view(torch.float32)
+            # Adapter between `hidden_states_sf` and DeepEP
+            # TODO: remove the adapter by adding dtype support to DeepEP
+            sf_dtype = hidden_states_sf.dtype
+            hidden_states_sf = hidden_states_sf.view(torch.float32)
 
             (
                 (hidden_states, hidden_states_sf),
