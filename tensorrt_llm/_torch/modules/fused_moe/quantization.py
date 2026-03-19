@@ -1111,215 +1111,37 @@ def transform_fp8_scale_to_required_layout(
 class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
-    # Temporary module attrs used to cache lazy-resmooth state across loading phases.
-    _RESMOOTHED_SCALES_ATTR = "_fp8_resmoothed_scales_by_expert"
-    _PRE_RESMOOTHED_TARGETS_ATTR = "_fp8_pre_resmoothed_targets"
-
-    def _maybe_lazy_resmooth_weight(
-            self, module: torch.nn.Module, expert_id: int, proj_name: str,
-            weight: Optional[torch.Tensor],
-            scale: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Resmooth a single expert weight on demand and cache its new scale.
-
-        The lazy path resmooths only the weight shard being loaded, instead of
-        eagerly resmoothing all experts during `load_weights()`. The updated
-        E8M0 scale is cached on the module so later scale loading and
-        `post_load_weights()` can reuse it without recomputing or applying a
-        second resmooth pass.
-        """
-        if weight is None or scale is None:
-            return weight
-
-        logger.debug(f"Lazily resmoothing {expert_id}.{proj_name}.weight")
-        resmoothed_weight, resmoothed_scale = resmooth_to_fp8_e8m0(
-            weight[:], scale[:].to(torch.float32))
-        cached_scales = getattr(module, self._RESMOOTHED_SCALES_ATTR, {})
-        setattr(module, self._RESMOOTHED_SCALES_ATTR, cached_scales)
-        expert_scales = cached_scales.setdefault(expert_id, {})
-        expert_scales[proj_name] = resmoothed_scale.cpu()
-        return resmoothed_weight
-
-    def _update_shared_scale_tensors(self, module: torch.nn.Module,
-                                     local_slot_id: int, expert_id: int):
-        expert_scales = getattr(module, self._RESMOOTHED_SCALES_ATTR,
-                                {}).get(expert_id, {})
-        cached_w3_scale = expert_scales.get("w3")
-        cached_w1_scale = expert_scales.get("w1")
-        cached_w2_scale = expert_scales.get("w2")
-
-        if (cached_w3_scale is None or cached_w1_scale is None
-                or cached_w2_scale is None):
-            return
-
-        shared_w3_w1_scales = getattr(module,
-                                      'local_shared_w3_w1_scale_tensors', None)
-        shared_w2_scales = getattr(module, 'local_shared_w2_scale_tensors',
-                                   None)
-        if shared_w3_w1_scales is None or shared_w2_scales is None:
-            return
-
-        dst_w3_scale, dst_w1_scale = shared_w3_w1_scales[local_slot_id].chunk(
-            2, dim=0)
-        dst_w1_scale.copy_(
-            load_weight_shard(cached_w1_scale,
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.COLUMN,
-                              device=shared_w3_w1_scales.device))
-        dst_w3_scale.copy_(
-            load_weight_shard(cached_w3_scale,
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.COLUMN,
-                              device=shared_w3_w1_scales.device))
-        shared_w2_scales[local_slot_id].copy_(
-            load_weight_shard(cached_w2_scale,
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.ROW,
-                              device=shared_w2_scales.device))
-
     def load_weights(self,
                      module: torch.nn.Module,
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
-        setattr(module, self._RESMOOTHED_SCALES_ATTR, {})
-        setattr(module, self._PRE_RESMOOTHED_TARGETS_ATTR, set())
+        if is_sm_100f():
+            expert_ids = set(module.initial_local_expert_ids)
+            if self.need_load_shared_weights(module):
+                expert_ids.update(
+                    module.layer_load_balancer.get_load_expert_ids())
+            for name in list(weights.keys()):
+                if not name.endswith("weight_scale_inv"):
+                    continue
+                if int(name.split(".")[0]) not in expert_ids:
+                    continue
+                weight_name = name.replace("weight_scale_inv", "weight")
+                if weight_name not in weights:
+                    continue
+                logger.debug(f"Resmoothing {weight_name}")
+                weight = weights[weight_name][:]
+                scale = weights[name][:].to(torch.float32)
+                weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
+                    weight, scale)
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
 
-    def load_expert_weights_to_dst(
-            self,
-            module: torch.nn.Module,
-            weights: Dict,
-            weight_loading_mode: MoEWeightLoadingMode,
-            load_expert_ids: List[int],
-            dst_w3_w1_weights_tensor: torch.Tensor,
-            dst_w2_weights_tensor: torch.Tensor,
-            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
-            dst_w2_bias_tensor: Optional[torch.Tensor],
-            allow_partial_loading: bool = False):
-        if not (is_sm_100f()
-                and weight_loading_mode == MoEWeightLoadingMode.VANILLA):
-            return super().load_expert_weights_to_dst(
-                module,
-                weights,
-                weight_loading_mode,
-                load_expert_ids,
-                dst_w3_w1_weights_tensor,
-                dst_w2_weights_tensor,
-                dst_w3_w1_bias_tensor,
-                dst_w2_bias_tensor,
-                allow_partial_loading=allow_partial_loading)
-
-        device = dst_w3_w1_weights_tensor.device.type
-        pre_resmoothed_targets = getattr(module,
-                                         self._PRE_RESMOOTHED_TARGETS_ATTR,
-                                         set())
-        setattr(module, self._PRE_RESMOOTHED_TARGETS_ATTR,
-                pre_resmoothed_targets)
-
-        def maybe_pageout_mmapped_cpu_weights(weight_tensors):
-            if device == "cuda":
-                return
-            for weight in weight_tensors:
-                if (isinstance(weight, torch.Tensor)
-                        and weight.device.type == "cpu"
-                        and weight.is_contiguous()):
-                    advise_tensor_pageout(weight)
-
-        for local_slot_id, expert_id in enumerate(load_expert_ids):
-            raw_w1_weight = weights[
-                f"{expert_id}.w1.weight"] if f"{expert_id}.w1.weight" in weights else None
-            raw_w3_weight = weights[
-                f"{expert_id}.w3.weight"] if f"{expert_id}.w3.weight" in weights else None
-            raw_w2_weight = weights[
-                f"{expert_id}.w2.weight"] if f"{expert_id}.w2.weight" in weights else None
-
-            w1_weight = self._maybe_lazy_resmooth_weight(
-                module, expert_id, "w1", raw_w1_weight,
-                weights.get(f"{expert_id}.w1.weight_scale_inv"))
-            w3_weight = self._maybe_lazy_resmooth_weight(
-                module, expert_id, "w3", raw_w3_weight,
-                weights.get(f"{expert_id}.w3.weight_scale_inv"))
-            w2_weight = self._maybe_lazy_resmooth_weight(
-                module, expert_id, "w2", raw_w2_weight,
-                weights.get(f"{expert_id}.w2.weight_scale_inv"))
-
-            self.load_expert_w3_w1_weight(
-                module,
-                w1_weight,
-                w3_weight,
-                dst_w3_w1_weights_tensor[local_slot_id],
-                allow_partial_loading=allow_partial_loading)
-            self.load_expert_w2_weight(
-                module,
-                w2_weight,
-                dst_w2_weights_tensor[local_slot_id],
-                allow_partial_loading=allow_partial_loading)
-
-            unmap_weights = [
-                weight
-                for weight in [raw_w1_weight, raw_w3_weight, raw_w2_weight]
-                if weight is not None
-            ]
-            module._add_raw_shared_weights_for_unmap(unmap_weights)
-            maybe_pageout_mmapped_cpu_weights(unmap_weights)
-
-            if dst_w3_w1_weights_tensor.device.type == "cpu":
-                pre_resmoothed_targets.add("shared")
-                self._update_shared_scale_tensors(module, local_slot_id,
-                                                  expert_id)
-            else:
-                pre_resmoothed_targets.add("local")
-
-            if module.bias:
-                w1_bias = weights[
-                    f"{expert_id}.w1.bias"] if f"{expert_id}.w1.bias" in weights else None
-                w3_bias = weights[
-                    f"{expert_id}.w3.bias"] if f"{expert_id}.w3.bias" in weights else None
-                w2_bias = weights[
-                    f"{expert_id}.w2.bias"] if f"{expert_id}.w2.bias" in weights else None
-
-                self.load_expert_w3_w1_weight(
-                    module,
-                    w1_bias,
-                    w3_bias,
-                    dst_w3_w1_bias_tensor.data[local_slot_id],
-                    allow_partial_loading=allow_partial_loading)
-                self.load_expert_w2_weight(
-                    module,
-                    w2_bias,
-                    dst_w2_bias_tensor.data[local_slot_id],
-                    allow_partial_loading=allow_partial_loading)
-
-                unmap_weights = [
-                    weight for weight in [w1_bias, w3_bias, w2_bias]
-                    if weight is not None
-                ]
-                module._add_raw_shared_weights_for_unmap(unmap_weights)
-                maybe_pageout_mmapped_cpu_weights(unmap_weights)
-
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        cached_scales = getattr(module, self._RESMOOTHED_SCALES_ATTR, {})
-        if not cached_scales:
-            return super().load_quant_scales(module, weights)
-
-        cached_weights = dict(weights)
-        for expert_id, scales in cached_scales.items():
-            for proj_name, scale in scales.items():
-                cached_weights[
-                    f"{expert_id}.{proj_name}.weight_scale_inv"] = scale
-        return super().load_quant_scales(module, cached_weights)
+    def _needs_e8m0_resmooth(self):
+        return is_sm_100f() or get_sm_version() == 120
 
     def post_load_weights(self, module: torch.nn.Module):
-        pre_resmoothed_targets = getattr(module,
-                                         self._PRE_RESMOOTHED_TARGETS_ATTR,
-                                         set())
-        # DeepGEMM SM100/SM120 FP8 block-scale expects requantized FP8 weights paired with E8M0-compatible scales.
-        needs_e8m0_resmooth = is_sm_100f() or get_sm_version() == 120
-        if needs_e8m0_resmooth:
+        if self._needs_e8m0_resmooth():
             # Resmooth shared experts before registering shared weights
             if self.need_load_shared_weights(module):
                 local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -1339,71 +1161,46 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                         module, 'local_shared_w2_tensors')
                     local_shared_w2_scale_tensors = getattr(
                         module, 'local_shared_w2_scale_tensors')
-
-                    if "shared" in pre_resmoothed_targets:
-                        transformed_shared_w3_w1_scale = transform_fp8_scale_to_required_layout(
-                            local_shared_w3_w1_tensors,
-                            local_shared_w3_w1_scale_tensors)
-                    else:
-                        resmoothed_shared_w3_w1_weight, transformed_shared_w3_w1_scale = resmooth_and_transform_fp8_scale(
-                            local_shared_w3_w1_tensors,
-                            local_shared_w3_w1_scale_tensors)
-                        setattr(module, 'local_shared_w3_w1_tensors',
-                                resmoothed_shared_w3_w1_weight.cpu())
+                    resmoothed_shared_w3_w1_weight, transformed_shared_w3_w1_scale = resmooth_and_transform_fp8_scale(
+                        local_shared_w3_w1_tensors,
+                        local_shared_w3_w1_scale_tensors)
+                    setattr(module, 'local_shared_w3_w1_tensors',
+                            resmoothed_shared_w3_w1_weight.cpu())
                     setattr(module, 'local_shared_w3_w1_scale_tensors',
                             transformed_shared_w3_w1_scale.cpu())
 
-                    if "shared" in pre_resmoothed_targets:
-                        transformed_shared_w2_scale = transform_fp8_scale_to_required_layout(
-                            local_shared_w2_tensors,
-                            local_shared_w2_scale_tensors)
-                    else:
-                        resmoothed_shared_w2_weight, transformed_shared_w2_scale = resmooth_and_transform_fp8_scale(
-                            local_shared_w2_tensors,
-                            local_shared_w2_scale_tensors)
-                        setattr(module, 'local_shared_w2_tensors',
-                                resmoothed_shared_w2_weight.cpu())
+                    resmoothed_shared_w2_weight, transformed_shared_w2_scale = resmooth_and_transform_fp8_scale(
+                        local_shared_w2_tensors, local_shared_w2_scale_tensors)
+                    setattr(module, 'local_shared_w2_tensors',
+                            resmoothed_shared_w2_weight.cpu())
                     setattr(module, 'local_shared_w2_scale_tensors',
                             transformed_shared_w2_scale.cpu())
 
         # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
         super().post_load_weights(module)
 
-        if needs_e8m0_resmooth:
+        if self._needs_e8m0_resmooth():
             logger.debug("Resmoothing FP8 weights in post_load_weights")
-            if "local" in pre_resmoothed_targets:
-                transformed_w3_w1_scale = transform_fp8_scale_to_required_layout(
-                    module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
-            else:
-                resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
-                    module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
-                replace_parameter_and_save_metadata(
-                    module, "w3_w1_weight", resmoothed_w3_w1_weight,
-                    module.rebuild_tensor_metadata)
+            resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
+                module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
+            replace_parameter_and_save_metadata(module, "w3_w1_weight",
+                                                resmoothed_w3_w1_weight,
+                                                module.rebuild_tensor_metadata)
             replace_parameter_and_save_metadata(module,
                                                 "w3_w1_weight_scaling_factor",
                                                 transformed_w3_w1_scale,
                                                 module.rebuild_tensor_metadata)
 
-            if "local" in pre_resmoothed_targets:
-                transformed_w2_scale = transform_fp8_scale_to_required_layout(
-                    module.w2_weight, module.w2_weight_scaling_factor)
-            else:
-                resmoothed_w2_weight, transformed_w2_scale = resmooth_and_transform_fp8_scale(
-                    module.w2_weight, module.w2_weight_scaling_factor)
-                replace_parameter_and_save_metadata(
-                    module, "w2_weight", resmoothed_w2_weight,
-                    module.rebuild_tensor_metadata)
+            resmoothed_w2_weight, transformed_w2_scale = resmooth_and_transform_fp8_scale(
+                module.w2_weight, module.w2_weight_scaling_factor)
+            replace_parameter_and_save_metadata(module, "w2_weight",
+                                                resmoothed_w2_weight,
+                                                module.rebuild_tensor_metadata)
             replace_parameter_and_save_metadata(module,
                                                 "w2_weight_scaling_factor",
                                                 transformed_w2_scale,
                                                 module.rebuild_tensor_metadata)
             self.setup_quant_scales(module)
-
-        for attr_name in (self._RESMOOTHED_SCALES_ATTR,
-                          self._PRE_RESMOOTHED_TARGETS_ATTR):
-            if hasattr(module, attr_name):
-                delattr(module, attr_name)
 
 
 class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
