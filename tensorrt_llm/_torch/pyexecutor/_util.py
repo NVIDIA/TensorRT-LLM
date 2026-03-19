@@ -33,7 +33,7 @@ from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .mamba_cache_manager import LinearHybridCacheManager, MambaHybridCacheManager
+from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
@@ -46,9 +46,6 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
-qwen3_next_kv_cache_manager_cls = LinearHybridCacheManager
-if os.environ.get("AAAA") in ["1", "2"]:
-    qwen3_next_kv_cache_manager_cls = MambaHybridCacheManager
 GB = 1 << 30
 
 
@@ -63,7 +60,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     elif is_hybrid_linear(config):
-        return qwen3_next_kv_cache_manager_cls
+        return MambaHybridCacheManager
     else:
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
 

@@ -407,7 +407,7 @@ class KVCacheManager(BaseResourceManager):
                 for window_size in set(self.max_attention_window_vec)
             }
             if self.is_linear_attention:
-                max_snapshots = max(max_num_tokens // linear_attention_metadata.states_snapshot_interval, self.max_batch_size)
+                max_snapshots = max(kv_cache_config.max_tokens // linear_attention_metadata.states_snapshot_interval, self.max_batch_size)
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
             logger.info(

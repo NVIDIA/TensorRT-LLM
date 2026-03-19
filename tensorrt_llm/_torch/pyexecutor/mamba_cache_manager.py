@@ -907,10 +907,6 @@ class LinearHybridCacheManager(KVCacheManager):
         print(f"address range of linear pool: {hex(pool_ref.data_ptr())} to {hex(pool_ref.data_ptr() + pool_ref.numel() * pool_ref.itemsize)}")
 
         self._request_block_ids = {}
-        self._previous_ssm_states = {}
-        # req_id -> (reason, prev_block_ids, block_ids, current_position); only first error per request.
-        self._block_id_check_failures: Dict[int, tuple[str, List[int], List[int], int]] = {}
-        atexit.register(self._report_block_id_check_failures)
         self.iter = 0
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -981,56 +977,7 @@ class LinearHybridCacheManager(KVCacheManager):
             self.impl.copy_linear_attention_block(req)
         self.impl.sync_transfer_manager_with_buffer_manager()
         self.impl.refresh_blocks()
-        if self.use_fake_pool:
-            self._setup_fake_states()
-        else:
-            self._setup_state_indices()
-        # if self.kv_cache_config.enable_block_reuse:
-        #     for req in scheduled_batch.context_requests:
-        #         if not self.is_estimating_kv_cache:
-        #             assert req.context_chunk_size == self.calc_next_context_chunk_size(req), f"request {req.py_request_id} has incorrect context chunk size {req.context_chunk_size} != {self.calc_next_context_chunk_size(req)}"
-        # attn_pool = self.impl.get_primary_pool_data(3).view([-1, 2, 2, 32, 256])
-        # for req in self.requests:
-        #     if req.is_context_finished:
-        #         next_step = self.get_num_tokens(req) - 1
-        #     elif self.kv_cache_config.enable_block_reuse:
-        #         next_step = (req.context_current_position - 1 + req.context_chunk_size)
-        #     else:
-        #         next_step = req.prompt_len - 1
-            # len = next_step
-            # attn_k=attn_pool[0:28, 0, :, :, :]
-            # attn_v=attn_pool[0:28, 1, :, :, :]
-            # torch.save(attn_k.clone(), f"kv/attn_k_{len}.pt")
-            # torch.save(attn_v.clone(), f"kv/attn_v_{len}.pt")
-            # block_num = (len) // self.tokens_per_block
-            # attn_block_ids = self.get_cache_indices(req, self.max_seq_len)[0:block_num + 1]
-            # print(f"len: {len}, block_num: {block_num}, block_ids: {attn_block_ids}")
-            # for block_id in attn_block_ids:
-            #     block_data = attn_pool[block_id]
-            #     if block_id == attn_block_ids[-1]:
-            #         last_block_len = (len) % self.tokens_per_block
-            #         block_data = block_data[:, :, :last_block_len + 1]
-            #     if torch.any(torch.isnan(block_data)) or torch.any(torch.isinf(block_data)):
-            #         print(f"error: block {block_id} for request {req.py_request_id} is not refreshed properly")
-            #         print(f"block_data: block_{block_id}_request_{req.py_request_id}_it{len}.pt    {block_data[0,:,:,0]}")
-            #         torch.save(block_data.clone(), f"block_{block_id}_request_{req.py_request_id}_it{len}.pt")
-                
-            # self._check_block_ids(req)
-        # ssm_states = self.get_ssm_states(0)
-        # for ctxreq in scheduled_batch.context_requests:
-        #     block_ids = self.get_cache_indices(ctxreq, LinearCacheType.RECURRENT_STATES.value)
-        #     curr_pos = ctxreq.context_current_position - 1
-        #     if curr_pos < 0:
-        #         print(f"new context request {ctxreq.py_request_id}, prompt_len={ctxreq.prompt_len}, block_ids={block_ids}")
-        #         continue
-        #     next_pos = curr_pos + ctxreq.context_chunk_size
-        #     curr_block_id = block_ids[curr_pos // self.tokens_per_block]
-        #     next_block_id = block_ids[next_pos // self.tokens_per_block]
-        #     curr_ssm_states = ssm_states[curr_block_id].clone()
-        #     next_ssm_states = ssm_states[next_block_id].clone()
-        #     if not torch.equal(curr_ssm_states, next_ssm_states):
-        #         print(f"fail to copy states for request {ctxreq.py_request_id}, should have copied from {curr_block_id} to {next_block_id}. curr_pos={curr_pos}, next_pos={next_pos}, block_ids={block_ids}")
-            
+        self._setup_state_indices()
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -1048,7 +995,6 @@ class LinearHybridCacheManager(KVCacheManager):
 
     def mamba_layer_cache(self,
                           layer_idx: int) -> Union[PythonMambaCacheManager.State, None]:
-        layer_offset = self.linear_layer_offsets[layer_idx]
         ret = PythonMambaCacheManager.State(conv=self.conv_states_mapping[layer_idx], temporal=self.ssm_states_mapping[layer_idx])
         return ret
 
@@ -1094,38 +1040,7 @@ class LinearHybridCacheManager(KVCacheManager):
                                       )] = host_linear_block_offsets.cuda()
         self._host_state_indices = host_linear_block_offsets.clone()
 
-
-    def _setup_fake_states(self):
-        block_indices = []
-        self.next_block_id = []
-        for req in self.requests:
-            if req.is_context_finished:
-                next_step = self.get_num_tokens(req) - 1
-                current_step = next_step - 1
-            elif self.kv_cache_config.enable_block_reuse:
-                next_step = (req.context_current_position - 1 + req.context_chunk_size)
-                current_step = req.context_current_position - 1
-            else:
-                next_step = req.prompt_len
-                current_step = req.context_current_position - 1
-            block_ids = self.get_cache_indices(req, LinearCacheType.RECURRENT_STATES.value)
-            current_block_id = block_ids[current_step // self.tokens_per_block]
-            next_block_id = block_ids[next_step // self.tokens_per_block]
-            self.next_block_id.append(next_block_id)
-            print(f"current_block_id: {current_block_id}, next_block_id: {next_block_id}")
-            if current_block_id != next_block_id and not req.is_context_finished:
-                print(f"fake copy states: {current_block_id} to {next_block_id}")
-                ssm_states, conv_states = self._get_fake_states(current_block_id)
-                next_ssm_states, next_conv_states = self._get_fake_states(next_block_id)
-                next_ssm_states.copy_(ssm_states)
-                next_conv_states.copy_(conv_states)
-
-        self.fake_state_indices[:len(self.requests)] = torch.tensor(self.next_block_id, dtype=torch.int32, device="cuda")
-
-
     def get_state_indices(self) -> torch.Tensor:
-        if self.use_fake_pool:
-            return self.fake_state_indices
         return self._cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
@@ -1216,110 +1131,80 @@ class LinearHybridCacheManager(KVCacheManager):
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype
 
-    def _get_fake_states(self, block_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.fake_ssm_states[:, block_id], self.fake_conv_states[:, block_id]
 
-    def _report_block_id_check_failures(self) -> None:
-        """Print all collected block_id check failures at process exit."""
-        if not self._block_id_check_failures:
-            return
-        if mpi_rank() != 0:
-            return
-        logger.error(
-            f"MambaCacheManager block_id check reported {len(self._block_id_check_failures)} failure(s):"
+class _MambaHybridCacheManagerMeta(type):
+    """Metaclass that enables isinstance/issubclass checks against
+    MambaHybridCacheManager for both V1 and Linear implementations."""
+
+    def __instancecheck__(cls, instance):
+        if cls is MambaHybridCacheManager:
+            return isinstance(
+                instance,
+                (MambaHybridCacheManagerV1, LinearHybridCacheManager))
+        return super().__instancecheck__(instance)
+
+    def __subclasscheck__(cls, subclass):
+        if cls is MambaHybridCacheManager:
+            return issubclass(
+                subclass,
+                (MambaHybridCacheManagerV1, LinearHybridCacheManager))
+        return super().__subclasscheck__(subclass)
+
+    def __getattr__(cls, name):
+        """Forward class-level attribute access (e.g. static methods) to
+        the KVCacheManager."""
+        return getattr(KVCacheManager, name)
+
+
+class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
+    """Factory class that creates the appropriate hybrid cache manager.
+
+    Delegates to LinearHybridCacheManager (default) or
+    MambaHybridCacheManagerV1 based on configuration.
+    LinearHybridCacheManager is preferred when both are applicable.
+
+    Selection logic:
+    - If TRTLLM_USE_CPP_MAMBA=1: MambaHybridCacheManagerV1
+    - If spec_config is not None (speculative decoding):
+      MambaHybridCacheManagerV1
+    - Otherwise: LinearHybridCacheManager (default)
+    """
+
+    def __new__(
+        cls,
+        # mamba cache parameters
+        mamba_d_state: int,
+        mamba_d_conv: int,
+        mamba_num_heads: int,
+        mamba_n_groups: int,
+        mamba_head_dim: int,
+        mamba_num_layers: int,
+        mamba_layer_mask: List[bool],
+        mamba_cache_dtype: torch.dtype,
+        mamba_ssm_cache_dtype: torch.dtype,
+        # kv cache parameters
+        kv_cache_config: KvCacheConfig,
+        kv_cache_type: CacheTypeCpp,
+        **kwargs,
+    ):
+        positional_args = (
+            mamba_d_state, mamba_d_conv, mamba_num_heads, mamba_n_groups,
+            mamba_head_dim, mamba_num_layers, mamba_layer_mask,
+            mamba_cache_dtype, mamba_ssm_cache_dtype, kv_cache_config,
+            kv_cache_type,
         )
-        for req_id in sorted(self._block_id_check_failures):
-            reason, prev_block_ids, block_ids, current_position = self._block_id_check_failures[
-                req_id
-            ]
-            logger.error(f"  request {req_id}: {reason}")
-            logger.error(f"    current_position={current_position}")
-            logger.error(f"    prev_block_ids={prev_block_ids}")
-            logger.error(f"    block_ids={block_ids}")
 
-    def _check_block_ids(self, request: LlmRequest):
-        id = request.py_request_id
-        block_ids = self.get_cache_indices(request, LinearCacheType.RECURRENT_STATES.value)
-        prev_block_ids = self._request_block_ids.get(id)
+        spec_config = kwargs.get('spec_config', None)
+        use_v1 = (use_cpp_mamba_cache_manager()
+                  or spec_config is not None)
 
-        def fail(reason: str) -> None:
-            if id in self._block_id_check_failures:
-                return
-            current_position = (
-                request.context_current_position
-                if not request.is_context_finished
-                else self.get_num_tokens(request)
+        if use_v1:
+            logger.info(
+                "Using MambaHybridCacheManagerV1 for hybrid cache management"
             )
-            logger.warning(f"block_id check failed for request {id}: {reason}")
-            self._block_id_check_failures[id] = (
-                reason,
-                list(prev_block_ids) if prev_block_ids is not None else [],
-                list(block_ids),
-                current_position,
-            )
-            if len(self._block_id_check_failures) >= 2:
-                logger.error("Too many block_id check failures, exiting...")
-                self._report_block_id_check_failures()
-                import sys
-                sys.exit(1)
-        # If request is new (context current position is 0), but request_id present in _request_block_ids, it's likely due to warmup dummy requests. Just ignore the existing one.
-        if prev_block_ids is None or request.context_current_position == 0:
-            self._request_block_ids[id] = list(block_ids)
-            return
-
-        # The block id must meet following requirements:
-        # 1. In context phase, block ids must never change
-        # 2. In generation phase, block id only grows when self.get_num_tokens(req) is a multiple of tokens_per_block.
-        #    When growing, the previous last block is shifted to the next slot, and a placeholder block (negative id) is inserted before.
-        # For example: [0, -2, 1, -3, 2] -> [0, -2, 1, -3, -4, 2] when self.get_num_tokens(req) is 3 * tokens_per_block.
-        if not request.is_context_finished:
-            # Context phase: block ids must never change.
-            if block_ids != prev_block_ids:
-                fail(
-                    f"in context phase block_ids must not change, "
-                    f"got prev={prev_block_ids} current={block_ids}"
-                )
-                return
+            return MambaHybridCacheManagerV1(*positional_args, **kwargs)
         else:
-            # Generation phase: block id only grows when (num_tokens - 1) % tokens_per_block == 0.
-            num_tokens = self.get_num_tokens(request)
-            num_tokens_minus_one = self.get_num_tokens(request) - 1
-            if num_tokens_minus_one % self.tokens_per_block == 0:
-                # Allowed to grow: prev[:-1] + [placeholder] + [prev[-1]].
-                if len(block_ids) != len(prev_block_ids) + 1:
-                    fail(
-                        f"on growth step (num_tokens={num_tokens}) block_ids length must be prev+1, "
-                        f"got len(prev)={len(prev_block_ids)} len(current)={len(block_ids)}"
-                    )
-                    return
-                if block_ids[-1] != prev_block_ids[-1] and (num_tokens_minus_one > request.prompt_len and self.linear_attention_metadata.save_last_snapshot):  # corner case
-                    fail(
-                        f"last block id must be unchanged when growing, prompt_len={request.prompt_len}, (num_tokens={num_tokens}), "
-                        f"got prev[-1]={prev_block_ids[-1]} current[-1]={block_ids[-1]}"
-                    )
-                    return
-                if block_ids[-2] >= 0:
-                    fail(
-                        f"new slot before last must be placeholder (negative id), "
-                        f"got {block_ids[-2]}"
-                    )
-                    return
-                if block_ids[:-2] != prev_block_ids[:-1]:
-                    fail(
-                        f"prefix before new placeholder must match prev[:-1], "
-                        f"got prev[:-1]={prev_block_ids[:-1]} current[:-2]={block_ids[:-2]}"
-                    )
-                    return
-            else:
-                # No growth: block_ids must be unchanged.
-                if block_ids != prev_block_ids:
-                    fail(
-                        f"in generation phase when not on block boundary "
-                        f"block_ids must not change, num_tokens = {num_tokens}, "
-                        f"got prev={prev_block_ids} current={block_ids}"
-                    )
-                    return
-        self._request_block_ids[id] = list(block_ids)
-
-
-MambaHybridCacheManager = LinearHybridCacheManager
+            logger.info(
+                "Using LinearHybridCacheManager for hybrid cache management"
+            )
+            return LinearHybridCacheManager(*positional_args, **kwargs)
