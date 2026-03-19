@@ -87,41 +87,42 @@ def get_mel_input(input_file, n_mels, mel_filters_dir):
 def validate_logits_alignment(output_ids, generation_logits, input_len, eot_id):
     """Check that output tokens have reasonable probability under generation_logits.
 
-    Returns True if all output tokens have log P > -10, False otherwise.
+    Returns True if all output tokens have log P > -10 across all beams, False otherwise.
     """
     LOG_PROB_THRESHOLD = -10.0
-    beam_idx = 0
     batch_size = output_ids.shape[0]
+    num_beams = output_ids.shape[1]
     all_aligned = True
 
     for b in range(batch_size):
-        gen_tokens = output_ids[b, beam_idx, input_len:]
-        eot_positions = (gen_tokens == eot_id).nonzero(as_tuple=True)[0]
-        gen_len = eot_positions[0].item() if len(eot_positions) > 0 else gen_tokens.shape[0]
+        for beam in range(num_beams):
+            gen_tokens = output_ids[b, beam, input_len:]
+            eot_positions = (gen_tokens == eot_id).nonzero(as_tuple=True)[0]
+            gen_len = eot_positions[0].item() if len(eot_positions) > 0 else gen_tokens.shape[0]
 
-        if gen_len == 0:
-            continue
+            if gen_len == 0:
+                continue
 
-        gen_tokens = gen_tokens[:gen_len]
-        logits = generation_logits[b, beam_idx, :gen_len, :]
+            gen_tokens = gen_tokens[:gen_len]
+            logits = generation_logits[b, beam, :gen_len, :]
 
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        actual_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            actual_logprobs = log_probs.gather(1, gen_tokens.unsqueeze(1)).squeeze(1)
 
-        min_logprob = actual_logprobs.min().item()
-        near_zero = (actual_logprobs < LOG_PROB_THRESHOLD).sum().item()
+            min_logprob = actual_logprobs.min().item()
+            near_zero = (actual_logprobs < LOG_PROB_THRESHOLD).sum().item()
 
-        argmax_matches = (logits.argmax(dim=-1) == gen_tokens).sum().item()
+            argmax_matches = (logits.argmax(dim=-1) == gen_tokens).sum().item()
 
-        print(
-            f"  Batch {b}: argmax match {argmax_matches}/{gen_len}, "
-            f"min log P = {min_logprob:.4f}, "
-            f"near-zero positions = {near_zero}/{gen_len}"
-        )
+            print(
+                f"  Batch {b}, beam {beam}: argmax match {argmax_matches}/{gen_len}, "
+                f"min log P = {min_logprob:.4f}, "
+                f"near-zero positions = {near_zero}/{gen_len}"
+            )
 
-        if near_zero > 0:
-            all_aligned = False
-            print(f"  FAIL: {near_zero} positions have near-zero probability")
+            if near_zero > 0:
+                all_aligned = False
+                print(f"  FAIL: {near_zero} positions have near-zero probability")
 
     return all_aligned
 
