@@ -529,6 +529,13 @@ def create_py_executor(
         cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
+    if (is_nemotron_hybrid(config)
+            or is_qwen3_hybrid(config)) and kv_cache_config.enable_block_reuse:
+        logger.warning(
+            "Disabling block reuse for MambaHybridCacheManager-based models")
+        kv_cache_config.enable_block_reuse = False
+        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                       False)
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64

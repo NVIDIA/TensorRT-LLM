@@ -19,8 +19,6 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
        Qwen3.5-specific HF weight layout differences like split linear-attention
        projections and fused MoE expert tensors) instead of the base
        Qwen3NextHfWeightMapper.
-    3. post_load_weights: wires next_layer_layernorm references needed by
-       Qwen3Next linear-attention layers; identical to Qwen3NextForCausalLM.
 
     See Qwen3NextForCausalLM in modeling_qwen3_next.py for the equivalent
     class that serves the vanilla Qwen3NextForCausalLM architecture.
