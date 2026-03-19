@@ -6367,7 +6367,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_nvfp4_4gpus_static_eplb(self):
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM", "CUTLASS"])
+    def test_nvfp4_4gpus_static_eplb(self, moe_backend):
 
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -6378,7 +6379,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         with open(f"{model_path}/config.json") as f:
             model_cfg = json.load(f)
         num_experts = model_cfg["n_routed_experts"]
-        num_slots = 576
+        max_batch_size = 32
+        num_slots = 576  # num_slots should be larger than num_experts and should be divisible by parallel_size.
         hybrid_pattern = model_cfg["hybrid_override_pattern"]
         moe_layer_indices = [
             i for i, ch in enumerate(hybrid_pattern) if ch == 'E'
@@ -6391,15 +6393,15 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_slots=num_slots,
             initial_global_assignments=initial_global_assignments,
             layer_updates_per_iter=0)
-        cuda_graph_config = CudaGraphConfig(max_batch_size=32,
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
                                             enable_padding=True)
-        moe_config = MoeConfig(backend="WIDEEP", load_balancer=eplb_config)
+        moe_config = MoeConfig(backend=moe_backend, load_balancer=eplb_config)
         pytorch_config = dict(cuda_graph_config=cuda_graph_config,
                               moe_config=moe_config)
         with LLM(
                 model_path,
                 kv_cache_config=kv_cache_config,
-                max_batch_size=32,
+                max_batch_size=max_batch_size,
                 tensor_parallel_size=4,
                 moe_expert_parallel_size=4,
                 enable_attention_dp=True,
@@ -6414,7 +6416,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
-    def test_nvfp4_4gpus_online_eplb(self):
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM", "CUTLASS"])
+    def test_nvfp4_4gpus_online_eplb(self, moe_backend):
 
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -6422,19 +6425,20 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             free_gpu_memory_fraction=0.5,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        num_slots = 576
+        num_slots = 576  # num_slots should be larger than num_experts and should be divisible by parallel_size.
+        max_batch_size = 32
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
-        cuda_graph_config = CudaGraphConfig(max_batch_size=32,
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
                                             enable_padding=True)
-        moe_config = MoeConfig(backend="WIDEEP", load_balancer=eplb_config)
+        moe_config = MoeConfig(backend=moe_backend, load_balancer=eplb_config)
         pytorch_config = dict(cuda_graph_config=cuda_graph_config,
                               moe_config=moe_config)
 
         with LLM(
                 model_path,
                 kv_cache_config=kv_cache_config,
-                max_batch_size=32,
+                max_batch_size=max_batch_size,
                 tensor_parallel_size=4,
                 moe_expert_parallel_size=4,
                 enable_attention_dp=True,
