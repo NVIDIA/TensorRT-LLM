@@ -14,7 +14,13 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import (
+    KVSlice,
+    LayerRange,
+    SessionState,
+    SessionStatus,
+    TokenRange,
+)
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -49,6 +55,95 @@ class KvCacheConfigV2:
     dtype: str = "auto"
     # V2 specific field
     max_util_for_resume: float = 0.95
+
+
+def test_token_range_valid():
+    tr = TokenRange(start=0, end=10)
+    assert tr.start == 0
+    assert tr.end == 10
+
+
+def test_token_range_invalid_negative():
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenRange(start=-1, end=5)
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenRange(start=0, end=-1)
+
+
+def test_token_range_invalid_start_ge_end():
+    with pytest.raises(ValueError, match="Invalid range"):
+        TokenRange(start=5, end=5)
+    with pytest.raises(ValueError, match="Invalid range"):
+        TokenRange(start=10, end=3)
+
+
+def test_layer_range_valid():
+    lr = LayerRange(start=0, end=32)
+    assert lr.start == 0
+    assert lr.end == 32
+
+
+def test_layer_range_invalid_negative():
+    with pytest.raises(ValueError, match="non-negative"):
+        LayerRange(start=-1, end=5)
+    with pytest.raises(ValueError, match="non-negative"):
+        LayerRange(start=0, end=-1)
+
+
+def test_layer_range_invalid_start_ge_end():
+    with pytest.raises(ValueError, match="Invalid range"):
+        LayerRange(start=5, end=5)
+    with pytest.raises(ValueError, match="Invalid range"):
+        LayerRange(start=10, end=3)
+
+
+def test_kv_slice_construction():
+    tr = TokenRange(0, 128)
+    lr = LayerRange(0, 32)
+    s = KVSlice(
+        token_range=tr,
+        layer_range=lr,
+        block_ids_per_layer_groups=[[1, 2, 3]],
+        is_last_slice=True,
+    )
+    assert s.token_range == tr
+    assert s.layer_range == lr
+    assert s.block_ids_per_layer_groups == [[1, 2, 3]]
+    assert s.is_last_slice is True
+
+    # Test defaults
+    s2 = KVSlice()
+    assert s2.token_range is None
+    assert s2.layer_range is None
+    assert s2.block_ids_per_layer_groups == []
+    assert s2.is_last_slice is False
+
+
+def test_session_status_enum():
+    expected = [
+        "INIT",
+        "READY",
+        "TRANSFERRING",
+        "TRANSFERRED",
+        "AUX_TRANSFERRED",
+        "COMPLETED",
+        "CANCELED",
+        "ERROR",
+    ]
+    for name in expected:
+        assert hasattr(SessionStatus, name)
+        assert SessionStatus[name].value == name
+    assert len(SessionStatus) == 8
+
+
+def test_session_state_construction():
+    state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
+    assert state.status == SessionStatus.INIT
+    assert state.finished_tasks == []
+
+    state2 = SessionState(status=SessionStatus.COMPLETED, finished_tasks=[1, 2, 3])
+    assert state2.status == SessionStatus.COMPLETED
+    assert state2.finished_tasks == [1, 2, 3]
 
 
 def create_transfer_worker_setup(

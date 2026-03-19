@@ -1103,6 +1103,8 @@ class KVCacheManager(BaseResourceManager):
         return bool(has_invalid_values)
 
     def get_unique_primary_pool(self) -> torch.Tensor:
+        # returns the pool of memory that is allocated for this specific KVCacheManager instance
+        # the pool is a list of block, each of which stores a fixed amount of KV cache data
         return self.impl.get_unique_primary_pool()
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
@@ -2163,6 +2165,7 @@ class KVCacheManagerV2(BaseResourceManager):
                                 request_ids: List[int],
                                 layer_id: int = 0) -> List[List[int]]:
 
+        # returns the block numbers needed for each request
         return self._get_batch_cache_indices_by_pool_id(
             request_ids,
             pool_id=self.layer_to_pool_mapping_dict[

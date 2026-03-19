@@ -182,6 +182,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
+    # starts background transfer to send this request's KV cache to the gen server, attaches ContextPhaseParams metadata
     def respond_and_send_async(self, req: LlmRequest):
         unique_rid = get_unique_rid(req)
         if unique_rid not in self.send_sessions:
@@ -190,12 +191,16 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         else:
             send_session = self.send_sessions[unique_rid]
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+        # stores block ids, not raw data
         kv_slice = self._create_kv_slice(req)
+        # sending actual kv data
         send_task_id = send_session.send(kv_slice)
         if self._need_aux_transfer(req):
             send_session.send_aux()
         self.send_task_ids[unique_rid] = send_task_id
 
+        # contains metadata about itself so the gen server can see
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
             req_id=unique_rid,
@@ -211,9 +216,12 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
     def request_and_receive_sync(self, req: LlmRequest):
         raise NotImplementedError("request_and_receive_sync is not implemented")
 
+    # starts background listener to receive KV cache from the ctx server into this request's pre-allocated blocks.
     def request_and_receive_async(self, req: LlmRequest):
         unique_rid = get_unique_rid(req)
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+        # create rx session for receiving blocks
         recv_session = self.transfer_worker.create_rx_session(req)
         self.recv_sessions[unique_rid] = recv_session
         kv_slice = self._create_kv_slice(req)
