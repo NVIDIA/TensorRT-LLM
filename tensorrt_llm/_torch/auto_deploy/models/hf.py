@@ -445,10 +445,14 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         try:
             if disable_preload:
                 # Load checkpoint directly to GPU using accelerate's load_checkpoint_in_model (no CPU preload)
+                ad_logger.info(
+                    "disable_preload=True: Using accelerate's load_checkpoint_in_model (no CPU preload)"
+                )
                 with hf_load_state_dict_with_device(device):
                     load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
             else:
                 # Preload checkpoint files to CPU
+                ad_logger.info("Preloading checkpoint files to CPU")
                 self._load_checkpoint_with_preload(model, ckpt_file, device)
         finally:
             load_handle.remove()
@@ -458,7 +462,11 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
     ):
         all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
+
+        ad_logger.info(f"Loading weights into model (device: {device})...")
         model.load_state_dict(all_weights, strict=False)
+
+        ad_logger.info("Checkpoint loading completed")
 
     def _load_full_checkpoint_to_cpu(self, checkpoint: str) -> dict:
         """Load the full checkpoint to CPU memory.
@@ -816,25 +824,3 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [TextModelExportInfo.from_autoinferred(model)]
-
-
-_MOE_EXPERT_KEY_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")
-
-
-def _summarize_moe_expert_keys(keys: List[str]) -> str:
-    expert_ids = sorted(
-        {
-            int(match.group(1))
-            for key in keys
-            if (match := _MOE_EXPERT_KEY_RE.search(key)) is not None
-        }
-    )
-    if not expert_ids:
-        return "none"
-    if len(expert_ids) <= 16:
-        return ",".join(str(idx) for idx in expert_ids)
-    return (
-        ",".join(str(idx) for idx in expert_ids[:8])
-        + " ... "
-        + ",".join(str(idx) for idx in expert_ids[-8:])
-    )
