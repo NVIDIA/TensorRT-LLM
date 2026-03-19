@@ -252,7 +252,7 @@ def setup_llm(args, **kwargs):
         if not args.use_one_model:
             print("Running MTP eagle with two model style.")
         spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=args.spec_decode_max_draft_len,
+            max_draft_len=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
