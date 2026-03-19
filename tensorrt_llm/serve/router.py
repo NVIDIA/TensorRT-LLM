@@ -654,14 +654,17 @@ class KvCacheAwareRouter(Router):
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
-            # TODO: send tokenize-only request instead of tokenizing locally
             tokenizer = self._get_tokenizer(request.model)
-            messages = [{"role": m["role"], "content": m.get("content", "")}
-                        for m in request.messages
-                        if "role" in m]
-            text = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False)
-            token_ids = tokenizer.encode(text, add_special_tokens=False)
+            token_ids = tokenizer.apply_chat_template(
+                [
+                    msg if isinstance(msg, dict) else dict(msg)
+                    for msg in request.messages
+                ],
+                add_generation_prompt=request.add_generation_prompt,
+                tokenize=True,
+            )
+            # Set prompt_token_ids so the worker server skips re-tokenization
+            request.prompt_token_ids = token_ids
             return [token_ids]
 
         # Handle CompletionRequest (has prompt)
@@ -675,9 +678,12 @@ class KvCacheAwareRouter(Router):
         else:
             assert isinstance(prompts, list) and isinstance(prompts[0], str)
 
-        # TODO: send tokenize-only request instead of tokenizing locally
         tokenizer = self._get_tokenizer(request.model)
-        return [tokenizer(prompt)["input_ids"] for prompt in prompts]
+        token_lists = [tokenizer(prompt)["input_ids"] for prompt in prompts]
+        # Replace string prompts with token IDs so the worker server
+        # skips re-tokenization
+        request.prompt = token_lists if len(token_lists) > 1 else token_lists[0]
+        return token_lists
 
     async def get_next_server(
             self,
