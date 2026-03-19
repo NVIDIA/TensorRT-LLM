@@ -1,4 +1,5 @@
 import re
+from types import SimpleNamespace
 from typing import Optional
 
 import transformers
@@ -170,23 +171,15 @@ class _Qwen35ConfigCompat:
 
         Temporary until FP8 block-scale TP loading is fixed for this layout.
         """
-        layer_types = text_config.get("layer_types")
-        if layer_types is None:
-            full_attention_interval = text_config.get("full_attention_interval")
-            num_hidden_layers = text_config.get("num_hidden_layers")
-            if isinstance(full_attention_interval,
-                          int) and full_attention_interval > 0 and isinstance(
-                              num_hidden_layers, int):
-                layer_types = [
-                    "linear_attention" if i %
-                    full_attention_interval != full_attention_interval -
-                    1 else "full_attention" for i in range(num_hidden_layers)
-                ]
-        if layer_types is not None:
-            for layer_idx, layer_type in enumerate(layer_types):
-                if layer_type == "linear_attention":
-                    modules.append(
-                        f"model.layers.{layer_idx}.linear_attn.in_proj_qkvz")
+        try:
+            layer_types = get_qwen3_hybrid_layer_types(
+                SimpleNamespace(**text_config))
+        except (ValueError, AttributeError):
+            return modules
+        for layer_idx, layer_type in enumerate(layer_types):
+            if layer_type == "linear_attention":
+                modules.append(
+                    f"model.layers.{layer_idx}.linear_attn.in_proj_qkvz")
         return modules
 
     @staticmethod

@@ -1,15 +1,9 @@
-from transformers import Qwen3NextConfig
-
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
-
-from ..model_config import ModelConfig
-from .modeling_qwen3_next import Qwen3NextModel
-from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_utils import register_auto_model
 
 
 @register_auto_model("Qwen3_5MoeForCausalLM")
-class Qwen3_5MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel, Qwen3NextConfig]):
+class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     """Thin wrapper that registers the Qwen3.5 MoE text architecture.
 
     Qwen3.5 text reuses the same model internals as Qwen3Next
@@ -32,30 +26,4 @@ class Qwen3_5MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel, Qwen3Nex
     class that serves the vanilla Qwen3NextForCausalLM architecture.
     """
 
-    def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
-        super().__init__(Qwen3NextModel(model_config), model_config)
-        self.preload_weight_modules = self.model.preload_weight_modules
-
-    def load_weights(
-        self,
-        weights: dict,
-        weight_mapper: BaseWeightMapper | None = None,
-        params_map: dict[str, str] | None = None,
-        allow_partial_loading: bool = False,
-    ):
-        if weight_mapper is not None:
-            weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(
-            weights,
-            weight_mapper=weight_mapper,
-            params_map=params_map,
-            allow_partial_loading=allow_partial_loading,
-        )
-
-    def post_load_weights(self):
-        assert self.config is not None
-        for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
-            if idx == self.config.num_hidden_layers - 1:
-                layer.next_layer_layernorm = self.model.norm
-            else:
-                layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
+    pass

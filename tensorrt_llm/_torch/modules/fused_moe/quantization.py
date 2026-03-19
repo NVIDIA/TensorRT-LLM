@@ -1095,47 +1095,8 @@ def resmooth_and_transform_fp8_scale(
     return resmoothed_weight, transformed_scale
 
 
-def transform_fp8_scale_to_required_layout(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-) -> torch.Tensor:
-    """Transform an already-resmoothed FP8 scale tensor to the required MoE layout."""
-    return transform_sf_into_required_layout(weight_scale,
-                                             mn=weight.shape[1],
-                                             k=weight.shape[2],
-                                             recipe=(1, 128, 128),
-                                             num_groups=weight.shape[0],
-                                             is_sfa=False)
-
-
 class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
-
-    def load_weights(self,
-                     module: torch.nn.Module,
-                     weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode,
-                     allow_partial_loading: bool = False):
-        if is_sm_100f():
-            expert_ids = set(module.initial_local_expert_ids)
-            if self.need_load_shared_weights(module):
-                expert_ids.update(
-                    module.layer_load_balancer.get_load_expert_ids())
-            for name in list(weights.keys()):
-                if not name.endswith("weight_scale_inv"):
-                    continue
-                if int(name.split(".")[0]) not in expert_ids:
-                    continue
-                weight_name = name.replace("weight_scale_inv", "weight")
-                if weight_name not in weights:
-                    continue
-                logger.debug(f"Resmoothing {weight_name}")
-                weight = weights[weight_name][:]
-                scale = weights[name][:].to(torch.float32)
-                weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
-                    weight, scale)
-        super().load_weights(module, weights, weight_loading_mode,
-                             allow_partial_loading)
 
     def _needs_e8m0_resmooth(self):
         return is_sm_100f() or get_sm_version() == 120

@@ -263,7 +263,7 @@ class Mamba2Metadata:
                 # Keep this as a CPU bool view/tensor to avoid introducing an
                 # implicit sync point while reading per-sequence cache status.
                 initial_states_cpu = num_cached_tokens_per_seq[:num_contexts].to(
-                    dtype=torch.bool, device='cpu', copy=False)
+                    dtype=torch.bool, device='cpu')
             else:
                 # Fallback when cache metadata is provided as a Python sequence.
                 initial_states_cpu = torch.tensor([

@@ -136,9 +136,7 @@ class KvCacheCreator:
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
-        kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
-            self._model_engine)
-        kv_size_per_token = kv_cache_manager_cls.get_cache_size_per_token(
+        kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
             model_config, mapping, tokens_per_block=self._tokens_per_block)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
