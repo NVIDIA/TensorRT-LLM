@@ -11,6 +11,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
@@ -1048,7 +1049,17 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
+                                  and IS_CUTLASS_DSL_AVAILABLE)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
+
+        if self.use_cute_dsl_topk and layer_idx == 0:
+            from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+            # the dtype of topk input tensor, which is float32 now.
+            # Note, need to update it if the dtype of topk input tensor is changed.
+            cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
+                dtype=torch.float32, top_k=self.index_topk)
 
     def post_load_weights(self):
         """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
@@ -1667,25 +1678,23 @@ class Indexer(nn.Module):
                 # This is because rowEnd = seq_len - next_n + offset + 1
                 gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
-
-                pre_idx = None
-                if self._enable_heuristic_topk:
-                    local_layer = metadata.kv_cache_manager.layer_offsets[
-                        self.layer_idx]
-                    staging = metadata.heuristic_pre_idx_staging
-                    staging[:num_generations].copy_(
-                        metadata.heuristic_prev_topk[
-                            local_layer, :num_generations])
-                    staging[:num_generations] += 1
-                    pre_idx = staging[:num_generations]
-
-                torch.ops.trtllm.indexer_topk_decode(
-                    logits_decode,
-                    gen_kv_lens_cuda,
-                    topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                        num_gen_tokens, :],
-                    next_n,
-                    pre_idx=pre_idx)
+                # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
+                # memory. Beyond 256 tokens the extra memory becomes significant,
+                # so we cap it at 256 for now and fall back to the CUDA C++
+                # indexer_topk_decode. This limit can be removed if GPU memory
+                # is not a bottleneck.
+                if self.use_cute_dsl_topk and num_gen_tokens <= 256:
+                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                        logits_decode, gen_kv_lens_cuda,
+                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                            num_gen_tokens, :], self.index_topk,
+                        next_n)
+                else:
+                    torch.ops.trtllm.indexer_topk_decode(
+                        logits_decode, gen_kv_lens_cuda,
+                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                            num_gen_tokens, :], next_n,
+                        self.index_topk)
             else:
                 # padded
                 positions = torch.arange(
