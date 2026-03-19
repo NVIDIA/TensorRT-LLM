@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Unit tests for Python scheduler implementations (PyMicroBatchScheduler,
-PyCapacityScheduler, SimpleUnifiedScheduler).
+Unit tests for Python scheduler implementations (TokenBudgetTracker,
+PyCapacityScheduler, UnifiedScheduler).
 
 These tests validate the pure-Python scheduler logic using real LlmRequest
 objects (from C++ bindings) and mock KV cache managers, without requiring
@@ -25,16 +25,53 @@ GPU. They are aligned with the C++ scheduler unit tests in:
 
 from dataclasses import dataclass, field
 from typing import List, Optional
+from unittest.mock import Mock
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
+    RequestScheduler,
+    SchedulerOutput,
+    ScheduleStepConfig,
+)
+from tensorrt_llm._torch.pyexecutor.scheduler.simple_scheduler import SimpleScheduler
+from tensorrt_llm._torch.pyexecutor.scheduler.unified_scheduler import (
     ChunkingPolicy,
     ContextChunkingConfig,
     PyCapacityScheduler,
-    PyMicroBatchScheduler,
-    SimpleUnifiedScheduler,
+    TokenBudgetTracker,
+    UnifiedScheduler,
 )
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+
+
+def _schedule_with_tracker(
+    max_batch_size: int,
+    max_num_tokens: Optional[int],
+    requests: list,
+    inflight_ids: set,
+    ctx_chunk_config=None,
+    max_context_length: Optional[int] = None,
+) -> tuple[list, list]:
+    """Helper that mimics the old PyMicroBatchScheduler.schedule() interface.
+
+    Creates a TokenBudgetTracker, adds each request via try_add(), then
+    finalizes to get (context_requests, generation_requests).
+    """
+    tracker = TokenBudgetTracker(
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        ctx_chunk_config=ctx_chunk_config,
+        inflight_request_ids=inflight_ids if inflight_ids else None,
+    )
+    if max_context_length is not None:
+        tracker.max_context_length = max_context_length
+    for req in requests:
+        if not tracker.try_add(req):
+            break
+        if tracker.batch_full:
+            break
+    ctx, gen, _ = tracker.finalize()
+    return ctx, gen
 
 
 def _make_request(
@@ -174,6 +211,9 @@ class MockKVCacheManager:
     def get_needed_resource_to_completion(self, req) -> int:
         return self._blocks_per_request
 
+    def get_remaining_blocks_to_completion_batch(self, requests, window_size: int) -> list:
+        return [self._blocks_per_request for _ in requests]
+
 
 class MockPeftCacheManager:
     def __init__(self, max_pages: int = 100, pages_per_request: int = 10):
@@ -184,28 +224,58 @@ class MockPeftCacheManager:
         return self._pages_per_request
 
 
+class _FakeScheduler(RequestScheduler):
+    def __init__(self, output, schedule_step_config=None, dist=None):
+        super().__init__(schedule_step_config=schedule_step_config, dist=dist)
+        self._output = output
+
+    def schedule_request(self, active_requests, inflight_request_ids):
+        return self._output
+
+    def can_schedule(self, requests):
+        return True
+
+
+class _StubCapacityScheduler:
+    def __init__(self, fitting_requests, disagg_requests=None, paused_requests=None):
+        self._fitting_requests = fitting_requests
+        self._disagg_requests = disagg_requests or []
+        self._paused_requests = paused_requests or []
+
+    def schedule_request(self, active_requests):
+        return self._fitting_requests, self._disagg_requests, self._paused_requests
+
+
+class _StubMicroBatchScheduler:
+    def __init__(self, context_requests, generation_requests):
+        self._context_requests = context_requests
+        self._generation_requests = generation_requests
+
+    def schedule(self, active_requests, inflight_request_ids):
+        return self._context_requests, self._generation_requests
+
+
 # ############################################################################
 #
-# Part 1: PyMicroBatchScheduler Tests
+# Part 1: TokenBudgetTracker Tests (formerly PyMicroBatchScheduler)
 #
 # ############################################################################
 
 
-class TestPyMicroBatchSchedulerBasic:
+class TestTokenBudgetTrackerBasic:
     """
-    Tests for PyMicroBatchScheduler — single-step scheduling decisions.
+    Tests for TokenBudgetTracker — single-step scheduling decisions.
     Aligned with C++ MicroBatchSchedulerTest in microBatchSchedulerTest.cpp.
     """
 
     def test_simple_context_only(self):
         """All requests are context requests, batch size allows 2."""
-        scheduler = PyMicroBatchScheduler(max_batch_size=2, max_num_tokens=None)
         requests = [
             make_context_request(0, prompt_len=10),
             make_context_request(1, prompt_len=10),
             make_context_request(2, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(2, None, requests, set())
         assert len(ctx) == 2
         assert len(gen) == 0
         assert ctx[0].request_id == 0
@@ -213,13 +283,12 @@ class TestPyMicroBatchSchedulerBasic:
 
     def test_simple_generation_only(self):
         """All requests are generation requests, batch size allows 2."""
-        scheduler = PyMicroBatchScheduler(max_batch_size=2, max_num_tokens=None)
         requests = [
             make_generation_request(0),
             make_generation_request(1),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(2, None, requests, set())
         assert len(ctx) == 0
         assert len(gen) == 2
         assert gen[0].request_id == 0
@@ -230,14 +299,13 @@ class TestPyMicroBatchSchedulerBasic:
         Mixed batch: context + generation requests.
         C++ ref: SimpleWithOverlap
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
         requests = [
             make_context_request(0, prompt_len=10),
             make_generation_request(1),
             make_context_request(2, prompt_len=10),
             make_generation_request(3),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, None, requests, set())
         assert len(ctx) == 2
         assert len(gen) == 2
         assert {r.request_id for r in ctx} == {0, 2}
@@ -248,13 +316,12 @@ class TestPyMicroBatchSchedulerBasic:
         max_num_tokens limits how many context tokens can be scheduled.
         C++ ref: SimpleNoOverlapMaxNumTokens
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=15)
         # Each context request has 10 tokens. Two would be 20 > 15.
         requests = [
             make_context_request(0, prompt_len=10),
             make_context_request(1, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 15, requests, set())
         # Only 1 fits within token budget
         assert len(ctx) == 1
         assert ctx[0].request_id == 0
@@ -264,26 +331,24 @@ class TestPyMicroBatchSchedulerBasic:
         After scheduling a context request, generation requests still fit
         if their token count (beam_width) fits in remaining budget.
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=12)
         requests = [
             make_context_request(0, prompt_len=10),
             make_generation_request(1, beam_width=1),
             make_generation_request(2, beam_width=1),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 12, requests, set())
         # context: 10 tokens, gen1: 1 token, gen2: 1 token => total 12
         assert len(ctx) == 1
         assert len(gen) == 2
 
     def test_max_batch_size_limits_total(self):
         """Batch size limits total (context + generation)."""
-        scheduler = PyMicroBatchScheduler(max_batch_size=2, max_num_tokens=None)
         requests = [
             make_context_request(0, prompt_len=5),
             make_generation_request(1),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(2, None, requests, set())
         # batch_size=2: should schedule context_0 + gen_1
         assert len(ctx) + len(gen) == 2
 
@@ -292,14 +357,13 @@ class TestPyMicroBatchSchedulerBasic:
         Generation requests with beam_width=1 each cost 1 token.
         C++ ref: SimpleMaxNumTokensBW1
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=12)
         requests = [
             make_context_request(0, prompt_len=10, beam_width=1),
             make_generation_request(1, beam_width=1),
             make_generation_request(2, beam_width=1),
             make_generation_request(3, beam_width=1),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 12, requests, set())
         # context: 10, gen: 1+1 = 12 total. Can't fit gen_3 (would be 13).
         assert len(ctx) == 1
         assert len(gen) == 2
@@ -309,13 +373,12 @@ class TestPyMicroBatchSchedulerBasic:
         Generation requests with beam_width=4 each cost 4 tokens.
         C++ ref: SimpleMaxNumTokensBW4
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=15)
         requests = [
             make_context_request(0, prompt_len=10, beam_width=4),
             make_generation_request(1, beam_width=4),
             make_generation_request(2, beam_width=4),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 15, requests, set())
         # context: 10, gen1: 4 = 14. gen2: +4 = 18 > 15.
         assert len(ctx) == 1
         assert len(gen) == 1
@@ -325,13 +388,12 @@ class TestPyMicroBatchSchedulerBasic:
         Generation requests with different beam widths are skipped.
         C++ ensures all gen requests in a batch have same beam_width.
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
         requests = [
             make_generation_request(0, beam_width=1),
             make_generation_request(1, beam_width=4),
             make_generation_request(2, beam_width=1),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, None, requests, set())
         # gen_0 sets beam_width=1, gen_1 is skipped (beam_width=4), gen_2 fits
         assert len(gen) == 2
         assert gen[0].request_id == 0
@@ -342,13 +404,12 @@ class TestPyMicroBatchSchedulerBasic:
         Draft tokens are added to the token count for both context and gen.
         C++ ref: DraftTokensMaxNumTokens
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=15)
         # Context request: 10 prompt + 3 draft = 13 tokens
         requests = [
             make_context_request(0, prompt_len=10, draft_tokens_len=3),
             make_generation_request(1, draft_tokens_len=2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 15, requests, set())
         # context: 10+3=13, gen: 1+2=3, total=16 > 15 => only context fits
         assert len(ctx) == 1
         assert len(gen) == 0
@@ -358,25 +419,23 @@ class TestPyMicroBatchSchedulerBasic:
         Generation with draft tokens: cost = beam_width + num_draft_tokens.
         C++ ref: GenDraftTokensMaxNumTokens
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=10)
         requests = [
             make_generation_request(0, beam_width=1, draft_tokens_len=3),
             make_generation_request(1, beam_width=1, draft_tokens_len=3),
             make_generation_request(2, beam_width=1, draft_tokens_len=3),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 10, requests, set())
         # Each gen costs 1+3=4. Two fit (8), three don't (12 > 10).
         assert len(gen) == 2
 
     def test_inflight_requests_excluded(self):
         """Requests already in flight are skipped."""
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
         requests = [
             make_context_request(0, prompt_len=10),
             make_context_request(1, prompt_len=10),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, {0, 2})
+        ctx, gen = _schedule_with_tracker(4, None, requests, {0, 2})
         # Only request 1 is not in flight
         assert len(ctx) == 1
         assert ctx[0].request_id == 1
@@ -384,13 +443,12 @@ class TestPyMicroBatchSchedulerBasic:
 
     def test_completed_requests_filtered(self):
         """Requests in GENERATION_COMPLETE state are filtered out."""
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
         requests = [
             make_context_request(0, prompt_len=10),
             make_completed_request(1),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, None, requests, set())
         # Completed request 1 is filtered by state gating
         assert len(ctx) == 1
         assert len(gen) == 1
@@ -402,8 +460,6 @@ class TestPyMicroBatchSchedulerBasic:
         C++ ref: SimpleNoOverlap (multi-iteration; here we test single-step
         scheduling decisions that compose the same behavior).
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=2, max_num_tokens=None)
-
         # Step 1: 4 context requests, only 2 fit
         requests = [
             make_context_request(0, prompt_len=10),
@@ -411,7 +467,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(2, prompt_len=10),
             make_context_request(3, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(2, None, requests, set())
         assert len(ctx) == 2
         assert len(gen) == 0
         assert ctx[0].request_id == 0
@@ -425,7 +481,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(2, prompt_len=10),
             make_context_request(3, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(2, None, requests, set())
         assert len(gen) == 2
         assert gen[0].request_id == 0
         assert gen[1].request_id == 1
@@ -437,7 +493,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(2, prompt_len=10),
             make_context_request(3, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(2, None, requests, set())
         assert len(ctx) == 2
         assert ctx[0].request_id == 2
         assert ctx[1].request_id == 3
@@ -449,15 +505,12 @@ class TestPyMicroBatchSchedulerBasic:
         Req 0, 1: promptLen=12, maxNewTokens=5, maxNumTokens=7, chunkUnitSize=5
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=2, max_num_tokens=7, ctx_chunk_config=config
-        )
 
         # Step 1 (it=0): Only req0 gets a chunk of 5, req1 doesn't fit
         # C++: Req 0: (0,1,2,3,4), Req 1: ()
         r0 = make_context_request(0, prompt_len=12)
         r1 = make_context_request(1, prompt_len=12)
-        ctx, gen = scheduler.schedule([r0, r1], set())
+        ctx, gen = _schedule_with_tracker(2, 7, [r0, r1], set(), ctx_chunk_config=config)
         assert len(ctx) >= 1
         # First request gets a chunk within budget
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -472,16 +525,13 @@ class TestPyMicroBatchSchedulerBasic:
         Requests with promptLen=10 and 17, maxContextLength=12, chunkUnitSize=5.
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=2, max_num_tokens=None, ctx_chunk_config=config
-        )
-        # Override max_context_length (in C++ this is a separate constructor arg)
-        scheduler.max_context_length = 12
 
         # Two requests with promptLen=10 fit within maxContextLength=12
         r0 = make_context_request(0, prompt_len=10)
         r1 = make_context_request(1, prompt_len=10)
-        ctx, gen = scheduler.schedule([r0, r1], set())
+        ctx, gen = _schedule_with_tracker(
+            2, None, [r0, r1], set(), ctx_chunk_config=config, max_context_length=12
+        )
         assert len(ctx) == 2
         # Each chunk should be at most max_context_length
         for r in ctx:
@@ -489,7 +539,9 @@ class TestPyMicroBatchSchedulerBasic:
 
         # Request with promptLen=17 needs chunking (17 > 12)
         r3 = make_context_request(3, prompt_len=17)
-        ctx2, gen2 = scheduler.schedule([r3], set())
+        ctx2, gen2 = _schedule_with_tracker(
+            2, None, [r3], set(), ctx_chunk_config=config, max_context_length=12
+        )
         assert len(ctx2) == 1
         assert ctx2[0].context_chunk_size <= 12
 
@@ -501,9 +553,9 @@ class TestPyMicroBatchSchedulerBasic:
 # ############################################################################
 
 
-class TestPyMicroBatchSchedulerChunking:
+class TestTokenBudgetTrackerChunking:
     """
-    Tests for context chunking logic in PyMicroBatchScheduler.
+    Tests for context chunking logic in TokenBudgetTracker.
     Aligned with C++ ContextChunkingTest in microBatchSchedulerTest.cpp.
     """
 
@@ -515,14 +567,11 @@ class TestPyMicroBatchSchedulerChunking:
         C++ ref: ContextChunkingTest with EQUAL_PROGRESS
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=10, ctx_chunk_config=config
-        )
         requests = [
             make_context_request(0, prompt_len=20),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 10, requests, set(), ctx_chunk_config=config)
         assert len(ctx) == 2
         # Each should get ~5 tokens (equal progress, unit=5, total=10)
         total_chunk = sum(r.context_chunk_size for r in ctx)
@@ -535,14 +584,11 @@ class TestPyMicroBatchSchedulerChunking:
         After chunking, sort puts not-last-chunk requests first.
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=15, ctx_chunk_config=config
-        )
         requests = [
             make_context_request(0, prompt_len=3),  # Only 3 tokens remaining
             make_context_request(1, prompt_len=20),  # Lots remaining
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 15, requests, set(), ctx_chunk_config=config)
         assert len(ctx) == 2
         # Look up by request_id since sort reorders (not-last-chunk first)
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -557,14 +603,11 @@ class TestPyMicroBatchSchedulerChunking:
         FIRST_COME_FIRST_SERVED: first request gets as much as possible.
         """
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=12, ctx_chunk_config=config
-        )
         requests = [
             make_context_request(0, prompt_len=20),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 12, requests, set(), ctx_chunk_config=config)
         # FCFS: request 0 gets up to budget, request 1 gets remainder
         assert len(ctx) >= 1
         # First request should get more tokens
@@ -574,14 +617,11 @@ class TestPyMicroBatchSchedulerChunking:
         """FCFS fills the first request completely if budget allows.
         After chunking, sort puts not-last-chunk requests first."""
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=25, ctx_chunk_config=config
-        )
         requests = [
             make_context_request(0, prompt_len=10),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 25, requests, set(), ctx_chunk_config=config)
         assert len(ctx) == 2
         # Look up by request_id since sort reorders (not-last-chunk first)
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -597,15 +637,12 @@ class TestPyMicroBatchSchedulerChunking:
         Generation tokens reduce the available budget for context chunks.
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=15, ctx_chunk_config=config
-        )
         requests = [
             make_generation_request(0),  # costs 1 token
             make_context_request(1, prompt_len=20),
             make_context_request(2, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 15, requests, set(), ctx_chunk_config=config)
         assert len(gen) == 1
         # Remaining budget for context: 15 - 1 = 14
         total_ctx_tokens = sum(r.context_chunk_size for r in ctx)
@@ -617,14 +654,11 @@ class TestPyMicroBatchSchedulerChunking:
         the scheduled context requests.
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=2, max_num_tokens=5, ctx_chunk_config=config
-        )
         requests = [
             make_context_request(0, prompt_len=20),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(2, 5, requests, set(), ctx_chunk_config=config)
         # With budget 5, at most one request gets chunk_size=5, the other might get 0
         for r in ctx:
             assert r.context_chunk_size > 0
@@ -635,13 +669,10 @@ class TestPyMicroBatchSchedulerChunking:
         C++ ref: SimpleNoOverlapMaxContextLength
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=12, ctx_chunk_config=config
-        )
         requests = [
             make_context_request(0, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 12, requests, set(), ctx_chunk_config=config)
         assert len(ctx) == 1
         # max_context_length = max_num_tokens = 12, so chunk <= 12
         assert ctx[0].context_chunk_size <= 12
@@ -652,12 +683,9 @@ class TestPyMicroBatchSchedulerChunking:
         (context_position > 0) continues from where it left off.
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=10, ctx_chunk_config=config
-        )
         req = make_context_request(0, prompt_len=20, context_position=10)
         # remaining = 20 - 10 = 10
-        ctx, gen = scheduler.schedule([req], set())
+        ctx, gen = _schedule_with_tracker(4, 10, [req], set(), ctx_chunk_config=config)
         assert len(ctx) == 1
         assert ctx[0].context_chunk_size <= 10  # remaining context
 
@@ -668,13 +696,10 @@ class TestPyMicroBatchSchedulerChunking:
         C++ ref: DraftTokensNoDiscard
         """
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=10)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=20, ctx_chunk_config=config
-        )
         # prompt_len=8, so chunk_size will be 8. Unit=10, remainder=2.
         # Draft tokens=2 fits in remainder.
         req = make_context_request(0, prompt_len=8, draft_tokens_len=2)
-        ctx, gen = scheduler.schedule([req], set())
+        ctx, gen = _schedule_with_tracker(4, 20, [req], set(), ctx_chunk_config=config)
         assert len(ctx) == 1
         assert req.is_last_context_chunk
 
@@ -684,12 +709,9 @@ class TestPyMicroBatchSchedulerChunking:
         C++ ref: DraftTokensDiscard
         """
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=5)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=20, ctx_chunk_config=config
-        )
         # prompt_len=5, chunk_size=5, unit=5, remainder=0. Draft=3 won't fit.
         req = make_context_request(0, prompt_len=5, draft_tokens_len=3)
-        ctx, gen = scheduler.schedule([req], set())
+        ctx, gen = _schedule_with_tracker(4, 20, [req], set(), ctx_chunk_config=config)
         assert len(ctx) == 1
 
     def test_chunked_context_draft_tokens_max_num_tokens(self):
@@ -702,13 +724,8 @@ class TestPyMicroBatchSchedulerChunking:
         Each request's draft reduced from 8 to 7.
         """
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=64)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=64,
-            max_num_tokens=8192,
-            ctx_chunk_config=config,
-        )
         requests = [make_context_request(i, prompt_len=2041, draft_tokens_len=8) for i in range(4)]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(64, 8192, requests, set(), ctx_chunk_config=config)
         assert len(ctx) == 4
         for req in ctx:
             assert req.num_draft_tokens == 7
@@ -724,28 +741,21 @@ class TestPyMicroBatchSchedulerChunking:
         Draft reduced from 5 to 4.
         """
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=64)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=64,
-            max_num_tokens=8192,
-            ctx_chunk_config=config,
-        )
-        scheduler.max_context_length = 10
         requests = [
             make_context_request(0, prompt_len=6, draft_tokens_len=5),
             make_context_request(1, prompt_len=6, draft_tokens_len=5),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(
+            64, 8192, requests, set(), ctx_chunk_config=config, max_context_length=10
+        )
         assert len(ctx) == 2
         for req in ctx:
             assert req.num_draft_tokens == 4
 
     def test_no_chunking_context_fits(self):
         """Without chunking, context is scheduled in full if it fits."""
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=20, ctx_chunk_config=None
-        )
         req = make_context_request(0, prompt_len=15)
-        ctx, gen = scheduler.schedule([req], set())
+        ctx, gen = _schedule_with_tracker(4, 20, [req], set())
         assert len(ctx) == 1
 
     def test_no_chunking_context_exceeds_budget(self):
@@ -753,14 +763,11 @@ class TestPyMicroBatchSchedulerChunking:
         Each individual request must fit within max_context_length (== max_num_tokens),
         but the cumulative token count is checked against the budget. The first request
         that would push the total over the limit breaks the loop."""
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=10, ctx_chunk_config=None
-        )
         requests = [
             make_context_request(0, prompt_len=8),
             make_context_request(1, prompt_len=8),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(4, 10, requests, set())
         # First request (8) fits (8 <= 10). Second (8+8=16 > 10) breaks the loop.
         assert len(ctx) == 1
         assert ctx[0].request_id == 0
@@ -770,11 +777,10 @@ class TestPyMicroBatchSchedulerChunking:
         Requests are sorted by lora_task_id for performance.
         C++ ref: sortRequests in inflightBatchingUtils.cpp
         """
-        scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
         r0 = _make_request(0, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=5)
         r1 = _make_request(1, state=LlmRequestState.GENERATION_IN_PROGRESS)
         r2 = _make_request(2, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=3)
-        ctx, gen = scheduler.schedule([r0, r1, r2], set())
+        ctx, gen = _schedule_with_tracker(4, None, [r0, r1, r2], set())
         # None < any value, so order should be: r1(None), r2(3), r0(5)
         assert gen[0].request_id == 1
         assert gen[1].request_id == 2
@@ -804,11 +810,11 @@ def _run_context_chunking_test(
 
     For each policy (EQUAL_PROGRESS and FCFS), it:
     1. Creates LlmRequests with given context_lengths and optional draft_lengths.
-    2. Creates a PyMicroBatchScheduler with the right ContextChunkingConfig.
-    3. If max_context_length is set, overrides scheduler.max_context_length.
+    2. Creates a TokenBudgetTracker with the right ContextChunkingConfig.
+    3. If max_context_length is set, overrides tracker.max_context_length.
     4. For each iteration (each element in positions list):
        a. Filters requests where context_remaining_length > 0.
-       b. Calls scheduler._set_ctx_requests_chunk_size(active_reqs, ctx_tokens_capacity).
+       b. Calls tracker._set_ctx_requests_chunk_size(active_reqs, ctx_tokens_capacity).
        c. For each active req, calls req.move_to_next_context_chunk().
        d. Verifies context position matches expected positions for ALL requests.
     5. After all iterations, verifies final draft_lengths if specified.
@@ -830,23 +836,23 @@ def _run_context_chunking_test(
             )
             requests.append(req)
 
-        # Create scheduler
+        # Create tracker
         config = ContextChunkingConfig(policy, chunk_unit_size=chunk_unit_size)
-        scheduler = PyMicroBatchScheduler(
+        tracker = TokenBudgetTracker(
             max_batch_size=64,
             max_num_tokens=1000,  # large enough not to limit
             ctx_chunk_config=config,
         )
 
         if max_context_length is not None:
-            scheduler.max_context_length = max_context_length
+            tracker.max_context_length = max_context_length
 
         # Run iterations
         for iteration_idx, expected_positions in enumerate(positions_list):
             # Filter active requests (those with remaining context)
             active_reqs = [r for r in requests if r.context_remaining_length > 0]
 
-            scheduler._set_ctx_requests_chunk_size(active_reqs, ctx_tokens_capacity)
+            tracker._set_ctx_requests_chunk_size(active_reqs, ctx_tokens_capacity)
 
             # Move each active request to next chunk
             for req in active_reqs:
@@ -1120,12 +1126,6 @@ class TestDraftTokensGreaterThanChunkSize:
         - Request 2: draftTokens = 5 (remaining budget)
         """
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=16)
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=64,
-            max_num_tokens=40,
-            ctx_chunk_config=config,
-        )
-        scheduler.max_context_length = 64
 
         requests = [
             make_context_request(0, prompt_len=3, draft_tokens_len=17),
@@ -1133,7 +1133,9 @@ class TestDraftTokensGreaterThanChunkSize:
             make_context_request(2, prompt_len=3, draft_tokens_len=17),
         ]
 
-        ctx, gen = scheduler.schedule(requests, set())
+        ctx, gen = _schedule_with_tracker(
+            64, 40, requests, set(), ctx_chunk_config=config, max_context_length=64
+        )
 
         assert len(ctx) == 3
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -1464,7 +1466,7 @@ class TestPyCapacitySchedulerStateGating:
 
 # ############################################################################
 #
-# Part 5: PyCapacityScheduler Advanced Tests
+# Part 5: PyCapacityScheduler Advanced Tests (LoRA, Priority, Chunked, etc.)
 #
 # ############################################################################
 
@@ -1512,23 +1514,101 @@ class TestPyCapacitySchedulerLora:
 
 # ############################################################################
 #
-# Part 6: SimpleUnifiedScheduler Integration Tests
+# Part 6: schedule_step Integration Tests
 #
 # ############################################################################
 
 
-class TestSimpleUnifiedScheduler:
+class TestScheduleStep:
+    def test_request_scheduler_schedule_step_passthrough(self):
+        ctx = make_context_request(0, prompt_len=10)
+        gen = make_generation_request(1)
+        scheduler = _FakeScheduler(
+            SchedulerOutput([ctx], [gen], [], [], 2),
+            schedule_step_config=ScheduleStepConfig(),
+        )
+
+        step_result = scheduler.schedule_step([ctx, gen], set())
+
+        assert step_result.scheduled_requests.context_requests == [ctx]
+        assert step_result.scheduled_requests.generation_requests == [gen]
+        assert step_result.fitting_disagg_gen_init_requests == []
+        assert step_result.num_fitting_requests == 2
+
+    def test_request_scheduler_schedule_step_applies_batch_waiting(self):
+        ctx = make_context_request(0, prompt_len=10)
+        gen = make_generation_request(1)
+        scheduler = _FakeScheduler(
+            SchedulerOutput([ctx], [gen], [], [], 2),
+            schedule_step_config=ScheduleStepConfig(
+                batch_wait_timeout_iters=1,
+                batch_wait_max_tokens_ratio=0.5,
+                max_num_tokens=100,
+            ),
+        )
+
+        step_result = scheduler.schedule_step([ctx, gen], set())
+
+        assert step_result.scheduled_requests.context_requests == []
+        assert step_result.scheduled_requests.generation_requests == [gen]
+
+    def test_simple_scheduler_schedule_step_uses_base_flow(self):
+        ctx = make_context_request(0, prompt_len=10)
+        gen = make_generation_request(1)
+        scheduler = SimpleScheduler(
+            _StubCapacityScheduler([ctx, gen]),
+            _StubMicroBatchScheduler([ctx], [gen]),
+            schedule_step_config=ScheduleStepConfig(),
+        )
+
+        step_result = scheduler.schedule_step([ctx, gen], set())
+
+        assert step_result.scheduled_requests.context_requests == [ctx]
+        assert step_result.scheduled_requests.generation_requests == [gen]
+        assert step_result.num_fitting_requests == 2
+
+    def test_request_scheduler_schedule_step_applies_adp_balance(self):
+        ctx = make_context_request(0, prompt_len=10)
+        gen = make_generation_request(1)
+        dist = Mock()
+        dist.tp_allgather.return_value = [[1, 1], [1, 1]]
+        scheduler = _FakeScheduler(
+            SchedulerOutput([ctx], [gen], [], [], 2),
+            schedule_step_config=ScheduleStepConfig(
+                enable_attention_dp=True,
+                attention_dp_enable_balance=True,
+                attention_dp_batching_wait_iters=1,
+                max_batch_size=4,
+            ),
+            dist=dist,
+        )
+
+        step_result = scheduler.schedule_step([ctx, gen], set())
+
+        dist.tp_allgather.assert_called_once_with([1, 1])
+        assert step_result.scheduled_requests.context_requests == []
+        assert step_result.scheduled_requests.generation_requests == [gen]
+
+
+# ############################################################################
+#
+# Part 7: UnifiedScheduler Integration Tests
+#
+# ############################################################################
+
+
+class TestUnifiedScheduler:
     """
-    Tests for the two-stage scheduling pipeline:
-    PyCapacityScheduler → PyMicroBatchScheduler
+    Tests for the fused scheduling pipeline:
+    PyCapacityScheduler + TokenBudgetTracker (single-pass via UnifiedScheduler)
     """
 
     def test_capacity_then_microbatch(self):
-        """Capacity filters, then microbatch selects within token budget.
+        """Capacity filters, then token budget selects within token budget.
         max_batch_size is used as max_num_requests for capacity scheduler,
         so it must be large enough for all requests to pass capacity."""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
-        scheduler = SimpleUnifiedScheduler(
+        scheduler = UnifiedScheduler(
             max_batch_size=4,
             max_num_tokens=15,
             kv_cache_manager=kv,
@@ -1541,15 +1621,16 @@ class TestSimpleUnifiedScheduler:
             make_generation_request(2),
         ]
         output = scheduler.schedule_request(requests, set())
-        # Capacity: all 3 fit (plenty of blocks, max_num_requests=4)
-        # Microbatch: gen_2 (1) + context_0 (10) = 11 <= 15, context_1 (10) would be 21 > 15
-        assert output.num_fitting_requests == 3
-        assert len(output.context_requests) + len(output.generation_requests) <= 2
+        # UnifiedScheduler fuses capacity + token budget in a single pass.
+        # num_fitting_requests counts requests passing BOTH gates (see docstring item 3).
+        # gen_2 (1) + context_0 (10) = 11 <= 15, context_1 (10) would be 21 > 15
+        assert output.num_fitting_requests == 2
+        assert len(output.context_requests) + len(output.generation_requests) == 2
 
     def test_can_schedule_dry_run(self):
         """can_schedule() checks capacity without side effects."""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
-        scheduler = SimpleUnifiedScheduler(
+        scheduler = UnifiedScheduler(
             max_batch_size=4,
             max_num_tokens=100,
             kv_cache_manager=kv,
@@ -1565,7 +1646,7 @@ class TestSimpleUnifiedScheduler:
     def test_can_schedule_returns_false(self):
         """can_schedule() returns False when capacity is insufficient."""
         kv = MockKVCacheManager(num_free_blocks=3, blocks_per_request=5)
-        scheduler = SimpleUnifiedScheduler(
+        scheduler = UnifiedScheduler(
             max_batch_size=4,
             max_num_tokens=100,
             kv_cache_manager=kv,
@@ -1582,7 +1663,7 @@ class TestSimpleUnifiedScheduler:
     def test_full_pipeline_output_structure(self):
         """Verify SchedulerOutput has all expected fields."""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
-        scheduler = SimpleUnifiedScheduler(
+        scheduler = UnifiedScheduler(
             max_batch_size=4,
             max_num_tokens=100,
             kv_cache_manager=kv,
@@ -1607,7 +1688,7 @@ class TestSimpleUnifiedScheduler:
     def test_paused_requests_propagated(self):
         """Paused requests from capacity scheduler appear in output."""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
-        scheduler = SimpleUnifiedScheduler(
+        scheduler = UnifiedScheduler(
             max_batch_size=4,
             max_num_tokens=100,
             kv_cache_manager=kv,
@@ -1622,10 +1703,31 @@ class TestSimpleUnifiedScheduler:
         output = scheduler.schedule_request(requests, set())
         assert isinstance(output.paused_requests, list)
 
+    def test_schedule_step_returns_scheduled_requests(self):
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        scheduler = UnifiedScheduler(
+            max_batch_size=4,
+            max_num_tokens=100,
+            kv_cache_manager=kv,
+            peft_cache_manager=None,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            schedule_step_config=ScheduleStepConfig(max_num_tokens=100),
+        )
+        requests = [
+            make_context_request(0, prompt_len=10),
+            make_generation_request(1),
+        ]
+
+        step_result = scheduler.schedule_step(requests, set())
+
+        assert len(step_result.scheduled_requests.context_requests) == 1
+        assert len(step_result.scheduled_requests.generation_requests) == 1
+        assert step_result.num_fitting_requests == 2
+
 
 # ############################################################################
 #
-# Part 7: Additional PyCapacityScheduler Tests
+# Part 8: Additional PyCapacityScheduler Tests
 #
 # ############################################################################
 

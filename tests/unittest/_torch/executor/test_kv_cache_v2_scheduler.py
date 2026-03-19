@@ -252,6 +252,17 @@ class TestConstruction:
         sched = make_scheduler(mgr, max_num_tokens=None)
         assert sched.max_num_tokens is None
 
+    def test_schedule_step_returns_step_result(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=16)
+
+        step_result = sched.schedule_step([req], set())
+
+        assert ids(step_result.scheduled_requests.context_requests) == [0]
+        assert ids(step_result.scheduled_requests.generation_requests) == []
+        assert step_result.num_fitting_requests == 1
+
 
 # ===========================================================================
 # Token Budget Limits

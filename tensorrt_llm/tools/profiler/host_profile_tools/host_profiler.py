@@ -44,6 +44,11 @@ LINE_PROFILER_PATH_ENV_VAR = "TLLM_LINE_PROFILER_PATH"
 # Format: "module.Class.method,module.Class.method2,..."
 LINE_PROFILER_FUNCTIONS_ENV_VAR = "TLLM_LINE_PROFILER_FUNCTIONS"
 
+# Environment variable to disable default profile targets.
+# When set (to any value), default targets are not loaded;
+# only explicitly specified targets (via TLLM_LINE_PROFILER_FUNCTIONS or API) are used.
+LINE_PROFILER_NO_DEFAULTS_ENV_VAR = "TLLM_LINE_PROFILER_NO_DEFAULTS"
+
 
 @dataclass
 class ProfileTarget:
@@ -152,10 +157,6 @@ _DEFAULT_PROFILE_CONFIG: Dict[str, Dict[Optional[str], List[str]]] = {
             "_select_generated_logits",
             "_sample_batched_by_strategy",
         ],
-        # Standalone module-level functions (use None as class_name)
-        None: [
-            "_group_requests_by_strategy_key",
-        ],
     },
     f"{_PYEXEC}.resource_manager": {
         "ResourceManager": ["prepare_resources", "update_resources", "free_resources"],
@@ -163,15 +164,6 @@ _DEFAULT_PROFILE_CONFIG: Dict[str, Dict[Optional[str], List[str]]] = {
     },
     f"{_PYEXEC}.scheduler": {
         "RequestScheduler": ["schedule_request"],
-    },
-    f"{_PYEXEC}.executor_request_queue": {
-        "ExecutorRequestQueue": [
-            "_fetch_new_requests_attention_tp",
-            "_fetch_new_requests_attention_dp",
-            "_fetch_and_process_requests",
-            "_merge_requests",
-            "fetch_new_requests",
-        ],
     },
 }
 
@@ -400,6 +392,10 @@ class HostProfiler:
         self.targets: List[ProfileTarget] = []
         self._line_profiler = None
         self._enabled = False
+
+        # When LINE_PROFILER_NO_DEFAULTS_ENV_VAR is set, disable default targets
+        if os.environ.get(LINE_PROFILER_NO_DEFAULTS_ENV_VAR):
+            use_defaults = False
 
         # Add default targets if requested
         if use_defaults:

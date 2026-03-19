@@ -44,8 +44,8 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, SimpleScheduler,
-                        SimpleUnifiedScheduler)
+                        KVCacheV2Scheduler, ScheduleStepConfig, SimpleScheduler,
+                        UnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -1268,6 +1268,21 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
+    adp_cfg = llm_args.attention_dp_config
+    adp_enable_balance = adp_cfg is not None and adp_cfg.enable_balance
+    schedule_step_config = ScheduleStepConfig(
+        enable_attention_dp=mapping.enable_attention_dp,
+        attention_dp_enable_balance=adp_enable_balance,
+        attention_dp_time_out_iters=adp_cfg.timeout_iters
+        if adp_enable_balance else 0,
+        attention_dp_batching_wait_iters=(adp_cfg.batching_wait_iters
+                                          if adp_enable_balance else 0),
+        batch_wait_timeout_iters=llm_args.batch_wait_timeout_iters,
+        batch_wait_max_tokens_ratio=llm_args.batch_wait_max_tokens_ratio,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+    )
+
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
@@ -1285,31 +1300,45 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_capacity=scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            schedule_step_config=schedule_step_config,
+            dist=dist,
         )
-    elif (scheduler_config is not None
-          and scheduler_config.use_python_scheduler):
-        scheduler = SimpleUnifiedScheduler(
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            kv_cache_manager=kv_cache_manager.impl
-            if kv_cache_manager is not None else None,
-            peft_cache_manager=peft_cache_manager.impl
-            if peft_cache_manager is not None else None,
-            scheduler_policy=scheduler_config.capacity_scheduler_policy,
-            ctx_chunk_config=ctx_chunk_config,
-            two_step_lookahead=mapping.has_pp(),
-            scheduler_capacity=scheduler_capacity)
     else:
-        capacity_scheduler = BindCapacityScheduler(
-            scheduler_capacity,
-            kv_cache_manager.impl if kv_cache_manager is not None else None,
-            peft_cache_manager.impl if peft_cache_manager is not None else None,
-            scheduler_config.capacity_scheduler_policy,
-            two_step_lookahead=mapping.has_pp())
+        use_python_scheduler = (scheduler_config.use_python_scheduler
+                                if scheduler_config is not None else False)
+        if use_python_scheduler:
+            scheduler = UnifiedScheduler(
+                max_batch_size=max_batch_size,
+                max_num_tokens=max_num_tokens,
+                kv_cache_manager=kv_cache_manager.impl
+                if kv_cache_manager is not None else None,
+                peft_cache_manager=peft_cache_manager.impl
+                if peft_cache_manager is not None else None,
+                scheduler_policy=scheduler_config.capacity_scheduler_policy,
+                ctx_chunk_config=ctx_chunk_config,
+                two_step_lookahead=mapping.has_pp(),
+                scheduler_capacity=scheduler_capacity,
+                schedule_step_config=schedule_step_config,
+                dist=dist,
+            )
+        else:
+            capacity_scheduler = BindCapacityScheduler(
+                scheduler_capacity,
+                kv_cache_manager.impl if kv_cache_manager is not None else None,
+                peft_cache_manager.impl
+                if peft_cache_manager is not None else None,
+                scheduler_config.capacity_scheduler_policy,
+                two_step_lookahead=mapping.has_pp())
 
-        mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config)
-        scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
+            mb_scheduler = BindMicroBatchScheduler(max_batch_size,
+                                                   max_num_tokens,
+                                                   ctx_chunk_config)
+            scheduler = SimpleScheduler(
+                capacity_scheduler,
+                mb_scheduler,
+                schedule_step_config=schedule_step_config,
+                dist=dist,
+            )
 
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
