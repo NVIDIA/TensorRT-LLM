@@ -402,8 +402,9 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
                     output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
                     if cutlass.const_expr(output_values_row is not None):
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
-        # TODO: move this part before line 822? for elems equal to pivot,
-        # small indices values could be put early if want to keep stable.
+        # TODO: move this region before the aligned-region pass so that
+        # equal-to-pivot elements with smaller indices are placed first
+        # (stable output order).
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
             if ordered == ordered_pivot:
