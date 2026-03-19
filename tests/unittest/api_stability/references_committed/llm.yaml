@@ -116,6 +116,9 @@ methods:
       use_tqdm:
         annotation: bool
         default: true
+      priority:
+        annotation: Union[float, List[float], NoneType]
+        default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -135,6 +138,9 @@ methods:
       streaming:
         annotation: bool
         default: false
+      priority:
+        annotation: Optional[float]
+        default: null
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
 properties:
   tokenizer:

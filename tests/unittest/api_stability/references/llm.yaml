@@ -266,6 +266,9 @@ methods:
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
+      priority:
+        annotation: Union[float, List[float], NoneType]
+        default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -286,6 +289,9 @@ methods:
         annotation: Optional[Mapping[str, str]]
         default: null
         status: prototype
+      priority:
+        annotation: Optional[float]
+        default: null
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   preprocess:
     parameters:
