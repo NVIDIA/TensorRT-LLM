@@ -294,8 +294,9 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
                                             ref_accepted_tokens,
                                             ref_num_accepted_tokens):
         batch_size = len(draft_len)
-        spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=mtp_num_modules)
+        spec_config = MTPDecodingConfig(max_draft_len=mtp_num_modules)
+        # Simulate update_spec_config_from_model_config for vanilla MTP tests
+        spec_config.num_nextn_predict_layers = mtp_num_modules
 
         # attention metedata
         attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,
@@ -870,8 +871,9 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
         batch_size = len(request_ids)
         batch_size - num_context_request
         hidden_size = hidden_states.shape[1]
-        spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=num_nextn_predict_layers)
+        spec_config = MTPDecodingConfig(max_draft_len=num_nextn_predict_layers)
+        # Simulate update_spec_config_from_model_config for vanilla MTP tests
+        spec_config.num_nextn_predict_layers = num_nextn_predict_layers
 
         attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,
                                                 max_num_tokens=1024,
@@ -1362,8 +1364,9 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             hidden_size = previous_layer_hidden_states.shape[1]
         else:
             hidden_size = 10
-        spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=num_nextn_predict_layers)
+        spec_config = MTPDecodingConfig(max_draft_len=num_nextn_predict_layers)
+        # Simulate update_spec_config_from_model_config for vanilla MTP tests
+        spec_config.num_nextn_predict_layers = num_nextn_predict_layers
 
         if attn_metadata is None:
             attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,

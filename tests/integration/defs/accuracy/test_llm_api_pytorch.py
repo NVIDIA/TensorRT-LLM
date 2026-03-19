@@ -1617,7 +1617,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         )
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  enable_chunked_prefill=enable_chunked_prefill,
@@ -1645,7 +1645,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         )
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  enable_chunked_prefill=enable_chunked_prefill,
@@ -1663,7 +1663,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
         )
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+        mtp_config = MTPDecodingConfig(max_draft_len=3,
                                        mtp_eagle_one_model=False,
                                        speculative_model=self.MODEL_PATH)
         with LLM(self.MODEL_PATH,
@@ -1683,8 +1683,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(),
         )
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=2,
-                                       use_sa_spec=True)
+        mtp_config = MTPDecodingConfig(max_draft_len=2, use_sa_spec=True)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  max_num_tokens=8192,
@@ -1723,7 +1722,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         )
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
@@ -1748,7 +1747,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(), )
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
@@ -1791,9 +1790,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         mtp_nextn = 2
         if mtp == "eagle":
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         elif mtp == "vanilla":
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn,
                                            use_mtp_vanilla=True)
 
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
@@ -1839,7 +1838,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         with LLM(
                 f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
@@ -1860,7 +1859,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(
@@ -1887,7 +1886,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(enable_padding=True),
@@ -1942,7 +1941,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                  tensor_parallel_size=tp_size,
@@ -2003,7 +2002,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         with LLM(
                 f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
@@ -2064,7 +2063,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                                    load_balancer=eplb_config))
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
@@ -2129,7 +2128,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend=moe_backend))
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         if fp8kv:
             kv_cache_config.dtype = "fp8"
@@ -2170,7 +2169,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend=moe_backend))
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         if fp8kv:
             kv_cache_config.dtype = "fp8"
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
@@ -2230,7 +2229,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         if fp8kv:
             kv_cache_config.dtype = "fp8"
@@ -2282,7 +2281,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         )
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         if quant_dtype == "none":
             assert not fp8kv
@@ -2363,7 +2362,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend=backend,
                   kv_cache_config=kv_cache_config,
@@ -2385,7 +2384,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=4,
                   moe_expert_parallel_size=4,
@@ -2582,7 +2581,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -2720,7 +2719,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -2790,7 +2789,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -2828,7 +2827,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                                   enable_padding=True, max_batch_size=1024),
                               moe_config=MoeConfig(backend="TRTLLM"))
 
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=1)
+        mtp_config = MTPDecodingConfig()
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
                  tensor_parallel_size=8,
                  pipeline_parallel_size=1,
@@ -2883,7 +2882,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -2930,7 +2929,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -3064,7 +3063,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -3125,7 +3124,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         with LLM(self.MODEL_PATH,
                  max_batch_size=max_batch_size,
@@ -3182,7 +3181,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         llm_kwargs = dict(
             max_batch_size=max_batch_size,
@@ -3252,7 +3251,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -3328,7 +3327,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             kv_cache_config.dtype = "fp8"
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         dsa_config = None
         if q_split_threshold is not None:
@@ -3384,7 +3383,7 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         with LLM(self.MODEL_PATH,
                  max_batch_size=max_batch_size,
@@ -3418,7 +3417,7 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         with LLM(f"{llm_models_root()}/glm-4.6-fp4",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -3449,7 +3448,7 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+        mtp_config = MTPDecodingConfig(max_draft_len=3,
                                        mtp_eagle_one_model=False,
                                        speculative_model=model_path)
 
@@ -3488,7 +3487,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         with LLM(self.MODEL_PATH,
                  max_batch_size=max_batch_size,
@@ -3522,7 +3521,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
 
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         with LLM(f"{llm_models_root()}/glm-4.5-air-fp4",
                  max_batch_size=max_batch_size,
@@ -3555,7 +3554,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+        mtp_config = MTPDecodingConfig(max_draft_len=3,
                                        mtp_eagle_one_model=False,
                                        speculative_model_dir=model_path)
 
@@ -5918,7 +5917,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
 
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+        mtp_config = MTPDecodingConfig(max_draft_len=3)
 
         moe_config = MoeConfig(backend='DEEPGEMM', max_num_tokens=32000)
 
@@ -5961,7 +5960,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
 
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+        mtp_config = MTPDecodingConfig(max_draft_len=3)
 
         pytorch_config = dict(cuda_graph_config=cuda_graph_config,
                               kv_cache_config=kv_cache_config,
@@ -6419,7 +6418,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
         # This test uses MTP with max_draft_len=3 and one_model mode.
         mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
+            max_draft_len=3,
             mtp_eagle_one_model=True,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
@@ -6454,7 +6453,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpu_mtp_ar(self):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=max_draft_len,
+            max_draft_len=max_draft_len,
             mtp_eagle_one_model=True,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
@@ -6519,7 +6518,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_bf16_4gpu_mtp_ar(self):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=max_draft_len,
+            max_draft_len=max_draft_len,
             mtp_eagle_one_model=True,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -6625,7 +6624,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(max_batch_size=128,
                                               enable_padding=True),
             moe_config=MoeConfig(backend="DEEPGEMM"),
-            speculative_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+            speculative_config=MTPDecodingConfig(),
             enable_chunked_prefill=True,
             custom_tokenizer="glm_moe_dsa",
         )

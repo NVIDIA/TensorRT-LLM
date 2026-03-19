@@ -41,7 +41,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
                  max_num_requests: int,
                  sa_manager=None):
         self.dtype = dtype
-        self.num_nextn_predict_layers = config.num_nextn_predict_layers
+        self.num_nextn_predict_layers = config.max_draft_len
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
@@ -279,7 +279,7 @@ class MTPWorker(SpecWorkerBase):
 
     @property
     def max_draft_len(self) -> int:
-        return self.spec_config.num_nextn_predict_layers
+        return self.spec_config.max_draft_len
 
     def forward(
         self,
@@ -506,7 +506,7 @@ class MTPWorker(SpecWorkerBase):
         resource_manager=None,
     ):
         batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        mtp_num_modules = self.spec_config.max_draft_len
         accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
@@ -589,7 +589,7 @@ class MTPWorker(SpecWorkerBase):
         seq_lens = attn_metadata.seq_lens_cuda
         seq_lens_cpu = attn_metadata.seq_lens
         hidden_size = hidden_states.shape[-1]
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        mtp_num_modules = self.spec_config.max_draft_len
 
         if self.is_thop:
             _, _ = torch.ops.trtllm.mtp_update_hidden_states_op(
@@ -761,7 +761,7 @@ class MTPWorker(SpecWorkerBase):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        mtp_num_modules = self.spec_config.max_draft_len
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
@@ -864,7 +864,7 @@ class MTPWorker(SpecWorkerBase):
                              attn_metadata: AttentionMetadata):
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
         batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        mtp_num_modules = self.spec_config.max_draft_len
 
         num_contexts = attn_metadata.num_contexts
         attn_metadata._seq_lens[num_contexts:batch_size] -= 1
@@ -955,7 +955,7 @@ class MTPWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
         mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool
         mtp_past_tokens_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_tokens_pool
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        mtp_num_modules = self.spec_config.max_draft_len
 
         if self.is_thop:
             # Temporary buffer
@@ -1120,7 +1120,7 @@ class MTPEagleWorker(MTPWorker):
                  use_separate_draft_kv_cache: bool = False):
         super().__init__(spec_config, model_config, use_separate_draft_kv_cache)
         self.model_config = model_config
-        self.mtp_num_modules = spec_config.num_nextn_predict_layers
+        self.mtp_num_modules = spec_config.max_draft_len
         self._is_mamba_hybrid_cache = None
 
     @torch.compile(options={"max-autotune": True})

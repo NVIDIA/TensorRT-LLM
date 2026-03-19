@@ -84,8 +84,7 @@ MTP is currently only supported by Deepseek. MTP can be tuned with the following
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
-speculative_config = MTPDecodingConfig(
-    max_draft_len=3, num_nextn_predict_layers=3)
+speculative_config = MTPDecodingConfig(max_draft_len=3)
 
 llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 ```
