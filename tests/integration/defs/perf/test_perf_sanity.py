@@ -55,6 +55,7 @@ MODEL_PATH_DICT = {
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
+    "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
 }
@@ -163,6 +164,8 @@ class ServerConfig:
         self.enable_attention_dp = server_config_data.get("enable_attention_dp", False)
         self.trust_remote_code = server_config_data.get("trust_remote_code", False)
         self.enable_lm_head_tp_in_adp = server_config_data.get("enable_lm_head_tp_in_adp", False)
+        self.backend = server_config_data.get("backend", "pytorch")
+        self.extra_llm_api_config_path = server_config_data.get("extra_llm_api_config_path", "")
 
         # attention_dp_config
         attention_dp_config = server_config_data.get("attention_dp_config", {})
@@ -247,6 +250,8 @@ class ServerConfig:
             "match_mode",
             "client_configs",
             "match_mode",
+            "backend",
+            "extra_llm_api_config_path",
         ]
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
@@ -269,7 +274,7 @@ class ServerConfig:
             "trtllm-serve",
             self.model_path,
             "--backend",
-            "pytorch",
+            self.backend,
             "--config",
             config_path,
         ]
@@ -291,6 +296,7 @@ class ServerConfig:
             "b_enable_chunked_prefill",
             "b_enable_attention_dp",
             "b_enable_lm_head_tp_in_adp",
+            "s_serving_backend",
             # attention_dp_config
             "b_attention_dp_balance",
             # cuda_graph_config
@@ -326,6 +332,7 @@ class ServerConfig:
             "b_enable_attention_dp": self.enable_attention_dp,
             "b_trust_remote_code": self.trust_remote_code,
             "b_enable_lm_head_tp_in_adp": self.enable_lm_head_tp_in_adp,
+            "s_serving_backend": self.backend,
             # attention_dp_config
             "b_attention_dp_balance": self.attention_dp_balance,
             "l_batching_wait_iters": self.batching_wait_iters,
@@ -363,6 +370,17 @@ class ServerConfig:
     def generate_extra_llm_api_config(self) -> str:
         """Generate extra-llm-api-config.yml content."""
         config_data = dict(self.extra_llm_api_config_data)
+
+        # Merge external AutoDeploy config if specified
+        if self.extra_llm_api_config_path:
+            config_path = self.extra_llm_api_config_path
+            if not os.path.isabs(config_path):
+                config_path = os.path.join(get_llm_root(), config_path)
+            with open(config_path, "r") as f:
+                external_config = yaml.safe_load(f) or {}
+            # Fields in extra_llm_api_config_data (from perf YAML) take precedence
+            merged = {**external_config, **config_data}
+            config_data = merged
 
         # Handle speculative_model path conversion
         if (
