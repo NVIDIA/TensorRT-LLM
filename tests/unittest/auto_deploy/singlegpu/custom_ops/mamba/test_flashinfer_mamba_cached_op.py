@@ -3,6 +3,7 @@ import torch
 from test_triton_mamba_cached_op import _random_params
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 @pytest.fixture
@@ -36,8 +37,9 @@ def test_flashinfer_decode_matches_triton(mamba_env):
     )
     ssm_state_cache_flashinfer = ssm_state_cache_triton.clone()
 
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, batch, batch])
+    batch_info_host = _bi.serialize()
     cu_seqlen = torch.zeros(batch + 1, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
 
