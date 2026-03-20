@@ -113,12 +113,12 @@ class TestFCFSWaitingQueue:
         queue = FCFSWaitingQueue()
         queue.add_request(create_mock_request_item(3))
 
-        # Prepend items [1, 2] - note: extendleft reverses order
+        # Prepend items [1, 2] — first item in the list ends up at the front
         queue.prepend_requests([create_mock_request_item(i) for i in [1, 2]])
 
-        # After extendleft([1, 2]), order is: 2, 1, 3
-        assert queue.pop_request().id == 2
+        # Expected order: 1, 2, 3
         assert queue.pop_request().id == 1
+        assert queue.pop_request().id == 2
         assert queue.pop_request().id == 3
 
     def test_remove_by_ids(self):
@@ -361,8 +361,8 @@ class TestPriorityWaitingQueue:
 
     def test_prepend_requests_restores_original_queue_order(self):
         """Simulates the request_utils.py pattern: pop several requests that
-        cannot be scheduled, then prepend them back in reversed order.  The
-        resulting pop sequence must match the original queue order."""
+        cannot be scheduled, then prepend them back.  The resulting pop
+        sequence must match the original queue order."""
         q = PriorityWaitingQueue()
         # Original queue: A(0.9) > B(0.5) > C(0.5) — B and C tied on priority,
         # so B comes before C by FCFS.
@@ -377,11 +377,47 @@ class TestPriorityWaitingQueue:
         pending = [q.pop_request(), q.pop_request(), q.pop_request()]
         assert [r.id for r in pending] == [1, 2, 3]
 
-        # Put them back using the reversed-order convention from request_utils.py.
-        q.prepend_requests(reversed(pending))
+        # Put them back — prepend_requests preserves input order internally.
+        q.prepend_requests(pending)
 
         # Order must be fully restored.
         assert [q.pop_request().id for _ in range(3)] == [1, 2, 3]
+
+    def test_prepend_requests_restores_order_with_existing_queue_entries(self):
+        """Simulates the request_utils.py pattern when new requests have
+        arrived while the scheduler was trying to place the popped ones.
+
+        Returned requests must come out ahead of any same-priority request
+        that arrived after they were originally enqueued, and the relative
+        order among the returned requests must be preserved.
+        """
+        q = PriorityWaitingQueue()
+        # Original queue: A(0.9) > B(0.5) > C(0.5)
+        req_a = create_priority_request_item(1, priority=0.9)
+        req_b = create_priority_request_item(2, priority=0.5)
+        req_c = create_priority_request_item(3, priority=0.5)
+        q.add_request(req_a)
+        q.add_request(req_b)
+        q.add_request(req_c)
+
+        # Scheduler dequeues all three but cannot schedule them.
+        pending = [q.pop_request(), q.pop_request(), q.pop_request()]
+        assert [r.id for r in pending] == [1, 2, 3]
+
+        # While the scheduler was working, new requests arrive at various
+        # priorities: one higher (0.9), one equal (0.5), one lower (0.1).
+        q.add_request(create_priority_request_item(4, priority=0.9))
+        q.add_request(create_priority_request_item(5, priority=0.5))
+        q.add_request(create_priority_request_item(6, priority=0.1))
+
+        # Put the pending requests back.
+        q.prepend_requests(pending)
+
+        # Expected order:
+        #   priority 0.9: A(1) before D(4) — A arrived first
+        #   priority 0.5: B(2) before C(3) before E(5) — B and C arrived first, in FCFS order
+        #   priority 0.1: F(6)
+        assert [q.pop_request().id for _ in range(6)] == [1, 4, 2, 3, 5, 6]
 
     def test_prepend_requests_does_not_starve_across_multiple_rounds(self):
         """A request returned to the queue multiple times still comes out

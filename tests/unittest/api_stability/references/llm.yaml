@@ -269,6 +269,7 @@ methods:
       priority:
         annotation: Union[float, List[float]]
         default: 0.5
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -292,6 +293,7 @@ methods:
       priority:
         annotation: float
         default: 0.5
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   preprocess:
     parameters:

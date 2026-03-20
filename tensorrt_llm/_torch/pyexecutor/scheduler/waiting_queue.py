@@ -51,9 +51,9 @@ class WaitingQueue(ABC):
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Re-insert multiple requests that could not be scheduled.
 
-        See prepend_request for the ordering contract.  Callers should pass
-        requests in *reverse* original order so that the first request in the
-        original queue comes out first after re-insertion.
+        See prepend_request for the ordering contract.  Requests are
+        re-inserted such that the first request in the iterable comes out
+        first after re-insertion (i.e. original queue order is preserved).
         """
         pass
 
@@ -102,8 +102,7 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         """Add multiple requests to the queue according to FCFS policy."""
         requests = list(requests)
         for request in requests:
-            # stacklevel=2: caller → add_requests → _warn_if_priority_set
-            self._warn_if_priority_set(request, stacklevel=2)
+            self._warn_if_priority_set(request, stacklevel=3)
         self.extend(requests)
 
     def pop_request(self) -> RequestQueueItem:
@@ -123,10 +122,10 @@ class FCFSWaitingQueue(deque, WaitingQueue):
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Prepend all requests from another iterable to the front of this queue.
 
-        Note: The requests will be prepended in reverse order of their
-        appearance in the `requests` iterable.
+        Requests are inserted in input order: the first item in ``requests``
+        ends up at the front of the queue.
         """
-        self.extendleft(requests)
+        self.extendleft(reversed(list(requests)))
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
         """Remove requests with the given IDs."""
@@ -151,7 +150,7 @@ class PriorityWaitingQueue(WaitingQueue):
     """A priority queue that serves higher-priority requests first.
 
     Requests with equal priority are served in FCFS order (arrival order).
-    Priority is read from ``item.request.priority``; the default is 0.5.
+    Priority is read from ``item.request.priority``; the default is DEFAULT_REQUEST_PRIORITY.
 
     Heap entries are ``(neg_priority, insertion_counter, item)`` tuples.
     Because ``insertion_counter`` is strictly monotonically increasing, no two
@@ -223,14 +222,13 @@ class PriorityWaitingQueue(WaitingQueue):
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Re-insert requests ahead of all normally-added requests of the same priority.
 
-        Requests are pushed in iteration order; because _prepend_counter
-        decreases on each call, the first item in ``requests`` ends up with
-        the largest (least-negative) prepend counter and therefore the last
-        item ends up at the front within its priority cohort.  Callers that
-        need the original queue order to be restored should pass the requests
-        in *reverse* original order (as request_utils.py does).
+        Requests are pushed in *reverse* iteration order so that the first
+        item in ``requests`` ends up with the most-negative prepend counter
+        and therefore sorts first within its priority cohort.  This means
+        the first request in the iterable comes out first after re-insertion,
+        preserving original queue order without any reversal by the caller.
         """
-        for request in requests:
+        for request in reversed(list(requests)):
             self._push_front(request)
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
@@ -266,6 +264,13 @@ def create_waiting_queue(
     Returns:
         A WaitingQueue instance.
     """
+    if priority_fn is not None:
+        warnings.warn(
+            "priority_fn is not supported and will be ignored. "
+            "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling.",
+            UserWarning,
+            stacklevel=2,
+        )
     if policy == WaitingQueuePolicy.FCFS:
         return FCFSWaitingQueue()
     elif policy == WaitingQueuePolicy.PRIORITY:
