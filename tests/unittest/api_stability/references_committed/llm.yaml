@@ -117,8 +117,8 @@ methods:
         annotation: bool
         default: true
       priority:
-        annotation: Union[float, List[float], NoneType]
-        default: null
+        annotation: Union[float, List[float]]
+        default: 0.5
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -139,8 +139,8 @@ methods:
         annotation: bool
         default: false
       priority:
-        annotation: Optional[float]
-        default: null
+        annotation: float
+        default: 0.5
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
 properties:
   tokenizer:

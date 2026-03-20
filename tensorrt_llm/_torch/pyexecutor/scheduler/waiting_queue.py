@@ -1,4 +1,5 @@
 import heapq
+import itertools
 import warnings
 from abc import ABC, abstractmethod
 from collections import deque
@@ -153,7 +154,9 @@ class PriorityWaitingQueue(WaitingQueue):
     def __init__(self) -> None:
         # Min-heap of (neg_priority, insertion_counter, RequestQueueItem).
         self._heap: list[tuple] = []
-        self._insertion_counter: int = 0
+        # itertools.count() is thread-safe (backed by a C-level atomic),
+        # ensuring correct FCFS tiebreaking under concurrent access.
+        self._counter = itertools.count()
 
     def _get_priority(self, item: RequestQueueItem) -> float:
         if item.request is not None:
@@ -161,8 +164,7 @@ class PriorityWaitingQueue(WaitingQueue):
         return DEFAULT_REQUEST_PRIORITY
 
     def _push(self, item: RequestQueueItem) -> None:
-        entry = (-self._get_priority(item), self._insertion_counter, item)
-        self._insertion_counter += 1
+        entry = (-self._get_priority(item), next(self._counter), item)
         heapq.heappush(self._heap, entry)
 
     def add_request(self, request: RequestQueueItem) -> None:
