@@ -356,10 +356,10 @@ class Sender(SenderBase):
         task.status = TaskStatus.TRANSFERRING
 
         agent_result = AgentResult.SUCCESS
-        if timer:
-            timer.record_transfer_start(write_meta.peer_rank)
         if write_meta.src_ptrs:
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
+            if timer:
+                timer.record_transfer_start(write_meta.peer_rank)
             if not self._agent.submit_transfer_requests(request).wait():
                 agent_result = AgentResult.FAILED
                 if not write_meta.task_future.done():
@@ -673,10 +673,9 @@ class Sender(SenderBase):
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
         if self._is_req_ready(req_info.unique_rid, expected_transfers):
-            if req_info.unique_rid in self._sessions:
-                session = self._get_session(req_info.unique_rid)
-                if session is not None and not session.receiver_ready:
-                    session.receiver_ready = True
+            session = self._get_session(req_info.unique_rid)
+            if session is not None and not session.receiver_ready:
+                session.receiver_ready = True
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
         req_info = self._get_first_req_info(unique_rid)
@@ -1073,7 +1072,7 @@ class Receiver(ReceiverBase):
         slice_id = int(slice_id_str)
         if msg_type.encode("ascii") != MessageType.KV_AGENT_RESULT:
             logger.error(
-                f"_process_kv_agent_result: unexpected msg_type={msg_type!r}, expected TASK_STATUS"
+                f"_process_kv_agent_result: unexpected msg_type={msg_type!r}, expected KV_AGENT_RESULT"
             )
             return
         session = self._get_session(unique_rid)
