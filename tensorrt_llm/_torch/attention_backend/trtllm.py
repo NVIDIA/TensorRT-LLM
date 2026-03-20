@@ -1512,6 +1512,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_target_model: bool = True,
         model_is_wrapped: bool = False,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
+        runtime_draft_len: Optional[int] = None,
     ) -> None:
         '''
         Update the spec-dec parameters for the TRTLLM attention layer.
@@ -1525,6 +1526,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             is_target_model: bool = True, whether the model is the target model.
             model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
+            runtime_draft_len: Optional[int] = None, the current runtime draft length for dynamic draft length support in linear tree mode.
         '''
 
         # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
@@ -1662,7 +1664,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
                 # So we create cache for position offsets and packed mask for each draft length to avoid reallocation.
                 assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
-                runtime_draft_len = max_draft_len
+                runtime_draft_len = runtime_draft_len if runtime_draft_len is not None else max_draft_len
                 self.generate_spec_decoding_generation_length(
                     runtime_draft_len=runtime_draft_len)
                 self.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(

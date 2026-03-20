@@ -567,12 +567,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             max_total_draft_tokens,
             is_target_model: bool = True,
             model_is_wrapped: bool = False,
-            spec_tree_manager: Optional['SpecTreeManager'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
+            runtime_draft_len: Optional[int] = None):
         super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
                                       is_spec_dec_dynamic_tree, max_draft_len,
                                       max_total_draft_tokens, is_target_model,
-                                      model_is_wrapped, spec_tree_manager)
+                                      model_is_wrapped, spec_tree_manager,
+                                      runtime_draft_len)
         self.max_draft_tokens = max_draft_len
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:

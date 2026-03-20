@@ -3703,7 +3703,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_total_draft_tokens=sd_max_total,
                 is_target_model=not self.is_draft_model,
                 model_is_wrapped=self.model_is_wrapped,
-                spec_tree_manager=spec_tree_manager)
+                spec_tree_manager=spec_tree_manager,
+                runtime_draft_len=self.runtime_draft_len)
         else:
             spec_resource_manager = None
             spec_metadata = None
