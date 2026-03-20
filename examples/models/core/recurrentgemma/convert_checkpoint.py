@@ -19,10 +19,9 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import (numpy_to_torch, str_dtype_to_torch,
                                  torch_to_numpy)
-
-from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 
 LOGGER = logging.getLogger("convert_checkpoint")
 
