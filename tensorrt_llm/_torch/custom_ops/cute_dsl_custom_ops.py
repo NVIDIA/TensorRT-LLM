@@ -3970,7 +3970,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 #                or num_rows * ctas_per_group <= num_sms * 2)
                 use_cluster = (single_pass_multi_cta_cluster)
                 if use_cluster:
-                    CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
+                    result = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
                         input_values=input_values,
                         seq_lens=seq_lens,
                         top_k=top_k,
@@ -3979,7 +3979,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         num_copy_bits=num_copy_bits,
                         output_indices=output_indices,
                     )
-                else:
+                    if result[0] is None:
+                        use_cluster = False
+
+                if not use_cluster:
                     CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
                         input_values=input_values,
                         seq_lens=seq_lens,
