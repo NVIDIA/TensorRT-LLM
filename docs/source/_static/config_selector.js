@@ -999,20 +999,21 @@
 
     function setSelectOptions(selectEl, group) {
       const previousValue = state.concurrency || "";
+      const visibleOptions = group.options.filter(
+        (option) => option.status !== "incompatible"
+      );
       selectEl.innerHTML = "";
       selectEl.appendChild(
         el("option", {
           value: "",
-          text: group.options.length ? "Select concurrency" : "No concurrency available",
+          text: visibleOptions.length ? "Select concurrency" : "No concurrency available",
         })
       );
-      for (const option of group.options) {
-        const isUnavailable = option.status === "incompatible";
+      for (const option of visibleOptions) {
         const optNode = el("option", {
           value: option.value,
           text: option.label,
         });
-        if (isUnavailable) optNode.disabled = true;
         optNode.dataset.status = option.status;
         selectEl.appendChild(optNode);
       }
