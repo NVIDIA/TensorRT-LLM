@@ -131,11 +131,10 @@ public:
     /// Throws std::runtime_error if the free list is empty.
     Block& acquireBlock();
 
-    /// Decrement the reference count of `block` and return it to the back of
-    /// the free list.
-    /// Throws std::runtime_error if the reference count is non-zero after
-    /// decrementing (i.e. the block was acquired more than once without a
-    /// matching release).
+    /// Decrement the reference count of `block`. If the count reaches zero,
+    /// return the block to the back of the free list.
+    /// Throws std::underflow_error (via Block::decRef) if the count is
+    /// already 0.
     void releaseBlock(Block& block);
 
     // -----------------------------------------------------------------------

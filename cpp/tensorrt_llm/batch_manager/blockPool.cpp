@@ -111,12 +111,8 @@ Block& BlockPool::acquireBlock()
 void BlockPool::releaseBlock(Block& block)
 {
     block.decRef();
-    if (!block.isFree())
-        throw std::runtime_error(
-            "BlockPool::releaseBlock(): block " + std::to_string(block.offset)
-            + " still has non-zero reference count (" + std::to_string(block.refCount())
-            + ") after release.");
-    freeBlocks_.push_back(&block);
+    if (block.isFree())
+        freeBlocks_.push_back(&block);
 }
 
 } // namespace tensorrt_llm::batch_manager::state_manager
