@@ -704,11 +704,13 @@ class ExecutionTracer(TaskCollection):
                                          branch_path: List[int]) -> TraceEvent:
         """Convert a RoleMessage into a non-assistant message event."""
         role = getattr(message, "role", None)
+        content = getattr(message, "content", None)
         return TraceEvent(
             event_type="message",
             branch_path=branch_path,
             conversation_id=conversation_id,
             role=role,
+            content=content,
         )
 
     @staticmethod

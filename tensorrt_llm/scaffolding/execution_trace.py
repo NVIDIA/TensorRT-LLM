@@ -13,6 +13,15 @@ def _strip_none(obj):
     return obj
 
 
+def _strip_keys(obj, keys):
+    """Recursively remove specified keys from dicts."""
+    if isinstance(obj, dict):
+        return {k: _strip_keys(v, keys) for k, v in obj.items() if k not in keys}
+    if isinstance(obj, list):
+        return [_strip_keys(item, keys) for item in obj]
+    return obj
+
+
 @dataclass
 class TraceEvent:
     """A single event in the execution trace.
@@ -54,6 +63,9 @@ class TraceEvent:
     num_branches: Optional[int] = None
     children: Optional[List["TraceEvent"]] = None
 
+    # -- message content (for system/user messages, used by tokenize_trace_scope) --
+    content: Optional[str] = None
+
     # -- tokenization annotation (filled by tokenize_trace_scope) --
     tokenize_count: Optional[int] = None
 
@@ -71,7 +83,7 @@ class ExecutionTrace:
         None-valued fields are stripped to keep the JSON compact — each
         event only contains the keys relevant to its ``event_type``.
         """
-        data = _strip_none(asdict(self))
+        data = _strip_keys(_strip_none(asdict(self)), {"content"})
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False, default=str)
 

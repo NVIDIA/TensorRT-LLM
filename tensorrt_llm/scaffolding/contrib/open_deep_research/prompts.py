@@ -1,12 +1,7 @@
 # ruff: noqa: E501
 
-GENERATE_RESEARCH_BRIEF_PROMPT = """You will be given a set of messages that have been exchanged so far between yourself and the user.
+GENERATE_RESEARCH_BRIEF_SYSTEM_PROMPT = """You will be given a set of messages that have been exchanged so far between yourself and the user.
 Your job is to translate these messages into a more detailed and concrete research question that will be used to guide the research.
-
-The messages that have been exchanged so far between yourself and the user are:
-<Messages>
-{messages}
-</Messages>
 
 Today's date is {date}.
 
@@ -33,6 +28,12 @@ Guidelines:
 - For academic or scientific queries, prefer linking directly to the original paper or official journal publication rather than survey papers or secondary summaries.
 - For people, try linking directly to their LinkedIn profile, or their personal website if they have one.
 - If the query is in a specific language, prioritize sources published in that language.
+"""
+
+GENERATE_RESEARCH_BRIEF_USER_PROMPT = """The messages that have been exchanged so far between yourself and the user are:
+<Messages>
+{messages}
+</Messages>
 """
 
 
