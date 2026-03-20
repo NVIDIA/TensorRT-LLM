@@ -449,8 +449,8 @@ class MetricsCollector:
                 self._log_histogram(self.histogram_time_to_first_token, ttft)
             if tpot := metrics_dict.get(MetricNames.TPOT, 0):
                 self._log_histogram(self.histogram_time_per_output_token, tpot)
-            if request_queue_time := metrics_dict.get(
-                    MetricNames.REQUEST_QUEUE_TIME, 0):
+            if (request_queue_time := metrics_dict.get(
+                    MetricNames.REQUEST_QUEUE_TIME)) is not None:
                 self._log_histogram(self.histogram_queue_time_request,
                                     request_queue_time)
             if prefill_time := metrics_dict.get(MetricNames.PREFILL_TIME, 0):

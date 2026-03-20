@@ -26,7 +26,7 @@ from .enums import MetricNames, RequestEventTiming
 def process_req_perf_metrics(
         req_perf_metrics_dict: Optional[dict],
         output_length: int,
-        is_multiple_response: bool = False) -> dict:
+        is_multiple_response: bool = False) -> dict[MetricNames, float | int]:
     """Compute derived per-request latency and token-count metrics.
 
     Args:
@@ -38,12 +38,12 @@ def process_req_perf_metrics(
             counting across response candidates.
 
     Returns:
-        Dict mapping ``MetricNames`` enum members to float/int values.
-        Keys with value <= 0 are filtered out.
+        Dict mapping ``MetricNames`` enum members to numeric values.
+        Keys with value <= 0 are filtered out, except ``REQUEST_QUEUE_TIME``
+        which may be 0 (meaning the request was scheduled immediately).
     """
-    stat: dict = {}
     if not req_perf_metrics_dict:
-        return stat
+        return {}
 
     arrival = req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
     first_scheduled = req_perf_metrics_dict.get(
@@ -53,7 +53,7 @@ def process_req_perf_metrics(
     last_token = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME,
                                            0)
 
-    stat: dict = {}
+    stat: dict[MetricNames, float | int] = {}
 
     # Base latency metrics — only compute when all required timestamps are
     # present (> 0).  Absent timestamps default to 0, so a difference that

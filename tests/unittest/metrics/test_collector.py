@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for MetricsCollector iteration stats Prometheus metrics."""
+"""Unit tests for MetricsCollector and process_req_perf_metrics."""
 
 import pytest
-from prometheus_client import REGISTRY, CollectorRegistry
+from prometheus_client import REGISTRY
 
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.metrics.enums import MetricNames
+from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
+from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
 
 
 @pytest.fixture(autouse=True)
@@ -449,9 +450,21 @@ class TestPerRequestPhaseHistograms:
                                     labels) == 0
         assert _get_counter_value(collector.counter_prompt_tokens, labels) == 0
 
+    def test_queue_time_zero_is_recorded_to_prometheus(self, collector):
+        """REQUEST_QUEUE_TIME=0 must reach the Prometheus histogram (not silently dropped)."""
+        labels = {"model_name": "test_model"}
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.E2E: 2.5,
+            MetricNames.TTFT: 0.3,
+            MetricNames.REQUEST_QUEUE_TIME: 0.0,  # immediate scheduling
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector.histogram_queue_time_request,
+                                    labels) == 1
+        assert _get_histogram_sum(collector.histogram_queue_time_request,
+                                  labels) == pytest.approx(0.0)
 
-from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
-from tensorrt_llm.metrics.enums import RequestEventTiming
 
 # Shared timing fixture used across TestProcessReqPerfMetrics tests.
 _FULL_TIMESTAMPS = {
@@ -522,7 +535,8 @@ class TestProcessReqPerfMetrics:
         assert MetricNames.E2E not in stat
 
     def test_clock_skew_negative_phase_time_is_dropped(self):
-        """Negative phase durations (clock skew) must not appear in output."""
+        """Negative phase durations (clock skew) must not appear in output;
+        non-negative metrics must still be present."""
         skewed = {
             RequestEventTiming.ARRIVAL_TIME: 1000.0,
             RequestEventTiming.FIRST_SCHEDULED_TIME: 1000.05,
@@ -533,6 +547,28 @@ class TestProcessReqPerfMetrics:
         stat = process_req_perf_metrics(skewed, output_length=50)
         # PREFILL_TIME = 1000.02 - 1000.05 = -0.03 → must be absent
         assert MetricNames.PREFILL_TIME not in stat
+        # Non-negative metrics must still be present
+        assert MetricNames.TTFT in stat
+        assert stat[MetricNames.TTFT] == pytest.approx(0.02)
+        assert MetricNames.E2E in stat
+        assert stat[MetricNames.E2E] == pytest.approx(2.5)
+        assert MetricNames.DECODE_TIME in stat
+        assert stat[MetricNames.DECODE_TIME] == pytest.approx(2.48)
+
+    def test_negative_queue_time_is_dropped(self):
+        """Negative REQUEST_QUEUE_TIME (arrival after first_scheduled due to clock skew)
+        must not appear in the output."""
+        skewed = {
+            RequestEventTiming.ARRIVAL_TIME: 1000.10,  # arrives after scheduled
+            RequestEventTiming.FIRST_SCHEDULED_TIME: 1000.05,
+            RequestEventTiming.FIRST_TOKEN_TIME: 1000.5,
+            RequestEventTiming.LAST_TOKEN_TIME: 1002.5,
+        }
+        stat = process_req_perf_metrics(skewed, output_length=50)
+        # REQUEST_QUEUE_TIME = 1000.05 - 1000.10 = -0.05 → must be absent
+        assert MetricNames.REQUEST_QUEUE_TIME not in stat
+        # Other metrics are still valid
+        assert MetricNames.PREFILL_TIME in stat
 
     def test_empty_stats_returns_empty(self):
         assert process_req_perf_metrics(None, output_length=10) == {}
