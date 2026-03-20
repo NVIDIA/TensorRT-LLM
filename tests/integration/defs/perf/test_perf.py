@@ -177,7 +177,6 @@ MODEL_PATH_DICT = {
     "nemotron_nano_3_30b_fp8": "Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
     "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
-    "starcoder2_7b": "starcoder2-7b",
     "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
 }
 # Model PATH of HuggingFace
