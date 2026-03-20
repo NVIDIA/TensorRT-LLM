@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils import fp4_utils
 
 from ...distributed import allgather
@@ -98,6 +99,40 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
 
     # DenseGEMM only supports SM100 and SM103 (Blackwell CuTe DSL kernels).
     _SUPPORTED_SM_VERSIONS = (100, 103)
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        swiglu_gptoss_style: bool = False,
+    ) -> tuple:
+        """Check if DenseGEMMFusedMoE can implement the given configuration.
+
+        DenseGEMMFusedMoE supports:
+        - NVFP4 quantization only
+        - SM100/SM103 (Blackwell) only
+        - SwiGLU activation only (swiglu_gptoss_style not supported)
+        """
+        from tensorrt_llm._utils import get_sm_version
+
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+        if sm_version not in cls._SUPPORTED_SM_VERSIONS:
+            return _warn_and_return(
+                f"DenseGEMMFusedMoE requires SM {cls._SUPPORTED_SM_VERSIONS}, got SM{sm_version}"
+            )
+
+        if quant_algo != QuantAlgo.NVFP4:
+            return _warn_and_return(
+                f"DenseGEMMFusedMoE only supports NVFP4 quantization (got quant_algo={quant_algo})"
+            )
+
+        if swiglu_gptoss_style:
+            return _warn_and_return("DenseGEMMFusedMoE does not support swiglu_gptoss_style")
+
+        return (True, None)
 
     def __init__(
         self,

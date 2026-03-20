@@ -64,7 +64,7 @@ try:
         fc2 as kernel_module,
     )
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
+    sys.path.insert(0, str(Path(__file__).parents[4] / "tensorrt_llm/_torch/cute_dsl_kernels"))
     from blackwell.moe_as_dense_gemm import fc2 as kernel_module
 
 Sm100BlockScaledPersistentDenseGemmKernel = kernel_module.Sm100BlockScaledPersistentDenseGemmKernel
@@ -73,6 +73,13 @@ cvt_sf_MKL_to_M32x4xrm_K4xrk_L = kernel_module.cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 # Add parent directory to path to import testing module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from testing import benchmark  # noqa: E402
+
+# Fixed random seed for reproducible tensor initialization.
+DEFAULT_RANDOM_SEED = 1111
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
 
 
 def run(
@@ -185,7 +192,7 @@ def run(
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
-    torch.manual_seed(1111)
+    torch.manual_seed(DEFAULT_RANDOM_SEED)
 
     # Create tensor A/B/C
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
@@ -221,9 +228,6 @@ def run(
 
     # Create scale factor tensor SFA/SFB
     def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):  # noqa: E741
-        def ceil_div(a, b):
-            return (a + b - 1) // b
-
         sf_k = ceil_div(k, sf_vec_size)
         ref_shape = (l, mn, sf_k)
 
