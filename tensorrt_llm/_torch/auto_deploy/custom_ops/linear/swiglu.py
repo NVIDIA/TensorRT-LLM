@@ -17,6 +17,7 @@
 
 This module provides custom operators for SwiGLU MLP fusion:
 - torch_swiglu_mlp: Intermediate representation after pattern matching
+- triton_swiglu_mlp: Triton backend with fused SwiGLU activation kernel
 - fused_swiglu_mlp: Fused implementation with concatenated gate+up weights
 """
 
@@ -89,6 +90,57 @@ def _(
 ) -> torch.Tensor:
     """Fake implementation for tracing."""
     # Output shape is [..., hidden_size] where hidden_size = down_weight.shape[0]
+    output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
+    return input.new_empty(output_shape, dtype=input.dtype)
+
+
+# ── Triton backend ───────────────────────────────────────────────────────────
+
+from .triton_swiglu import swiglu_mlp as _triton_swiglu_mlp  # noqa: E402
+
+
+@torch.library.custom_op("auto_deploy::triton_swiglu_mlp", mutates_args=())
+def triton_swiglu_mlp(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_bias: Optional[torch.Tensor],
+    up_bias: Optional[torch.Tensor],
+    down_bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Triton backend for SwiGLU MLP.
+
+    Uses cuBLAS for GEMM operations and a Triton kernel for the fused
+    SwiGLU activation (silu(gate) * up), avoiding an extra round-trip
+    to global memory between the SiLU and multiply operations.
+
+    Args:
+        input: Input tensor of shape [..., hidden_size].
+        gate_weight: Gate projection weight of shape [intermediate_size, hidden_size].
+        up_weight: Up projection weight of shape [intermediate_size, hidden_size].
+        down_weight: Down projection weight of shape [hidden_size, intermediate_size].
+        gate_bias: Optional gate projection bias of shape [intermediate_size].
+        up_bias: Optional up projection bias of shape [intermediate_size].
+        down_bias: Optional down projection bias of shape [hidden_size].
+
+    Returns:
+        Output tensor of shape [..., hidden_size].
+    """
+    return _triton_swiglu_mlp(input, gate_weight, up_weight, down_weight, gate_bias, up_bias, down_bias)
+
+
+@triton_swiglu_mlp.register_fake
+def _(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_bias: Optional[torch.Tensor],
+    up_bias: Optional[torch.Tensor],
+    down_bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
     output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
     return input.new_empty(output_shape, dtype=input.dtype)
 

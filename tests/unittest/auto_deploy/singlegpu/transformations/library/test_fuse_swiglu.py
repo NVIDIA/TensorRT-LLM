@@ -186,3 +186,82 @@ def test_swiglu_pattern_match_only():
     y_matched = gm_matched(x)
     y_model = model(x)
     torch.testing.assert_close(y_matched, y_model, atol=1e-3, rtol=1e-3)
+
+
+# ── Triton backend dispatch tests ────────────────────────────────────────────
+
+
+def _run_triton_backend_test(model, expected_num_matches=1):
+    """Run the SwiGLU triton backend dispatch test.
+
+    Args:
+        model: The test model to transform.
+        expected_num_matches: Expected number of triton_swiglu_mlp ops.
+    """
+    x = torch.randn(2, 256, device="cuda", dtype=torch.float16)
+    dynamic_shapes = {0: Dim.DYNAMIC}
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    # Apply transforms with triton backend
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "match_swiglu_pattern": {
+                "stage": "pattern_matcher",
+            },
+            "fuse_swiglu": {
+                "stage": "post_load_fusion",
+                "enabled": True,
+                "swiglu_backend": "triton",
+            },
+        },
+    )(None, gm)
+
+    # Move to CUDA if needed
+    gm_transformed = gm_transformed.to("cuda")
+
+    # Check that triton_swiglu_mlp is present (not fused_swiglu_mlp)
+    triton_count = sum(
+        1
+        for n in gm_transformed.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.triton_swiglu_mlp.default)
+    )
+    fused_count = sum(
+        1
+        for n in gm_transformed.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.fused_swiglu_mlp.default)
+    )
+    assert triton_count == expected_num_matches, (
+        f"Expected {expected_num_matches} triton_swiglu_mlp ops, got {triton_count}"
+    )
+    assert fused_count == 0, f"Expected 0 fused_swiglu_mlp ops, got {fused_count}"
+
+    # Verify numerical correctness
+    y_transformed = gm_transformed(x)
+    y_model = model(x)
+    torch.testing.assert_close(y_transformed, y_model, atol=1e-2, rtol=1e-2)
+
+    # Test with a different batch size
+    new_input = torch.randn(4, 256, device="cuda", dtype=torch.float16)
+    y_transformed_2 = gm_transformed(new_input)
+    y_model_2 = model(new_input)
+    torch.testing.assert_close(y_transformed_2, y_model_2, atol=1e-2, rtol=1e-2)
+
+
+def test_swiglu_triton_backend_basic():
+    """Test Triton backend dispatch for SwiGLU without biases."""
+    model = SwiGLUTestModel(with_bias=False)
+    _run_triton_backend_test(model)
+
+
+def test_swiglu_triton_backend_with_bias():
+    """Test Triton backend dispatch for SwiGLU with biases."""
+    model = SwiGLUTestModel(with_bias=True)
+    _run_triton_backend_test(model)
+
+
+@pytest.mark.parametrize("num_layers", [2, 3])
+def test_swiglu_triton_backend_multiple_layers(num_layers):
+    """Test Triton backend dispatch for multiple SwiGLU layers."""
+    model = SwiGLUTestModelMultipleMLP(num_layers=num_layers)
+    _run_triton_backend_test(model, expected_num_matches=num_layers)
