@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._utils import nvtx_range
 
 RequestList = list[LlmRequest]
 
@@ -211,6 +212,7 @@ class RequestScheduler(ABC):
         """
         raise NotImplementedError
 
+    @nvtx_range("_schedule")
     def schedule_step(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> ScheduleStepResult:
