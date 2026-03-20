@@ -218,22 +218,7 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
         tidx,
     ):
         """Execute one radix select round with cluster-based inter-CTA sync."""
-        # Compute prefix_mask for this round (top round_idx*8 bits)
-        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint32(0)
-            else:
-                prefix_mask = cutlass.Uint32(
-                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
-                )
-        else:
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint16(0)
-            else:
-                prefix_mask = cutlass.Uint16(
-                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
-                )
+        prefix_mask = self._compute_prefix_mask(round_idx)
 
         # 1. Build local histogram in SMEM
         self.build_local_histogram(

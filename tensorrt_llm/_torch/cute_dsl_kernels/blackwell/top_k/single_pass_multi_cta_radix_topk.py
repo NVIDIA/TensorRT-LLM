@@ -358,6 +358,33 @@ class SinglePassMultiCTARadixTopKKernel:
         return prologue_elems, aligned_size, left_size
 
     # ------------------------------------------------------------------
+    # Prefix mask helper (shared by all radix round variants)
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _compute_prefix_mask(self, round_idx):
+        """Compute prefix_mask for the given radix round.
+
+        Returns the top ``round_idx * radix_bits`` bits set as a mask,
+        typed as Uint32 (Float32) or Uint16 (Float16/BFloat16).
+        """
+        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            if cutlass.const_expr(prefix_mask_bits == 0):
+                prefix_mask = cutlass.Uint32(0)
+            else:
+                prefix_mask = cutlass.Uint32(
+                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
+                )
+        else:
+            if cutlass.const_expr(prefix_mask_bits == 0):
+                prefix_mask = cutlass.Uint16(0)
+            else:
+                prefix_mask = cutlass.Uint16(
+                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
+                )
+        return prefix_mask
+
+    # ------------------------------------------------------------------
     # Step 2a: Build local histogram (SMEM only, no global merge)
     # ------------------------------------------------------------------
     @cute.jit
@@ -500,22 +527,7 @@ class SinglePassMultiCTARadixTopKKernel:
         the CTA owns all data, so ``local_histogram`` (smem) is already the
         complete histogram after the local build pass.
         """
-        # Compute prefix_mask for this round (top round_idx*8 bits)
-        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint32(0)
-            else:
-                prefix_mask = cutlass.Uint32(
-                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
-                )
-        else:
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint16(0)
-            else:
-                prefix_mask = cutlass.Uint16(
-                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
-                )
+        prefix_mask = self._compute_prefix_mask(round_idx)
 
         # Clear local histogram
         for i in range(tidx, self.radix, num_threads):
@@ -591,22 +603,7 @@ class SinglePassMultiCTARadixTopKKernel:
         next_hist_offset = next_hist_buf_idx * cutlass.Int32(self.radix)
         global_hist_ptr = state_base_ptr + hist_offset
 
-        # Compute prefix_mask for this round (top round_idx*8 bits)
-        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint32(0)
-            else:
-                prefix_mask = cutlass.Uint32(
-                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
-                )
-        else:
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint16(0)
-            else:
-                prefix_mask = cutlass.Uint16(
-                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
-                )
+        prefix_mask = self._compute_prefix_mask(round_idx)
 
         # Build local histogram and merge to global
         self.build_and_merge_histogram(
