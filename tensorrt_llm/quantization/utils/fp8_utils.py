@@ -129,8 +129,7 @@ def resmooth_to_fp8_e8m0(
         max_batches_per_launch = num_batches
 
     for batch_offset in range(0, num_batches, max_batches_per_launch):
-        batch_count = min(max_batches_per_launch,
-                          num_batches - batch_offset)
+        batch_count = min(max_batches_per_launch, num_batches - batch_offset)
         grid = (batch_count, grid_m, grid_k)
 
         _resmooth_kernel[grid](
