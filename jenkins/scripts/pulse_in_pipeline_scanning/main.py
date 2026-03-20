@@ -105,5 +105,3 @@ resp_container_licenses = submit_container_licenses(
     "amd64",
     **SUBMIT_KWARG,
 )
-
-# get_last_scan_results("container_vulnerability", "main")

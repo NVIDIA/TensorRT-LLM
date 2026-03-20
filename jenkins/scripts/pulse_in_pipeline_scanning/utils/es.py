@@ -6,11 +6,16 @@ from elasticsearch import Elasticsearch, RequestsHttpConnection
 
 ES_QUERY_URL = os.environ.get("TRTLLM_ES_QUERY_URL")
 ES_INDEX_BASE = os.environ.get("TRTLLM_ES_INDEX_BASE") or ""
+ES_INDEX_PREAPPROVED_BASE = os.environ.get("TRTLLM_ES_INDEX_PREAPPROVED_BASE") or ""
 
 if not ES_QUERY_URL:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_QUERY_URL' is not set!")
 if not ES_INDEX_BASE:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_INDEX_BASE' is not set!")
+if not ES_INDEX_PREAPPROVED_BASE:
+    raise EnvironmentError(
+        "Error: Environment variable 'TRTLLM_ES_INDEX_PREAPPROVED_BASE' is not set!"
+    )
 
 TIMEOUT = 1000
 ES_CLIENT = Elasticsearch(
@@ -103,3 +108,14 @@ def get_last_scan_results(report_type: str, branch: str):
         else:
             detected_dependencies[package_name] += 1
     return detected_dependencies
+
+
+def get_latest_license_preapproved_container_deps():
+    data = ES_CLIENT.search(
+        index=ES_INDEX_BASE + "-*",
+        body={"size": 1, "sort": [{"ts_created": "desc"}], "_source": ["preapproved_deps"]},
+    )
+    data_source = data["hits"]["hits"][0]["_source"]
+    if not data_source:
+        return []
+    return data_source["preapproved_deps"]
