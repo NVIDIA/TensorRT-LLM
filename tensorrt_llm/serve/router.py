@@ -1,5 +1,6 @@
 import asyncio
 import heapq
+import os
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
@@ -642,7 +643,14 @@ class KvCacheAwareRouter(Router):
         self._tokenizers = {}
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        env_tokens_per_block = os.environ.get(
+            "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
+        if env_tokens_per_block is not None:
+            tokens_per_block = int(env_tokens_per_block)
         self._tokens_per_block = tokens_per_block
+        logger.info(
+            f"KvCacheAwareRouter: tokens_per_block={self._tokens_per_block}"
+        )
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
