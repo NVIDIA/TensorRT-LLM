@@ -192,6 +192,7 @@ def fused_moe(
     activation_type: int = int(ActivationType.Swiglu),
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
+    use_dynamic_fc2_scale: bool = False,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -263,7 +264,8 @@ def fused_moe(
                          cluster_size, cluster_rank, enable_alltoall,
                          min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
                          activation_type, unpadded_hidden_size,
-                         tuner_num_tokens, out_tensor)
+                         tuner_num_tokens, out_tensor,
+                         use_dynamic_fc2_scale)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
@@ -317,7 +319,8 @@ def _(input: torch.Tensor,
       tuner_top_k: Optional[int] = None,
       activation_type: ActivationType = ActivationType.Swiglu,
       unpadded_hidden_size: Optional[int] = None,
-      out_tensor: Optional[torch.Tensor] = None):
+      out_tensor: Optional[torch.Tensor] = None,
+      use_dynamic_fc2_scale: bool = False):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,

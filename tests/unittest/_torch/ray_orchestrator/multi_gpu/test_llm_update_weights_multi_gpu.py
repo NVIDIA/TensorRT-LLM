@@ -256,6 +256,9 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
             if i != self.device_id:
                 self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
 
+        del self.model
+        torch.cuda.empty_cache()
+
     @classmethod
     def _should_quantize(cls, name: str) -> bool:
         """Determine whether to quantize a parameter to NVFP4."""
@@ -343,6 +346,7 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
     "model_dir",
     [
         "Qwen3/Qwen3-30B-A3B",
+        "Qwen3/Qwen3-8B",
     ],
 )
 def test_llm_update_weights_nvfp4(model_dir):
@@ -393,11 +397,11 @@ def test_llm_update_weights_nvfp4(model_dir):
     "model_dir",
     [
         "Qwen3/Qwen3-30B-A3B",
+        "Qwen3/Qwen3-8B",
     ],
 )
 def test_llm_partial_update_weights_nvfp4(model_dir):
     model_dir = str(llm_models_root() / model_dir)
-    num_hidden_layers = 1
     hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
@@ -410,7 +414,6 @@ def test_llm_partial_update_weights_nvfp4(model_dir):
         kv_cache_config=kv_cache_config,
         force_dynamic_quantization=True,
         model_kwargs={
-            "num_hidden_layers": num_hidden_layers,
             "quantization_config": {
                 "quant_method": "nvfp4",
                 "group_size": 16,

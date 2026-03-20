@@ -2024,6 +2024,17 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                  requires_grad=False)
         module.register_parameter("fc2_alpha", fc2_alpha)
 
+        # Per-expert weight_scale_2 for dynamic quantization (fixed address for CUDA graph)
+        fc31_weight_scale_2 = nn.Parameter(torch.ones(module.expert_size_per_partition,
+                                                       dtype=torch.float32),
+                                            requires_grad=False)
+        module.register_parameter("fc31_weight_scale_2", fc31_weight_scale_2)
+
+        fc2_weight_scale_2 = nn.Parameter(torch.ones(module.expert_size_per_partition,
+                                                      dtype=torch.float32),
+                                           requires_grad=False)
+        module.register_parameter("fc2_weight_scale_2", fc2_weight_scale_2)
+
         # Optional per-channel act scale for NVFP4_AWQ (pre_quant_scale support)
         # This will be initialized in load_quant_scales if pre_quant_scale exists
         module.register_parameter("fc31_act_scale", None)
@@ -2317,6 +2328,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             self.load_expert_fc2_alpha_nvfp4(w2_ws2,
                                              module.fc2_input_scale.data,
                                              dst_fc2_alpha[expert_idx])
+
+            # Store per-expert weight_scale_2 for dynamic quantization
+            module.fc31_weight_scale_2.data[expert_idx] = w1_ws2[...].reshape([]).float()
+            module.fc2_weight_scale_2.data[expert_idx] = w2_ws2[...].reshape([]).float()
 
     def _finalize_pre_quant_scales(self, module: torch.nn.Module):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
