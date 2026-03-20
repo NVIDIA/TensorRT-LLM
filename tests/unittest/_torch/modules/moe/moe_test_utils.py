@@ -585,16 +585,6 @@ def should_skip_densegemm(
                 f"FC2 kernel cannot split alpha_scale at non-aligned expert boundaries."
             )
 
-        # DenseGEMM with very large intermediate_size has accuracy issues vs
-        # per-expert reference due to FP4 error accumulation in the large
-        # FC2 reduction dimension (expert_count * intermediate_size).
-        if intermediate_size >= 14336:
-            return (
-                f"[Design Limitation] DenseGEMMFusedMoE NVFP4 with large "
-                f"intermediate_size={intermediate_size} has accuracy issues "
-                f"vs per-expert reference due to FP4 error accumulation."
-            )
-
     return None
 
 
