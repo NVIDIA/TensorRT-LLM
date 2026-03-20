@@ -369,6 +369,8 @@ def create_sampling_params_from_proto(
             kwargs["guided_decoding"] = GuidedDecodingParams(regex=guide_content)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_EBNF_GRAMMAR:
             kwargs["guided_decoding"] = GuidedDecodingParams(grammar=guide_content)
+        elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_STRUCTURAL_TAG:
+            kwargs["guided_decoding"] = GuidedDecodingParams(structural_tag=guide_content)
 
     params = SamplingParams(**kwargs)
 
