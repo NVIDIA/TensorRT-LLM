@@ -1,63 +1,33 @@
 # Source-Backed Tuning Notes
 
-Use these notes only **after** reading an exact or nearby checked-in config and the model's current deployment guide. These are not universal thresholds.
+Read an exact or nearby checked-in config and the model's deployment guide **before** using these notes. These are not universal thresholds.
 
-Preserve the user's explicit performance objective before borrowing knob values from any nearby config. If the nearby config is unlabeled for latency / balanced / throughput intent, treat it as a default starting point rather than a verified objective match.
+## Commonly Tuned Fields
 
-## Commonly Tuned Fields in Current Repo Sources
-
-| Field | What current checked-in docs/configs support |
+| Field | Guidance |
 |---|---|
-| `max_batch_size` | Affects throughput and should not be set too low. Current docs note the reachable batch size depends on total sequence length and available GPU memory. |
-| `max_num_tokens` | Affects throughput and memory pressure. Tune it together with `max_batch_size`. |
-| `enable_attention_dp` | Current checked-in configs show it is scenario-dependent. Keep or change it based on the exact model guide/config you are following, not on a global threshold. |
-| `kv_cache_config.free_gpu_memory_fraction` | One possible OOM lever. Current checked-in guides often adjust `max_batch_size` or `max_seq_len` first, depending on the model. |
-| `moe_expert_parallel_size` | For MoE models, copy the exact or nearest checked-in value for the same model family and verify it against the model-specific guide/config you are following. Do not assume it always equals TP. |
-| `moe_config.backend` | Only set this when the model-specific deployment guide or a checked-in config calls for it. |
-| `stream_interval` | Current configs show model-specific variation; do not assume one global value. |
-| `num_postprocess_workers` | Present in some current streaming / higher-concurrency configs; keep or remove it based on nearby checked-in configs. |
-| `attention_dp_config.*` | Preserve it when present in nearby source-backed configs. |
-| `cuda_graph_config.max_batch_size` / `batch_sizes` | Keep it aligned with the batching strategy shown in current docs/configs. |
-| `speculative_config.num_nextn_predict_layers` | Only use this when the exact checked-in config you selected is an in-scope DeepSeek-R1 `MTP` serve config. Copy it verbatim instead of interpolating it. |
-| `speculative_config.use_relaxed_acceptance_for_thinking`, `relaxed_topk`, `relaxed_delta` | Preserve these exactly when present in the checked-in `MTP` config you are following. Do not synthesize them from nearby configs. |
+| `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. |
+| `max_num_tokens` | Affects throughput and memory. Tune together with `max_batch_size`. |
+| `enable_attention_dp` | Scenario-dependent. Follow the exact model guide/config. |
+| `kv_cache_config.free_gpu_memory_fraction` | OOM lever. Guides often adjust `max_batch_size` or `max_seq_len` first. |
+| `moe_expert_parallel_size` | MoE only. Copy from checked-in source; do not assume it equals TP. |
+| `moe_config.backend` | Set only when model guide or checked-in config specifies it. |
+| `stream_interval` | Model-specific variation; no single global value. |
+| `num_postprocess_workers` | Present in some streaming/higher-concurrency configs. |
+| `attention_dp_config.*` | Preserve when present in source configs. |
+| `cuda_graph_config.max_batch_size` / `batch_sizes` | Align with source config. Not necessarily equal to server `max_batch_size`. |
+| MTP fields (`num_nextn_predict_layers`, `use_relaxed_acceptance_for_thinking`, `relaxed_topk`, `relaxed_delta`) | Only under the **MTP carveout**. Copy verbatim from selected config. |
 
-## Narrow Bench-Derived Hints
+## Bench-Derived Hints (fallback only)
 
-These come from `tensorrt_llm/bench/` and are benchmark / engine-build heuristics, not universal `trtllm-serve` rules. Only borrow them intentionally as a fallback, and mark the result as unverified.
+These come from `tensorrt_llm/bench/` and are benchmark heuristics, not serve rules. Mark any bench-derived value as unverified.
 
-- Bench-only fallback: use dataset averages as first local targets when no exact scenario match exists. `tensorrt_llm/bench/benchmark/throughput.py` and `tensorrt_llm/bench/build/build.py` seed `target_input_len` / `target_output_len` from `DatasetMetadata.avg_isl` / `avg_osl`.
-- Treat `max_batch_size` and `max_num_tokens` as coupled knobs. `tensorrt_llm/bench/build/tuning.py` derives them together from target ISL/OSL and estimated KV-cache capacity rather than tuning them independently.
-- Treat too-small `max_num_tokens` as a warning sign on the current bench non-`enable_chunked_prefill` path. `tensorrt_llm/bench/benchmark/utils/general.py` raises `max_num_tokens` to at least `max_isl + max_batch_size` in that path. Use this as a benchmark safeguard, not a universal serve invariant.
-- `tensorrt_llm/bench/build/tuning.py` rounds `max_batch_size` and `max_num_tokens` upward into coarse buckets and enforces a benchmark-oriented minimum `max_num_tokens` of `2048`. Treat that as benchmark convenience, not as a general serving default.
-- If `cuda_graph_config` leaves both `batch_sizes` and `max_batch_size` unset, `tensorrt_llm/bench/dataclasses/configuration.py` fills `cuda_graph_config.max_batch_size` from runtime `max_batch_size`. Do not apply this if the checked-in config already sets graph batch sizes explicitly.
-- `tensorrt_llm/bench/build/tuning.py` describes its outputs as "slightly optimistic" upper bounds for benchmark engine build. If a bench-derived value diverges materially from nearby checked-in serve configs, prefer the checked-in serve config unless you are explicitly building a benchmark-only engine.
+- `throughput.py` and `build.py` seed target ISL/OSL from `DatasetMetadata.avg_isl`/`avg_osl` — use as a fallback when no exact scenario match exists.
+- `tuning.py` derives `max_batch_size` and `max_num_tokens` together from ISL/OSL and estimated KV-cache capacity. Rounds upward into coarse buckets; enforces min `max_num_tokens` of 2048. Outputs are "slightly optimistic" upper bounds for benchmark engine builds.
+- `general.py` raises `max_num_tokens` to at least `max_isl + max_batch_size` on the non-chunked-prefill path. Benchmark safeguard, not a serve invariant.
+- `configuration.py` fills `cuda_graph_config.max_batch_size` from runtime `max_batch_size` when both `batch_sizes` and `max_batch_size` are unset. Skip if the source config already sets graph batch sizes.
+- If a bench-derived value diverges from nearby checked-in serve configs, prefer the serve config.
 
-## Safe Adjustment Order
+## OOM Triage
 
-1. Lock the user's performance objective (`Min Latency`, `Balanced`, `Max Throughput`, or unspecified)
-2. Lock decode mode: non-spec by default, or exact-source-backed `MTP` only when the selected checked-in DeepSeek-R1 serve config explicitly uses it
-3. Exact in-scope database config
-4. Same-model in-scope database config for a nearby scenario with matching objective when current sources label it
-5. Same-model curated config that stays in scope and matches the stated objective when the repo labels it explicitly
-6. If the selected config is `MTP`-backed, copy the full `speculative_config` block from that checked-in YAML
-7. Model-specific deployment guide / README
-8. Small local adjustments, explicitly marked as unverified
-
-## Things to Avoid
-
-- Numeric crossover thresholds that are not stated in the current checked-in guide for that model
-- "Only N knobs matter" framing
-- Crossing from a latency-oriented config to a throughput-oriented config without calling out the mismatch
-- Copying knob values across unrelated model families
-- Interpolating `speculative_config` fields across scenarios, GPUs, or model families
-- Treating one `MTP`-backed DeepSeek config as evidence that all nearby DeepSeek configs are also in-scope `MTP`
-- Treating an unlabeled default config as a verified latency / balanced / throughput profile
-- Dropping model-specific fields because they look auxiliary
-- Assuming a field is constant just because it was constant for one other model
-
-## OOM / Mismatch Triage
-
-- If you hit OOM, follow the exact model guide/config first. Common levers in current checked-in docs/configs include lowering `max_batch_size`, `max_num_tokens`, `max_seq_len`, or `kv_cache_config.free_gpu_memory_fraction`.
-- If a nearby checked-in config contains fields your draft omits, preserve them unless the current docs say they are out of scope.
-- If the selected checked-in config is `MTP`-backed, preserve the entire `speculative_config` block unless the exact checked-in source for that scenario differs.
-- If the deployment guide provides a backend support matrix, use it instead of guessing `moe_config.backend`.
+Follow the exact model guide/config first. Common levers: lower `max_batch_size`, `max_num_tokens`, `max_seq_len`, or `free_gpu_memory_fraction`. If the deployment guide provides a backend support matrix, use it for `moe_config.backend`.
