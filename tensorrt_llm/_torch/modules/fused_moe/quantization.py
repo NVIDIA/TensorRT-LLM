@@ -320,6 +320,7 @@ class FusedMoEMethodBase(ABC):
             w3_w1_kargs["allow_partial_loading"] = allow_partial_loading
         if "allow_partial_loading" in w2_args:
             w2_kargs["allow_partial_loading"] = allow_partial_loading
+        pass_expert_idx_w3w1 = "expert_idx" in w3_w1_args
 
         def maybe_pageout_mmapped_cpu_weights(
                 weight_tensors: List[object]) -> None:
@@ -377,6 +378,8 @@ class FusedMoEMethodBase(ABC):
                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
                 )
 
+            if pass_expert_idx_w3w1:
+                w3_w1_kargs["expert_idx"] = expert_idx
             self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
                                           dst_w3_w1_weights_tensor[expert_idx],
                                           **w3_w1_kargs)
@@ -394,7 +397,8 @@ class FusedMoEMethodBase(ABC):
             if module.bias:
                 self.load_expert_w3_w1_weight(
                     module, w1_bias, w3_bias,
-                    dst_w3_w1_bias_tensor.data[expert_idx], **w3_w1_kargs)
+                    dst_w3_w1_bias_tensor.data[expert_idx],
+                    **w3_w1_kargs)
 
                 self.load_expert_w2_weight(module, w2_bias,
                                            dst_w2_bias_tensor.data[expert_idx],
@@ -2155,9 +2159,13 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
             if not ignore_weight_scale:
                 if w1_weight_scale is not None or w3_weight_scale is not None:
+                    scale_kargs = {}
+                    if "expert_idx" in inspect.getfullargspec(
+                            self.load_expert_w3_w1_weight_scale_nvfp4).args:
+                        scale_kargs["expert_idx"] = expert_idx
                     self.load_expert_w3_w1_weight_scale_nvfp4(
                         module, w1_weight_scale, w3_weight_scale,
-                        dst_w3_w1_weight_scale[expert_idx])
+                        dst_w3_w1_weight_scale[expert_idx], **scale_kargs)
                     unmap_scales = [
                         s for s in [w1_weight_scale, w3_weight_scale]
                         if s is not None
@@ -2523,7 +2531,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
     def load_expert_w3_w1_weight_scale_nvfp4(
             self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+            dst_w3_w1_weight_scale: torch.Tensor,
+            expert_idx: int = -1):
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w3_w1_weight_scale.device
         w1_weight_scale = load_weight_shard(
@@ -2542,10 +2551,11 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         # Store raw shards in tmp. Cat + pad + interleave always done in
         # process_weights_after_loading() because padding the whole buffer
         # differs from padding each half independently.
+        # Use expert_idx as stable key (not id(tensor_view) which changes across partial loads).
         if not hasattr(module, '_tmp_cutlass_w3_w1_weight_scales'):
             module._tmp_cutlass_w3_w1_weight_scales = {}
-        expert_entry = module._tmp_cutlass_w3_w1_weight_scales.setdefault(
-            id(dst_w3_w1_weight_scale), {})
+        assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
+        expert_entry = module._tmp_cutlass_w3_w1_weight_scales.setdefault(expert_idx, {})
         expert_entry['dst'] = dst_w3_w1_weight_scale
         if w3_weight_scale is not None:
             expert_entry['w3'] = w3_weight_scale.contiguous().view(
@@ -2605,7 +2615,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor,
-                                 allow_partial_loading: bool = False):
+                                 allow_partial_loading: bool = False,
+                                 expert_idx: int = -1):
         """Load and pad w1 and w3 weights for each expert, to match shape requirements for Cutlass nvfp4 alignment."""
         if not allow_partial_loading:
             assert w1_weight is not None and w3_weight is not None
@@ -2627,10 +2638,11 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         # Store raw shards in tmp. Cat + pad always done in process_weights_after_loading()
         # because padding the whole buffer differs from padding each half independently.
+        # Use expert_idx as stable key (not id(tensor_view) which changes across partial loads).
         if not hasattr(module, '_tmp_cutlass_w3_w1_weights'):
             module._tmp_cutlass_w3_w1_weights = {}
-        expert_entry = module._tmp_cutlass_w3_w1_weights.setdefault(
-            id(dst_w3_w1_weight), {})
+        assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
+        expert_entry = module._tmp_cutlass_w3_w1_weights.setdefault(expert_idx, {})
         expert_entry['dst'] = dst_w3_w1_weight
         if w1_weight_shard is not None:
             expert_entry['w1'] = w1_weight_shard.contiguous().view(
@@ -2717,14 +2729,16 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor,
-                                 allow_partial_loading: bool = False):
+                                 allow_partial_loading: bool = False,
+                                 expert_idx: int = -1):
         if not allow_partial_loading:
             assert w1_weight is not None and w3_weight is not None
         if w1_weight is None and w3_weight is None:
             return
         super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
                                          dst_w3_w1_weight,
-                                         allow_partial_loading)
+                                         allow_partial_loading,
+                                         expert_idx=expert_idx)
         # CuteDsl interleave deferred to process_weights_after_loading().
 
     @staticmethod
@@ -2740,10 +2754,12 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     def load_expert_w3_w1_weight_scale_nvfp4(
             self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+            dst_w3_w1_weight_scale: torch.Tensor,
+            expert_idx: int = -1):
         super().load_expert_w3_w1_weight_scale_nvfp4(module, w1_weight_scale,
                                                      w3_weight_scale,
-                                                     dst_w3_w1_weight_scale)
+                                                     dst_w3_w1_weight_scale,
+                                                     expert_idx=expert_idx)
 
         # CuteDsl interleave deferred to process_weights_after_loading().
 

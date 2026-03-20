@@ -476,8 +476,6 @@ class CutlassFusedMoE(MoE):
                 # Dynamic quantization: compute input_scale from current input
                 # and update alpha in-place (same tensor addresses for CUDA graph).
                 if self.force_dynamic_quantization and hasattr(self, 'fc31_weight_scale_2'):
-                    # Compute dynamic fc31 alpha directly from weight_scale_2,
-                    # same approach as NVFP4LinearMethod._input_prepare for dense layers.
                     FP8_MAX, E2M1_MAX = 448.0, 6.0
                     amax_input = torch.amax(torch.abs(x)).float()
                     dyn_input_scale = FP8_MAX * E2M1_MAX / amax_input
