@@ -51,6 +51,7 @@ from _torch.modules.moe.moe_test_utils import (
     should_skip_cutedsl,
     should_skip_cutlass,
     should_skip_deepgemm,
+    should_skip_densegemm,
     should_skip_multi_gpu,
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
@@ -977,6 +978,14 @@ def generate_multi_gpu_test_params(
                         model_config=model_config,
                         moe_tp_size=moe_tp_size,
                     ),
+                    should_skip_densegemm(
+                        backend_type,
+                        quant_algo=quant_algo,
+                        model_config=model_config,
+                        comm_method=comm_method,
+                        moe_tp_size=moe_tp_size,
+                        parallel_mode=parallel_mode,
+                    ),
                     should_skip_multi_gpu(
                         parallel_mode, model_config, world_size=4, comm_method=comm_method
                     ),
@@ -1099,10 +1108,6 @@ def test_configurable_moe_single_gpu(
     3. Autotune captures and replays all tactics properly
     4. swiglu_gptoss_style (SwiGLU with custom parameters) works correctly
     """
-    # DENSEGEMM: disable fused fc2_alpha path for testing against per-expert reference.
-    if moe_backend == MoeBackendType.DENSEGEMM.value:
-        os.environ["TRTLLM_MOE_FUSED_FC2_ALPHA"] = "0"
-
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=MoeBackendType(moe_backend),
