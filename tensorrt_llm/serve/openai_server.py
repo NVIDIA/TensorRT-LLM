@@ -370,8 +370,8 @@ class OpenAIServer:
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
-                "model_name": "undefined",
-                "engine_type": "undefined"
+                "model_name": self.model,
+                "engine_type": self.generator.args.backend or "unknown"
             })
             self._log_config_info_metrics()
             max_perf_metrics = self.generator.args.perf_metrics_max_requests
@@ -454,7 +454,6 @@ class OpenAIServer:
             speculative_config=speculative_config,
             cache_config=cache_config if cache_config else None,
         )
-
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:

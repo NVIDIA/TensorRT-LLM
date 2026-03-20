@@ -25,6 +25,7 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
+from ..metrics.perf_utils import process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -566,6 +567,11 @@ class GenerationResultBase:
             stats, len(output.token_ids), self.sampling_params.n > 1)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
+        if output.finish_reason and not (self.sampling_params.n > 1):
+            prompt_token_ids = getattr(self, "prompt_token_ids", None)
+            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
+                metrics_stats[MetricNames.PROMPT_TOKENS] = len(
+                    prompt_token_ids)
         self.metrics_dict.update(metrics_stats)
 
     def do_tracing(
@@ -1044,28 +1050,3 @@ def compute_logprobs(
                           generation=generation_logprobs)
 
 
-def _process_req_perf_metrics(
-        req_perf_metrics_dict: Optional[dict[str, float]],
-        output_length: int,
-        is_multiple_response: bool = False) -> dict[MetricNames, float]:
-    stat = {}
-    if not req_perf_metrics_dict:
-        return stat
-    ttft = req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0) - \
-           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    e2e = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) - \
-          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
-                         req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    stat = {
-        MetricNames.TTFT: ttft,
-        MetricNames.E2E: e2e,
-        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
-    }
-    if output_length > 1 and not is_multiple_response:
-        tpot = (req_perf_metrics_dict.get(
-            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
-                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
-        stat.update({MetricNames.TPOT: tpot})
-    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
-    return stat

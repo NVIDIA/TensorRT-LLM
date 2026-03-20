@@ -39,6 +39,11 @@ class MetricsCollector:
             trtllm_time_to_first_token_seconds
             trtllm_time_per_output_token_seconds
             trtllm_request_queue_time_seconds
+            trtllm_request_prefill_time_seconds
+            trtllm_request_decode_time_seconds
+            trtllm_request_inference_time_seconds
+            trtllm_prompt_tokens_total
+            trtllm_generation_tokens_total
 
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
@@ -132,6 +137,54 @@ class MetricsCollector:
                 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0,
                 40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0
             ],
+            labelnames=self.labels.keys())
+
+        # Prefill duration is typically in the 1 ms–10 s range; use fine-
+        # grained sub-second buckets to capture that distribution accurately.
+        _prefill_buckets = [
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            10.0, 20.0, 40.0, 80.0, 160.0, 640.0, 2560.0
+        ]
+        # Decode and inference durations span seconds to minutes; reuse the
+        # same coarse buckets as e2e_request_latency_seconds.
+        _decode_inference_buckets = [
+            0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0,
+            40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0
+        ]
+        self.histogram_prefill_time_request = Histogram(
+            name=self.metric_prefix + "request_prefill_time_seconds",
+            documentation=
+            "Histogram of prefill (context) phase duration in seconds "
+            "(first_token_time - first_scheduled_time).",
+            buckets=_prefill_buckets,
+            labelnames=self.labels.keys())
+
+        self.histogram_decode_time_request = Histogram(
+            name=self.metric_prefix + "request_decode_time_seconds",
+            documentation=
+            "Histogram of decode (generation) phase duration in seconds "
+            "(last_token_time - first_token_time).",
+            buckets=_decode_inference_buckets,
+            labelnames=self.labels.keys())
+
+        self.histogram_inference_time_request = Histogram(
+            name=self.metric_prefix + "request_inference_time_seconds",
+            documentation=
+            "Histogram of total inference duration in seconds "
+            "(last_token_time - first_scheduled_time).",
+            buckets=_decode_inference_buckets,
+            labelnames=self.labels.keys())
+
+        self.counter_prompt_tokens = Counter(
+            name=self.metric_prefix + "prompt_tokens_total",
+            documentation=
+            "Cumulative number of prompt (input) tokens processed.",
+            labelnames=self.labels.keys())
+
+        self.counter_generation_tokens = Counter(
+            name=self.metric_prefix + "generation_tokens_total",
+            documentation=
+            "Cumulative number of generation (output) tokens produced.",
             labelnames=self.labels.keys())
 
         self.kv_cache_hit_rate = Gauge(name=self.metric_prefix +
@@ -354,6 +407,11 @@ class MetricsCollector:
         - histogram_time_to_first_token
         - histogram_time_per_output_token
         - histogram_queue_time_request
+        - histogram_prefill_time_request
+        - histogram_decode_time_request
+        - histogram_inference_time_request
+        - counter_prompt_tokens
+        - counter_generation_tokens
 
         Args:
             metrics_dict: A dictionary containing request metrics with the following expected keys:
@@ -363,6 +421,11 @@ class MetricsCollector:
                 - `MetricNames.TTFT` (float): Time to first token in seconds.
                 - `MetricNames.TPOT` (float): Time per output token in seconds.
                 - `MetricNames.REQUEST_QUEUE_TIME` (float): Request queue time in seconds.
+                - `MetricNames.PREFILL_TIME` (float): Prefill phase duration in seconds.
+                - `MetricNames.DECODE_TIME` (float): Decode phase duration in seconds.
+                - `MetricNames.INFERENCE_TIME` (float): Total inference duration in seconds.
+                - `MetricNames.PROMPT_TOKENS` (int): Number of input tokens.
+                - `MetricNames.GENERATION_TOKENS` (int): Number of output tokens.
 
         Returns:
             None: Metrics are logged to Prometheus; nothing is returned.
@@ -390,6 +453,23 @@ class MetricsCollector:
                     MetricNames.REQUEST_QUEUE_TIME, 0):
                 self._log_histogram(self.histogram_queue_time_request,
                                     request_queue_time)
+            if prefill_time := metrics_dict.get(MetricNames.PREFILL_TIME, 0):
+                self._log_histogram(self.histogram_prefill_time_request,
+                                    prefill_time)
+            if decode_time := metrics_dict.get(MetricNames.DECODE_TIME, 0):
+                self._log_histogram(self.histogram_decode_time_request,
+                                    decode_time)
+            if inference_time := metrics_dict.get(MetricNames.INFERENCE_TIME,
+                                                  0):
+                self._log_histogram(self.histogram_inference_time_request,
+                                    inference_time)
+            if prompt_tokens := metrics_dict.get(MetricNames.PROMPT_TOKENS, 0):
+                self._log_counter(self.counter_prompt_tokens, {},
+                                  prompt_tokens)
+            if generation_tokens := metrics_dict.get(
+                    MetricNames.GENERATION_TOKENS, 0):
+                self._log_counter(self.counter_generation_tokens, {},
+                                  generation_tokens)
             self.last_log_time = time.time()
 
     def log_iteration_stats(self, iteration_stats: dict) -> None:

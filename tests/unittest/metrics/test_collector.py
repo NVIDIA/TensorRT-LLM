@@ -18,6 +18,7 @@ import pytest
 from prometheus_client import REGISTRY, CollectorRegistry
 
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.enums import MetricNames
 
 
 @pytest.fixture(autouse=True)
@@ -293,3 +294,246 @@ class TestConfigInfoMetrics:
         """Only model config provided, others None."""
         collector.log_config_info(
             model_config={"model": "test", "dtype": "auto"})
+
+
+# ---------------------------------------------------------------------------
+# Per-request token counters and phase histograms (Step 1 additions)
+# ---------------------------------------------------------------------------
+
+SAMPLE_REQUEST_METRICS_FULL = {
+    MetricsCollector.labelname_finish_reason: "end_id",
+    # latency fields (seconds) — keys are MetricNames enum members
+    MetricNames.E2E: 2.5,
+    MetricNames.TTFT: 0.3,
+    MetricNames.TPOT: 0.05,
+    MetricNames.REQUEST_QUEUE_TIME: 0.1,
+    MetricNames.PREFILL_TIME: 0.2,
+    MetricNames.DECODE_TIME: 2.2,
+    MetricNames.INFERENCE_TIME: 2.4,
+    # token counts
+    MetricNames.PROMPT_TOKENS: 128,
+    MetricNames.GENERATION_TOKENS: 50,
+}
+
+
+
+
+class TestPerRequestTokenCounters:
+    """Test prompt_tokens_total and generation_tokens_total counters."""
+
+    def test_prompt_tokens_incremented(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_counter_value(collector.counter_prompt_tokens,
+                                  labels) == 128
+
+    def test_generation_tokens_incremented(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_counter_value(collector.counter_generation_tokens,
+                                  labels) == 50
+
+    def test_token_counters_accumulate(self, collector):
+        """Counters should sum across multiple requests."""
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_counter_value(collector.counter_prompt_tokens,
+                                  labels) == 256
+        assert _get_counter_value(collector.counter_generation_tokens,
+                                  labels) == 100
+
+    def test_missing_token_counts_no_error(self, collector):
+        """No error and no increment when token counts are absent."""
+        labels = {"model_name": "test_model"}
+        metrics_without_tokens = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.E2E: 1.0,
+            MetricNames.TTFT: 0.1,
+        }
+        collector.log_request_metrics_dict(metrics_without_tokens)
+        assert _get_counter_value(collector.counter_prompt_tokens, labels) == 0
+        assert _get_counter_value(collector.counter_generation_tokens,
+                                  labels) == 0
+
+    def test_zero_tokens_not_incremented(self, collector):
+        """Zero token counts should not increment the counter."""
+        labels = {"model_name": "test_model"}
+        metrics = {
+            **SAMPLE_REQUEST_METRICS_FULL,
+            MetricNames.PROMPT_TOKENS: 0,
+            MetricNames.GENERATION_TOKENS: 0,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_counter_value(collector.counter_prompt_tokens, labels) == 0
+        assert _get_counter_value(collector.counter_generation_tokens,
+                                  labels) == 0
+
+
+def _get_histogram_sum(histogram, labels):
+    """Return the sum of all observations in a Prometheus histogram."""
+    for metric in REGISTRY.collect():
+        if metric.name == histogram._name:
+            for sample in metric.samples:
+                if sample.name.endswith("_sum") and sample.labels == labels:
+                    return sample.value
+    return 0.0
+
+
+def _get_histogram_count(histogram, labels):
+    """Return the number of observations in a Prometheus histogram."""
+    for metric in REGISTRY.collect():
+        if metric.name == histogram._name:
+            for sample in metric.samples:
+                if sample.name.endswith("_count") and sample.labels == labels:
+                    return int(sample.value)
+    return 0
+
+
+class TestPerRequestPhaseHistograms:
+    """Test request_prefill_time_seconds, _decode_time_seconds, _inference_time_seconds."""
+
+    def test_prefill_time_observed(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_histogram_count(collector.histogram_prefill_time_request,
+                                    labels) == 1
+        assert _get_histogram_sum(collector.histogram_prefill_time_request,
+                                  labels) == pytest.approx(0.2)
+
+    def test_decode_time_observed(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_histogram_count(collector.histogram_decode_time_request,
+                                    labels) == 1
+        assert _get_histogram_sum(collector.histogram_decode_time_request,
+                                  labels) == pytest.approx(2.2)
+
+    def test_inference_time_observed(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_histogram_count(collector.histogram_inference_time_request,
+                                    labels) == 1
+        assert _get_histogram_sum(collector.histogram_inference_time_request,
+                                  labels) == pytest.approx(2.4)
+
+    def test_missing_phase_times_no_observation(self, collector):
+        """No histogram observations when phase times are absent."""
+        labels = {"model_name": "test_model"}
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.E2E: 1.0,
+            MetricNames.TTFT: 0.1,
+        }
+        collector.log_request_metrics_dict(metrics)
+        assert _get_histogram_count(collector.histogram_prefill_time_request,
+                                    labels) == 0
+        assert _get_histogram_count(collector.histogram_decode_time_request,
+                                    labels) == 0
+        assert _get_histogram_count(collector.histogram_inference_time_request,
+                                    labels) == 0
+
+    def test_no_observation_without_finish_reason(self, collector):
+        """Phase histograms must not be updated for in-progress requests."""
+        labels = {"model_name": "test_model"}
+        metrics_no_finish = {
+            MetricNames.E2E: 1.0,
+            MetricNames.PREFILL_TIME: 0.2,
+            MetricNames.DECODE_TIME: 0.8,
+            MetricNames.INFERENCE_TIME: 1.0,
+            MetricNames.PROMPT_TOKENS: 10,
+            MetricNames.GENERATION_TOKENS: 5,
+        }
+        collector.log_request_metrics_dict(metrics_no_finish)
+        assert _get_histogram_count(collector.histogram_prefill_time_request,
+                                    labels) == 0
+        assert _get_counter_value(collector.counter_prompt_tokens, labels) == 0
+
+
+from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
+from tensorrt_llm.metrics.enums import RequestEventTiming
+
+# Shared timing fixture used across TestProcessReqPerfMetrics tests.
+_FULL_TIMESTAMPS = {
+    RequestEventTiming.ARRIVAL_TIME: 1000.0,
+    RequestEventTiming.FIRST_SCHEDULED_TIME: 1000.05,
+    RequestEventTiming.FIRST_TOKEN_TIME: 1000.3,
+    RequestEventTiming.LAST_TOKEN_TIME: 1002.5,
+}
+
+
+class TestProcessReqPerfMetrics:
+    """Unit tests for process_req_perf_metrics (new phase timings + token counts)."""
+
+    def test_phase_timings_computed(self):
+        stat = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=50)
+
+        assert stat[MetricNames.PREFILL_TIME] == pytest.approx(0.25)
+        assert stat[MetricNames.DECODE_TIME] == pytest.approx(2.2)
+        assert stat[MetricNames.INFERENCE_TIME] == pytest.approx(2.45)
+
+    def test_base_latencies_computed(self):
+        stat = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=50)
+
+        assert stat[MetricNames.TTFT] == pytest.approx(0.3)
+        assert stat[MetricNames.E2E] == pytest.approx(2.5)
+
+    def test_zero_queue_time_is_included(self):
+        """REQUEST_QUEUE_TIME=0 (instant scheduling) must not be filtered out."""
+        timestamps = {
+            RequestEventTiming.ARRIVAL_TIME: 1000.0,
+            RequestEventTiming.FIRST_SCHEDULED_TIME: 1000.0,  # same as arrival
+            RequestEventTiming.FIRST_TOKEN_TIME: 1000.3,
+            RequestEventTiming.LAST_TOKEN_TIME: 1002.5,
+        }
+        stat = process_req_perf_metrics(timestamps, output_length=50)
+        assert MetricNames.REQUEST_QUEUE_TIME in stat
+        assert stat[MetricNames.REQUEST_QUEUE_TIME] == pytest.approx(0.0)
+
+    def test_generation_tokens_in_stat(self):
+        stat = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=50)
+        assert stat[MetricNames.GENERATION_TOKENS] == 50
+
+    def test_output_length_one_has_tokens_but_no_tpot(self):
+        """GENERATION_TOKENS is present but TPOT is excluded for single-token output."""
+        stat = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=1)
+        assert stat[MetricNames.GENERATION_TOKENS] == 1
+        assert MetricNames.TPOT not in stat
+
+    def test_generation_tokens_excluded_for_multiple_response(self):
+        stat = process_req_perf_metrics(_FULL_TIMESTAMPS,
+                                        output_length=50,
+                                        is_multiple_response=True)
+        assert MetricNames.GENERATION_TOKENS not in stat
+
+    def test_zero_output_length_excludes_tokens(self):
+        stat = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=0)
+        assert MetricNames.GENERATION_TOKENS not in stat
+
+    def test_missing_timestamps_no_phase_timings(self):
+        """When only the arrival timestamp is present, phase metrics are absent."""
+        # Key must be RequestEventTiming enum to match dict lookups.
+        raw = {RequestEventTiming.ARRIVAL_TIME: 1000.0}
+        stat = process_req_perf_metrics(raw, output_length=10)
+        assert MetricNames.PREFILL_TIME not in stat
+        assert MetricNames.DECODE_TIME not in stat
+        assert MetricNames.INFERENCE_TIME not in stat
+        assert MetricNames.TTFT not in stat
+        assert MetricNames.E2E not in stat
+
+    def test_clock_skew_negative_phase_time_is_dropped(self):
+        """Negative phase durations (clock skew) must not appear in output."""
+        skewed = {
+            RequestEventTiming.ARRIVAL_TIME: 1000.0,
+            RequestEventTiming.FIRST_SCHEDULED_TIME: 1000.05,
+            # first_token before first_scheduled — invalid clock ordering
+            RequestEventTiming.FIRST_TOKEN_TIME: 1000.02,
+            RequestEventTiming.LAST_TOKEN_TIME: 1002.5,
+        }
+        stat = process_req_perf_metrics(skewed, output_length=50)
+        # PREFILL_TIME = 1000.02 - 1000.05 = -0.03 → must be absent
+        assert MetricNames.PREFILL_TIME not in stat
+
+    def test_empty_stats_returns_empty(self):
+        assert process_req_perf_metrics(None, output_length=10) == {}
+        assert process_req_perf_metrics({}, output_length=10) == {}
