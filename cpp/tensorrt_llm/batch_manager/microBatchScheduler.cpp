@@ -317,8 +317,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
             // Only count compute tokens (total - reusable).
             // Reusable credit only applies to the first context chunk.
             SizeType32 const reusable = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
-            SizeType32 const computeTokens
-                = std::max(0, llmReq->getContextChunkSize() - std::min(reusable, llmReq->getContextChunkSize()));
+            SizeType32 const computeTokens = std::max(0, llmReq->getContextChunkSize() - reusable);
             batchNumTokens += computeTokens;
             TLLM_LOG_DEBUG("context request scheduled: ID %lu, chunk size %d%s", llmReq->mRequestId,
                 llmReq->getContextChunkSize(), reusable > 0 ? (", reusable " + std::to_string(reusable)).c_str() : "");

@@ -411,6 +411,10 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
             # --- B. Context Request Handling ---
             elif req_state_value == self._context_init_state_value:
+                # Reusable tokens set by capacity scheduler (from radix tree lookup).
+                # Only valid for the first context chunk; subsequent chunks must compute all remaining tokens.
+                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
+
                 if not ctx_chunk_config:
                     # No Chunking: Schedule full context
                     # C++ uses getNumTokens(beam=0) which is tokens.size() - numPreDecodedTokens
@@ -418,9 +422,6 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
                     req_num_tokens = base_tokens + draft_tokens
 
-                    # Reusable tokens set by capacity scheduler (from radix tree lookup).
-                    # Only valid for the first context chunk; subsequent chunks must compute all remaining tokens.
-                    reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
                     compute_tokens = max(1, req_num_tokens - reusable)
 
                     assert max_context_length is None or compute_tokens <= max_context_length, (
@@ -441,10 +442,6 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 else:
                     # Chunking Enabled: Tentative schedule
                     req.context_chunk_size = req.context_remaining_length
-
-                    # Reusable tokens set by capacity scheduler (from radix tree lookup).
-                    # Only valid for the first context chunk; subsequent chunks must compute all remaining tokens.
-                    reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
 
                     draft_tokens = (
                         req.num_draft_tokens
@@ -521,9 +518,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 context_requests.append(req)
                 # Reusable credit only applies to the first context chunk.
                 reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
-                compute_tokens = max(
-                    0, req.context_chunk_size - min(reusable, req.context_chunk_size)
-                )
+                compute_tokens = max(0, req.context_chunk_size - reusable)
                 batch_num_tokens += compute_tokens
                 logger.debug(
                     f"context request scheduled: ID {req.request_id}, "
@@ -666,8 +661,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             # Limit by compute capacity (reusable tokens are free)
             if current_compute_capacity < compute_cost:
                 # Can't fit all new tokens; allow all reusable + whatever compute fits
-                actual_size = reusable + current_compute_capacity
-                actual_size = min(actual_size, suggested_size)
+                actual_size = min(reusable + current_compute_capacity, suggested_size)
 
             # Limit by max_context_length (applies to compute portion only)
             if self.max_context_length is not None:
@@ -683,7 +677,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             req.context_chunk_size = int(actual_size)
 
             # Subtract only the compute portion from capacity
-            actual_compute = max(0, req.context_chunk_size - min(reusable, req.context_chunk_size))
+            actual_compute = max(0, req.context_chunk_size - reusable)
             if capacity is not None:
                 current_compute_capacity -= actual_compute
 

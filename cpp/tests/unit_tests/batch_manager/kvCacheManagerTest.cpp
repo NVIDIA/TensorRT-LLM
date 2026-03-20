@@ -4341,10 +4341,12 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
 
     EXPECT_EQ(events.size(), 2);
 
-    EXPECT_EQ(events.front().windowSize, slidingWindow);
+    // storeContextBlocks iterates windows in descending order (largest first) to preserve
+    // per-window event ordering, so the full-attention window is emitted before the SWA window.
+    EXPECT_EQ(events.front().windowSize, maxAttentionWindow);
     EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
 
-    EXPECT_EQ(events.back().windowSize, maxAttentionWindow);
+    EXPECT_EQ(events.back().windowSize, slidingWindow);
     EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.back().data));
 }
 
@@ -6001,15 +6003,18 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     };
 
     // After removeSequence, reusable blocks are free (no active refs).
-    // getRemainingBlocksToCompletion must NOT subtract free reusable blocks.
+    // getRemainingBlocksToCompletion must NOT subtract free reusable blocks from the BLOCK budget.
     // Needs all 5 context + 3 generation = 8 blocks.
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     auto const numContextBlocks = promptLength / tokensPerBlock; // 5 blocks
     auto const numGenBlocks = maxNewTokens / tokensPerBlock;     // 3 blocks
     EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);       // 5 context + 3 generation = 8
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // storeContextBlocks stores (promptLength - 1) / tokensPerBlock = 4 full blocks.
+    // getRemainingBlocksToCompletion counts ALL reusable blocks (free or allocated) for the
+    // TOKEN budget, so estimatedReusableTokens = min(4, 5) * tokensPerBlock = 64.
+    auto const numStoredBlocks = (promptLength - 1) / tokensPerBlock; // 4
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), std::min(numStoredBlocks, numContextBlocks) * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)

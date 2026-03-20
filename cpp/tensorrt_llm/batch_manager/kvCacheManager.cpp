@@ -786,8 +786,14 @@ bool WindowBlockManager::verifyQueueIntegrity()
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
     constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
-    for (auto const& [windowSize, _] : mWindowBlockManagers)
+    // Iterate in descending window-size order (largest/full-attention windows first).
+    // This guarantees that the Stored event for the full-attention window is committed
+    // before flushRemovedEvents fires for SWA windows, preserving the per-window
+    // ordering guarantee: Removed events precede the Stored event for the same window,
+    // and Stored(full) is not interleaved with Removed(SWA).
+    for (auto it = mWindowBlockManagers.rbegin(); it != mWindowBlockManagers.rend(); ++it)
     {
+        auto& [windowSize, manager] = *it;
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
         TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %d unique tokens", llmRequest.mRequestId,
@@ -796,7 +802,7 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto blockedUniqueTokens
             = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        (void) mWindowBlockManagers.at(windowSize).storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        (void) manager.storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
     }
 }
 
@@ -2328,14 +2334,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         && numAllocBlocksPerBeam == 0)
     {
         auto const uniqueTokens = req.getUniqueTokens(0);
-        auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
-        numReusableContextBlocks = std::min(numReusableBlocks, numContextBlocks);
-        // Store on request so the micro batch scheduler can use it for token budget
-        req.setEstimatedReusableTokens(numReusableContextBlocks * getTokensPerBlock());
+        // Block budget: only subtract blocks that are already allocated (have active refs).
+        // Free cached blocks are already counted in the eviction policy's free pool and
+        // must not be double-counted against the capacity estimate.
+        auto const numReusableBlocksAllocated = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
+        numReusableContextBlocks = std::min(numReusableBlocksAllocated, numContextBlocks);
+        // Token budget: count all reusable blocks (free or allocated). Cached tokens need
+        // not be recomputed regardless of whether their blocks currently have active refs.
+        auto const numReusableBlocksAll = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/false);
+        req.setEstimatedReusableTokens(std::min(numReusableBlocksAll, numContextBlocks) * getTokensPerBlock());
         TLLM_LOG_DEBUG(
-            "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, numReusableBlocks=%d, "
+            "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
+            "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
-            req.mRequestId, numContextBlocks, numReusableBlocks, numReusableContextBlocks, numGenBlocksPerBeam);
+            req.mRequestId, numContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll,
+            numReusableContextBlocks, numGenBlocksPerBeam);
     }
 
     // In case of sliding window attention, a new block is allocated when the
