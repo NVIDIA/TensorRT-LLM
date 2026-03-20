@@ -313,12 +313,12 @@ def convert_and_save_nemo(args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.
-    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
 
