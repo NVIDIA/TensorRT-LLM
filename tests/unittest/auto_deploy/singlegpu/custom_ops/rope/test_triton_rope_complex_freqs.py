@@ -98,8 +98,11 @@ def test_triton_rope_complex_matches_torch_bnsd(
     )
     actual_q, actual_k = torch.ops.auto_deploy.triton_rope_with_complex_freqs(xq, xk, freqs_cis, 1)
 
-    torch.testing.assert_close(actual_q, expected_q, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(actual_k, expected_k, rtol=1e-3, atol=1e-3)
+    # bf16 has lower mantissa precision than fp16; use relaxed tolerances for large head_dim
+    rtol = 2e-2 if dtype == torch.bfloat16 else 1e-3
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(actual_q, expected_q, rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize(
