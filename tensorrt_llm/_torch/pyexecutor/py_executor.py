@@ -1920,7 +1920,8 @@ class PyExecutor:
             True when the total number of generation-ready requests
             reaches ``benchmark_req_queues_size``.
         """
-        local_gen_count = len(scheduled_batch.generation_requests)
+        local_gen_count = sum(1 for req in scheduled_batch.generation_requests
+                              if not req.is_attention_dp_dummy)
         if self.enable_attention_dp:
             total_gen_count = sum(self.dist.tp_allgather(local_gen_count))
         else:
@@ -2936,8 +2937,10 @@ class PyExecutor:
 
         # In benchmark disagg mode, skip dummy addition while requests are
         # still in INIT/transfer state (waiting for KV cache transfer).
+        # We also skip when active_requests is empty (early fill phase) to
+        # avoid occupying a KV cache slot that would block real requests.
         if (self.is_benchmark_disagg and not self.is_warmup
-                and len(self.active_requests) > 0 and num_active_request == 0):
+                and num_active_request == 0):
             logger.info(
                 f"Skipped adding dummy requests: num_fetch_requests={self.num_fetch_requests}, {num_active_request=}"
             )

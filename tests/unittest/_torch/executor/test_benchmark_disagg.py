@@ -35,10 +35,24 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 # ---------------------------------------------------------------------------
 
 
-def _make_scheduled_batch(num_gen_requests: int) -> ScheduledRequests:
-    """Create a ScheduledRequests with *num_gen_requests* generation stubs."""
+def _make_gen_request(is_dummy: bool = False) -> Mock:
+    """Create a generation request stub with the ``is_attention_dp_dummy`` flag."""
+    req = Mock()
+    req.is_attention_dp_dummy = is_dummy
+    return req
+
+
+def _make_scheduled_batch(num_gen_requests: int, num_dummy_requests: int = 0) -> ScheduledRequests:
+    """Create a ScheduledRequests with generation stubs.
+
+    Args:
+        num_gen_requests: Number of real (non-dummy) generation requests.
+        num_dummy_requests: Number of ADP dummy generation requests.
+    """
     batch = ScheduledRequests()
-    batch.generation_requests = [Mock() for _ in range(num_gen_requests)]
+    batch.generation_requests = [
+        _make_gen_request(is_dummy=False) for _ in range(num_gen_requests)
+    ] + [_make_gen_request(is_dummy=True) for _ in range(num_dummy_requests)]
     return batch
 
 
@@ -165,6 +179,20 @@ class TestFillCompleteADP:
         ex._is_benchmark_disagg_fill_complete(batch)
         ex.dist.tp_allgather.assert_called_once_with(3)
 
+    def test_allgather_excludes_dummy_requests(self):
+        """Dummy requests must not inflate the local count sent via allgather."""
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            kv_cache_transceiver=Mock(),
+            enable_attention_dp=True,
+            tp_size=2,
+        )
+        batch = _make_scheduled_batch(num_gen_requests=2, num_dummy_requests=3)
+        ex.dist.tp_allgather.return_value = [2, 2]
+
+        ex._is_benchmark_disagg_fill_complete(batch)
+        ex.dist.tp_allgather.assert_called_once_with(2)
+
     def test_logs_progress_on_rank_zero(self):
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=8,
@@ -197,6 +225,79 @@ class TestFillCompleteADP:
         with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock_logger:
             ex._is_benchmark_disagg_fill_complete(batch)
             mock_logger.info.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ADP regression: mixed real + dummy generation requests
+# ---------------------------------------------------------------------------
+
+
+class TestFillCompleteADPDummyExclusion:
+    """Verify that ADP dummy requests do not inflate the fill threshold.
+
+    In ADP, ``_pad_attention_dp_dummy_request`` injects dummy generation
+    requests on ranks with no active work.  These dummies must be excluded
+    from the ``total_gen_count`` so the ``can_forward`` gate only opens
+    after the required number of *real* requests complete KV transfer.
+    """
+
+    def test_dummies_do_not_trigger_threshold(self):
+        """8 dummies + 0 real must not satisfy a threshold of 4."""
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            kv_cache_transceiver=Mock(),
+            enable_attention_dp=True,
+            tp_size=2,
+        )
+        batch = _make_scheduled_batch(num_gen_requests=0, num_dummy_requests=8)
+        ex.dist.tp_allgather.return_value = [0, 0]
+
+        assert ex._is_benchmark_disagg_fill_complete(batch) is False
+
+    def test_mixed_real_and_dummy_only_counts_real(self):
+        """2 real + 3 dummies on each rank: total real = 4, threshold = 4."""
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            kv_cache_transceiver=Mock(),
+            enable_attention_dp=True,
+            tp_size=2,
+        )
+        batch = _make_scheduled_batch(num_gen_requests=2, num_dummy_requests=3)
+        ex.dist.tp_allgather.return_value = [2, 2]
+
+        assert ex._is_benchmark_disagg_fill_complete(batch) is True
+
+    def test_mixed_below_threshold(self):
+        """1 real + 5 dummies on each rank: total real = 2, threshold = 4."""
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            kv_cache_transceiver=Mock(),
+            enable_attention_dp=True,
+            tp_size=2,
+        )
+        batch = _make_scheduled_batch(num_gen_requests=1, num_dummy_requests=5)
+        ex.dist.tp_allgather.return_value = [1, 1]
+
+        assert ex._is_benchmark_disagg_fill_complete(batch) is False
+
+    def test_non_adp_dummies_excluded(self):
+        """Without ADP, dummies should also be excluded from the local count."""
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            enable_attention_dp=False,
+        )
+        batch = _make_scheduled_batch(num_gen_requests=2, num_dummy_requests=5)
+
+        assert ex._is_benchmark_disagg_fill_complete(batch) is False
+
+    def test_non_adp_real_only_meets_threshold(self):
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            enable_attention_dp=False,
+        )
+        batch = _make_scheduled_batch(num_gen_requests=4, num_dummy_requests=3)
+
+        assert ex._is_benchmark_disagg_fill_complete(batch) is True
 
 
 # ---------------------------------------------------------------------------
