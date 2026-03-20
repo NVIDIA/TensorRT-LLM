@@ -33,14 +33,13 @@ from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
 from .open_search_db_utils import (
-    SCENARIO_MATCH_FIELDS,
+    add_baseline_fields_to_post_merge_data,
     add_id,
-    generate_perf_yaml,
+    check_perf_regression,
     get_common_values,
     get_history_data,
     get_job_info,
     post_new_perf_data,
-    prepare_baseline_data,
     prepare_regressive_test_cases,
 )
 
@@ -1494,7 +1493,6 @@ class PerfSanityTestConfig:
             return {add_prefix(key, prefix_name): value for key, value in config_dict.items()}
 
         match_keys = []
-        is_scenario_mode = False
 
         if self.runtime == "aggr_server":
             job_config = get_job_info()
@@ -1536,18 +1534,17 @@ class PerfSanityTestConfig:
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
+                    new_data["s_stage_name"] = os.environ.get("stageName", "")
+                    new_data["s_test_list"] = self._test_param_labels
+
                     add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
 
                     if not match_keys:
-                        if server_config.match_mode == "scenario":
-                            match_keys = SCENARIO_MATCH_FIELDS.copy()
-                            is_scenario_mode = True  # noqa: F841
-                        else:
-                            match_keys.extend(["s_gpu_type", "s_runtime"])
-                            match_keys.extend(server_config.to_match_keys())
-                            match_keys.extend(client_config.to_match_keys())
+                        match_keys.extend(["s_gpu_type", "s_runtime"])
+                        match_keys.extend(server_config.to_match_keys())
+                        match_keys.extend(client_config.to_match_keys())
 
         elif self.runtime == "multi_node_disagg_server":
             # Only BENCHMARK node uploads
@@ -1606,6 +1603,9 @@ class PerfSanityTestConfig:
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
+                    new_data["s_stage_name"] = os.environ.get("stageName", "")
+                    new_data["s_test_list"] = self._test_param_labels
+
                     add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
@@ -1636,32 +1636,21 @@ class PerfSanityTestConfig:
         common_values_dict = get_common_values(new_data_dict, match_keys)
 
         # Get history data for each cmd_idx
-        history_baseline_dict, history_data_dict = get_history_data(
+        latest_history_data_dict, history_data_dict = get_history_data(
             new_data_dict, match_keys, common_values_dict
         )
 
-        # Update regression info in new_data_dict
-        prepare_regressive_test_cases(history_baseline_dict, new_data_dict)
+        # Update regression info in new_data_dict (both post-merge and pre-merge)
+        prepare_regressive_test_cases(latest_history_data_dict, history_data_dict, new_data_dict)
 
         if is_post_merge:
-            # Prepare new baseline data for post-merge
-            new_baseline_data_dict = prepare_baseline_data(
-                history_baseline_dict, history_data_dict, new_data_dict
-            )
-        else:
-            # Pre-merge does not need to upload baseline data
-            new_baseline_data_dict = None
+            # Embed baseline fields into post-merge data
+            add_baseline_fields_to_post_merge_data(latest_history_data_dict, new_data_dict)
 
         if self.upload_to_db:
-            # Upload the new perf data and baseline data to database
-            post_new_perf_data(new_baseline_data_dict, new_data_dict)
+            post_new_perf_data(new_data_dict)
 
-        generate_perf_yaml(
-            new_data_dict,
-            output_dir=self.test_output_dir,
-        )
-        # TODO: Re-enable regression failure check if needed
-        # check_perf_regression(new_data_dict, fail_on_regression=is_scenario_mode, output_dir=self.test_output_dir)
+        check_perf_regression(new_data_dict, fail_on_regression=not is_post_merge)
 
 
 # Perf sanity test case parameters

@@ -22,7 +22,6 @@ import sys
 import time
 from datetime import datetime
 
-import yaml
 from defs.trt_test_alternative import print_info, print_warning
 
 _project_root = os.path.abspath(
@@ -73,20 +72,6 @@ REGRESSION_METRICS = [
 # Default threshold values for performance regression detection
 POST_MERGE_THRESHOLD = 0.05
 PRE_MERGE_THRESHOLD = 0.1
-
-# Fields for scenario-only matching for recipe tests.
-# Unlike regular tests that match on all config fields, recipes match only on the benchmark
-# scenario, allowing the underlying config to change while still comparing against baselines
-# for the same scenario.
-SCENARIO_MATCH_FIELDS = [
-    "s_gpu_type",
-    "s_runtime",
-    "s_model_name",
-    "l_isl",
-    "l_osl",
-    "l_concurrency",
-    "l_num_gpus",
-]
 
 
 def add_id(data):
@@ -337,7 +322,11 @@ def calculate_baseline_metrics(history_data_list, new_data):
 
 def get_history_data(new_data_dict, match_keys, common_values_dict):
     """
-    Query history post-merge data for each cmd_idx
+    Query history post-merge data for each cmd_idx.
+
+    Returns (latest_history_data_dict, history_data_dict):
+      - latest_history_data_dict: latest post-merge entry per cmd_idx (or None)
+      - history_data_dict: all history post-merge entries per cmd_idx
     """
 
     def get_latest_data(data_list):
@@ -393,6 +382,11 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
                 }
             },
             {
+                "term": {
+                    "b_is_baseline": False
+                }
+            },
+            {
                 "range": {
                     "ts_created": {
                         "gte":
@@ -412,47 +406,24 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
         return None, None
 
     # Query was successful (even if empty list), initialize dicts
-    history_baseline_dict = {}
     history_data_dict = {}
     for cmd_idx in cmd_idxs:
         history_data_dict[cmd_idx] = []
-        history_baseline_dict[cmd_idx] = []
 
     # Process history data if we have any
     if history_data_list:
         for history_data in history_data_list:
             for cmd_idx in cmd_idxs:
                 if match(history_data, new_data_dict[cmd_idx], match_keys):
-                    if history_data.get("b_is_baseline") and history_data.get(
-                            "b_is_baseline") == True:
-                        history_baseline_dict[cmd_idx].append(history_data)
-                    else:
-                        history_data_dict[cmd_idx].append(history_data)
+                    history_data_dict[cmd_idx].append(history_data)
                     break
 
-    # Sometimes the database has several baselines and we only use the latest one
-    # If list is empty, set to None for each cmd_idx
-    for cmd_idx, baseline_list in history_baseline_dict.items():
-        latest_baseline = get_latest_data(baseline_list)
-        history_baseline_dict[cmd_idx] = latest_baseline
-    return history_baseline_dict, history_data_dict
-
-
-def _get_threshold_for_metric(baseline_data, metric, is_post_merge):
-    """
-    Get the threshold for a metric from baseline data using is_post_merge flag.
-    """
-    metric_suffix = metric[2:]  # Remove "d_" prefix
-    if is_post_merge:
-        threshold_key = f"d_threshold_post_merge_{metric_suffix}"
-    else:
-        threshold_key = f"d_threshold_pre_merge_{metric_suffix}"
-
-    if threshold_key in baseline_data:
-        return baseline_data[threshold_key]
-
-    raise KeyError(f"No threshold found for metric '{metric}'. "
-                   f"Expected '{threshold_key}' in baseline data.")
+    # Find the latest entry per cmd_idx
+    latest_history_data_dict = {}
+    for cmd_idx in cmd_idxs:
+        latest_history_data_dict[cmd_idx] = get_latest_data(
+            history_data_dict[cmd_idx])
+    return latest_history_data_dict, history_data_dict
 
 
 def _calculate_diff(metric, new_value, baseline_value):
@@ -470,46 +441,71 @@ def _calculate_diff(metric, new_value, baseline_value):
         return (baseline_value - new_value) / baseline_value * 100
 
 
-def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
+def prepare_regressive_test_cases(latest_history_data_dict, history_data_dict,
+                                  new_data_dict):
     """Update regression info for all data in new_data_dict.
+
+    Uses embedded baseline fields from latest history data when available,
+    otherwise falls back to calculating baseline from history data.
     """
-    # If history_baseline_dict is None (network failure), skip regression check
-    if history_baseline_dict is None:
+    # If latest_history_data_dict is None (network failure), skip regression check
+    if latest_history_data_dict is None:
         return
 
     for cmd_idx in new_data_dict:
         new_data = new_data_dict[cmd_idx]
-        history_baseline = history_baseline_dict.get(cmd_idx)
-        if history_baseline is None:
+        latest_history = latest_history_data_dict.get(cmd_idx)
+        if latest_history is None:
             new_data["s_regression_info"] = ""
             new_data["b_is_regression"] = False
             continue
 
         is_post_merge = new_data.get("b_is_post_merge", False)
-        info_parts = [
-            f"baseline_id: {history_baseline.get('_id', '')}",
-            f"baseline_branch: {history_baseline.get('s_branch', '')}",
-            f"baseline_commit: {history_baseline.get('s_commit', '')}",
-            f"baseline_date: {history_baseline.get('ts_created', '')}",
-        ]
         regressive_metrics = []
+        info_lines = []
+
+        # Pre-calculate fallback baseline from history if needed
+        fallback_baseline = None
+
         # Check all metrics and build info string
         for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
-            if metric not in new_data or metric not in history_baseline:
+            if metric not in new_data:
                 continue
 
-            baseline_value = history_baseline[metric]
             new_value = new_data[metric]
-            threshold = _get_threshold_for_metric(history_baseline, metric,
-                                                  is_post_merge)
-            diff = _calculate_diff(metric, new_value, baseline_value)
+            metric_suffix = metric[2:]  # Remove "d_" prefix
 
-            # Add metric info to s_regression_info
-            metric_info = (f"{metric}'s value: {new_value} "
-                           f"baseline value: {baseline_value} "
-                           f"threshold: {threshold * 100:.2f}% "
-                           f"diff: {diff:+.2f}%")
-            info_parts.append(metric_info)
+            # Get baseline value: try embedded field from latest history first
+            baseline_key = f"d_baseline_{metric_suffix}"
+            baseline_value = latest_history.get(baseline_key)
+            if baseline_value is None or baseline_value <= 0:
+                # Fallback: calculate from history data
+                if fallback_baseline is None:
+                    history_list = history_data_dict.get(cmd_idx, [])
+                    fallback_baseline = calculate_baseline_metrics(
+                        history_list, new_data)
+                baseline_value = fallback_baseline.get(metric)
+                if baseline_value is None or baseline_value <= 0:
+                    continue
+
+            # Get threshold: try embedded field from latest history first
+            if is_post_merge:
+                threshold_key = f"d_threshold_post_merge_{metric_suffix}"
+                default_threshold = POST_MERGE_THRESHOLD
+            else:
+                threshold_key = f"d_threshold_pre_merge_{metric_suffix}"
+                default_threshold = PRE_MERGE_THRESHOLD
+
+            threshold = latest_history.get(threshold_key)
+            if threshold is None or threshold <= 0:
+                threshold = default_threshold
+
+            diff = _calculate_diff(metric, new_value, baseline_value)
+            info_lines.append(
+                f"  {metric}: value={new_value:.4f} "
+                f"baseline={baseline_value:.4f} "
+                f"threshold={threshold * 100:.2f}% "
+                f"diff={diff:+.2f}%")
 
             # Check if this metric is regressive (only for key regression metrics)
             if metric in REGRESSION_METRICS:
@@ -522,89 +518,59 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
                     if new_value > baseline_value * (1 + threshold):
                         regressive_metrics.append(metric)
 
-        new_data["s_regression_info"] = ", ".join(info_parts)
+        test_case = new_data.get("s_test_case_name", "unknown")
+        header = f"Regression in {test_case}:"
+        new_data["s_regression_info"] = "\n".join([header] + info_lines)
         new_data["b_is_regression"] = len(regressive_metrics) > 0
 
 
-def _is_valid_baseline(baseline_data):
-    """Check if baseline data is valid (non-empty dict)."""
-    if isinstance(baseline_data, dict) and len(baseline_data) > 0:
-        return True
-    return False
+def add_baseline_fields_to_post_merge_data(latest_history_data_dict,
+                                           new_data_dict):
+    """Embed baseline fields directly into each post-merge data entry.
 
-
-def prepare_baseline_data(history_baseline_dict, history_data_dict,
-                          new_data_dict):
+    For each metric, adds:
+      - d_baseline_{metric_suffix}: from latest history if available and > 0, else -1
+      - d_threshold_post_merge_{metric_suffix}: from latest history if available, else POST_MERGE_THRESHOLD
+      - d_threshold_pre_merge_{metric_suffix}: from latest history if available, else PRE_MERGE_THRESHOLD
     """
-    Calculate new baseline from history post-merge data and new data.
-    Then return new baseline data.
-    """
-    # If history_baseline_dict and history_data_dict are None (network failure),
-    # return None to indicate we cannot prepare baseline data
-    if history_baseline_dict is None and history_data_dict is None:
-        return {}
+    if latest_history_data_dict is None:
+        return
 
-    new_baseline_data_dict = {}
-    cmd_idxs = new_data_dict.keys()
-    # Find the best history post-merge data for each cmd
-    for cmd_idx in cmd_idxs:
-        # Calculate baseline metrics using rolling smooth + P95 algorithm
-        best_metrics = calculate_baseline_metrics(history_data_dict[cmd_idx],
-                                                  new_data_dict[cmd_idx])
+    for cmd_idx in new_data_dict:
+        new_data = new_data_dict[cmd_idx]
+        latest_history = latest_history_data_dict.get(cmd_idx)
 
-        # Create new_baseline_data from new_data_dict and set b_is_baseline
-        new_baseline_data = new_data_dict[cmd_idx].copy()
-        new_baseline_data["b_is_baseline"] = True
-
-        # Initialize metric_threshold_dict with default thresholds for all metrics
-        metric_threshold_dict = {}
         for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
-            metric_suffix = metric[2:]
+            metric_suffix = metric[2:]  # Remove "d_" prefix
+            baseline_key = f"d_baseline_{metric_suffix}"
             post_merge_key = f"d_threshold_post_merge_{metric_suffix}"
             pre_merge_key = f"d_threshold_pre_merge_{metric_suffix}"
-            metric_threshold_dict[post_merge_key] = POST_MERGE_THRESHOLD
-            metric_threshold_dict[pre_merge_key] = PRE_MERGE_THRESHOLD
 
-        # If history baseline is valid, extract thresholds and update metric_threshold_dict
-        history_baseline = history_baseline_dict[cmd_idx]
-        if _is_valid_baseline(history_baseline):
-            for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
-                metric_suffix = metric[2:]
-                post_merge_key = f"d_threshold_post_merge_{metric_suffix}"
-                pre_merge_key = f"d_threshold_pre_merge_{metric_suffix}"
-                if post_merge_key in history_baseline:
-                    metric_threshold_dict[post_merge_key] = history_baseline[
-                        post_merge_key]
-                if pre_merge_key in history_baseline:
-                    metric_threshold_dict[pre_merge_key] = history_baseline[
-                        pre_merge_key]
+            # Threshold: inherit from latest history or use defaults
+            if latest_history and post_merge_key in latest_history:
+                new_data[post_merge_key] = latest_history[post_merge_key]
+            else:
+                new_data[post_merge_key] = POST_MERGE_THRESHOLD
 
-        # Update new_baseline_data with best_metrics values
-        for metric, value in best_metrics.items():
-            new_baseline_data[metric] = value
+            if latest_history and pre_merge_key in latest_history:
+                new_data[pre_merge_key] = latest_history[pre_merge_key]
+            else:
+                new_data[pre_merge_key] = PRE_MERGE_THRESHOLD
 
-        # Add all thresholds to new_baseline_data
-        for threshold_key, threshold_value in metric_threshold_dict.items():
-            new_baseline_data[threshold_key] = threshold_value
-
-        add_id(new_baseline_data)
-        new_baseline_data_dict[cmd_idx] = new_baseline_data
-
-    return new_baseline_data_dict
+            # Baseline value: inherit from latest history if positive, else -1
+            if (latest_history and baseline_key in latest_history
+                    and latest_history[baseline_key] is not None
+                    and latest_history[baseline_key] > 0):
+                new_data[baseline_key] = latest_history[baseline_key]
+            else:
+                new_data[baseline_key] = -1
 
 
-def post_new_perf_data(new_baseline_data_dict, new_data_dict):
+def post_new_perf_data(new_data_dict):
     """
-    Post new perf results and new baseline to database
+    Post new perf results to database.
     """
-    data_list = []
-    cmd_idxs = new_data_dict.keys()
-    for cmd_idx in cmd_idxs:
-        # Only upload baseline data when post-merge.
-        if new_baseline_data_dict and cmd_idx in new_baseline_data_dict:
-            data_list.append(new_baseline_data_dict[cmd_idx])
-        if cmd_idx in new_data_dict:
-            data_list.append(new_data_dict[cmd_idx])
+    data_list = list(new_data_dict.values())
     if not data_list:
         return
     try:
@@ -616,127 +582,40 @@ def post_new_perf_data(new_baseline_data_dict, new_data_dict):
             f"Failed to post data to {TEST_INFO_PROJECT_NAME}, error: {e}")
 
 
-def _get_metric_keys():
-    """Get all metric-related keys for filtering config keys."""
-    metric_keys = set()
-    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
-        metric_suffix = metric[2:]  # Strip "d_" prefix
-        metric_keys.add(metric)
-        metric_keys.add(f"d_baseline_{metric_suffix}")
-        metric_keys.add(f"d_threshold_post_merge_{metric_suffix}")
-        metric_keys.add(f"d_threshold_pre_merge_{metric_suffix}")
-    return metric_keys
-
-
-def generate_perf_yaml(new_data_dict, output_dir=None):
+def check_perf_regression(new_data_dict, fail_on_regression=False):
     """
-    Save new perf data entries to perf_data.yaml for post-processing.
-
-    Each entry in the output list is a dict with:
-      - "new_data": the new perf data dict
+    Check performance regression by printing s_regression_info for each
+    regressive entry. Post-merge regressions log warnings. Pre-merge
+    regressions raise RuntimeError when fail_on_regression is True.
     """
-    all_entries = []
-    for cmd_idx, new_data in new_data_dict.items():
-        entry = {"new_data": new_data}
-        all_entries.append(entry)
+    regressive_data_list = [
+        data for data in new_data_dict.values()
+        if data.get("b_is_regression", False)
+    ]
 
-    if output_dir is not None and len(all_entries) > 0:
-        perf_data_file = os.path.join(output_dir, "perf_data.yaml")
-        with open(perf_data_file, 'w') as f:
-            yaml.dump(all_entries, f, default_flow_style=False)
-        print_info(
-            f"Saved {len(all_entries)} perf data entries to {perf_data_file}")
-    elif len(all_entries) == 0:
-        print_info("No perf data to save.")
+    if not regressive_data_list:
+        print_info("No regression data found.")
+        return
 
+    post_merge_regressions = [
+        data for data in regressive_data_list
+        if data.get("b_is_post_merge", False)
+    ]
+    pre_merge_regressions = [
+        data for data in regressive_data_list
+        if not data.get("b_is_post_merge", False)
+    ]
 
-# def _print_regression_data(data, print_func=None):
-#     """
-#     Print regression info and config.
-#     """
-#     if print_func is None:
-#         print_func = print_info
-#
-#     if "s_regression_info" in data:
-#         print_func("=== Regression Info ===")
-#         for item in data["s_regression_info"].split(","):
-#             print_func(item.strip())
-#
-#     metric_keys = _get_metric_keys()
-#
-#     print_func("\n=== Config ===")
-#     config_keys = sorted([key for key in data.keys() if key not in metric_keys])
-#     for key in config_keys:
-#         if key == "s_regression_info":
-#             continue
-#         value = data[key]
-#         print_func(f'"{key}": {value}')
+    # Print post-merge regression details as warnings
+    for data in post_merge_regressions:
+        print_warning(data.get("s_regression_info", ""))
 
-# def check_perf_regression(new_data_dict,
-#                           fail_on_regression=False,
-#                           output_dir=None):
-#     """
-#     Check performance regression by printing regression data from new_data_dict.
-#     If fail_on_regression is True, raises RuntimeError when regressions are found.
-#     (This is a temporary feature to fail regression tests. We are observing the stability and will fail them by default soon.)
-#     If output_dir is provided, saves regression data to regression_data.yaml.
-#     """
-#     # Filter regression data from new_data_dict
-#     regressive_data_list = [
-#         data for data in new_data_dict.values()
-#         if data.get("b_is_regression", False)
-#     ]
-#     # Split regression data into post-merge and pre-merge
-#     post_merge_regressions = [
-#         data for data in regressive_data_list
-#         if data.get("b_is_post_merge", False)
-#     ]
-#     pre_merge_regressions = [
-#         data for data in regressive_data_list
-#         if not data.get("b_is_post_merge", False)
-#     ]
-#
-#     # Save regression data to yaml file if output_dir is provided
-#     if output_dir is not None and len(regressive_data_list) > 0:
-#         regression_data_file = os.path.join(output_dir, "regression_data.yaml")
-#         with open(regression_data_file, 'w') as f:
-#             yaml.dump(regressive_data_list, f, default_flow_style=False)
-#         print_info(
-#             f"Saved {len(regressive_data_list)} regression data to {regression_data_file}"
-#         )
-#
-#     # Print pre-merge regression data with print_warning
-#     if len(pre_merge_regressions) > 0:
-#         print_warning(
-#             f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
-#         )
-#         for i, data in enumerate(pre_merge_regressions):
-#             print_warning(f"\n{'=' * 60}")
-#             print_warning(f"Pre-merge Regression Data #{i + 1}")
-#             print_warning("=" * 60)
-#             _print_regression_data(data, print_func=print_warning)
-#
-#         if fail_on_regression:
-#             raise RuntimeError(
-#                 f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
-#             )
-#
-#     # Print post-merge regression data with print_warning
-#     if len(post_merge_regressions) > 0:
-#         print_warning(
-#             f"Found {len(post_merge_regressions)} post-merge perf regression data"
-#         )
-#         for i, data in enumerate(post_merge_regressions):
-#             print_warning(f"\n{'=' * 60}")
-#             print_warning(f"Post-merge Regression Data #{i + 1}")
-#             print_warning("=" * 60)
-#             _print_regression_data(data, print_func=print_warning)
-#
-#         if fail_on_regression:
-#             raise RuntimeError(
-#                 f"Found {len(post_merge_regressions)} post-merge perf regression data"
-#             )
-#
-#     # Print summary if no regressions
-#     if len(regressive_data_list) == 0:
-#         print_info("No regression data found.")
+    # Print pre-merge regression details and raise error
+    if pre_merge_regressions:
+        error_parts = []
+        for data in pre_merge_regressions:
+            info = data.get("s_regression_info", "")
+            print_warning(info)
+            error_parts.append(info)
+        if fail_on_regression:
+            raise RuntimeError("\n".join(error_parts))

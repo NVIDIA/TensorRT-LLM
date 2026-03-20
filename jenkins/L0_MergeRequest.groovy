@@ -901,30 +901,6 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        stage("Collect Perf Sanity Test Result") {
-            def yamlFiles = sh(
-                returnStdout: true,
-                script: 'find . -type f -name "perf_data.yaml" 2>/dev/null || true'
-            ).trim()
-            echo "Perf data yaml files: ${yamlFiles}"
-            if (yamlFiles) {
-                def yamlFileList = yamlFiles.split(/\s+/).collect { it.trim() }.findAll { it }.join(",")
-                echo "Found perf data files: ${yamlFileList}"
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml requests")
-                sh """
-                    python3 llm/jenkins/scripts/perf/get_pre_merge_html.py \
-                    --input-files=${yamlFileList} \
-                    --output-file=perf_sanity_report.html
-                """
-                trtllm_utils.uploadArtifacts("perf_sanity_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Perf sanity report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_sanity_report.html"
-            } else {
-                echo "No perf_data.yaml files found."
-            }
-        } // Collect Perf Sanity Test Result stage
         stage("Rerun Report") {
             sh "rm -rf rerun && mkdir -p rerun"
             sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
