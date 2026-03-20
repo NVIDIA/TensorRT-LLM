@@ -1,4 +1,5 @@
 import bisect
+import warnings
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -67,12 +68,27 @@ class WaitingQueue(ABC):
 class FCFSWaitingQueue(deque, WaitingQueue):
     """A first-come-first-served queue that supports deque operations."""
 
+    @staticmethod
+    def _warn_if_priority_set(request: RequestQueueItem) -> None:
+        if request.request is not None and request.request.priority != DEFAULT_REQUEST_PRIORITY:
+            warnings.warn(
+                "A request has a non-default priority but the FCFS waiting "
+                "queue is in use; the priority value will be ignored. "
+                "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling.",
+                UserWarning,
+                stacklevel=3,
+            )
+
     def add_request(self, request: RequestQueueItem) -> None:
         """Add a request to the queue according to FCFS policy."""
+        self._warn_if_priority_set(request)
         self.append(request)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Add multiple requests to the queue according to FCFS policy."""
+        requests = list(requests)
+        for request in requests:
+            self._warn_if_priority_set(request)
         self.extend(requests)
 
     def pop_request(self) -> RequestQueueItem:
