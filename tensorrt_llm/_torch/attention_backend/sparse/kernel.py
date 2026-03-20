@@ -1944,7 +1944,7 @@ def triton_convert_req_index_to_global_index(
 
 
 @triton.jit
-def _fused_gather_k_cache_kernel(
+def _triton_gather_k_cache_kernel(
     k_cache_ptr,
     slot_fp8_ptr,
     slot_scale_ptr,
@@ -1985,7 +1985,7 @@ def _fused_gather_k_cache_kernel(
     tl.store(out_scale_ptr + dst_scale, scale_data, mask=gather_mask)
 
 
-def fused_gather_k_cache(
+def triton_gather_k_cache(
     k_cache: torch.Tensor,
     slot_mapping_fp8: torch.Tensor,
     slot_mapping_scale: torch.Tensor,
@@ -2038,7 +2038,7 @@ def fused_gather_k_cache(
                             device=device)
 
     grid = (triton.cdiv(num_k_tokens, BLOCK_TOKENS), )
-    _fused_gather_k_cache_kernel[grid](
+    _triton_gather_k_cache_kernel[grid](
         k_cache_flat,
         slot_mapping_fp8,
         slot_mapping_scale,
