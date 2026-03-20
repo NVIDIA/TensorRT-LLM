@@ -135,7 +135,163 @@ __global__ void updateKVCacheDraftTokenLocationBatchedKernel(std::array<KVCacheB
         __syncthreads();
     }
 }
+
+template <typename KVCacheBuffer, SizeType32 MaxLayerCount, typename MoveEltType>
+__global__ void updateKVCacheDraftTokenLocationBatchedKernel2D(std::array<KVCacheBuffer, MaxLayerCount> kvCacheBuffers,
+    IndexType const* acceptedDraftTokensIndices2D, SizeType32 const* numAcceptedTokens, SizeType32 maxDraftLen,
+    SizeType32 const* pastKeyValueLengths, SizeType32 rewindDraftTokenCommonCount,
+    SizeType32 const* rewindDraftTokenSeparateAdjustments, SizeType32 const* seqSlotRemapping,
+    SizeType32 const* batchSlots, SizeType32 eltCountPerHead)
+{
+    auto const seqIdx = static_cast<SizeType32>(blockIdx.x);
+    auto const headIdx = static_cast<SizeType32>(blockIdx.y);
+    auto const layerIdx = static_cast<SizeType32>(blockIdx.z);
+    auto const warpIdx = static_cast<SizeType32>(threadIdx.x / 32);
+    auto const warpCount = static_cast<SizeType32>(blockDim.x / 32);
+    auto const laneIdx = static_cast<SizeType32>(threadIdx.x & 0x1f);
+    auto const seqDraftCount = max(numAcceptedTokens[seqIdx] - 1, 0);
+    auto const seqSlot = seqSlotRemapping == nullptr ? seqIdx : seqSlotRemapping[seqIdx];
+    auto const maxEltCountPerMove = seqDraftCount > 0
+        ? static_cast<SizeType32>(kUpdateKVCacheKernelShmSize / sizeof(MoveEltType) / seqDraftCount)
+        : 0;
+    auto const eltCountPerMove = min(maxEltCountPerMove, eltCountPerHead);
+    if (seqDraftCount == 0 || eltCountPerMove == 0)
+    {
+        return;
+    }
+    auto const seqRow = seqIdx * maxDraftLen;
+    KVCacheBuffer& kvCacheBuffer = kvCacheBuffers[layerIdx];
+    auto tokenStartIdx = pastKeyValueLengths[seqSlot] - rewindDraftTokenCommonCount;
+    if (rewindDraftTokenSeparateAdjustments != nullptr)
+    {
+        auto const batchSlot = batchSlots == nullptr ? seqIdx : batchSlots[seqIdx];
+        tokenStartIdx -= rewindDraftTokenSeparateAdjustments[batchSlot];
+    }
+    // Guard against negative tokenStartIdx (e.g. during CUDA graph warmup
+    // when kv_lens < rewindDraftTokenCommonCount).
+    if (tokenStartIdx < 0)
+    {
+        return;
+    }
+    __shared__ char loadSmemBuffer[kUpdateKVCacheKernelShmSize];
+    auto* eltLoadSmemBuffer = reinterpret_cast<MoveEltType*>(&loadSmemBuffer[0]);
+    for (SizeType32 startChannelOffset = 0; startChannelOffset < eltCountPerHead; startChannelOffset += eltCountPerMove)
+    {
+        SizeType32 eltCountCurrentMove = min(eltCountPerMove, eltCountPerHead - startChannelOffset);
+        for (SizeType32 tokenIdx = warpIdx; tokenIdx < seqDraftCount; tokenIdx += warpCount)
+        {
+            // Clamp negative indices (e.g. -1 fill during CUDA graph warmup) to 0
+            // to prevent OOB access. Correctness is N/A for warmup data.
+            auto const tokenPos = max(acceptedDraftTokensIndices2D[seqRow + tokenIdx], 0);
+            auto* tokenSmemBuffer = eltLoadSmemBuffer + tokenIdx * eltCountCurrentMove;
+            auto const tokenKVPosition = tokenStartIdx + tokenPos;
+            auto* kPtr = reinterpret_cast<MoveEltType*>(kvCacheBuffer.getKBlockPtr(seqSlot, tokenKVPosition));
+            for (SizeType32 loadChannelIdx = laneIdx; loadChannelIdx < eltCountCurrentMove; loadChannelIdx += 32)
+            {
+                auto const channelIdx = loadChannelIdx + startChannelOffset;
+                auto const kvLocationIdx
+                    = kvCacheBuffer.getKVLocalIdx(tokenKVPosition, headIdx, eltCountPerHead, channelIdx);
+                tokenSmemBuffer[loadChannelIdx] = kPtr[kvLocationIdx];
+            }
+        }
+        __syncthreads();
+        for (SizeType32 tokenIdx = warpIdx; tokenIdx < seqDraftCount; tokenIdx += warpCount)
+        {
+            auto const tokenPos = tokenIdx;
+            auto* tokenSmemBuffer = eltLoadSmemBuffer + tokenIdx * eltCountCurrentMove;
+            auto const tokenKVPosition = tokenStartIdx + tokenPos;
+            auto* kPtr = reinterpret_cast<MoveEltType*>(kvCacheBuffer.getKBlockPtr(seqSlot, tokenKVPosition));
+            for (SizeType32 loadChannelIdx = laneIdx; loadChannelIdx < eltCountCurrentMove; loadChannelIdx += 32)
+            {
+                auto const channelIdx = loadChannelIdx + startChannelOffset;
+                auto const kvLocationIdx
+                    = kvCacheBuffer.getKVLocalIdx(tokenKVPosition, headIdx, eltCountPerHead, channelIdx);
+                kPtr[kvLocationIdx] = tokenSmemBuffer[loadChannelIdx];
+            }
+        }
+        __syncthreads();
+        for (SizeType32 tokenIdx = warpIdx; tokenIdx < seqDraftCount; tokenIdx += warpCount)
+        {
+            auto const tokenPos = max(acceptedDraftTokensIndices2D[seqRow + tokenIdx], 0);
+            auto* tokenSmemBuffer = eltLoadSmemBuffer + tokenIdx * eltCountCurrentMove;
+            auto const tokenKVPosition = tokenStartIdx + tokenPos;
+            auto* vPtr = reinterpret_cast<MoveEltType*>(kvCacheBuffer.getVBlockPtr(seqSlot, tokenKVPosition));
+            for (SizeType32 loadChannelIdx = laneIdx; loadChannelIdx < eltCountCurrentMove; loadChannelIdx += 32)
+            {
+                auto const channelIdx = loadChannelIdx + startChannelOffset;
+                auto const kvLocationIdx
+                    = kvCacheBuffer.getKVLocalIdx(tokenKVPosition, headIdx, eltCountPerHead, channelIdx);
+                tokenSmemBuffer[loadChannelIdx] = vPtr[kvLocationIdx];
+            }
+        }
+        __syncthreads();
+        for (SizeType32 tokenIdx = warpIdx; tokenIdx < seqDraftCount; tokenIdx += warpCount)
+        {
+            auto const tokenPos = tokenIdx;
+            auto* tokenSmemBuffer = eltLoadSmemBuffer + tokenPos * eltCountCurrentMove;
+            auto const tokenKVPosition = tokenStartIdx + tokenPos;
+            auto* vPtr = reinterpret_cast<MoveEltType*>(kvCacheBuffer.getVBlockPtr(seqSlot, tokenKVPosition));
+            for (SizeType32 loadChannelIdx = laneIdx; loadChannelIdx < eltCountCurrentMove; loadChannelIdx += 32)
+            {
+                auto const channelIdx = loadChannelIdx + startChannelOffset;
+                auto const kvLocationIdx
+                    = kvCacheBuffer.getKVLocalIdx(tokenKVPosition, headIdx, eltCountPerHead, channelIdx);
+                vPtr[kvLocationIdx] = tokenSmemBuffer[loadChannelIdx];
+            }
+        }
+        __syncthreads();
+    }
+}
 } // namespace
+
+template <typename KVCacheBuffer, SizeType32 MaxLayerCount>
+void updateKVCacheDraftTokenLocationBatched2D(KVCacheBuffer const* kvCacheBuffers,
+    IndexType const* acceptedDraftTokensIndices2D, SizeType32 const* numAcceptedTokens, SizeType32 maxDraftLen,
+    SizeType32 const* pastKeyValueLengths, SizeType32 layerCount, SizeType32 seqCount, SizeType32 numKVHeads,
+    SizeType32 sizeInBytesPerKVHead, SizeType32 rewindDraftTokenCommonCount,
+    SizeType32 const* rewindDraftTokenSeparateAdjustments, SizeType32 const* seqSlotRemapping,
+    SizeType32 const* batchSlots, cudaStream_t stream)
+{
+    static_assert(MaxLayerCount * sizeof(KVCacheBuffer) <= 3072);
+    if (seqCount == 0 || layerCount == 0)
+    {
+        return;
+    }
+    SizeType32 alignedBytes = 16;
+    while (alignedBytes > 0 && (sizeInBytesPerKVHead % alignedBytes != 0))
+    {
+        alignedBytes >>= 1;
+    }
+    TLLM_CHECK_WITH_INFO(alignedBytes > 0, "alignedByte should be positive");
+    SizeType32 eltCountPerHead = sizeInBytesPerKVHead / alignedBytes;
+    dim3 grid(seqCount, numKVHeads, layerCount);
+    dim3 block(128, 1, 1);
+    std::array<KVCacheBuffer, MaxLayerCount> kvCacheBufferArray;
+    for (SizeType32 i = 0; i < layerCount; i++)
+    {
+        kvCacheBufferArray[i] = kvCacheBuffers[i];
+    }
+    void (*pKernelFunc)(std::array<KVCacheBuffer, MaxLayerCount>, IndexType const*, SizeType32 const*, SizeType32,
+        SizeType32 const*, SizeType32, SizeType32 const*, SizeType32 const*, SizeType32 const*, SizeType32)
+        = nullptr;
+    switch (alignedBytes)
+    {
+    case 16: pKernelFunc = &updateKVCacheDraftTokenLocationBatchedKernel2D<KVCacheBuffer, MaxLayerCount, int4>; break;
+    case 8: pKernelFunc = &updateKVCacheDraftTokenLocationBatchedKernel2D<KVCacheBuffer, MaxLayerCount, int64_t>; break;
+    case 4:
+        pKernelFunc = &updateKVCacheDraftTokenLocationBatchedKernel2D<KVCacheBuffer, MaxLayerCount, SizeType32>;
+        break;
+    case 2: pKernelFunc = &updateKVCacheDraftTokenLocationBatchedKernel2D<KVCacheBuffer, MaxLayerCount, int16_t>; break;
+    default:
+        TLLM_CHECK_WITH_INFO(alignedBytes == 1, "Strange alignedBytes");
+        pKernelFunc = &updateKVCacheDraftTokenLocationBatchedKernel2D<KVCacheBuffer, MaxLayerCount, int8_t>;
+        break;
+    }
+    pKernelFunc<<<grid, block, 0, stream>>>(kvCacheBufferArray, acceptedDraftTokensIndices2D, numAcceptedTokens,
+        maxDraftLen, pastKeyValueLengths, rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments,
+        seqSlotRemapping, batchSlots, eltCountPerHead);
+    sync_check_cuda_error(stream);
+}
 
 template <typename KVCacheBuffer, SizeType32 MaxLayerCount>
 void updateKVCacheDraftTokenLocationBatched(KVCacheBuffer const* kvCacheBuffers,
@@ -239,6 +395,55 @@ void updateKVCacheDraftTokenLocation(KVCacheBuffer const* kvCacheBuffers,
             rewindDraftTokenSeparateAdjustments, seqSlotRemapping, batchSlots, stream);
         startLayer += microBatchLayerCount;
     }
+}
+
+template <typename KVCacheBuffer>
+void updateKVCacheDraftTokenLocation2D(KVCacheBuffer const* kvCacheBuffers,
+    IndexType const* acceptedDraftTokensIndices2D, SizeType32 const* numAcceptedTokens, SizeType32 maxDraftLen,
+    SizeType32 const* pastKeyValueLengths, SizeType32 layerCount, SizeType32 seqCount, SizeType32 numKVHeads,
+    SizeType32 sizeInBytesPerKVHead, SizeType32 rewindDraftTokenCommonCount,
+    SizeType32 const* rewindDraftTokenSeparateAdjustments, SizeType32 const* seqSlotRemapping,
+    SizeType32 const* batchSlots, cudaStream_t stream)
+{
+    SizeType32 startLayer = 0;
+    static constexpr SizeType32 kMaxLayersPerIter = 32;
+    while (startLayer < layerCount)
+    {
+        SizeType32 microBatchLayerCount = std::min(layerCount - startLayer, kMaxLayersPerIter);
+        updateKVCacheDraftTokenLocationBatched2D<KVCacheBuffer, kMaxLayersPerIter>(kvCacheBuffers + startLayer,
+            acceptedDraftTokensIndices2D, numAcceptedTokens, maxDraftLen, pastKeyValueLengths, microBatchLayerCount,
+            seqCount, numKVHeads, sizeInBytesPerKVHead, rewindDraftTokenCommonCount,
+            rewindDraftTokenSeparateAdjustments, seqSlotRemapping, batchSlots, stream);
+        startLayer += microBatchLayerCount;
+    }
+}
+
+void updateKVBlockArrayDraftTokenLocation2D(IndexType const* acceptedDraftTokensIndices2D,
+    SizeType32 const* numAcceptedTokens, SizeType32 maxDraftLen, SizeType32 const* pastKeyValueLengths,
+    void* const* pointerArray, KVBlockArray::DataType* offsetArray, SizeType32 layerCount, SizeType32 seqCount,
+    SizeType32 numKVHeads, SizeType32 sizeInBytesPerKVHead, SizeType32 rewindDraftTokenCommonCount,
+    SizeType32 const* rewindDraftTokenSeparateAdjustments, SizeType32 const* seqSlotRemapping,
+    SizeType32 const* batchSlots, SizeType32 maxKVCacheLen, SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock,
+    bool canUseOneMoreBlock, cudaStream_t stream)
+{
+    std::vector<KVBlockArray> kvBlockArrays;
+    kvBlockArrays.reserve(layerCount);
+    auto const bytesPerToken = numKVHeads * sizeInBytesPerKVHead;
+    auto const bytesPerBlock = tokensPerBlock * bytesPerToken;
+    for (SizeType32 layerIdx = 0; layerIdx < layerCount; layerIdx++)
+    {
+        auto const layerOffset = layerIdx * 2 * bytesPerBlock;
+        auto* const primaryPoolPointer
+            = reinterpret_cast<void*>(reinterpret_cast<char*>(pointerArray[0]) + layerOffset);
+        auto* const secondaryPoolPointer
+            = reinterpret_cast<void*>(reinterpret_cast<char*>(pointerArray[1]) + layerOffset);
+
+        kvBlockArrays.emplace_back(seqCount, maxBlocksPerSeq, tokensPerBlock, bytesPerToken, maxKVCacheLen,
+            maxKVCacheLen, 0, canUseOneMoreBlock, primaryPoolPointer, secondaryPoolPointer, offsetArray);
+    }
+    updateKVCacheDraftTokenLocation2D(kvBlockArrays.data(), acceptedDraftTokensIndices2D, numAcceptedTokens,
+        maxDraftLen, pastKeyValueLengths, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,
+        rewindDraftTokenCommonCount, rewindDraftTokenSeparateAdjustments, seqSlotRemapping, batchSlots, stream);
 }
 
 void updateLinearKVCacheDraftTokenLocation(SizeType32 const* seqAcceptedDraftTokenOffsets,

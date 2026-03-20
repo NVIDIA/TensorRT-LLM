@@ -17,6 +17,10 @@
 from typing import TYPE_CHECKING, override
 
 import torch
+import triton
+import triton.language as tl
+
+from tensorrt_llm._utils import nvtx_range
 
 from ..attention_backend import AttentionMetadata
 from .eagle3 import Eagle3OneModelWorker
@@ -24,6 +28,70 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
+
+
+@triton.jit
+def _gather_repack_step0_kernel(
+    hidden_states_ptr,
+    accept_token_ptr,
+    position_ids_ptr,
+    accepted_indices_ptr,
+    num_accepted_ptr,
+    out_hs_ptr,
+    out_ids_ptr,
+    out_pos_ptr,
+    out_gather_ids_ptr,
+    num_ctx_tokens,
+    num_contexts,
+    tokens_per_gen_step,
+    max_path_len,
+    max_draft_len,
+    hidden_dim,
+    BLOCK_H: tl.constexpr,
+):
+    """Fused gather+repack for generation requests in step 0.
+
+    Each program handles one (gen_request, path_position) pair:
+    - Gathers hidden_states from tree-topology to contiguous layout
+    - Copies input_id from accept_token
+    - Computes position_id from base_position + path_offset
+    - Computes gather_id for the last accepted position
+    """
+    pid = tl.program_id(0)
+    gen_idx = pid // max_path_len
+    path_idx = pid % max_path_len
+
+    # Source position in tree-topology layout
+    gen_start = num_ctx_tokens + gen_idx * tokens_per_gen_step
+    # tl.where evaluates both branches, so clamp index to avoid OOB when path_idx==0
+    safe_idx = tl.maximum(path_idx - 1, 0)
+    raw_val = tl.load(accepted_indices_ptr + gen_idx * max_draft_len + safe_idx)
+    tree_pos = tl.where(path_idx == 0, 0, raw_val.to(tl.int64) + 1)
+    src_row = gen_start + tree_pos
+
+    # Destination position in output buffers
+    dst_row = num_ctx_tokens + gen_idx * max_path_len + path_idx
+
+    # 1) Gather hidden_states: src[src_row, :] → out[dst_row, :]
+    for h in range(0, hidden_dim, BLOCK_H):
+        offsets = h + tl.arange(0, BLOCK_H)
+        mask = offsets < hidden_dim
+        vals = tl.load(hidden_states_ptr + src_row * hidden_dim + offsets, mask=mask)
+        tl.store(out_hs_ptr + dst_row * hidden_dim + offsets, vals, mask=mask)
+
+    # 2) Copy input_id
+    token = tl.load(accept_token_ptr + gen_idx * max_path_len + path_idx)
+    tl.store(out_ids_ptr + dst_row, token)
+
+    # 3) Compute position_id: base_pos + path_idx
+    base_pos = tl.load(position_ids_ptr + gen_start)
+    tl.store(out_pos_ptr + dst_row, base_pos + path_idx)
+
+    # 4) Compute gather_id (only for last accepted token of each gen request)
+    n_acc = tl.load(num_accepted_ptr + num_contexts + gen_idx).to(tl.int64)
+    if path_idx == 0:
+        gather_id = num_ctx_tokens + gen_idx * max_path_len + n_acc - 1
+        tl.store(out_gather_ids_ptr + num_contexts + gen_idx, gather_id)
 
 
 class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
@@ -89,20 +157,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             (max_batch_size, max_draft_len), -1, dtype=torch.int32, device="cuda"
         )
 
-        # Initialized by _sample_and_accept_dynamic_tree; None during warmup.
-        self._accept_token = None
-        self._last_num_accepted = None
-        self._last_selected_parents = None
-        self._kv_head_bytes = None  # Lazily set on first _relocate_kv_eagerly call
-
-        # Pre-allocated buffers for _relocate_kv_eagerly (avoid per-call allocations)
-        self._reloc_n_acc_draft = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
-        self._reloc_offsets = torch.zeros(max_batch_size + 1, dtype=torch.int32, device="cuda")
-        self._reloc_col_idx = torch.arange(max_draft_len, device="cuda")
-        self._reloc_valid_mask = torch.zeros(
-            max_batch_size, max_draft_len, dtype=torch.bool, device="cuda"
+        self._accept_token = torch.zeros(
+            max_batch_size, max_draft_len + 1, dtype=torch.int64, device="cuda"
         )
-        self._reloc_rewind_adj = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
+        self._last_num_accepted = torch.ones(max_batch_size, dtype=torch.int32, device="cuda")
+        self._last_selected_parents = None
+        self._cache_mgr = None
+        self._kv_head_dim_bytes = None
+        self._kv_correction = self.tokens_per_gen_step - (max_draft_len + 1)
 
         # Hidden state management buffers (lazily initialized in update_hidden_states)
         self._hs_write_buffer = None
@@ -115,19 +177,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Step 0 buffers
         max_step0_tokens = max_draft_len + 1
-        self._step0_hs_buf = None
         self._step0_causal_mask = torch.tensor(
             [(1 << (t + 1)) - 1 for t in range(max_step0_tokens)],
             dtype=torch.int64,
             device="cuda",
         )
         self._arange_max_batch = torch.arange(max_batch_size, device="cuda")
-        self._arange_max_path = torch.arange(max_step0_tokens, device="cuda")
         self._causal_offs = torch.arange(max_step0_tokens, device="cuda", dtype=torch.int32)
-        self._step0_path_pos_buf = torch.zeros(
-            max_batch_size, max_step0_tokens, dtype=torch.long, device="cuda"
-        )
-        self._step0_gather_ids = torch.empty(0, dtype=torch.long, device="cuda")
         self._parent_init_arange = torch.arange(-1, K, device="cuda", dtype=torch.int32)
 
         # Verification buffers
@@ -166,19 +222,40 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size, max_total_draft_tokens, dtype=torch.int32, device="cuda"
         )
 
+    @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
-        """Lazily initialize spec_tree_manager from resource_manager."""
-        if self.spec_tree_manager is None and resource_manager is not None:
-            from ..pyexecutor.resource_manager import ResourceManagerType
+        """Lazily initialize spec_tree_manager, cache_mgr, and kv constants."""
+        if self.spec_tree_manager is not None:
+            return
+        from ..pyexecutor.resource_manager import ResourceManagerType
 
-            spec_rm = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER
-            )
-            if spec_rm is not None and hasattr(spec_rm, "spec_tree_manager"):
-                self.spec_tree_manager = spec_rm.spec_tree_manager
+        spec_rm = resource_manager.get_resource_manager(ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        assert spec_rm is not None and hasattr(spec_rm, "spec_tree_manager"), (
+            "Dynamic tree mode requires spec_tree_manager in resource_manager"
+        )
+        self.spec_tree_manager = spec_rm.spec_tree_manager
+
+        self._cache_mgr = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+
+        from tensorrt_llm.bindings import DataType
+
+        _dtype_bytes = {
+            DataType.HALF: 2,
+            DataType.BF16: 2,
+            DataType.FLOAT: 4,
+            DataType.FP8: 1,
+            DataType.INT8: 1,
+            DataType.NVFP4: 0.5,
+        }
+        self._kv_head_dim_bytes = int(
+            self._cache_mgr.head_dim * _dtype_bytes.get(self._cache_mgr.dtype, 0.5)
+        )
 
     # ---- Overridden dispatch methods ----
 
+    @nvtx_range("eagle3_dyn.forward")
     @override
     def forward(
         self,
@@ -192,6 +269,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         resource_manager=None,
     ):
         """Override to add accepted_draft_tokens_indices to output."""
+        # Initialize cache_mgr before super().forward() which calls
+        # sample_and_accept_draft_tokens → _relocate_kv_eagerly needing _cache_mgr.
+        if resource_manager is not None:
+            self._ensure_spec_tree_manager(resource_manager)
         output = super().forward(
             input_ids,
             position_ids,
@@ -207,70 +288,28 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         return output
 
+    @nvtx_range("eagle3_dyn._relocate_kv_eagerly")
     def _relocate_kv_eagerly(self, attn_metadata, batch_size):
-        """Move accepted draft tokens' KV from tree to linear positions."""
-        cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
-        if self._last_num_accepted is None or cache_mgr is None:
+        """Move accepted draft tokens' KV from tree to linear positions.
+
+        Called from model_engine.py after CUDA graph replay (outside the graph)
+        so that KVBlockArray pointers are live, not frozen graph captures.
+        The kernel internally computes draft count as max(num_accepted - 1, 0).
+        Context requests naturally have num_accepted=1 → 0 draft tokens.
+        """
+        cache_mgr = self._cache_mgr
+        if cache_mgr is None:
             return
-
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
-
-        if num_gens <= 0:
-            return
-
-        # Accepted DRAFT tokens per request (exclude root), using pre-allocated buffer
-        n_acc_draft = self._reloc_n_acc_draft[:batch_size]
-        n_acc_draft.copy_(self._last_num_accepted[:batch_size])
-        n_acc_draft.sub_(1).clamp_(min=0)
-        n_acc_draft[:num_contexts].zero_()
-
-        # Build packed offsets using pre-allocated buffer
-        offsets = self._reloc_offsets[: batch_size + 1]
-        offsets[0] = 0
-        torch.cumsum(n_acc_draft, dim=0, out=offsets[1:])
-
-        indices_2d = self._accepted_draft_indices_tensor[:batch_size]
-        max_draft = indices_2d.shape[1]
-        col_idx = self._reloc_col_idx[:max_draft]
-        valid_mask = self._reloc_valid_mask[:batch_size, :max_draft]
-        torch.less(col_idx.unsqueeze(0), n_acc_draft.unsqueeze(1), out=valid_mask)
-        packed = indices_2d[valid_mask]
-
-        if packed.numel() == 0:
-            return
-
-        past_kv_lens = attn_metadata.kv_lens_cuda[:batch_size]
-
-        if self._kv_head_bytes is None:
-            from tensorrt_llm.bindings import DataType
-
-            dtype = cache_mgr.dtype
-            head_dim = cache_mgr.head_dim
-            if dtype in (DataType.HALF, DataType.BF16):
-                self._kv_head_bytes = head_dim * 2
-            elif dtype == DataType.FLOAT:
-                self._kv_head_bytes = head_dim * 4
-            elif dtype in (DataType.FP8, DataType.INT8):
-                self._kv_head_bytes = head_dim
-            else:
-                self._kv_head_bytes = head_dim // 2  # INT4
-
-        rewind_adj = self._reloc_rewind_adj[:batch_size]
-        rewind_adj.zero_()
-
-        torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
-            offsets,
-            packed,
-            past_kv_lens,
-            True,  # use_paged_kv_cache
+        torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
+            self._accepted_draft_indices_tensor[:batch_size],
+            self._last_num_accepted[:batch_size],
+            attn_metadata.kv_lens_cuda[:batch_size],
+            True,
             cache_mgr.num_layers,
             cache_mgr.num_kv_heads,
-            self._kv_head_bytes,
+            self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
             cache_mgr.max_attention_window_vec[0],
-            rewind_adj,
-            None,
             cache_mgr.kv_cache_pool_pointers,
             attn_metadata.kv_cache_block_offsets,
             cache_mgr.max_blocks_per_seq,
@@ -278,6 +317,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             None,
         )
 
+    @nvtx_range("eagle3_dyn.sample_and_accept_draft_tokens")
     @override
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
         """Override to handle dynamic tree verification."""
@@ -289,6 +329,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
         )
 
+    @nvtx_range("eagle3_dyn.prepare_1st_drafter_inputs")
     @override
     def prepare_1st_drafter_inputs(
         self,
@@ -302,6 +343,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     ):
         """Re-pack gen inputs from tree-topology to uniform-padded layout
         (max_draft_len + 1 tokens per gen request) for the shared KV cache.
+        Uses a fused Triton kernel for gen requests to minimize kernel launches.
         """
         num_contexts = attn_metadata.num_contexts
         num_gens = attn_metadata.num_seqs - num_contexts
@@ -323,49 +365,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         if num_gens > 0:
             max_path_len = self.max_draft_len + 1
-
-            # CUDA graph warmup: verification hasn't run yet
-            if self._last_num_accepted is None:
-                self._last_num_accepted = torch.ones(
-                    self._max_batch_size, dtype=torch.int32, device="cuda"
-                )
-            if self._accept_token is None:
-                self._accept_token = torch.zeros(
-                    self._max_batch_size, max_path_len, dtype=torch.int64, device="cuda"
-                )
-
-            n_acc_all = self._last_num_accepted[num_contexts:batch_size]
-
-            input_ids_gen = self._accept_token[:num_gens].flatten().to(input_ids.dtype)
-            gen_starts = (
-                num_ctx_tokens + self._arange_max_batch[:num_gens] * self.tokens_per_gen_step
-            )
-            base_positions = position_ids[gen_starts]
-            arange_path = self._arange_max_path[:max_path_len]
-            pos_gen = (base_positions.unsqueeze(1) + arange_path.unsqueeze(0)).reshape(-1)
-
-            hs_gen_buf = self._gather_accepted_hidden_states(
-                hidden_states, gen_starts, num_gens, num_contexts, batch_size, max_path_len
-            )
-
-            attn_metadata._seq_lens[num_contexts:batch_size].fill_(max_path_len)
-            attn_metadata._seq_lens_cuda[num_contexts:batch_size].fill_(max_path_len)
-            attn_metadata.on_update()
-
-            self._step0_gather_ids = (
-                num_ctx_tokens + self._arange_max_batch[:num_gens] * max_path_len + n_acc_all - 1
-            ).long()
-
             num_gen_tokens = num_gens * max_path_len
             total_len = num_ctx_tokens + num_gen_tokens
-
-            self._step0_input_ids_buf[:num_ctx_tokens].copy_(input_ids_ctx)
-            self._step0_input_ids_buf[num_ctx_tokens:total_len].copy_(input_ids_gen)
-            input_ids = self._step0_input_ids_buf[:total_len]
-
-            self._step0_position_ids_buf[:num_ctx_tokens].copy_(position_ids[:num_ctx_tokens])
-            self._step0_position_ids_buf[num_ctx_tokens:total_len].copy_(pos_gen)
-            position_ids = self._step0_position_ids_buf[:total_len]
 
             hidden_dim = hidden_states.shape[-1]
             if (
@@ -378,13 +379,43 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     dtype=hidden_states.dtype,
                     device="cuda",
                 )
+
+            # Context tokens: copy directly
+            self._step0_input_ids_buf[:num_ctx_tokens].copy_(input_ids_ctx)
+            self._step0_position_ids_buf[:num_ctx_tokens].copy_(position_ids[:num_ctx_tokens])
             self._step0_hidden_states_buf[:num_ctx_tokens].copy_(hidden_states[:num_ctx_tokens])
-            self._step0_hidden_states_buf[num_ctx_tokens:total_len].copy_(hs_gen_buf)
+
+            # Gen tokens: fused Triton kernel
+            BLOCK_H = triton.next_power_of_2(hidden_dim)
+            _gather_repack_step0_kernel[(num_gens * max_path_len,)](
+                hidden_states,
+                self._accept_token[:num_gens],
+                position_ids,
+                self._accepted_draft_indices_tensor[num_contexts:batch_size],
+                self._last_num_accepted,
+                self._step0_hidden_states_buf,
+                self._step0_input_ids_buf,
+                self._step0_position_ids_buf,
+                self._gather_ids_buf,
+                num_ctx_tokens,
+                num_contexts,
+                self.tokens_per_gen_step,
+                max_path_len,
+                self.max_draft_len,
+                hidden_dim,
+                BLOCK_H=BLOCK_H,
+            )
+
+            input_ids = self._step0_input_ids_buf[:total_len]
+            position_ids = self._step0_position_ids_buf[:total_len]
             hidden_states = self._step0_hidden_states_buf[:total_len]
+
+            attn_metadata._seq_lens[num_contexts:batch_size].fill_(max_path_len)
+            attn_metadata._seq_lens_cuda[num_contexts:batch_size].fill_(max_path_len)
+            attn_metadata.on_update()
         else:
             # Context-only (warmup). No gen tokens.
             input_ids = input_ids_ctx
-            self._step0_gather_ids = self._gather_ids_buf[:0]
 
         return {
             "input_ids": input_ids,
@@ -393,39 +424,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
-
-    def _gather_accepted_hidden_states(
-        self,
-        hidden_states: torch.Tensor,
-        gen_starts: torch.Tensor,
-        num_gens: int,
-        num_contexts: int,
-        batch_size: int,
-        max_path_len: int,
-    ) -> torch.Tensor:
-        """Gather hidden states from tree-topology to contiguous accepted-path order."""
-        hidden_dim = hidden_states.shape[-1]
-        if self._step0_hs_buf is None or self._step0_hs_buf.shape[1] != hidden_dim:
-            max_buf = self._arange_max_batch.shape[0] * max_path_len
-            self._step0_hs_buf = torch.zeros(
-                max_buf, hidden_dim, dtype=hidden_states.dtype, device="cuda"
-            )
-        hs_gen_buf = self._step0_hs_buf[: num_gens * max_path_len]
-
-        # path_pos_2d[i, j]: tree position of j-th accepted token for gen request i
-        path_pos_2d = self._step0_path_pos_buf[:num_gens, :max_path_len]
-        path_pos_2d[:, 0] = 0  # root position is always 0
-        if max_path_len > 1:
-            path_pos_2d[:, 1:] = (
-                self._accepted_draft_indices_tensor[
-                    num_contexts:batch_size, : max_path_len - 1
-                ].long()
-                + 1
-            )
-
-        src_flat = (gen_starts.unsqueeze(1) + path_pos_2d).reshape(-1)
-        hs_gen_buf[:] = hidden_states[src_flat]
-        return hs_gen_buf
 
     # ---- Dynamic tree draft loop ----
 
@@ -456,12 +454,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # === Step 0: Initial forward ===
         num_step0_tokens = self.max_draft_len + 1
 
-        step0_gather_len = self._step0_gather_ids.shape[0]
-        total_gather = num_contexts + step0_gather_len
+        # Triton kernel already wrote gen gather_ids into _gather_ids_buf;
+        # just prepend context gather_ids.
         self._gather_ids_buf[:num_contexts].copy_(spec_metadata.gather_ids[:num_contexts])
-        if step0_gather_len > 0:
-            self._gather_ids_buf[num_contexts:total_gather].copy_(self._step0_gather_ids)
-        gather_ids = self._gather_ids_buf[:total_gather]
+        gather_ids = self._gather_ids_buf[:batch_size]
 
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
@@ -490,9 +486,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # KV correction: target processed tokens_per_gen_step per request,
         # but step 0 should only attend to max_draft_len + 1 accepted-path tokens.
         if num_gens > 0 and hasattr(attn_metadata, "kv_lens_cuda"):
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self.tokens_per_gen_step - (
-                self.max_draft_len + 1
-            )
+            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
@@ -700,6 +694,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         return accepted_tokens, num_accepted_tokens
 
+    @nvtx_range("eagle3_dyn.sample")
     def sample(
         self, logits: torch.Tensor, max_top_k: int, draft_model=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
