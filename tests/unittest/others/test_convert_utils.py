@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
 
 NVBug: https://nvbugs/5866619
 """
+
 import tempfile
 import unittest
 import unittest.mock
@@ -59,8 +60,8 @@ class TestLoadStateDict(unittest.TestCase):
         }
 
         peft_error = ValueError(
-            "could not determine the shape of object type "
-            "'torch.storage.UntypedStorage'")
+            "could not determine the shape of object type 'torch.storage.UntypedStorage'"
+        )
 
         # Build a mock context manager that:
         #   - succeeds on safe_open() call (returns a context manager)
@@ -90,17 +91,22 @@ class TestLoadStateDict(unittest.TestCase):
 
         # The fallback must deliver the same keys and shapes, with dtype cast
         self.assertEqual(
-            set(result.keys()), set(expected.keys()),
-            "Fallback path must return the same keys as the saved file")
+            set(result.keys()),
+            set(expected.keys()),
+            "Fallback path must return the same keys as the saved file",
+        )
         for key in expected:
-            self.assertIn(key, result,
-                          f"Key {key!r} missing after fallback load")
+            self.assertIn(key, result, f"Key {key!r} missing after fallback load")
             self.assertEqual(
-                result[key].shape, expected[key].shape,
-                f"Shape mismatch after fallback for key {key!r}")
+                result[key].shape,
+                expected[key].shape,
+                f"Shape mismatch after fallback for key {key!r}",
+            )
             self.assertEqual(
-                result[key].dtype, torch.float16,
-                f"dtype cast not applied in fallback path for key {key!r}")
+                result[key].dtype,
+                torch.float16,
+                f"dtype cast not applied in fallback path for key {key!r}",
+            )
 
 
 if __name__ == "__main__":
