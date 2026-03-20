@@ -235,6 +235,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
         self.spec_tree_manager = spec_rm.spec_tree_manager
 
+        # NOTE: _cache_mgr is ONLY used for computing _kv_head_dim_bytes at init.
+        # _relocate_kv_eagerly must use attn_metadata.kv_cache_manager instead,
+        # because resource_manager's KV_CACHE_MANAGER may differ from the target
+        # model's KV cache in one-model spec decoding configurations.
         self._cache_mgr = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
@@ -294,10 +298,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         Called from model_engine.py after CUDA graph replay (outside the graph)
         so that KVBlockArray pointers are live, not frozen graph captures.
-        The kernel internally computes draft count as max(num_accepted - 1, 0).
-        Context requests naturally have num_accepted=1 → 0 draft tokens.
+        Uses attn_metadata.kv_cache_manager (the target model's live KV cache)
+        rather than self._cache_mgr (the resource_manager's KV cache manager,
+        which may differ in one-model spec decoding configurations).
         """
-        cache_mgr = self._cache_mgr
+        cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
         if cache_mgr is None:
             return
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
