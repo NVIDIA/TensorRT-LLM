@@ -30,23 +30,35 @@ Full documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html
 |---|---|
 | [`llm-api/`](llm-api/) | Python LLM API examples (offline inference, quantization, speculative decoding) |
 | [`apps/`](apps/) | Application examples (chat, FastAPI server) |
-| [`configs/`](configs/) | Pre-tuned serving configurations for popular models |
+| [`configs/`](configs/) | Pre-tuned serving configurations — [curated](configs/curated/) quick-starts and a [comprehensive database](configs/database/) |
+| [`auto_deploy/`](auto_deploy/) | AutoDeploy (beta) development examples, cookbooks, and model registry |
 | [`serve/`](serve/) | `trtllm-serve` deployment guides and examples |
 | [`quantization/`](quantization/) | Quantization workflows with NVIDIA Model Optimizer |
 
 ## Pre-Tuned Model Configurations
 
-The [`configs/database/`](configs/database/) directory contains optimized serving
-configurations for popular models across different GPUs and concurrency levels.
-These are validated Pareto-optimal configurations from benchmark data.
-
-Use them with `trtllm-serve`:
+The [`configs/`](configs/) directory contains recommended `trtllm-serve` configurations.
+Start with the hand-picked [curated configs](configs/curated/) or browse the full
+[database](configs/database/) for specific GPU / ISL / OSL / concurrency combinations.
 
 ```bash
-trtllm-serve "deepseek-ai/DeepSeek-R1-0528" --config configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc64.yaml
+trtllm-serve "deepseek-ai/DeepSeek-R1-0528" \
+  --config configs/curated/deepseek-r1-throughput.yaml
 ```
 
-See [`configs/database/lookup.yaml`](configs/database/lookup.yaml) for the full catalog.
+For model-specific walkthroughs and an interactive recipe selector, see the
+[Model Recipes](https://nvidia.github.io/TensorRT-LLM/deployment-guide/index.html)
+deployment guide.
+
+## AutoDeploy (Beta)
+
+The [AutoDeploy](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html)
+backend automatically translates HuggingFace models into optimized inference graphs.
+It is accessed through the same `trtllm-serve`, `trtllm-bench`, and LLM API entry
+points as the default PyTorch backend.
+
+See [`auto_deploy/`](auto_deploy/) for development examples, Jupyter cookbooks,
+and a registry of 90+ validated models.
 
 ## Legacy Engine-Build Workflow
 
