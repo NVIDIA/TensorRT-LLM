@@ -33,9 +33,9 @@ def _cu_seqlens_triton_kernel(
     cu_seqlens_ptr,  # [num_seqs + 1]
     chunk_indices_ptr,  # [N] output
     chunk_offsets_ptr,  # [N] output
-    num_seqs: tl.constexpr,
+    num_seqs,
     chunk_size: tl.constexpr,
-    N: tl.constexpr,
+    N,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Computes chunk_indices and chunk_offsets in a single kernel launch."""
@@ -67,8 +67,18 @@ def _cu_seqlens_triton_kernel(
 
 def cu_seqlens_to_chunk_indices_offsets_triton(
         cu_seqlens: torch.Tensor,
-        chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized version of cu_seqlens_to_chunk_indices_offsets."""
+        chunk_size: int,
+        total_seqlens: int = -1,
+        extra_chunks: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimized version of cu_seqlens_to_chunk_indices_offsets.
+
+    Args:
+        total_seqlens: If provided (>= 0), avoids a GPU->CPU sync to read
+            cu_seqlens[-1].  Callers that already know the total number of
+            context tokens should pass it here.
+        extra_chunks: If provided (>= 0), avoids a GPU->CPU sync to compute
+            the number of extra chunks from misaligned sequence boundaries.
+    """
     device = cu_seqlens.device
     num_seqs = cu_seqlens.numel() - 1
 
@@ -77,7 +87,8 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
                 torch.empty(0, dtype=torch.int, device=device))
 
     cu = cu_seqlens.to(dtype=torch.int64)
-    total_seqlens = cu[-1].item()
+    if total_seqlens < 0:
+        total_seqlens = cu[-1].item()
 
     if num_seqs == 1:
         # Fast path for single sequence (no boundaries to process)
@@ -85,10 +96,11 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
         return (torch.arange(N, device=device, dtype=torch.int),
                 torch.zeros(N, device=device, dtype=torch.int))
 
-    seq_starts = cu[1:-1]
-    misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
-    p = torch.cumsum(misaligned, dim=0)
-    extra_chunks = p[-1].item() if p.numel() > 0 else 0
+    if extra_chunks < 0:
+        seq_starts = cu[1:-1]
+        misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
+        p = torch.cumsum(misaligned, dim=0)
+        extra_chunks = p[-1].item() if p.numel() > 0 else 0
     N = (total_seqlens + chunk_size - 1) // chunk_size + extra_chunks
     chunk_indices = torch.empty(N, device=device, dtype=torch.int)
     chunk_offsets = torch.empty(N, device=device, dtype=torch.int)
@@ -282,8 +294,21 @@ class Mamba2Metadata:
                 self.has_initial_states_cpu[:num_contexts].any())
 
             if self.use_initial_states:
+                # Compute extra_chunks using pure Python arithmetic on CPU
+                # seq_lens to avoid any GPU->CPU sync point.
+                _cs = self.chunk_size
+                _cumsum = 0
+                _extra = 0
+                for i in range(num_contexts - 1):
+                    _cumsum += int(attn_metadata.seq_lens[i])
+                    if _cumsum % _cs != 0:
+                        _extra += 1
+
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
-                    self.cu_seqlens[:num_contexts + 1], self.chunk_size)
+                    self.cu_seqlens[:num_contexts + 1],
+                    self.chunk_size,
+                    total_seqlens=num_ctx_tokens,
+                    extra_chunks=_extra)
             else:
                 self.chunk_indices = None
                 self.chunk_offsets = None
