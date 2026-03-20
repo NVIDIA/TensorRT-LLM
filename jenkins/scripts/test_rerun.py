@@ -51,7 +51,9 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
     return ran_tests
 
 
-def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
+def generate_rerun_tests_list(outdir,
+                              xml_filename,
+                              failSignaturesList,
                               test_list_filename=None,
                               unfinished_test_filename=None):
     # Generate rerun test lists:
