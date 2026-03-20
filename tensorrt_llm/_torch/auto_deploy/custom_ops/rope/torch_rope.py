@@ -84,6 +84,33 @@ def torch_apply_rope_with_complex_freqs_fake(
     return torch.empty_like(xq), torch.empty_like(xk)
 
 
+@torch.library.custom_op("auto_deploy::triton_rope_with_complex_freqs", mutates_args=())
+def triton_apply_rope_with_complex_freqs(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    unsqueeze_dim: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton-accelerated complex-multiplication RoPE.
+
+    Dispatches to the Triton kernel in triton_rope_with_complex_freqs.py.
+    Same interface as torch_rope_with_complex_freqs.
+    """
+    from .triton_rope_with_complex_freqs import rope_with_complex_freqs
+
+    return rope_with_complex_freqs(xq, xk, freqs_cis, unsqueeze_dim)
+
+
+@triton_apply_rope_with_complex_freqs.register_fake
+def triton_apply_rope_with_complex_freqs_fake(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    unsqueeze_dim: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(xq), torch.empty_like(xk)
+
+
 @torch.library.custom_op("auto_deploy::torch_rope_with_qk_interleaving", mutates_args=())
 def torch_apply_rope_with_qk_interleaving(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
