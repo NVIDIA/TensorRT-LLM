@@ -40,12 +40,12 @@ from torch import Tensor
 def _fused_glu_activation_kernel(
     gate_up_ptr,
     output_ptr,
-    stride_gate_up_row: tl.constexpr,
-    stride_out_row: tl.constexpr,
+    stride_gate_up_row,
+    stride_out_row,
+    alpha_val,
+    limit_val,
     I_SIZE: tl.constexpr,
     BLOCK_I: tl.constexpr,
-    alpha: tl.constexpr,
-    limit: tl.constexpr,
 ):
     """Fused interleaved-split + clamp + GLU activation kernel.
 
@@ -78,11 +78,11 @@ def _fused_glu_activation_kernel(
     up_f = up_vals.to(tl.float32)
 
     # Clamp: gate max=limit, up min=-limit max=limit
-    gate_f = tl.minimum(gate_f, limit)
-    up_f = tl.maximum(tl.minimum(up_f, limit), -limit)
+    gate_f = tl.minimum(gate_f, limit_val)
+    up_f = tl.maximum(tl.minimum(up_f, limit_val), -limit_val)
 
     # GLU: glu = gate * sigmoid(gate * alpha)
-    glu = gate_f * tl.sigmoid(gate_f * alpha)
+    glu = gate_f * tl.sigmoid(gate_f * alpha_val)
 
     # Fused multiply: (up + 1) * glu
     result = (up_f + 1.0) * glu
@@ -128,12 +128,10 @@ def _weighted_expert_sum_kernel(
         w_f = w.to(tl.float32)
 
         # Load expert output for this token
-        expert_row_ptr = (
-            expert_out_ptr
-            + e * stride_expert_out_e
-            + token_idx * stride_expert_out_t
+        expert_row_ptr = expert_out_ptr + e * stride_expert_out_e + token_idx * stride_expert_out_t
+        expert_vals = tl.load(
+            expert_row_ptr + col_offsets * stride_expert_out_h, mask=mask, other=0.0
         )
-        expert_vals = tl.load(expert_row_ptr + col_offsets * stride_expert_out_h, mask=mask, other=0.0)
 
         acc += w_f * expert_vals.to(tl.float32)
 
@@ -187,23 +185,27 @@ def _moe_dense_mlp_triton(
     # Step 2-5: Fused interleaved-split + clamp + GLU activation (Triton kernel)
     # Output: [E, T, I]
     act_out = torch.empty(
-        num_experts, num_tokens, intermediate_size,
-        dtype=hidden_states.dtype, device=hidden_states.device
+        num_experts,
+        num_tokens,
+        intermediate_size,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
 
     total_rows = num_experts * num_tokens
     BLOCK_I = triton.next_power_of_2(intermediate_size)
 
+    gate_up_contig = gate_up.contiguous()
     grid = (total_rows,)
     _fused_glu_activation_kernel[grid](
-        gate_up.contiguous(),
+        gate_up_contig,
         act_out,
-        stride_gate_up_row=gate_up.stride(-2),
-        stride_out_row=act_out.stride(-2),
+        gate_up_contig.stride(-2),
+        act_out.stride(-2),
+        float(alpha),
+        float(limit),
         I_SIZE=intermediate_size,
         BLOCK_I=BLOCK_I,
-        alpha=alpha,
-        limit=limit,
         num_warps=4,
         num_stages=3,
     )
@@ -216,8 +218,7 @@ def _moe_dense_mlp_triton(
     # Ensure next_states is contiguous for the kernel
     next_states = next_states.contiguous()
     output = torch.empty(
-        num_tokens, hidden_size,
-        dtype=hidden_states.dtype, device=hidden_states.device
+        num_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
     )
 
     BLOCK_H = triton.next_power_of_2(hidden_size)
