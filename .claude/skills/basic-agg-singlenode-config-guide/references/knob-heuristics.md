@@ -8,8 +8,8 @@ Read an exact or nearby checked-in config and the model's deployment guide **bef
 |---|---|
 | `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. MoE models generally cap lower than dense. |
 | `max_num_tokens` | Affects throughput and memory. Must exceed ISL plus chat template overhead; sweet spot is ISL to 2× ISL. Tune together with `max_batch_size`. |
-| `enable_attention_dp` | Scenario-dependent; primarily benefits high-throughput / high-concurrency traffic. At low concurrency the memory overhead can be prohibitive with little throughput gain. Follow the exact model guide/config. |
-| `kv_cache_config.free_gpu_memory_fraction` | OOM lever. Safe range depends on attention architecture (MLA vs GQA) and whether ADP is enabled. Guides often adjust `max_batch_size` or `max_seq_len` first. |
+| `enable_attention_dp` | Usually shines only in high-throughput / high-concurrency traffic scenarios; at low concurrency the memory and compute overhead can be prohibitively resource-intensive with little throughput gain. Follow the exact model guide/config. |
+| `kv_cache_config.free_gpu_memory_fraction` | OOM lever. Safe range depends on attention architecture (MLA vs GQA) and whether attention data parallelism (ADP) is enabled. Guides often adjust `max_batch_size` or `max_seq_len` first. |
 | `moe_expert_parallel_size` | MoE only. Copy from checked-in source; do not assume it equals TP. |
 | `moe_config.backend` | Backend choice depends on quantization, GPU generation, and concurrency level. Set only when model guide or checked-in config specifies it. |
 | `stream_interval` | Model-specific variation; no single global value. |

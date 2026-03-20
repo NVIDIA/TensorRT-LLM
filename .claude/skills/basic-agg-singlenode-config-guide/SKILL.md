@@ -10,9 +10,9 @@ description: Generate a source-backed starting `trtllm-serve --config` YAML for
 
 # Basic Aggregate Single-Node Config Guide
 
-**Scope:** aggregate/IFB colocated prefill+decode, single node, PyTorch backend, non-speculative by default.
+**Scope:** aggregate/IFB (in-flight batching) colocated prefill+decode, single node, PyTorch backend, non-speculative by default.
 
-**Input:** model, GPU, ISL, OSL, concurrency, TP, performance objective (`Min Latency` | `Balanced` | `Max Throughput` | unspecified).
+**Input:** model, GPU, ISL (input sequence length), OSL (output sequence length), concurrency, TP, performance objective (`Min Latency` | `Balanced` | `Max Throughput` | unspecified).
 **Output:** repo-grounded starting YAML for `trtllm-serve --config`.
 
 If the request is adjacent but out of scope, provide a best-effort answer using the nearest in-scope config as a starting point, clearly label inferred vs. verified fields, and point to the relevant feature doc (see Repo Resources table).

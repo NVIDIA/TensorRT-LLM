@@ -1,4 +1,17 @@
-# Model-to-Source Mapping
+# Architecture Reference
+
+## Architecture Classes
+
+Config knobs vary by two architecture dimensions:
+
+| Dimension | Classes | Impact |
+|---|---|---|
+| **Expert structure** | **Dense** (all parameters active per token) vs **MoE** (Mixture-of-Experts, subset of experts active per token) | MoE models use `moe_expert_parallel_size` and `moe_config.backend`; generally cap `max_batch_size` lower than dense due to per-expert memory scaling. |
+| **Attention type** | **GQA** (Grouped-Query Attention, full KV per head group) vs **MLA** (Multi-Latent Attention, compressed KV via latent projection) | MLA models have smaller per-token KV footprint, tolerate higher `free_gpu_memory_fraction`, and have lower `enable_attention_dp` memory overhead. GQA models need more KV cache headroom. |
+
+Common combinations in supported models: Dense+GQA (Llama-3.3-70B), MoE+GQA (Qwen3-235B, Llama-4 Scout, GPT-OSS-120B), MoE+MLA (DeepSeek-R1, DeepSeek-V3, Kimi-K2).
+
+## Model-to-Source Mapping
 
 Consult this table to find the primary checked-in sources for each supported model family before selecting or adjusting configs. This table is derived from the repo's lookup YAML files — update it when those files change.
 
