@@ -19,7 +19,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 (triggers op registration)
-from tensorrt_llm._torch.auto_deploy.custom_ops.triton_kernels.rope_with_qk_interleaving import (
+from tensorrt_llm._torch.auto_deploy.custom_ops.rope.triton_rope_with_qk_interleaving import (
     rope_with_qk_interleaving_fused,
 )
 

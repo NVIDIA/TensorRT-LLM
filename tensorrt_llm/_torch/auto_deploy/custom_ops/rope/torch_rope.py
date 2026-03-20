@@ -17,7 +17,7 @@ from typing import Tuple
 
 import torch
 
-from .triton_kernels.rope_with_qk_interleaving import rope_with_qk_interleaving_fused
+from .triton_rope_with_qk_interleaving import rope_with_qk_interleaving_fused
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
