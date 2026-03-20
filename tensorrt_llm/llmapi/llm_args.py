@@ -323,12 +323,20 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+    use_cute_dsl_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
+    )
     q_split_threshold: int = Field(
         default=8192,
         description=
         "If number of packed tokens in prefill chunk exceeds this threshold, \
             q tokens will be evenly distributed across ranks for indexer computation. \
             If negative, q split will always be disabled.")
+    indexer_rope_interleave: bool = Field(
+        default=False,
+        description="Whether to use interleaved RoPE layout for the indexer.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -2320,7 +2328,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         description="The max number of tokens the transfer buffer can fit.")
 
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
-        default=None,
+        default=60000,
         description=
         "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
     )
@@ -2629,6 +2637,12 @@ class BaseLlmArgs(StrictBaseModel):
         "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
         status="prototype")
 
+    enable_energy_metrics: bool = Field(
+        default=False,
+        description=
+        "Enable GPU energy monitoring via NVML. When enabled, the server exposes an /energy_metrics endpoint that reports cumulative GPU energy consumption in joules.",
+        status="prototype")
+
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
         description=
@@ -2754,6 +2768,8 @@ class BaseLlmArgs(StrictBaseModel):
             TOKENIZER_ALIASES = {
                 'deepseek_v32':
                 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+                'glm_moe_dsa':
+                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
             }
 
             tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
@@ -3461,6 +3477,15 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Configuration for layer-wise benchmarks calibration.",
         status="prototype")
 
+    video_pruning_rate: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        lt=1.0,
+        description="Pruning rate for video frames in multimodal models. "
+        "Applied by Efficient Video Sampling (EVS) in NemotronH_Nano_VL_V2. "
+        "None (default) disables EVS, values in [0, 1) enable pruning.",
+        status="prototype")
+
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
@@ -3697,6 +3722,9 @@ def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
+
+    if 'hf_revision' in llm_args_dict:
+        llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:

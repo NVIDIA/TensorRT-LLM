@@ -189,7 +189,7 @@ def replace_env_in_file(log_dir, file_path, env_var):
 
 
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
-                             nsys_on, profile_range, concurrency, gpu_ids):
+                             nsys_on, profile_range, concurrency):
     """Build complete environment dictionary for worker processes.
 
     Args:
@@ -200,14 +200,14 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         nsys_on: Whether nsys profiling is enabled
         profile_range: Profile range string (e.g., "10-30")
         concurrency: Concurrency level
-        gpu_ids: List of GPU IDs assigned to this worker
 
     Returns:
         Dictionary of environment variables
 
     Note:
-        CUDA_VISIBLE_DEVICES is NOT set here. It is passed as an argument to
-        start_worker.sh and set per-rank based on SLURM_LOCALID.
+        CUDA_VISIBLE_DEVICES is passed as an argument to start_worker.sh,
+        not via srun --export (which cannot reliably pass comma-separated
+        values inside shared containers).
     """
     env = {}
 
@@ -243,11 +243,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                               'TLLM_PROFILE_START_STOP',
                               f'TLLM_PROFILE_START_STOP={profile_range}')
 
-    # 3. Set CUDA_VISIBLE_DEVICES from gpu_ids
-    cuda_devices = ','.join(map(str, gpu_ids))
-    env["CUDA_VISIBLE_DEVICES"] = cuda_devices
-
-    # 4. Parse user-defined worker env vars from config
+    # 3. Parse user-defined worker env vars from config
     #    (now includes mode-based and profiling vars from steps 1-2)
     worker_env_var = env_config.get('worker_env_var', '')
     for var_string in worker_env_var.split():
@@ -255,7 +251,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
             key, val = var_string.split('=', 1)
             env[key] = val
 
-    # 5. Add role-specific env vars (CTX or GEN)
+    # 4. Add role-specific env vars (CTX or GEN)
     #    (now includes role-specific mode/profiling vars from steps 1-2)
     role_env_vars = {
         "CTX": env_config.get('ctx_worker_env_var', ''),
@@ -521,6 +517,7 @@ def submit_job(config, log_dir, dry_run):
             gpu_ids = list(allocation["nodes"].values())[0]
 
             # Build environment for this worker
+            cuda_devices = ','.join(map(str, gpu_ids))
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -529,7 +526,6 @@ def submit_job(config, log_dir, dry_run):
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
                 concurrency=benchmark_config['concurrency_list'].split(',')[0],
-                gpu_ids=gpu_ids,
             )
             export_str = format_export_string(worker_env)
 
@@ -554,6 +550,7 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
+                cuda_devices,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))

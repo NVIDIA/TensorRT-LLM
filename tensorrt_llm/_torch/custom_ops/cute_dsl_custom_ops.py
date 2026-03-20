@@ -320,6 +320,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
         FilteredTopKKernelVarlenDecode
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
+        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
+        SinglePassMultiCTARadixTopKKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -2824,6 +2828,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
         torch.float32: cutlass.Float32,
     }
 
+    def _get_or_alloc_buffer(buffer_cache, key, shape, dtype, device="cuda"):
+        """Get cached buffer or allocate a new one, growing if needed.
+
+        Buffers only grow, never shrink, to maintain stable addresses for
+        CUDA Graph capture/replay. Returns a slice of the cached buffer
+        matching the requested shape.
+        """
+        buf = buffer_cache.get(key)
+        need_realloc = (buf is None or buf.dtype != dtype
+                        or any(b < s for b, s in zip(buf.shape, shape)))
+        if need_realloc:
+            # Grow: take element-wise max of old and new shape
+            if buf is not None:
+                alloc_shape = tuple(max(b, s) for b, s in zip(buf.shape, shape))
+            else:
+                alloc_shape = shape
+            buffer_cache[key] = torch.empty(alloc_shape,
+                                            dtype=dtype,
+                                            device=device)
+            buf = buffer_cache[key]
+        # Slice each dim to the requested size
+        slices = tuple(slice(0, s) for s in shape)
+        return buf[slices]
+
     class CuteDSLTopKDecodeSingleCTARunner:
         """Runner for CuTE DSL Top-K decode kernel (single CTA version).
 
@@ -2849,6 +2877,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             - Automatically selects occupancy optimization based on batch size
         """
         kernel_cache = dict()
+        buffer_cache = dict()
 
         @classmethod
         def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
@@ -2942,6 +2971,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = False,
             num_copy_bits: int = 256,
             load_balance: bool = False,
+            output_indices: Optional[torch.Tensor] = None,
         ):
             """Execute filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
@@ -2952,7 +2982,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
 
-            # Compilation key
             key = (
                 dtype,
                 bucketed_num_cols,
@@ -2963,55 +2992,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 load_balance,
                 large_occupancy,
             )
-
-            if key not in cls.kernel_cache:
-                cls._compile(
-                    dtype,
-                    bucketed_num_cols,
-                    top_k,
-                    next_n,
-                    return_val,
-                    num_copy_bits,
-                    load_balance,
-                    large_occupancy,
-                )
+            cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
 
             # Prepare output tensors
-            output_indices_torch = torch.empty(num_rows,
-                                               top_k,
-                                               dtype=torch.int32,
-                                               device="cuda")
+            if output_indices is not None:
+                output_indices_torch = output_indices
+            else:
+                output_indices_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_indices", (num_rows, top_k),
+                    torch.int32)
             if return_val:
-                output_values_torch = torch.empty(num_rows,
-                                                  top_k,
-                                                  dtype=torch_dtype,
-                                                  device="cuda")
+                output_values_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_values", (num_rows, top_k),
+                    torch_dtype)
             else:
                 output_values_torch = None
 
             # Prepare buffer
+            # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
+            # fp32: up to 256 MB (256 * 2 * 262144 * 4)
+            # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
             if dtype == cutlass.Float32:
                 buffer_numbers = 2
             else:
                 buffer_numbers = 1
-            buffer_bytes = num_rows * buffer_numbers * num_cols * 4
-            if buffer_bytes > 1 << 30:  # > 1 GB
-                logger.warning(
-                    f"CuTE DSL top-k: intermediate buffer is {buffer_bytes / (1 << 30):.1f} GB "
-                    f"(num_rows={num_rows}, num_cols={num_cols}). "
-                    "Consider reducing batch size or vocab size to avoid OOM.")
-            buffer_torch = torch.empty(num_rows,
-                                       buffer_numbers,
-                                       num_cols,
-                                       dtype=torch.int32,
-                                       device="cuda")
-
+            buffer_torch = _get_or_alloc_buffer(
+                cls.buffer_cache, "buffer",
+                (num_rows, buffer_numbers, bucketed_num_cols), torch.int32)
+            buffer_torch = buffer_torch[:, :, :num_cols]
             # Prepare global counter for persistent dynamic scheduling
             if load_balance:
-                g_global_counter_torch = torch.zeros(1,
-                                                     dtype=torch.int32,
-                                                     device="cuda")
+                g_global_counter_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "g_global_counter", (1, ), torch.int32)
+                g_global_counter_torch.zero_()
             else:
                 g_global_counter_torch = None
 
@@ -3149,11 +3163,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             - Automatically selects occupancy optimization based on batch size
         """
         kernel_cache = dict()
+        buffer_cache = dict()
 
         @classmethod
         def _compile(cls,
                      dtype,
-                     bucketed_num_cols,
                      top_k,
                      next_n,
                      return_val,
@@ -3166,14 +3180,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Compile and cache multi-CTA top-k kernels for the given config."""
             key = (
                 dtype,
-                bucketed_num_cols,
                 top_k,
                 next_n,
                 return_val,
                 num_copy_bits,
                 load_balance,
                 large_occupancy,
-                True,
                 chunk_size_per_cta,
                 num_ctas_per_row,
                 dynamic,
@@ -3305,12 +3317,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits: int = 256,
             chunk_size_per_cta: int = 16384,
             dynamic: bool = True,
+            output_indices: Optional[torch.Tensor] = None,
         ):
             """Execute multi-CTA filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
             dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
             num_rows, num_cols = input_values.shape
-            bucketed_num_cols = next_positive_power_of_2(num_cols)
 
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
@@ -3319,37 +3331,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
             merge_cols = num_ctas_per_row * top_k
 
-            # Compilation key (use bucketed_num_cols to reduce recompilations;
-            # include num_ctas_per_row since it depends on actual num_cols)
             key = (
                 dtype,
-                bucketed_num_cols,
                 top_k,
                 next_n,
                 return_val,
                 num_copy_bits,
                 load_balance,
                 large_occupancy,
-                True,  # enable_multi_cta
                 chunk_size_per_cta,
                 num_ctas_per_row,
                 dynamic,
             )
-
-            if key not in cls.kernel_cache:
-                cls._compile(
-                    dtype,
-                    bucketed_num_cols,
-                    top_k,
-                    next_n,
-                    return_val,
-                    num_copy_bits,
-                    load_balance,
-                    large_occupancy,
-                    chunk_size_per_cta,
-                    num_ctas_per_row,
-                    dynamic,
-                )
+            cls._compile(*key)
             compiled_kernel_first, compiled_kernel_second = \
                 cls.kernel_cache[key]
 
@@ -3358,114 +3352,316 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 buffer_numbers = 1
 
-            if dynamic:
-                # Dynamic mode: 2D grid (num_rows, num_ctas_per_row) with
-                # per-CTA early exit for rows needing fewer chunks.
-                # Intermediate buffers: 2D (num_rows, merge_cols)
-                first_output_indices = torch.empty(num_rows,
-                                                   merge_cols,
-                                                   dtype=torch.int32,
-                                                   device="cuda")
-                first_output_values = torch.empty(num_rows,
-                                                  merge_cols,
-                                                  dtype=torch_dtype,
-                                                  device="cuda")
+            # Intermediate buffers for first kernel output
+            first_output_indices = _get_or_alloc_buffer(cls.buffer_cache,
+                                                        "first_output_indices",
+                                                        (num_rows, merge_cols),
+                                                        torch.int32)
+            first_output_values = _get_or_alloc_buffer(cls.buffer_cache,
+                                                       "first_output_values",
+                                                       (num_rows, merge_cols),
+                                                       torch_dtype)
 
-                # Shared buffer for both kernels (they run sequentially)
-                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
-                                           buffer_numbers,
-                                           buffer_dim2,
-                                           dtype=torch.int32,
-                                           device="cuda")
+            # Shared buffer for both kernels (they run sequentially)
+            buffer_dim2 = max(chunk_size_per_cta, merge_cols)
+            buffer_torch = _get_or_alloc_buffer(
+                cls.buffer_cache, "buffer",
+                (num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2),
+                torch.int32)
 
-                # Final output tensors
-                output_indices_torch = torch.empty(num_rows,
-                                                   top_k,
-                                                   dtype=torch.int32,
-                                                   device="cuda")
-                if return_val:
-                    output_values_torch = torch.empty(num_rows,
-                                                      top_k,
-                                                      dtype=torch_dtype,
-                                                      device="cuda")
-                else:
-                    output_values_torch = None
-
-                # Execute first kernel: per-chunk top-k with early exit
-                compiled_kernel_first(
-                    input_values,
-                    None,  # indices
-                    buffer_torch,
-                    None,  # g_global_counter_torch
-                    seq_lens,
-                    first_output_indices,
-                    first_output_values,
-                )
-
-                # Execute second kernel: varlen merge (reuses buffer_torch)
-                # merge_width computed in-kernel from seqlen.
-                compiled_kernel_second(
-                    first_output_values,
-                    first_output_indices,
-                    buffer_torch,
-                    None,  # g_global_counter_torch
-                    seq_lens,
-                    output_indices_torch,
-                    output_values_torch,
-                )
+            # Final output tensors
+            if output_indices is not None:
+                output_indices_torch = output_indices
             else:
-                # Static mode: fixed grid (num_rows, num_ctas_per_row)
-                # Prepare intermediate output tensors for first kernel
-                first_kernel_output_indices_torch = torch.empty(
-                    num_rows, merge_cols, dtype=torch.int32, device="cuda")
-                first_kernel_output_values_torch = torch.empty(
-                    num_rows, merge_cols, dtype=torch_dtype, device="cuda")
+                output_indices_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_indices", (num_rows, top_k),
+                    torch.int32)
+            if return_val:
+                output_values_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_values", (num_rows, top_k),
+                    torch_dtype)
+            else:
+                output_values_torch = None
 
-                # Prepare final output tensors
-                output_indices_torch = torch.empty(num_rows,
-                                                   top_k,
-                                                   dtype=torch.int32,
-                                                   device="cuda")
-                if return_val:
-                    output_values_torch = torch.empty(num_rows,
-                                                      top_k,
-                                                      dtype=torch_dtype,
-                                                      device="cuda")
-                else:
-                    output_values_torch = None
+            # Execute first kernel: per-chunk top-k
+            compiled_kernel_first(
+                input_values,
+                None,  # indices
+                buffer_torch,
+                None,  # g_global_counter_torch
+                seq_lens,
+                first_output_indices,
+                first_output_values,
+            )
 
-                # Prepare buffer
-                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
-                                           buffer_numbers,
-                                           buffer_dim2,
-                                           dtype=torch.int32,
-                                           device="cuda")
-
-                # Execute first kernel: per-chunk top-k
-                compiled_kernel_first(
-                    input_values,
-                    None,  # indices, used for merge blocks kernel
-                    buffer_torch,
-                    None,  # g_global_counter_torch
-                    seq_lens,
-                    first_kernel_output_indices_torch,
-                    first_kernel_output_values_torch,
-                )
-
-                # Execute second kernel: merge partial results
-                compiled_kernel_second(
-                    first_kernel_output_values_torch,
-                    first_kernel_output_indices_torch,
-                    buffer_torch,
-                    None,  # g_global_counter_torch
-                    seq_lens,
-                    output_indices_torch,
-                    output_values_torch,
-                )
+            # Execute second kernel: merge partial results
+            compiled_kernel_second(
+                first_output_values,
+                first_output_indices,
+                buffer_torch,
+                None,  # g_global_counter_torch
+                seq_lens,
+                output_indices_torch,
+                output_values_torch,
+            )
 
             return output_indices_torch, output_values_torch
+
+    class CuteDSLTopKDecodeSinglePassMultiCTARunner:
+        """Runner for single-pass multi-CTA radix top-k (FlashInfer-style fused multi-CTA).
+
+        All CTAs in a group cooperatively find the global pivot via multi-round
+        radix select with global histogram merging, then each CTA collects
+        results from its own chunk.  Single kernel launch, no intermediate
+        buffer, no merge kernel.
+
+        All methods are class-level — no instantiation needed.
+
+        Attributes:
+            kernel_cache: Class-level dict mapping config tuples to compiled
+                         kernels.
+        """
+        kernel_cache = dict()
+        # buffer_cache is used to cache the row_states and output buffers.
+        buffer_cache = dict()
+
+        @classmethod
+        def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
+                     ctas_per_group, num_sms, return_val):
+            """Compile and cache a single-pass multi-CTA radix top-k kernel."""
+            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
+                   ctas_per_group, num_sms, return_val)
+            if key in cls.kernel_cache:
+                return
+            n_rows = cute.sym_int()
+            n_cols = cute.sym_int()
+            n_batch = cute.sym_int()
+            n_groups = cute.sym_int()
+
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                dtype,
+                (n_rows, n_cols),
+                stride_order=(1, 0),
+                assumed_align=32,
+            )
+            row_states_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_groups, DISTRIBUTED_TOPK_STATE_SIZE),
+                stride_order=(1, 0),
+                assumed_align=32,
+            )
+            seqlen_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_batch, ),
+                stride_order=(0, ),
+            )
+            output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, top_k),
+                stride_order=(1, 0),
+            )
+            if return_val:
+                output_values_fake = cute.runtime.make_fake_compact_tensor(
+                    dtype,
+                    (n_rows, top_k),
+                    stride_order=(1, 0),
+                )
+            else:
+                output_values_fake = None
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+
+            kernel_obj = SinglePassMultiCTARadixTopKKernel(
+                dtype=dtype,
+                chunk_size=chunk_size,
+                top_k=top_k,
+                next_n=next_n,
+                num_copy_bits=num_copy_bits,
+                ctas_per_group=ctas_per_group,
+                num_sms=num_sms,
+            )
+            compiled_kernel = cute.compile(
+                kernel_obj,
+                input_fake,
+                row_states_fake,
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                options="--enable-tvm-ffi",
+            )
+            cls.kernel_cache[key] = compiled_kernel
+
+        @classmethod
+        def _compute_max_chunk(cls, dtype, num_copy_bits: int = 256):
+            """Compute the maximum chunk_size a single CTA can handle."""
+            max_smem = cutlass.utils.get_smem_capacity_in_bytes()
+            # Fixed shared memory overhead (excludes shared_ordered[chunk_size]):
+            # local_histogram[256]*4 + prefix_buf[256]*4 + scalars[4]*4 + warp_sums[8]*4
+            overhead = 256 * 4 * 2 + 4 * 4 + 8 * 4
+            if dtype == cutlass.Float32:
+                ordered_elem_size = 4
+            else:
+                ordered_elem_size = 2
+            vec_size = num_copy_bits // dtype.width
+            max_chunk = (max_smem - overhead) // ordered_elem_size
+            max_chunk = (max_chunk // vec_size) * vec_size
+            return max_chunk, vec_size
+
+        @classmethod
+        def _get_chunk_config(cls,
+                              dtype,
+                              num_cols: int,
+                              chunk_size: Optional[int] = None,
+                              num_copy_bits: int = 256,
+                              num_rows: int = 1):
+            """Resolve chunk_size and ctas_per_group.
+
+            If chunk_size is provided, use it (clamped and aligned).
+            Otherwise use an SM-aware heuristic that targets
+            total_ctas ≈ num_sms by balancing parallelism against
+            per-CTA reduce overhead.
+
+            Returns:
+                (chunk_size, ctas_per_group, vec_size)
+            """
+            max_chunk, vec_size = cls._compute_max_chunk(dtype, num_copy_bits)
+
+            if chunk_size is not None:
+                # User-specified: clamp and align
+                chunk_size = min(chunk_size, max_chunk)
+                chunk_size = (chunk_size // vec_size) * vec_size
+                if chunk_size < vec_size:
+                    chunk_size = vec_size
+            else:
+                # Auto: SM-aware heuristic
+                num_sms = _get_num_sms()
+
+                # Target total_ctas ≈ num_sms
+                ideal_ctas_per_group = max(1, num_sms // max(num_rows, 1))
+
+                if ideal_ctas_per_group <= 1:
+                    # Large batch: use FlashInfer-style logic —
+                    # minimize ctas_per_group based on max_chunk capacity
+                    ctas_per_group = math.ceil(num_cols / max_chunk)
+                    if ctas_per_group < 1:
+                        ctas_per_group = 1
+                    chunk_size = math.ceil(num_cols / ctas_per_group)
+                    chunk_size = (
+                        (chunk_size + vec_size - 1) // vec_size) * vec_size
+                    if chunk_size > max_chunk:
+                        chunk_size = max_chunk
+                else:
+                    chunk_size = math.ceil(num_cols / ideal_ctas_per_group)
+
+                    # Minimum chunk to avoid per-CTA overhead dominating
+                    chunk_size = max(chunk_size, 8192)
+
+                    # Avoid ctas_per_group=2 with small chunks: reduce
+                    # overhead (~5us) exceeds 2-way parallelism benefit
+                    ctas_per_group = math.ceil(num_cols / chunk_size)
+                    if ctas_per_group == 2 and chunk_size < 32768:
+                        chunk_size = num_cols
+
+                    # Snap to power-of-2 for JIT cache friendliness
+                    snap_up = 1 << math.ceil(math.log2(max(chunk_size, 1)))
+                    if snap_up > max_chunk:
+                        snap_up = 1 << int(math.log2(max_chunk))
+                    chunk_size = snap_up
+
+            ctas_per_group = math.ceil(num_cols / chunk_size)
+            return chunk_size, ctas_per_group, vec_size
+
+        @classmethod
+        def _get_possible_chunk_sizes(cls, dtype, num_copy_bits: int = 256):
+            """Return all possible chunk_size values the auto heuristic can produce.
+
+            These are powers of 2 from 8192 up to the largest power of 2
+            that fits within max_chunk (for the SM-aware multi-CTA path).
+            """
+            max_chunk, _ = cls._compute_max_chunk(dtype, num_copy_bits)
+            sizes = []
+            cs = 8192
+            while cs <= max_chunk:
+                sizes.append(cs)
+                cs *= 2
+            return sizes
+
+        @classmethod
+        def forward(
+            cls,
+            input_values: torch.Tensor,
+            seq_lens: torch.Tensor,
+            top_k: int,
+            next_n: int,
+            return_val: bool = False,
+            num_copy_bits: int = 256,
+            chunk_size: Optional[int] = None,
+            output_indices: Optional[torch.Tensor] = None,
+        ):
+            """Execute single-pass multi-CTA radix top-k selection.
+
+            Args:
+                chunk_size: Optional chunk size per CTA. If None, uses the
+                    maximum chunk that fits in shared memory. Smaller values
+                    increase ctas_per_group (more parallelism) at the cost of
+                    more inter-CTA synchronization.
+            """
+            torch_dtype = input_values.dtype
+            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+            num_rows, num_cols = input_values.shape
+            num_sms = _get_num_sms()
+
+            chunk_size, ctas_per_group, _ = cls._get_chunk_config(
+                dtype, num_cols, chunk_size, num_copy_bits, num_rows=num_rows)
+
+            num_groups = min(num_sms // ctas_per_group, num_rows)
+            if num_groups < 1:
+                num_groups = 1
+
+            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
+                   ctas_per_group, num_sms, return_val)
+            cls._compile(*key)
+            compiled_kernel = cls.kernel_cache[key]
+
+            # Allocate row_states once with num_sms rows — large enough for
+            # any ctas_per_group config because group_id < num_groups
+            # <= num_sms // ctas_per_group <= num_sms.  The kernel resets
+            # the slots it used at end-of-kernel, so the buffer stays clean
+            # across calls without re-zeroing (FlashInfer pattern).
+            # extra buffer: 148 * 770 * 4 bytes = 452960 bytes = 440 KB
+            if "row_states" not in cls.buffer_cache:
+                cls.buffer_cache["row_states"] = torch.zeros(
+                    num_sms,
+                    DISTRIBUTED_TOPK_STATE_SIZE,
+                    dtype=torch.int32,
+                    device="cuda")
+            row_states = cls.buffer_cache["row_states"]
+
+            # Allocate outputs
+            if output_indices is not None:
+                output_indices_torch = output_indices
+            else:
+                output_indices_torch = _get_or_alloc_buffer(
+                    cls.buffer_cache, "output_indices", (num_rows, top_k),
+                    torch.int32)
+            if return_val:
+                output_values = _get_or_alloc_buffer(cls.buffer_cache,
+                                                     "output_values",
+                                                     (num_rows, top_k),
+                                                     torch_dtype)
+            else:
+                output_values = None
+
+            compiled_kernel(
+                input_values,
+                row_states,
+                seq_lens,
+                output_indices_torch,
+                output_values,
+            )
+
+            return output_indices_torch, output_values
 
     @torch.library.custom_op("trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
                              mutates_args=(),
@@ -3567,175 +3763,292 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return indices
 
     @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
-                             mutates_args=(),
+                             mutates_args=("output_indices", ),
                              device_types="cuda")
     def cute_dsl_indexer_topk_decode(
         input_values: torch.Tensor,
         seq_lens: torch.Tensor,
+        output_indices: torch.Tensor,
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
-    ) -> torch.Tensor:
-        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA.
+        single_pass_multi_cta: bool = False,
+    ) -> None:
+        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
+        single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
+        and multi-CTA (1-pass multi-CTA). When single_pass_multi_cta=False, it selects between
+        single-CTA and multi-CTA (2-pass multi-CTA).
 
-        Automatically chooses the faster kernel based on:
-          1. dtype threshold: fp16/bf16 >= 131072, fp32 >= 65536
-          2. SM utilization < 25% (num_rows < num_sms // 4)
-        Multi-CTA is only used when both conditions are met, ensuring it
-        only activates when single-CTA occupancy is genuinely low.
-        Uses chunk_size_per_cta=16384 for multi-CTA.
+        Writes results directly into the pre-allocated ``output_indices`` buffer.
 
-        Based on benchmark results (Blackwell SM100, top_k=2048).
-        See bench_cute_dsl_single_vs_multi_cta_topk.py.
+        Dispatch logic (``single_pass_multi_cta=True`` path):
+
+        The key insight is that the single-pass multi-CTA kernel wins when all CTAs fit
+        in a single SM wave (no inter-CTA barrier serialization across waves).
+        For fp32, the 4 radix rounds double the sync overhead vs fp16/bf16's
+        2 rounds, so the crossover favors single-CTA much earlier.
+
+        - **ctas_per_group >= 2** (single-pass multi-CTA):
+          Use single-pass multi-CTA when ``num_rows * ctas_per_group <= num_sms``
+          (single wave). For fp32, additionally require ``vocab >= 65536``
+          since smaller vocab doesn't benefit enough from parallelism.
+        - **ctas_per_group == 1** (effectively single-CTA single-pass multi-CTA):
+          fp16/bf16: use single-pass multi-CTA when ``num_rows <= num_sms`` (no
+          inter-CTA sync, single-pass multi-CTA kernel is faster due to better
+          memory access patterns).
+          fp32: always use single-CTA (single-pass multi-CTA overhead not worth it).
+
+        Benchmark: overhead vs oracle ~2.4%, speedup vs always-single ~1.14x
+        (Blackwell SM100 148 SMs, top_k=2048, fp32/bf16/fp16).
+
+        Legacy dispatch (``single_pass_multi_cta=False``) uses the original vocab
+        threshold + SM utilization heuristic for the 2-pass multi-CTA kernel.
 
         Args:
             input_values: Input logits tensor [batch_size * next_n, vocab_size]
             seq_lens: Sequence lengths for each batch [batch_size]
+            output_indices: Pre-allocated output buffer [batch_size * next_n, top_k]
             top_k: Number of top elements to select (max 2048)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
-
-        Returns:
-            indices: Top-k indices [batch_size * next_n, top_k]
+            dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
+            single_pass_multi_cta: Use single-pass multi-CTA radix top-k
         """
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
-        chunk_size_per_cta = 16384
 
-        # Multi-CTA vocab thresholds by dtype.
-        # fp32: multi-CTA wins at vocab >= 65536 (4+ CTAs per row)
-        # fp16/bf16: multi-CTA wins at vocab >= 131072 (8+ CTAs per row)
-        if input_values.dtype == torch.float32:
-            use_multi_cta = num_tokens >= 65536
+        if single_pass_multi_cta:
+            # --- heuristic for single-CTA vs single-pass multi-CTA ---
+            # Determines whether the single-pass multi-CTA kernel
+            # is faster than single-CTA based on SM wave occupancy analysis.
+            #
+            # Core rules:
+            # 1. ctas_per_group >= 2: single-pass multi-CTA wins iff all CTAs fit in one
+            #    SM wave (num_rows * ctas_per_group <= num_sms). Multi-wave
+            #    causes inter-CTA barrier serialization → perf collapse.
+            #    For fp32, also require vocab >= 65536 (small vocab: sync
+            #    overhead from 4 radix rounds > parallelism benefit).
+            # 2. ctas_per_group == 1: no inter-CTA sync needed.
+            #    fp16/bf16: single-pass multi-CTA wins when num_rows <= num_sms.
+            #    fp32: single-CTA always wins (single-pass multi-CTA overhead too high).
+            is_fp32 = (input_values.dtype == torch.float32)
+
+            # Short-circuit: fp32 with small vocab never benefits from
+            # single-pass multi-CTA (sync overhead from 4 radix rounds > parallelism
+            # gain). Skip _get_chunk_config entirely.
+            if is_fp32 and num_tokens < 65536:
+                use_single_pass_multi_cta = False
+            else:
+                num_sms = _get_num_sms()
+                cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[input_values.dtype]
+                _, ctas_per_group, _ = (
+                    CuteDSLTopKDecodeSinglePassMultiCTARunner._get_chunk_config(
+                        cutlass_dtype,
+                        num_tokens,
+                        num_copy_bits=num_copy_bits,
+                        num_rows=num_rows))
+
+                if ctas_per_group >= 2:
+                    use_single_pass_multi_cta = (num_rows * ctas_per_group
+                                                 <= num_sms)
+                    if is_fp32:
+                        use_single_pass_multi_cta = (use_single_pass_multi_cta
+                                                     and num_tokens >= 65536)
+                else:  # ctas_per_group == 1
+                    use_single_pass_multi_cta = (not is_fp32
+                                                 and num_rows <= num_sms)
+
+            if use_single_pass_multi_cta:
+                CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
+                    input_values=input_values,
+                    seq_lens=seq_lens,
+                    top_k=top_k,
+                    next_n=next_n,
+                    return_val=False,
+                    num_copy_bits=num_copy_bits,
+                    output_indices=output_indices,
+                )
+            else:
+                CuteDSLTopKDecodeSingleCTARunner.forward(
+                    input_values=input_values,
+                    seq_lens=seq_lens,
+                    top_k=top_k,
+                    next_n=next_n,
+                    return_val=False,
+                    num_copy_bits=num_copy_bits,
+                    output_indices=output_indices,
+                )
         else:
-            use_multi_cta = num_tokens >= 131072
+            # --- 2-pass multi-CTA dispatch ---
+            # Kept for A/B comparison and as fallback when single_pass_multi_cta=False.
+            # Uses vocab threshold + SM utilization < 25% heuristic.
+            chunk_size_per_cta = 16384
 
-        # Only use multi-CTA when SM utilization from single-CTA is low
-        # (< 25%). Beyond this, single-CTA already saturates the SMs and
-        # multi-CTA 2-pass overhead hurts.
-        if use_multi_cta:
-            num_sms = _get_num_sms()
-            use_multi_cta = num_rows < num_sms // 4
+            # Multi-CTA vocab thresholds by dtype.
+            # fp32: multi-CTA wins at vocab >= 65536 (4+ CTAs per row)
+            # fp16/bf16: multi-CTA wins at vocab >= 131072 (8+ CTAs per row)
+            if input_values.dtype == torch.float32:
+                use_multi_cta = num_tokens >= 65536
+            else:
+                use_multi_cta = num_tokens >= 131072
 
-        if use_multi_cta:
-            indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(
-                input_values=input_values,
-                seq_lens=seq_lens,
-                top_k=top_k,
-                next_n=next_n,
-                return_val=False,
-                num_copy_bits=num_copy_bits,
-                chunk_size_per_cta=chunk_size_per_cta,
-                dynamic=dynamic,
-            )
-        else:
-            indices, _ = CuteDSLTopKDecodeSingleCTARunner.forward(
-                input_values=input_values,
-                seq_lens=seq_lens,
-                top_k=top_k,
-                next_n=next_n,
-                return_val=False,
-                num_copy_bits=num_copy_bits,
-            )
-        return indices
+            # Only use multi-CTA when SM utilization from single-CTA is low
+            # (< 25%). Beyond this, single-CTA already saturates the SMs and
+            # multi-CTA 2-pass overhead hurts.
+            if use_multi_cta:
+                num_sms = _get_num_sms()
+                use_multi_cta = num_rows < num_sms // 4
+
+            if use_multi_cta:
+                CuteDSLTopKDecodeMultiCTARunner.forward(
+                    input_values=input_values,
+                    seq_lens=seq_lens,
+                    top_k=top_k,
+                    next_n=next_n,
+                    return_val=False,
+                    num_copy_bits=num_copy_bits,
+                    chunk_size_per_cta=chunk_size_per_cta,
+                    dynamic=dynamic,
+                    output_indices=output_indices,
+                )
+            else:
+                CuteDSLTopKDecodeSingleCTARunner.forward(
+                    input_values=input_values,
+                    seq_lens=seq_lens,
+                    top_k=top_k,
+                    next_n=next_n,
+                    return_val=False,
+                    num_copy_bits=num_copy_bits,
+                    output_indices=output_indices,
+                )
 
     @torch.library.register_fake("trtllm::cute_dsl_indexer_topk_decode")
     def _(
         input_values: torch.Tensor,
         seq_lens: torch.Tensor,
+        output_indices: torch.Tensor,
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
-    ):
-        num_rows = input_values.shape[0]
-        indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
-        return indices
+        single_pass_multi_cta: bool = False,
+    ) -> None:
+        return None
 
-    # TODO: call this warmup in DSL initialization or autotune warmup to compile all the dsl top-k kernels.
-    def warmup_cute_dsl_topk_kernels(
-        dtype=cutlass.BFloat16,
-        top_k: int = 2048,
+    def warmup_cute_dsl_indexer_topk(
+        dtype: torch.dtype,
+        top_k: int,
         next_n: int = 1,
-        return_val: bool = False,
         num_copy_bits: int = 256,
-        bucketed_num_cols_list: list | None = None,
-        chunk_size_per_cta: int = 16384,
-    ):
-        """Pre-compile CuTE DSL top-k kernels for common configurations.
+        min_seq_len_log2: int = 10,
+        max_seq_len_log2: int = 18,
+        single_pass_multi_cta: bool = False,
+    ) -> None:
+        """Pre-compile all CuTE DSL top-k kernel variants for every
+        power-of-2 bucketed_num_cols in [2^min_seq_len_log2, 2^max_seq_len_log2].
 
-        Enumerates all combinations of (bucketed_num_cols, large_occupancy)
-        and compiles both single-CTA and multi-CTA kernels. This avoids
-        compilation latency on the first decode request.
+        Because the kernel compilation key uses
+        ``bucketed_num_cols = next_positive_power_of_2(num_cols)``, only
+        a small number of distinct kernels are needed regardless of the
+        actual ``max_seq_len``.  This allows warmup to be called at model
+        init time without knowing the runtime ``max_seq_len``.
+
+        Must be called before CUDA Graph capture so that JIT compilation
+        does not occur during capture/replay.
 
         Args:
-            dtype: Cutlass data type (default BFloat16).
-            top_k: Number of top-k elements (default 2048).
-            next_n: Speculative decoding candidates (default 1).
-            return_val: Whether kernels should return values (default False).
-            num_copy_bits: Vectorization width (default 256).
-            bucketed_num_cols_list: List of bucketed num_cols to warmup.
-                If None, uses powers of 2 from 4096 to 262144.
-            chunk_size_per_cta: Chunk size for multi-CTA (default 16384).
+            dtype: Data type of the logits (e.g. torch.bfloat16).
+            top_k: Number of top elements to select.
+            next_n: Number of candidates per sequence (speculative decoding).
+            num_copy_bits: Vectorized memory copy width (128 or 256).
+            min_seq_len_log2: Log2 of minimum bucketed_num_cols (default 10 → 1024).
+            max_seq_len_log2: Log2 of maximum bucketed_num_cols (default 18 → 262144).
         """
-        # Default bucketed num_cols values to warmup (powers of 2 from 4096 to 262144).
-        _CUTE_DSL_TOPK_WARMUP_BUCKETED_NUM_COLS = [
-            1 << i for i in range(12, 19)
-        ]
-        if bucketed_num_cols_list is None:
-            bucketed_num_cols_list = _CUTE_DSL_TOPK_WARMUP_BUCKETED_NUM_COLS
+        cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[dtype]
+        return_val = False
+        chunk_size_per_cta = 16384
 
-        load_balance = False
-        count = 0
-        for bucketed_num_cols in bucketed_num_cols_list:
-            for large_occupancy in [False, True]:
-                # Single-CTA kernel
+        # Multi-CTA vocab thresholds by dtype
+        if dtype == torch.float32:
+            multi_cta_threshold = 65536
+        else:
+            multi_cta_threshold = 131072
+
+        # SingleCTA: enumerate all power-of-2 bucketed_num_cols
+        for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+            bucketed_num_cols = 1 << log2_n
+            for large_occupancy in (False, True):
                 CuteDSLTopKDecodeSingleCTARunner._compile(
-                    dtype,
+                    cutlass_dtype,
                     bucketed_num_cols,
                     top_k,
                     next_n,
                     return_val,
                     num_copy_bits,
-                    load_balance,
-                    large_occupancy,
+                    load_balance=False,
+                    large_occupancy=large_occupancy,
                 )
-                count += 1
 
-                # Multi-CTA kernel (only when num_cols > chunk_size_per_cta)
-                num_ctas_per_row = math.ceil(bucketed_num_cols /
-                                             chunk_size_per_cta)
-                if num_ctas_per_row > 1:
+        if single_pass_multi_cta:
+            # Single-pass multi-CTA: enumerate all (chunk_size, ctas_per_group)
+            # pairs.  chunk_size is snapped to power-of-2 (+ max_chunk clamp),
+            # so the set of possible values is small and deterministic.
+            num_sms = _get_num_sms()
+            possible_chunks = CuteDSLTopKDecodeSinglePassMultiCTARunner._get_possible_chunk_sizes(
+                cutlass_dtype, num_copy_bits)
+            max_chunk, vec_size = CuteDSLTopKDecodeSinglePassMultiCTARunner._compute_max_chunk(
+                cutlass_dtype, num_copy_bits)
+            single_pass_multi_cta_configs = set()
+            for cs in possible_chunks:
+                for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                    num_cols = 1 << log2_n
+                    ctas = math.ceil(num_cols / cs)
+                    if ctas >= 1:
+                        single_pass_multi_cta_configs.add((cs, ctas))
+            # Also cover FlashInfer-style fallback path (large batch):
+            # ctas_per_group = ceil(num_cols / max_chunk), chunk_size aligned
+            for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                num_cols = 1 << log2_n
+                ctas = math.ceil(num_cols / max_chunk)
+                if ctas >= 1:
+                    cs = math.ceil(num_cols / ctas)
+                    cs = ((cs + vec_size - 1) // vec_size) * vec_size
+                    if cs > max_chunk:
+                        cs = max_chunk
+                    single_pass_multi_cta_configs.add((cs, ctas))
+            for cs, ctas in sorted(single_pass_multi_cta_configs):
+                CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
+                    cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
+                    num_sms, return_val)
+            multi_cta_info = (
+                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs)"
+            )
+        else:
+            # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
+            # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)
+            # fp32: num_cols in [65536, 262144] → num_ctas_per_row in [4, 16]
+            # fp16/bf16: num_cols in [131072, 262144] → num_ctas_per_row in [8, 16]
+            min_ctas = math.ceil(multi_cta_threshold / chunk_size_per_cta)
+            max_ctas = math.ceil((1 << max_seq_len_log2) / chunk_size_per_cta)
+            for num_ctas_per_row in range(min_ctas, max_ctas + 1):
+                for large_occupancy in (False, True):
                     CuteDSLTopKDecodeMultiCTARunner._compile(
-                        dtype,
-                        bucketed_num_cols,
+                        cutlass_dtype,
                         top_k,
                         next_n,
                         return_val,
                         num_copy_bits,
-                        load_balance,
-                        large_occupancy,
-                        chunk_size_per_cta,
-                        num_ctas_per_row,
-                    )
-                    count += 1
-
-                    # Dynamic multi-CTA kernel
-                    CuteDSLTopKDecodeMultiCTARunner._compile(
-                        dtype,
-                        bucketed_num_cols,
-                        top_k,
-                        next_n,
-                        return_val,
-                        num_copy_bits,
-                        load_balance,
-                        large_occupancy,
-                        chunk_size_per_cta,
-                        num_ctas_per_row,
+                        load_balance=False,
+                        large_occupancy=large_occupancy,
+                        chunk_size_per_cta=chunk_size_per_cta,
+                        num_ctas_per_row=num_ctas_per_row,
                         dynamic=True,
                     )
-                    count += 1
+            multi_cta_info = (
+                f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}]")
 
-        logger.info(f"Warmup: pre-compiled {count} CuTE DSL top-k kernels "
-                    f"(dtype={dtype}, top_k={top_k}, next_n={next_n})")
+        logger.info(
+            f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
+            f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
+            f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")

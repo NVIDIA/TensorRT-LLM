@@ -50,6 +50,8 @@ from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
+                           prepare_attn_metadata_for_draft_replay,
+                           restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
@@ -201,10 +203,15 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
 
+        input_processor_kwargs = {}
+        if llm_args.video_pruning_rate is not None:
+            input_processor_kwargs[
+                'video_pruning_rate'] = llm_args.video_pruning_rate
         self.input_processor = create_input_processor(
             model_path,
             tokenizer=None,
-            checkpoint_format=llm_args.checkpoint_format)
+            checkpoint_format=llm_args.checkpoint_format,
+            **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
@@ -355,11 +362,16 @@ class PyTorchModelEngine(ModelEngine):
                 (self.batch_size, ), dtype=torch.int, device='cuda')
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
-            self.max_draft_len = spec_config.max_draft_len
-            # Mutable per-iteration draft length. Updated at each iteration if dynamic draft length is enabled;
-            # Otherwise stays at max_draft_len.
-            self.runtime_draft_len = spec_config.max_draft_len
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
+            # PARD uses 2K tokens per gen request (K accepted + K masks), so
+            # its per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            if spec_config.spec_dec_mode.is_pard():
+                self.max_draft_len = self.max_total_draft_tokens
+            else:
+                self.max_draft_len = spec_config.max_draft_len
+            # Mutable per-iteration draft length (updated each iteration when
+            # dynamic draft length is enabled; otherwise stays fixed).
+            self.runtime_draft_len = self.max_draft_len
 
         else:
             self.without_logits = False
@@ -2193,7 +2205,8 @@ class PyTorchModelEngine(ModelEngine):
         draft_lens = []
         gen_request_seq_slots = []  # per generation request
         multimodal_params_list = []
-        mrope_position_ids = []
+        mrope_position_ids = [
+        ]  # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
         num_accepted_draft_tokens = []  # per request
         # if using tree decoding, we need to store the request type and accepted path for each request,
         # which will be used to update the hidden_states_read_indices.
@@ -2266,7 +2279,10 @@ class PyTorchModelEngine(ModelEngine):
                             'mrope_position_ids'][:, :,
                                                   begin_compute:begin_compute +
                                                   len(prompt_tokens)]
-                    mrope_position_ids.append(ctx_mrope_position_ids)
+                    # Record as (start_idx, end_idx, (3,1,L) mrope_pos_ids)
+                    mrope_position_ids.append(
+                        (len(position_ids) - len(prompt_tokens),
+                         len(position_ids), ctx_mrope_position_ids))
 
                 # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
                 multimodal_params.to_device("multimodal_data",
@@ -2586,8 +2602,12 @@ class PyTorchModelEngine(ModelEngine):
                                         "mrope_config.mrope_position_deltas"
                                     ])
                             for beam in range(beam_width):
+                                # Locate this beam's single token in the flat array.
+                                token_start = len(
+                                    position_ids) - beam_width + beam
                                 mrope_position_ids.append(
-                                    gen_mrope_position_ids)
+                                    (token_start, token_start + 1,
+                                     gen_mrope_position_ids))
                                 multimodal_params_list.append(multimodal_params)
 
                 request.py_batch_idx = request.py_seq_slot
@@ -2822,14 +2842,41 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda *= 0
 
         if self.use_mrope and mrope_position_ids:
-            # NOTE: self.use_mrope is enough for differentiating whether to use mrope_position_ids but
-            # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
-            # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
-            mrope_position_ids = torch.cat(mrope_position_ids, dim=-1)
-            if mrope_position_ids.device.type == "cpu":
-                mrope_position_ids = maybe_pin_memory(mrope_position_ids)
+            # Mixed batches may have only some requests with multimodal MRoPE
+            # data. Seed the full (3,1,N) buffer from scalar position_ids
+            # (text-only tokens get the same value on all 3 axes), then
+            # overwrite only the multimodal spans with their real MRoPE coords.
+            position_ids_tensor = torch.tensor(position_ids,
+                                               dtype=torch.int,
+                                               pin_memory=prefer_pinned())
+            self.position_ids_cuda[:total_num_tokens].copy_(position_ids_tensor,
+                                                            non_blocking=True)
+            # Broadcast [N] to [3,1,N]: default for text-only tokens.
             self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
-                mrope_position_ids[:, :, :total_num_tokens], non_blocking=True)
+                self.position_ids_cuda[:total_num_tokens].view(1, 1, -1).expand(
+                    3, 1, -1),
+                non_blocking=True)
+            # Overwrite multimodal spans with per-axis MRoPE positions.
+            for start_idx, end_idx, segment in mrope_position_ids:
+                if segment.ndim != 3:
+                    raise RuntimeError(
+                        f"Expected 3D mrope_position_ids, got shape {tuple(segment.shape)}"
+                    )
+                if segment.shape[0] != 3 and segment.shape[-1] == 3:
+                    logger.warning(
+                        "Transposing unexpected mrope_position_ids shape from %s",
+                        tuple(segment.shape),
+                    )
+                    segment = segment.transpose(0, 2).contiguous()
+                if segment.shape[:2] != (3, 1):
+                    raise RuntimeError(
+                        f"Unexpected mrope_position_ids shape {tuple(segment.shape)} for span {start_idx}:{end_idx}"
+                    )
+                segment = segment.contiguous()
+                if segment.device.type == "cpu":
+                    segment = maybe_pin_memory(segment)
+                self.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
+                    segment[:, :, :end_idx - start_idx], non_blocking=True)
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
@@ -2948,8 +2995,9 @@ class PyTorchModelEngine(ModelEngine):
             self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
             if self.use_mrope and mrope_position_ids:
-                self.mrope_position_ids_cuda[
-                    total_num_tokens:padded_num_tokens].fill_(0)
+                # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
+                self.mrope_position_ids_cuda[:, :, total_num_tokens:
+                                             padded_num_tokens].fill_(0)
                 final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                                   virtual_num_tokens]
             else:
@@ -3627,13 +3675,23 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
+            # PARD has 2K tokens per gen request, not K+1.  Pass 2K-1
+            # so generation_lengths = 2K and the XQA kernel computes
+            # the correct past_kv_len.
+            if spec_metadata.spec_dec_mode.is_pard():
+                sd_max_draft_len = self.original_max_total_draft_tokens
+                sd_max_total = self.original_max_total_draft_tokens
+            else:
+                sd_max_draft_len = self.original_max_draft_len
+                sd_max_total = self._spec_dec_max_total_draft_tokens
+
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
                 is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
                 is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
-                max_draft_len=self.original_max_draft_len,
-                max_total_draft_tokens=self._spec_dec_max_total_draft_tokens,
+                max_draft_len=sd_max_draft_len,
+                max_total_draft_tokens=sd_max_total,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
                 spec_tree_manager=spec_tree_manager,
@@ -3715,12 +3773,24 @@ class PyTorchModelEngine(ModelEngine):
                             enable_spec_decode=self.enable_spec_decode,
                             postprocess_fn=capture_postprocess_fn)
 
-                        # here we don't need to use context since cuda graph capture didn't run kernel.
-                        # maybe we need a cleaner way to do this.
-                        outputs = self.cuda_graph_runner.replay(key, inputs)
-                    else:
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                        # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
+                        saved_draft = prepare_attn_metadata_for_draft_replay(
+                            attn_metadata, draft_kv_cache_manager)
+                        try:
                             outputs = self.cuda_graph_runner.replay(key, inputs)
+                        finally:
+                            restore_attn_metadata_after_draft_replay(
+                                attn_metadata, saved_draft)
+                    else:
+                        saved_draft = prepare_attn_metadata_for_draft_replay(
+                            attn_metadata, draft_kv_cache_manager)
+                        try:
+                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                                outputs = self.cuda_graph_runner.replay(
+                                    key, inputs)
+                        finally:
+                            restore_attn_metadata_after_draft_replay(
+                                attn_metadata, saved_draft)
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

@@ -14,10 +14,13 @@
 # limitations under the License.
 """Unit tests for Mamba2 metadata preparation optimizations."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    Mamba2Metadata,
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
 )
@@ -56,6 +59,35 @@ class TestCuSeqlensToChunkIndicesOffsets:
 
         torch.testing.assert_close(indices_triton, indices_ref)
         torch.testing.assert_close(offsets_triton, offsets_ref)
+
+
+@skip_no_cuda
+class TestMamba2Metadata:
+    def test_prepare_handles_tensor_cached_tokens(self):
+        metadata = Mamba2Metadata(max_batch_size=4, chunk_size=8)
+        seq_lens = torch.tensor([4, 3], dtype=torch.int)
+        attn_metadata = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=2,
+            num_ctx_tokens=7,
+            kv_cache_manager=None,
+            request_ids=None,
+            kv_cache_params=SimpleNamespace(
+                num_cached_tokens_per_seq=torch.tensor([0, 5], dtype=torch.int),
+            ),
+        )
+
+        metadata.prepare(attn_metadata)
+
+        assert metadata.has_initial_states_cpu.is_pinned()
+        torch.testing.assert_close(metadata.has_initial_states_cpu[:2], torch.tensor([False, True]))
+        torch.testing.assert_close(
+            metadata.has_initial_states[:2].cpu(), torch.tensor([False, True])
+        )
+        assert metadata.use_initial_states is True
+        assert metadata.chunk_indices is not None
+        assert metadata.chunk_offsets is not None
 
     def test_single_sequence_unaligned(self):
         """Test with a single sequence that doesn't align with chunk size."""

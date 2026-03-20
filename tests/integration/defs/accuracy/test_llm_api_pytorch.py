@@ -3087,6 +3087,57 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,overlap_scheduler,max_batch_size,host_cache_size_gb",
+        [
+            (8, 1, 8, 0, True, 24, 10),
+            (8, 1, 8, 1, True, 24, 10),
+        ],
+        ids=["host_cache_offload", "host_cache_offload_mtp1"])
+    def test_dsa_host_cache_offload(self, tp_size, pp_size, ep_size, mtp_nextn,
+                                    overlap_scheduler, max_batch_size,
+                                    host_cache_size_gb):
+        """Validate DSA host-offloading for both pools (MLA KV cache + indexer-K cache)."""
+        if get_sm_version() == 100 or get_sm_version() == 103:
+            moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
+        else:
+            moe_config = MoeConfig()
+
+        # Use a small GPU fraction so that host offload is actually exercised.
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.4,
+            host_cache_size=host_cache_size_gb * (1 << 30),
+        )
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig(),
+            moe_config=moe_config,
+        )
+
+        dsa_config = DeepSeekSparseAttentionConfig(
+            skip_indexer_for_short_seqs=False)
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        with LLM(self.MODEL_PATH,
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=True,
+                 speculative_config=mtp_config,
+                 sparse_attention_config=dsa_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,attention_dp,max_batch_size,moe_backend,fp8kv,chunked_prefill",
@@ -3222,6 +3273,23 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @skip_pre_blackwell
+    def test_nvfp4_attn_multi_gpus(self):
+        """Test with NVFP4 attention checkpoint (kv_a_proj_with_mqa quantized to NVFP4).
+
+        Unlike test_nvfp4_multi_gpus which uses a checkpoint with BF16 attention,
+        this test uses a checkpoint where kv_a_proj_with_mqa, q_a_proj, and q_b_proj
+        are also quantized to NVFP4, while indexer.wk remains BF16 (unfused).
+        """
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-NVFP4-FP4attn",
+                 tensor_parallel_size=4) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
@@ -5762,6 +5830,59 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-35B-A3B"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    def test_bf16(self):
+        world_size = 1
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128])
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=world_size,
+                 moe_expert_parallel_size=world_size,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 max_batch_size=128,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    def test_fp8(self):
+        model_dir = f"{self.MODEL_PATH}-FP8"
+        # Model is being added to CI. Skip at the moment.
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
+
+        world_size = 1
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        moe_config = MoeConfig(backend='DEEPGEMM')
+
+        with LLM(model_dir,
+                 tensor_parallel_size=world_size,
+                 moe_expert_parallel_size=world_size,
+                 max_seq_len=4096,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=moe_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Seed-OSS/Seed-OSS-36B-Instruct"
@@ -6154,7 +6275,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 max_batch_size=32, enable_padding=True) if cuda_graph else None)
 
         with LLM(
-                f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
                 kv_cache_config=kv_cache_config,
                 max_batch_size=32,
                 tensor_parallel_size=tp_size,
@@ -6199,7 +6320,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                            "1" if use_cpp_mamba else "0")
 
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-fp8-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6241,7 +6362,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         # The optimized config is still under investigation.
         # Adding this test as placeholder.
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6317,7 +6438,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_parallelism(self, tp_size, ep_size, pp_size, attention_dp):
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
@@ -6349,7 +6470,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-011526"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
                 kv_cache_config=KvCacheConfig(
@@ -6384,7 +6505,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=max_draft_len,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-011526"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
             model=model_path,
@@ -6443,13 +6564,13 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_fp16_4gpu_mtp_ar(self):
+    def test_bf16_4gpu_mtp_ar(self):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=max_draft_len,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
         llm_common_config = dict(
             model=model_path,
             tensor_parallel_size=4,
@@ -6533,5 +6654,36 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestGLM5FP8(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5-FP8"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5-FP8"
+
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    @pytest.mark.skip_less_device(8)
+    def test_8gpus(self, tp_size, ep_size):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="DEEPGEMM"),
+            speculative_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+            enable_chunked_prefill=True,
+            custom_tokenizer="glm_moe_dsa",
+        )
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)

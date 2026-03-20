@@ -538,6 +538,7 @@ class GenerationResultBase:
                     handler := self._background_error_handler()):
                 handler()
         elif isinstance(response, ErrorResponse):
+            self._done = True
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
                 handler(response.error_msg)
