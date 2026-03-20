@@ -17,6 +17,9 @@
 import glob
 import json
 import os
+import random
+import time
+import urllib.request
 
 import pytest
 import torch
@@ -116,12 +119,21 @@ VBENCH_COMMIT = "98b19513678e99c80d8377fda25ba53b81a491a6"
 DINO_REPO = "https://github.com/facebookresearch/dino.git"
 DINO_HUB_DIR_NAME = "facebookresearch_dino_main"
 
+AESTHETIC_PREDICTOR_URL = (
+    "https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_l_14_linear.pth"
+)
+AESTHETIC_PREDICTOR_FILENAME = "sa_0_4_vit_l_14_linear.pth"
+AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "emb_reader")
+
 
 @pytest.fixture(scope="session")
 def _visual_gen_deps(llm_venv):
-    """Install av + diffusers once per session (shared by all video-gen fixtures)."""
+    """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "git+https://github.com/huggingface/diffusers.git"])
+    # Install ffmpeg system package required by MediaStorage.save_video for MP4 encoding
+    check_call(["apt-get", "update", "-y"], shell=False)
+    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")
@@ -130,6 +142,7 @@ def vbench_repo_root(llm_venv):
     workspace = llm_venv.get_working_directory()
     repo_path = os.path.join(workspace, "VBench_repo")
     _precache_dino_for_torch_hub()
+    _precache_aesthetic_predictor()
     if os.path.exists(repo_path):
         return repo_path
     # Shallow-fetch only the pinned commit to avoid downloading full history (~350 MB)
@@ -185,6 +198,47 @@ def _precache_dino_for_torch_hub():
             ["git", "clone", "--depth", "1", "-b", "main", DINO_REPO, dino_cache],
             shell=False,
         )
+
+
+def _precache_aesthetic_predictor():
+    """Pre-download LAION aesthetic predictor weights to avoid GitHub rate limits.
+
+    VBench's aesthetic_quality dimension downloads sa_0_4_vit_l_14_linear.pth
+    from GitHub via wget at evaluation time.  GitHub often returns HTTP 429
+    (Too Many Requests) in CI environments.  Pre-downloading with retries
+    and proper headers ensures the file is cached before VBench needs it.
+    """
+    os.makedirs(AESTHETIC_PREDICTOR_CACHE_DIR, exist_ok=True)
+    cached_path = os.path.join(AESTHETIC_PREDICTOR_CACHE_DIR, AESTHETIC_PREDICTOR_FILENAME)
+    if os.path.isfile(cached_path):
+        return
+
+    max_retries = 8
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                AESTHETIC_PREDICTOR_URL,
+                headers={"User-Agent": "TensorRT-LLM-CI/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+            tmp_path = cached_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, cached_path)
+            return
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                wait = min(10 * 2**attempt, 120) + random.uniform(0, 5)
+                print(
+                    f"[precache] Aesthetic predictor download attempt {attempt + 1}/{max_retries} "
+                    f"failed ({exc}), retrying in {wait:.0f}s..."
+                )
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"Failed to download aesthetic predictor after {max_retries} attempts: {exc}"
+                ) from exc
 
 
 @pytest.fixture(scope="session")
