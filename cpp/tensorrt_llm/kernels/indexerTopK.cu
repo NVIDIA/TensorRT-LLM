@@ -668,7 +668,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, cudaStream_t const stream)
+    int const preIdxCount, float* heuristicScratch, cudaStream_t const stream)
 {
 
     constexpr int kSortingAlgorithmThreshold = 12288;
@@ -676,12 +676,13 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
-        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold;
+        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+        && heuristicScratch != nullptr;
 
     if (canUseHeuristic)
     {
-        launchHeuristicTopKDecode(
-            logits, seqLens, preIdx, indices, stride0, next_n, topK, preIdxStride, preIdxCount, numRows, stream);
+        launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
+            preIdxStride, preIdxCount, numRows, stream);
     }
     else if (numColumns < kSortingAlgorithmThreshold)
     {

@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/kernels/heuristicTopKDecode.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 
 // Import heuristicTopKJob (__device__ __noinline__) and all helpers.
@@ -77,55 +78,30 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
 
 } // anonymous namespace
 
-void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices, int stride0,
-    int next_n, int topK, int preIdxStride, int preIdxCount, int numRows, cudaStream_t stream)
+void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices,
+    float* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
+    cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(topK == TOP_K, "heuristicTopKDecode requires topK == 2048 (compile-time constant)");
+
     size_t const smemSize = sizeof(KernelSmem);
 
-    static bool configured = false;
-    if (!configured)
+    // Opt-in to extended shared memory. cudaFuncSetAttribute is device-scoped
+    // and cheap — call unconditionally to be safe across multi-GPU processes.
+    if (smemSize > 48u * 1024u)
     {
-        int device = 0;
-        cudaGetDevice(&device);
-        int maxSmem = 0;
-        cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-        if (smemSize > 48u * 1024u && smemSize <= static_cast<size_t>(maxSmem))
-        {
-            cudaFuncSetAttribute(
-                heuristicTopKMultiRowKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
-        }
-        configured = true;
+        cudaFuncSetAttribute(
+            heuristicTopKMultiRowKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
     }
 
-    // Scratch buffer for outputValues — heuristicTopKJob unconditionally writes
-    // to outputValues, and this pattern is needed for optimal SASS quality.
-    float* scratchValues = nullptr;
-    cudaMallocAsync(&scratchValues, static_cast<size_t>(numRows) * topK * sizeof(float), stream);
+    // float4 loads require 16-byte-aligned (4-float) row pointers.
+    // In TRT-LLM the logits stride is always a multiple of tokens_per_block (≥64),
+    // so this condition is never hit. Assert rather than silently allocating.
+    TLLM_CHECK_WITH_INFO(stride0 % 4 == 0 || numRows <= 1,
+        "heuristicTopKDecode requires logits stride0 divisible by 4 for multi-row launch");
 
-    // Alignment: float4 loads need 16-byte aligned per-row pointers.
-    float const* kernelLogits = logits;
-    int kernelStride = stride0;
-    float* alignedLogits = nullptr;
-
-    if (stride0 % 4 != 0 && numRows > 1)
-    {
-        int const alignedStride = (stride0 + 3) & ~3;
-        cudaMallocAsync(&alignedLogits, static_cast<size_t>(numRows) * alignedStride * sizeof(float), stream);
-        cudaMemcpy2DAsync(alignedLogits, static_cast<size_t>(alignedStride) * sizeof(float), logits,
-            static_cast<size_t>(stride0) * sizeof(float), static_cast<size_t>(stride0) * sizeof(float), numRows,
-            cudaMemcpyDeviceToDevice, stream);
-        kernelLogits = alignedLogits;
-        kernelStride = alignedStride;
-    }
-
-    heuristicTopKMultiRowKernel<<<numRows, BLOCK_SIZE, smemSize, stream>>>(kernelLogits, seqLens, preIdx, scratchValues,
-        outIndices, kernelStride, next_n, topK, preIdxStride, preIdxCount);
-
-    cudaFreeAsync(scratchValues, stream);
-    if (alignedLogits)
-    {
-        cudaFreeAsync(alignedLogits, stream);
-    }
+    heuristicTopKMultiRowKernel<<<numRows, BLOCK_SIZE, smemSize, stream>>>(
+        logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK, preIdxStride, preIdxCount);
 }
 
 } // namespace kernels

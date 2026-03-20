@@ -521,11 +521,28 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
+            # Zero-initialize so the first decode step's pre_idx (after +1
+            # offset) points to index 1 — a valid but benign candidate.
+            # Without this, uninitialized memory produces random hint indices.
+            self.heuristic_prev_topk.zero_()
             self.heuristic_pre_idx_staging = self.get_empty(
                 self.cuda_graph_buffers,
                 (self.max_num_sequences, self.sparse_mla_topk),
                 cache_name="heuristic_pre_idx_staging",
                 dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            # Scratch buffer for heuristic TopK kernel output values.
+            # Pre-allocated with stable address for CUDA Graph compatibility
+            # (replaces cudaMallocAsync/cudaFreeAsync inside the kernel launcher).
+            # Shape: [max_gen_tokens, topK] where max_gen_tokens = max_batch * (1 + max_draft).
+            max_gen_tokens = self.max_num_sequences * (1 +
+                                                       self.max_draft_tokens)
+            self.heuristic_scratch_values = self.get_empty(
+                self.cuda_graph_buffers,
+                (max_gen_tokens, self.sparse_mla_topk),
+                cache_name="heuristic_scratch_values",
+                dtype=torch.float32,
                 capture_graph=capture_graph,
             )
 
@@ -575,6 +592,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 (self.num_sms // 2 + 1, 2),
                 cache_name="scheduler_metadata_buffer_mtp3",
                 dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+        # Resize heuristic scratch buffer when max_draft_tokens changes.
+        if self.enable_heuristic_topk:
+            max_gen_tokens = self.max_num_sequences * (1 +
+                                                       self.max_draft_tokens)
+            self.heuristic_scratch_values = self.get_empty(
+                self.cuda_graph_buffers,
+                (max_gen_tokens, self.sparse_mla_topk),
+                cache_name="heuristic_scratch_values",
+                dtype=torch.float32,
                 capture_graph=capture_graph,
             )
 
@@ -1616,6 +1644,7 @@ class Indexer(nn.Module):
                     num_contexts:num_contexts + num_generations]
 
                 pre_idx = None
+                heuristic_scratch = None
                 if self._enable_heuristic_topk:
                     local_layer = metadata.kv_cache_manager.layer_offsets[
                         self.layer_idx]
@@ -1625,6 +1654,9 @@ class Indexer(nn.Module):
                             local_layer, :num_generations])
                     staging[:num_generations] += 1
                     pre_idx = staging[:num_generations]
+                    heuristic_scratch = \
+                        metadata.heuristic_scratch_values[
+                            :num_gen_tokens]
 
                 # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
                 # memory. Beyond 256 tokens the extra memory becomes significant,
@@ -1639,10 +1671,14 @@ class Indexer(nn.Module):
                         next_n)
                 else:
                     torch.ops.trtllm.indexer_topk_decode(
-                        logits_decode, gen_kv_lens_cuda,
+                        logits_decode,
+                        gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                            num_gen_tokens, :], next_n,
-                        self.index_topk, pre_idx=pre_idx)
+                                            num_gen_tokens, :],
+                        next_n,
+                        self.index_topk,
+                        pre_idx=pre_idx,
+                        heuristic_scratch=heuristic_scratch)
             else:
                 # padded
                 positions = torch.arange(
