@@ -1,6 +1,10 @@
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Type
+
+from tensorrt_llm import logger
 
 
 @dataclass
@@ -165,6 +169,104 @@ class DeepSeekR1Parser(BaseReasoningParser):
                                          reasoning_content=reasoning_content)
         raise RuntimeError(
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
+
+
+MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
+    "qwen3": "qwen3",
+    "qwen3_moe": "qwen3",
+    "qwen3_5": "qwen3",
+    "qwen3_5_moe": "qwen3",
+    "qwen3_next": "qwen3",
+    "deepseek_v3": "deepseek-r1",
+    "deepseek_v32": "deepseek-r1",
+    "nemotron_h": "nano-v3",
+}
+
+_QWEN3_MODEL_TYPES = frozenset({
+    "qwen3",
+    "qwen3_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
+    "qwen3_next",
+})
+
+
+def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
+    """Distinguish Qwen3 hybrid / forced-thinking / forced-non-thinking models.
+
+    The Qwen3 family has three reasoning variants with different chat templates:
+    - **Hybrid** (e.g. Qwen3-235B-A22B): the template contains an
+      ``enable_thinking`` flag that lets users toggle ``<think>`` on/off.
+      → use the ``"qwen3"`` reasoning parser.
+    - **Forced-thinking** (e.g. Qwen3-235B-A22B-Thinking-2507): the template
+      always injects ``<think>`` in the generation prompt without any toggle.
+      → use the ``"deepseek-r1"`` parser (``reasoning_at_start=True``).
+    - **Forced-non-thinking** (e.g. Qwen3-235B-A22B-Instruct-2507): the
+      template never injects ``<think>``.
+      → no reasoning parser needed (returns ``None``).
+    """
+    tokenizer_config_path = Path(model) / "tokenizer_config.json"
+    if not tokenizer_config_path.exists():
+        logger.warning(
+            "Cannot read tokenizer_config.json for Qwen3 model at '%s'. "
+            "Defaulting to 'qwen3' reasoning parser. If this is a "
+            "forced-thinking model (*-Thinking-*), use "
+            "'--reasoning_parser deepseek-r1' instead.",
+            model,
+        )
+        return "qwen3"
+
+    with open(tokenizer_config_path) as f:
+        tokenizer_config = json.load(f)
+
+    chat_template = tokenizer_config.get("chat_template", "")
+
+    if "enable_thinking" in chat_template:
+        # Hybrid model: has enable_thinking toggle.
+        return "qwen3"
+
+    if "<think>" in chat_template:
+        # Forced-thinking model: always injects <think> tag.
+        logger.info(
+            "Detected forced-thinking Qwen3 model (no enable_thinking "
+            "toggle, but <think> tag present in chat template). "
+            "Using 'deepseek-r1' reasoning parser.", )
+        return "deepseek-r1"
+
+    # Forced-non-thinking model: no <think> tag at all.
+    logger.info(
+        "Detected forced-non-thinking Qwen3 model (no <think> tag in "
+        "chat template). No reasoning parser needed.", )
+    return None
+
+
+def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
+    """Resolve 'auto' reasoning parser by reading the model's HF config.
+
+    For DeepSeek models, only maps to deepseek-r1 if the model path
+    suggests it is a reasoning model (contains 'R1' in the name).
+
+    For Qwen3 models, inspects the chat template to distinguish hybrid,
+    forced-thinking, and forced-non-thinking variants.
+    """
+    config_path = Path(model) / "config.json"
+    if not config_path.exists():
+        return None
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    model_type = config.get("model_type", "")
+
+    if model_type in ("deepseek_v3", "deepseek_v32"):
+        model_name = Path(model).name.lower()
+        if "r1" not in model_name:
+            return None
+
+    if model_type in _QWEN3_MODEL_TYPES:
+        return _resolve_qwen3_reasoning_parser(model)
+
+    return MODEL_TYPE_TO_REASONING_PARSER.get(model_type)
 
 
 @register_reasoning_parser("nano-v3")

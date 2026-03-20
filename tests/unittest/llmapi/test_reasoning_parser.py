@@ -1,6 +1,10 @@
+import json
+import os
+
 import pytest
 
-from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
+                                                  resolve_auto_reasoning_parser)
 
 R1_START, R1_END = "<think>", "</think>"
 
@@ -193,3 +197,121 @@ def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
     result = reasoning_parser.finish()
     assert result.content == finish_content
     assert result.reasoning_content == finish_reasoning
+
+
+# ---------------------------------------------------------------------------
+# Auto-detection tests for resolve_auto_reasoning_parser
+# ---------------------------------------------------------------------------
+
+
+def _write_config(model_dir: str, model_type: str):
+    """Write a minimal config.json with the given model_type."""
+    with open(os.path.join(model_dir, "config.json"), "w") as f:
+        json.dump({"model_type": model_type}, f)
+
+
+def _write_tokenizer_config(model_dir: str, chat_template: str):
+    """Write a minimal tokenizer_config.json with the given chat_template."""
+    with open(os.path.join(model_dir, "tokenizer_config.json"), "w") as f:
+        json.dump({"chat_template": chat_template}, f)
+
+
+# Hybrid Qwen3: chat template contains "enable_thinking" → use "qwen3" parser
+_HYBRID_TEMPLATE = (
+    "{%- if enable_thinking is not defined %}{% set enable_thinking = true %}"
+    "{% endif %}{%- if add_generation_prompt %}{%- if enable_thinking %}"
+    "{{- '<|im_start|>assistant\\n<think>\\n' }}{%- else %}"
+    "{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}"
+    "{%- endif %}{%- endif %}")
+
+# Forced-thinking Qwen3: no "enable_thinking" but has "<think>" → "deepseek-r1"
+_FORCED_THINKING_TEMPLATE = ("{%- if add_generation_prompt %}"
+                             "{{- '<|im_start|>assistant\\n<think>\\n' }}"
+                             "{%- endif %}")
+
+# Forced-non-thinking Qwen3: no "enable_thinking" and no "<think>" → None
+_FORCED_NON_THINKING_TEMPLATE = ("{%- if add_generation_prompt %}"
+                                 "{{- '<|im_start|>assistant\\n' }}"
+                                 "{%- endif %}")
+
+
+def test_auto_detect_qwen3_hybrid(tmp_path):
+    """Hybrid Qwen3 model with enable_thinking toggle → 'qwen3' parser."""
+    model_dir = str(tmp_path / "Qwen3-235B-A22B")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_moe")
+    _write_tokenizer_config(model_dir, _HYBRID_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3"
+
+
+def test_auto_detect_qwen3_forced_thinking(tmp_path):
+    """Forced-thinking Qwen3 model → 'deepseek-r1' parser."""
+    model_dir = str(tmp_path / "Qwen3-235B-A22B-Thinking-2507")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_moe")
+    _write_tokenizer_config(model_dir, _FORCED_THINKING_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "deepseek-r1"
+
+
+def test_auto_detect_qwen3_forced_non_thinking(tmp_path):
+    """Forced-non-thinking Qwen3 model → None (no parser needed)."""
+    model_dir = str(tmp_path / "Qwen3-235B-A22B-Instruct-2507")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_moe")
+    _write_tokenizer_config(model_dir, _FORCED_NON_THINKING_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result is None
+
+
+def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
+    """Qwen3 model without tokenizer_config.json → falls back to 'qwen3'."""
+    model_dir = str(tmp_path / "Qwen3-SomeModel")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3"
+
+
+def test_auto_detect_deepseek_r1(tmp_path):
+    """DeepSeek R1 model → 'deepseek-r1' parser."""
+    model_dir = str(tmp_path / "DeepSeek-R1")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "deepseek_v3")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "deepseek-r1"
+
+
+def test_auto_detect_deepseek_non_r1(tmp_path):
+    """DeepSeek non-R1 model → None."""
+    model_dir = str(tmp_path / "DeepSeek-V3")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "deepseek_v3")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result is None
+
+
+def test_auto_detect_unknown_model(tmp_path):
+    """Unknown model type → None."""
+    model_dir = str(tmp_path / "SomeUnknownModel")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "unknown_type")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result is None
+
+
+def test_auto_detect_no_config(tmp_path):
+    """No config.json → None."""
+    model_dir = str(tmp_path / "EmptyDir")
+    os.makedirs(model_dir)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result is None
