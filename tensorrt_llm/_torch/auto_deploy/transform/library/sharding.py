@@ -1568,19 +1568,23 @@ def shard_weight_tensor(
     sharded_weight = f_split(weight_tensor)
     sharded_shape = sharded_weight.shape
 
-    # Register load hook
-    gm._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=param_key,
-            param_shape=sharded_shape,
-        )
-    )
-
     # Update the parameter in the module
     modname, _, param_name = param_key.rpartition(".")
     submod = gm.get_submodule(modname)
+
+    # Register load hook on the owning submodule (not the top-level gm).
+    # This ensures the hook runs *after* any parent-level hooks that transform
+    # the state_dict (e.g., unfusing fused MoE checkpoint weights into
+    # individual expert keys). With the hook on gm, it would run before
+    # unfusing and fail to find the individual expert keys.
+    submod._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=f_split,
+            param_key=param_name,
+            param_shape=sharded_shape,
+        )
+    )
     param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
     setattr(submod, param_name, param_new)
 
@@ -1810,12 +1814,13 @@ def _tp_shard_moe_scale(
     sharded_scale = f_split(scale_tensor)
     submod.register_buffer(attr_name, sharded_scale)
 
-    # Register load hook so state_dict loading also TP-shards the scale
-    gm._register_load_state_dict_pre_hook(
+    # Register load hook on the owning submodule so it runs after any
+    # parent-level checkpoint format conversion hooks (e.g., fused MoE unfusing).
+    submod._register_load_state_dict_pre_hook(
         partial(
             _load_hook,
             f_split=f_split,
-            param_key=param_key,
+            param_key=attr_name,
             param_shape=sharded_scale.shape,
         )
     )
