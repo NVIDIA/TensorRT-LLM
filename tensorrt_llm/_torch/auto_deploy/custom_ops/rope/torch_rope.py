@@ -17,7 +17,7 @@ from typing import Tuple
 
 import torch
 
-from .triton_kernels.rope_with_cos_sin import rope_with_cos_sin as _triton_rope_with_cos_sin
+from .triton_rope_with_cos_sin import rope_with_cos_sin as _triton_rope_with_cos_sin
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
