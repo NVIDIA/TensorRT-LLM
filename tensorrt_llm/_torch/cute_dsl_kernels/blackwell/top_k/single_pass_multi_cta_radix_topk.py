@@ -437,8 +437,13 @@ class SinglePassMultiCTARadixTopKKernel:
     ):
         """Build per-CTA histogram on smem data and atomicAdd to global."""
         self.build_local_histogram(
-            shared_ordered, actual_chunk_size, prefix, prefix_mask, shift,
-            local_histogram, tidx,
+            shared_ordered,
+            actual_chunk_size,
+            prefix,
+            prefix_mask,
+            shift,
+            local_histogram,
+            tidx,
         )
 
         # Merge to global histogram
@@ -846,9 +851,16 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
         self._collect_pass_gt(
-            shared_ordered, chunk_start, prologue_elems, aligned_size,
-            left_size, ordered_pivot, local_histogram,
-            output_indices_row, output_values_row, tidx,
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            ordered_pivot,
+            local_histogram,
+            output_indices_row,
+            output_values_row,
+            tidx,
         )
 
         # Inter-CTA barrier between pass 1 and pass 2 (only thread 0 signals)
@@ -859,9 +871,17 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # Pass 2: equal to pivot
         self._collect_pass_eq(
-            shared_ordered, chunk_start, prologue_elems, aligned_size,
-            left_size, ordered_pivot, top_k, output_counter_ptr,
-            output_indices_row, output_values_row, tidx,
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            ordered_pivot,
+            top_k,
+            output_counter_ptr,
+            output_indices_row,
+            output_values_row,
+            tidx,
         )
 
         return barrier_phase

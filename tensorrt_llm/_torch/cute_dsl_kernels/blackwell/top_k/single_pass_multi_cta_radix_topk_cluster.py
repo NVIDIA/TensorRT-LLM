@@ -305,9 +305,16 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
 
         # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
         self._collect_pass_gt(
-            shared_ordered, chunk_start, prologue_elems, aligned_size,
-            left_size, ordered_pivot, local_histogram,
-            output_indices_row, output_values_row, tidx,
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            ordered_pivot,
+            local_histogram,
+            output_indices_row,
+            output_values_row,
+            tidx,
         )
 
         # Cluster barrier between pass 1 and pass 2
@@ -316,9 +323,17 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
 
         # Pass 2: equal to pivot
         self._collect_pass_eq(
-            shared_ordered, chunk_start, prologue_elems, aligned_size,
-            left_size, ordered_pivot, top_k, output_counter_ptr,
-            output_indices_row, output_values_row, tidx,
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            ordered_pivot,
+            top_k,
+            output_counter_ptr,
+            output_indices_row,
+            output_values_row,
+            tidx,
         )
 
     # ------------------------------------------------------------------
