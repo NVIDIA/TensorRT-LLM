@@ -18,6 +18,7 @@
 
 #include <numeric>
 #include <stdexcept>
+#include <string>
 
 namespace tensorrt_llm::batch_manager::state_manager {
 
@@ -42,6 +43,10 @@ BlockPool::BlockPool(vmm::CudaVmmArena*       arena,
     blockSizeBytes_ = elementSize_
         * std::accumulate(dimensions_.begin(), dimensions_.end(),
                           std::size_t{1}, std::multiplies<std::size_t>{});
+
+    // Reserve the full maximum capacity upfront so that pointers into blocks_
+    // remain stable through all future grow() calls.
+    blocks_.reserve(arena_->max_size() / blockSizeBytes_);
 }
 
 void BlockPool::grow(std::size_t newNumBlocks)
@@ -53,10 +58,13 @@ void BlockPool::grow(std::size_t newNumBlocks)
     // Grow the arena first; this may throw if the arena's max_size is exceeded.
     arena_->grow(newNumBlocks * blockSizeBytes_);
 
-    // Append metadata for each newly committed block.
-    blocks_.reserve(newNumBlocks);
+    // Append metadata for each newly committed block and enqueue on free list.
+    // No reallocation occurs because the vector was reserved to max capacity.
     for (std::size_t i = blocks_.size(); i < newNumBlocks; ++i)
+    {
         blocks_.emplace_back(i);
+        freeBlocks_.push_back(&blocks_.back());
+    }
 }
 
 void BlockPool::shrink(std::size_t newNumBlocks)
@@ -74,11 +82,41 @@ void BlockPool::shrink(std::size_t newNumBlocks)
                 + " has non-zero reference count (" + std::to_string(blocks_[i].refCount()) + ").");
     }
 
-    // Drop tail metadata before releasing physical pages.
+    // Remove tail block pointers from the free list before destroying metadata.
+    Block* tailBegin = &blocks_[newNumBlocks];
+    Block* tailEnd   = &blocks_[blocks_.size()];
+    freeBlocks_.remove_if([tailBegin, tailEnd](Block* p)
+    {
+        return p >= tailBegin && p < tailEnd;
+    });
+
+    // Destroy tail Block metadata.
     blocks_.erase(blocks_.begin() + static_cast<std::ptrdiff_t>(newNumBlocks), blocks_.end());
 
     // Shrink the arena; releases physical pages backing the removed blocks.
     arena_->shrink(newNumBlocks * blockSizeBytes_);
+}
+
+Block& BlockPool::acquireBlock()
+{
+    if (freeBlocks_.empty())
+        throw std::runtime_error("BlockPool::acquireBlock(): no free blocks available.");
+
+    Block* block = freeBlocks_.front();
+    freeBlocks_.pop_front();
+    block->incRef();
+    return *block;
+}
+
+void BlockPool::releaseBlock(Block& block)
+{
+    block.decRef();
+    if (!block.isFree())
+        throw std::runtime_error(
+            "BlockPool::releaseBlock(): block " + std::to_string(block.offset)
+            + " still has non-zero reference count (" + std::to_string(block.refCount())
+            + ") after release.");
+    freeBlocks_.push_back(&block);
 }
 
 } // namespace tensorrt_llm::batch_manager::state_manager

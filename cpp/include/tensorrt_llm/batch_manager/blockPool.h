@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/cudaVmmArena.h"
 
 #include <cstddef>
+#include <list>
 #include <stdexcept>
 #include <vector>
 
@@ -112,17 +113,30 @@ public:
     // -----------------------------------------------------------------------
 
     /// Grow the pool to `newNumBlocks` total blocks.
-    /// Grows the underlying arena to accommodate the new blocks, then appends
-    /// Block metadata objects for each newly committed slot.
+    /// Grows the underlying arena to accommodate the new blocks, appends Block
+    /// metadata objects for each newly committed slot, and enqueues them on
+    /// the free list.
     /// Throws if newNumBlocks <= block_count(), or if the arena cannot grow.
     void grow(std::size_t newNumBlocks);
 
     /// Shrink the pool to `newNumBlocks` total blocks.
-    /// Removes tail Block metadata objects, then shrinks the underlying arena
-    /// to release the corresponding physical pages.
+    /// Removes tail Block metadata objects from the free list, releases the
+    /// underlying arena pages, then destroys the metadata.
     /// Throws if newNumBlocks >= block_count(), or if any block that would be
     /// removed has a non-zero reference count.
     void shrink(std::size_t newNumBlocks);
+
+    /// Remove the front block from the free list, increment its reference
+    /// count, and return a reference to it.
+    /// Throws std::runtime_error if the free list is empty.
+    Block& acquireBlock();
+
+    /// Decrement the reference count of `block` and return it to the back of
+    /// the free list.
+    /// Throws std::runtime_error if the reference count is non-zero after
+    /// decrementing (i.e. the block was acquired more than once without a
+    /// matching release).
+    void releaseBlock(Block& block);
 
     // -----------------------------------------------------------------------
     // Accessors
@@ -136,6 +150,9 @@ public:
 
     /// Read-only ordered view of all committed Block metadata objects.
     const std::vector<Block>& blocks() const noexcept { return blocks_; }
+
+    /// Number of blocks currently on the free list.
+    std::size_t freeCount() const noexcept { return freeBlocks_.size(); }
 
     /// Raw CUdeviceptr to the first byte of `block` in the arena.
     CUdeviceptr blockPtr(const Block& block) const noexcept {
@@ -162,7 +179,12 @@ private:
     std::size_t              elementSize_;
     std::vector<std::size_t> dimensions_;
     std::size_t              blockSizeBytes_;
+    /// All committed Block objects, in creation order.
+    /// Reserved to max capacity at construction so pointers into this vector
+    /// remain stable for the lifetime of the pool.
     std::vector<Block>       blocks_;
+    /// FIFO free list; each entry is a non-owning pointer into blocks_.
+    std::list<Block*>        freeBlocks_;
 };
 
 } // namespace tensorrt_llm::batch_manager::state_manager
