@@ -37,12 +37,24 @@ class WaitingQueue(ABC):
 
     @abstractmethod
     def prepend_request(self, request: RequestQueueItem) -> None:
-        """Prepend a request to the front of the queue."""
+        """Re-insert a request that could not be scheduled.
+
+        Implementations must ensure the request is served before any request
+        that was added *after* it originally arrived (i.e. it does not lose
+        its place to later-arriving requests of equal priority).  For FCFS
+        queues this means inserting at the front; for priority queues this
+        means using a tiebreaker that sorts ahead of normally-added entries.
+        """
         pass
 
     @abstractmethod
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
-        """Prepend all requests from another iterable to the front of this queue."""
+        """Re-insert multiple requests that could not be scheduled.
+
+        See prepend_request for the ordering contract.  Callers should pass
+        requests in *reverse* original order so that the first request in the
+        original queue comes out first after re-insertion.
+        """
         pass
 
     @abstractmethod
@@ -70,26 +82,28 @@ class FCFSWaitingQueue(deque, WaitingQueue):
     """A first-come-first-served queue that supports deque operations."""
 
     @staticmethod
-    def _warn_if_priority_set(request: RequestQueueItem) -> None:
+    def _warn_if_priority_set(request: RequestQueueItem, stacklevel: int = 3) -> None:
         if request.request is not None and request.request.priority != DEFAULT_REQUEST_PRIORITY:
             warnings.warn(
                 "A request has a non-default priority but the FCFS waiting "
                 "queue is in use; the priority value will be ignored. "
                 "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling.",
                 UserWarning,
-                stacklevel=3,
+                stacklevel=stacklevel,
             )
 
     def add_request(self, request: RequestQueueItem) -> None:
         """Add a request to the queue according to FCFS policy."""
-        self._warn_if_priority_set(request)
+        # stacklevel=3: caller → add_request → _warn_if_priority_set
+        self._warn_if_priority_set(request, stacklevel=3)
         self.append(request)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Add multiple requests to the queue according to FCFS policy."""
         requests = list(requests)
         for request in requests:
-            self._warn_if_priority_set(request)
+            # stacklevel=2: caller → add_requests → _warn_if_priority_set
+            self._warn_if_priority_set(request, stacklevel=2)
         self.extend(requests)
 
     def pop_request(self) -> RequestQueueItem:
@@ -154,9 +168,13 @@ class PriorityWaitingQueue(WaitingQueue):
     def __init__(self) -> None:
         # Min-heap of (neg_priority, insertion_counter, RequestQueueItem).
         self._heap: list[tuple] = []
-        # itertools.count() is thread-safe (backed by a C-level atomic),
-        # ensuring correct FCFS tiebreaking under concurrent access.
+        # _counter assigns strictly increasing non-negative integers to
+        # normally-added requests for FCFS tiebreaking within a priority cohort.
+        # _prepend_counter assigns strictly decreasing negative integers to
+        # prepended requests, guaranteeing they sort before any normally-added
+        # request of the same priority.
         self._counter = itertools.count()
+        self._prepend_counter = itertools.count(-1, -1)
 
     def _get_priority(self, item: RequestQueueItem) -> float:
         if item.request is not None:
@@ -165,6 +183,10 @@ class PriorityWaitingQueue(WaitingQueue):
 
     def _push(self, item: RequestQueueItem) -> None:
         entry = (-self._get_priority(item), next(self._counter), item)
+        heapq.heappush(self._heap, entry)
+
+    def _push_front(self, item: RequestQueueItem) -> None:
+        entry = (-self._get_priority(item), next(self._prepend_counter), item)
         heapq.heappush(self._heap, entry)
 
     def add_request(self, request: RequestQueueItem) -> None:
@@ -190,13 +212,26 @@ class PriorityWaitingQueue(WaitingQueue):
         return self._heap[0][2]
 
     def prepend_request(self, request: RequestQueueItem) -> None:
-        """Re-insert the request at the position dictated by its priority."""
-        self._push(request)
+        """Re-insert a request ahead of all normally-added requests of the same priority.
+
+        Uses a strictly decreasing counter so the request sorts before any
+        request added via add_request / add_requests, preserving FCFS order
+        within a priority cohort when requests are returned to the queue.
+        """
+        self._push_front(request)
 
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
-        """Re-insert requests at the positions dictated by their priorities."""
+        """Re-insert requests ahead of all normally-added requests of the same priority.
+
+        Requests are pushed in iteration order; because _prepend_counter
+        decreases on each call, the first item in ``requests`` ends up with
+        the largest (least-negative) prepend counter and therefore the last
+        item ends up at the front within its priority cohort.  Callers that
+        need the original queue order to be restored should pass the requests
+        in *reverse* original order (as request_utils.py does).
+        """
         for request in requests:
-            self._push(request)
+            self._push_front(request)
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
         """Remove requests with the given IDs."""
@@ -210,7 +245,11 @@ class PriorityWaitingQueue(WaitingQueue):
         return len(self._heap)
 
     def __iter__(self) -> Iterator[RequestQueueItem]:
-        """Iterate over requests in descending priority order."""
+        """Iterate over requests in descending priority order.
+
+        Returns a generator over a snapshot of the heap taken at call time.
+        Modifications to the queue after iteration begins are not reflected.
+        """
         return (e[2] for e in sorted(self._heap))
 
 

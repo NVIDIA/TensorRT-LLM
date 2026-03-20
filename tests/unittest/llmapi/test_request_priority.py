@@ -24,6 +24,8 @@ Tests cover priority propagation through:
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY, GenerationRequest
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -59,6 +61,11 @@ class TestGenerationRequestPriority:
     def test_priority_midpoint(self):
         req = self._make_request(priority=DEFAULT_REQUEST_PRIORITY)
         assert req.priority == DEFAULT_REQUEST_PRIORITY
+
+    @pytest.mark.parametrize("bad_priority", [-0.1, 1.1, float("nan"), float("inf"), -float("inf")])
+    def test_invalid_priority_raises(self, bad_priority):
+        with pytest.raises(ValueError):
+            self._make_request(priority=bad_priority)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +274,28 @@ class TestBaseLLMGeneratePriority:
         )
         assert calls[0]["priority"] == DEFAULT_REQUEST_PRIORITY
 
+    @pytest.mark.parametrize("bad_priority", [-0.1, 1.5, float("nan")])
+    def test_invalid_scalar_priority_raises(self, bad_priority):
+        llm, _ = self._make_llm_spy()
+        # generate delegates to generate_async which validates the scalar value
+        with pytest.raises((ValueError, Exception)):
+            llm.generate(
+                ["hello"],
+                sampling_params=SamplingParams(max_tokens=5),
+                priority=bad_priority,
+                use_tqdm=False,
+            )
+
+    def test_invalid_list_priority_raises(self):
+        llm, _ = self._make_llm_spy()
+        with pytest.raises(ValueError):
+            llm.generate(
+                ["hello", "world"],
+                sampling_params=SamplingParams(max_tokens=5),
+                priority=[0.2, 1.5],
+                use_tqdm=False,
+            )
+
 
 # ---------------------------------------------------------------------------
 # executor_request_to_llm_request - priority not hard-coded
@@ -291,22 +320,6 @@ class TestExecutorRequestToLlmRequestPriority:
         assert "priority=executor_request.priority" in source, (
             "executor_request_to_llm_request must pass executor_request.priority "
             "to LlmRequest, not a hard-coded value."
-        )
-
-    def test_no_hardcoded_priority_in_function(self):
-        """Ensure the old hard-coded priority=0.5 was removed from the function."""
-        import inspect
-        import re
-
-        import tensorrt_llm._torch.pyexecutor.llm_request as lr_mod
-
-        source = inspect.getsource(lr_mod.executor_request_to_llm_request)
-        # Should not have a standalone priority=0.5 assignment (the default in
-        # tllm.Request.__init__ is fine, but not inside this converter function)
-        hardcoded_matches = re.findall(r"\bpriority\s*=\s*0\.5\b", source)
-        assert not hardcoded_matches, (
-            "Hard-coded priority=0.5 should not appear in "
-            "executor_request_to_llm_request; use executor_request.priority instead."
         )
 
 

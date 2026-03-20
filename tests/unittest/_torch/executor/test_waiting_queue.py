@@ -335,6 +335,72 @@ class TestPriorityWaitingQueue:
         )
         assert [q.pop_request().id for _ in range(3)] == [2, 1, 3]
 
+    def test_prepend_request_beats_later_arrivals_of_same_priority(self):
+        """A prepended request comes out before same-priority requests added after it."""
+        q = PriorityWaitingQueue()
+        # Add two requests, then pop the first one to simulate the DP-constraint path.
+        req_a = create_priority_request_item(1, priority=0.5)
+        req_b = create_priority_request_item(2, priority=0.5)
+        q.add_request(req_a)
+        q.add_request(req_b)
+        popped = q.pop_request()  # removes req_a (earliest arrival)
+        assert popped.id == 1
+
+        # A new request arrives while req_a was being processed.
+        req_c = create_priority_request_item(3, priority=0.5)
+        q.add_request(req_c)
+
+        # req_a is returned to the queue (couldn't be scheduled).
+        q.prepend_request(popped)
+
+        # req_a should still come out before req_c despite req_c being in the
+        # queue before the prepend call.
+        assert q.pop_request().id == 1  # req_a
+        assert q.pop_request().id == 2  # req_b
+        assert q.pop_request().id == 3  # req_c
+
+    def test_prepend_requests_restores_original_queue_order(self):
+        """Simulates the request_utils.py pattern: pop several requests that
+        cannot be scheduled, then prepend them back in reversed order.  The
+        resulting pop sequence must match the original queue order."""
+        q = PriorityWaitingQueue()
+        # Original queue: A(0.9) > B(0.5) > C(0.5) — B and C tied on priority,
+        # so B comes before C by FCFS.
+        req_a = create_priority_request_item(1, priority=0.9)
+        req_b = create_priority_request_item(2, priority=0.5)
+        req_c = create_priority_request_item(3, priority=0.5)
+        q.add_request(req_a)
+        q.add_request(req_b)
+        q.add_request(req_c)
+
+        # Simulate the scheduler dequeuing all three but failing to schedule them.
+        pending = [q.pop_request(), q.pop_request(), q.pop_request()]
+        assert [r.id for r in pending] == [1, 2, 3]
+
+        # Put them back using the reversed-order convention from request_utils.py.
+        q.prepend_requests(reversed(pending))
+
+        # Order must be fully restored.
+        assert [q.pop_request().id for _ in range(3)] == [1, 2, 3]
+
+    def test_prepend_requests_does_not_starve_across_multiple_rounds(self):
+        """A request returned to the queue multiple times still comes out
+        ahead of newly-arrived requests of the same priority."""
+        q = PriorityWaitingQueue()
+        req_a = create_priority_request_item(1, priority=0.5)
+        q.add_request(req_a)
+
+        # Simulate req_a being returned to the queue twice (two scheduling rounds
+        # where it couldn't run due to resource constraints).
+        for _ in range(2):
+            popped = q.pop_request()
+            # New request arrives while req_a couldn't be scheduled.
+            q.add_request(create_priority_request_item(99, priority=0.5))
+            q.prepend_request(popped)
+
+        # req_a must still be served before the newly-arrived requests.
+        assert q.pop_request().id == 1
+
     # ------------------------------------------------------------------
     # remove_by_ids
     # ------------------------------------------------------------------

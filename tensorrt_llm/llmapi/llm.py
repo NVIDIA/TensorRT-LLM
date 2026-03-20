@@ -340,10 +340,18 @@ class BaseLLM:
 
         inputs = [prompt_inputs(i) for i in inputs]
 
-        if isinstance(priority, list) and len(priority) != len(inputs):
-            raise ValueError(
-                f"priority list length ({len(priority)}) does not match "
-                f"number of prompts ({len(inputs)})")
+        if isinstance(priority, list):
+            if len(priority) != len(inputs):
+                raise ValueError(
+                    f"priority list length ({len(priority)}) does not match "
+                    f"number of prompts ({len(inputs)})")
+            for p in priority:
+                if not 0.0 <= p <= 1.0:
+                    raise ValueError(
+                        f"each priority must be in [0, 1], got {p}")
+        else:
+            if not 0.0 <= priority <= 1.0:
+                raise ValueError(f"priority must be in [0, 1], got {priority}")
 
         def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
             if isinstance(maybe_batched, list):

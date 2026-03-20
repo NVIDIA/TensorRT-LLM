@@ -1,4 +1,3 @@
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -135,7 +134,7 @@ class GenerationRequest:
         self.scheduling_params = scheduling_params
         self.cache_salt_id = cache_salt_id
         self.arrival_time = arrival_time
-        if math.isnan(priority) or not (0.0 <= priority <= 1.0):
+        if not (0.0 <= priority <= 1.0):
             raise ValueError(
                 f"priority must be a float in [0.0, 1.0], got {priority}")
         self.priority = priority
