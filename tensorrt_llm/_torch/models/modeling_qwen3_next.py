@@ -22,6 +22,7 @@ import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -34,6 +35,8 @@ from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import \
     fused_sigmoid_gating_delta_rule_update
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor.config_utils import \
+    get_qwen3_hybrid_layer_types
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import get_sm_version
@@ -45,7 +48,7 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, create_moe)
@@ -154,6 +157,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
+        # Qwen3.5 BF16 checkpoints store fused [gate_up_proj, down_proj] per
+        # expert, while Qwen3Next and Qwen3.5 FP8 checkpoints store separate
+        # gate_proj/up_proj/down_proj (vanilla).  The model_type is set by HF
+        # config.json: "qwen3_5_moe_text" for Qwen3.5, "qwen3_next" otherwise.
+        weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+                               if config.model_type == "qwen3_5_moe_text" else
+                               MoEWeightLoadingMode.VANILLA)
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -164,6 +174,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             reduce_results=False,
             model_config=model_config,
             layer_idx=layer_idx,
+            weight_loading_mode=weight_loading_mode,
         )
 
         self.shared_expert = GatedMLP(
@@ -1202,12 +1213,12 @@ class Qwen3NextModel(DecoderModel):
                 gather_output=True,
             )
 
+        layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
         self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[pretrained_config.layer_types[layer_idx]](
-                model_config,
-                layer_idx,
-                self.aux_stream,
-            ) for layer_idx in range(pretrained_config.num_hidden_layers)
+            ALL_DECODER_LAYER_TYPES[layer_types[layer_idx]](model_config,
+                                                            layer_idx,
+                                                            self.aux_stream)
+            for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
 
         self.norm = RMSNorm(

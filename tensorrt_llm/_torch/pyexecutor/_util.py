@@ -28,7 +28,8 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
+from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid)
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -59,7 +60,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_nemotron_hybrid(config) or is_qwen3_next(config):
+    elif is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
         return MambaHybridCacheManager
     else:
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
@@ -128,6 +129,10 @@ class KvCacheCreator:
         self._draft_config = draft_config
         self._skip_est = skip_est
 
+    def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
+        return get_kv_cache_manager_cls(model_engine.model.model_config,
+                                        self._kv_cache_config)
+
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
@@ -135,7 +140,9 @@ class KvCacheCreator:
             model_config, mapping, tokens_per_block=self._tokens_per_block)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
-            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+            draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+                self._draft_model_engine)
+            kv_size_per_token += draft_kv_cache_manager_cls.get_cache_size_per_token(
                 draft_model_config,
                 mapping,
                 tokens_per_block=self._tokens_per_block)
@@ -528,6 +535,8 @@ class KvCacheCreator:
             estimating_kv_cache: bool = False) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
+        kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+            model_engine)
 
         # When using separate draft KV cache in one-model speculative decoding,
         # use layer_mask to include only target layers. The draft layers should
@@ -541,7 +550,7 @@ class KvCacheCreator:
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
-            kv_cache_manager_cls=self._kv_cache_manager_cls,
+            kv_cache_manager_cls=kv_cache_manager_cls,
             mapping=mapping,
             kv_cache_config=self._kv_cache_config,
             tokens_per_block=self._tokens_per_block,
@@ -1006,7 +1015,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
         )
-    elif is_qwen3_next(config):
+    elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -1015,19 +1024,10 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-        mamba_layer_mask = [
-            True if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else False for i in range(num_hidden_layers)
-        ]
-        hybrid_layer_mask = [
-            False if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else True for i in range(num_hidden_layers)
-        ]
-        num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
-            config.full_attention_interval - 1)
-        num_layers = num_hidden_layers - num_mamba_layers
+        hybrid_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
+            config)
+        num_layers = sum(hybrid_layer_mask)
+        num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.linear_key_head_dim,

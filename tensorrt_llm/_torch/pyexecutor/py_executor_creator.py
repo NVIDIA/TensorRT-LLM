@@ -36,7 +36,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
+from .config_utils import is_nemotron_hybrid, is_qwen3_hybrid
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
@@ -171,6 +171,13 @@ class _ExecutorMemoryMonitor:
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+
+
+def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
+    for engine in model_engines:
+        if engine is None:
+            continue
+        engine.attn_runtime_features.cache_reuse = cache_reuse
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -522,6 +529,13 @@ def create_py_executor(
         cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
+    if (is_nemotron_hybrid(config)
+            or is_qwen3_hybrid(config)) and kv_cache_config.enable_block_reuse:
+        logger.warning(
+            "Disabling block reuse for MambaHybridCacheManager-based models")
+        kv_cache_config.enable_block_reuse = False
+        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                       False)
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -694,7 +708,7 @@ def create_py_executor(
         # Disagg for hybrid models is currently only supported with C++ RnnStateManager
         config = model_engine.model.model_config.pretrained_config
         if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
-            if is_nemotron_hybrid(config) or is_qwen3_next(config):
+            if is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
                 logger.info("Disaggregated serving with hybrid model detected. "
                             "Enabling C++ MambaCacheManager automatically.")
                 os.environ['TRTLLM_USE_CPP_MAMBA'] = '1'
