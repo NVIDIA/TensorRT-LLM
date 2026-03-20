@@ -136,9 +136,11 @@ class SuffixAutomatonManager(BaseResourceManager):
         # global pool is off, or max(64, max_num_requests) / explicit
         # value when on. All slot-indexed sizing uses pool_size.
         self.pool_size = sa_config.effective_pool_size
-        assert self.pool_size >= max_num_requests, (
-            f"global_pool_size ({self.pool_size}) must be >= max_batch_size ({max_num_requests})"
-        )
+        if self.pool_size < max_num_requests:
+            raise ValueError(
+                f"global_pool_size ({self.pool_size}) must be >= "
+                f"max_batch_size ({max_num_requests})"
+            )
 
         # Calculate per-state size based on max_seq_len
         self.state_size = _sa_native.get_state_size(self.max_seq_len)

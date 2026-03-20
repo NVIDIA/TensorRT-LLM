@@ -3577,6 +3577,14 @@ class TorchLlmArgs(BaseLlmArgs):
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
+            if isinstance(self.speculative_config, SADecodingConfig):
+                pool_size = self.speculative_config.global_pool_size
+                if pool_size is not None and self.max_batch_size is not None:
+                    if pool_size < self.max_batch_size:
+                        raise ValueError(
+                            f"global_pool_size ({pool_size}) must be >= "
+                            f"max_batch_size ({self.max_batch_size})")
+
             if isinstance(self.speculative_config,
                           SaveHiddenStatesDecodingConfig):
                 logger.warning(
