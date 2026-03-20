@@ -2065,20 +2065,23 @@ class OpenAIServer:
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
 
-            # Delete the video file(s) - check for both .mp4 and .avi
-            video_path = None
-            if job.output_path and os.path.exists(job.output_path):
-                video_path = job.output_path
+            # Delete all generated video files (batch-aware)
+            paths_to_delete: list[str] = []
+            if job.output_paths:
+                paths_to_delete.extend(job.output_paths)
+            elif job.output_path:
+                paths_to_delete.append(job.output_path)
             else:
                 # Fall back to checking common extensions
                 for ext in [".mp4", ".avi"]:
                     candidate = self.media_storage_path / f"{video_id}{ext}"
                     if os.path.exists(candidate):
-                        video_path = candidate
+                        paths_to_delete.append(str(candidate))
                         break
 
-            if video_path and os.path.exists(video_path):
-                os.remove(video_path)
+            for video_path in paths_to_delete:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
 
             # Delete from store
             success = await VIDEO_STORE.pop(video_id)

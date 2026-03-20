@@ -938,8 +938,8 @@ class TestDeleteVideo:
         )
         video_id = create_resp.json()["id"]
 
-        # Write a dummy video file
-        (tmp_path / f"{video_id}.mp4").write_bytes(b"\x00" * 32)
+        # Write a dummy video file matching the batch naming convention
+        (tmp_path / f"{video_id}_0.mp4").write_bytes(b"\x00" * 32)
 
         resp = client.delete(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
@@ -951,7 +951,7 @@ class TestDeleteVideo:
         assert resp.status_code == 404
 
         # Verify file is deleted
-        assert not (tmp_path / f"{video_id}.mp4").exists()
+        assert not (tmp_path / f"{video_id}_0.mp4").exists()
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
     def test_delete_video_not_found(self, video_client):
