@@ -340,14 +340,14 @@ files = [
 
 [[package]]
 name = "attrs"
-version = "25.4.0"
+version = "26.1.0"
 description = "Classes Without Boilerplate"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "attrs-25.4.0-py3-none-any.whl", hash = "sha256:adcf7e2a1fb3b36ac48d97835bb6d8ade15b8dcce26aba8bf1d14847b57a3373"},
-    {file = "attrs-25.4.0.tar.gz", hash = "sha256:16d5969b87f0859ef33a48b35d55ac1be6e42ae49d5e853b597db70c35c57e11"},
+    {file = "attrs-26.1.0-py3-none-any.whl", hash = "sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309"},
+    {file = "attrs-26.1.0.tar.gz", hash = "sha256:d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32"},
 ]
 
 [[package]]
@@ -1992,27 +1992,27 @@ all = ["flake8 (>=7.1.1)", "mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2
 
 [[package]]
 name = "importlib-metadata"
-version = "8.7.1"
+version = "8.8.0"
 description = "Read metadata from Python packages"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "importlib_metadata-8.7.1-py3-none-any.whl", hash = "sha256:5a1f80bf1daa489495071efbb095d75a634cf28a8bc299581244063b53176151"},
-    {file = "importlib_metadata-8.7.1.tar.gz", hash = "sha256:49fef1ae6440c182052f407c8d34a68f72efc36db9ca90dc0113398f2fdde8bb"},
+    {file = "importlib_metadata-8.8.0-py3-none-any.whl", hash = "sha256:f05c37e6b05dc776a1f0bfc39b890634476404ec8449427f7db938e236c4c54e"},
+    {file = "importlib_metadata-8.8.0.tar.gz", hash = "sha256:d4ae075d546a9c2db36f0ba957f15f9443c9604e57d0785701621cb7ea2ec5d7"},
 ]
 
 [package.dependencies]
 zipp = ">=3.20"
 
 [package.extras]
-check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1) ; sys_platform != \"cygwin\""]
+check = ["pytest-checkdocs (>=2.14)", "pytest-ruff (>=0.2.1) ; sys_platform != \"cygwin\""]
 cover = ["pytest-cov"]
 doc = ["furo", "jaraco.packaging (>=9.3)", "jaraco.tidelift (>=1.4)", "rst.linker (>=1.9)", "sphinx (>=3.5)", "sphinx-lint"]
 enabler = ["pytest-enabler (>=3.4)"]
 perf = ["ipython"]
-test = ["flufl.flake8", "jaraco.test (>=5.4)", "packaging", "pyfakefs", "pytest (>=6,!=8.1.*)", "pytest-perf (>=0.9.2)"]
-type = ["mypy (<1.19) ; platform_python_implementation == \"PyPy\"", "pytest-mypy (>=1.0.1)"]
+test = ["packaging", "pyfakefs", "pytest (>=6,!=8.1.*)", "pytest-perf (>=0.9.2)"]
+type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 
 [[package]]
 name = "jinja2"
@@ -3563,14 +3563,14 @@ typing-extensions = "*"
 
 [[package]]
 name = "nvidia-ml-py"
-version = "13.590.48"
+version = "13.595.45"
 description = "Python Bindings for the NVIDIA Management Library"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "nvidia_ml_py-13.590.48-py3-none-any.whl", hash = "sha256:fd43d30ee9cd0b7940f5f9f9220b68d42722975e3992b6c21d14144c48760e43"},
-    {file = "nvidia_ml_py-13.590.48.tar.gz", hash = "sha256:8184d1be52914ac7f0991cd1c0d946c65dc88a840c754cd12c274b77b88760dd"},
+    {file = "nvidia_ml_py-13.595.45-py3-none-any.whl", hash = "sha256:b65a7977f503d56154b14d683710125ef93594adb63fbf7e559336e3318f1376"},
+    {file = "nvidia_ml_py-13.595.45.tar.gz", hash = "sha256:c9f34897fe0441ff35bc8f35baf80f830a20b0f4e6ce71e0a325bc0e66acf079"},
 ]
 
 [[package]]
