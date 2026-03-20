@@ -5614,6 +5614,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           mocker):
         if not one_model:
             pytest.skip("v2 does not support two model")
+        pytest.skip("Hang: eagle3 2gpus one_model hangs with v2 KV cache")
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
