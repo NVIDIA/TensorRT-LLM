@@ -1,7 +1,7 @@
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 from tensorrt_llm import logger
 
@@ -25,7 +25,6 @@ class MemoryDesc(NamedTuple):
     ptr: int
     size: int
     device_id: int
-    name: Optional[str] = None
 
 
 @dataclass
@@ -46,7 +45,7 @@ class TransferRequest:
 @dataclass
 class RegMemoryDescs:
     type: str
-    descs: List[MemoryDesc]
+    descs: List[Tuple[int, int, int, str]]
 
 
 class TransferStatus(ABC):
