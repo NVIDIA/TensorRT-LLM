@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton kernels and launcher for dense MoE with fused GEMM + activation.
+"""Triton kernels and custom op registration for dense MoE with fused GEMM + activation.
 
 The dense MoE computation is:
     1. gate_up = bmm(hidden, gate_up_w) + gate_up_b
@@ -142,7 +142,7 @@ def _weighted_expert_sum_kernel(
     tl.store(out_ptr + col_offsets * stride_out_h, acc.to(expert_vals.dtype), mask=mask)
 
 
-def moe_dense_mlp(
+def _moe_dense_mlp_triton(
     hidden_states: Tensor,
     routing_weights: Tensor,
     gate_up_w: Tensor,
@@ -241,3 +241,38 @@ def moe_dense_mlp(
     )
 
     return output.reshape(*leading_shape, hidden_size)
+
+
+@torch.library.custom_op("auto_deploy::triton_moe_dense_mlp", mutates_args=())
+def triton_moe_dense_mlp(
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_w: torch.Tensor,
+    gate_up_b: torch.Tensor,
+    down_w: torch.Tensor,
+    down_b: torch.Tensor,
+    alpha: float = 1.0,
+    limit: float = 10.0,
+) -> torch.Tensor:
+    """Triton-accelerated dense MoE custom op (GPT-OSS style).
+
+    Matches the signature and semantics of auto_deploy::torch_moe_dense_mlp but
+    uses Triton kernels for the fused GLU activation and weighted expert summation.
+    """
+    return _moe_dense_mlp_triton(
+        hidden_states, routing_weights, gate_up_w, gate_up_b, down_w, down_b, alpha, limit
+    )
+
+
+@triton_moe_dense_mlp.register_fake
+def _triton_moe_dense_mlp_fake(
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_w: torch.Tensor,
+    gate_up_b: torch.Tensor,
+    down_w: torch.Tensor,
+    down_b: torch.Tensor,
+    alpha: float = 1.0,
+    limit: float = 10.0,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)

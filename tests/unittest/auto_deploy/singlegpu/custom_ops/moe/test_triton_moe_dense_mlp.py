@@ -23,8 +23,10 @@ import pytest
 import torch
 
 # Trigger registration of custom ops
-from tensorrt_llm._torch.auto_deploy.custom_ops.torch_moe import (  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe import (  # noqa: F401
     torch_moe_dense_mlp,
+)
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.triton_moe_dense_mlp import (  # noqa: F401
     triton_moe_dense_mlp,
 )
 
