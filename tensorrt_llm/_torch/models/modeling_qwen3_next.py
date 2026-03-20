@@ -240,10 +240,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             if isinstance(shared_expert_output, torch.Tensor):
                 window = self.allreduce.get_nccl_window_for_shape(
-                    final_hidden_states.shape,
-                    all_reduce_params=all_reduce_params,
-                    like_tensor=final_hidden_states,
-                )
+                    final_hidden_states)
                 final_hidden_states = torch.add(
                     final_hidden_states,
                     shared_expert_output,

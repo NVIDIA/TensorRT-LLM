@@ -1177,11 +1177,7 @@ class Deepseekv3MoE(nn.Module):
                         all_reduce_params=final_all_reduce_params)
                 return final_hidden_states
             if not self.use_dp and self.mapping.tp_size > 1:
-                window = self.allreduce.get_nccl_window_for_shape(
-                    shared_output.shape,
-                    all_reduce_params=final_all_reduce_params,
-                    like_tensor=shared_output,
-                )
+                window = self.allreduce.get_nccl_window_for_shape(shared_output)
             else:
                 window = None
             if routed_output.dim() == 3:

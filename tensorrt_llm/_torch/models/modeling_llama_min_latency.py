@@ -619,10 +619,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             if isinstance(shared_output, torch.Tensor):
                 window = self.all_reduce.get_nccl_window_for_shape(
-                    shared_output.shape,
-                    all_reduce_params=final_all_reduce_params,
-                    like_tensor=shared_output,
-                )
+                    shared_output)
                 final_hidden_states = torch.add(shared_output,
                                                 routed_output,
                                                 out=window)
