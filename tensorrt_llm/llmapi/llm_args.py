@@ -2788,6 +2788,8 @@ class BaseLlmArgs(StrictBaseModel):
             TOKENIZER_ALIASES = {
                 'deepseek_v32':
                 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+                'glm_moe_dsa':
+                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
             }
 
             tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
@@ -3493,6 +3495,15 @@ class TorchLlmArgs(BaseLlmArgs):
     layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
         default_factory=LayerwiseBenchmarksConfig,
         description="Configuration for layer-wise benchmarks calibration.",
+        status="prototype")
+
+    video_pruning_rate: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        lt=1.0,
+        description="Pruning rate for video frames in multimodal models. "
+        "Applied by Efficient Video Sampling (EVS) in NemotronH_Nano_VL_V2. "
+        "None (default) disables EVS, values in [0, 1) enable pruning.",
         status="prototype")
 
     @property

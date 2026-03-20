@@ -59,6 +59,7 @@ class CachedSequenceInterface:
         kv_cache_config: Optional[KvCacheConfig] = None,
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
+        spec_config=None,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -70,6 +71,8 @@ class CachedSequenceInterface:
             max_num_tokens: Maximum total tokens across all sequences. If None, computed from
                 max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
+            spec_config: Speculative decoding configuration. Used to set num_extra_kv_tokens,
+                max_draft_len, max_total_draft_tokens on KVCacheManager after creation.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -97,6 +100,7 @@ class CachedSequenceInterface:
         self._kv_cache_manager: Optional[Union[KVCacheManager, MambaHybridCacheManager]] = None
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
+        self._spec_config = spec_config
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -132,9 +136,15 @@ class CachedSequenceInterface:
             else:
                 raise ValueError(f"Invalid KVCacheConfig field: {k}")
 
-    def add_resource(self, name: str, resource_handler: ResourceHandler) -> None:
-        """Add a resource handler to the cache interface."""
-        self._resource_lookup[name] = resource_handler
+    def add_resource(self, suffix: str, resource_handler: ResourceHandler) -> str:
+        """Add a resource handler to the cache interface.
+
+        Low-level method that adds a single resource. If you have a group of related resources
+        that should share the same index, use add_resource_group() instead.
+        """
+        full_name = f"r{len(self._resource_lookup)}_{suffix}"
+        self._resource_lookup[full_name] = resource_handler
+        return full_name
 
     @staticmethod
     def _check_n_groups_constraint(
@@ -407,7 +417,8 @@ class CachedSequenceInterface:
                 "max_seq_len": self.info.max_seq_len,
                 "max_batch_size": self.info.max_batch_size,
                 "mapping": Mapping(),
-                "layer_mask": None,
+                "layer_mask": [True] * kv_cache_kwargs["num_layers"],
+                "spec_config": self._spec_config,
                 # NOTE (lucaslie): we can always run with False here since when we are estimating,
                 # we are explicitly setting the max_tokens in which case it's okay to use False here
                 # since we don't rely on free_gpu_memory_fraction inside the KVCacheManager. This is
