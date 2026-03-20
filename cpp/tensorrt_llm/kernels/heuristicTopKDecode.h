@@ -17,8 +17,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -28,8 +28,12 @@ namespace kernels
 inline constexpr int kHeuristicTopK = 2048;
 inline constexpr int kHeuristicSize = 2048;
 
+/// Launch heuristic TopK decode kernel.
+/// @param scratchValues Caller-owned buffer of size [numRows * topK] floats.
+///        Required for CUDA Graph compatibility — must have a stable device address.
 void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices,
-    int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows, cudaStream_t stream);
+    float* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
+    cudaStream_t stream);
 
 } // namespace kernels
 

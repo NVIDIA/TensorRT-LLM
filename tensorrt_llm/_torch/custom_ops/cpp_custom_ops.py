@@ -193,7 +193,13 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::indexer_topk_decode")
-    def _(logits, seq_lens, indices, next_n, index_topk, pre_idx=None):
+    def _(logits,
+          seq_lens,
+          indices,
+          next_n,
+          index_topk,
+          pre_idx=None,
+          heuristic_scratch=None):
         # In-place operation, no return value (void function)
         pass
 

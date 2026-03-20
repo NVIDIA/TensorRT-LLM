@@ -778,7 +778,5 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
 
 template cudaError_t launchHeuristicTopK<float, int>(
     float const*, int, int const*, int, int, float*, int*, cudaStream_t, int);
-template cudaError_t launchHeuristicTopK<float, int64_t>(
-    float const*, int, int64_t const*, int, int, float*, int64_t*, cudaStream_t, int);
 
 } // namespace heuristic_topk
