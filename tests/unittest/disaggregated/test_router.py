@@ -319,6 +319,152 @@ async def test_kv_cache_aware_router(servers):
     assert servers == ("server3", "server1", "server2")
 
 
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_multi_turn_conversation():
+    """Test that consecutive turns of a multi-turn conversation route to the
+    same server due to KV cache prefix hits.
+
+    Simulates two concurrent sessions inspired by
+    agentic_data/dataset_sample2000.jsonl session sess-fca58a1f44cd:
+      Turn 0: 68 hash_ids (system prompt + first user input)
+      Turn 1:  9 hash_ids (second user input, accumulated with turn 0)
+      Turn 2:  6 hash_ids (third user input, accumulated with turn 1)
+
+    Scaled down to 10, 3, 2 blocks for test manageability.  Each hash_id
+    maps to a deterministic block of tokens (mirroring aiperf's
+    HashIdRandomGenerator).  The router should prefer the server that
+    already caches the conversation's prefix.
+    """
+    server_list = ["server1", "server2", "server3"]
+    tokens_per_block = 32
+
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=server_list,
+        use_tokens=False,
+        max_batch_size=64,
+        tokens_per_block=tokens_per_block,
+    )
+
+    # -- helpers ----------------------------------------------------------
+    def hash_id_to_block(hash_id: int) -> list[int]:
+        """Deterministic token block per hash_id (mirrors aiperf corpus sampling)."""
+        return [(hash_id * 7 + i) % 50000 for i in range(tokens_per_block)]
+
+    def build_tokens(hash_ids: list[int]) -> list[int]:
+        tokens = []
+        for hid in hash_ids:
+            tokens.extend(hash_id_to_block(hid))
+        # Append one extra token so the last full block is included in hashing.
+        # (KvCacheManager excludes the very last token from block keys.)
+        tokens.append(0)
+        return tokens
+
+    # -- dataset-inspired hash_ids per turn (new blocks only) -------------
+    # Session A (the conversation under test)
+    sess_a_turn0_hids = list(range(10))        # 10 blocks
+    sess_a_turn1_hids = list(range(100, 103))  # 3 new blocks
+    sess_a_turn2_hids = list(range(200, 202))  # 2 new blocks
+
+    # Session B (competing traffic on a different server)
+    sess_b_turn0_hids = list(range(500, 510))  # 10 completely different blocks
+
+    # -- build accumulated token sequences --------------------------------
+    # Turn 0: just the first turn's tokens
+    sess_a_turn0_tokens = build_tokens(sess_a_turn0_hids)
+
+    # Turn 1 accumulated: turn 0 tokens + simulated assistant reply + new user tokens
+    assistant_reply_tokens = [9999] * (tokens_per_block * 2)  # 2 blocks of reply
+    sess_a_turn1_tokens = build_tokens(
+        sess_a_turn0_hids + [9990, 9991] + sess_a_turn1_hids
+    )
+    # (hash_ids 9990/9991 stand in for the assistant-reply blocks)
+
+    # Turn 2 accumulated: extends turn 1 further
+    sess_a_turn2_tokens = build_tokens(
+        sess_a_turn0_hids + [9990, 9991] + sess_a_turn1_hids + [9992, 9993]
+        + sess_a_turn2_hids
+    )
+
+    sess_b_tokens = build_tokens(sess_b_turn0_hids)
+
+    # -- Round 1: initial routing (empty caches) --------------------------
+    # Route both sessions concurrently so load-balancing spreads them to
+    # different servers (with equal KV cache misses, ties are broken by load).
+    req_a0 = CompletionRequest(model="TinyLlama", prompt=[sess_a_turn0_tokens])
+    server_a, info_a0 = await router.get_next_server(req_a0)
+    # Do NOT finish req_a0 yet — keep its load active so session B avoids server_a
+
+    req_b0 = CompletionRequest(model="TinyLlama", prompt=[sess_b_tokens])
+    server_b, info_b0 = await router.get_next_server(req_b0)
+
+    # Now finish both and populate caches
+    await router.finish_request(req_a0)
+    await router.finish_request(req_b0)
+    router._server_state[server_a].add_blocks(info_a0["block_hashes"][0])
+    router._server_state[server_b].add_blocks(info_b0["block_hashes"][0])
+
+    # Sanity: two sessions should land on different servers
+    assert server_a != server_b, "Disjoint sessions should land on different servers"
+
+    # Verify block hashes are disjoint between sessions
+    blocks_a = set(info_a0["block_hashes"][0])
+    blocks_b = set(info_b0["block_hashes"][0])
+    assert blocks_a.isdisjoint(blocks_b), "Different sessions must not share block hashes"
+
+    # -- Round 2: turn 1 of session A (prefix extends turn 0) ------------
+    req_a1 = CompletionRequest(model="TinyLlama", prompt=[sess_a_turn1_tokens])
+    server_a1, info_a1 = await router.get_next_server(req_a1)
+    await router.finish_request(req_a1)
+
+    assert server_a1 == server_a, (
+        f"Turn 1 must route to the same server as turn 0 ({server_a}) "
+        f"due to KV cache prefix hit, but got {server_a1}. "
+        f"Matches: {info_a1['matches']}"
+    )
+
+    # The match count on server_a must equal the prefix overlap
+    server_a_idx = list(router._server_state.keys()).index(server_a)
+    expected_prefix_match = len(sess_a_turn0_hids) * tokens_per_block
+    assert info_a1["matches"][server_a_idx] == expected_prefix_match, (
+        f"Expected {expected_prefix_match} matched tokens on server_a, "
+        f"got {info_a1['matches'][server_a_idx]}"
+    )
+
+    # Update server_a cache with new blocks from turn 1
+    router._server_state[server_a].add_blocks(info_a1["block_hashes"][0])
+
+    # -- Round 3: turn 2 of session A (prefix extends turn 1) ------------
+    req_a2 = CompletionRequest(model="TinyLlama", prompt=[sess_a_turn2_tokens])
+    server_a2, info_a2 = await router.get_next_server(req_a2)
+    await router.finish_request(req_a2)
+
+    assert server_a2 == server_a, (
+        f"Turn 2 must route to the same server as turns 0-1 ({server_a}) "
+        f"due to KV cache prefix hit, but got {server_a2}. "
+        f"Matches: {info_a2['matches']}"
+    )
+
+    # Turn 2 should match all of turn 0 + turn 1 prefix blocks
+    expected_full_match = (
+        len(sess_a_turn0_hids) + 2 + len(sess_a_turn1_hids)  # turn0 + reply + turn1
+    ) * tokens_per_block
+    assert info_a2["matches"][server_a_idx] == expected_full_match, (
+        f"Expected {expected_full_match} matched tokens on turn 2, "
+        f"got {info_a2['matches'][server_a_idx]}"
+    )
+
+    # -- Verify session B still routes to its own server ------------------
+    req_b1 = CompletionRequest(model="TinyLlama", prompt=[sess_b_tokens])
+    server_b1, info_b1 = await router.get_next_server(req_b1)
+    await router.finish_request(req_b1)
+
+    assert server_b1 == server_b, (
+        f"Session B should route to its original server ({server_b}), "
+        f"but got {server_b1}"
+    )
+
+
 def test_create_router(servers):
     default_router = create_router(None, servers)
     assert isinstance(default_router, RoundRobinRouter)
