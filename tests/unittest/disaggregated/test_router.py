@@ -320,7 +320,8 @@ async def test_kv_cache_aware_router(servers):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_multi_turn_conversation():
+@pytest.mark.parametrize("api_type", ["completion", "chat"])
+async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
     """Test that consecutive turns of a multi-turn conversation route to the
     same server due to KV cache prefix hits.
 
@@ -360,6 +361,22 @@ async def test_kv_cache_aware_router_multi_turn_conversation():
         tokens.append(0)
         return tokens
 
+    def make_request(token_ids: list[int]):
+        """Create a CompletionRequest or ChatCompletionRequest with pre-tokenized IDs."""
+        if api_type == "completion":
+            return CompletionRequest(model="TinyLlama",
+                                     prompt=[token_ids])
+        else:
+            # Use prompt_token_ids to skip tokenizer (no real model needed)
+            return ChatCompletionRequest(
+                model="TinyLlama",
+                messages=[{
+                    "role": "user",
+                    "content": "dummy"
+                }],
+                prompt_token_ids=token_ids,
+            )
+
     # -- dataset-inspired hash_ids per turn (new blocks only) -------------
     # Session A (the conversation under test)
     sess_a_turn0_hids = list(range(10))        # 10 blocks
@@ -374,7 +391,6 @@ async def test_kv_cache_aware_router_multi_turn_conversation():
     sess_a_turn0_tokens = build_tokens(sess_a_turn0_hids)
 
     # Turn 1 accumulated: turn 0 tokens + simulated assistant reply + new user tokens
-    assistant_reply_tokens = [9999] * (tokens_per_block * 2)  # 2 blocks of reply
     sess_a_turn1_tokens = build_tokens(
         sess_a_turn0_hids + [9990, 9991] + sess_a_turn1_hids
     )
@@ -391,11 +407,11 @@ async def test_kv_cache_aware_router_multi_turn_conversation():
     # -- Round 1: initial routing (empty caches) --------------------------
     # Route both sessions concurrently so load-balancing spreads them to
     # different servers (with equal KV cache misses, ties are broken by load).
-    req_a0 = CompletionRequest(model="TinyLlama", prompt=[sess_a_turn0_tokens])
+    req_a0 = make_request(sess_a_turn0_tokens)
     server_a, info_a0 = await router.get_next_server(req_a0)
     # Do NOT finish req_a0 yet — keep its load active so session B avoids server_a
 
-    req_b0 = CompletionRequest(model="TinyLlama", prompt=[sess_b_tokens])
+    req_b0 = make_request(sess_b_tokens)
     server_b, info_b0 = await router.get_next_server(req_b0)
 
     # Now finish both and populate caches
@@ -413,7 +429,7 @@ async def test_kv_cache_aware_router_multi_turn_conversation():
     assert blocks_a.isdisjoint(blocks_b), "Different sessions must not share block hashes"
 
     # -- Round 2: turn 1 of session A (prefix extends turn 0) ------------
-    req_a1 = CompletionRequest(model="TinyLlama", prompt=[sess_a_turn1_tokens])
+    req_a1 = make_request(sess_a_turn1_tokens)
     server_a1, info_a1 = await router.get_next_server(req_a1)
     await router.finish_request(req_a1)
 
@@ -435,7 +451,7 @@ async def test_kv_cache_aware_router_multi_turn_conversation():
     router._server_state[server_a].add_blocks(info_a1["block_hashes"][0])
 
     # -- Round 3: turn 2 of session A (prefix extends turn 1) ------------
-    req_a2 = CompletionRequest(model="TinyLlama", prompt=[sess_a_turn2_tokens])
+    req_a2 = make_request(sess_a_turn2_tokens)
     server_a2, info_a2 = await router.get_next_server(req_a2)
     await router.finish_request(req_a2)
 
@@ -455,7 +471,7 @@ async def test_kv_cache_aware_router_multi_turn_conversation():
     )
 
     # -- Verify session B still routes to its own server ------------------
-    req_b1 = CompletionRequest(model="TinyLlama", prompt=[sess_b_tokens])
+    req_b1 = make_request(sess_b_tokens)
     server_b1, info_b1 = await router.get_next_server(req_b1)
     await router.finish_request(req_b1)
 
