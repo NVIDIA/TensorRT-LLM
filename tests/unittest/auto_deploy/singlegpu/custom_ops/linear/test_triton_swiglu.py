@@ -26,10 +26,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.linear.swiglu import (  # noqa: 
     torch_swiglu_mlp,
     triton_swiglu_mlp,
 )
-from tensorrt_llm._torch.auto_deploy.custom_ops.linear.triton_swiglu import (
-    triton_swiglu_activation,
-)
-
+from tensorrt_llm._torch.auto_deploy.custom_ops.linear.triton_swiglu import triton_swiglu_activation
 
 # ---------------------------------------------------------------------------
 # Triton SwiGLU activation kernel tests (low-level)
@@ -93,9 +90,9 @@ def test_triton_swiglu_mlp_no_bias(batch_size, hidden_size, intermediate_size, d
     """Triton SwiGLU MLP without bias matches torch reference."""
     torch.manual_seed(42)
     input_tensor = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
-    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype)
+    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype) * 0.02
 
     expected = torch_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
     actual = triton_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
@@ -118,12 +115,12 @@ def test_triton_swiglu_mlp_with_bias(batch_size, hidden_size, intermediate_size,
     """Triton SwiGLU MLP with bias matches torch reference."""
     torch.manual_seed(42)
     input_tensor = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
-    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype)
-    gate_bias = torch.randn(intermediate_size, device="cuda", dtype=dtype)
-    up_bias = torch.randn(intermediate_size, device="cuda", dtype=dtype)
-    down_bias = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype) * 0.02
+    gate_bias = torch.randn(intermediate_size, device="cuda", dtype=dtype) * 0.02
+    up_bias = torch.randn(intermediate_size, device="cuda", dtype=dtype) * 0.02
+    down_bias = torch.randn(hidden_size, device="cuda", dtype=dtype) * 0.02
 
     expected = torch_swiglu_mlp(
         input_tensor, gate_weight, up_weight, down_weight, gate_bias, up_bias, down_bias
@@ -144,9 +141,9 @@ def test_triton_swiglu_mlp_3d_input():
     dtype = torch.bfloat16
     batch_size, seq_len, hidden_size, intermediate_size = 2, 16, 256, 512
     input_tensor = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
-    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype)
+    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype) * 0.02
 
     expected = torch_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
     actual = triton_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
@@ -161,9 +158,9 @@ def test_triton_swiglu_mlp_large():
     batch_size, hidden_size, intermediate_size = 32, 4096, 11008
 
     input_tensor = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
-    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype)
+    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype) * 0.02
 
     expected = torch_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
     actual = triton_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
@@ -180,9 +177,9 @@ def test_triton_swiglu_mlp_single_element():
     hidden_size, intermediate_size = 64, 128
 
     input_tensor = torch.randn(1, hidden_size, device="cuda", dtype=dtype)
-    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
-    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype)
+    gate_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    up_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.02
+    down_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype) * 0.02
 
     expected = torch_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
     actual = triton_swiglu_mlp(input_tensor, gate_weight, up_weight, down_weight, None, None, None)
