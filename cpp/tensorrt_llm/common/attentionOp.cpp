@@ -1162,6 +1162,8 @@ int AttentionOp::mlaGeneration(
         // Metadata must always be pre-computed by Python (compute_flash_mla_metadata) and passed in.
         TLLM_CHECK_WITH_INFO(params.flash_mla_tile_scheduler_metadata != nullptr,
             "FlashMLA tile-scheduler metadata must be pre-computed by Python.");
+        TLLM_CHECK_WITH_INFO(
+            params.flash_mla_num_splits != nullptr, "FlashMLA num_splits must be pre-computed by Python.");
         int* tile_scheduler_metadata_ptr = const_cast<int*>(params.flash_mla_tile_scheduler_metadata);
         int* num_splits_ptr = const_cast<int*>(params.flash_mla_num_splits);
 
