@@ -12,8 +12,9 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
-                                                         load_pretrained_config)
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
+    load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -784,12 +785,7 @@ class ModelConfig(Generic[TConfig]):
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif hasattr(
-                self.pretrained_config, "architectures"
-        ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
-                0] in ["Qwen3NextForCausalLM"]:
-            # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
-            # we need to calculate the number of fullattention layers
-            return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
+        elif is_qwen3_hybrid(self.pretrained_config):
+            return get_qwen3_hybrid_num_attention_layers(self.pretrained_config)
         else:
             return self.pretrained_config.num_hidden_layers
