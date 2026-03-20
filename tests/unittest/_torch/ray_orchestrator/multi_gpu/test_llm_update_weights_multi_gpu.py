@@ -402,7 +402,7 @@ def test_llm_update_weights_nvfp4(model_dir):
 )
 def test_llm_partial_update_weights_nvfp4(model_dir):
     model_dir = str(llm_models_root() / model_dir)
-    hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+    hf_model = RefNVFP4ModelWithIPCHandles(model_dir)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
     llm = LLM(
