@@ -40,7 +40,7 @@ This section can be skipped if you already have TensorRT LLM installed and have 
 
 #### 1. Download TensorRT LLM
 
-**You can also find more comprehensive instructions to install TensorRT LLM in this [TensorRT LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html), refer to that guide for common issues if you encounter any here.**
+**You can also find more comprehensive instructions to install TensorRT LLM in this [TensorRT LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html), refer to that guide for common issues if you encounter any here.**
 
 ``` bash
 # Prerequisites

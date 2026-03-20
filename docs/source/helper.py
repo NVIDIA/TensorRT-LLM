@@ -368,6 +368,9 @@ def update_version():
         updated = content.replace(
             "nvcr.io/nvidia/tensorrt-llm/release:x.y.z",
             f"nvcr.io/nvidia/tensorrt-llm/release:{version}",
+        ).replace(
+            "nvcr.io/nvidia/tensorrt-llm/devel:x.y.z",
+            f"nvcr.io/nvidia/tensorrt-llm/devel:{version}",
         )
         if updated != content:
             with open(file_path, "w") as f:
