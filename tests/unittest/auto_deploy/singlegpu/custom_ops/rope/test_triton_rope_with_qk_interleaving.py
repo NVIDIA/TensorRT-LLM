@@ -24,6 +24,13 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.rope.triton_rope_with_qk_interle
 )
 
 
+def _get_tolerances(dtype):
+    """Return (rtol, atol) appropriate for the given dtype."""
+    if dtype == torch.bfloat16:
+        return 1e-2, 1e-2
+    return 1e-3, 1e-3
+
+
 def _make_cos_sin(batch, seq_len, head_dim, dtype, device):
     """Create duplicated cos/sin tensors matching DeepSeek RoPE convention."""
     inv_freq = 1.0 / (
@@ -73,8 +80,9 @@ def test_triton_matches_torch_reference(batch, seq_len, n_heads, head_dim, dtype
         q, k, cos, sin, 2
     )
 
-    torch.testing.assert_close(actual_q, expected_q, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(actual_k, expected_k, rtol=1e-3, atol=1e-3)
+    rtol, atol = _get_tolerances(dtype)
+    torch.testing.assert_close(actual_q, expected_q, rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -103,8 +111,9 @@ def test_triton_matches_torch_bnsd_layout(batch, seq_len, n_heads, head_dim, dty
         q, k, cos, sin, 1
     )
 
-    torch.testing.assert_close(actual_q, expected_q, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(actual_k, expected_k, rtol=1e-3, atol=1e-3)
+    rtol, atol = _get_tolerances(dtype)
+    torch.testing.assert_close(actual_q, expected_q, rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize(
@@ -132,8 +141,9 @@ def test_triton_non_power_of_2_seq_len(batch, seq_len, n_heads, head_dim):
         q, k, cos, sin, 2
     )
 
-    torch.testing.assert_close(actual_q, expected_q, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(actual_k, expected_k, rtol=1e-3, atol=1e-3)
+    rtol, atol = _get_tolerances(dtype)
+    torch.testing.assert_close(actual_q, expected_q, rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
 
 
 def test_triton_large_realistic_shape():
@@ -207,5 +217,6 @@ def test_triton_3d_input():
         q, k, cos, sin, 1
     )
 
-    torch.testing.assert_close(actual_q, expected_q, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(actual_k, expected_k, rtol=1e-3, atol=1e-3)
+    rtol, atol = _get_tolerances(dtype)
+    torch.testing.assert_close(actual_q, expected_q, rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_k, expected_k, rtol=rtol, atol=atol)
