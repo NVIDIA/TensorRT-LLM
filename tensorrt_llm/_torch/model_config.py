@@ -12,12 +12,14 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
+                                                         is_qwen3_next,
+                                                         load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          MoeLoadBalancerConfig)
+                                          KvCacheConfig, MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -620,9 +622,12 @@ class ModelConfig(Generic[TConfig]):
         model_config._frozen = True
         return model_config
 
-    def get_bindings_model_config(self,
-                                  tokens_per_block: Optional[int] = None
-                                  ) -> "ModelConfigCpp":
+    def get_bindings_model_config(
+        self,
+        tokens_per_block: Optional[int] = None,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        spec_config: Optional['SpeculativeConfig'] = None,
+    ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
@@ -648,7 +653,8 @@ class ModelConfig(Generic[TConfig]):
 
         hidden_size = self.pretrained_config.hidden_size // attn_tp_size
         num_layers = self.pretrained_config.num_hidden_layers
-        num_attention_layers = self.get_num_attention_layers()
+        num_attention_layers = self.get_num_attention_layers(
+            kv_cache_config, spec_config)
         if (self.spec_config is not None
                 and self.spec_config.spec_dec_mode.is_mtp_one_model()):
             num_layers += self.spec_config.num_nextn_predict_layers
@@ -774,15 +780,20 @@ class ModelConfig(Generic[TConfig]):
         else:
             return None
 
-    def get_num_attention_layers(self):
-        # if is_nemotron_hybrid(self.pretrained_config):
-        #     return self.pretrained_config.hybrid_override_pattern.count("*")
-        # elif os.environ.get("AAAA") in ["1", "2"] and hasattr(
-        #         self.pretrained_config, "architectures"
-        # ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
-        #         0] in ["Qwen3NextForCausalLM"]:
-        #     # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
-        #     # we need to calculate the number of fullattention layers
-        #     return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
-        # else:
-        return self.pretrained_config.num_hidden_layers
+    def get_num_attention_layers(
+            self,
+            kv_cache_config: Optional[KvCacheConfig] = None,
+            spec_config: Optional['SpeculativeConfig'] = None):
+        use_disagg = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+        kv_cache_config is not None and kv_cache_config.enable_block_reuse
+        use_spec = spec_config is not None
+
+        use_v1_mamba_manager = use_disagg or use_spec
+        if is_nemotron_hybrid(self.pretrained_config) and use_v1_mamba_manager:
+            return self.pretrained_config.hybrid_override_pattern.count("*")
+        elif is_qwen3_next(self.pretrained_config) and use_v1_mamba_manager:
+            # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
+            # we need to calculate the number of fullattention layers
+            return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
+        else:
+            return self.pretrained_config.num_hidden_layers
