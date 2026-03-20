@@ -93,7 +93,8 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
             tasks = [task(prompt) for prompt in prompts]
             results = await asyncio.gather(*tasks)
 
-            assert len(results) == len(expected_outputs), "Output length mismatch"
+            assert len(results) == len(
+                expected_outputs), "Output length mismatch"
             for result, expected in zip(results, expected_outputs):
                 assert similar(result, expected,
                                1.0), f"Expected '{expected}' but get '{result}'"
