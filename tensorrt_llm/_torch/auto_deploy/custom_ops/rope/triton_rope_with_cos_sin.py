@@ -127,19 +127,18 @@ def rope_with_cos_sin(
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
-    # Expand cos/sin to match q/k shape for uniform stride computation
-    cos = cos.expand_as(q).contiguous()
-    sin = sin.expand_as(q).contiguous()
-
     D = q.shape[-1]
     assert D % 2 == 0, "RoPE requires even head dimension"
     HALF_D = D // 2
 
+    BLOCK_SIZE = triton.next_power_of_2(HALF_D)
+
+    # Expand cos/sin separately for q and k (they may have different num_heads in GQA)
+    cos_q = cos.expand_as(q).contiguous()
+    sin_q = sin.expand_as(q).contiguous()
+
     # Flatten all dimensions except the last one into "rows"
     num_rows_q = q.numel() // D
-    num_rows_k = k.numel() // D
-
-    BLOCK_SIZE = triton.next_power_of_2(HALF_D)
 
     # Allocate outputs
     q_out = torch.empty_like(q)
@@ -149,8 +148,8 @@ def rope_with_cos_sin(
     grid_q = (num_rows_q,)
     _rope_cos_sin_kernel[grid_q](
         q,
-        cos,
-        sin,
+        cos_q,
+        sin_q,
         q_out,
         stride_x_row=D,
         stride_cs_row=D,
@@ -160,12 +159,18 @@ def rope_with_cos_sin(
         num_stages=3,
     )
 
+    # Expand cos/sin for k shape (may differ from q in GQA)
+    cos_k = cos.expand_as(k).contiguous()
+    sin_k = sin.expand_as(k).contiguous()
+
+    num_rows_k = k.numel() // D
+
     # Launch for k
     grid_k = (num_rows_k,)
     _rope_cos_sin_kernel[grid_k](
         k,
-        cos,
-        sin,
+        cos_k,
+        sin_k,
         k_out,
         stride_x_row=D,
         stride_cs_row=D,

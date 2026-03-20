@@ -78,8 +78,13 @@ def test_triton_rope_matches_torch(dtype, batch, num_heads, seq_len, head_dim, u
         q, k, cos, sin, unsqueeze_dim
     )
 
-    torch.testing.assert_close(q_tri, q_ref, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(k_tri, k_ref, rtol=1e-3, atol=1e-3)
+    # bf16 needs looser tolerance: Triton kernel computes in float32 while
+    # the torch reference computes in the native dtype, and bf16 has only
+    # ~7 mantissa bits (machine eps ~0.008).
+    rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    atol = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(q_tri, q_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(k_tri, k_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -100,8 +105,8 @@ def test_triton_rope_different_head_dims(head_dim):
     q_ref, k_ref = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 1)
     q_tri, k_tri = torch.ops.auto_deploy.triton_rope_with_explicit_cos_sin(q, k, cos, sin, 1)
 
-    torch.testing.assert_close(q_tri, q_ref, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(k_tri, k_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(q_tri, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_tri, k_ref, rtol=1e-2, atol=1e-2)
 
 
 def test_triton_rope_different_qk_heads():
@@ -123,8 +128,8 @@ def test_triton_rope_different_qk_heads():
     q_ref, k_ref = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 1)
     q_tri, k_tri = torch.ops.auto_deploy.triton_rope_with_explicit_cos_sin(q, k, cos, sin, 1)
 
-    torch.testing.assert_close(q_tri, q_ref, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(k_tri, k_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(q_tri, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_tri, k_ref, rtol=1e-2, atol=1e-2)
 
 
 def test_triton_rope_large_realistic():
