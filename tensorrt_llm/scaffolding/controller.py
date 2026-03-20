@@ -244,7 +244,6 @@ class ChatWithMCPController(Controller):
         for _ in range(self.max_iterations):
             yield from self.generation_controller.process([chat_task])
             response_message = chat_task.messages[-1]
-            print(f"\nresponse_message: {response_message}\n")
             assert isinstance(
                 response_message, AssistantMessage
             ), f"response is not AssistantMessage, {type(response_message)=}"

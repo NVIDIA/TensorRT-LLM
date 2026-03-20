@@ -39,8 +39,10 @@ from tensorrt_llm.scaffolding.task import (
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
+    TokenizeWorkerTag,
     drop_kv_cache_scope,
     sub_request_node,
+    tokenize_trace_scope,
     with_execution_tracing,
     with_task_collection,
 )
@@ -209,6 +211,7 @@ def create_swebench_coder_scaffolding_llm(
 
     if enable_tracing:
         coder_type = with_execution_tracing("SWEBenchCoder")(coder_type)
+        coder_type = tokenize_trace_scope()(coder_type)
 
     chat_with_tools_controller = chat_with_mcp_controller_type(
         generation_controller, max_iterations=max_iterations
@@ -218,13 +221,17 @@ def create_swebench_coder_scaffolding_llm(
         chat_with_tools_controller=chat_with_tools_controller,
     )
 
+    workers = {
+        NativeGenerationController.WorkerTag.GENERATION: generation_worker,
+        ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
+        DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
+    }
+    if enable_tracing:
+        workers[TokenizeWorkerTag.TOKENIZE] = generation_worker
+
     scaffolding_llm = ScaffoldingLlm(
         coder_controller,
-        {
-            NativeGenerationController.WorkerTag.GENERATION: generation_worker,
-            ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
-            DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
-        },
+        workers,
         max_parallel_requests=max_parallel_requests,
     )
 

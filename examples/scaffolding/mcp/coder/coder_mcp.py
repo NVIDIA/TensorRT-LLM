@@ -68,6 +68,7 @@ class SessionManager:
         self._locks: dict[str, asyncio.Lock] = {}
         self._refcounts: dict[str, int] = {}
         self._detached_at: dict[str, float] = {}
+        self._client_layers: dict[str, list[str]] = {}
 
         self._client: Optional[httpx.AsyncClient] = None
         self._reaper_task: Optional[asyncio.Task] = None
@@ -93,12 +94,25 @@ class SessionManager:
             self._locks[cid] = asyncio.Lock()
         return self._locks[cid]
 
-    async def _create_apiary_session(self) -> str:
+    def set_client_layers(self, cid: str, layers: list[str]) -> None:
+        """Register OverlayFS lower-dir layers for *cid*.
+
+        Called when an SSE connection provides ``base_image`` query
+        parameters.  The layers are passed to Apiary when the session
+        for this client is created.
+        """
+        if layers:
+            self._client_layers[cid] = layers
+
+    async def _create_apiary_session(
+        self,
+        base_image: Optional[list[str]] = None,
+    ) -> str:
         client = await self._get_client()
-        response = await client.post(
-            "/api/v1/sessions",
-            json={"working_dir": self._working_dir},
-        )
+        payload: dict[str, Any] = {"working_dir": self._working_dir}
+        if base_image:
+            payload["base_image"] = base_image
+        response = await client.post("/api/v1/sessions", json=payload)
         response.raise_for_status()
         return response.json()["session_id"]
 
@@ -114,7 +128,8 @@ class SessionManager:
         async with lock:
             if cid in self._sessions:
                 return self._sessions[cid]
-            session_id = await self._create_apiary_session()
+            layers = self._client_layers.get(cid)
+            session_id = await self._create_apiary_session(base_image=layers)
             self._sessions[cid] = session_id
             LOGGER.info("Created Apiary session %s for client %s", session_id, cid)
             return session_id
@@ -124,6 +139,7 @@ class SessionManager:
         self._locks.pop(cid, None)
         self._refcounts.pop(cid, None)
         self._detached_at.pop(cid, None)
+        self._client_layers.pop(cid, None)
         _plan_states.pop(cid, None)
         if session_id:
             await self._destroy_apiary_session(session_id)
@@ -563,9 +579,12 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
                 return
 
         cid = request.query_params.get("client_id") or uuid.uuid4().hex[:12]
+        layers = request.query_params.getlist("base_image")
         _client_id.set(cid)
+        if layers:
+            _session.set_client_layers(cid, layers)
         _session.attach(cid)
-        LOGGER.info("Client %s connected", cid)
+        LOGGER.info("Client %s connected (layers=%d)", cid, len(layers))
 
         async with sse.connect_sse(
             request.scope,

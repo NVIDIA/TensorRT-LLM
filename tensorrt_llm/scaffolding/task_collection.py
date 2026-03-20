@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 from .controller import Controller, ParallelProcess
 from .execution_scope import current_scope
 from .execution_trace import ExecutionTrace, TraceEvent
-from .task import (ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask,
-                   Task, TokenizeTask)
+from .task import (ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask, Task,
+                   TokenizeTask)
 
 
 class TaskCollection:
@@ -890,8 +890,7 @@ def _collect_tokenizable_events(events: List[TraceEvent]) -> List[TraceEvent]:
     return result
 
 
-def _collect_all_message_events(
-        events: List[TraceEvent]) -> List[TraceEvent]:
+def _collect_all_message_events(events: List[TraceEvent]) -> List[TraceEvent]:
     """Collect all message events (any role), including children of parallel_start."""
     result = []
     for event in events:
@@ -902,11 +901,11 @@ def _collect_all_message_events(
     return result
 
 
-def _correct_system_tokenize_counts(events: List[TraceEvent]) -> None:
-    """Correct the tokenize_count of system messages using assistant prompt_tokens.
+def _correct_system_tokenss(events: List[TraceEvent]) -> None:
+    """Correct the tokens of system messages using assistant prompt_tokens.
 
     For each conversation_id, find the first assistant message with
-    prompt_tokens, then subtract the tokenize_count of each preceding
+    prompt_tokens, then subtract the tokens of each preceding
     user message. The remainder is assigned to the first system message,
     capturing hidden tokens (e.g. tool definitions) that the naive
     per-content tokenization misses.
@@ -936,17 +935,17 @@ def _correct_system_tokenize_counts(events: List[TraceEvent]) -> None:
         remaining = first_assistant.prompt_tokens
 
         # Walk backwards from just before the assistant to the first
-        # system message, subtracting user tokenize_counts
+        # system message, subtracting user tokenss
         first_system = None
         for m in reversed(msgs[:assistant_idx]):
-            if m.role == "user" and m.tokenize_count is not None:
-                remaining -= m.tokenize_count
+            if m.role == "user" and m.tokens is not None:
+                remaining -= m.tokens
             elif m.role == "system":
                 first_system = m
                 break
 
         if first_system is not None and remaining >= 0:
-            first_system.tokenize_count = remaining
+            first_system.tokens = remaining
 
 
 def tokenize_trace_scope():
@@ -979,11 +978,11 @@ def tokenize_trace_scope():
 
                 for task in tokenize_tasks:
                     if task.token_count is not None and task.event is not None:
-                        task.event.tokenize_count = task.token_count
+                        task.event.tokens = task.token_count
 
                 # Correct system message token counts using assistant
                 # prompt_tokens to account for tool definitions, etc.
-                _correct_system_tokenize_counts(tracer.events)
+                _correct_system_tokenss(tracer.events)
 
             return wrapper()
 

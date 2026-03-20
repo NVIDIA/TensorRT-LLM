@@ -232,7 +232,7 @@ pip install datasets  # only for HuggingFace dataset loading
 
 ```bash
 python examples/scaffolding/contrib/Coder/run_swebench.py \
-    --dataset verified \
+    --dataset lite \
     --base_url http://localhost:8000/v1 \
     --model Qwen3/Qwen3-30B-A3B \
     --mcp_url http://0.0.0.0:8083/sse \

@@ -45,7 +45,7 @@ def load_instances(dataset: str) -> list[dict]:
 
     hf_path = DATASET_MAPPING.get(dataset, dataset)
     logger.info("Loading HuggingFace dataset %s ...", hf_path)
-    return list(hf_load(hf_path, split="test"))
+    return list(hf_load(hf_path, split="dev"))
 
 
 def get_docker_image(instance: dict) -> str:
@@ -180,7 +180,7 @@ async def main():
     unique_images = list(image_map.keys())
     logger.info("%d instances, %d unique Docker images", len(instances), len(unique_images))
 
-    logger.info("[Phase 1] Exporting rootfs ...")
+    logger.info("[Phase 1] Extracting image layers ...")
     try:
         from apiary_swebench.rootfs import RootfsManager
     except ImportError as exc:
@@ -192,13 +192,13 @@ async def main():
         ) from exc
 
     rootfs_mgr = RootfsManager(cache_dir=args.rootfs_cache_dir)
-    rootfs_map: dict[str, str] = {}
+    rootfs_map: dict[str, list[str]] = {}
     with ThreadPoolExecutor(max_workers=args.rootfs_workers) as pool:
-        futures = {pool.submit(rootfs_mgr.ensure, img): img for img in unique_images}
+        futures = {pool.submit(rootfs_mgr.ensure_layers, img): img for img in unique_images}
         for fut in as_completed(futures):
             img = futures[fut]
             rootfs_map[img] = fut.result()
-    logger.info("Rootfs ready: %d images", len(rootfs_map))
+    logger.info("Layers ready: %d images", len(rootfs_map))
 
     logger.info("[Phase 2] Running agents ...")
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
@@ -237,6 +237,15 @@ async def main():
 
             save_trajectory(output_dir, iid, prompt, text, elapsed)
             update_preds(preds_path, iid, args.model, text)
+
+            if args.enable_tracing and result.task_collections:
+                tracer = result.task_collections.get("execution_tracer")
+                if tracer:
+                    trace = tracer.export_trace()
+                    trace_path = output_dir / iid / f"{iid}.trace.json"
+                    trace.save(str(trace_path))
+                    logger.info("Execution trace saved to %s", trace_path)
+
             completed += 1
             logger.info(
                 "[%d/%d] %s completed (%.1fs)",

@@ -233,8 +233,7 @@ class OpenaiWorker(Worker):
         url = base_url + "tokenize"
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(url,
-                                             json={"prompt": task.content})
+                response = await client.post(url, json={"prompt": task.content})
             if response.status_code != 200:
                 return TaskStatus.WORKER_EXECEPTION
             task.token_count = response.json().get("count", 0)
@@ -555,7 +554,7 @@ class ApiaryMCPWorker(Worker):
         self.base_url = base_url.rstrip("/")
         self._max_connections = max_connections
         self._conns: dict[str, ApiaryMCPWorker._ConnState] = {}
-        self._scope_params: dict[str, dict[str, str]] = {}
+        self._scope_params: dict[str, dict[str, str | list[str]]] = {}
         # Lazy-init for asyncio primitives (must be created inside the loop).
         self._lock: Optional[asyncio.Lock] = None
         self._sem: Optional[asyncio.Semaphore] = None
@@ -565,7 +564,8 @@ class ApiaryMCPWorker(Worker):
             self._lock = asyncio.Lock()
             self._sem = asyncio.Semaphore(self._max_connections)
 
-    def set_scope_params(self, request_id: str, **params: str) -> None:
+    def set_scope_params(self, request_id: str,
+                         **params: str | list[str]) -> None:
         """Associate extra SSE URL query parameters with *request_id*.
 
         These parameters are appended to the SSE URL when the connection
@@ -573,10 +573,17 @@ class ApiaryMCPWorker(Worker):
         this **after** :meth:`ScaffoldingLlm.generate_async` returns, using
         ``result.id`` as the *request_id*.
 
+        Values may be strings or lists of strings.  List values are
+        emitted as repeated query parameters (e.g.
+        ``base_image=/p1&base_image=/p2``).
+
         Typical usage for SWE-bench::
 
             result = llm.generate_async(prompt)
-            mcp_worker.set_scope_params(result.id, base_image="/path/to/rootfs")
+            mcp_worker.set_scope_params(
+                result.id,
+                base_image=["/layer/base", "/layer/top"],
+            )
         """
         self._scope_params[request_id] = params
 
@@ -619,7 +626,7 @@ class ApiaryMCPWorker(Worker):
                 extra = self._scope_params.get(self._root_request_id(scope_id),
                                                {})
                 if extra:
-                    url += "&" + urlencode(extra)
+                    url += "&" + urlencode(extra, doseq=True)
                 queue: asyncio.Queue = asyncio.Queue()
                 ready = asyncio.Event()
                 task = asyncio.create_task(self._conn_loop(url, queue, ready))

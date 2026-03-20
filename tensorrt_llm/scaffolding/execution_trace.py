@@ -67,7 +67,7 @@ class TraceEvent:
     content: Optional[str] = None
 
     # -- tokenization annotation (filled by tokenize_trace_scope) --
-    tokenize_count: Optional[int] = None
+    tokens: Optional[int] = None
 
 
 @dataclass
