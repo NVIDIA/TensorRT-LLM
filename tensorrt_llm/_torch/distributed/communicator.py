@@ -443,7 +443,8 @@ def _chunked_transfer_loop(
                                        chunk_size).astype(np.int32)
         sent_so_far = np.minimum(lengths, round_offs)
 
-        round_recvbuf = np.empty(counts_this_round.sum(), dtype=np.uint8)
+        round_recvbuf = (np.empty(counts_this_round.sum(), dtype=np.uint8)
+                         if recvbuf is not None else None)
         round_displs = np.zeros(size, dtype=np.int32)
         if size > 1:
             round_displs[1:] = np.cumsum(counts_this_round[:-1])
