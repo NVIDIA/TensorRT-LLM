@@ -17,7 +17,6 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     LayerRange,
-    SessionState,
     SessionStatus,
     TokenRange,
 )
@@ -124,26 +123,14 @@ def test_session_status_enum():
         "INIT",
         "READY",
         "TRANSFERRING",
-        "TRANSFERRED",
-        "AUX_TRANSFERRED",
-        "COMPLETED",
-        "CANCELED",
+        "KV_TRANSFERRED",
+        "FULLY_TRANSFERRED",
         "ERROR",
     ]
     for name in expected:
         assert hasattr(SessionStatus, name)
         assert SessionStatus[name].value == name
-    assert len(SessionStatus) == 8
-
-
-def test_session_state_construction():
-    state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
-    assert state.status == SessionStatus.INIT
-    assert state.finished_tasks == []
-
-    state2 = SessionState(status=SessionStatus.COMPLETED, finished_tasks=[1, 2, 3])
-    assert state2.status == SessionStatus.COMPLETED
-    assert state2.finished_tasks == [1, 2, 3]
+    assert len(SessionStatus) == 6
 
 
 def create_transfer_worker_setup(
@@ -720,13 +707,13 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_tasks = [
-            sender_session._kv_tasks[sender_session.send(send_kv_slice)]
+        send_slice_futures = [
+            sender_session.send(send_kv_slice)
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
 
         for sender_session in sender_sessions:
-            assert sender_session.state.status == SessionStatus.INIT
+            assert sender_session.status == SessionStatus.INIT
 
         receiver_sessions = [
             gen_transfer_worker.create_rx_session(gen_request)
@@ -736,8 +723,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_tasks = [
-            receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
+        recv_slice_futures = [
+            receiver_session.receive(recv_kv_slice)
             for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
         ]
 
@@ -750,8 +737,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_tasks = [
-            receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
+        recv_slice_futures = [
+            receiver_session.receive(recv_kv_slice)
             for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
         ]
 
@@ -765,37 +752,39 @@ def add_and_verify_request(
         time.sleep(0.1)
 
         for sender_session in sender_sessions:
-            assert sender_session.state.status != SessionStatus.INIT
+            assert sender_session.status != SessionStatus.INIT
 
         send_kv_slices = [
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_tasks = [
-            sender_session._kv_tasks[sender_session.send(send_kv_slice)]
+        send_slice_futures = [
+            sender_session.send(send_kv_slice)
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
         send_aux_tasks = []
         for sender_session in sender_sessions:
-            sender_session.pack_aux()
+            sender_session.pack_aux(ctx_request)
             send_aux_tasks.append(sender_session.send_aux())
 
-    for send_slice_task in send_slice_tasks:
-        send_slice_task.future.result()
-    for recv_slice_task in recv_slice_tasks:
-        recv_slice_task.future.result()
+    for future in send_slice_futures:
+        future.result()
+    for future in recv_slice_futures:
+        future.result()
     if not send_first:
         for send_aux_task in send_aux_tasks:
             send_aux_task.future.result()
 
-    sync_session_status = SessionStatus.TRANSFERRED if send_first else SessionStatus.AUX_TRANSFERRED
+    sync_session_status = (
+        SessionStatus.KV_TRANSFERRED if send_first else SessionStatus.FULLY_TRANSFERRED
+    )
     for sender_session in sender_sessions:
-        assert sender_session.state.status == sync_session_status
+        assert sender_session.status == sync_session_status
     if not send_first:
         time.sleep(0.1)
     for receiver_session in receiver_sessions:
-        assert receiver_session.state.status == sync_session_status, (
-            f"receiver_session.state.status={receiver_session.state.status}, "
+        assert receiver_session.status == sync_session_status, (
+            f"receiver_session.status={receiver_session.status}, "
             f"sync_session_status={sync_session_status} send_first={send_first}"
         )
 
@@ -912,9 +901,9 @@ def add_and_verify_request(
             for tp_rank in range(valid_gen_tp):
                 transfer_worker = valid_gen_transfer_workers[pp_rank * valid_gen_tp + tp_rank]
                 recv_session = receiver_sessions[pp_rank * valid_gen_tp + tp_rank]
-                recv_session.unpack_aux()
+                recv_session.unpack_aux(gen_request)
 
-                assert gen_request.context_phase_params.first_gen_tokens == [8 + ctx_request_id]
+                assert gen_request.py_first_gen_tokens == [8 + ctx_request_id]
                 assert gen_request.py_draft_tokens == [
                     9 + ctx_request_id,
                     10 + ctx_request_id,
