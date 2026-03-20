@@ -156,6 +156,9 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       use_one_model: bool, enable_chunked_prefill: bool,
                       use_chain_drafter: bool, multi_batch: bool,
                       attention_dp: bool, use_hf_speculative_model: bool):
+    if not use_one_model:
+        pytest.skip(
+            "KV cache v2 does not support two-model speculative decoding")
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -263,6 +266,9 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
 @pytest.mark.parametrize("eagle3_one_model", [True, False])
 def test_eagle3_spec_decoding_stats(eagle3_one_model):
     """Test that specDecodingStats are correctly populated in metrics endpoint"""
+    if not eagle3_one_model:
+        pytest.skip(
+            "KV cache v2 does not support two-model speculative decoding")
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -345,6 +351,7 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
 @pytest.mark.parametrize("use_cuda_graph", [True, False])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3_long_prompt(use_cuda_graph):
+    pytest.skip("KV cache v2 does not support two-model speculative decoding")
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -396,6 +403,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
 
 
 def test_deepseek_eagle3():
+    pytest.skip("KV cache v2 does not support two-model speculative decoding")
     use_cuda_graph = True
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
@@ -607,6 +615,9 @@ def test_deepseek_mla_eagle3():
 
 @pytest.mark.parametrize("use_one_model", [True, False])
 def test_multi_eagle3(use_one_model: bool):
+    if not use_one_model:
+        pytest.skip(
+            "KV cache v2 does not support two-model speculative decoding")
     use_cuda_graph = True
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
@@ -714,6 +725,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     the system properly reserves one additional slot for the padded dummy request.
     Without this fix, there would be errors caused by no free slot.
     """
+    pytest.skip("KV cache v2 does not support two-model speculative decoding")
     attn_backend = "TRTLLM"
     enable_block_reuse = False
     use_one_model = False
@@ -768,6 +780,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     """Test CDL sampling with 2 requests and max_batch_size=2."""
+    pytest.skip("KV cache v2 does not support two-model speculative decoding")
     attn_backend = "TRTLLM"
     enable_block_reuse = False
     use_one_model = False

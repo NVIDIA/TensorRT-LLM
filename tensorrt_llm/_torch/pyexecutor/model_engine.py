@@ -715,6 +715,14 @@ class PyTorchModelEngine(ModelEngine):
         A General warmup to warmup with several different requests.
         It is used to warmup torch.compile path and warmup memory pool before running real requests.
         """
+        # Disable CUDA graph replay during general warmup to avoid replaying
+        # graphs with stale KV cache block offsets from capture time.
+        with self.no_cuda_graph():
+            self._general_warmup_impl(resource_manager, reverse)
+
+    def _general_warmup_impl(self,
+                             resource_manager: ResourceManager,
+                             reverse: bool = False):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
@@ -1173,6 +1181,8 @@ class PyTorchModelEngine(ModelEngine):
             if gen_requests is None:
                 for r in ctx_requests:
                     kv_cache_manager.free_resources(r)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(r)
                 return None
 
             if spec_resource_manager is not None:
@@ -1267,6 +1277,8 @@ class PyTorchModelEngine(ModelEngine):
         if max_seq_len_request is None:
             for r in requests:
                 kv_cache_manager.free_resources(r)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(r)
             return None
         else:
             max_seq_len_request = max_seq_len_request[0]
