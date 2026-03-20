@@ -2,6 +2,7 @@
 
 This module tests the waiting queue functionality including:
 - FCFSWaitingQueue operations
+- PriorityWaitingQueue operations
 - WaitingQueue abstract interface
 - create_waiting_queue factory function
 """
@@ -16,12 +17,23 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     WaitingQueue,
     create_waiting_queue,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
 
 
 def create_mock_request_item(request_id: int) -> RequestQueueItem:
     """Create a mock RequestQueueItem for testing."""
     mock_request = Mock()
+    return RequestQueueItem(request_id, mock_request)
+
+
+def create_priority_request_item(
+    request_id: int, priority: float = DEFAULT_REQUEST_PRIORITY
+) -> RequestQueueItem:
+    """Create a mock RequestQueueItem with an explicit float priority."""
+    mock_request = Mock()
+    mock_request.priority = priority
     return RequestQueueItem(request_id, mock_request)
 
 
@@ -187,3 +199,232 @@ class TestCreateWaitingQueue:
         """Test creating queue with default policy."""
         queue = create_waiting_queue()
         assert isinstance(queue, FCFSWaitingQueue)
+
+    def test_create_priority_queue(self):
+        """Test creating a PriorityWaitingQueue via PRIORITY policy."""
+        queue = create_waiting_queue(WaitingQueuePolicy.PRIORITY)
+        assert isinstance(queue, PriorityWaitingQueue)
+
+
+class TestPriorityWaitingQueue:
+    """Tests for PriorityWaitingQueue.
+
+    Covers priority ordering, FCFS tiebreak for equal priorities, and
+    the full WaitingQueue interface (add, pop, peek, prepend, remove,
+    bool, len, iter).
+    """
+
+    # ------------------------------------------------------------------
+    # Ordering
+    # ------------------------------------------------------------------
+
+    def test_high_priority_served_before_low(self):
+        """Higher priority requests are popped before lower priority ones."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.1))
+        q.add_request(create_priority_request_item(2, priority=0.9))
+        q.add_request(create_priority_request_item(3, priority=0.5))
+        assert [q.pop_request().id for _ in range(3)] == [2, 3, 1]
+
+    def test_equal_priority_falls_back_to_fcfs(self):
+        """Requests with equal priority are served in arrival (FCFS) order."""
+        q = PriorityWaitingQueue()
+        for req_id in [10, 20, 30]:
+            q.add_request(create_priority_request_item(req_id, priority=0.7))
+        assert [q.pop_request().id for _ in range(3)] == [10, 20, 30]
+
+    def test_default_priority_is_fcfs(self):
+        """Requests using the default priority are served in arrival order."""
+        q = PriorityWaitingQueue()
+        for req_id in range(5):
+            q.add_request(create_priority_request_item(req_id))
+        assert [q.pop_request().id for _ in range(5)] == [0, 1, 2, 3, 4]
+
+    def test_mixed_priorities_correct_order(self):
+        """Mixed priorities are served strictly in descending priority order."""
+        q = PriorityWaitingQueue()
+        items = [
+            (1, 0.3),
+            (2, 1.0),
+            (3, 0.0),
+            (4, 0.8),
+            (5, 0.5),
+        ]
+        for req_id, priority in items:
+            q.add_request(create_priority_request_item(req_id, priority))
+        # Expected order: 2 (1.0), 4 (0.8), 5 (0.5), 1 (0.3), 3 (0.0)
+        assert [q.pop_request().id for _ in range(5)] == [2, 4, 5, 1, 3]
+
+    def test_interleaved_add_and_pop(self):
+        """Priority order is maintained when requests are added between pops."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.5))
+        q.add_request(create_priority_request_item(2, priority=0.2))
+        assert q.pop_request().id == 1  # highest so far
+
+        # Add a higher-priority request after the first pop
+        q.add_request(create_priority_request_item(3, priority=0.9))
+        assert q.pop_request().id == 3
+        assert q.pop_request().id == 2
+
+    # ------------------------------------------------------------------
+    # add_requests (batch insert)
+    # ------------------------------------------------------------------
+
+    def test_add_requests_batch(self):
+        """add_requests inserts all items and respects priority ordering."""
+        q = PriorityWaitingQueue()
+        q.add_requests(
+            [
+                create_priority_request_item(1, priority=0.2),
+                create_priority_request_item(2, priority=0.8),
+                create_priority_request_item(3, priority=0.5),
+            ]
+        )
+        assert len(q) == 3
+        assert [q.pop_request().id for _ in range(3)] == [2, 3, 1]
+
+    # ------------------------------------------------------------------
+    # peek_request
+    # ------------------------------------------------------------------
+
+    def test_peek_returns_highest_priority_without_removing(self):
+        """peek_request returns the highest-priority item and does not remove it."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.3))
+        q.add_request(create_priority_request_item(2, priority=0.9))
+
+        peeked = q.peek_request()
+        assert peeked.id == 2
+        assert len(q) == 2  # not consumed
+
+    def test_peek_from_empty_raises(self):
+        """peek_request raises IndexError on an empty queue."""
+        with pytest.raises(IndexError):
+            PriorityWaitingQueue().peek_request()
+
+    def test_pop_from_empty_raises(self):
+        """pop_request raises IndexError on an empty queue."""
+        with pytest.raises(IndexError):
+            PriorityWaitingQueue().pop_request()
+
+    # ------------------------------------------------------------------
+    # prepend_request / prepend_requests
+    # ------------------------------------------------------------------
+
+    def test_prepend_request_respects_priority(self):
+        """prepend_request re-inserts by priority, not unconditionally to front."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.8))
+        q.add_request(create_priority_request_item(2, priority=0.6))
+
+        # Prepend a low-priority item — it should not jump to the front
+        q.prepend_request(create_priority_request_item(3, priority=0.1))
+
+        assert [q.pop_request().id for _ in range(3)] == [1, 2, 3]
+
+    def test_prepend_requests_respects_priority(self):
+        """prepend_requests re-inserts all items by priority."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.5))
+        q.prepend_requests(
+            [
+                create_priority_request_item(2, priority=0.9),
+                create_priority_request_item(3, priority=0.1),
+            ]
+        )
+        assert [q.pop_request().id for _ in range(3)] == [2, 1, 3]
+
+    # ------------------------------------------------------------------
+    # remove_by_ids
+    # ------------------------------------------------------------------
+
+    def test_remove_by_ids_removes_correct_items(self):
+        """remove_by_ids removes exactly the specified requests."""
+        q = PriorityWaitingQueue()
+        for i, p in enumerate([0.9, 0.7, 0.5, 0.3, 0.1]):
+            q.add_request(create_priority_request_item(i, priority=p))
+
+        q.remove_by_ids({1, 3})
+
+        assert len(q) == 3
+        remaining = [q.pop_request().id for _ in range(3)]
+        assert remaining == [0, 2, 4]
+
+    def test_remove_by_ids_nonexistent_is_noop(self):
+        """remove_by_ids with unknown IDs does not change the queue."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.8))
+        q.add_request(create_priority_request_item(2, priority=0.4))
+
+        q.remove_by_ids({99, 100})
+
+        assert len(q) == 2
+
+    def test_remove_all_ids_leaves_empty_queue(self):
+        """remove_by_ids can empty the queue entirely."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.8))
+        q.add_request(create_priority_request_item(2, priority=0.4))
+
+        q.remove_by_ids({1, 2})
+
+        assert len(q) == 0
+        assert not q
+
+    def test_priority_order_preserved_after_remove(self):
+        """Priority ordering is intact after remove_by_ids."""
+        q = PriorityWaitingQueue()
+        for i, p in enumerate([0.9, 0.7, 0.5, 0.3]):
+            q.add_request(create_priority_request_item(i, priority=p))
+
+        q.remove_by_ids({1})  # remove priority=0.7
+
+        assert [q.pop_request().id for _ in range(3)] == [0, 2, 3]
+
+    # ------------------------------------------------------------------
+    # bool / len / iter
+    # ------------------------------------------------------------------
+
+    def test_bool_empty(self):
+        """Empty queue is falsy."""
+        assert not PriorityWaitingQueue()
+
+    def test_bool_nonempty(self):
+        """Non-empty queue is truthy."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.5))
+        assert q
+
+    def test_len_tracks_adds_and_pops(self):
+        """__len__ accurately reflects the number of items."""
+        q = PriorityWaitingQueue()
+        assert len(q) == 0
+        q.add_request(create_priority_request_item(1, priority=0.5))
+        assert len(q) == 1
+        q.add_requests([create_priority_request_item(i, priority=0.5) for i in range(2, 5)])
+        assert len(q) == 4
+        q.pop_request()
+        assert len(q) == 3
+
+    def test_iter_yields_in_priority_order(self):
+        """__iter__ yields items in descending priority order."""
+        q = PriorityWaitingQueue()
+        for i, p in enumerate([0.1, 0.9, 0.5]):
+            q.add_request(create_priority_request_item(i, priority=p))
+
+        iterated_ids = [item.id for item in q]
+        assert iterated_ids == [1, 2, 0]  # 0.9, 0.5, 0.1
+
+    def test_iter_does_not_consume_items(self):
+        """Iterating over the queue does not remove items."""
+        q = PriorityWaitingQueue()
+        q.add_request(create_priority_request_item(1, priority=0.8))
+        q.add_request(create_priority_request_item(2, priority=0.4))
+
+        _ = list(q)
+        assert len(q) == 2
+
+    def test_is_waiting_queue_subclass(self):
+        """PriorityWaitingQueue is a WaitingQueue."""
+        assert isinstance(PriorityWaitingQueue(), WaitingQueue)

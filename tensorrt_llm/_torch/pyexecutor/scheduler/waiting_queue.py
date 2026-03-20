@@ -1,4 +1,4 @@
-import bisect
+import heapq
 import warnings
 from abc import ABC, abstractmethod
 from collections import deque
@@ -135,71 +135,81 @@ class FCFSWaitingQueue(deque, WaitingQueue):
 class PriorityWaitingQueue(WaitingQueue):
     """A priority queue that serves higher-priority requests first.
 
-    Requests with equal priority are served in FCFS order.
-    Priority is read from ``item.request.priority``; the default priority is 0.5.
+    Requests with equal priority are served in FCFS order (arrival order).
+    Priority is read from ``item.request.priority``; the default is 0.5.
+
+    Heap entries are ``(neg_priority, insertion_counter, item)`` tuples.
+    Because ``insertion_counter`` is strictly monotonically increasing, no two
+    entries share the same first two elements, so ``item`` is never compared
+    and does not need to implement ``__lt__``.
+
+    Complexity:
+        - add_request / add_requests: O(log n)
+        - pop_request / peek_request: O(log n) / O(1)
+        - remove_by_ids: O(n) rebuild + O(n) heapify
+        - __iter__: O(n log n) over a sorted copy (priority order)
     """
 
-    _DEFAULT_PRIORITY: float = DEFAULT_REQUEST_PRIORITY
-
     def __init__(self) -> None:
-        self._queue: list[RequestQueueItem] = []
-        # Parallel list of sort keys: (neg_priority, insertion_counter).
-        # bisect operates on this list so insertions stay O(log n).
-        self._keys: list[tuple] = []
+        # Min-heap of (neg_priority, insertion_counter, RequestQueueItem).
+        self._heap: list[tuple] = []
         self._insertion_counter: int = 0
 
     def _get_priority(self, item: RequestQueueItem) -> float:
         if item.request is not None:
             return item.request.priority
-        return self._DEFAULT_PRIORITY
+        return DEFAULT_REQUEST_PRIORITY
 
-    def _insert(self, item: RequestQueueItem) -> None:
-        key = (-self._get_priority(item), self._insertion_counter)
+    def _push(self, item: RequestQueueItem) -> None:
+        entry = (-self._get_priority(item), self._insertion_counter, item)
         self._insertion_counter += 1
-        idx = bisect.bisect_right(self._keys, key)
-        self._keys.insert(idx, key)
-        self._queue.insert(idx, item)
+        heapq.heappush(self._heap, entry)
 
     def add_request(self, request: RequestQueueItem) -> None:
-        self._insert(request)
+        """Add a request to the queue in priority order."""
+        self._push(request)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
+        """Add multiple requests to the queue in priority order."""
         for request in requests:
-            self._insert(request)
+            self._push(request)
 
     def pop_request(self) -> RequestQueueItem:
-        self._keys.pop(0)
-        return self._queue.pop(0)
+        """Pop the highest-priority request (FCFS tiebreak)."""
+        if not self._heap:
+            raise IndexError("pop from an empty queue")
+        _, _, item = heapq.heappop(self._heap)
+        return item
 
     def peek_request(self) -> RequestQueueItem:
-        if not self._queue:
+        """Return the highest-priority request without removing it."""
+        if not self._heap:
             raise IndexError("peek from an empty queue")
-        return self._queue[0]
+        return self._heap[0][2]
 
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Re-insert the request at the position dictated by its priority."""
-        self._insert(request)
+        self._push(request)
 
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Re-insert requests at the positions dictated by their priorities."""
         for request in requests:
-            self._insert(request)
+            self._push(request)
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
-        pairs = [(k, r) for k, r in zip(self._keys, self._queue) if r.id not in request_ids]
-        if pairs:
-            self._keys, self._queue = map(list, zip(*pairs))
-        else:
-            self._keys, self._queue = [], []
+        """Remove requests with the given IDs."""
+        self._heap = [e for e in self._heap if e[2].id not in request_ids]
+        heapq.heapify(self._heap)
 
     def __bool__(self) -> bool:
-        return len(self._queue) > 0
+        return len(self._heap) > 0
 
     def __len__(self) -> int:
-        return len(self._queue)
+        return len(self._heap)
 
     def __iter__(self) -> Iterator[RequestQueueItem]:
-        return iter(self._queue)
+        """Iterate over requests in descending priority order."""
+        return (e[2] for e in sorted(self._heap))
 
 
 def create_waiting_queue(
