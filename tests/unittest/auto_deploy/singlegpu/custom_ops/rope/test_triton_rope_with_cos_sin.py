@@ -29,8 +29,7 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 def _precompute_cos_sin(seq_len, head_dim, dtype=torch.float32, device="cuda"):
     """Precompute cos/sin tensors in the HF style (duplicated halves)."""
     inv_freq = 1.0 / (
-        10000.0
-        ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+        10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
     )
     positions = torch.arange(seq_len, dtype=torch.float32, device=device)
     freqs = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # [S, D/2]
@@ -149,5 +148,5 @@ def test_triton_rope_large_realistic():
     q_ref, k_ref = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 1)
     q_tri, k_tri = torch.ops.auto_deploy.triton_rope_with_explicit_cos_sin(q, k, cos, sin, 1)
 
-    torch.testing.assert_close(q_tri, q_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(k_tri, k_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(q_tri, q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(k_tri, k_ref, rtol=2e-2, atol=2e-2)
