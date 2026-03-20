@@ -552,6 +552,8 @@ public:
                     // Use pre-computed metadata if provided.
                     if (flash_mla_tile_scheduler_metadata.has_value())
                     {
+                        TORCH_CHECK(flash_mla_num_splits.has_value(),
+                            "flash_mla_num_splits must be provided when flash_mla_tile_scheduler_metadata is set.");
                         mla_params.flash_mla_tile_scheduler_metadata
                             = flash_mla_tile_scheduler_metadata->data_ptr<int>();
                         mla_params.flash_mla_num_splits = flash_mla_num_splits->data_ptr<int>();

@@ -260,8 +260,10 @@ public:
     {
         static constexpr int block_size_m = 64;
         int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
+        int device;
+        cudaGetDevice(&device);
         int sm_cnt;
-        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, 0);
+        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, device);
         int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
         return num_sm_parts;
     }
