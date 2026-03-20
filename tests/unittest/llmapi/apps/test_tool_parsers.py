@@ -28,6 +28,7 @@ from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
@@ -1788,6 +1789,315 @@ class TestToolParserIntegration:
 
         assert result1.calls[0].name == "get_weather"
         assert result2.calls[0].name == "search_web"
+
+
+# ============================================================================
+# MiniMaxM2ToolParser Tests
+# ============================================================================
+
+
+class TestMiniMaxM2ToolParser:
+    """Test suite for MiniMaxM2ToolParser class."""
+
+    @pytest.fixture
+    def parser(self):
+        return MiniMaxM2ToolParser()
+
+    def test_initialization(self, parser):
+        """Test that MiniMaxM2ToolParser initializes correctly."""
+        assert parser.bot_token == "<minimax:tool_call>"
+        assert parser.eot_token == "</minimax:tool_call>"
+
+    def test_has_tool_call_true(self, parser):
+        """Test has_tool_call returns True when tool call present."""
+        text = '<minimax:tool_call><invoke name="get_weather"><parameter name="location">NYC</parameter></invoke></minimax:tool_call>'
+        assert parser.has_tool_call(text) is True
+
+    def test_has_tool_call_false(self, parser):
+        """Test has_tool_call returns False when no tool call present."""
+        text = "Just some regular text without tool calls"
+        assert parser.has_tool_call(text) is False
+
+    def test_detect_and_parse_single_tool(self, sample_tools, parser):
+        """Test detect_and_parse with a single tool call."""
+        text = ('I will check the weather.'
+                '<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">NYC</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "I will check the weather." in result.normal_text
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "NYC"}
+
+    def test_detect_and_parse_multiple_tools(self, sample_tools, parser):
+        """Test detect_and_parse with multiple tool calls (parallel)."""
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">NYC</parameter>'
+                '</invoke>'
+                '<invoke name="search_web">'
+                '<parameter name="query">AI news</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 2
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[1].name == "search_web"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+        assert json.loads(result.calls[1].parameters) == {"query": "AI news"}
+
+    def test_detect_and_parse_no_tool_call(self, sample_tools, parser):
+        """Test detect_and_parse with text containing no tool calls."""
+        text = "This is just a regular response."
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == text
+        assert len(result.calls) == 0
+
+    def test_detect_and_parse_with_thinking(self, sample_tools, parser):
+        """Test detect_and_parse with interleaved thinking content before tool call."""
+        text = ('Let me think about this...\n'
+                '<minimax:tool_call>'
+                '<invoke name="search_web">'
+                '<parameter name="query">weather forecast</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "Let me think about this..." in result.normal_text
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "search_web"
+
+    def test_detect_and_parse_multiple_params(self, sample_tools, parser):
+        """Test parsing with multiple parameters."""
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">Tokyo</parameter>'
+                '<parameter name="unit">celsius</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "Tokyo", "unit": "celsius"}
+
+    def test_detect_and_parse_no_params(self):
+        """Test parsing tool call with no parameters."""
+        parser = MiniMaxM2ToolParser()
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_time">'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_time"
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_parse_streaming_increment_normal_text(self, sample_tools, parser):
+        """Test streaming parser handles normal text without tool calls."""
+        text = "Hello, how can I help?"
+
+        result = parser.parse_streaming_increment(text, sample_tools)
+
+        assert result.normal_text == text
+        assert len(result.calls) == 0
+
+    def test_parse_streaming_increment_partial_bot_token(
+            self, sample_tools, parser):
+        """Test streaming parser buffers partial bot token."""
+        result = parser.parse_streaming_increment("<minimax:tool_cal",
+                                                  sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
+
+    def test_parse_streaming_increment_complete_tool(self, sample_tools):
+        """Test streaming parser with complete tool call."""
+        parser = MiniMaxM2ToolParser()
+
+        # Send the complete tool call
+        result = parser.parse_streaming_increment(
+            '<minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">NYC</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>', sample_tools)
+
+        # Should have parsed the tool call
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+
+    def test_supports_structural_tag(self, parser):
+        """Test that supports_structural_tag returns False."""
+        assert parser.supports_structural_tag() is False
+
+    def test_parse_param_value_string_not_coerced(self):
+        """Test that string-typed params are not coerced by json.loads."""
+        from tensorrt_llm.serve.tool_parser.minimax_m2_parser import \
+            _parse_param_value
+
+        # Values that json.loads would coerce if not short-circuited.
+        assert _parse_param_value("42", "string") == "42"
+        assert _parse_param_value("true", "string") == "true"
+        assert _parse_param_value("null", "string") == "null"
+        assert _parse_param_value('{"k": 1}', "string") == '{"k": 1}'
+        assert _parse_param_value("[1,2]", "string") == "[1,2]"
+        # Non-string types should still be parsed.
+        assert _parse_param_value("42", "integer") == 42
+        assert _parse_param_value("3.14", "number") == 3.14
+        assert _parse_param_value("true", "boolean") is True
+        assert _parse_param_value('{"k": 1}', "object") == {"k": 1}
+
+    def test_detect_and_parse_preserves_suffix(self, sample_tools):
+        """Test that text after </minimax:tool_call> is preserved."""
+        parser = MiniMaxM2ToolParser()
+        text = ('prefix text'
+                '<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">NYC</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>'
+                ' suffix text')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "prefix text" in result.normal_text
+        assert "suffix text" in result.normal_text
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+
+    def test_streaming_preserves_prefix_in_same_chunk(self, sample_tools):
+        """Test streaming returns prefix when it arrives with the tool token."""
+        parser = MiniMaxM2ToolParser()
+        result = parser.parse_streaming_increment(
+            'Hello! <minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">NYC</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>', sample_tools)
+
+        assert "Hello!" in result.normal_text
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+
+
+# ============================================================================
+# Reasoning Parser Tests for Interleaved Thinking
+# ============================================================================
+
+
+class TestInterleavedThinkingReasoningParsers:
+    """Test reasoning parsers used for interleaved thinking models."""
+
+    def test_minimax_m2_reasoning_parser_registered(self):
+        """Test that minimax_m2 reasoning parser is registered."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+        assert "minimax_m2" in ReasoningParserFactory.keys()
+
+    def test_minimax_m2_append_think_reasoning_parser_registered(self):
+        """Test that minimax_m2_append_think reasoning parser is registered."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+        assert "minimax_m2_append_think" in ReasoningParserFactory.keys()
+
+    def test_minimax_m2_parser_handles_think_tags(self):
+        """Test MiniMax-M2 reasoning parser correctly extracts thinking content."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+        parser = ReasoningParserFactory.create_reasoning_parser("minimax_m2")
+
+        text = "Let me reason about this...</think>Here is the answer."
+        result = parser.parse(text)
+
+        assert result.reasoning_content == "Let me reason about this..."
+        assert result.content == "Here is the answer."
+
+    def test_interleaved_thinking_minimax_with_tool_call(self):
+        """Test MiniMax-M2 reasoning + tool parsing pipeline."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            "minimax_m2_append_think")
+        text = ("Let me search for the latest news.</think>"
+                '<minimax:tool_call>'
+                '<invoke name="search_web">'
+                '<parameter name="query">latest AI news</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.parse(text)
+
+        assert result.reasoning_content == "Let me search for the latest news."
+        assert "<minimax:tool_call>" in result.content
+
+        # Tool parser processes the content
+        tool_parser = MiniMaxM2ToolParser()
+        tool_result = tool_parser.detect_and_parse(result.content, [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="search_web",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string"
+                            },
+                        },
+                    },
+                ),
+            )
+        ])
+        assert len(tool_result.calls) == 1
+        assert tool_result.calls[0].name == "search_web"
+
+
+# ============================================================================
+# Tool Parser Factory Tests
+# ============================================================================
+
+
+class TestToolParserFactory:
+    """Test that the tool parser factory registers all expected parsers."""
+
+    def test_minimax_m2_registered(self):
+        """Test that minimax_m2 parser is registered in factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert "minimax_m2" in ToolParserFactory.parsers
+
+    def test_create_minimax_m2_parser(self):
+        """Test creating minimax_m2 parser via factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        parser = ToolParserFactory.create_tool_parser("minimax_m2")
+        assert isinstance(parser, MiniMaxM2ToolParser)
 
 
 if __name__ == "__main__":
