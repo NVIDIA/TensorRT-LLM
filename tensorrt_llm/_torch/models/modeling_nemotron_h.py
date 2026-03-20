@@ -655,7 +655,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         """
         # TODO: Remove enable_block_reuse=False once KV cache block reuse
         # is supported for Mamba/SSM-based models
-        return {}
+        return {"kv_cache_config": {"enable_block_reuse": False}}
 
 
 class NemotronHMTPDecoderLayer(NemotronHLayer):
