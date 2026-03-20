@@ -681,7 +681,7 @@
     }
 
     const id = ++widgetId;
-    const selModel = mkOptionGroup("Model", 1);
+    const selModel = mkSelectField("Model", `trtllm-model-${id}`, 1);
     const selTopo = mkOptionGroup("GPU(s)", 2);
     const selSeq = mkOptionGroup("ISL / OSL", 3);
     const selConc = mkSelectField("Concurrency", `trtllm-conc-${id}`, 4);
@@ -831,6 +831,9 @@
     function captureFocusDescriptor() {
       const activeEl = document.activeElement;
       if (!activeEl || !container.contains(activeEl)) return null;
+      if (activeEl === selModel.select) {
+        return { type: "model-select" };
+      }
       if (activeEl === selConc.select) {
         return { type: "select" };
       }
@@ -849,6 +852,10 @@
 
     function restoreFocusDescriptor(descriptor) {
       if (!descriptor) return;
+      if (descriptor.type === "model-select") {
+        selModel.select.focus();
+        return;
+      }
       if (descriptor.type === "select") {
         selConc.select.focus();
         return;
@@ -964,6 +971,32 @@
       }
     }
 
+    function setModelSelect(selectEl, group) {
+      const previousValue = state.model || "";
+      selectEl.innerHTML = "";
+      selectEl.appendChild(
+        el("option", {
+          value: "",
+          text: group.options.length ? "Select model" : "No models available",
+        })
+      );
+      for (const option of group.options) {
+        const isUnavailable = option.status === "incompatible";
+        const optNode = el("option", {
+          value: option.value,
+          text: option.label,
+        });
+        if (isUnavailable) optNode.disabled = true;
+        optNode.dataset.status = option.status;
+        selectEl.appendChild(optNode);
+      }
+
+      const canPreserveValue = group.options.some((option) => option.value === previousValue);
+      selectEl.value = canPreserveValue ? previousValue : "";
+      const selectedOption = group.options.find((option) => option.value === selectEl.value);
+      selectEl.dataset.status = (selectedOption && selectedOption.status) || "idle";
+    }
+
     function setSelectOptions(selectEl, group) {
       const previousValue = state.concurrency || "";
       selectEl.innerHTML = "";
@@ -1010,23 +1043,21 @@
         curatedEntries.filter((e) => !dbModelValues.has(e.model)),
         (e) => e.model
       );
+      const modelGroup = { ...view.groups.model };
       if (curatedOnlyModels.length) {
-        const augmented = { ...view.groups.model };
-        augmented.options = augmented.options.slice();
+        modelGroup.options = modelGroup.options.slice();
         for (const ce of curatedOnlyModels) {
           const opt = modelOption(ce.model, modelsInfo);
           const isSelected = view.state.model === ce.model;
-          augmented.options.push({
+          modelGroup.options.push({
             ...opt,
             status: isSelected ? "active" : "available",
             selected: isSelected,
           });
         }
-        augmented.options.sort((a, b) => sortStrings(a.label, b.label));
-        setOptionButtons(selModel.options, "model", augmented);
-      } else {
-        setOptionButtons(selModel.options, "model", view.groups.model);
+        modelGroup.options.sort((a, b) => sortStrings(a.label, b.label));
       }
+      setModelSelect(selModel.select, modelGroup);
 
       const modelCurated = curatedEntriesForModel(curatedEntries, view.state.model);
       const hasCurated = modelCurated.length > 0;
@@ -1117,6 +1148,15 @@
 
       restoreFocusDescriptor(focusDescriptor);
     }
+
+    selModel.select.addEventListener("change", () => {
+      state.curatedIndex = null;
+      state.model = selModel.select.value;
+      state.topology = "";
+      state.islOsl = "";
+      state.concurrency = "";
+      render();
+    });
 
     selConc.select.addEventListener("change", () => {
       state.concurrency = selConc.select.value;
