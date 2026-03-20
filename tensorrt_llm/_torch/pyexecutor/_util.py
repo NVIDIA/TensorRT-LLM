@@ -931,10 +931,6 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
-            model_config=model_engine.model.model_config.
-            get_bindings_model_config(tokens_per_block=tokens_per_block,
-                                      kv_cache_config=kv_cache_config,
-                                      spec_config=spec_config),
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:

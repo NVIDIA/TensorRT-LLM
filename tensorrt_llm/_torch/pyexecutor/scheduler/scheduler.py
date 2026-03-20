@@ -592,7 +592,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             all_context_requests_fit = False
 
         need_chunking = not all_context_requests_fit and contexts_to_be_chunked
-        if ctx_chunk_config and ctx_chunk_config[0] == ChunkingPolicy.FORCE_CHUNK:
+        if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
             need_chunking = True
 
         print(f"need_chunking: {need_chunking}")

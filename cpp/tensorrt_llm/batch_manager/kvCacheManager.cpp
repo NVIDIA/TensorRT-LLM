@@ -1066,11 +1066,6 @@ void WindowBlockManager::allocatePools(bool useUvm)
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
         else
             pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
-        // if (isRecurrentState())
-        cudaMemset(pool.primaryPtr->data(), 0xff, pool.primaryPtr->getSizeInBytes());
-        TLLM_LOG_INFO("[%s] Primary pool addr=%p, size=%zu bytes, end=%p", mLogPrefix.c_str(), pool.primaryPtr->data(),
-            pool.primaryPtr->getSizeInBytes(),
-            static_cast<char*>(pool.primaryPtr->data()) + pool.primaryPtr->getSizeInBytes());
         if (mNumSecondaryBlocks > 0)
         {
             nvinfer1::Dims cacheShapeOffload;

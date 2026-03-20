@@ -529,9 +529,12 @@ def create_py_executor(
         cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
-    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse:
+    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
+            spec_config is not None or cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models")
+            "Disabling block reuse for MambaHybridCacheManager-based models when MTP or disagg is enabled"
+        )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                        False)

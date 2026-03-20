@@ -13,8 +13,8 @@ from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
-    load_pretrained_config)
+    get_qwen3_hybrid_num_attention_layers, is_hybrid_linear, is_nemotron_hybrid,
+    is_qwen3_hybrid, load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -796,13 +796,19 @@ class ModelConfig(Generic[TConfig]):
             kv_cache_config: Optional[KvCacheConfig] = None,
             spec_config: Optional['SpeculativeConfig'] = None):
         use_disagg = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
-        kv_cache_config is not None and kv_cache_config.enable_block_reuse
+        use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
         use_spec = spec_config is not None
 
         use_v1_mamba_manager = use_disagg or use_spec
+        if is_hybrid_linear(
+                self.pretrained_config) and use_v1_mamba_manager and use_reuse:
+            logger.warning(
+                "Block reuse does not work with MTP or disagg for hybrid linear models"
+            )
+            use_reuse = False
         if is_nemotron_hybrid(self.pretrained_config) and use_v1_mamba_manager:
             return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif is_qwen3_hybrid(self.pretrained_config):
+        elif is_qwen3_hybrid(self.pretrained_config) and use_v1_mamba_manager:
             return get_qwen3_hybrid_num_attention_layers(self.pretrained_config)
         else:
             return self.pretrained_config.num_hidden_layers
