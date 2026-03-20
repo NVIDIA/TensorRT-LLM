@@ -1534,7 +1534,7 @@ def test_priority_request_completes_before_low_priority():
     """High-priority request must be scheduled before a lower-priority one.
 
     Setup (max_batch_size=1, WaitingQueuePolicy.PRIORITY):
-      - Request 1: no explicit priority (default 0.5), max_tokens=50  – long, ignore_eos
+      - Request 1: no explicit priority (default 0.5), max_tokens=500  – long, ignore_eos
       - Request 2: no explicit priority (default 0.5), max_tokens=5   – short
       - Request 3: priority=0.9,                       max_tokens=5   – short + high priority
 
@@ -1560,9 +1560,8 @@ def test_priority_request_completes_before_low_priority():
         # Request 1 uses ignore_eos so it keeps the batch slot busy for the
         # full max_tokens count rather than stopping at an early EOS token.
         out1 = llm.generate_async(
-            prompt, SamplingParams(max_tokens=50,
-                                   temperature=0,
-                                   ignore_eos=True))
+            prompt,
+            SamplingParams(max_tokens=500, temperature=0, ignore_eos=True))
         out2 = llm.generate_async(prompt,
                                   SamplingParams(max_tokens=5, temperature=0))
         out3 = llm.generate_async(prompt,
