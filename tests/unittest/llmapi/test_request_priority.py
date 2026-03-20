@@ -124,7 +124,7 @@ class TestGenerationExecutorPriorityPropagation:
 
 
 # ---------------------------------------------------------------------------
-# BaseWorker._enqueue_request  –  priority default of 0.5
+# BaseWorker._enqueue_request  -  priority default of 0.5
 # ---------------------------------------------------------------------------
 
 
@@ -197,7 +197,7 @@ class TestBaseWorkerPriorityDefault:
 
 
 # ---------------------------------------------------------------------------
-# BaseLLM.generate – scalar and list priority
+# BaseLLM.generate - scalar and list priority
 # ---------------------------------------------------------------------------
 
 
@@ -269,7 +269,7 @@ class TestBaseLLMGeneratePriority:
 
 
 # ---------------------------------------------------------------------------
-# executor_request_to_llm_request – priority not hard-coded
+# executor_request_to_llm_request - priority not hard-coded
 # ---------------------------------------------------------------------------
 
 
@@ -311,7 +311,7 @@ class TestExecutorRequestToLlmRequestPriority:
 
 
 # ---------------------------------------------------------------------------
-# PriorityWaitingQueue – requests served in priority order
+# PriorityWaitingQueue - requests served in priority order
 # ---------------------------------------------------------------------------
 
 

@@ -410,6 +410,9 @@ class BaseLLM:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
 
+        if not 0.0 <= priority <= 1.0:
+            raise ValueError(f"priority must be in [0, 1], got {priority}")
+
         # Check if the worker is shutting down
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
