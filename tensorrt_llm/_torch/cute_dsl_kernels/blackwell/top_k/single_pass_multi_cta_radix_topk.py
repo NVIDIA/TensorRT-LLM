@@ -358,10 +358,10 @@ class SinglePassMultiCTARadixTopKKernel:
         return prologue_elems, aligned_size, left_size
 
     # ------------------------------------------------------------------
-    # Step 2a: Build local histogram and merge to global
+    # Step 2a: Build local histogram (SMEM only, no global merge)
     # ------------------------------------------------------------------
     @cute.jit
-    def build_and_merge_histogram(
+    def build_local_histogram(
         self,
         shared_ordered,
         actual_chunk_size,
@@ -369,10 +369,9 @@ class SinglePassMultiCTARadixTopKKernel:
         prefix_mask,
         shift,
         local_histogram,
-        global_histogram_ptr,
         tidx,
     ):
-        """Build per-CTA histogram on smem data and atomicAdd to global."""
+        """Build per-CTA histogram on smem data (no global merge)."""
         # Clear local histogram
         for i in range(tidx, self.radix, self.num_threads):
             local_histogram[i] = cutlass.Int32(0)
@@ -393,6 +392,27 @@ class SinglePassMultiCTARadixTopKKernel:
                     )
                 atomicAdd(local_histogram.iterator + bucket, val_one)
         cute.arch.barrier()
+
+    # ------------------------------------------------------------------
+    # Step 2a+: Build local histogram and merge to global
+    # ------------------------------------------------------------------
+    @cute.jit
+    def build_and_merge_histogram(
+        self,
+        shared_ordered,
+        actual_chunk_size,
+        prefix,
+        prefix_mask,
+        shift,
+        local_histogram,
+        global_histogram_ptr,
+        tidx,
+    ):
+        """Build per-CTA histogram on smem data and atomicAdd to global."""
+        self.build_local_histogram(
+            shared_ordered, actual_chunk_size, prefix, prefix_mask, shift,
+            local_histogram, tidx,
+        )
 
         # Merge to global histogram
         for i in range(tidx, self.radix, self.num_threads):
@@ -674,6 +694,114 @@ class SinglePassMultiCTARadixTopKKernel:
         return local_histogram[0]
 
     # ------------------------------------------------------------------
+    # Step 3a: Collect elements strictly greater than pivot
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _collect_pass_gt(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        left_size,
+        ordered_pivot,
+        local_histogram,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Collect elements with float > pivot (ordered < ordered_pivot).
+
+        Uses FlashInfer-style batch atomicAdd: local_histogram[0] tracks
+        the local offset within the CTA's allocation, local_histogram[1]
+        holds the global base from the batch atomicAdd.
+
+        3-region structure mirrors the reordered smem layout from
+        load_chunk_to_smem.
+        """
+        val_one = cutlass.Int32(1)
+        for i in range(tidx, aligned_size, self.num_threads):
+            ordered = shared_ordered[i]
+            if ordered < ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered < ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered < ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(
+                    chunk_start + prologue_elems + aligned_size + i
+                )
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+
+    # ------------------------------------------------------------------
+    # Step 3b: Collect elements equal to pivot
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _collect_pass_eq(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        left_size,
+        ordered_pivot,
+        top_k,
+        output_counter_ptr,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Collect elements with float == pivot (ordered == ordered_pivot).
+
+        Per-element atomicAdd on output_counter_ptr; writes only while pos < k.
+        Same 3-region structure as _collect_pass_gt.
+        """
+        val_one = cutlass.Int32(1)
+        for i in range(tidx, aligned_size, self.num_threads):
+            ordered = shared_ordered[i]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+        # TODO: move prologue region before aligned-region pass so that
+        # equal-to-pivot elements with smaller indices are placed first
+        # (stable output order).
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(
+                        chunk_start + prologue_elems + aligned_size + i
+                    )
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+
+    # ------------------------------------------------------------------
     # Step 3: Collect output indices and values
     # ------------------------------------------------------------------
     @cute.jit
@@ -709,8 +837,6 @@ class SinglePassMultiCTARadixTopKKernel:
         elements from all CTAs are counted before == pivot elements start
         filling the remaining slots.
         """
-        val_one = cutlass.Int32(1)
-
         # Reuse local_histogram for counters (FlashInfer convention):
         #   [0] = local_offset_gt  (local position within CTA allocation)
         #   [1] = global_base_gt   (global base from batch atomicAdd)
@@ -722,37 +848,11 @@ class SinglePassMultiCTARadixTopKKernel:
         cute.arch.barrier()
 
         # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
-        # 3-region structure mirrors the reordered smem layout from
-        # load_chunk_to_smem:
-        #   aligned:  smem[i]                       → gmem[chunk_start + prologue_elems + i]
-        #   prologue: smem[aligned_size + i]         → gmem[chunk_start + i]
-        #   tail:     smem[aligned_size+prologue+i]  → gmem[chunk_start + prologue_elems + aligned_size + i]
-        for i in range(tidx, aligned_size, self.num_threads):
-            ordered = shared_ordered[i]
-            if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
-                pos = local_histogram[1] + local_pos
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
-        for i in range(tidx, prologue_elems, self.num_threads):
-            ordered = shared_ordered[i + aligned_size]
-            if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
-                pos = local_histogram[1] + local_pos
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
-        for i in range(tidx, left_size, self.num_threads):
-            ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
-                pos = local_histogram[1] + local_pos
-                output_indices_row[pos] = cutlass.Int32(
-                    chunk_start + prologue_elems + aligned_size + i
-                )
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
+        self._collect_pass_gt(
+            shared_ordered, chunk_start, prologue_elems, aligned_size,
+            left_size, ordered_pivot, local_histogram,
+            output_indices_row, output_values_row, tidx,
+        )
 
         # Inter-CTA barrier between pass 1 and pass 2 (only thread 0 signals)
         if tidx == 0:
@@ -760,33 +860,12 @@ class SinglePassMultiCTARadixTopKKernel:
         barrier_phase = barrier_phase + 1
         barrier_inter_cta(arrival_counter_ptr, barrier_phase * ctas_per_group, tidx)
 
-        # Pass 2: equal to pivot — same 3-region structure
-        for i in range(tidx, aligned_size, self.num_threads):
-            ordered = shared_ordered[i]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, prologue_elems, self.num_threads):
-            ordered = shared_ordered[i + aligned_size]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, left_size, self.num_threads):
-            ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(
-                        chunk_start + prologue_elems + aligned_size + i
-                    )
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+        # Pass 2: equal to pivot
+        self._collect_pass_eq(
+            shared_ordered, chunk_start, prologue_elems, aligned_size,
+            left_size, ordered_pivot, top_k, output_counter_ptr,
+            output_indices_row, output_values_row, tidx,
+        )
 
         return barrier_phase
 
