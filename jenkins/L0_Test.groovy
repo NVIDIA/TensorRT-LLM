@@ -434,8 +434,6 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
 
-        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
         def slurmJobID = Utils.exec(
@@ -488,8 +486,6 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     CloudManager.destroyNode(nodeName)
 
     Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
-
-    Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
@@ -1947,7 +1943,6 @@ def launchTestListCheck(pipeline)
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y libffi-dev")
             sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
             // download TRT-LLM tarfile
             def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
@@ -2571,7 +2566,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y rsync")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
@@ -2579,7 +2573,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "env | sort"
         sh "which python3"
         sh "python3 --version"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y libffi-dev")
+
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
@@ -2612,10 +2606,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         stage("Interactive Debug Session")
         {
             testFilter[(DEBUG_MODE)] = false
-
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install openssh-server -y")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install autossh -y")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install sshpass -y")
 
             sh """
                 echo 'Port 22' >> /etc/ssh/sshd_config
