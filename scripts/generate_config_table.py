@@ -38,6 +38,10 @@ from examples.configs.database.database import (  # noqa: E402
 )
 
 MODEL_INFO = {
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
+        "display_name": "Nemotron v3 Super (NVFP4)",
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    },
     "deepseek-ai/DeepSeek-R1-0528": {
         "display_name": "DeepSeek-R1",
         "url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",

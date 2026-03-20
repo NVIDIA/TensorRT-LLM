@@ -1,4 +1,9 @@
 # arch: MODEL_CLASS_MAPPING key; required when model has get_model_defaults. Add when adding entries.
+- model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+  arch: NemotronNASForCausalLM
+  config_path: examples/configs/curated/nemotron-3-super-throughput.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "B200, GB200"
 - model: Qwen/Qwen3-Next-80B-A3B-Thinking
   arch: Qwen3NextForCausalLM
   config_path: examples/configs/curated/qwen3-next.yaml

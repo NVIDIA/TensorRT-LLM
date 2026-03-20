@@ -1,6 +1,18 @@
 {
   "curated_entries": [
     {
+      "command": "trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-3-super-throughput.yaml",
+      "config_filename": "nemotron-3-super-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-3-super-throughput.yaml",
+      "config_path": "examples/configs/curated/nemotron-3-super-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/nemotron-3-super-throughput.yaml",
+      "gpu_compatibility": "B200, GB200",
+      "model": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+      "model_display_name": "Nemotron v3 Super (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+      "scenario": "Max Throughput"
+    },
+    {
       "command": "trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --config ${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml",
       "config_filename": "qwen3-next.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3-next.yaml",
@@ -3499,6 +3511,10 @@
     "nvidia/Llama-4-Scout-17B-16E-Instruct-FP8": {
       "display_name": "Llama 4 Scout (FP8)",
       "url": "https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8"
+    },
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
+      "display_name": "Nemotron v3 Super (NVFP4)",
+      "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
     },
     "openai/gpt-oss-120b": {
       "display_name": "gpt-oss-120b",
