@@ -241,6 +241,14 @@ enum class MoeGemmId : int
 
 struct QuantParams
 {
+    // Dynamic fc2 quantization: compute fc2 input scale from intermediate activation at runtime
+    bool use_dynamic_fc2_scale = false;
+    // Workspace pointers for dynamic fc2 (set by caller)
+    float* dynamic_fc2_amax = nullptr;           // [1] global amax output
+    float* dynamic_fc2_alpha = nullptr;          // [num_experts] dynamic alpha output
+    void* dynamic_fc2_bf16_buffer = nullptr;     // bf16 intermediate buffer
+    float const* fc2_weight_scale_2 = nullptr;   // [num_experts] per-expert weight_scale_2 for fc2
+
     // Int weight only quantization params
     struct
     {
