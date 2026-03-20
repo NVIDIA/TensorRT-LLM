@@ -39,14 +39,14 @@ class SADraftEnhancer:
     ``maybe_override_all_draft_tokens`` is called after the draft loop.
 
     Usage:
-        1. Construct once during worker ``__init__`` when ``use_sa_spec`` is True.
+        1. Construct once during worker ``__init__`` when ``sa_config`` is set.
         2. Call ``extend_and_prepare`` after ``sample_and_accept_draft_tokens``.
         3. Call ``maybe_override_all_draft_tokens`` once after all draft layers
            have finished, so that neural draft layers never see SA tokens.
     """
 
-    def __init__(self, sa_spec_threshold: int):
-        self.sa_spec_threshold = sa_spec_threshold
+    def __init__(self, threshold: int):
+        self.threshold = threshold
         self.sa_match_len: Optional[torch.Tensor] = None
         self.sa_draft_tokens: Optional[torch.Tensor] = None
         self.sa_spec_index: int = 0
@@ -157,11 +157,7 @@ class SADraftEnhancer:
 
             n = self._num_gens
             K = draft_tokens.shape[1]
-            mask = (
-                (self.sa_match_len[:n] >= self.sa_spec_threshold)
-                .unsqueeze(1)
-                .expand_as(draft_tokens)
-            )
+            mask = (self.sa_match_len[:n] >= self.threshold).unsqueeze(1).expand_as(draft_tokens)
             draft_tokens = torch.where(mask, self.sa_draft_tokens[:n, :K], draft_tokens)
 
         return draft_tokens

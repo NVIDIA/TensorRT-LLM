@@ -101,18 +101,31 @@ class SuffixAutomatonManager(BaseResourceManager):
                 "Please ensure the native bindings are properly built."
             )
 
+        from tensorrt_llm.llmapi.llm_args import SADecodingConfig, SAEnhancerConfig
+
         # SA configuration
-        sa_config = (
-            config
-            if isinstance(config, SAConfig)
-            else SAConfig(
+        if isinstance(config, SAConfig):
+            sa_config = config
+        elif isinstance(config, SAEnhancerConfig):
+            sa_config = SAConfig(
                 max_seq_len=max_seq_len,
                 max_slots=max_num_requests,
-                threshold=getattr(config, "sa_spec_threshold", 4),
-                enable_global_pool=getattr(config, "enable_global_pool", False),
-                global_pool_size=getattr(config, "global_pool_size", None),
+                threshold=config.threshold,
+                enable_global_pool=config.enable_global_pool,
             )
-        )
+        elif isinstance(config, SADecodingConfig):
+            sa_config = SAConfig(
+                max_seq_len=max_seq_len,
+                max_slots=max_num_requests,
+                enable_global_pool=config.enable_global_pool,
+                global_pool_size=config.global_pool_size,
+            )
+        else:
+            raise TypeError(
+                f"SuffixAutomatonManager received unsupported config type "
+                f"{type(config).__name__}. Expected SAConfig, SAEnhancerConfig,"
+                f" or SADecodingConfig."
+            )
 
         self.config = sa_config
         self.max_num_requests = max_num_requests

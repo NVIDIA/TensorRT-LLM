@@ -58,7 +58,7 @@ from tensorrt_llm.llmapi import (
     Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
     NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
     SADecodingConfig, SamplingParams, SchedulerConfig,
-    SkipSoftmaxAttentionConfig, TorchCompileConfig)
+    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -372,7 +372,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         spec_config = Eagle3DecodingConfig(max_draft_len=4,
                                            speculative_model=eagle_model_dir,
                                            eagle3_one_model=True,
-                                           use_sa_spec=True)
+                                           sa_config=SAEnhancerConfig())
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
@@ -396,11 +396,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
-        spec_config = Eagle3DecodingConfig(max_draft_len=4,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=True,
-                                           use_sa_spec=True,
-                                           enable_global_pool=True)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=4,
+            speculative_model=eagle_model_dir,
+            eagle3_one_model=True,
+            sa_config=SAEnhancerConfig(enable_global_pool=True))
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
@@ -455,7 +455,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         spec_config = PARDDecodingConfig(max_draft_len=4,
                                          speculative_model=pard_model_dir,
-                                         use_sa_spec=True)
+                                         sa_config=SAEnhancerConfig())
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
@@ -480,10 +480,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         pard_model_dir = f"{llm_models_root()}/PARD-Llama-3.2-1B"
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
-        spec_config = PARDDecodingConfig(max_draft_len=4,
-                                         speculative_model=pard_model_dir,
-                                         use_sa_spec=True,
-                                         enable_global_pool=True)
+        spec_config = PARDDecodingConfig(
+            max_draft_len=4,
+            speculative_model=pard_model_dir,
+            sa_config=SAEnhancerConfig(enable_global_pool=True))
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
@@ -1737,7 +1737,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(),
         )
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=2,
-                                       use_sa_spec=True)
+                                       sa_config=SAEnhancerConfig())
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  max_num_tokens=8192,
@@ -1757,9 +1757,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
                                               enable_padding=True),
         )
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=2,
-                                       use_sa_spec=True,
-                                       enable_global_pool=True)
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=2,
+            sa_config=SAEnhancerConfig(enable_global_pool=True))
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  max_num_tokens=8192,

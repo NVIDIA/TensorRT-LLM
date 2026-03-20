@@ -89,8 +89,8 @@ class PARDWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.mapping = mapping
         self.sa_enhancer: Optional[SADraftEnhancer] = None
-        if getattr(spec_config, "use_sa_spec", False):
-            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
+        if getattr(spec_config, "sa_config", None) is not None:
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
         logger.info(
             f"PARDWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
