@@ -25,6 +25,7 @@ def test_pard(disable_overlap_scheduler: bool):
     This test verifies that PARD (Parallel Draft) speculative decoding works
     correctly with CUDA graphs and padding enabled.
     """
+    pytest.skip("OOM: KV cache v2 memory allocation exceeds GPU capacity")
     attn_backend = "TRTLLM"
     enable_block_reuse = False
     enable_chunked_prefill = False

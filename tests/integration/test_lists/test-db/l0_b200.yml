@@ -121,8 +121,7 @@ l0_b200:
   # --- MoE end
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
-  # Skip speculative tests due to IMA
-  # - unittest/_torch/speculative
+  - unittest/_torch/speculative
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"

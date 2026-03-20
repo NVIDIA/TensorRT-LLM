@@ -662,8 +662,9 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
+                draft_len = get_draft_token_length(req)
                 self.impl.add_token(req.py_request_id)
-                for _ in range(get_draft_token_length(req)):
+                for _ in range(draft_len):
                     self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
@@ -672,6 +673,17 @@ class KVCacheManager(BaseResourceManager):
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
+
+    def extend_capacity_for_tokens(self, request: LlmRequest,
+                                   num_tokens: int) -> None:
+        """Extend KV cache capacity for *request* by *num_tokens* extra tokens.
+
+        Used after ``pad_draft_tokens_for_cuda_graph`` to ensure the KV cache
+        has enough capacity for the padded draft tokens so that the subsequent
+        rewind does not underflow.
+        """
+        for _ in range(num_tokens):
+            self.impl.add_token(request.py_request_id)
 
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
@@ -2297,6 +2309,41 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                     )
+                kv_cache = self.kv_cache_map[req.py_request_id]
+                draft_len = get_draft_token_length(req)
+                new_capacity = kv_cache.capacity + 1 + draft_len
+                success = kv_cache.resize(new_capacity)
+                if not success:
+                    raise ValueError(
+                        f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for generation update"
+                    )
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self)
+
+    def extend_capacity_for_tokens(self, request: LlmRequest,
+                                   num_tokens: int) -> None:
+        """Extend KV cache capacity for *request* by *num_tokens* extra tokens.
+
+        Used after ``pad_draft_tokens_for_cuda_graph`` to ensure the KV cache
+        has enough capacity for the padded draft tokens so that the subsequent
+        rewind does not underflow.
+        """
+        if num_tokens <= 0:
+            return
+        kv_cache = self.kv_cache_map[request.py_request_id]
+        new_capacity = kv_cache.capacity + num_tokens
+        success = kv_cache.resize(new_capacity)
+        if not success:
+            raise ValueError(
+                f"Failed to extend capacity of KV cache for request "
+                f"{request.py_request_id} by {num_tokens} tokens "
+                f"(target capacity {new_capacity})")
+
+    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
+        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
+            request)
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
@@ -2391,7 +2438,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
                         req.py_request_id, req.lora_task_id, input_tokens)
                     success = draft_kv_cache.resume(
-                        torch.cuda.current_stream().cuda_stream)
+                        draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
                         release_resources(req, free_draft_resources=True)
                         return None
@@ -2410,7 +2457,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
                     success = kv_cache.resize(new_capacity)
                     if not success:
-                        release_resources(req)
+                        release_resources(req,
+                                          free_draft_resources=draft_kv_cache
+                                          is not None)
                         return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
