@@ -122,6 +122,9 @@ def _weighted_expert_sum_kernel(
     # Accumulate weighted expert outputs in float32
     acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
+    # Probe input dtype before the loop (Triton can't see loop-scoped vars after the loop)
+    _dtype_probe = tl.load(expert_out_ptr, eviction_policy="evict_first")
+
     for e in range(num_experts):
         # Load routing weight for this token-expert pair
         w = tl.load(routing_weights_ptr + token_idx * stride_routing_t + e * stride_routing_e)
@@ -137,7 +140,7 @@ def _weighted_expert_sum_kernel(
 
     # Store result
     out_ptr = output_ptr + token_idx * stride_out_t
-    tl.store(out_ptr + col_offsets * stride_out_h, acc.to(expert_vals.dtype), mask=mask)
+    tl.store(out_ptr + col_offsets * stride_out_h, acc.to(_dtype_probe.dtype), mask=mask)
 
 
 def _moe_dense_mlp_triton(
