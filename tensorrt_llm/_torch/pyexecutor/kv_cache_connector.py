@@ -453,6 +453,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.scheduler_output_manager.record_new_matched_tokens(
             request, num_tokens)
+       
+        request.py_num_connector_matched_tokens = num_tokens  
 
         return num_tokens
 
