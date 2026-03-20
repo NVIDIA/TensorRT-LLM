@@ -32,6 +32,7 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
+from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
@@ -303,7 +304,7 @@ class BaseLLM:
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
-        priority: Optional[Union[float, List[float]]] = None,
+        priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -325,7 +326,7 @@ class BaseLLM:
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
                 Scheduling parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
-            priority (float, List[float], optional): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to None (uses the backend default of 0.5).
+            priority (float, List[float], optional): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -387,7 +388,7 @@ class BaseLLM:
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
-        priority: Optional[float] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -404,7 +405,7 @@ class BaseLLM:
             trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
-            priority (float, optional): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to None (uses the backend default of 0.5).
+            priority (float, optional): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """

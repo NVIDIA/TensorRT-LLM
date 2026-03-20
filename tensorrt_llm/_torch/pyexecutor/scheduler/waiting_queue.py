@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import Callable, Optional
 
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
 
 from ..executor_request_queue import RequestQueueItem
@@ -119,11 +120,10 @@ class PriorityWaitingQueue(WaitingQueue):
     """A priority queue that serves higher-priority requests first.
 
     Requests with equal priority are served in FCFS order.
-    Priority is read from ``item.request.priority``; requests whose priority
-    is ``None`` are treated as having the default priority of 0.5.
+    Priority is read from ``item.request.priority``; the default priority is 0.5.
     """
 
-    _DEFAULT_PRIORITY: float = 0.5
+    _DEFAULT_PRIORITY: float = DEFAULT_REQUEST_PRIORITY
 
     def __init__(self) -> None:
         self._queue: list[RequestQueueItem] = []
@@ -133,8 +133,8 @@ class PriorityWaitingQueue(WaitingQueue):
         self._insertion_counter: int = 0
 
     def _get_priority(self, item: RequestQueueItem) -> float:
-        if item.request is not None and item.request.priority is not None:
-            return float(item.request.priority)
+        if item.request is not None:
+            return item.request.priority
         return self._DEFAULT_PRIORITY
 
     def _insert(self, item: RequestQueueItem) -> None:

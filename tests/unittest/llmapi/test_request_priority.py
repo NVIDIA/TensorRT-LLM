@@ -24,7 +24,7 @@ Tests cover priority propagation through:
 
 from unittest.mock import MagicMock, patch
 
-from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY, GenerationRequest
 from tensorrt_llm.sampling_params import SamplingParams
 
 # ---------------------------------------------------------------------------
@@ -40,9 +40,9 @@ class TestGenerationRequestPriority:
             **kwargs,
         )
 
-    def test_priority_defaults_to_none(self):
+    def test_priority_defaults_to_half(self):
         req = self._make_request()
-        assert req.priority is None
+        assert req.priority == DEFAULT_REQUEST_PRIORITY
 
     def test_priority_stored_correctly(self):
         req = self._make_request(priority=0.8)
@@ -57,8 +57,8 @@ class TestGenerationRequestPriority:
         assert req.priority == 1.0
 
     def test_priority_midpoint(self):
-        req = self._make_request(priority=0.5)
-        assert req.priority == 0.5
+        req = self._make_request(priority=DEFAULT_REQUEST_PRIORITY)
+        assert req.priority == DEFAULT_REQUEST_PRIORITY
 
 
 # ---------------------------------------------------------------------------
@@ -105,13 +105,13 @@ class TestGenerationExecutorPriorityPropagation:
         assert len(executor.submitted) == 1
         assert executor.submitted[0].priority == 0.9
 
-    def test_no_priority_leaves_none(self):
+    def test_no_priority_defaults_to_half(self):
         executor = self._make_executor()
         executor.generate_async(
             prompt_token_ids=[1, 2, 3],
             sampling_params=SamplingParams(max_tokens=5),
         )
-        assert executor.submitted[0].priority is None
+        assert executor.submitted[0].priority == DEFAULT_REQUEST_PRIORITY
 
     def test_priority_zero_propagated(self):
         executor = self._make_executor()
@@ -129,10 +129,7 @@ class TestGenerationExecutorPriorityPropagation:
 
 
 class TestBaseWorkerPriorityDefault:
-    """Verify that BaseWorker passes request.priority to tllm.Request.
-
-    Falls back to 0.5 when priority is None.
-    """
+    """Verify that BaseWorker passes request.priority to tllm.Request."""
 
     def _captured_tllm_request_priority(self, request_priority):
         """Run _enqueue_request with a mocked engine.
@@ -186,9 +183,9 @@ class TestBaseWorkerPriorityDefault:
         priority = self._captured_tllm_request_priority(0.8)
         assert priority == 0.8
 
-    def test_none_priority_defaults_to_half(self):
-        priority = self._captured_tllm_request_priority(None)
-        assert priority == 0.5
+    def test_default_priority_is_half(self):
+        priority = self._captured_tllm_request_priority(DEFAULT_REQUEST_PRIORITY)
+        assert priority == DEFAULT_REQUEST_PRIORITY
 
     def test_low_priority_is_forwarded(self):
         priority = self._captured_tllm_request_priority(0.1)
@@ -261,14 +258,14 @@ class TestBaseLLMGeneratePriority:
         assert calls[0]["priority"] == 0.2
         assert calls[1]["priority"] == 0.9
 
-    def test_no_priority_passes_none(self):
+    def test_no_priority_passes_default(self):
         llm, calls = self._make_llm_spy()
         llm.generate(
             ["hello"],
             sampling_params=SamplingParams(max_tokens=5),
             use_tqdm=False,
         )
-        assert calls[0]["priority"] is None
+        assert calls[0]["priority"] == DEFAULT_REQUEST_PRIORITY
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +323,7 @@ class TestPriorityWaitingQueueSchedulingOrder:
     downstream C++ capacity scheduler sees them in the right order.
     """
 
-    def _make_queue_item(self, req_id: int, priority: float | None = None):
+    def _make_queue_item(self, req_id: int, priority: float = 0.5):
         from unittest.mock import MagicMock
 
         from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
@@ -341,7 +338,7 @@ class TestPriorityWaitingQueueSchedulingOrder:
         q = PriorityWaitingQueue()
         q.add_request(self._make_queue_item(1, priority=0.1))
         q.add_request(self._make_queue_item(2, priority=0.9))
-        q.add_request(self._make_queue_item(3, priority=0.5))
+        q.add_request(self._make_queue_item(3, priority=DEFAULT_REQUEST_PRIORITY))
         served = [q.pop_request().id for _ in range(3)]
         assert served == [2, 3, 1], "Requests must be served in descending priority order"
 

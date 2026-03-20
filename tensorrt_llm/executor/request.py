@@ -15,10 +15,14 @@ from ..scheduling_params import SchedulingParams
 from .postproc_worker import PostprocParams
 
 __all__ = [
+    "DEFAULT_REQUEST_PRIORITY",
     "LoRARequest",
     "PromptAdapterRequest",
     "GenerationRequest",
 ]
+
+# Mirrors C++ executor.h Request::kDefaultPriority
+DEFAULT_REQUEST_PRIORITY: float = 0.5
 
 
 @dataclass(slots=True)
@@ -101,7 +105,7 @@ class GenerationRequest:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
-        priority: Optional[float] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
