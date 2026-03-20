@@ -1001,7 +1001,8 @@ class TestLlmError:
         """ LLM should raise error when got prompt length exceed the valid range. """
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
-                  max_num_tokens=100)
+                  max_num_tokens=100,
+                  enable_chunked_prefill=False)
 
         try:
             with pytest.raises(RequestError,
@@ -1174,7 +1175,8 @@ class TestLlmError:
         """ LLM should raise error when got prompt length exceed the valid range. """
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
-                  max_num_tokens=100)
+                  max_num_tokens=100,
+                  enable_chunked_prefill=False)
 
         try:
             with pytest.raises(RequestError,

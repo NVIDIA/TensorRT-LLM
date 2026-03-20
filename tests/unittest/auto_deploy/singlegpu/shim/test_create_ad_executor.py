@@ -91,6 +91,7 @@ def test_create_autodeploy_executor_with_guided_decoding(
         max_input_len=64,
         guided_decoding_backend=guided_decoding_backend,
         backend="_autodeploy",
+        enable_chunked_prefill=False,
     )
 
     # Mock guided decoding config
