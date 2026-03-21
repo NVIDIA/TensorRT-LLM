@@ -55,11 +55,13 @@ struct BatchedGemmData
         int32_t mNumTokens{0};
         // Whether the batch is on the M dimension.
         bool mBatchM{true};
-        // The maximum number of CTAs in the token dimension.
+        // The maximum number of CTAs (CGAs) in the token dimension.
         // Need to be set if mNumTokens > 0 and the token per batch
         // distribution is not known at launch time.
-        // In this case, the kernel will launch mMaxNumCtasInTokenDim CTAs in token dim and exit early
-        // if the idx of CTAs is larger or equal to mPtrNumNonExitingCtas.
+        // In this case, the kernel will launch mMaxNumCtasInTokenDim units in token dim and exit
+        // early if the batched-dim index is larger or equal to ptrNumNonExitingCtas.
+        // The legacy CTA-based name is kept for interface compatibility even though they are indexed at
+        // CGA granularity.
         int32_t mMaxNumCtasInTokenDim{0};
 
         // Either mBatchedM or mBatchedN must be set when mNumTokens == 0, otherwise not used.
@@ -418,8 +420,8 @@ struct BatchedGemmData
         int32_t const* mPtrTotalNumPaddedTokens;
 
         // Pointer to the map from the CTA index (in X/Y dim) to the batch index.
-        // Maps CTA index in batch dim (i.e. blockDim.x if batchM, otherwise blockDim.y)
-        // to batch index.
+        // The legacy CTA-based name is kept for interface compatibility even though routed MoE paths
+        // index this map at CGA granularity.
         // E.g. with listM = 128,255,32 and tileM = 128, should be equal to
         // ctaIdxXyToBatchIdx = [0, 1, 1, 2]
         // If isStaticBatch == true, ptrCtaIdxXyToBatchIdx should be set to nullptr and
@@ -438,6 +440,8 @@ struct BatchedGemmData
         // expandIdx += <index in the batch>
         // E.g. with numTokens = [128,255,32] and tileM = 128, should be equal to
         // ptrCtaIdxXyToMnLimit = [128, 256, 383, 416]
+        // The legacy CTA-based name is kept for interface compatibility even though routed MoE paths
+        // index this map at CGA granularity.
         // The shape is
         // [divUp(numTokens + numBatches * (tileM/N - 1), tileM/N)]
         int32_t const* mPtrCtaIdxXyToMnLimit;
@@ -777,6 +781,7 @@ public:
         BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
     {
         bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
+        int32_t const clusterDimInBatchDim = batchM ? options.mClusterDimX : options.mClusterDimY;
 
         int32_t numCtasBatch{0};
         // For normal BMM, mNumTokens == 0 and the number of CTAs is known to host.
@@ -789,27 +794,20 @@ public:
                     : gemm::divUp(options.mBatchedN[bi], options.mTileN * options.mClusterDimY) * options.mClusterDimY;
             }
         }
-        // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
-        // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine the
-        // actual number of CTAs to run.
+        // For MoE, mNumTokens != 0 and the number of active batched-dimension entries is known only
+        // at runtime. We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to
+        // determine the actual number of active entries to run. The legacy CTA-based name is kept for
+        // interface compatibility even though routed MoE paths may count these entries at CGA
+        // granularity.
         else if ((options.mEnablesEarlyExit || options.mEnablesDelayedEarlyExit) && options.mNumTokens != 0)
         {
             assert(maxNumCtasInBatchDim.has_value()
                 && "maxNumCtasInBatchDim must be provided when options.mNumTokens != 0");
-            numCtasBatch = maxNumCtasInBatchDim.value();
+            numCtasBatch = maxNumCtasInBatchDim.value() * clusterDimInBatchDim;
         }
         else
         {
             throw std::invalid_argument("Invalid combination of options");
-        }
-
-        if (batchM)
-        {
-            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
-        }
-        else
-        {
-            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
         }
 
         int32_t numCtasTile

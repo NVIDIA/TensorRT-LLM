@@ -61,6 +61,11 @@ inline bool isArchBlackwell(CudaArch cudaArch)
     return cudaArch == CudaArch::Sm100a || cudaArch == CudaArch::Sm100f || cudaArch == CudaArch::Sm103a;
 }
 
+inline bool isArchBlackwellUltra(CudaArch cudaArch)
+{
+    return cudaArch == CudaArch::Sm103a;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline std::string cudaArchToString(CudaArch cudaArch, bool isFull = true)

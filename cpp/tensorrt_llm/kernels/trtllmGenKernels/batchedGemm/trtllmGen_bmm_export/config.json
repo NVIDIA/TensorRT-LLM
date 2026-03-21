@@ -5,6 +5,7 @@
             "mmaN": 8,
             "tileN": 8,
             "epilogueTileN": 8,
+            "numStages": 4,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
             "clusterDimY": 1,
@@ -26,6 +27,7 @@
             "_template": "BatchedGemmDefault",
             "tileM": 128,
             "epilogueTileM": 128,
+            "numStagesMma": 1,
             "useShuffledMatrix": true,
             "useDeepSeekFp8": false
         },
@@ -33,6 +35,7 @@
         "BatchedGemmFp4Base": {
             "_template": "BatchedGemmNonDsBase",
             "dtypeA": "e2m1",
+            "dtypeC": "e2m1",
             "tileK": 512
         },
         "BatchedGemmFp4LowLatency": {
@@ -40,13 +43,14 @@
             "mmaM": 128,
             "mmaK": 64,
             "clusterDimX": 1,
+            "sfLayoutB": "8x4",
             "sfLayoutC": "8x4",
             "transposeMmaOutput": true,
             "batch": "N",
+            "biasType": "m",
             "ctaSwizzleType": "rasterizeAlongM",
             "numRegsPerThreadNonEpilogueWarp": 48,
-            "numRegsPerThreadEpilogueWarp": 192,
-            "biasType": "m"
+            "numRegsPerThreadEpilogueWarp": 192
         },
         "BatchedGemmFp4HighThroughput": {
             "_template": "BatchedGemmFp4Base",
@@ -56,8 +60,8 @@
             "sfLayoutC": "128x4",
             "transposeMmaOutput": true,
             "batch": "N",
-            "ctaSwizzleType": "rasterizeAlongM",
-            "biasType": "m"
+            "biasType": "m",
+            "ctaSwizzleType": "rasterizeAlongM"
         },
         "BatchedGemmFp4HighThroughputNonSwapAb": {
             "_template": "BatchedGemmFp4Base",
@@ -67,8 +71,8 @@
             "sfLayoutC": "128x4",
             "transposeMmaOutput": false,
             "batch": "M",
-            "ctaSwizzleType": "rasterizeAlongN",
             "biasType": "n",
+            "ctaSwizzleType": "rasterizeAlongN",
             "epilogueLdtmDps": 32,
             "epilogueLdtmBits": 32
         },
@@ -76,6 +80,7 @@
         "BatchedGemmPerTensorScalingFp8Base": {
             "_template": "BatchedGemmNonDsBase",
             "dtypeA": "e4m3",
+            "dtypeC": "e4m3",
             "mmaK": 32,
             "tileK": 512
         },
@@ -109,6 +114,7 @@
         "BatchedGemmDeepSeekFp8LowLatency": {
             "_template": "BatchedGemmDefault",
             "dtypeA": "e4m3",
+            "dtypeC": "e4m3",
             "mmaK": 32,
             "mmaM": 64,
             "tileM": 128,
@@ -130,9 +136,11 @@
             "clusterDimX": 1,
             "dtypeA": "mxe2m1",
             "dtypeB": "e4m3",
+            "dtypeC": "e4m3",
             "dtypeMmaB": "mxe4m3",
             "mmaK": 32,
             "tileK": 512,
+            "sfLayoutB": "8x4",
             "sfLayoutC": "8x4",
             "biasType": "m",
             "act": "swiglu",
@@ -214,6 +222,7 @@
             "mmaM": 128,
             "mmaK": 32,
             "clusterDimX": 1,
+            "sfLayoutB": "8x4",
             "sfLayoutC": "8x4",
             "transposeMmaOutput": true,
             "batch": "N",
@@ -231,10 +240,10 @@
             "routeAct": false,
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
-            "numStages": 4,
             "dtypeC": ["bf16", "fp16", "e2m1"],
-            "sfLayoutB": "8x4",
             "listN": "8,8",
+            "numExperts": 2,
+            "numStagesMma": 1,
             "tileScheduler": "static"
         },
         {
@@ -244,8 +253,11 @@
             "eltwiseActType": ["none", "relu2"],
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": ["bf16", "fp16", "e4m3"],
+            "tileK": 512,
             "numStages": 3,
             "listN": "8,8",
+            "numExperts": 2,
+            "numStagesMma": 1,
             "tileScheduler": "static"
         },
         {
@@ -255,7 +267,6 @@
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "listN": "8,8",
-            "numStages": 4,
             "numStagesMma": 2,
             "tileScheduler": "static",
             "layoutA": "T"
@@ -268,10 +279,12 @@
             "fusedAct,act,eltwiseActType": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],
-                [false, "swiglu", "relu2"]
+                [false, "swiglu", "relu2"],
+                [false, "swiglu", "silu"]
             ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "e2m1",
             "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
                 [128,  8,  8,  8, 512, 1, 1, 1, 5],
                 [128,  8,  8,  8, 256, 1, 1, 1, 9],
@@ -292,10 +305,12 @@
             "routeSfsAct": "tma",
             "fusedAct,act,eltwiseActType": [
                 [true, "geglu", "none"],
-                [false, "none", "relu2"]
+                [false, "none", "relu2"],
+                [false, "none", "silu"]
             ],
             "sfLayoutA": "128x4",
             "sfLayoutB": "linear",
+            "dtypeC": "e2m1",
             "layoutA": "T",
             "mmaN,tileN,epilogueTileN,numSlicesForSplitK,clusterDimZ,numStages": [
                 [8, 8, 8, 2, 2, 5],
@@ -315,11 +330,14 @@
             "fusedAct,act,eltwiseActType": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],
-                [false, "none", "relu2"]
+                [false, "none", "relu2"],
+                [false, "none", "silu"]
             ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": false,
+            "numRegsPerThreadNonEpilogueWarp": 48,
             "numWarpsLoadSfB": 4,
+            "dtypeC": "e2m1",
             "tileScheduler": "persistent",
             "numStagesMma": 2,
             "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutC,routeSfsAct": [
@@ -335,11 +353,14 @@
             "fusedAct,act,eltwiseActType": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],
-                [false, "none", "relu2"]
+                [false, "none", "relu2"],
+                [false, "none", "silu"]
             ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": false,
+            "dtypeC": "e2m1",
             "tileScheduler": "persistent",
+            "numStagesMma": 1,
             "routeSfsAct": "ldgPlusSts",
             "fuseUtccpWithUtcmma": true,
             "useMaxTmemOverlap": true,
@@ -364,9 +385,11 @@
                 [false, "none", "relu2"]
             ],
             "sfLayoutA": "linear",
-            "numWarpsLoadSfA": [2, 4],
+            "numWarpsLoadSfA,numRegsPerThreadNonEpilogueWarp": [
+                [2, 80],
+                [4, 48]
+            ],
             "useUnrollLoop2xForMma": false,
-            "numRegsPerThreadNonEpilogueWarp": 48,
             "tileScheduler": "persistent",
             "numStagesMma": 2,
             "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB,routeSfsAct": [
@@ -385,6 +408,7 @@
             "sfLayoutA": "linear",
             "useUnrollLoop2xForMma": false,
             "tileScheduler": "persistent",
+            "numStagesMma": 1,
             "routeSfsAct": "ldgPlusSts",
             "fuseUtccpWithUtcmma": true,
             "useMaxTmemOverlap": true,
@@ -404,6 +428,7 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
+            "sfLayoutA": "128x4",
             "sfLayoutB": "8x4",
             "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
                 [128,  8,  8,  8, 512, 1, 1, 1, 5],
@@ -424,8 +449,8 @@
             "routeAct": false,
             "fusedAct": false,
             "sfLayoutA": "128x4",
-            "dtypeC": "bf16",
             "sfLayoutB": "8x4",
+            "dtypeC": "bf16",
             "layoutA": "T",
             "mmaN,tileN,epilogueTileN,numSlicesForSplitK,clusterDimZ,numStagesMma,numStages": [
                 [8, 8, 8, 2, 2, 1, 5],
@@ -456,6 +481,7 @@
             "useUnrollLoop2xForMma": false,
             "dtypeC": "bf16",
             "tileScheduler": "persistent",
+            "numStagesMma": 1,
             "fuseUtccpWithUtcmma": true,
             "useMaxTmemOverlap": true,
             "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB": [
@@ -496,6 +522,7 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "numRegsPerThreadNonEpilogueWarp": 80,
+            "dtypeC": "e4m3",
             "mmaN,tileN,epilogueTileN,numStages,numWarpsLoadB,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
                 [8, 8, 8, 8, 2, 160, 48],
                 [16, 16, 16, 6, 2, 160, 48],
@@ -535,10 +562,12 @@
             "routeAct": "tma",
             "fusedAct,eltwiseActType": [
                 [true, "none"],
-                [false, "relu2"]
+                [false, "relu2"],
+                [false, "silu"]
             ],
             "usePerTokenSfB": true,
             "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "e4m3",
             "layoutA": "T",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
                 [8, 8, 8, 256, 6],
@@ -556,7 +585,8 @@
             "routeAct": "tma",
             "fusedAct,eltwiseActType": [
                 [true, "none"],
-                [false, "relu2"]
+                [false, "relu2"],
+                [false, "silu"]
             ],
             "usePerTokenSfB": true,
             "numRegsPerThreadNonEpilogueWarp": 56,
@@ -564,6 +594,7 @@
             "numWarpsLoadB": 8,
             "useUnrollLoop2xForMma": false,
             "layoutA": "T",
+            "dtypeC": "e4m3",
             "mmaN,tileN,epilogueTileN,tileK,numStages,numEpilogueWarps": [
                 [64, 64, 64, 256, 5, 4],
                 [128, 128, 64, 128, 8, 4],
@@ -581,7 +612,6 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "sfLayoutB": "8x4",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
                 [8, 8, 8, 256, 6],
                 [16, 16, 16, 256, 6],
@@ -682,6 +712,7 @@
             "routeAct": "tma",
             "routeSfsAct": "ldgsts",
             "fusedAct": true,
+            "sfLayoutA": "128x4",
             "dtypeC": "mxe4m3",
             "numWarpsLoadSfB": 4,
             "sfLayoutB": "linear",
@@ -714,6 +745,7 @@
             "_comment": "MxFp4xMxFp8_FC1_HighThroughput_tileN_256",
             "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
             "routeAct": "tma",
+            "sfLayoutA": "128x4",
             "routeSfsAct": "ldgsts",
             "fusedAct": true,
             "dtypeC": "mxe4m3",
@@ -772,6 +804,7 @@
             "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
             "routeAct": false,
             "fusedAct": false,
+            "sfLayoutA": "128x4",
             "useUnrollLoop2xForMma": false,
             "dtypeC": "bf16",
             "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp,numStagesMma": [
@@ -787,6 +820,7 @@
             "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
             "routeAct": false,
             "fusedAct": false,
+            "sfLayoutA": "128x4",
             "fuseUtccpWithUtcmma": true,
             "useMaxTmemOverlap": true,
             "useUnrollLoop2xForMma": false,
@@ -801,6 +835,7 @@
             "_template": "BatchedGemmMxE2m1MxE4m3HighThroughputNonSwapAb",
             "routeAct": false,
             "fusedAct": false,
+            "sfLayoutA": "128x4",
             "fuseUtccpWithUtcmma": true,
             "useMaxTmemOverlap": true,
             "useUnrollLoop2xForMma": false,
@@ -813,10 +848,12 @@
         {
             "_comment": "MxFp4xBf16_FC1_LowLatency",
             "_template": "BatchedGemmMxE2m1Bf16LowLatency",
+            "sfLayoutA": "128x4",
             "routeAct": "ldgsts",
             "fusedAct": true,
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
                 [8, 8, 8, 128, 5],
                 [8, 8, 8, 256, 3],
@@ -838,6 +875,7 @@
             "routeAct": false,
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
             "sfLayoutB": "8x4",
             "mmaN,tileN,epilogueTileN,numStages": [
                 [8, 8, 8, 3],
