@@ -269,55 +269,7 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
     def target_op(self):
         return torch.ops.auto_deploy.torch_quant_nvfp4_moe
 
-    def _post_init(self):
-        self._pending_scales = None
-
-    def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
-        """Quantize weight to FP4 and pre-compute kernel-ready scales.
-
-        On success, stores scales in self._pending_scales for default_scales() to consume.
-        Falls back to placeholder (empty uint8) if required ops are unavailable.
-        """
-        if (
-            FP4_GLOBAL_SCALE_MAX is None
-            or TRTLLM_NVFP4_SCALING_VECTOR_SIZE is None
-            or _float4_sf_dtype is None
-        ):
-            return super().quantize_weight(w)
-
-        try:
-            from .fuse_quant import _swizzle_nvfp4_scale
-
-            ws2_global = fp4_global_scale(w)
-            weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
-                w.to("cuda"),
-                ws2_global.to("cuda"),
-                TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
-                False,
-            )
-            m, k = w.shape
-            raw_ws = cutlass_fp4_scale_to_modelopt_fp4_scale(weight_scale_cutlass, (m, k))
-            # Default input_scale = 1/6; kernel needs inv_input_scale = 6
-            raw_is = torch.tensor(1.0 / 6.0)
-            raw_ws2 = 1.0 / torch.clamp(ws2_global, min=1e-30)
-            swizzled_ws = _swizzle_nvfp4_scale(raw_ws, _float4_sf_dtype, flatten=False)
-            inv_is = 1.0 / torch.clamp(raw_is, min=1e-30)
-            alpha = torch.clamp(raw_ws2 * raw_is, min=1e-30)
-            self._pending_scales = {
-                "input_scale": inv_is,
-                "weight_scale": swizzled_ws,
-                "weight_scale_2": alpha,
-            }
-            return weight_fp4
-        except Exception:
-            self._pending_scales = None
-            return super().quantize_weight(w)
-
     def default_scales(self, original_weight_shape):
-        if self._pending_scales is not None:
-            scales = self._pending_scales
-            self._pending_scales = None
-            return scales
         if TRTLLM_NVFP4_SCALING_VECTOR_SIZE is None:
             return super().default_scales(original_weight_shape)
         # Fallback: flat uint8 placeholder matching kernel-ready (swizzled) format.
@@ -376,11 +328,6 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
             state_dict[weight_scale_key] = cutlass_fp4_scale_to_modelopt_fp4_scale(
                 weight_scale_cutlass, (m, k)
             )
-            # input_scale from checkpoint (may be amax or s_in2 after convert_amax_hook)
-            if input_scale_key in state_dict:
-                state_dict[input_scale_key] = 1 / torch.clamp(
-                    state_dict[input_scale_key], min=1e-30
-                )
             # Store raw weight_scale_2 = 1/ws2_global
             state_dict[ws2_key] = 1 / torch.clamp(ws2_global, min=1e-30)
 

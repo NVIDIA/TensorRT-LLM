@@ -232,9 +232,11 @@ def torch_fake_quant_nvfp4_linear(
     """
     Reference (eager) implementation for NVFP4 fake-quant linear.
     Expects torch-compatible FP8 per-block weight scale (no kernel-specific swizzling).
-      - input_scale[0]  = per-tensor input scale_2 (amax / FP4_GLOBAL_SCALE_MAX)
-      - weight_scale[0] = per-block scale in FP8 (torch.float8_e4m3fn), shape >= N*(K/16)
-      - weight_scale[1] = per-tensor weight scale_2 (amax / FP4_GLOBAL_SCALE_MAX)
+
+    Scale tensors must be in raw (checkpoint / pre-fusion) form:
+      - input_scale[0]: per-tensor activation scale, (raw amax / FP4_GLOBAL_SCALE_MAX).
+      - weight_scale[0]: per-block scale in FP8 (torch.float8_e4m3fn), shape >= N*(K/16)
+      - weight_scale[1]: per-tensor weight scale (raw amax / FP4_GLOBAL_SCALE_MAX)
     """
     if weight_quantized.dtype != torch.uint8:
         raise TypeError("NVFP4 path requires packed uint8 weights (2x FP4 per byte).")

@@ -7,6 +7,7 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
@@ -209,14 +210,14 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     K_packed = 32  # weight is packed by 2 FP4 per byte
     K_eff = 2 * K_packed
 
-    # FP4 dummy tensors (new IR format: weight_scale is FP8 per-block 2D)
+    # FP4 dummy tensors (weight_scale is FP8 per-block 2D)
     x_fp4 = torch.randn(3, K_eff, device="meta", dtype=torch.float16)
     w_fp4 = torch.randint(0, 255, (N, K_packed), device="meta", dtype=torch.uint8)
 
     s_in2 = torch.tensor(0.01, device="meta", dtype=torch.float32)
     ws2 = torch.tensor(1.2345, device="meta", dtype=torch.float32)
 
-    # Per-block FP8 weight scale: 2D [N, K_eff//16] (new IR format)
+    # Per-block FP8 weight scale: 2D [N, K_eff//16]
     weight_scale_fp8 = torch.empty((N, K_eff // 16), device="meta", dtype=torch.float8_e4m3fn)
 
     # no-bias variant
@@ -328,8 +329,13 @@ def _swizzle_nvfp4_scale(
 
 
 def _collect_nvfp4_scale_keys(gm: GraphModule):
-    """Collect (input_scale, weight_scale, weight_scale_2) buffer keys from fused nvfp4 nodes."""
+    """Collect unique (input_scale, weight_scale, weight_scale_2) buffer keys from fused nvfp4 nodes.
+
+    Deduplicates by target path so the same quantized module referenced from multiple nodes
+    is only processed once by _process_nvfp4_scales_inplace (which mutates buffers).
+    """
     scale_keys = []
+    seen = set()
     for node in gm.graph.nodes:
         if not is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_linear):
             continue
@@ -346,7 +352,10 @@ def _collect_nvfp4_scale_keys(gm: GraphModule):
             elif attr == "input_scale":
                 scale_map["is"] = t
         if len(scale_map) == 3:
-            scale_keys.append((scale_map["is"], scale_map["ws"], scale_map["ws2"]))
+            key = (scale_map["is"], scale_map["ws"], scale_map["ws2"])
+            if key not in seen:
+                seen.add(key)
+                scale_keys.append(key)
     return scale_keys
 
 
@@ -361,9 +370,9 @@ def _process_nvfp4_scales_inplace(gm: GraphModule, scale_keys):
     try:
         from .....quantization.utils.fp4_utils import float4_sf_dtype
     except ImportError:
-        float4_sf_dtype = None
-
-    if not float4_sf_dtype:
+        ad_logger.warning(
+            "Could not import float4_sf_dtype from fp4_utils; skipping NVFP4 scale pre-processing."
+        )
         return
 
     for is_key, ws_key, ws2_key in scale_keys:

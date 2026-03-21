@@ -463,7 +463,7 @@ def nvfp4_linear(
 
     assert weight_scale.numel() % (128 * 4) == 0
 
-    input = input.reshape(-1, input.shape[-1])
+    input = input.reshape(-1, k)
 
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
