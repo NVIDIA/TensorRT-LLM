@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import json
 import os
 import re
 import signal
@@ -1109,9 +1110,22 @@ class OpenAIServer:
                     for pp_res in pp_result:
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
-            except:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first
+                # chunk, so we cannot change the status code.  Yield
+                # an SSE error event so the stream terminates cleanly
+                # instead of breaking the HTTP connection.
+                error_data = json.dumps({
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": None,
+                        "param": None,
+                    }
+                })
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()

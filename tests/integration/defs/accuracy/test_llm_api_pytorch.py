@@ -1592,6 +1592,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
     @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("v2_kv_cache", [True, False])
     # Chunked Prefill for MLA can only be enabled on SM100
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
@@ -1602,8 +1603,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
-                      overlap_scheduler, torch_compile, enable_chunked_prefill):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+                      overlap_scheduler, torch_compile, enable_chunked_prefill,
+                      v2_kv_cache):
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            use_kv_cache_manager_v2=v2_kv_cache,
+        )
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1632,17 +1637,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                        cuda_graph, overlap_scheduler,
                                        enable_chunked_prefill):
         scheduler_config = SchedulerConfig(use_python_scheduler=True)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            scheduler_config=scheduler_config,
         )
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
-                 scheduler_config=scheduler_config,
                  enable_chunked_prefill=enable_chunked_prefill,
                  max_num_tokens=256 if enable_chunked_prefill else 8192,
                  **pytorch_config,
@@ -5813,6 +5818,59 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-35B-A3B"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    def test_bf16(self):
+        world_size = 1
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128])
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=world_size,
+                 moe_expert_parallel_size=world_size,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 max_batch_size=128,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    def test_fp8(self):
+        model_dir = f"{self.MODEL_PATH}-FP8"
+        # Model is being added to CI. Skip at the moment.
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
+
+        world_size = 1
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        moe_config = MoeConfig(backend='DEEPGEMM')
+
+        with LLM(model_dir,
+                 tensor_parallel_size=world_size,
+                 moe_expert_parallel_size=world_size,
+                 max_seq_len=4096,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=moe_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
