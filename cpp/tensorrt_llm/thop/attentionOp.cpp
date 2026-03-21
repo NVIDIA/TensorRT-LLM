@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -93,7 +94,8 @@ public:
         int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const
+        std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> flash_mla_num_splits) const
         = 0;
 };
 
@@ -153,7 +155,8 @@ public:
         int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const override
+        std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> flash_mla_num_splits) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -546,6 +549,15 @@ public:
                     TORCH_CHECK(block_ids_per_seq.has_value());
                     int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
                     mla_params.block_ids_per_seq = block_ids_per_seq_ptr;
+                    // Use pre-computed metadata if provided.
+                    if (flash_mla_tile_scheduler_metadata.has_value())
+                    {
+                        TORCH_CHECK(flash_mla_num_splits.has_value(),
+                            "flash_mla_num_splits must be provided when flash_mla_tile_scheduler_metadata is set.");
+                        mla_params.flash_mla_tile_scheduler_metadata
+                            = flash_mla_tile_scheduler_metadata->data_ptr<int>();
+                        mla_params.flash_mla_num_splits = flash_mla_num_splits->data_ptr<int>();
+                    }
                 }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
                 op.mlaGeneration<T>(mla_params, enqueue_params, stream);
@@ -617,7 +629,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer)
+    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+    std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -881,7 +894,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
-            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -899,7 +913,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
-            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -1036,6 +1051,25 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
 }
 
 } // namespace torch_ext
+
+void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits,
+    int64_t batch_size, int64_t s_q, int64_t num_q_heads, int64_t num_kv_heads, int64_t head_size_v)
+{
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static constexpr int block_size_n = 64;
+    static constexpr int fixed_overhead_num_blocks = 5;
+    int const num_sm_parts = tensorrt_llm::common::op::AttentionOp::getFlashMlaNumSmPartsStatic(static_cast<int>(s_q),
+        static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads), static_cast<int>(head_size_v));
+    Mla_metadata_params params = {};
+    params.seqlens_k_ptr = seqlens_k.data_ptr<int>();
+    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+    params.num_splits_ptr = num_splits.data_ptr<int>();
+    params.batch_size = static_cast<int>(batch_size);
+    params.block_size_n = block_size_n;
+    params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
+    params.num_sm_parts = num_sm_parts;
+    get_mla_metadata_func(params, stream);
+}
 
 TRTLLM_NAMESPACE_END
 
