@@ -1857,6 +1857,39 @@ class WaitingQueuePolicy(StrEnum):
     """Waiting queue scheduling policy for managing pending requests."""
 
     FCFS = "fcfs"  # First-Come-First-Served
+    SJF = "sjf"  # Shortest-Job-First
+
+
+class SjfConfig(StrictBaseModel):
+    """Configuration for SJF (Shortest Job First) waiting queue scheduling.
+
+    SJF prioritizes shorter requests while using wait-time aging to prevent
+    starvation of longer requests. The score is computed as:
+        score = length_weight * length_score + time_weight * time_score
+    where:
+        length_score = 1 / (1 + prompt_len / length_median)
+        time_score = wait_time / time_median
+    """
+
+    length_median: PositiveInt = Field(
+        default=32768,
+        description=
+        "Median prompt length (in tokens) for normalization. Requests shorter "
+        "than this get a length_score > 0.5, longer ones get < 0.5.")
+
+    time_median: float = Field(
+        default=5.0,
+        gt=0.0,
+        description=
+        "Median wait time (in seconds) for normalization. After waiting this "
+        "long, a request's time_score reaches 1.0.")
+
+    length_weight: NonNegativeFloat = Field(
+        default=0.5, description="Weight for the length-based score component.")
+
+    time_weight: NonNegativeFloat = Field(
+        default=0.5,
+        description="Weight for the wait-time-based score component.")
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
@@ -1907,9 +1940,23 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
 
+    sjf_config: Optional[SjfConfig] = Field(
+        default=None,
+        description=
+        "Configuration for SJF waiting queue scheduling. Only used when "
+        "waiting_queue_policy is 'sjf'. If not provided, defaults are used.")
+
     use_python_scheduler: bool = Field(
         default=False,
         description="Use pure-Python scheduler instead of C++ scheduler.")
+
+    @model_validator(mode='after')
+    def validate_sjf_config(self) -> 'SchedulerConfig':
+        if (self.sjf_config is not None
+                and self.waiting_queue_policy != WaitingQueuePolicy.SJF):
+            raise ValueError(
+                "sjf_config is only used when waiting_queue_policy is 'sjf'")
+        return self
 
     def _to_pybind(self):
         return _SchedulerConfig(

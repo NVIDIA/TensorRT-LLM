@@ -31,7 +31,8 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import (PeftCacheConfig, SjfConfig,
+                                          WaitingQueuePolicy)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
@@ -286,6 +287,7 @@ class PyExecutor:
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
             waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+            sjf_config: Optional[SjfConfig] = None,
             adp_router: Optional[ADPRouter] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -497,7 +499,7 @@ class PyExecutor:
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
-            waiting_queue_policy)
+            waiting_queue_policy, sjf_config=sjf_config)
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
