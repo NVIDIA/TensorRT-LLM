@@ -39,5 +39,5 @@ Common pitfalls:
 - HF safetensors weights may not match what the AD custom modeling code expects. Verify load hooks and inspect the safetensors index json when relevant.
 - Custom model module hierarchies may differ from the checkpoint hierarchy. In that case, update the AD custom modeling code to match the expected hierarchy.
 
-Use your own tools to read files, search, edit, and run shell commands. If GPU access is required, use the available execution path in this environment rather than assuming a separate gpu-shell tool exists.
+Use your own tools to read files, search, edit, and run shell commands.
 """
