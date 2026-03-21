@@ -2,6 +2,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk.py
 # -*- coding: utf-8 -*-
 
+import warnings
 from typing import Optional
 
 import torch
@@ -194,9 +195,12 @@ def chunk_gated_delta_rule(
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
     if head_first:
-        raise DeprecationWarning(
+        warnings.warn(
             "head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead.")
+            "Please use head_first=False for now instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         q, k, v, beta, g = map(lambda x: rearrange(x, "b h t ... -> b t h ..."),
                                (q, k, v, beta, g))
     # if not head_first and q.shape[1] < q.shape[2]:
