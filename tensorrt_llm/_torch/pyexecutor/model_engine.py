@@ -3801,14 +3801,6 @@ class PyTorchModelEngine(ModelEngine):
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
 
-            # Relocate accepted draft tokens' KV from tree to linear positions.
-            if (self.spec_config is not None
-                    and getattr(self.spec_config, 'use_dynamic_tree', False)):
-                spec_worker = self._get_spec_worker()
-                if spec_worker is not None:
-                    spec_worker._relocate_kv_eagerly(
-                        attn_metadata, scheduled_requests.batch_size)
-
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 

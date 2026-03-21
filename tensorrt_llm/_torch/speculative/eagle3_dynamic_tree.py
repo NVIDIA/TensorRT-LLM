@@ -293,21 +293,23 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         return output
 
     @nvtx_range("eagle3_dyn._relocate_kv_eagerly")
-    def _relocate_kv_eagerly(self, attn_metadata, batch_size):
+    def _relocate_kv_eagerly(self, attn_metadata, batch_size, num_accepted_tokens):
         """Move accepted draft tokens' KV from tree to linear positions.
 
-        Called from model_engine.py after CUDA graph replay (outside the graph)
-        so that KVBlockArray pointers are live, not frozen graph captures.
-        Uses attn_metadata.kv_cache_manager (the target model's live KV cache)
-        rather than self._cache_mgr (the resource_manager's KV cache manager,
-        which may differ in one-model spec decoding configurations).
+        Called inside sample_and_accept_draft_tokens (captured in CUDA graph).
+        All tensor arguments are pre-allocated so their device addresses are
+        stable across CUDA graph capture and replay.
+
+        Must use attn_metadata.kv_cache_manager (the target model's live KV
+        cache), NOT self._cache_mgr which may be a different manager in
+        one-model spec decoding configurations.
         """
         cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
         if cache_mgr is None:
             return
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
             self._accepted_draft_indices_tensor[:batch_size],
-            self._last_num_accepted[:batch_size],
+            num_accepted_tokens,
             attn_metadata.kv_lens_cuda[:batch_size],
             True,
             cache_mgr.num_layers,
@@ -330,9 +332,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        return self._sample_and_accept_dynamic_tree(
+        accepted_tokens, num_accepted_tokens = self._sample_and_accept_dynamic_tree(
             logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
         )
+        if num_gens > 0:
+            self._relocate_kv_eagerly(attn_metadata, batch_size, num_accepted_tokens)
+        return accepted_tokens, num_accepted_tokens
 
     @nvtx_range("eagle3_dyn.prepare_1st_drafter_inputs")
     @override
