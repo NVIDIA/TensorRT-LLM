@@ -114,6 +114,8 @@ class ViTPatchGenerator(nn.Module):
         register_multiple: Optional[int] = None,
         num_registers: Optional[int] = None,
         patch_bias: bool = False,
+        temporal_patch_size: int = 1,
+        separate_video_embedder: bool = True,
     ):
         super().__init__()
 
@@ -133,6 +135,7 @@ class ViTPatchGenerator(nn.Module):
         self.patch_size = patch_size
         self.abs_pos = abs_pos
         self.embed_dim = embed_dim
+        self.temporal_patch_size = temporal_patch_size
         self.num_rows = max_input_dims[0] // patch_size
         self.num_cols = max_input_dims[1] // patch_size
         self.input_dims = tuple(d // patch_size for d in input_dims)
@@ -141,6 +144,20 @@ class ViTPatchGenerator(nn.Module):
 
         self.im_to_patches = Im2Patches(patch_size)
         self.embedder = ViTPatchLinear(patch_size, embed_dim, bias=patch_bias)
+
+        if temporal_patch_size > 1:
+            if not separate_video_embedder:
+                raise NotImplementedError(
+                    "Only separate_video_embedder=True is supported for "
+                    "temporal compression (temporal_patch_size > 1).")
+            self.video_embedder = ViTPatchLinear(
+                patch_size,
+                embed_dim,
+                bias=patch_bias,
+                temporal_patch_size=temporal_patch_size,
+            )
+        self._video_embedder_loaded = False
+
         self.pos_embed = None
         if abs_pos:
             scale = embed_dim**-0.5
@@ -171,6 +188,54 @@ class ViTPatchGenerator(nn.Module):
             patches, pos_enc = self.apply_pos_enc(patches,
                                                   input_size=x.shape[2:])
             patches = self.cls_token(patches)
+        patches = self.patch_normalizer(patches)
+        return patches
+
+    def forward_video(self, x: torch.Tensor) -> torch.Tensor:
+        """Process video frames with temporal compression.
+
+        Groups T consecutive frames into tubelets before embedding.
+
+        Args:
+            x: [num_frames, 3, H, W] tensor of video frames.
+
+        Returns:
+            Embedded patches with temporal compression applied,
+            shape [num_tubelets, seq_per_tubelet, embed_dim].
+        """
+        if not self._video_embedder_loaded:
+            raise ValueError(
+                "Temporal compression (video_temporal_patch_size > 1) requires "
+                "video_embedder weights, but they were never loaded. "
+                "Ensure the checkpoint was trained with temporal compression.")
+        T = self.temporal_patch_size
+        input_size = x.shape[2:]
+
+        patches = self.im_to_patches(x)  # [N, num_patches, 3*P*P]
+        num_frames, num_spatial, feat_dim = patches.shape
+
+        # Pad to a multiple of T by repeating the last frame.
+        num_pad_frames = (-num_frames) % T
+        if num_pad_frames > 0:
+            last_frame_dup = patches[-1:].expand(num_pad_frames, -1, -1)
+            patches = torch.cat([patches, last_frame_dup], dim=0)
+
+        # Group T frames per tubelet: concatenate features across T consecutive
+        # frames for each spatial position (matches Megatron training order).
+        num_frames_padded = patches.shape[0]
+        num_tubelets = num_frames_padded // T
+        patches = rearrange(
+            patches,
+            '(tubelets frames) spatial feat -> tubelets spatial (frames feat)',
+            tubelets=num_tubelets,
+            frames=T,
+            spatial=num_spatial,
+            feat=feat_dim,
+        )
+
+        patches = self.video_embedder(patches)
+        patches, _ = self.apply_pos_enc(patches, input_size=input_size)
+        patches = self.cls_token(patches)
         patches = self.patch_normalizer(patches)
         return patches
 
@@ -288,7 +353,7 @@ class ViTPatchGenerator(nn.Module):
             max_dim = max(input_dims)
             pos_embed = F.interpolate(pos_embed.float(),
                                       size=(max_dim, max_dim),
-                                      align_corners=True,
+                                      align_corners=False,
                                       mode='bilinear').to(pos_embed.dtype)
             pos_embed = window_select(pos_embed)
         else:
@@ -297,7 +362,7 @@ class ViTPatchGenerator(nn.Module):
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(pos_embed.float(),
                                       size=input_dims,
-                                      align_corners=True,
+                                      align_corners=False,
                                       mode='bilinear').to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)
@@ -338,9 +403,13 @@ class ViTPatchLinear(nn.Linear):
         patch_size: int,
         embed_dim: int,
         bias: bool = False,
+        temporal_patch_size: int = 1,
     ):
-        super().__init__(3 * (patch_size**2), embed_dim, bias=bias)
+        super().__init__(3 * temporal_patch_size * (patch_size**2),
+                         embed_dim,
+                         bias=bias)
         self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
 
 
 class Block(nn.Module):
@@ -629,6 +698,12 @@ class VisionTransformer(nn.Module):
         register_multiple = getattr(special_args, 'register_multiple', None)
         num_registers = getattr(special_args, 'cpe_num_registers', None)
 
+        # Temporal compression config (for video).
+        self.temporal_patch_size = getattr(self.config,
+                                           'video_temporal_patch_size', 1)
+        separate_video_embedder = getattr(self.config,
+                                          'separate_video_embedder', True)
+
         self.patch_generator = ViTPatchGenerator(
             patch_size=patch_size,
             embed_dim=embed_dim,
@@ -640,6 +715,8 @@ class VisionTransformer(nn.Module):
             num_cls_tokens=num_cls_tokens,
             register_multiple=register_multiple,
             num_registers=num_registers,
+            temporal_patch_size=self.temporal_patch_size,
+            separate_video_embedder=separate_video_embedder,
         )
         self.patch_embed = None
         self.cls_token = None
@@ -688,15 +765,31 @@ class VisionTransformer(nn.Module):
         attn_metadata.prepare()
         return attn_metadata
 
-    def forward_features(
-            self,
-            x: torch.Tensor,
-            image_sizes: Optional[List[Tuple[int,
-                                             int]]] = None) -> torch.Tensor:
-        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
-        x = self.patch_generator(x, image_sizes=image_sizes)
+    def forward_features(self,
+                         x: torch.Tensor,
+                         image_sizes: Optional[List[Tuple[int, int]]] = None,
+                         num_frames: Optional[int] = None) -> torch.Tensor:
+        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm).
 
-        if image_sizes is not None:
+        Args:
+            x: Input pixel values.
+            image_sizes: Per-image pixel sizes for dynamic resolution.
+            num_frames: Number of video frames. When provided with
+                temporal_patch_size > 1, enables temporal compression.
+        """
+        T = self.temporal_patch_size
+        packed_batch_size = None  # set when we pack tubelets
+
+        if num_frames is not None and T > 1:
+            # Temporal compression: group T frames into tubelets.
+            x = self.patch_generator.forward_video(x)
+            packed_batch_size, seq_per_tubelet, hidden_size = x.shape
+            # Pack all tubelets into one sequence for attention.
+            x = x.reshape(1, -1, hidden_size)
+            seq_lengths = [seq_per_tubelet] * packed_batch_size
+            batch_size = packed_batch_size
+        elif image_sizes is not None:
+            x = self.patch_generator(x, image_sizes=image_sizes)
             # Dynamic resolution: each image is a separate "context".
             num_skip = self.patch_generator.num_skip
             seq_lengths = [
@@ -705,6 +798,7 @@ class VisionTransformer(nn.Module):
             ]
             batch_size = len(image_sizes)
         else:
+            x = self.patch_generator(x, image_sizes=image_sizes)
             batch_size, seq_len, _ = x.shape
             seq_lengths = [seq_len] * batch_size
 
@@ -717,7 +811,10 @@ class VisionTransformer(nn.Module):
         for block in self.blocks:
             x = block(x, attn_metadata=attn_metadata)
 
-        if image_sizes is not None:
+        # Reshape back from flattened.
+        if packed_batch_size is not None:
+            x = x.reshape(packed_batch_size, seq_per_tubelet, hidden_size)
+        elif image_sizes is not None:
             x = x.reshape(1, -1, hidden_size)
         else:
             x = x.reshape(batch_size, seq_lengths[0], hidden_size)
@@ -824,12 +921,11 @@ class RADIOVisionModelBase(nn.Module):
         width = max(width, self.min_resolution_step)
         return Resolution(height=height, width=width)
 
-    def forward(
-            self,
-            x: torch.Tensor,
-            feature_fmt: str = 'NLC',
-            image_sizes: Optional[List[Tuple[int,
-                                             int]]] = None) -> torch.Tensor:
+    def forward(self,
+                x: torch.Tensor,
+                feature_fmt: str = 'NLC',
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None) -> torch.Tensor:
         if image_sizes is None:
             res_step = self.min_resolution_step
             if res_step is not None and (x.shape[-2] % res_step != 0
@@ -840,7 +936,9 @@ class RADIOVisionModelBase(nn.Module):
                     f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
                 )
             x = self.input_conditioner(x)
-        y = self.model.forward_features(x, image_sizes=image_sizes)
+        y = self.model.forward_features(x,
+                                        image_sizes=image_sizes,
+                                        num_frames=num_frames)
         ret = self._extract_final(x,
                                   y,
                                   feature_fmt=feature_fmt,
@@ -1012,10 +1110,18 @@ class RADIOVisionModel(PreTrainedModel):
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
-            # TODO(TRTLLM-11269): Add support for the conv3d layer.
+            # model.blocks weights are loaded separately below via
+            # _load_weights_impl (to handle qkv splitting).
+            # video_embedder is only unexpected when temporal_patch_size==1
+            # (model doesn't have the submodule).
             if not u.startswith(
                 ('model.blocks.', 'model.patch_generator.video_embedder')):
                 raise ValueError(f"Unexpected key: {u}")
+
+        # Mark video_embedder as loaded when the weights were found.
+        patch_gen = self.radio_model.model.patch_generator
+        if 'model.patch_generator.video_embedder.weight' not in unexpected_keys:
+            patch_gen._video_embedder_loaded = True
 
         # Load weights for vision transformer module.
         model_weights = {
@@ -1047,5 +1153,8 @@ class RADIOVisionModel(PreTrainedModel):
 
     def forward(self,
                 x: torch.Tensor,
-                image_sizes: Optional[List[Tuple[int, int]]] = None):
-        return self.radio_model.forward(x, image_sizes=image_sizes)
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None):
+        return self.radio_model.forward(x,
+                                        image_sizes=image_sizes,
+                                        num_frames=num_frames)
