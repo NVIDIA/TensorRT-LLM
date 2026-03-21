@@ -1,6 +1,6 @@
 # Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)
 
-This blog post continues our previous work on [Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), where we introduced the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM. Building upon that foundation, we have made significant performance improvements through various optimizations, achieving better throughput and latency for large-scale MoE models.
+This blog post continues our previous work on [Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), where we introduced the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM. Building upon that foundation, we have made significant performance improvements through various optimizations, achieving better throughput and latency for large-scale MoE models.
 
 *By NVIDIA TensorRT LLM Team*
 
@@ -28,7 +28,7 @@ This blog post continues our previous work on [Scaling Expert Parallelism in Ten
 
 ## Optimization Highlights
 
-Following the introduction of the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), the TensorRT LLM team has focused on optimizing the large EP implementation to improve performance.
+Following the introduction of the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), the TensorRT LLM team has focused on optimizing the large EP implementation to improve performance.
 
 At the kernel level, we analyzed kernel duration and optimized performance by either improving existing kernels or developing new kernels that perform better. At the system level, we refined and optimized the EPLB implementation (which also helps reduce kernel scalability issues), integrated additional features such as MTP, and optimized host overhead to prevent Python code from slowing down inference.
 
@@ -77,7 +77,7 @@ This optimization was implemented in [PR 5215](https://github.com/NVIDIA/TensorR
 
 #### Communication Kernels
 
-As introduced in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-communication-kernels-implementation), we developed EP communication kernels to transfer hidden state tensors of MoE. In the original design, each rank needs to determine which tokens it needs to send and receive, along with the expert IDs and scaling factors selected by those tokens. We initially used `allgather` to collect expert IDs and scaling factors, then each rank calculated the required metadata. However, we found that although the transmission size of this data is not large, the performance of `allgather` is unsatisfactory and may become a performance bottleneck when EP size increases. Therefore, we developed new communication kernels to optimize this process.
+As introduced in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-communication-kernels-implementation), we developed EP communication kernels to transfer hidden state tensors of MoE. In the original design, each rank needs to determine which tokens it needs to send and receive, along with the expert IDs and scaling factors selected by those tokens. We initially used `allgather` to collect expert IDs and scaling factors, then each rank calculated the required metadata. However, we found that although the transmission size of this data is not large, the performance of `allgather` is unsatisfactory and may become a performance bottleneck when EP size increases. Therefore, we developed new communication kernels to optimize this process.
 
 First, a kernel counts the number of tokens needed to be transferred to another rank and transfers the count to that rank. Then each rank can calculate the index information for subsequent alltoall kernels. Finally, an alltoall kernel transfers expert IDs and scaling factors. These kernels make EP more scalable because the communication size no longer increases with EP size. The implementation of the communication part of these kernels is similar to the previous communication kernel of hidden states, are used in a FIFO manner. But an important difference is that these kernels use release-acquire instructions to ensure memory consistency, which has the advantage of being able to support various forms of data more flexibly. Although it is not as efficient as LL128 primitive in terms of performance, it is more helpful for fast iteration before the functionality converges.
 
@@ -94,7 +94,7 @@ This optimization was implemented in [PR 5570](https://github.com/NVIDIA/TensorR
 
 ### Expert Parallelism Load Balancer (EPLB)
 
-As introduced in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-load-balancer), EP-level workload imbalance is common for large-scale EP inference across multiple datasets and has significant performance impacts. TensorRT LLM implements a set of functionalities to address this issue. We have refined the code and improved the usability of this feature, and the benefits of EPLB are directly reflected in kernel duration improvements.
+As introduced in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-load-balancer), EP-level workload imbalance is common for large-scale EP inference across multiple datasets and has significant performance impacts. TensorRT LLM implements a set of functionalities to address this issue. We have refined the code and improved the usability of this feature, and the benefits of EPLB are directly reflected in kernel duration improvements.
 
 The core challenge with EP scaling is that different experts receive varying amounts of work based on the routing decisions made by the MoE layer. This imbalance becomes more pronounced as EP size increases, leading to scenarios where some GPUs are heavily loaded while others remain underutilized. The Expert Parallelism Load Balancer (EPLB) addresses this by dynamically redistributing expert assignments to achieve better load balance across all participating GPUs.
 
@@ -108,7 +108,7 @@ In the previous [Kernel Optimizations](#kernel-optimizations) section, we noted 
 
 #### Attempts at Online EPLB Implementation
 
-We discussed the [high-level design](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#high-level-design-introduction) and [implementation considerations](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#online-ep-load-balancer) of Online EPLB in our previous blog. However, several unexpected issues arose during implementation.
+We discussed the [high-level design](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#high-level-design-introduction) and [implementation considerations](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#online-ep-load-balancer) of Online EPLB in our previous blog. However, several unexpected issues arose during implementation.
 
 These issues primarily stem from the weight updating mechanism.
 
@@ -235,7 +235,7 @@ After implementing huge pages, we found that warmup kernels now execute in only 
 
 ### Multi-Token Prediction (MTP)
 
-MTP allows verifying and accepting several draft tokens in a single iteration, which is very beneficial for scenarios that prefer low latency. TensorRT LLM has supported MTP, and we refer to our previous [MTP blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md#mtp-implementation-in-tensorrt-llm) for more details on the implementation.
+MTP allows verifying and accepting several draft tokens in a single iteration, which is very beneficial for scenarios that prefer low latency. TensorRT LLM has supported MTP, and we refer to our previous [MTP blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.md#mtp-implementation-in-tensorrt-llm) for more details on the implementation.
 
 For large EP, we have also extended the implementation so that it works well with online EPLB. This was implemented in [PR 5213](https://github.com/NVIDIA/TensorRT-LLM/pull/5213).
 
