@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1135,8 +1135,6 @@ int AttentionOp::mlaGeneration(
     }
     else if (mUseGenFlashMLA)
     {
-        static constexpr int block_size_n = 64;
-        static constexpr int fixed_overhead_num_blocks = 5;
         static constexpr int TileSchedulerMetaDataSize = 8;
 
         int const num_q_heads = mNumHeads / mCpSize;
@@ -1153,27 +1151,22 @@ int AttentionOp::mlaGeneration(
         size_t const softmax_lse_accum_size = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q);
         size_t const out_accum_size = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q * head_size_v);
 
-        int* tile_scheduler_metadata_ptr
-            = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, tile_scheduler_metadata_size));
-        int* num_splits_ptr = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, num_splits_size));
+        // Workspace pointers for softmax accumulators (tile_scheduler and num_splits come from Python).
+        nextWorkspacePtr(workspace_byte_ptr, offset, tile_scheduler_metadata_size);
+        nextWorkspacePtr(workspace_byte_ptr, offset, num_splits_size);
         float* softmax_lse_ptr
             = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, softmax_lse_size));
         float* softmax_lse_accum_ptr
             = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, softmax_lse_accum_size));
         float* out_accum_ptr = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, out_accum_size));
 
-        // prepare metadata
-        Mla_metadata_params mlaMetaDataParams = {};
-        mlaMetaDataParams.seqlens_k_ptr = const_cast<int*>(params.cache_seq_lens);
-        mlaMetaDataParams.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
-        mlaMetaDataParams.num_splits_ptr = num_splits_ptr;
-        mlaMetaDataParams.batch_size = batch_beam;
-        mlaMetaDataParams.block_size_n = block_size_n;
-        mlaMetaDataParams.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
-        mlaMetaDataParams.num_sm_parts = num_sm_parts;
-
-        // metadata should only be init once per iter, to fix later
-        get_mla_metadata_func(mlaMetaDataParams, stream);
+        // Metadata must always be pre-computed by Python (compute_flash_mla_metadata) and passed in.
+        TLLM_CHECK_WITH_INFO(params.flash_mla_tile_scheduler_metadata != nullptr,
+            "FlashMLA tile-scheduler metadata must be pre-computed by Python.");
+        TLLM_CHECK_WITH_INFO(
+            params.flash_mla_num_splits != nullptr, "FlashMLA num_splits must be pre-computed by Python.");
+        int* tile_scheduler_metadata_ptr = const_cast<int*>(params.flash_mla_tile_scheduler_metadata);
+        int* num_splits_ptr = const_cast<int*>(params.flash_mla_num_splits);
 
         Flash_fwd_mla_params flashMlaParams{};
         flashMlaParams.b = batch_beam;
