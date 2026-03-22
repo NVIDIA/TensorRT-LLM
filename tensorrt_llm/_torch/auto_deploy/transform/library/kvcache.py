@@ -192,9 +192,6 @@ class _InsertCachedOperator(BaseTransform):
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
         for attn_node in source_attn_nodes:
-            # pick out GEMMs
-            qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
-
             # setup + store cache resource handlers and caches as input nodes
             resources_dict = attn_descriptor.get_cache_initializers(attn_node, cm.kv_cache_config)
             cache_in_nodes = [
@@ -204,6 +201,10 @@ class _InsertCachedOperator(BaseTransform):
 
             # allow backend-specific prep before constants are extracted
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
+
+            # pick out QKV args AFTER prepare_node_for_cache_insertion, since
+            # transforms like FuseRopeIntoTrtllmAttention may have rewired Q/K.
+            qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
