@@ -2086,10 +2086,14 @@ class KVCacheManagerV2(BaseResourceManager):
             if kv_cache is None:
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id,
-                    req.get_tokens(DEFAULT_BEAM_INDEX)[:-1]
-                    if self.enable_block_reuse else None)
+                if self.enable_block_reuse:
+                    all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                    tokens = self._augment_tokens_for_block_reuse(
+                        all_tokens, req, end=len(all_tokens) - 1)
+                else:
+                    tokens = None
+                kv_cache = self._create_kv_cache(req.py_request_id,
+                                                 req.lora_task_id, tokens)
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2179,6 +2183,24 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Draft KV cache context resize failed for request "
                         f"{req.py_request_id}: could not resize to {capacity} tokens"
                     )
+
+            for req in scheduled_batch.generation_requests:
+                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                if kv_cache is None:
+                    raise RuntimeError(
+                        f"Missing draft KV cache for generation request {req.py_request_id}"
+                    )
+                if not self._resume_and_restore(req.py_request_id, kv_cache):
+                    raise RuntimeError(
+                        f"Failed to resume draft KV cache for request {req.py_request_id}"
+                    )
+                new_cap = self._required_gen_capacity(req, kv_cache.capacity)
+                if not kv_cache.resize(new_cap):
+                    raise RuntimeError(
+                        f"Draft KV cache generation resize failed for request "
+                        f"{req.py_request_id}: could not resize to {new_cap} tokens"
+                    )
+
     def _augment_tokens_for_block_reuse(
             self,
             tokens: Sequence[int],
@@ -2230,120 +2252,6 @@ class KVCacheManagerV2(BaseResourceManager):
             result[result_offset:result_offset +
                    n] = mm_tokens[mm_offset:mm_offset + n]
         return result
-
-    @nvtx_range("prepare_resources_kv_cache_manager_v2")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        with request_context(self.is_draft, scheduled_batch):
-            # allocate KV Cache
-            for req in scheduled_batch.context_requests:
-                beam_width = req.sampling_config.beam_width
-                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
-                        'cp_type']:
-                    raise RuntimeError(
-                        "Star attention is not supported for kv cache manager v2"
-                    )
-                else:
-                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
-                            req):
-                        # Last token cannot be recovered, so we don't include it in the input tokens to look up for the block that can be reused.
-                        if self.enable_block_reuse:
-                            all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
-                            tokens = self._augment_tokens_for_block_reuse(
-                                all_tokens, req, end=len(all_tokens) - 1)
-                        else:
-                            tokens = None
-                        kv_cache = self._create_kv_cache(
-                            req.py_request_id, req.lora_task_id, tokens)
-                        kv_cache.cuda_stream = self._stream.cuda_stream
-                        assert beam_width == 1, "Currently, KVCacheManagerV2 only supports beam width 1"
-                        if not self.enable_block_reuse:
-                            assert kv_cache.num_committed_tokens == 0
-                            kv_cache.stop_committing()
-                        else:
-                            req.context_current_position = kv_cache.num_committed_tokens
-                            req.set_prepopulated_prompt_len(
-                                kv_cache.num_committed_tokens,
-                                self.tokens_per_block)
-                            chunk_size = req.context_chunk_size
-                            if req.context_current_position + req.context_chunk_size < req.prompt_len:
-                                floored_end_position = (
-                                    req.context_current_position +
-                                    req.context_chunk_size
-                                ) // self.tokens_per_block * self.tokens_per_block
-                                chunk_size = floored_end_position - req.context_current_position
-
-                            req.context_chunk_size = min(
-                                chunk_size,
-                                req.prompt_len - req.context_current_position)
-
-                        success = kv_cache.resume()
-                        assert success
-                        new_capacity = req.prompt_len + self.num_extra_kv_tokens + get_draft_token_length(
-                            req)
-                        success = kv_cache.resize(new_capacity)
-                        if not success:
-                            raise ValueError(
-                                f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for context update"
-                            )
-                        if self.kv_connector_manager is not None:
-                            block_ids = self.get_cache_indices(req)
-                            self.kv_connector_manager.update_state_after_alloc(
-                                req, block_ids)
-
-            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
-            scheduled_batch.reset_context_requests()
-
-            for req in scheduled_batch.generation_requests:
-                kv_cache = self.kv_cache_map.get(req.py_request_id)
-                if kv_cache is None:
-                    raise RuntimeError(
-                        f"Missing draft KV cache for generation request {req.py_request_id}"
-                    )
-                if not self._resume_and_restore(req.py_request_id, kv_cache):
-                    raise RuntimeError(
-                        f"Failed to resume draft KV cache for request {req.py_request_id}"
-                    )
-                new_cap = self._required_gen_capacity(req, kv_cache.capacity)
-                if not kv_cache.resize(new_cap):
-                    raise RuntimeError(
-                        f"Draft KV cache generation resize failed for request "
-                        f"{req.py_request_id}: could not resize to {new_cap} tokens"
-                    )
-                kv_cache = self.kv_cache_map[req.py_request_id]
-                draft_len = get_draft_token_length(req)
-                new_capacity = kv_cache.capacity + 1 + draft_len
-                success = kv_cache.resize(new_capacity)
-                if not success:
-                    raise ValueError(
-                        f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for generation update"
-                    )
-
-        if self.kv_connector_manager is not None:
-            self.kv_connector_manager.build_scheduler_output(
-                scheduled_batch, self)
-
-    def extend_capacity_for_tokens(self, request: LlmRequest,
-                                   num_tokens: int) -> None:
-        """Extend KV cache capacity for *request* by *num_tokens* extra tokens.
-
-        Used after ``pad_draft_tokens_for_cuda_graph`` to ensure the KV cache
-        has enough capacity for the padded draft tokens so that the subsequent
-        rewind does not underflow.
-        """
-        if num_tokens <= 0:
-            return
-        kv_cache = self.kv_cache_map[request.py_request_id]
-        new_capacity = kv_cache.capacity + num_tokens
-        success = kv_cache.resize(new_capacity)
-        if not success:
-            raise ValueError(
-                f"Failed to extend capacity of KV cache for request "
-                f"{request.py_request_id} by {num_tokens} tokens "
-                f"(target capacity {new_capacity})")
-
-    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
-        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
-            request)
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
@@ -2737,12 +2645,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.context_remaining_length == 0:
                     kv_cache.stop_committing()
             else:
-                # For draft managers, prepare_resources may have failed to
-                # resize capacity (OOM). Ensure capacity >= history_length
-                # before setting history_length to avoid ValueError.
-                new_capacity = None
-                if self.is_draft and kv_cache.capacity < req.context_current_position:
-                    new_capacity = req.context_current_position + self.num_extra_kv_tokens
                 success = kv_cache.resize(new_capacity,
                                           req.context_current_position)
                 if not success:
