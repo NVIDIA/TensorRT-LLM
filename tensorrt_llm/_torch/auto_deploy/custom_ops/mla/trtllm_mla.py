@@ -180,7 +180,9 @@ class _TrtllmMLAPlanner:
         if self.workspace is not None:
             return
 
-        self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        # Start with empty workspace — the C++ AttentionOp auto-resizes it
+        # on the first call (matching the PT backend's approach).
+        self.workspace = torch.empty(0, dtype=torch.int8, device=device)
         self.host_pool_mapping = torch.zeros(
             1, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
@@ -467,6 +469,7 @@ def _call_thop_attention_mla(
     rotary_embedding_dim: int = 0,
     rotary_embedding_base: float = 10000.0,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    layer_idx: int = 0,
 ) -> None:
     """Call thop.attention with MLA parameters enabled.
 
@@ -526,7 +529,7 @@ def _call_thop_attention_mla(
         is_fused_qkv,  # is_fused_qkv
         update_kv_cache,  # update_kv_cache
         1,  # predicted_tokens_per_seq
-        0,  # layer_idx
+        layer_idx,  # layer_idx
         num_heads,  # num_heads
         num_kv_heads,  # num_kv_heads
         head_size,  # head_size
@@ -615,8 +618,9 @@ def _handle_prefill_thop(
     position_embedding_type: int = 2,
     rotary_embedding_dim: int = 0,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
-    """Batched prefill via a single thop.attention call (SEPARATE_Q_K_V layout).
+    """Batched prefill via thop.attention (SEPARATE_Q_K_V layout).
 
     Expands compressed KV via kv_b_proj, assembles full Q/K/V, and passes the
     entire batch to thop.attention with attention_input_type=context_only.
@@ -649,40 +653,72 @@ def _handle_prefill_thop(
 
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    _call_thop_attention_mla(
-        q,
-        k,
-        v,
-        output,
-        latent_cache,
-        None,
-        False,
-        1,
-        num_heads,
-        num_kv_heads,
-        qk_head_dim,
-        tokens_per_block,
-        max_num_requests,
-        max_context_length,
-        1.0,
-        quant_mode,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-        sequence_length,
-        context_lengths,
-        host_past_kv_lengths,
-        host_context_lengths,
-        host_request_types,
-        host_total_kv_lens,
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        position_embedding_type=position_embedding_type,
-        rotary_embedding_dim=rotary_embedding_dim,
-        rotary_cos_sin=rotary_cos_sin,
-    )
+    planner = _GlobalTrtllmMLAPlanner
+
+    # Pinned single-sequence host tensors (allocated once, reused).
+    if not hasattr(planner, "_pfx_host_total_kv"):
+        planner._pfx_host_total_kv = torch.zeros(
+            2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
+        planner._pfx_host_req_type = torch.zeros(
+            1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+
+    # Only iterate over prefill sequences (type==0); they precede decode in metadata.
+    num_prefill_seqs = int((host_request_types == 0).sum())
+
+    # Process each prefill sequence independently (matches PT backend's
+    # one-sequence-at-a-time context processing).
+    tok_offset = 0
+    for i in range(num_prefill_seqs):
+        seq_ctx_len = int(host_context_lengths[i])
+        if seq_ctx_len == 0:
+            continue
+
+        t0 = tok_offset
+        t1 = tok_offset + seq_ctx_len
+
+        planner._pfx_host_total_kv[0] = int(sequence_length[i])
+        planner._pfx_host_total_kv[1] = 0
+
+        _call_thop_attention_mla(
+            q[t0:t1].contiguous(),
+            k[t0:t1].contiguous(),
+            v[t0:t1].contiguous(),
+            output[t0:t1],
+            latent_cache[t0:t1].contiguous(),
+            None,
+            False,
+            1,  # attention_input_type = context_only
+            num_heads,
+            num_kv_heads,
+            kv_lora_rank + qk_rope_head_dim,  # head_size: latent dim (matches PT backend)
+            tokens_per_block,
+            max_num_requests,
+            max_context_length,
+            1.0,
+            quant_mode,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            sequence_length[i : i + 1],
+            context_lengths[i : i + 1],
+            host_past_kv_lengths[i : i + 1],
+            host_context_lengths[i : i + 1],
+            planner._pfx_host_req_type,
+            planner._pfx_host_total_kv,
+            kv_cache_block_offsets[:, i : i + 1, :, :],
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            block_ids_per_seq=planner.block_ids_per_seq[i : i + 1],
+            position_embedding_type=position_embedding_type,
+            rotary_embedding_dim=rotary_embedding_dim,
+            rotary_cos_sin=rotary_cos_sin,
+            layer_idx=layer_idx,
+        )
+
+        tok_offset = t1
 
     return output
 
@@ -731,7 +767,13 @@ def _write_decode_latent_to_cache(
     page_ids = planner.block_ids_per_seq[num_prefill:num_seq][seq_range, page_in_seq.long()]
     flat_idx = page_ids.long() * rpb + slot
 
-    kv_cache_2d.index_copy_(0, flat_idx, latent_cache)
+    # Cast latent_cache to match KV cache dtype (e.g. BF16 → FP8 for FP8 models).
+    src = (
+        latent_cache
+        if latent_cache.dtype == kv_cache_2d.dtype
+        else latent_cache.to(kv_cache_2d.dtype)
+    )
+    kv_cache_2d.index_copy_(0, flat_idx, src)
 
 
 def _apply_rope_from_table(
@@ -811,6 +853,7 @@ def _handle_decode_impl(
     host_kv_cache_pool_mapping: torch.Tensor,
     *,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """Handle decode: weight absorption + latent-space attention + output projection.
 
@@ -865,7 +908,7 @@ def _handle_decode_impl(
             planner.block_ids_per_seq,
             [None, None],  # mla_tensor_params (helix)
             1,  # predicted_tokens_per_seq
-            0,  # layer_idx
+            layer_idx,  # layer_idx
             num_heads,
             num_kv_heads,
             gen_head_size,
@@ -952,6 +995,7 @@ def _mla_with_cache_impl(
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """Shared implementation for both MLA attention ops (with and without fused RoPE).
 
@@ -1136,6 +1180,7 @@ def _mla_with_cache_impl(
             position_embedding_type=2,
             rotary_embedding_dim=qk_rope_head_dim,
             rotary_cos_sin=rope_table,
+            layer_idx=layer_idx,
         )
 
     # -- Decode helper --------------------------------------------------------
@@ -1156,6 +1201,7 @@ def _mla_with_cache_impl(
             n_pf,
             *_make_shared_metadata(),
             rotary_cos_sin=rotary_cos_sin,
+            layer_idx=layer_idx,
         )
 
     # -- 3-way dispatch -------------------------------------------------------
@@ -1244,6 +1290,7 @@ def trtllm_mla_with_cache(
     # Constants
     scale: Optional[float],
     kv_lora_rank: int,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """TRT-LLM MLA attention with paged latent cache (post-RoPE inputs)."""
     return _mla_with_cache_impl(
@@ -1260,6 +1307,7 @@ def trtllm_mla_with_cache(
         kv_cache,
         scale,
         kv_lora_rank,
+        layer_idx=layer_idx,
     )
 
 
@@ -1278,6 +1326,7 @@ def trtllm_mla_with_cache_fake(
     kv_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
@@ -1305,6 +1354,7 @@ def trtllm_mla_fused_rope_with_cache(
     # Constants
     scale: Optional[float],
     kv_lora_rank: int,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """TRT-LLM MLA attention with fused RoPE and paged latent cache (pre-RoPE inputs)."""
     return _mla_with_cache_impl(
@@ -1322,6 +1372,7 @@ def trtllm_mla_fused_rope_with_cache(
         scale,
         kv_lora_rank,
         rotary_cos_sin=rotary_cos_sin,
+        layer_idx=layer_idx,
     )
 
 
@@ -1341,6 +1392,7 @@ def trtllm_mla_fused_rope_with_cache_fake(
     kv_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
@@ -1397,6 +1449,22 @@ class TrtllmMLAAttention(AttentionDescriptor):
         )
 
     @classmethod
+    def _has_fp8_model_weights(cls, source_attn_node: Node) -> bool:
+        """Detect if the model uses FP8 weights.
+
+        Checks the graph module's parameters for any FP8 tensors.  This runs
+        during the ``cache_init`` stage which is after ``weight_load``, so
+        parameters carry their actual loaded dtypes.
+        """
+        gm = source_attn_node.graph.owning_module
+        if gm is None:
+            return False
+        for param in gm.parameters():
+            if param.dtype == torch.float8_e4m3fn:
+                return True
+        return False
+
+    @classmethod
     def get_cache_initializers(
         cls,
         source_attn_node: Node,
@@ -1405,6 +1473,12 @@ class TrtllmMLAAttention(AttentionDescriptor):
         """Return KV cache handler for MLA latent cache.
 
         MLA stores [compressed_kv | k_pe] per token with num_kv_heads=1.
+
+        For FP8 models, the KV cache is allocated in FP8 dtype when
+        ``cache_config.dtype`` is ``"auto"``.  This matches the PT backend
+        (which uses ``quant_mode=FP8_KV_CACHE``) and routes to the
+        ``mFP8ContextMLA=true`` C++ code path, avoiding the batch-size
+        dependent crash in the BF16 context FMHA path.
         """
         q_nope_fake: FakeTensor = source_attn_node.args[0].meta["val"]
         compressed_kv_fake: FakeTensor = source_attn_node.args[2].meta["val"]
@@ -1427,14 +1501,21 @@ class TrtllmMLAAttention(AttentionDescriptor):
                 f"Use the flashinfer_mla backend for this model instead."
             )
 
+        # NOTE: FP8 KV cache is NOT auto-enabled because the C++ MLA decode
+        # FMHA kernel does not support FP8 with num_kv_heads=1 and MLA latent
+        # dimensions (headSize=576, headSizeV=512).  The PT backend also uses
+        # BF16 KV cache by default for MLA models.  Users can still explicitly
+        # set cache_config.dtype="fp8" if a future kernel adds support.
+        cache_dtype = cls.resolve_cache_dtype(
+            cache_config.dtype,
+            compressed_kv_fake.dtype,
+        )
+
         return {
             "kv_cache": KVPagedResourceHandler(
                 num_kv_heads=1,
                 head_dim=kv_lora_rank + qk_rope_head_dim,
-                dtype=cls.resolve_cache_dtype(
-                    cache_config.dtype,
-                    compressed_kv_fake.dtype,
-                ),
+                dtype=cache_dtype,
                 kv_factor=1,
                 kv_layout="HND",
             )
@@ -1452,3 +1533,7 @@ class TrtllmMLAAttention(AttentionDescriptor):
         kv_lora_rank = compressed_kv_fake.shape[-1]
         (scale,) = extract_op_args(source_attn_node, "scale")
         return [scale, kv_lora_rank]
+
+    @classmethod
+    def needs_layer_idx(cls) -> bool:
+        return True

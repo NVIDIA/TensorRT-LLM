@@ -208,6 +208,13 @@ class _InsertCachedOperator(BaseTransform):
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
 
+            # Append layer_idx so the cached op can pass it to thop.attention.
+            # This ensures each layer creates a separate C++ AttentionOp
+            # (which is cached by layer_idx) rather than sharing one across
+            # all layers.
+            if hasattr(attn_descriptor, "needs_layer_idx") and attn_descriptor.needs_layer_idx():
+                constants = list(constants) + [idx]
+
             # insert cached attention replacement op
             self._insert_cached_attn_node(
                 gm,
