@@ -40,7 +40,9 @@ from tensorrt_llm._torch.auto_deploy.mlir.decompose import run_decomposition  # 
 from tensorrt_llm._torch.auto_deploy.mlir.dialect import (  # noqa: E402
     AdAdd,
     AdGraphOutput,
+    AdMul,
     AdRMSNorm,
+    AdSilu,
 )
 from tensorrt_llm._torch.auto_deploy.mlir.fusion.subgraph_discovery import (  # noqa: E402
     discover_fusible_subgraphs,
@@ -180,3 +182,125 @@ def test_pipeline_reports_subgraph_metadata():
     # The subgraph should have inputs (x, residual, weight) and at least one output
     assert len(largest_sg.inputs) >= 2, f"Expected >= 2 inputs, got {len(largest_sg.inputs)}"
     assert len(largest_sg.outputs) >= 1, f"Expected >= 1 outputs, got {len(largest_sg.outputs)}"
+
+
+# ---------------------------------------------------------------------------
+# Novel fusion: add + rmsnorm + silu(gate) * normed
+# This pattern has NO pre-existing hand-written kernel — the MLIR pipeline
+# must automatically discover and generate it.
+# ---------------------------------------------------------------------------
+
+
+def _build_add_rmsnorm_silu_gate_module(hidden: int = 128):
+    """Build MLIR module for add + rmsnorm + silu_gate (novel fusion).
+
+    Graph: (x, residual, weight, gate)
+        added  = add(x, residual)
+        normed = rmsnorm(added, weight, eps=1e-5)
+        gated  = normed * silu(gate)
+    Outputs: (gated, added)
+    """
+    t = TensorType(BFloat16Type(), [2, hidden])
+    tw = TensorType(BFloat16Type(), [hidden])
+    eps = FloatAttr(1e-5, Float64Type())
+
+    block = Block()
+    x = block.insert_arg(t, 0)
+    res = block.insert_arg(t, 1)
+    w = block.insert_arg(tw, 2)
+    gate = block.insert_arg(t, 3)
+
+    add_op = AdAdd.build(operands=[x, res], result_types=[t])
+    block.add_op(add_op)
+
+    norm_op = AdRMSNorm.build(
+        operands=[add_op.output, w], attributes={"eps": eps}, result_types=[t]
+    )
+    block.add_op(norm_op)
+
+    silu_op = AdSilu.build(operands=[gate], result_types=[t])
+    block.add_op(silu_op)
+
+    mul_op = AdMul.build(operands=[norm_op.output, silu_op.output], result_types=[t])
+    block.add_op(mul_op)
+
+    out_op = AdGraphOutput.build(operands=[[mul_op.output, add_op.output]])
+    block.add_op(out_op)
+
+    return ModuleOp(Region([block]))
+
+
+def test_novel_add_rmsnorm_silu_gate():
+    """Fusion that has NO pre-existing kernel — auto-discovered and generated.
+
+    Validates the full decompose -> discover -> codegen pipeline on a novel
+    add + rmsnorm + silu(gate) pattern. After decomposition, all ops should
+    be fusible primitives that land in ONE subgraph.
+    """
+    hidden = 128
+    mlir_mod = _build_add_rmsnorm_silu_gate_module(hidden)
+
+    # Step 1: Decompose — rmsnorm decomposes into primitives
+    num_decomposed = run_decomposition(mlir_mod)
+    assert num_decomposed >= 1, "Expected at least one decomposition (rmsnorm)"
+
+    # Step 2: Discover fusible subgraphs
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) >= 1, "Expected at least one fusible subgraph"
+
+    # ALL primitive ops (add + rmsnorm decomp + silu + mul) should be in ONE
+    # subgraph — this is the key assertion proving novel fusion discovery.
+    largest_sg = max(subgraphs, key=lambda sg: len(sg.ops))
+    # add(1) + rmsnorm-decomp(~7) + silu(1) + mul(1) = ~10 ops minimum
+    assert len(largest_sg.ops) >= 9, (
+        f"Expected >= 9 ops in the fused subgraph (add + rmsnorm decomp + "
+        f"silu + mul), got {len(largest_sg.ops)}"
+    )
+    # Should be exactly ONE subgraph covering everything
+    assert len(subgraphs) == 1, (
+        f"Expected exactly 1 subgraph (all ops fused together), got {len(subgraphs)}"
+    )
+
+    # Step 3: Generate Triton kernel from the novel subgraph
+    kernel_fn = generate_kernel_from_subgraph(largest_sg)
+    assert callable(kernel_fn), "Expected generate_kernel_from_subgraph to return a callable"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_novel_fusion_numerical_correctness():
+    """Verify the novel add+rmsnorm+silu_gate kernel matches torch reference.
+
+    This is the key validation that the system works for novel patterns:
+    no kernel was hand-written for this fused operation.
+    """
+    hidden = 128
+    mlir_mod = _build_add_rmsnorm_silu_gate_module(hidden)
+
+    # Run full pipeline
+    run_decomposition(mlir_mod)
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) >= 1
+
+    largest_sg = max(subgraphs, key=lambda sg: len(sg.ops))
+    kernel_fn = generate_kernel_from_subgraph(largest_sg)
+
+    # Prepare inputs: x, residual, weight, gate
+    xt = torch.randn(2, hidden, device="cuda", dtype=torch.bfloat16)
+    rest = torch.randn_like(xt)
+    wt = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+    gate_t = torch.randn_like(xt)
+
+    # Run generated kernel
+    result = kernel_fn(xt, rest, wt, gate_t)
+
+    # Reference: add + rmsnorm + silu(gate) * normed
+    added_ref = xt + rest
+    x_f32 = added_ref.float()
+    var = x_f32.pow(2).mean(dim=-1, keepdim=True)
+    normed_ref = (x_f32 * torch.rsqrt(var + 1e-5)).to(torch.bfloat16) * wt
+    gated_ref = normed_ref * torch.nn.functional.silu(gate_t)
+
+    # Verify both outputs: (gated, added)
+    assert len(result) >= 2, f"Expected at least 2 outputs, got {len(result)}"
+    torch.testing.assert_close(result[0], added_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(result[1], gated_ref, atol=1e-2, rtol=1e-2)

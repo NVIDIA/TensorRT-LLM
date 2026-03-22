@@ -96,15 +96,23 @@ def discover_fusible_subgraphs(mlir_module: ModuleOp) -> List[FusibleSubgraph]:
         if not _is_fusible(op):
             continue
 
-        # Check if any operand comes from an op already in a group
-        merged_group = None
+        # Check if any operand comes from an op already in a group.
+        # If operands come from *multiple* groups, merge them all.
+        producer_groups: set[int] = set()
         for operand in op.operands:
             producer = operand.owner
             if producer in op_to_group:
-                merged_group = op_to_group[producer]
-                break
+                producer_groups.add(op_to_group[producer])
 
-        if merged_group is not None:
+        if producer_groups:
+            # Pick the lowest-numbered group as the merge target
+            merged_group = min(producer_groups)
+            # Merge all other groups into the target
+            for other_gid in producer_groups:
+                if other_gid != merged_group:
+                    for other_op in groups[other_gid]:
+                        op_to_group[other_op] = merged_group
+                    groups[merged_group].extend(groups.pop(other_gid))
             op_to_group[op] = merged_group
             groups[merged_group].append(op)
         else:
@@ -152,11 +160,15 @@ def discover_fusible_subgraphs(mlir_module: ModuleOp) -> List[FusibleSubgraph]:
                         insert_idx = min(insert_idx, i)
             group_ops.insert(insert_idx, op)
 
-    # Build FusibleSubgraph objects for groups with >=2 ops
+    # Build FusibleSubgraph objects for groups with >=2 ops.
+    # Re-sort ops in topological order (block iteration order) since group
+    # merging may have disrupted ordering.
+    topo_order = {op: i for i, op in enumerate(block.ops)}
     result = []
     for gid, ops in groups.items():
         if len(ops) < 2:
             continue
+        ops.sort(key=lambda o: topo_order.get(o, 0))
         sg = FusibleSubgraph(ops=ops)
 
         op_set = set(ops)
