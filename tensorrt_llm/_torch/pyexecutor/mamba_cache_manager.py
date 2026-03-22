@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.model_config import ModelConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
@@ -761,6 +762,7 @@ class LinearHybridCacheManager(KVCacheManager):
         kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
         *,
+        model_config_py: Optional[ModelConfig] = None,
         num_layers: int,
         num_kv_heads: Union[int, List[Optional[int]]],
         head_dim: int,
@@ -774,7 +776,6 @@ class LinearHybridCacheManager(KVCacheManager):
         spec_config: Optional["DecodingBaseConfig"] = None,
         layer_mask: Optional[List[bool]] = None,
         max_num_tokens: int = 8192,
-        model_config: Optional[ModelConfigCpp] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
@@ -845,7 +846,10 @@ class LinearHybridCacheManager(KVCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             max_num_tokens=max_num_tokens,
-            model_config=model_config,
+            model_config=model_config_py.get_bindings_model_config(
+                tokens_per_block=tokens_per_block,
+                kv_cache_config=kv_cache_config,
+                spec_config=spec_config),
             max_beam_width=max_beam_width,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager,

@@ -11,7 +11,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 from ...._utils import torch_dtype_to_binding
-from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager, MambaHybridCacheManagerV1
 from ...pyexecutor.resource_manager import KVCacheManager
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
@@ -459,16 +459,8 @@ class CachedSequenceInterface:
         )
         num_managed_mamba_layers = mamba_params["mamba_num_layers"]
 
-        # Construct mamba_layer_mask and update layer_mask to cover total layers.
-        # AutoDeploy treats attention layers (KV resources) as the first N layers
-        # and mamba/linear layers (SSM/Conv resources) as the remaining layers.
-        num_kv_layers = kv_cache_kwargs["num_layers"]
-        mamba_layer_mask = [False] * num_kv_layers + [True] * num_managed_mamba_layers
-        mamba_params["mamba_layer_mask"] = mamba_layer_mask
-        kv_cache_kwargs["layer_mask"] = [True] * num_kv_layers + [False] * num_managed_mamba_layers
-
         # Create the hybrid cache manager
-        manager = MambaHybridCacheManager(
+        manager = MambaHybridCacheManagerV1(
             **mamba_params,
             **kv_cache_kwargs,
         )

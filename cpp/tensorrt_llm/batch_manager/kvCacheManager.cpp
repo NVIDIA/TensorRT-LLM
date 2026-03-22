@@ -1713,6 +1713,12 @@ SizeType32 WindowBlockManager::addSequence(
     {
         shareLastContextBlockAmongBeams = inputLength % mTokensPerBlock == 0;
     }
+    else if (sequence.getBeamWidth() > 1)
+    {
+        // The last context block cannot be shared among beams because each
+        // beam will write different generated tokens into it.
+        shareLastContextBlockAmongBeams = false;
+    }
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, llmRequest,
         perBlockRetentions, shareLastContextBlockAmongBeams, mode, directory);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);

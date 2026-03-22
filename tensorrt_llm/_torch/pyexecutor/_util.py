@@ -1015,10 +1015,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_config=model_engine.model.model_config.
-            get_bindings_model_config(tokens_per_block=tokens_per_block,
-                                      kv_cache_config=kv_cache_config,
-                                      spec_config=spec_config),
+            model_config_py=model_engine.model.model_config,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1060,10 +1057,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_config=model_engine.model.model_config.
-            get_bindings_model_config(tokens_per_block=tokens_per_block,
-                                      kv_cache_config=kv_cache_config,
-                                      spec_config=spec_config),
+            model_config_py=model_engine.model.model_config,
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
