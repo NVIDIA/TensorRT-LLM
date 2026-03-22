@@ -305,6 +305,10 @@ class FXToMLIRConverter:
         eps_val = float(node.args[2]) if len(node.args) > 2 else 1e-5
         eps_attr = FloatAttr(eps_val, Float64Type())
         result_type = _result_type_for_node(node)
+        # If no FakeTensor metadata (e.g., from match_rmsnorm_pattern),
+        # use the input tensor's type — rmsnorm preserves shape.
+        if result_type.get_shape() == (-1,) and isinstance(input_val.type, TensorType):
+            result_type = input_val.type
         op = AdRMSNorm.build(
             operands=[input_val, weight_val],
             attributes={"eps": eps_attr},
