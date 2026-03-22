@@ -2329,6 +2329,41 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     def _round_up(x, alignment):
         return (x + alignment - 1) // alignment * alignment
 
+    def _extract_internal_routing_args(
+        selected_experts: Node,
+        routing_weights: Node,
+    ) -> Optional[dict]:
+        def _match_noaux_getitem(node: Node, expected_index: int) -> Optional[Node]:
+            if node.op != "call_function":
+                return None
+            if not hasattr(node.target, "__name__") or node.target.__name__ != "getitem":
+                return None
+            if len(node.args) < 2 or node.args[1] != expected_index:
+                return None
+            source_node = node.args[0]
+            if not isinstance(source_node, Node) or not is_op(
+                source_node, torch.ops.trtllm.noaux_tc_op
+            ):
+                return None
+            return source_node
+
+        weights_source = _match_noaux_getitem(routing_weights, expected_index=0)
+        indices_source = _match_noaux_getitem(selected_experts, expected_index=1)
+        if weights_source is None or indices_source is None or weights_source is not indices_source:
+            return None
+
+        if len(indices_source.args) < 6:
+            return None
+
+        return {
+            "router_logits": indices_source.args[0],
+            "routing_bias": indices_source.args[1],
+            "n_group": indices_source.args[2],
+            "topk_group": indices_source.args[3],
+            "top_k": indices_source.args[4],
+            "routed_scaling_factor": indices_source.args[5],
+        }
+
     EPILOGUE_TILE_M = 128
 
     def _reverse_interleave_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
@@ -2417,6 +2452,7 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             act_fn,
         ) = _extract_op_args(node)
 
+        internal_routing_args = _extract_internal_routing_args(selected_experts, routing_weights)
         w1_stacked = _stack(w1_list, dim=0)
         w2_stacked = _stack(w2_list, dim=0)
         device, dtype = (w1_stacked.device, w1_stacked.dtype)
@@ -2645,6 +2681,9 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                     "act_fn": act_fn,
                 }
             )
+            if internal_routing_args is not None:
+                kwargs.update(internal_routing_args)
+                kwargs["use_internal_routing"] = True
             new_node = graph.call_function(
                 replacement_op,
                 args=args,
@@ -2705,7 +2744,6 @@ class FuseNVFP4Moe(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        ad_logger.info(f"FuseNVFP4Moe: backend={self.config.backend}")
         with cuda_memory_tracker():
             if self.config.backend == "cutlass":
                 fused_key_counter = _stack_nvfp4_cutlass_moe_weights(
