@@ -45,10 +45,13 @@ from .dialect import (
     AdMul,
     AdNeg,
     AdOpaque,
+    AdPow,
+    AdReduceMean,
     AdRelu,
     AdRMSNorm,
     AdRsqrt,
     AdSilu,
+    AdSplat,
     AdSqrt,
     AdSub,
     AdTanh,
@@ -210,6 +213,10 @@ class FXToMLIRConverter:
             self._convert_unary_elementwise(node, block, AdRsqrt)
         elif is_op(node, [torch.ops.aten.sqrt, torch.ops.aten.sqrt.default]):
             self._convert_unary_elementwise(node, block, AdSqrt)
+        elif is_op(node, torch.ops.aten.pow.Tensor_Scalar):
+            self._convert_pow(node, block)
+        elif is_op(node, torch.ops.aten.mean.dim):
+            self._convert_mean(node, block)
         elif _is_rmsnorm(node):
             self._convert_rmsnorm(node, block)
         elif is_op(node, torch.ops.aten.to.dtype):
@@ -224,23 +231,58 @@ class FXToMLIRConverter:
     # ------------------------------------------------------------------
 
     def _convert_add(self, node: Node, block: Block) -> None:
-        """``aten.add.Tensor`` → ``ad.add``."""
-        lhs = self._resolve_operand(node.args[0])
-        rhs = self._resolve_operand(node.args[1])
+        """``aten.add.Tensor`` → ``ad.add``. Handles scalar second arg via splat."""
         result_type = _result_type_for_node(node)
+        lhs = self._resolve_operand(node.args[0], block, result_type)
+        rhs = self._resolve_operand(node.args[1], block, result_type)
         op = AdAdd.build(operands=[lhs, rhs], result_types=[result_type])
         block.add_op(op)
         self._value_map[node.name] = op.output
         self._store_meta(node)
-        # Store FX node name so MLIR→FX can reconstruct references
         self.metadata[node.name]["_fx_node_name"] = node.name
 
     def _convert_binary_elementwise(self, node: Node, block: Block, op_cls) -> None:
-        """Generic binary elementwise: two inputs, one output."""
-        lhs = self._resolve_operand(node.args[0])
-        rhs = self._resolve_operand(node.args[1])
+        """Generic binary elementwise: two inputs, one output. Handles scalar args via splat."""
         result_type = _result_type_for_node(node)
+        lhs = self._resolve_operand(node.args[0], block, result_type)
+        rhs = self._resolve_operand(node.args[1], block, result_type)
         op = op_cls.build(operands=[lhs, rhs], result_types=[result_type])
+        block.add_op(op)
+        self._value_map[node.name] = op.output
+        self._store_meta(node)
+        self.metadata[node.name]["_fx_node_name"] = node.name
+
+    def _convert_pow(self, node: Node, block: Block) -> None:
+        """``aten.pow.Tensor_Scalar`` → ``ad.pow``."""
+        base_val = self._resolve_operand(node.args[0])
+        exponent = float(node.args[1])
+        result_type = _result_type_for_node(node)
+        op = AdPow.build(
+            operands=[base_val],
+            attributes={"exponent": FloatAttr(exponent, Float64Type())},
+            result_types=[result_type],
+        )
+        block.add_op(op)
+        self._value_map[node.name] = op.output
+        self._store_meta(node)
+        self.metadata[node.name]["_fx_node_name"] = node.name
+
+    def _convert_mean(self, node: Node, block: Block) -> None:
+        """``aten.mean.dim`` → ``ad.reduce_mean``."""
+        input_val = self._resolve_operand(node.args[0])
+        dims = node.args[1]  # list of ints
+        keepdim = node.args[2] if len(node.args) > 2 else False
+        # We only support single-dim reduction for now
+        dim = dims[0] if isinstance(dims, (list, tuple)) else dims
+        result_type = _result_type_for_node(node)
+        op = AdReduceMean.build(
+            operands=[input_val],
+            attributes={
+                "dim": IntegerAttr(dim, IntegerType(64)),
+                "keepdim": IntegerAttr(1 if keepdim else 0, IntegerType(1)),
+            },
+            result_types=[result_type],
+        )
         block.add_op(op)
         self._value_map[node.name] = op.output
         self._store_meta(node)
@@ -405,8 +447,14 @@ class FXToMLIRConverter:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _resolve_operand(self, arg) -> SSAValue:
-        """Look up the MLIR SSAValue for a given FX node or constant."""
+    def _resolve_operand(self, arg, block: Block = None, result_type=None) -> SSAValue:
+        """Look up the MLIR SSAValue for a given FX node or constant.
+
+        For scalar constants (int, float), emits an ``AdSplat`` op to the given
+        block and returns its result. This enables ``aten.add(tensor, 1e-5)``
+        to lower to ``ad.splat(1e-5) → ad.add(tensor, splat)`` instead of
+        falling through to ``ad.opaque``.
+        """
         if isinstance(arg, Node):
             val = self._value_map.get(arg.name)
             if val is None:
@@ -415,6 +463,16 @@ class FXToMLIRConverter:
                     "This may indicate an unsupported node type or ordering issue."
                 )
             return val
+        if isinstance(arg, (int, float)) and block is not None and result_type is not None:
+            # Scalar constant → emit AdSplat
+            scalar_val = float(arg)
+            splat_type = result_type  # broadcast to match the result shape
+            splat_op = AdSplat.build(
+                attributes={"value": FloatAttr(scalar_val, Float64Type())},
+                result_types=[splat_type],
+            )
+            block.add_op(splat_op)
+            return splat_op.output
         raise TypeError(f"Cannot resolve non-Node operand to SSAValue: {type(arg)}")
 
     def _store_meta(self, node: Node) -> None:
