@@ -69,6 +69,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     KVPagedResourceHandler,
     MHACallable,
@@ -352,7 +353,6 @@ _GlobalTrtllmMLAPlanner = _TrtllmMLAPlanner()
 
 def prepare_trtllm_mla_metadata_host(
     batch_info_host: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     seq_len_with_cache_host: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_host: torch.Tensor,
@@ -362,8 +362,11 @@ def prepare_trtllm_mla_metadata_host(
     Runs OUTSIDE the CUDA graph before every forward (including replays).
     Mirrors ``prepare_trtllm_metadata_host`` from the standard trtllm backend.
     """
-    num_prefill, _, num_decode = batch_info_host.tolist()
-    max_context_length, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, _, num_decode = batch_info.get_absorbed_info()
+    max_context_length = batch_info.get_max_context_length()
+    max_blocks_per_seq = batch_info.get_max_blocks_per_seq()
+    max_batch_size = batch_info.get_max_batch_size()
 
     _GlobalTrtllmMLAPlanner.reset(torch.device("cuda"), max_batch_size, max_blocks_per_seq)
 
@@ -385,7 +388,6 @@ def prepare_trtllm_mla_metadata_host(
 @torch.library.custom_op("auto_deploy::trtllm_mla_prepare_metadata", mutates_args=())
 def prepare_trtllm_mla_metadata(
     batch_info_host: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
 ) -> List[torch.Tensor]:
@@ -395,9 +397,10 @@ def prepare_trtllm_mla_metadata(
     ``block_ids_per_seq`` on the GPU, then derives ``block_offsets``.
     Returns ``[block_offsets]`` which flows through the graph to each attention op.
     """
-    num_prefill, _, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, _, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
-    _, _, block_offset_multiplier, _ = max_seq_info_host.tolist()
+    block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
     _GlobalTrtllmMLAPlanner.plan_device(
         num_seq=num_seq,
@@ -412,12 +415,13 @@ def prepare_trtllm_mla_metadata(
 @prepare_trtllm_mla_metadata.register_fake
 def prepare_trtllm_mla_metadata_fake(
     batch_info_host: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
-    _, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    max_blocks_per_seq = batch_info.get_max_blocks_per_seq()
+    max_batch_size = batch_info.get_max_batch_size()
     return [
         torch.empty(
             1, max_batch_size, 2, max_blocks_per_seq, dtype=torch.int32, device=cache_loc.device
@@ -989,7 +993,6 @@ def _mla_with_cache_impl(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     kv_cache_block_offsets: torch.Tensor,
     kv_cache: torch.Tensor,
     scale: Optional[float],
@@ -1021,11 +1024,12 @@ def _mla_with_cache_impl(
     kv_head_dim = out_features // num_heads
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
-    max_context_length = int(max_seq_info_host[0])
-    max_num_requests = int(max_seq_info_host[3])
+    max_context_length = batch_info.get_max_context_length()
+    max_num_requests = batch_info.get_max_batch_size()
 
     if scale is None:
         scale = 1.0 / math.sqrt(qk_head_dim)
@@ -1278,11 +1282,10 @@ def trtllm_mla_with_cache(
     compressed_kv: torch.Tensor,
     kpe: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
-    # Standard metadata (4 args — matches trtllm attention pattern)
+    # Standard metadata (3 args — matches trtllm attention pattern)
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     # Extra metadata from prepare_trtllm_mla_metadata (1 arg)
     kv_cache_block_offsets: torch.Tensor,
     # Cache
@@ -1302,7 +1305,6 @@ def trtllm_mla_with_cache(
         batch_info_host,
         seq_len,
         seq_len_with_cache,
-        max_seq_info_host,
         kv_cache_block_offsets,
         kv_cache,
         scale,
@@ -1321,7 +1323,6 @@ def trtllm_mla_with_cache_fake(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     kv_cache_block_offsets: torch.Tensor,
     kv_cache: torch.Tensor,
     scale: Optional[float],
@@ -1342,11 +1343,10 @@ def trtllm_mla_fused_rope_with_cache(
     kpe: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
     rotary_cos_sin: torch.Tensor,
-    # Standard metadata (4 args — matches trtllm attention pattern)
+    # Standard metadata (3 args — matches trtllm attention pattern)
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     # Extra metadata from prepare_trtllm_mla_metadata (1 arg)
     kv_cache_block_offsets: torch.Tensor,
     # Cache
@@ -1366,7 +1366,6 @@ def trtllm_mla_fused_rope_with_cache(
         batch_info_host,
         seq_len,
         seq_len_with_cache,
-        max_seq_info_host,
         kv_cache_block_offsets,
         kv_cache,
         scale,
@@ -1387,7 +1386,6 @@ def trtllm_mla_fused_rope_with_cache_fake(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     kv_cache_block_offsets: torch.Tensor,
     kv_cache: torch.Tensor,
     scale: Optional[float],
@@ -1433,7 +1431,6 @@ class TrtllmMLAAttention(AttentionDescriptor):
             "batch_info_host",
             "seq_len",
             "seq_len_with_cache",
-            "max_seq_info_host",
         ]
 
     @classmethod

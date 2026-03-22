@@ -213,7 +213,7 @@ class _InsertCachedOperator(BaseTransform):
             # (which is cached by layer_idx) rather than sharing one across
             # all layers.
             if hasattr(attn_descriptor, "needs_layer_idx") and attn_descriptor.needs_layer_idx():
-                constants = list(constants) + [idx]
+                constants = list(constants) + [num_cached_attn_replacements]
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
