@@ -1,3 +1,4 @@
+# Config to be used for long context low concurrency
 runtime: trtllm
 compile_backend: torch-cudagraph
 attn_backend: trtllm
@@ -22,9 +23,10 @@ transforms:
   fuse_nvfp4_moe:
     backend: trtllm_gen
   detect_sharding:
-    allreduce_strategy: SYMM_MEM
     dist_mapping: {moe_tp: 8, moe_ep: 1}
+    allreduce_strategy: SYMM_MEM
     shard_all_unprocessed: true
+    simple_shard_filter: "lm_head"
   multi_stream_moe:
     stage: compile
     enabled: true
