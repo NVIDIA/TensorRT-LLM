@@ -51,6 +51,7 @@ _EMIT = {
     "ad.mul": lambda a, b: f"({a} * {b})",
     "ad.sub": lambda a, b: f"({a} - {b})",
     "ad.neg": lambda a: f"(-{a})",
+    "ad.pow": None,  # handled specially — needs attribute extraction for exponent
     "ad.rsqrt": (lambda a: f"(1.0 / tl.sqrt({a}.to(tl.float32))).to({a}.dtype)"),
     "ad.sqrt": lambda a: f"tl.sqrt({a})",
     "ad.silu": (lambda a: f"({a} * tl.sigmoid({a}.to(tl.float32))).to({a}.dtype)"),
@@ -182,6 +183,23 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             for r in op.results:
                 val_names[id(r)] = result_name
 
+        elif op_name == "ad.pow":
+            # pow(base, exponent) — exponent is an attribute, not an operand
+            base_val = op.operands[0]
+            base_name = val_names[id(base_val)]
+            exp_attr = op.attributes["exponent"]
+            if isinstance(exp_attr, FloatAttr):
+                exp_val = exp_attr.value.data
+            else:
+                exp_val = float(str(exp_attr))
+            result_name = f"t{temp_counter}"
+            body_lines.append(
+                f"    {result_name} = tl.math.pow({base_name}.to(tl.float32), {exp_val}).to({base_name}.dtype)"
+            )
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
         elif op_name == "ad.reduce_mean":
             # reduce_mean(input, ncols)
             input_val = op.operands[0]
@@ -231,7 +249,12 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     # Store all subgraph outputs
     for i, out in enumerate(subgraph.outputs):
         out_name = val_names[id(out)]
-        body_lines.append(f"    tl.store(out{i}_ptr + row_off + offs, {out_name}, mask=mask)")
+        out_rank = _get_tensor_rank(out)
+        if out_rank < max_rank:
+            # Scalar-like output (from reduction) — store one value per row
+            body_lines.append(f"    tl.store(out{i}_ptr + pid, {out_name})")
+        else:
+            body_lines.append(f"    tl.store(out{i}_ptr + row_off + offs, {out_name}, mask=mask)")
 
     # Build parameter lists
     in_ptr_params = [f"in{i}_ptr" for i in range(n_inputs)]
@@ -357,14 +380,14 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     # Build a wrapper that calls via torch.ops
     op_short_name = f"mlir_fused_{sg_hash}"
 
-    def make_wrapper(name, n_in):
+    def make_wrapper(name):
         def wrapper(*args):
             op_fn = getattr(torch.ops.auto_deploy, name)
             return op_fn(*args)
 
         return wrapper
 
-    wrapper = make_wrapper(op_short_name, n_inputs)
+    wrapper = make_wrapper(op_short_name)
 
     _generated_op_cache[cache_key] = wrapper
     _kernel_cache.put(sg_hash, wrapper)

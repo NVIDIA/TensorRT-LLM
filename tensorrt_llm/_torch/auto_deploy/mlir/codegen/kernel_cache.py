@@ -35,11 +35,20 @@ class KernelCache:
 
     @staticmethod
     def hash_subgraph(subgraph) -> str:
-        """Compute a stable hash from op types + connectivity + dtypes."""
+        """Compute a stable hash from op types + operand connectivity + dtypes."""
+        op_index = {id(op): i for i, op in enumerate(subgraph.ops)}
+        input_index = {id(inp): i for i, inp in enumerate(subgraph.inputs)}
         parts = []
         for op in subgraph.ops:
             parts.append(op.name)
-            parts.append(str(len(op.operands)))
+            for operand in op.operands:
+                owner = operand.owner
+                if id(owner) in op_index:
+                    parts.append(f"op{op_index[id(owner)]}")
+                elif id(operand) in input_index:
+                    parts.append(f"in{input_index[id(operand)]}")
+                else:
+                    parts.append("ext")
             for r in op.results:
                 parts.append(str(r.type))
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
