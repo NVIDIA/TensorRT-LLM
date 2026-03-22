@@ -35,8 +35,12 @@ from tensorrt_llm._torch.auto_deploy.mlir.dialect import (  # noqa: E402
     AdFusedAddRMSNorm,
     AdGraphInput,
     AdGraphOutput,
+    AdMul,
     AdOpaque,
+    AdReduceMean,
     AdRMSNorm,
+    AdSilu,
+    AdSplat,
     Float8E4M3FNType,
     Float8E5M2Type,
     register_ad_dialect,
@@ -235,3 +239,81 @@ def test_build_complete_ir():
     assert ops[0].name == "ad.add"
     assert ops[1].name == "ad.rmsnorm"
     assert ops[2].name == "ad.graph_output"
+
+
+def test_ad_mul_construction():
+    """Verify ad.mul op can be constructed with proper operands and result."""
+    t = TensorType(BFloat16Type(), [2, 8, 128])
+    block = Block()
+    lhs = block.insert_arg(t, 0)
+    rhs = block.insert_arg(t, 1)
+    op = AdMul.build(operands=[lhs, rhs], result_types=[t])
+    block.add_op(op)
+    assert op.name == "ad.mul"
+
+
+def test_ad_reduce_mean_construction():
+    """Verify ad.reduce_mean op with dim and keepdim attributes."""
+    from xdsl.dialects.builtin import IntegerAttr  # noqa: E402
+
+    t = TensorType(BFloat16Type(), [2, 8, 128])
+    t_reduced = TensorType(BFloat16Type(), [2, 8, 1])
+    block = Block()
+    inp = block.insert_arg(t, 0)
+    op = AdReduceMean.build(
+        operands=[inp],
+        attributes={
+            "dim": IntegerAttr(-1, IntegerType(64)),
+            "keepdim": IntegerAttr(1, IntegerType(1)),
+        },
+        result_types=[t_reduced],
+    )
+    block.add_op(op)
+    assert op.name == "ad.reduce_mean"
+
+
+def test_ad_silu_construction():
+    """Verify ad.silu op can be constructed."""
+    t = TensorType(BFloat16Type(), [2, 8, 128])
+    block = Block()
+    inp = block.insert_arg(t, 0)
+    op = AdSilu.build(operands=[inp], result_types=[t])
+    block.add_op(op)
+    assert op.name == "ad.silu"
+
+
+def test_ad_splat_construction():
+    """Verify ad.splat op with value attribute and no operands."""
+    t = TensorType(BFloat16Type(), [1])
+    block = Block()
+    op = AdSplat.build(
+        attributes={"value": FloatAttr(1e-5, Float64Type())},
+        result_types=[t],
+    )
+    block.add_op(op)
+    assert op.name == "ad.splat"
+
+
+def test_all_primitive_ops_registered():
+    """Verify all 14 primitive ops are registered in the ad dialect."""
+    from xdsl.context import Context as MLContext
+
+    ctx = MLContext()
+    register_ad_dialect(ctx)
+    for name in [
+        "ad.mul",
+        "ad.sub",
+        "ad.neg",
+        "ad.pow",
+        "ad.rsqrt",
+        "ad.sqrt",
+        "ad.silu",
+        "ad.gelu",
+        "ad.relu",
+        "ad.tanh",
+        "ad.reduce_sum",
+        "ad.reduce_mean",
+        "ad.cast",
+        "ad.splat",
+    ]:
+        assert ctx.get_optional_op(name) is not None, f"{name} not registered"

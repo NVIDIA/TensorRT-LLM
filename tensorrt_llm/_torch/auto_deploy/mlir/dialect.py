@@ -26,6 +26,12 @@ Ops:
     - ``ad.fused_add_rmsnorm``: Fused add+rmsnorm returning ``(norm, add)``
     - ``ad.opaque``: Catch-all for unmodeled FX ops
     - ``ad.graph_input`` / ``ad.graph_output``: Graph boundaries
+    - ``ad.mul``, ``ad.sub``, ``ad.neg``: Elementwise arithmetic primitives
+    - ``ad.pow``, ``ad.rsqrt``, ``ad.sqrt``: Power/root primitives
+    - ``ad.silu``, ``ad.gelu``, ``ad.relu``, ``ad.tanh``: Activation primitives
+    - ``ad.reduce_sum``, ``ad.reduce_mean``: Reduction primitives
+    - ``ad.cast``: Dtype cast primitive
+    - ``ad.splat``: Constant scalar splat
 """
 
 import torch
@@ -233,6 +239,145 @@ class AdGraphOutput(IRDLOperation):
 
 
 # ---------------------------------------------------------------------------
+# Primitive ops for elementwise fusion
+# ---------------------------------------------------------------------------
+
+
+@irdl_op_definition
+class AdMul(IRDLOperation):
+    """Elementwise multiplication — mirrors ``aten.mul.Tensor``."""
+
+    name = "ad.mul"
+    lhs = operand_def(AnyAttr())
+    rhs = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdSub(IRDLOperation):
+    """Elementwise subtraction — mirrors ``aten.sub.Tensor``."""
+
+    name = "ad.sub"
+    lhs = operand_def(AnyAttr())
+    rhs = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdNeg(IRDLOperation):
+    """Elementwise negation — mirrors ``aten.neg``."""
+
+    name = "ad.neg"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdPow(IRDLOperation):
+    """Elementwise power — mirrors ``aten.pow.Tensor_Scalar``."""
+
+    name = "ad.pow"
+    base = operand_def(AnyAttr())
+    exponent = attr_def(FloatAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdRsqrt(IRDLOperation):
+    """Elementwise reciprocal square root — mirrors ``aten.rsqrt``."""
+
+    name = "ad.rsqrt"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdSqrt(IRDLOperation):
+    """Elementwise square root — mirrors ``aten.sqrt``."""
+
+    name = "ad.sqrt"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdSilu(IRDLOperation):
+    """SiLU activation — mirrors ``aten.silu``."""
+
+    name = "ad.silu"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdGelu(IRDLOperation):
+    """GELU activation — mirrors ``aten.gelu``."""
+
+    name = "ad.gelu"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdRelu(IRDLOperation):
+    """ReLU activation — mirrors ``aten.relu``."""
+
+    name = "ad.relu"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdTanh(IRDLOperation):
+    """Tanh activation — mirrors ``aten.tanh``."""
+
+    name = "ad.tanh"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdReduceSum(IRDLOperation):
+    """Reduction sum along a dimension — mirrors ``aten.sum.dim_IntList``."""
+
+    name = "ad.reduce_sum"
+    input = operand_def(AnyAttr())
+    dim = attr_def(IntegerAttr)
+    keepdim = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdReduceMean(IRDLOperation):
+    """Reduction mean along a dimension — mirrors ``aten.mean.dim``."""
+
+    name = "ad.reduce_mean"
+    input = operand_def(AnyAttr())
+    dim = attr_def(IntegerAttr)
+    keepdim = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdCast(IRDLOperation):
+    """Dtype cast — mirrors ``aten.to.dtype`` as a primitive op."""
+
+    name = "ad.cast"
+    input = operand_def(AnyAttr())
+    target_dtype = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdSplat(IRDLOperation):
+    """Constant splat — creates a tensor filled with a scalar value."""
+
+    name = "ad.splat"
+    value = attr_def(FloatAttr)
+    output = result_def(AnyAttr())
+
+
+# ---------------------------------------------------------------------------
 # Dialect registration
 # ---------------------------------------------------------------------------
 
@@ -244,6 +389,20 @@ AD_OPS = [
     AdOpaque,
     AdGraphInput,
     AdGraphOutput,
+    AdMul,
+    AdSub,
+    AdNeg,
+    AdPow,
+    AdRsqrt,
+    AdSqrt,
+    AdSilu,
+    AdGelu,
+    AdRelu,
+    AdTanh,
+    AdReduceSum,
+    AdReduceMean,
+    AdCast,
+    AdSplat,
 ]
 
 
