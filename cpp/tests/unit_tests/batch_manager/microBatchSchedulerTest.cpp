@@ -948,6 +948,55 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextFCFS_OverBudgetM
     EXPECT_EQ(req2->getContextChunkSize(), 0) << "req2: budget exhausted, chunk = 0";
 }
 
+TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextEqualProgress)
+{
+    // Test compute-aware budget tracking in EQUAL_PROGRESS with reusable tokens.
+    //
+    // Setup: 2 requests, promptLen=15, reusable=10, compute budget=3, chunkUnit=1.
+    //
+    // In EQUAL_PROGRESS, chunks grow by 1 per request per iteration. Reusable tokens
+    // do not consume forward-pass capacity, so the budget is only charged for tokens
+    // beyond the reusable prefix.
+    //
+    // Expected (compute-aware EQUAL_PROGRESS):
+    //   Tokens 0-10 are "free" (all cached). Budget is only consumed for tokens > 10.
+    //   req0: chunk=12 (model cost = 12-10 = 2)
+    //   req1: chunk=11 (model cost = 11-10 = 1)
+    //   total compute = 3 = budget (fully utilised).
+    //
+    // Bug (raw-token EQUAL_PROGRESS): chunks capped at 2 and 1 (budget fully consumed
+    //   after the very first two tokens, ignoring reusable credits).
+    constexpr SizeType32 maxNumTokens = 3;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 chunkUnitSize = 1;
+    constexpr SizeType32 reusableTokens = 10;
+    constexpr SizeType32 promptLen = 15;
+    constexpr SizeType32 maxNewTokens = 5;
+    constexpr ContextChunkingPolicy ctxChunkPolicy{ContextChunkingPolicy::kEQUAL_PROGRESS};
+
+    mNumContexts = 2;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler
+        = std::make_shared<MicroBatchScheduler>(ContextChunkingConfig{ctxChunkPolicy, chunkUnitSize}, std::nullopt);
+
+    RequestVector activeRequests;
+    auto req0 = createRequest(promptLen, maxNewTokens, 0);
+    auto req1 = createRequest(promptLen, maxNewTokens, 1);
+    req0->setEstimatedReusableTokens(reusableTokens);
+    req1->setEstimatedReusableTokens(reusableTokens);
+    activeRequests.push_back(req0);
+    activeRequests.push_back(req1);
+
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    EXPECT_EQ(ctx.size(), 2u) << "Both requests should be scheduled";
+
+    // req0 gets one extra unit over req1 due to equal-progress ordering.
+    EXPECT_EQ(req0->getContextChunkSize(), 12) << "req0: reusable(10) + 2 compute tokens = chunk 12";
+    EXPECT_EQ(req1->getContextChunkSize(), 11) << "req1: reusable(10) + 1 compute token = chunk 11";
+}
+
 TEST_F(MicroBatchSchedulerTest, ReusableTokensZeroHasNoEffect)
 {
     // Verify that zero reusable tokens (the default) produces identical scheduling
@@ -976,6 +1025,147 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensZeroHasNoEffect)
     // 10 tokens fits, but 10 + 10 = 20 > 12, so only 1 context request scheduled
     EXPECT_EQ(ctx.size(), 1);
     EXPECT_EQ(gen.size(), 0);
+}
+
+TEST_F(MicroBatchSchedulerTest, ReusableTokensNoChunkingMinCostIsOne)
+{
+    // Test (no-chunking path) that the compute cost of a context request is floored at 1
+    // even when the number of reusable tokens exceeds the prompt length.
+    //
+    // req0: promptLen=10, reusable=15 → compute = max(1, 10-15) = 1
+    // req1: promptLen=10, reusable=0  → compute = 10
+    // maxNumTokens=10: req0 costs 1 token of compute; adding req1 would bring the total
+    // to 11 which exceeds the budget → req1 is not scheduled.
+    //
+    // Python ref: test_reusable_tokens_no_chunking_min_cost_is_one
+    constexpr SizeType32 maxNumTokens = 10;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr int32_t promptLen = 10;
+    constexpr int32_t maxNewTokens = 5;
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler = std::make_shared<MicroBatchScheduler>(); // no chunking
+
+    auto req0 = createRequest(promptLen, maxNewTokens, 0);
+    auto req1 = createRequest(promptLen, maxNewTokens, 1);
+    req0->setEstimatedReusableTokens(15); // exceeds promptLen
+
+    RequestVector activeRequests = {req0, req1};
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    EXPECT_EQ(ctx.size(), 1u) << "req0 costs 1 compute (floored), req1 costs 10; only req0 fits";
+    EXPECT_EQ(ctx.at(0)->mRequestId, 0u) << "req0 should be the scheduled request";
+    EXPECT_EQ(gen.size(), 0u);
+}
+
+TEST_F(MicroBatchSchedulerTest, BeamWidthMismatchSkipped)
+{
+    // Test that generation requests whose beam width differs from the first scheduled
+    // generation request are skipped for that step.
+    //
+    // req0: BW=1 (scheduled), req1: BW=4 (skipped), req2: BW=1 (scheduled alongside req0).
+    //
+    // Python ref: test_beam_width_mismatch_skipped
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr int32_t promptLen = 2;
+    constexpr int32_t maxNewTokens = 5;
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler = std::make_shared<MicroBatchScheduler>();
+
+    // Helper: manually advance a context request to generation state.
+    auto advanceToGeneration = [](std::shared_ptr<LlmRequest> req)
+    {
+        req->setContextChunkSize(req->getContextRemainingLength());
+        req->moveToNextContextChunk();
+        req->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+        req->addNewTokens({42});
+    };
+
+    auto req0 = createRequest(promptLen, maxNewTokens, 0, /*beamWidth=*/1);
+    auto req1 = createRequest(promptLen, maxNewTokens, 1, /*beamWidth=*/4);
+    auto req2 = createRequest(promptLen, maxNewTokens, 2, /*beamWidth=*/1);
+    advanceToGeneration(req0);
+    advanceToGeneration(req1);
+    advanceToGeneration(req2);
+
+    RequestVector activeRequests = {req0, req1, req2};
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, std::nullopt);
+
+    EXPECT_EQ(gen.size(), 2u) << "req0 and req2 (BW=1) scheduled; req1 (BW=4) skipped";
+    EXPECT_EQ(gen.at(0)->mRequestId, 0u);
+    EXPECT_EQ(gen.at(1)->mRequestId, 2u);
+    EXPECT_EQ(ctx.size(), 0u);
+}
+
+TEST_F(MicroBatchSchedulerTest, InflightRequestsExcluded)
+{
+    // Test that requests already tracked in inflightReqIds are not re-scheduled.
+    // This guards the 2-micro-batch overlap mechanism: when requests from micro-batch
+    // slot 0 are inflight, the scheduler must not pick them up for slot 1.
+    //
+    // Python ref: test_inflight_requests_excluded
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr int32_t promptLen = 10;
+    constexpr int32_t maxNewTokens = 5;
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler = std::make_shared<MicroBatchScheduler>();
+
+    RequestVector activeRequests;
+    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 0));
+    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 1));
+    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 2));
+
+    // Mark requests 0 and 2 as inflight — only request 1 should be scheduled.
+    ReqIdsSet inflightReqIds = {0, 2};
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, std::nullopt);
+
+    EXPECT_EQ(ctx.size(), 1u) << "Only req1 (not inflight) should be scheduled";
+    EXPECT_EQ(ctx.at(0)->mRequestId, 1u);
+    EXPECT_EQ(gen.size(), 0u);
+}
+
+TEST_F(MicroBatchSchedulerTest, ChunkSizeZeroNotScheduled)
+{
+    // Test that context requests whose chunk_size remains 0 after the chunking step
+    // are excluded from the scheduled output.
+    //
+    // Setup: budget=5, chunkUnit=5, EQUAL_PROGRESS, 2 requests with promptLen=20.
+    // On the first scheduling step EQUAL_PROGRESS distributes one unit at a time;
+    // with budget=5 only one request receives chunk=5 while the other stays at 0.
+    // The zero-chunk request must not appear in the context output.
+    //
+    // Python ref: test_chunk_size_zero_not_scheduled
+    constexpr SizeType32 maxNumTokens = 5;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 chunkUnitSize = 5;
+    constexpr ContextChunkingPolicy ctxChunkPolicy{ContextChunkingPolicy::kEQUAL_PROGRESS};
+    constexpr int32_t promptLen = 20;
+    constexpr int32_t maxNewTokens = 5;
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler
+        = std::make_shared<MicroBatchScheduler>(ContextChunkingConfig{ctxChunkPolicy, chunkUnitSize}, std::nullopt);
+
+    RequestVector activeRequests;
+    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 0));
+    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 1));
+
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    for (auto const& req : ctx)
+    {
+        EXPECT_GT(req->getContextChunkSize(), 0) << "Requests with chunk_size=0 must not appear in output";
+    }
+    EXPECT_EQ(ctx.size(), 1u) << "Only the request that received chunk=5 should be scheduled";
 }
 
 ////

@@ -493,6 +493,52 @@ class TestPyMicroBatchSchedulerBasic:
         assert len(ctx2) == 1
         assert ctx2[0].context_chunk_size <= 12
 
+    def test_simple_with_overlap(self):
+        """
+        2-micro-batch overlap: with max_batch_size=2 and 4 context requests,
+        the inflight mechanism ensures alternating pairs of requests are scheduled
+        in successive steps, mimicking the 2-slot pipeline in C++.
+
+        Step 1: no inflight     → req0, req1 scheduled (slot 0)
+        Step 2: {0,1} inflight  → req2, req3 scheduled (slot 1)
+        Step 3: {2,3} inflight  → req0, req1 scheduled again (slot 0 freed)
+
+        C++ ref: SimpleWithOverlap
+        """
+        scheduler = PyMicroBatchScheduler(max_batch_size=2, max_num_tokens=None)
+        requests = [make_context_request(i, prompt_len=10) for i in range(4)]
+
+        # Step 1: slot 0 — req0, req1 scheduled
+        ctx0, _ = scheduler.schedule(requests, set())
+        assert {r.request_id for r in ctx0} == {0, 1}
+        slot0_inflight = {r.request_id for r in ctx0}
+
+        # Step 2: slot 1 — req0/req1 still inflight, req2/req3 scheduled
+        ctx1, _ = scheduler.schedule(requests, slot0_inflight)
+        assert {r.request_id for r in ctx1} == {2, 3}
+        slot1_inflight = {r.request_id for r in ctx1}
+
+        # Step 3: slot 0 freed (inflight = slot1 only) — req0/req1 scheduled again
+        ctx2, _ = scheduler.schedule(requests, slot1_inflight)
+        assert {r.request_id for r in ctx2} == {0, 1}
+
+    def test_gen_draft_tokens_max_num_tokens(self):
+        """
+        Draft tokens in generation phase reduce batch size when maxNumTokens is tight.
+        Each gen request costs beam_width + num_draft_tokens = 1 + 63 = 64 tokens.
+        With maxNumTokens=128, only 2 of the 4 gen requests fit (2*64=128).
+
+        C++ ref: GenDraftTokensMaxNumTokens
+        """
+        scheduler = PyMicroBatchScheduler(max_batch_size=64, max_num_tokens=128)
+        requests = [make_generation_request(i, beam_width=1, draft_tokens_len=63) for i in range(4)]
+        ctx, gen = scheduler.schedule(requests, set())
+        # Each request costs 1 + 63 = 64 tokens; 2 fit (128 = budget), 3 don't (192 > 128).
+        assert len(gen) == 2
+        assert gen[0].request_id == 0
+        assert gen[1].request_id == 1
+        assert len(ctx) == 0
+
 
 # ############################################################################
 #
@@ -927,6 +973,92 @@ class TestPyMicroBatchSchedulerReusableTokens:
         # req0 compute = 1; req1 compute = 10; 1 + 10 = 11 > 10 → only req0 fits.
         assert len(ctx) == 1
         assert ctx[0].request_id == 0
+
+    def test_reusable_tokens_fcfs_over_budget_multi_request(self):
+        """
+        FCFS compute-aware scheduling with multiple requests exceeding the compute budget.
+        C++ ref: ReusableTokensWithChunkedContextFCFS_OverBudgetMultiRequest
+
+        Setup: 3 requests, prompt_len=15, reusable=8, compute budget=20, chunk_unit=1.
+        Note: In PyMicroBatchScheduler, max_context_length = max_num_tokens = 20, so
+        prompt_len=15 keeps chunk sizes within the max_context_length limit.
+        Total compute if all scheduled in full: 3 * (15 - 8) = 21 > 20 → chunking exercised.
+
+        The model processes min(chunk_size, P - reusable) tokens from position reusable,
+        where P = context_remaining_length = 15 (full prompt on first chunk).
+
+        Expected (compute-aware FCFS):
+          req0: full context fits (compute=7 <= 20); chunk=15; budget 20→13
+          req1: full context fits (compute=7 <= 13); chunk=15; budget 13→6
+          req2: compute=7 > 6 → chunk=6 (remaining capacity); budget→0
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=1)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=4, max_num_tokens=20, ctx_chunk_config=config
+        )
+        req0 = make_context_request(0, prompt_len=15)
+        req1 = make_context_request(1, prompt_len=15)
+        req2 = make_context_request(2, prompt_len=15)
+        req0.estimated_reusable_tokens = 8
+        req1.estimated_reusable_tokens = 8
+        req2.estimated_reusable_tokens = 8
+
+        ctx, gen = scheduler.schedule([req0, req1, req2], set())
+
+        # Note: ctx is sorted — partially-chunked requests come before full-context ones.
+        # Look up by request_id rather than by position.
+        chunks = {r.request_id: r.context_chunk_size for r in ctx}
+        assert len(ctx) == 3, "All three requests should be scheduled"
+        assert chunks[0] == 15, "req0: full context (compute=7, budget 20→13)"
+        assert chunks[1] == 15, "req1: full context (compute=7, budget 13→6)"
+        assert chunks[2] == 6, "req2: chunk=6 (remaining capacity)"
+
+    def test_reusable_tokens_equal_progress(self):
+        """
+        EQUAL_PROGRESS compute-aware budget tracking with reusable tokens.
+        C++ ref: ReusableTokensWithChunkedContextEqualProgress
+
+        Note: In PyMicroBatchScheduler, max_context_length = max_num_tokens, so
+        individual chunk sizes are capped at max_num_tokens. Parameters are chosen
+        so the reusable prefix is smaller than max_num_tokens, allowing the
+        compute-aware path to produce noticeably larger chunks than the raw path.
+
+        Setup: 3 requests, prompt_len=15, reusable=5, compute budget=8, chunk_unit=1.
+        max_context_length = max_num_tokens = 8 (caps individual chunk sizes at 8).
+        Total compute if all scheduled in full: 3 * (15 - 5) = 30 > 8 → chunking exercised.
+
+        Reusable tokens 0-4 are "free" (compute_increment = 0 until chunk > 5).
+        Budget is only consumed for tokens beyond the reusable prefix.
+
+        This test validates the loop-termination fix: num_tokens_single_loop must use
+        the raw chunk increment (not compute_increment). With the bug, the loop exits
+        on the very first iteration because compute_increment=0 for all reqs → loops
+        terminates at chunk=1. With the fix, the loop continues until the compute
+        budget is exhausted or max_context_length is reached.
+
+        Expected (compute-aware EQUAL_PROGRESS):
+          req0: chunk=8  (model cost = 8 - 5 = 3)
+          req1: chunk=8  (model cost = 3)
+          req2: chunk=7  (model cost = 7 - 5 = 2; total compute 3+3+2=8 = budget)
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=1)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=4, max_num_tokens=8, ctx_chunk_config=config
+        )
+        req0 = make_context_request(0, prompt_len=15)
+        req1 = make_context_request(1, prompt_len=15)
+        req2 = make_context_request(2, prompt_len=15)
+        req0.estimated_reusable_tokens = 5
+        req1.estimated_reusable_tokens = 5
+        req2.estimated_reusable_tokens = 5
+
+        ctx, gen = scheduler.schedule([req0, req1, req2], set())
+
+        chunks = {r.request_id: r.context_chunk_size for r in ctx}
+        assert len(ctx) == 3, "All three requests should be scheduled"
+        assert chunks[0] == 8, "req0: reusable(5) + 3 compute tokens = 8"
+        assert chunks[1] == 8, "req1: reusable(5) + 3 compute tokens = 8"
+        assert chunks[2] == 7, "req2: reusable(5) + 2 compute tokens = 7"
 
 
 # ############################################################################

@@ -583,7 +583,11 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         requests: RequestList,
         capacity: Optional[int],
     ):
-        # C++: Resets all chunk sizes to 0 at start
+        """
+        Mirrors MicroBatchScheduler::setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        Structure: reset all chunk sizes to 0, dispatch to policy, then trim draft tokens.
+        """
         for req in requests:
             req.context_chunk_size = 0
 
@@ -600,7 +604,16 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self._fit_draft_tokens(requests, capacity, unit_size)
 
     def _chunk_equal_progress(self, requests: RequestList, capacity: Optional[int], unit_size: int):
-        # capacity is a compute-token budget (non-reusable only). Track compute tokens, not including reusable tokens.
+        """
+        Mirrors the kEQUAL_PROGRESS specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        All requests advance in lock-step: each while-loop iteration offers every request one
+        additional unit_size worth of tokens, until the compute budget (capacity) is exhausted
+        or no request can make further progress.
+
+        capacity is a compute-token budget (non-reusable only). Tokens covered by the reusable
+        KV-cache prefix are not charged against it.
+        """
         num_compute_tokens = 0
         num_tokens_single_loop = 1
 
@@ -613,20 +626,25 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 # C++ logic: suggested = past + unit
                 suggested_size = past_size + unit_size
 
-                # Ensure we don't exceed what the request actually needs
+                # In C++, setContextChunkSize() clamps to getContextRemainingLength() internally.
+                # Python's setter does not clamp, so we replicate that clamp here explicitly.
                 remaining_total = req.context_remaining_length
                 suggested_size = min(suggested_size, remaining_total)
 
                 req.context_chunk_size = suggested_size
 
+                # In C++, getContextChunkSize() is called after the setter to observe the
+                # clamped value. In Python the setter does not re-clamp, so actual_size ==
+                # suggested_size; the readback is kept for structural symmetry with C++.
                 actual_size = req.context_chunk_size
+
                 # Compute the compute-token increment (reusable tokens don't consume budget).
                 reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
                 past_compute = max(0, past_size - min(reusable, past_size))
                 actual_compute = max(0, actual_size - min(reusable, actual_size))
                 compute_increment = actual_compute - past_compute
 
-                # Check Constraints
+                # Check Constraints — mirrors the if-block guard in C++ before numCtxTokens +=
                 # 1. Capacity (in compute tokens)
                 if capacity is not None and (num_compute_tokens + compute_increment > capacity):
                     req.context_chunk_size = past_size  # Revert
@@ -638,7 +656,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     continue
 
                 num_compute_tokens += compute_increment
-                num_tokens_single_loop += compute_increment
+                # Keep raw increment (actual_size - past_size) including reusable tokens for loop-termination detection,
+                # not compute_increment.
+                num_tokens_single_loop += actual_size - past_size
 
     def _chunk_fcfs(
         self,
@@ -646,13 +666,19 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         capacity: Optional[int],
         unit_size: int,
     ):
-        # capacity represents the COMPUTE budget (non-reusable tokens).
-        # Reusable tokens are "free" — they don't consume forward-pass compute.
+        """Mirrors the kFIRST_COME_FIRST_SERVED specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        Requests are processed in order; each greedily claims as much of the remaining compute
+        budget as possible before the next request is considered — hence "first come, first served".
+
+        capacity represents the COMPUTE budget (non-reusable tokens).
+        Reusable tokens are "free" — they don't consume forward-pass compute.
+        """
         current_compute_capacity = capacity if capacity is not None else float("inf")
 
         for req in requests:
             suggested_size = req.context_remaining_length
-            # Only the first context chunk can reuse cached KV blocks
+            # Only the first context chunk can reuse cached KV blocks;
             # subsequent chunks must compute all remaining tokens.
             reusable = min(
                 req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
@@ -660,36 +686,40 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             )
             compute_cost = suggested_size - reusable
 
-            # Start with full context as the allocation target
+            # Start with full context as the allocation target.
             actual_size = suggested_size
 
-            # Limit by compute capacity (reusable tokens are free)
+            # Constraint 1: compute capacity.
             if current_compute_capacity < compute_cost:
-                # Model processes min(chunk_size, P - reusable) tokens from position reusable.
-                # To keep model tokens within budget: chunk_size = capacity (not reusable + capacity).
+                # Model processes min(chunk_size, P - reusable) tokens from position reusable,
+                # where P = suggested_size = context_remaining_length (full prompt on first chunk).
+                # To keep model tokens within budget: chunk_size = capacity (not reusable + capacity),
                 actual_size = int(current_compute_capacity)
 
-            # Limit by max_context_length (applies to compute portion only)
+            # Constraint 2: max_context_length (applies to compute portion only).
             if self.max_context_length is not None:
                 actual_compute = max(0, actual_size - reusable)
                 if actual_compute > self.max_context_length:
                     actual_size = reusable + self.max_context_length
                     actual_size = min(actual_size, suggested_size)
 
-            # Round down to unit size if we had to truncate
+            # Align down to unit_size when either constraint trimmed the chunk, to avoid
+            # KV-cache fragmentation.
             if actual_size < suggested_size:
                 actual_size = (int(actual_size) // unit_size) * unit_size
 
             req.context_chunk_size = int(actual_size)
 
-            # Subtract actual model token count: min(chunk_size, P - reusable).
+            # Decrement budget by actual model token count: min(chunk_size, P - reusable).
+            # where P = suggested_size =context_remaining_length (full prompt on first chunk)
             actual_model_cost = min(req.context_chunk_size, max(0, int(suggested_size) - reusable))
             if capacity is not None:
                 current_compute_capacity -= actual_model_cost
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         # capacity is a compute-token budget. Sum actual model tokens per request:
-        # min(chunk_size, P - reusable), where P = context_remaining_length for first chunk.
+        # min(chunk_size, P - reusable), where P = context_remaining_length
+        # (the full prompt length on the first context chunk).
         num_ctx_tokens = sum(
             min(
                 req.context_chunk_size,

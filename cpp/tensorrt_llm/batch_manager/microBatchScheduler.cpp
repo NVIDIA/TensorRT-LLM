@@ -86,6 +86,24 @@ void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
     }
 }
 
+// Assigns chunk sizes to context requests under the kEQUAL_PROGRESS policy.
+//
+// All requests advance together in lock-step: each iteration of the outer while-loop
+// offers every request one additional chunkUnitSize of tokens. This continues until
+// the compute budget (ctxTokensCapacity) is exhausted or no request can advance further.
+//
+// Budget accounting is compute-aware: tokens covered by the reusable KV-cache prefix
+// (getEstimatedReusableTokens) are served from cache and do not consume forward-pass
+// capacity. Only tokens beyond that prefix count against ctxTokensCapacity.
+// The reusable prefix is only considered on the very first chunk of a request
+// (isFirstContextChunk), since subsequent chunks start past the cached prefix.
+//
+// A request is skipped for this iteration if adding chunkUnitSize would exceed
+// ctxTokensCapacity or maxContextLength; its chunk size is left unchanged.
+//
+// Loop-termination uses the raw token increment (actualIncrement), not the
+// compute-adjusted one, so a request whose entire new chunk is reusable still
+// counts as progress and does not cause a premature exit.
 template <>
 void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kEQUAL_PROGRESS>(
     RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
@@ -107,18 +125,54 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
             SizeType32 actualChunkSize = llmReq->getContextChunkSize();
             SizeType32 actualIncrement = actualChunkSize - pastChunkSize;
 
-            if ((ctxTokensCapacity && numCtxTokens + actualIncrement > ctxTokensCapacity.value())
+            // Compute-aware budget: reusable tokens are served from cache and do not
+            // consume forward-pass capacity. Only the tokens beyond the reusable prefix count.
+            SizeType32 const reusable = llmReq->isFirstContextChunk()
+                ? std::min(llmReq->getEstimatedReusableTokens(), llmReq->getContextRemainingLength())
+                : 0;
+            SizeType32 const pastCompute = std::max<SizeType32>(0, pastChunkSize - std::min(reusable, pastChunkSize));
+            SizeType32 const actualCompute
+                = std::max<SizeType32>(0, actualChunkSize - std::min(reusable, actualChunkSize));
+            SizeType32 const computeIncrement = actualCompute - pastCompute;
+
+            if ((ctxTokensCapacity && numCtxTokens + computeIncrement > ctxTokensCapacity.value())
                 || (maxContextLength && actualChunkSize > maxContextLength.value()))
             {
                 llmReq->setContextChunkSize(pastChunkSize);
                 continue;
             }
-            numCtxTokens += actualIncrement;
+            numCtxTokens += computeIncrement;
+            // Keep raw actualIncrement for loop-termination detection (not compute-aware).
             numTokensSingleLoop += actualIncrement;
         }
     }
 }
 
+// Assigns chunk sizes to context requests under the kFIRST_COME_FIRST_SERVED policy.
+//
+// Requests are processed in order. Each request greedily claims as many tokens as
+// possible from the remaining compute budget (ctxTokensCapacity) before the next
+// request is considered — hence "first come, first served".
+//
+// For each request the desired chunk is its full remaining context length. The actual
+// chunk size is then reduced by two independent constraints (applied in order):
+//
+//   1. ctxTokensCapacity: the available forward-pass compute budget.
+//      Reusable tokens (cached KV prefix, first chunk only) are free; only
+//      non-reusable tokens count. If the non-reusable portion exceeds the budget,
+//      the chunk is capped at ctxTokensCapacity (not reusable + ctxTokensCapacity,
+//      because the model processes tokens starting from position 0 of the chunk).
+//
+//   2. maxContextLength: an upper bound on the number of compute tokens per chunk.
+//      If the non-reusable portion exceeds this, the chunk is capped at
+//      reusable + maxContextLength (clamped to suggestedChunkSize).
+//
+// When either constraint trims the chunk, the result is aligned down to the nearest
+// chunkUnitSize boundary to avoid KV-cache fragmentation.
+//
+// After assigning the chunk, ctxTokensCapacity is decremented by the actual model
+// cost: min(actualChunkSize, non-reusable tokens), so the budget available to
+// subsequent requests reflects only the compute consumed by this one.
 template <>
 void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED>(
     RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
@@ -163,6 +217,16 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
     }
 }
 
+// Entry point for chunk-size assignment. Resets all chunk sizes to zero, then
+// dispatches to the appropriate policy-specific implementation:
+//
+//   kEQUAL_PROGRESS      — all requests advance together one chunkUnitSize at a time.
+//   kFIRST_COME_FIRST_SERVED — requests are served greedily in order until the budget
+//                              is exhausted.
+//
+// Both policies are compute-aware: tokens covered by the reusable KV-cache prefix are
+// not charged against ctxTokensCapacity. See the individual template specialisations
+// above for full details.
 void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChunked,
     ContextChunkingPolicy const ctxChunkPolicy, std::optional<SizeType32> ctxTokensCapacity,
     SizeType32 const chunkUnitSize, std::optional<SizeType32> const& maxContextLength)
