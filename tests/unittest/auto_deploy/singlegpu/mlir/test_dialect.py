@@ -32,7 +32,6 @@ from xdsl.ir import Block, Region  # noqa: E402
 
 from tensorrt_llm._torch.auto_deploy.mlir.dialect import (  # noqa: E402
     AdAdd,
-    AdFusedAddRMSNorm,
     AdGraphInput,
     AdGraphOutput,
     AdMul,
@@ -135,29 +134,6 @@ def test_ad_rmsnorm_construction():
     assert op.eps.value.data == pytest.approx(1e-5)
 
 
-def test_ad_fused_add_rmsnorm_construction():
-    """Verify ad.fused_add_rmsnorm op produces two results."""
-    t = TensorType(BFloat16Type(), [2, 8, 128])
-    tw = TensorType(BFloat16Type(), [128])
-    eps_attr = FloatAttr(1e-5, Float64Type())
-
-    block = Block()
-    x = block.insert_arg(t, 0)
-    res = block.insert_arg(t, 1)
-    weight = block.insert_arg(tw, 2)
-
-    op = AdFusedAddRMSNorm.build(
-        operands=[x, res, weight],
-        attributes={"eps": eps_attr},
-        result_types=[t, t],
-    )
-    block.add_op(op)
-
-    assert op.name == "ad.fused_add_rmsnorm"
-    assert op.norm_result.type == t
-    assert op.add_result.type == t
-
-
 def test_ad_opaque_construction():
     """Verify ad.opaque catch-all op."""
     t = TensorType(BFloat16Type(), [2, 8, 128])
@@ -206,7 +182,7 @@ def test_register_ad_dialect():
     # Should not raise — ops are now loaded
     assert ctx.get_optional_op("ad.add") is not None
     assert ctx.get_optional_op("ad.rmsnorm") is not None
-    assert ctx.get_optional_op("ad.fused_add_rmsnorm") is not None
+    assert ctx.get_optional_op("ad.opaque") is not None
 
 
 def test_build_complete_ir():

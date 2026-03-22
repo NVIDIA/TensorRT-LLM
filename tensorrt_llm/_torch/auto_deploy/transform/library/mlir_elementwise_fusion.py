@@ -153,7 +153,7 @@ class MLIRElementwiseFusion(BaseTransform):
             )
 
         # Step 5: MLIR -> FX (with fused ops becoming kernel calls)
-        back_converter = MLIRToFXConverter(gm, codegen_mode="generate")
+        back_converter = MLIRToFXConverter(gm)
         new_gm = back_converter.convert(mlir_module, converter.metadata)
 
         return new_gm, TransformInfo(

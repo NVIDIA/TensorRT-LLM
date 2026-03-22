@@ -26,7 +26,6 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import * 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.mlir.fx_to_mlir import FXToMLIRConverter  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.mlir.mlir_to_fx import MLIRToFXConverter  # noqa: E402
-from tensorrt_llm._torch.auto_deploy.mlir.patterns import run_fusion_patterns  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Test models
@@ -122,24 +121,6 @@ def test_fx_to_mlir_metadata_stored():
     assert has_val, "Expected 'val' metadata to be stored for tensor nodes"
 
 
-def test_mlir_fusion_produces_fused_op():
-    """FX → MLIR → fusion produces ad.fused_add_rmsnorm."""
-    model = AddNormModel()
-    x = torch.randn(2, 8, 128, device="cuda", dtype=torch.bfloat16)
-    res = torch.randn_like(x)
-    gm = _export_model(model, x, res)
-
-    converter = FXToMLIRConverter(gm)
-    mlir_mod = converter.convert()
-
-    num_matches = run_fusion_patterns(mlir_mod)
-    assert num_matches >= 1
-
-    op_names = [op.name for op in mlir_mod.body.block.ops]
-    assert "ad.fused_add_rmsnorm" in op_names
-    assert "ad.rmsnorm" not in op_names
-
-
 def test_roundtrip_identity():
     """FX → MLIR → FX (no patterns) preserves graph structure."""
     model = AddNormModel()
@@ -165,8 +146,10 @@ def test_roundtrip_identity():
     assert add_count_after == add_count_before
 
 
-def test_roundtrip_with_fusion():
-    """FX → MLIR → fusion → FX produces a working fused graph."""
+def test_roundtrip_with_decomposition():
+    """FX → MLIR → decompose → FX round-trips correctly."""
+    from tensorrt_llm._torch.auto_deploy.mlir.decompose import run_decomposition
+
     model = AddNormModel()
     x = torch.randn(2, 8, 128, device="cuda", dtype=torch.bfloat16)
     res = torch.randn_like(x)
@@ -176,22 +159,15 @@ def test_roundtrip_with_fusion():
     converter = FXToMLIRConverter(gm)
     mlir_mod = converter.convert()
 
-    # Apply fusion
-    num_matches = run_fusion_patterns(mlir_mod)
-    assert num_matches >= 1
+    # Decompose rmsnorm into primitives
+    num_decomposed = run_decomposition(mlir_mod)
+    assert num_decomposed >= 1
 
     # MLIR → FX
-    back = MLIRToFXConverter(gm, codegen_mode="preexisting")
+    back = MLIRToFXConverter(gm)
     new_gm = back.convert(mlir_mod, converter.metadata)
 
-    # Verify the fused graph has the fused op
-    from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.flashinfer_fused_add_rms_norm import (
-        flashinfer_fused_add_rms_norm,
-    )
-
-    fused_count = sum(
-        1
-        for n in new_gm.graph.nodes
-        if n.op == "call_function" and n.target is flashinfer_fused_add_rms_norm
-    )
-    assert fused_count >= 1, "Expected fused op in reconstructed graph"
+    # Verify the decomposed graph has primitive ops (mul, rsqrt, etc.)
+    op_names = [str(n.target) for n in new_gm.graph.nodes if n.op == "call_function"]
+    op_str = " ".join(op_names)
+    assert "rsqrt" in op_str or "mul" in op_str, "Expected decomposed primitives in graph"

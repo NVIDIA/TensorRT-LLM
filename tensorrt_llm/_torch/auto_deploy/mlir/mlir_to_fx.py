@@ -16,23 +16,21 @@
 """MLIR (xDSL) → FX graph converter.
 
 Walks an xDSL ``ModuleOp`` and reconstructs a PyTorch FX ``GraphModule``.
-Fused ops (e.g., ``ad.fused_add_rmsnorm``) are mapped to either pre-existing
-custom ops or Triton-generated kernels depending on the codegen mode.
+Fused ops are represented as ``ad.opaque`` with metadata pointing to
+auto-generated Triton kernels registered as ``torch.library.custom_op``.
 """
 
 import operator
-from typing import Any, Callable, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 from torch.fx import Graph, GraphModule, Node
 from xdsl.dialects.builtin import ModuleOp
 from xdsl.ir import Operation, SSAValue
 
-from .codegen.triton_emitter import TritonCodegen
 from .dialect import (
     AdAdd,
     AdCast,
-    AdFusedAddRMSNorm,
     AdGelu,
     AdGraphInput,
     AdGraphOutput,
@@ -61,17 +59,10 @@ class MLIRToFXConverter:
     Args:
         original_gm: The original FX GraphModule (used for module references
             and parameter access).
-        codegen_mode: ``"preexisting"`` to map fused ops to existing custom ops,
-            ``"generate"`` to use Triton-generated kernels.
     """
 
-    def __init__(
-        self,
-        original_gm: GraphModule,
-        codegen_mode: Literal["preexisting", "generate"] = "preexisting",
-    ):
+    def __init__(self, original_gm: GraphModule, **kwargs):
         self._original_gm = original_gm
-        self._codegen = TritonCodegen(mode=codegen_mode)
         # MLIR SSAValue → FX Node
         self._value_map: Dict[SSAValue, Node] = {}
         # Old FX node name → new FX Node (for opaque arg reconstruction)
@@ -159,8 +150,6 @@ class MLIRToFXConverter:
             self._convert_rmsnorm(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdToDtype):
             self._convert_to_dtype(mlir_op, graph, metadata)
-        elif isinstance(mlir_op, AdFusedAddRMSNorm):
-            self._convert_fused_add_rmsnorm(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdGraphOutput):
             self._convert_graph_output(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdOpaque):
@@ -279,30 +268,6 @@ class MLIRToFXConverter:
         node = graph.call_function(torch.ops.aten.to.dtype, args=(input_node, target_dtype))
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)
-
-    def _convert_fused_add_rmsnorm(
-        self, op: AdFusedAddRMSNorm, graph: Graph, metadata: dict
-    ) -> None:
-        """Reconstruct fused add+rmsnorm as a custom op call.
-
-        Uses TritonCodegen to select between pre-existing (FlashInfer) or
-        generated (Triton) implementations.
-        """
-        x_node = self._resolve(op.x)
-        residual_node = self._resolve(op.residual)
-        weight_node = self._resolve(op.weight)
-        eps = op.eps.value.data
-
-        impl_fn = self._codegen.get_fused_add_rmsnorm_impl(op)
-
-        fused_node = graph.call_function(impl_fn, args=(x_node, residual_node, weight_node, eps))
-
-        # Extract tuple results via getitem (matches existing FX convention)
-        norm_out = graph.call_function(operator.getitem, args=(fused_node, 0))
-        add_out = graph.call_function(operator.getitem, args=(fused_node, 1))
-
-        self._map_value(op.norm_result, norm_out)
-        self._map_value(op.add_result, add_out)
 
     def _convert_graph_output(self, op: AdGraphOutput, graph: Graph, metadata: dict) -> None:
         """Reconstruct FX output node from ``ad.graph_output``.

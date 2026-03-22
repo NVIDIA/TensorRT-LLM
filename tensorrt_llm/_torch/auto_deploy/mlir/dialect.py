@@ -23,7 +23,6 @@ Ops:
     - ``ad.add``: Elementwise add (maps to ``aten.add.Tensor``)
     - ``ad.rmsnorm``: RMSNorm with eps attribute (backend-agnostic)
     - ``ad.to_dtype``: Dtype cast (maps to ``aten.to.dtype``)
-    - ``ad.fused_add_rmsnorm``: Fused add+rmsnorm returning ``(norm, add)``
     - ``ad.opaque``: Catch-all for unmodeled FX ops
     - ``ad.graph_input`` / ``ad.graph_output``: Graph boundaries
     - ``ad.mul``, ``ad.sub``, ``ad.neg``: Elementwise arithmetic primitives
@@ -190,19 +189,6 @@ class AdToDtype(IRDLOperation):
     input = operand_def(AnyAttr())
     target_dtype = attr_def(IntegerAttr)  # stores torch dtype enum value
     output = result_def(AnyAttr())
-
-
-@irdl_op_definition
-class AdFusedAddRMSNorm(IRDLOperation):
-    """Fused add + rmsnorm, returns ``(norm_result, add_result)``."""
-
-    name = "ad.fused_add_rmsnorm"
-    x = operand_def(AnyAttr())
-    residual = operand_def(AnyAttr())
-    weight = operand_def(AnyAttr())
-    eps = attr_def(FloatAttr)
-    norm_result = result_def(AnyAttr())
-    add_result = result_def(AnyAttr())
 
 
 @irdl_op_definition
@@ -385,7 +371,6 @@ AD_OPS = [
     AdAdd,
     AdRMSNorm,
     AdToDtype,
-    AdFusedAddRMSNorm,
     AdOpaque,
     AdGraphInput,
     AdGraphOutput,

@@ -15,6 +15,6 @@
 
 """Codegen backends for MLIR fused ops."""
 
-from .triton_emitter import TritonCodegen
+from .triton_emitter import generate_kernel_from_subgraph
 
-__all__ = ["TritonCodegen"]
+__all__ = ["generate_kernel_from_subgraph"]

@@ -374,7 +374,7 @@ def test_full_fx_roundtrip_with_replacement():
     replace_subgraph_with_fused_op(sg, kernel_fn, sg_hash, converter.metadata)
 
     # Step 5: MLIR → FX
-    back_converter = MLIRToFXConverter(gm, codegen_mode="generate")
+    back_converter = MLIRToFXConverter(gm)
     new_gm = back_converter.convert(mlir_module, converter.metadata)
 
     # Step 6: Run the new graph and verify correctness
