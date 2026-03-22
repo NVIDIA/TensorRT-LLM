@@ -86,6 +86,16 @@ class SpecTreeManager:
         self.use_dynamic_tree = use_dynamic_tree
         self.max_total_draft_tokens = max_total_draft_tokens
         self.max_draft_len = max_draft_len
+
+        # In dynamic tree mode the draft loop can produce up to
+        # K * max_draft_len tokens, which may exceed max_total_draft_tokens+1.
+        # Size the working buffers to the larger of the two so the masks and
+        # position-offset tensors never run out of columns/rows.
+        if use_dynamic_tree and dynamic_tree_max_topK > 0:
+            self._internal_buf_dim = max(max_total_draft_tokens + 1,
+                                         dynamic_tree_max_topK * max_draft_len)
+        else:
+            self._internal_buf_dim = max_total_draft_tokens + 1
         self.eagle_choices = eagle_choices
         self.num_trees = max_num_requests if use_dynamic_tree else 1
         self.dynamic_tree_max_topK = dynamic_tree_max_topK
@@ -110,6 +120,7 @@ class SpecTreeManager:
                 device='cuda',
             ).unsqueeze(0).repeat(self.num_trees, 1, 1)
 
+        # CUDA kernel facing — MUST be max_total_draft_tokens + 1
         self.spec_dec_packed_mask = torch.zeros(
             (self.num_trees, self.max_total_draft_tokens + 1,
              math.ceil((self.max_total_draft_tokens + 1) / 32)),
@@ -125,16 +136,16 @@ class SpecTreeManager:
         # Cached constants for compute_spec_dec_packed_mask (avoids per-call allocation)
         self._pack_weights = (
             1 << torch.arange(32, device='cuda', dtype=torch.int32))
-        # Pre-allocated intermediate buffers for packed mask computation
-        num_blocks = math.ceil((self.max_total_draft_tokens + 1) / 32)
+        # Python-only internal buffers — enlarged to _internal_buf_dim
+        num_blocks = math.ceil(self._internal_buf_dim / 32)
         total_bits = num_blocks * 32
         self._padded_mask_buf = torch.zeros(self.num_trees,
-                                            self.max_total_draft_tokens + 1,
+                                            self._internal_buf_dim,
                                             total_bits,
                                             dtype=torch.int32,
                                             device='cuda')
         self._pack_result_buf = torch.zeros(self.num_trees,
-                                            self.max_total_draft_tokens + 1,
+                                            self._internal_buf_dim,
                                             num_blocks,
                                             dtype=torch.int32,
                                             device='cuda')

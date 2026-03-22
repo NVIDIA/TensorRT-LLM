@@ -50,7 +50,11 @@ from .communication import (
     NVLinkOneSided,
     NVLinkTwoSided,
 )
-from .fused_moe_cute_dsl import CuteDslFusedMoE
+
+try:
+    from .fused_moe_cute_dsl import CuteDslFusedMoE
+except ImportError:
+    CuteDslFusedMoE = None
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE

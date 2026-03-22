@@ -159,15 +159,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         K = self.K
         max_draft_len = spec_config.max_draft_len
-        max_total_draft_tokens = self.max_total_draft_tokens
         max_batch_size = self._max_batch_size
+        loop_max_tokens = K * max_draft_len  # draft loop working size
 
         # Pre-allocated 2D buffers
         self.draft_tokens_buffer = torch.zeros(
-            max_batch_size, self.max_total_draft_tokens, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
         )
         self.position_ids_buffer = torch.zeros(
-            max_batch_size, self.tokens_per_gen_step, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
         )
         self.history_draft_tokens_buffer = torch.zeros(
             (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int64, device="cuda"
@@ -179,7 +179,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             (max_batch_size, K * (max_draft_len - 1) + 1), dtype=torch.int64, device="cuda"
         )
         self.tree_mask_buffer = torch.zeros(
-            (max_batch_size * self.tokens_per_gen_step * self.tokens_per_gen_step),
+            (max_batch_size * loop_max_tokens * loop_max_tokens),
             dtype=torch.int32,
             device="cuda",
         )
@@ -251,13 +251,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._gather_ids_buf = torch.zeros(max_total_tokens, dtype=torch.long, device="cuda")
         self._current_mask_buf = torch.zeros(
             max_batch_size,
-            max_total_draft_tokens,
-            tokens_per_gen_step,
+            loop_max_tokens,
+            loop_max_tokens,
             dtype=torch.int32,
             device="cuda",
         )
         self._new_pos_offset_buf = torch.zeros(
-            max_batch_size, max_total_draft_tokens, dtype=torch.int32, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
@@ -509,9 +509,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
             tokens_per_req = self.tokens_per_gen_step
-            total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
-            max_reqs = total_po_size // tokens_per_req
-            pos_2d = attn_metadata.spec_decoding_position_offsets.view(max_reqs, tokens_per_req)
+            # Only view the portion needed for the current batch
+            # (buf_dim may not be divisible by tokens_per_req)
+            pos_2d = attn_metadata.spec_decoding_position_offsets[
+                : batch_size * tokens_per_req
+            ].view(batch_size, tokens_per_req)
             pos_2d[num_contexts:batch_size, :num_step0_tokens] = self._causal_offs[
                 :num_step0_tokens
             ]

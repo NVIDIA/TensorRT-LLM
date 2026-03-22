@@ -1075,7 +1075,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
                     f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
             else:
-                assert self.max_total_draft_tokens <= total_history_draft_tokens and self.max_total_draft_tokens >= default_max_total_draft_tokens, f"max_total_draft_tokens should be between {default_max_total_draft_tokens} and {total_history_draft_tokens}"
+                assert self.max_total_draft_tokens >= self.max_draft_len, f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
 
         # Linear tree
         if self.max_total_draft_tokens is None:

@@ -1571,10 +1571,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
             if is_spec_dec_tree and self.spec_decoding_position_offsets is None:
                 if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
+                    # Dynamic tree: use _internal_buf_dim which may be larger
+                    # than max_total_draft_tokens+1 to accommodate K*max_draft_len
+                    buf_dim = spec_tree_manager._internal_buf_dim
                     # Dynamic tree: 1D layout for flexible view() in drafting loop
                     self.spec_decoding_position_offsets = torch.empty(
-                        (self.max_num_requests *
-                         (max_total_draft_tokens + 1), ),
+                        (self.max_num_requests * buf_dim, ),
                         dtype=torch.int,
                         device='cuda',
                     )
@@ -1586,11 +1588,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         device='cuda',
                     )
             if is_spec_dec_tree and self.spec_decoding_packed_mask is None:
+                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
+                    buf_dim = spec_tree_manager._internal_buf_dim
+                else:
+                    buf_dim = max_total_draft_tokens + 1
                 self.spec_decoding_packed_mask = torch.empty(
-                    [
-                        self.max_num_requests, max_total_draft_tokens + 1,
-                        math.ceil((max_total_draft_tokens + 1) / 32)
-                    ],
+                    [self.max_num_requests, buf_dim,
+                     math.ceil(buf_dim / 32)],
                     dtype=torch.int,
                     device='cuda',
                 )
@@ -1620,25 +1624,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         # - For the context requests, we do not need to prepare these spec-dec parameters.
                         # - For the generation requests, their spec-dec parameters are updated via the one-model dynamic tree worker.
                         #   And the XQA kernel will only handle the generation requests.
-                        # Dynamic tree: copy to 1D buffer using view for efficiency
-                        # spec_tree_manager.spec_dec_position_offsets: [num_trees, max_total_draft_tokens+1]
-                        # self.spec_decoding_position_offsets: 1D [max_num_requests * (max_total_draft_tokens+1)]
-                        tokens_per_req = spec_tree_manager.max_total_draft_tokens + 1
-                        self.spec_decoding_position_offsets.view(
-                            self.max_num_requests,
-                            tokens_per_req)[:batch_size, :].copy_(
-                                spec_tree_manager.
-                                spec_dec_position_offsets[:batch_size, :],
-                                non_blocking=True)
-                        # Both spec_decoding_packed_mask and spec_tree_manager.spec_dec_packed_mask are 3D:
-                        # [max_num_requests/num_trees, max_total_draft_tokens + 1, num_blocks]
-                        # Dynamic tree: each request has its own mask (different tree structure)
-                        self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                            spec_tree_manager.
-                            spec_dec_packed_mask[:batch_size, :, :],
+                        #
+                        # spec_tree_manager buffers are sized [num_trees, max_total_draft_tokens + 1]
+                        # (CUDA kernel facing), while attn buffers are sized with _internal_buf_dim
+                        # (which may be larger to accommodate K*max_draft_len in the draft loop).
+                        n_dt = spec_tree_manager.max_total_draft_tokens + 1
+                        n_blk = spec_tree_manager.spec_dec_packed_mask.shape[-1]
+
+                        # Position offsets: pack contiguously with stride = n_dt
+                        # (XQA reads raw pointer with stride = generation_lengths[i] = n_dt)
+                        self.spec_decoding_position_offsets[:batch_size * n_dt].view(
+                            batch_size,
+                            n_dt).copy_(spec_tree_manager.
+                                        spec_dec_position_offsets[:batch_size],
+                                        non_blocking=True)
+
+                        # Packed mask: zero stale data, copy top-left corner
+                        # (XQA uses sizes()[1] = buf_dim as row stride, extra cols = 0)
+                        self.spec_decoding_packed_mask[:batch_size].zero_()
+                        self.spec_decoding_packed_mask[:batch_size, :n_dt, :n_blk].copy_(
+                            spec_tree_manager.spec_dec_packed_mask[:batch_size],
                             non_blocking=True)
-                        self.spec_decoding_generation_lengths[:batch_size].fill_(
-                            spec_tree_manager.max_total_draft_tokens + 1)
+
+                        self.spec_decoding_generation_lengths[:
+                                                              batch_size].fill_(
+                                                                  n_dt)
                     # Case 1.1.2: static tree
                     else:
                         # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
