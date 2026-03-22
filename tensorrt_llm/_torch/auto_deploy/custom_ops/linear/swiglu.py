@@ -230,13 +230,20 @@ def fused_fp8_swiglu_mlp(
         gate_up_input_scale,
         gate_up_weight_scale,
     )
-    hidden = _silu_and_mul(gate_up_out)
-    return torch.ops.auto_deploy.trtllm_quant_fp8_linear(
-        hidden,
+    gate_up_out_2d = gate_up_out.reshape(-1, gate_up_out.shape[-1])
+    hidden_fp8 = torch.ops.trtllm.silu_and_mul(
+        gate_up_out_2d,
+        scale=down_input_scale,
+        dtype=torch.float8_e4m3fn,
+    )
+    hidden_fp8 = hidden_fp8.reshape(*gate_up_out.shape[:-1], hidden_fp8.shape[-1])
+    return torch.ops.auto_deploy.trtllm_fp8_prequant_linear(
+        hidden_fp8,
         down_weight,
         None,
         down_input_scale,
         down_weight_scale,
+        out_dtype=str(input.dtype).replace("torch.", ""),
     )
 
 
