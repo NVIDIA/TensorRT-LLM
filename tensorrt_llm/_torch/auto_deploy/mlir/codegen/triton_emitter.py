@@ -17,7 +17,8 @@
 
 Two operating modes:
     - ``preexisting``: Map fused ops to existing custom ops (FlashInfer/Triton).
-    - ``generate``: Generate Triton kernels from MLIR op semantics.
+    - ``generate``: Generate Triton kernels from MLIR op semantics, registered
+      as proper ``torch.library.custom_op`` for FX graph compatibility.
 """
 
 from typing import Callable, Literal, Optional
@@ -25,6 +26,42 @@ from typing import Callable, Literal, Optional
 import torch
 
 from ..dialect import AdFusedAddRMSNorm
+
+# Cache for registered generated ops (module-level to survive across instances)
+_generated_op_cache: dict = {}
+
+
+def _get_triton_fused_add_rmsnorm_op():
+    """Register and return the Triton-generated fused_add_rmsnorm as a custom op.
+
+    The op is registered once and cached. It has a proper schema and fake
+    implementation so FX tracing, shape propagation, and ``operator.getitem``
+    on the tuple result all work correctly.
+    """
+    cache_key = "triton_fused_add_rmsnorm"
+    if cache_key in _generated_op_cache:
+        return _generated_op_cache[cache_key]
+
+    from .templates.fused_add_rmsnorm import fused_add_rmsnorm as triton_kernel
+
+    # Register as a torch custom op with explicit schema
+    @torch.library.custom_op("auto_deploy::mlir_triton_fused_add_rmsnorm", mutates_args=())
+    def mlir_triton_fused_add_rmsnorm(
+        x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return triton_kernel(x, residual, weight, eps)
+
+    @mlir_triton_fused_add_rmsnorm.register_fake
+    def _(x, residual, weight, eps):
+        return torch.empty_like(x), torch.empty_like(x)
+
+    # Build a wrapper matching the flashinfer_fused_add_rms_norm calling convention:
+    # call the custom op and return the tuple.
+    def wrapper(x, residual, weight, eps):
+        return torch.ops.auto_deploy.mlir_triton_fused_add_rmsnorm(x, residual, weight, eps)
+
+    _generated_op_cache[cache_key] = wrapper
+    return wrapper
 
 
 class TritonCodegen:
@@ -37,18 +74,18 @@ class TritonCodegen:
 
     def __init__(self, mode: Literal["preexisting", "generate"] = "preexisting"):
         self.mode = mode
-        self._generated_ops: dict = {}
 
     def get_fused_add_rmsnorm_impl(self, fused_op: Optional[AdFusedAddRMSNorm] = None) -> Callable:
         """Return a callable implementing fused add + rmsnorm.
 
         In ``preexisting`` mode, returns the existing FlashInfer wrapper.
-        In ``generate`` mode, returns the Triton-generated kernel launcher.
+        In ``generate`` mode, returns the Triton-generated kernel launcher
+        registered as a proper torch custom op.
         """
         if self.mode == "preexisting":
             return self._get_preexisting_impl()
         else:
-            return self._get_generated_impl()
+            return _get_triton_fused_add_rmsnorm_op()
 
     def _get_preexisting_impl(self) -> Callable:
         """Return the existing flashinfer_fused_add_rms_norm wrapper."""
@@ -57,58 +94,3 @@ class TritonCodegen:
         )
 
         return flashinfer_fused_add_rms_norm
-
-    def _get_generated_impl(self) -> Callable:
-        """Return the Triton-generated fused_add_rmsnorm kernel launcher.
-
-        The generated kernel is registered as a PyTorch custom op on first call.
-        """
-        cache_key = "fused_add_rmsnorm"
-        if cache_key in self._generated_ops:
-            return self._generated_ops[cache_key]
-
-        from .templates.fused_add_rmsnorm import fused_add_rmsnorm as triton_impl
-
-        # Register as a torch custom op for FX graph compatibility
-        impl = self._register_as_custom_op(triton_impl)
-        self._generated_ops[cache_key] = impl
-        return impl
-
-    def _register_as_custom_op(self, kernel_fn: Callable) -> Callable:
-        """Register a generated kernel as a PyTorch custom op.
-
-        Uses ``create_derived_custom_op`` from the AutoDeploy utils when available,
-        otherwise returns the raw callable (suitable for direct invocation in tests).
-        """
-        try:
-            from ...utils._graph import create_derived_custom_op
-
-            def make_impl(orig_impl):
-                def impl(x, residual, weight, eps):
-                    return kernel_fn(x, residual, weight, eps)
-
-                return impl
-
-            def make_fake(orig_fake):
-                def fake(x, residual, weight, eps):
-                    norm_out = torch.empty_like(x)
-                    add_out = torch.empty_like(x)
-                    return norm_out, add_out
-
-                return fake
-
-            # Derive from the flashinfer op schema for compatibility
-            from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import (
-                flashinfer_fused_add_rms_norm,
-            )
-
-            derived_op = create_derived_custom_op(
-                flashinfer_fused_add_rms_norm,
-                suffix="_triton_generated",
-                make_impl=make_impl,
-                make_fake=make_fake,
-            )
-            return derived_op
-        except Exception:
-            # Fallback: return raw callable (works for testing)
-            return kernel_fn
