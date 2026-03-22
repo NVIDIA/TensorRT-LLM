@@ -27,7 +27,8 @@ Ops:
     - ``ad.graph_input`` / ``ad.graph_output``: Graph boundaries
     - ``ad.mul``, ``ad.sub``, ``ad.neg``: Elementwise arithmetic primitives
     - ``ad.pow``, ``ad.rsqrt``, ``ad.sqrt``: Power/root primitives
-    - ``ad.silu``, ``ad.gelu``, ``ad.relu``, ``ad.tanh``: Activation primitives
+    - ``ad.silu``, ``ad.gelu``, ``ad.relu``, ``ad.tanh``, ``ad.sigmoid``: Activation primitives
+    - ``ad.exp``, ``ad.softplus``: Elementwise math primitives
     - ``ad.reduce_sum``, ``ad.reduce_mean``: Reduction primitives
     - ``ad.cast``: Dtype cast primitive
     - ``ad.splat``: Constant scalar splat
@@ -323,6 +324,33 @@ class AdTanh(IRDLOperation):
 
 
 @irdl_op_definition
+class AdSigmoid(IRDLOperation):
+    """Sigmoid activation — mirrors ``aten.sigmoid``."""
+
+    name = "ad.sigmoid"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdExp(IRDLOperation):
+    """Elementwise exponential — mirrors ``aten.exp``."""
+
+    name = "ad.exp"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdSoftplus(IRDLOperation):
+    """Softplus activation — mirrors ``aten.softplus``."""
+
+    name = "ad.softplus"
+    input = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
 class AdReduceSum(IRDLOperation):
     """Reduction sum along a dimension — mirrors ``aten.sum.dim_IntList``."""
 
@@ -384,6 +412,9 @@ AD_OPS = [
     AdGelu,
     AdRelu,
     AdTanh,
+    AdSigmoid,
+    AdExp,
+    AdSoftplus,
     AdReduceSum,
     AdReduceMean,
     AdCast,

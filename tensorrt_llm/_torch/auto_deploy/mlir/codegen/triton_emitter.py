@@ -59,6 +59,9 @@ _EMIT = {
     "ad.gelu": lambda a: f"({a} * 0.5 * (1.0 + tl.math.erf({a} * 0.7071067811865476)))",
     "ad.relu": lambda a: f"tl.maximum({a}, 0)",
     "ad.tanh": lambda a: f"tl.math.tanh({a})",
+    "ad.sigmoid": lambda a: f"tl.sigmoid({a})",
+    "ad.exp": lambda a: f"tl.math.exp({a})",
+    "ad.softplus": lambda a: f"tl.math.log(1.0 + tl.math.exp({a}))",
     "ad.reduce_sum": lambda a: f"tl.sum({a}, 0)",
     "ad.reduce_mean": lambda a, ncols: f"(tl.sum({a}, 0) * (1.0 / {ncols}))",
     "ad.splat": None,  # handled specially — just inline the scalar value
