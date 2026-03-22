@@ -209,7 +209,12 @@ transforms:
     enabled: false
   fuse_add_rms_norm:
     stage: post_load_fusion
+    enabled: false
+  mlir_fuse_add_rms_norm:
+    stage: post_load_fusion
     enabled: true
+    codegen_mode: preexisting
+    run_shape_prop: true
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: false
