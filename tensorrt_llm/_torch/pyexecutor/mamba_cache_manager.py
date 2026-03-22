@@ -1187,17 +1187,12 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
 
         spec_config = kwargs.get('spec_config', None)
         use_v1 = (use_cpp_mamba_cache_manager() or spec_config is not None)
-        use_reuse = kv_cache_config.enable_block_reuse
+
         if use_v1:
             logger.info(
                 "Using MambaHybridCacheManagerV1 for hybrid cache management")
             return MambaHybridCacheManagerV1(*positional_args, **kwargs)
-        elif use_reuse:
-            logger.info(
-                "Using LinearHybridCacheManager for hybrid cache management with block reuse"
-            )
-            return LinearHybridCacheManager(*positional_args, **kwargs)
         else:
             logger.info(
-                "Using MambaHybridCacheManagerV1 for hybrid cache management")
-            return MambaHybridCacheManagerV1(*positional_args, **kwargs)
+                "Using LinearHybridCacheManager for hybrid cache management")
+            return LinearHybridCacheManager(*positional_args, **kwargs)
