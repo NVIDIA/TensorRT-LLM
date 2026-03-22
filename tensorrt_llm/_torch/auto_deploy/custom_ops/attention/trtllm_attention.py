@@ -85,10 +85,6 @@ class _TrtllmPlanner:
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
         self.block_offsets: Optional[torch.Tensor] = None
-        # Cached max sizes for use in torch.compile fake implementations
-        # (set during reset(), before compile stage runs)
-        self.max_batch: int = 0
-        self.max_blocks_per_seq: int = 0
         # Per-layer cache for tensors that must survive CUDA graph replay.
         # Keyed by kv_cache.data_ptr() (stable and unique per layer).
         self._layer_cache: dict[
@@ -101,10 +97,6 @@ class _TrtllmPlanner:
         Guards against double-init. Called lazily from ``prepare_trtllm_metadata``
         on the first forward pass after cache initialization.
         """
-        # Cache max sizes for torch.compile fake implementations
-        self.max_batch = max_batch
-        self.max_blocks_per_seq = max_blocks_per_seq
-
         if self.workspace is not None:
             return  # already initialized
 
@@ -305,20 +297,13 @@ def prepare_trtllm_metadata_fake(
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
 ) -> List[torch.Tensor]:
-    """Fake implementation for torch.compile tracing.
-
-    Uses cached max sizes from the planner (set during reset() in cache_init stage,
-    before compile stage runs) to avoid calling BatchInfo which requires .numpy()
-    on the host tensor — unsupported for FakeTensors.
-    """
+    """Fake implementation for torch.compile tracing."""
+    batch_info = BatchInfo(batch_info_host)
+    max_blocks_per_seq = batch_info.get_max_blocks_per_seq()
+    max_batch_size = batch_info.get_max_batch_size()
     return [
         torch.empty(
-            1,
-            _GlobalTrtllmPlanner.max_batch,
-            2,
-            _GlobalTrtllmPlanner.max_blocks_per_seq,
-            dtype=torch.int32,
-            device=cache_loc.device,
+            1, max_batch_size, 2, max_blocks_per_seq, dtype=torch.int32, device=cache_loc.device
         )
     ]
 
@@ -390,7 +375,6 @@ def trtllm_mha_with_cache(
     )
 
     # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse.
-    # thop.attention requires fused QKV for non-MLA attention.
     # Input is [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
     # With piecewise CUDA graphs the tensor may be padded to a bucket size
     # (b*s > num_tokens), so flatten first and slice to the real token count.
