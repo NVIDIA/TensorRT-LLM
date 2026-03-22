@@ -19,16 +19,357 @@ Two operating modes:
     - ``preexisting``: Map fused ops to existing custom ops (FlashInfer/Triton).
     - ``generate``: Generate Triton kernels from MLIR op semantics, registered
       as proper ``torch.library.custom_op`` for FX graph compatibility.
+
+String-based codegen:
+    - ``generate_kernel_from_subgraph()``: Walk a ``FusibleSubgraph`` in topo
+      order, emit Triton expressions per op, compile via ``exec()``, and
+      register as ``torch.library.custom_op``.
 """
 
-from typing import Callable, Literal, Optional
+import textwrap
+from typing import Callable, List, Literal, Optional
 
 import torch
+from xdsl.dialects.builtin import FloatAttr, TensorType
+from xdsl.ir import SSAValue
 
 from ..dialect import AdFusedAddRMSNorm
+from .kernel_cache import KernelCache
 
 # Cache for registered generated ops (module-level to survive across instances)
 _generated_op_cache: dict = {}
+
+# Module-level kernel cache shared across calls
+_kernel_cache = KernelCache()
+
+# ---------------------------------------------------------------------------
+# Emission table: op name -> lambda producing Triton expression string
+# ---------------------------------------------------------------------------
+
+_EMIT = {
+    "ad.add": lambda a, b: f"({a} + {b})",
+    "ad.mul": lambda a, b: f"({a} * {b})",
+    "ad.sub": lambda a, b: f"({a} - {b})",
+    "ad.neg": lambda a: f"(-{a})",
+    "ad.rsqrt": (lambda a: f"(1.0 / tl.sqrt({a}.to(tl.float32))).to({a}.dtype)"),
+    "ad.sqrt": lambda a: f"tl.sqrt({a})",
+    "ad.silu": (lambda a: f"({a} * tl.sigmoid({a}.to(tl.float32))).to({a}.dtype)"),
+    "ad.gelu": (
+        lambda a: f"({a} * 0.5 * (1.0 + tl.math.erf("
+        f"{a}.to(tl.float32) * 0.7071067811865476))).to({a}.dtype)"
+    ),
+    "ad.relu": lambda a: f"tl.maximum({a}, 0)",
+    "ad.tanh": (lambda a: f"tl.math.tanh({a}.to(tl.float32)).to({a}.dtype)"),
+    "ad.reduce_sum": lambda a: f"tl.sum({a}.to(tl.float32), 0)",
+    "ad.reduce_mean": (lambda a, ncols: f"(tl.sum({a}.to(tl.float32), 0) * (1.0 / {ncols}))"),
+    "ad.splat": None,  # handled specially — just inline the scalar value
+    "ad.cast": lambda a, dt: f"{a}.to({dt})",
+}
+
+# Triton dtype name for MLIR element types
+_TRITON_DTYPE_MAP = {
+    "f16": "tl.float16",
+    "f32": "tl.float32",
+    "bf16": "tl.bfloat16",
+    "f64": "tl.float64",
+}
+
+
+def _mlir_elem_to_triton_str(tensor_type: TensorType) -> str:
+    """Return Triton dtype string for a TensorType's element type."""
+    elem_str = str(tensor_type.element_type)
+    return _TRITON_DTYPE_MAP.get(elem_str, "tl.float32")
+
+
+def _get_tensor_rank(val: SSAValue) -> int:
+    """Return the rank (number of dims) of an SSAValue's TensorType."""
+    if isinstance(val.type, TensorType):
+        return len(val.type.get_shape())
+    return 0
+
+
+def _is_broadcast_input(val: SSAValue, max_rank: int) -> bool:
+    """Return True if this input is lower rank (broadcast/weight)."""
+    return _get_tensor_rank(val) < max_rank
+
+
+def _get_ncols(inputs: List[SSAValue]) -> int:
+    """Return the last-dim size from the highest-rank input."""
+    for inp in inputs:
+        if isinstance(inp.type, TensorType):
+            shape = inp.type.get_shape()
+            if len(shape) >= 2:
+                return shape[-1]
+    # Fallback: use the last dim of any input
+    for inp in inputs:
+        if isinstance(inp.type, TensorType):
+            shape = inp.type.get_shape()
+            if shape:
+                return shape[-1]
+    raise ValueError("Cannot determine N_COLS from subgraph inputs")
+
+
+def generate_kernel_from_subgraph(subgraph) -> Callable:
+    """Generate a Triton kernel from a FusibleSubgraph and register it.
+
+    Walks the subgraph ops in topological order, emits Triton expressions,
+    wraps them in kernel boilerplate, compiles via ``exec()``, and registers
+    the result as a ``torch.library.custom_op``.
+
+    Args:
+        subgraph: A ``FusibleSubgraph`` with ops, inputs, and outputs.
+
+    Returns:
+        A callable that takes torch tensors (matching subgraph inputs) and
+        returns a tuple of output tensors.
+    """
+    sg_hash = KernelCache.hash_subgraph(subgraph)
+
+    # Check cache first
+    cached = _kernel_cache.get(sg_hash)
+    if cached is not None:
+        return cached
+
+    # Also check if the custom op was already registered in _generated_op_cache
+    cache_key = f"mlir_fused_{sg_hash}"
+    if cache_key in _generated_op_cache:
+        return _generated_op_cache[cache_key]
+
+    n_inputs = len(subgraph.inputs)
+    n_outputs = len(subgraph.outputs)
+    ncols = _get_ncols(subgraph.inputs)
+
+    # Determine max rank among inputs to detect broadcast inputs
+    max_rank = max((_get_tensor_rank(inp) for inp in subgraph.inputs), default=2)
+
+    # Map SSAValue -> variable name
+    val_names: dict[int, str] = {}
+
+    # Assign names to subgraph inputs
+    for i, inp in enumerate(subgraph.inputs):
+        val_names[id(inp)] = f"v{i}"
+
+    # Track which inputs are broadcast (1D weights)
+    broadcast_flags = [_is_broadcast_input(inp, max_rank) for inp in subgraph.inputs]
+
+    # Build kernel body lines
+    body_lines = []
+
+    # Load all subgraph inputs
+    for i, inp in enumerate(subgraph.inputs):
+        if broadcast_flags[i]:
+            body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask)")
+        else:
+            body_lines.append(f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask)")
+
+    # Process ops in topological order
+    temp_counter = 0
+    for op in subgraph.ops:
+        op_name = op.name
+        emitter = _EMIT.get(op_name)
+
+        if op_name == "ad.splat":
+            # Inline the constant value
+            float_val = op.attributes["value"]
+            if isinstance(float_val, FloatAttr):
+                scalar = float_val.value.data
+            else:
+                scalar = float(str(float_val))
+            result_name = f"t{temp_counter}"
+            body_lines.append(f"    {result_name} = {scalar}")
+            temp_counter += 1
+            # Map the result SSAValue
+            for r in op.results:
+                val_names[id(r)] = result_name
+
+        elif op_name == "ad.reduce_mean":
+            # reduce_mean(input, ncols)
+            input_val = op.operands[0]
+            input_name = val_names[id(input_val)]
+            result_name = f"t{temp_counter}"
+            expr = _EMIT["ad.reduce_mean"](input_name, ncols)
+            body_lines.append(f"    {result_name} = {expr}")
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
+        elif op_name == "ad.reduce_sum":
+            input_val = op.operands[0]
+            input_name = val_names[id(input_val)]
+            result_name = f"t{temp_counter}"
+            expr = _EMIT["ad.reduce_sum"](input_name)
+            body_lines.append(f"    {result_name} = {expr}")
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
+        elif op_name == "ad.cast":
+            input_val = op.operands[0]
+            input_name = val_names[id(input_val)]
+            # Get target dtype from the result type
+            result_type = op.results[0].type
+            triton_dt = _mlir_elem_to_triton_str(result_type)
+            result_name = f"t{temp_counter}"
+            expr = _EMIT["ad.cast"](input_name, triton_dt)
+            body_lines.append(f"    {result_name} = {expr}")
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
+        elif emitter is not None:
+            # Standard elementwise op
+            operand_names = [val_names[id(v)] for v in op.operands]
+            result_name = f"t{temp_counter}"
+            expr = emitter(*operand_names)
+            body_lines.append(f"    {result_name} = {expr}")
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+        else:
+            raise ValueError(f"Unsupported op for Triton codegen: {op_name}")
+
+    # Store all subgraph outputs
+    for i, out in enumerate(subgraph.outputs):
+        out_name = val_names[id(out)]
+        body_lines.append(f"    tl.store(out{i}_ptr + row_off + offs, {out_name}, mask=mask)")
+
+    # Build parameter lists
+    in_ptr_params = [f"in{i}_ptr" for i in range(n_inputs)]
+    out_ptr_params = [f"out{i}_ptr" for i in range(n_outputs)]
+    all_ptr_params = in_ptr_params + out_ptr_params
+
+    kernel_name = f"fused_kernel_{sg_hash}"
+    params_str = ",\n    ".join(
+        all_ptr_params
+        + ["row_stride: tl.constexpr", "N_COLS: tl.constexpr", "BLOCK_N: tl.constexpr"]
+    )
+
+    preamble = textwrap.dedent("""\
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < N_COLS
+    row_off = pid * row_stride""")
+
+    preamble_lines = ["    " + line for line in preamble.splitlines()]
+
+    kernel_src = (
+        f"@triton.jit\n"
+        f"def {kernel_name}(\n"
+        f"    {params_str},\n"
+        f"):\n" + "\n".join(preamble_lines) + "\n" + "\n".join(body_lines) + "\n"
+    )
+
+    # Build launcher function
+    in_tensor_params = [f"input{i}" for i in range(n_inputs)]
+    out_alloc_lines = []
+    # Determine output shapes from subgraph output types
+    for i, out in enumerate(subgraph.outputs):
+        # Find which input to use as shape reference
+        out_rank = _get_tensor_rank(out)
+        if out_rank < max_rank:
+            # Scalar-like output (from reduction) — use first full-rank input shape
+            out_alloc_lines.append(
+                f"    out{i} = torch.empty("
+                f"input0.shape[:-1] + (1,), device=input0.device, dtype=input0.dtype)"
+            )
+        else:
+            out_alloc_lines.append(f"    out{i} = torch.empty_like(input0)")
+
+    launch_args = [f"input{i}" for i in range(n_inputs)] + [f"out{i}" for i in range(n_outputs)]
+
+    return_tuple = ", ".join(f"out{i}" for i in range(n_outputs))
+
+    launcher_name = f"launch_{sg_hash}"
+    launcher_src = (
+        f"def {launcher_name}({', '.join(in_tensor_params)}):\n"
+        f"    feat_size = input0.size(-1)\n"
+        f"    seq_len = input0.numel() // feat_size\n"
+        f"    row_stride = input0.stride(-2) if input0.dim() >= 2 else feat_size\n"
+        f"    BLOCK_N = triton.next_power_of_2(feat_size)\n" + "\n".join(out_alloc_lines) + "\n"
+        f"    grid = (seq_len,)\n"
+        f"    {kernel_name}[grid](\n"
+        f"        {', '.join(launch_args)},\n"
+        f"        row_stride=row_stride,\n"
+        f"        N_COLS=feat_size,\n"
+        f"        BLOCK_N=BLOCK_N,\n"
+        f"        num_warps=4,\n"
+        f"        num_stages=3,\n"
+        f"    )\n"
+        f"    return ({return_tuple},)\n"
+    )
+
+    # Compile the kernel + launcher by writing to a temp file.
+    # Triton's @jit requires inspect.getsourcelines() to work, which needs
+    # the function to live in an actual .py file on disk.
+    full_src = (
+        "import triton\n"
+        "import triton.language as tl\n"
+        "import torch\n\n" + kernel_src + "\n" + launcher_src
+    )
+
+    import importlib.util
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", prefix=f"triton_gen_{sg_hash}_", delete=False
+    ) as f:
+        f.write(full_src)
+        tmp_path = f.name
+
+    spec = importlib.util.spec_from_file_location(f"_triton_gen_{sg_hash}", tmp_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    launcher_fn = getattr(mod, launcher_name)
+
+    # Register as torch.library.custom_op
+    op_name = f"auto_deploy::mlir_fused_{sg_hash}"
+
+    # Build the custom op dynamically
+    tensor_annotations = ", ".join(f"input{i}: torch.Tensor" for i in range(n_inputs))
+    return_annotation = "tuple[" + ", ".join("torch.Tensor" for _ in range(n_outputs)) + "]"
+
+    # Build fake return expressions
+    fake_returns = []
+    for i, out in enumerate(subgraph.outputs):
+        out_rank = _get_tensor_rank(out)
+        if out_rank < max_rank:
+            fake_returns.append(
+                "torch.empty(input0.shape[:-1] + (1,), device=input0.device, dtype=input0.dtype)"
+            )
+        else:
+            fake_returns.append("torch.empty_like(input0)")
+
+    fake_returns_str = ", ".join(fake_returns)
+
+    reg_src = (
+        f'@torch.library.custom_op("{op_name}", mutates_args=())\n'
+        f"def the_op({tensor_annotations}) -> {return_annotation}:\n"
+        f"    return launcher_fn({', '.join(in_tensor_params)})\n"
+        f"\n"
+        f"@the_op.register_fake\n"
+        f"def _({tensor_annotations}):\n"
+        f"    return ({fake_returns_str},)\n"
+    )
+
+    reg_globals = {"torch": torch, "launcher_fn": launcher_fn}
+    exec(reg_src, reg_globals)  # noqa: S102
+
+    # Build a wrapper that calls via torch.ops
+    op_short_name = f"mlir_fused_{sg_hash}"
+
+    def make_wrapper(name, n_in):
+        def wrapper(*args):
+            op_fn = getattr(torch.ops.auto_deploy, name)
+            return op_fn(*args)
+
+        return wrapper
+
+    wrapper = make_wrapper(op_short_name, n_inputs)
+
+    _generated_op_cache[cache_key] = wrapper
+    _kernel_cache.put(sg_hash, wrapper)
+
+    return wrapper
 
 
 def _get_triton_fused_add_rmsnorm_op():
