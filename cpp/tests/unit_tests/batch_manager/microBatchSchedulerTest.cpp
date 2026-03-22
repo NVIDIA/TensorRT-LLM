@@ -889,6 +889,65 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextFCFS)
     }
 }
 
+TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextFCFS_OverBudgetMultiRequest)
+{
+    // Regression test for FCFS compute-aware scheduling with multiple requests and reusable tokens.
+    //
+    // Setup: 3 requests, each promptLen=20, reusable=15.
+    //   Compute budget = 7 (maxNumTokens=7, no generation requests).
+    //   Total compute if all fit: 3 * (20 - 15) = 15 > 7 → allContextRequestsFit = false,
+    //   FCFS chunk allocation is exercised.
+    //
+    // The model processes min(chunk_size, P - reusable) tokens per request starting from
+    // context_current_position = reusable. chunk_size must stay <= capacity so that model
+    // tokens do not exceed max_num_tokens.
+    //
+    // Expected (correct compute-aware FCFS):
+    //   req0: chunk=20 (full context fits; model processes min(20,5)=5 tokens; budget 7→2)
+    //   req1: chunk=2  (capacity=2 remaining; model processes min(2,5)=2 tokens; budget 2→0)
+    //   req2: chunk=0  (no budget remaining; not scheduled)
+    //
+    // Bug (raw-token FCFS): req0 gets chunk=7 (limited by raw budget), req1 and req2 starved.
+    constexpr SizeType32 maxNumTokens = 7;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 chunkUnitSize = 1;
+    constexpr SizeType32 reusableTokens = 15;
+    constexpr SizeType32 promptLen = 20;
+    constexpr SizeType32 maxNewTokens = 5;
+    constexpr ContextChunkingPolicy ctxChunkPolicy{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED};
+
+    mNumContexts = 3;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler
+        = std::make_shared<MicroBatchScheduler>(ContextChunkingConfig{ctxChunkPolicy, chunkUnitSize}, std::nullopt);
+
+    RequestVector activeRequests;
+    auto req0 = createRequest(promptLen, maxNewTokens, 0);
+    auto req1 = createRequest(promptLen, maxNewTokens, 1);
+    auto req2 = createRequest(promptLen, maxNewTokens, 2);
+    req0->setEstimatedReusableTokens(reusableTokens);
+    req1->setEstimatedReusableTokens(reusableTokens);
+    req2->setEstimatedReusableTokens(reusableTokens);
+    activeRequests.push_back(req0);
+    activeRequests.push_back(req1);
+    activeRequests.push_back(req2);
+
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    // req0 and req1 are scheduled; req2 gets chunk=0 (no budget) and is filtered out.
+    EXPECT_EQ(ctx.size(), 2u) << "req0 and req1 fit; req2 has no budget and is not scheduled";
+
+    // req0: full context fits (compute cost = 5 <= budget 7); chunk = promptLen.
+    EXPECT_EQ(req0->getContextChunkSize(), promptLen) << "req0: full context fits (model 5 tokens out of budget 7)";
+
+    // req1: 2 compute tokens remain; chunk = 2 (the remaining capacity, not reusable + capacity).
+    EXPECT_EQ(req1->getContextChunkSize(), 2) << "req1: chunk = remaining capacity (2), model processes 2 tokens";
+
+    // req2: no budget remaining; chunk = 0, not scheduled.
+    EXPECT_EQ(req2->getContextChunkSize(), 0) << "req2: budget exhausted, chunk = 0";
+}
+
 TEST_F(MicroBatchSchedulerTest, ReusableTokensZeroHasNoEffect)
 {
     // Verify that zero reusable tokens (the default) produces identical scheduling

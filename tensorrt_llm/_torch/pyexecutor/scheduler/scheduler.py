@@ -600,11 +600,12 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self._fit_draft_tokens(requests, capacity, unit_size)
 
     def _chunk_equal_progress(self, requests: RequestList, capacity: Optional[int], unit_size: int):
-        num_ctx_tokens = 0
+        # capacity is a compute-token budget (non-reusable only). Track compute tokens, not including reusable tokens.
+        num_compute_tokens = 0
         num_tokens_single_loop = 1
 
         # C++ Loop: while ((!capacity || numCtxTokens < capacity) && numTokensSingleLoop)
-        while (capacity is None or num_ctx_tokens < capacity) and num_tokens_single_loop > 0:
+        while (capacity is None or num_compute_tokens < capacity) and num_tokens_single_loop > 0:
             num_tokens_single_loop = 0
             for req in requests:
                 past_size = req.context_chunk_size
@@ -619,11 +620,15 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 req.context_chunk_size = suggested_size
 
                 actual_size = req.context_chunk_size
-                actual_increment = actual_size - past_size
+                # Compute the compute-token increment (reusable tokens don't consume budget).
+                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
+                past_compute = max(0, past_size - min(reusable, past_size))
+                actual_compute = max(0, actual_size - min(reusable, actual_size))
+                compute_increment = actual_compute - past_compute
 
                 # Check Constraints
-                # 1. Capacity
-                if capacity is not None and (num_ctx_tokens + actual_increment > capacity):
+                # 1. Capacity (in compute tokens)
+                if capacity is not None and (num_compute_tokens + compute_increment > capacity):
                     req.context_chunk_size = past_size  # Revert
                     continue
 
@@ -632,8 +637,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     req.context_chunk_size = past_size  # Revert
                     continue
 
-                num_ctx_tokens += actual_increment
-                num_tokens_single_loop += actual_increment
+                num_compute_tokens += compute_increment
+                num_tokens_single_loop += compute_increment
 
     def _chunk_fcfs(
         self,
@@ -660,8 +665,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
             # Limit by compute capacity (reusable tokens are free)
             if current_compute_capacity < compute_cost:
-                # Can't fit all new tokens; allow all reusable + whatever compute fits
-                actual_size = min(reusable + current_compute_capacity, suggested_size)
+                # Model processes min(chunk_size, P - reusable) tokens from position reusable.
+                # To keep model tokens within budget: chunk_size = capacity (not reusable + capacity).
+                actual_size = int(current_compute_capacity)
 
             # Limit by max_context_length (applies to compute portion only)
             if self.max_context_length is not None:
@@ -676,14 +682,28 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
             req.context_chunk_size = int(actual_size)
 
-            # Subtract only the compute portion from capacity
-            actual_compute = max(0, req.context_chunk_size - reusable)
+            # Subtract actual model token count: min(chunk_size, P - reusable).
+            actual_model_cost = min(req.context_chunk_size, max(0, int(suggested_size) - reusable))
             if capacity is not None:
-                current_compute_capacity -= actual_compute
+                current_compute_capacity -= actual_model_cost
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
-        # Calculate tokens already taken by the batch so far
-        num_ctx_tokens = sum(req.context_chunk_size for req in requests)
+        # capacity is a compute-token budget. Sum actual model tokens per request:
+        # min(chunk_size, P - reusable), where P = context_remaining_length for first chunk.
+        num_ctx_tokens = sum(
+            min(
+                req.context_chunk_size,
+                max(
+                    0,
+                    req.context_remaining_length
+                    - min(
+                        req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
+                        req.context_remaining_length,
+                    ),
+                ),
+            )
+            for req in requests
+        )
 
         for req in requests:
             if req.is_last_context_chunk and req.has_draft_tokens:

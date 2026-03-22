@@ -2234,6 +2234,9 @@ void KVCacheManager::startScheduling()
 SizeType32 KVCacheManager::getNeededBlocksOneStep(
     LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const
 {
+    // Default to zero; overwritten below when block reuse is active for a first-chunk context request.
+    req.setEstimatedReusableTokens(0);
+
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
         auto const chunkSize = req.mMaxNewTokens;
@@ -2293,6 +2296,8 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
 
 SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
 {
+    // Default to zero; overwritten below when block reuse is active for a first-chunk context request.
+    req.setEstimatedReusableTokens(0);
 
     if (isCrossKv())
     {
