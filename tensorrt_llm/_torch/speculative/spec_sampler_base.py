@@ -238,19 +238,30 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
-        # Pad to match fixed-size store buffers for index_copy_.
-        if o_new_tokens.shape[1] < (self.draft_len + 1):
+        # Pad or truncate to match fixed-size store buffers for index_copy_.
+        # Use actual store buffer dimensions (which may differ from draft_len
+        # when _get_max_new_tokens is overridden, e.g. dynamic tree mode).
+        new_tokens_width = self.store.new_tokens.shape[0]
+        next_new_tokens_width = self.store.next_new_tokens.shape[0]
+        draft_tokens_width = self.store.next_draft_tokens.shape[1]
+        if o_new_tokens.shape[1] < new_tokens_width:
             o_new_tokens = torch.nn.functional.pad(
-                o_new_tokens, (0, (self.draft_len + 1) - o_new_tokens.shape[1])
+                o_new_tokens, (0, new_tokens_width - o_new_tokens.shape[1])
             )
-        if o_next_draft_tokens.shape[1] < self.draft_len:
+        elif o_new_tokens.shape[1] > new_tokens_width:
+            o_new_tokens = o_new_tokens[:, :new_tokens_width]
+        if o_next_draft_tokens.shape[1] < draft_tokens_width:
             o_next_draft_tokens = torch.nn.functional.pad(
-                o_next_draft_tokens, (0, self.draft_len - o_next_draft_tokens.shape[1])
+                o_next_draft_tokens, (0, draft_tokens_width - o_next_draft_tokens.shape[1])
             )
-        if o_next_new_tokens.shape[1] < (self.draft_len + 1):
+        elif o_next_draft_tokens.shape[1] > draft_tokens_width:
+            o_next_draft_tokens = o_next_draft_tokens[:, :draft_tokens_width]
+        if o_next_new_tokens.shape[1] < next_new_tokens_width:
             o_next_new_tokens = torch.nn.functional.pad(
-                o_next_new_tokens, (0, (self.draft_len + 1) - o_next_new_tokens.shape[1])
+                o_next_new_tokens, (0, next_new_tokens_width - o_next_new_tokens.shape[1])
             )
+        elif o_next_new_tokens.shape[1] > next_new_tokens_width:
+            o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)

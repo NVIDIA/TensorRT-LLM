@@ -605,16 +605,28 @@ class TestLlama(unittest.TestCase):
         attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
         attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
         attn_metadata_gen_phase_0.prepare()
+        is_tree_phase1 = is_spec_dec_tree if get_sm_version() < 100 else False
+        spec_tree_mgr_phase1 = None
+        if is_tree_phase1:
+            max_draft_1 = gen_input_ids_1.size(-1) - 1
+            spec_tree_mgr_phase1 = SpecTreeManager(
+                max_num_requests=1,
+                use_dynamic_tree=False,
+                max_total_draft_tokens=max_draft_1,
+                max_draft_len=max_draft_1,
+                eagle_choices=None,
+                dynamic_tree_max_topK=10,
+            )
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_spec_dec_tree
-            if get_sm_version() < 100 else False,
+            is_spec_dec_tree=is_tree_phase1,
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_1.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
             is_target_model=True,
-            model_is_wrapped=False)
+            model_is_wrapped=False,
+            spec_tree_manager=spec_tree_mgr_phase1)
 
         gen_position_ids_1 = [
             torch.full(
@@ -661,16 +673,28 @@ class TestLlama(unittest.TestCase):
         attn_metadata_ref.spec_decoding_packed_mask = None
         attn_metadata_ref.spec_decoding_generation_lengths = None
         attn_metadata_ref.prepare()
+        is_tree_ref = is_spec_dec_tree if get_sm_version() < 100 else False
+        spec_tree_mgr_ref = None
+        if is_tree_ref:
+            max_draft_ref = gen_input_ids_ref.size(-1) - 1
+            spec_tree_mgr_ref = SpecTreeManager(
+                max_num_requests=1,
+                use_dynamic_tree=False,
+                max_total_draft_tokens=max_draft_ref,
+                max_draft_len=max_draft_ref,
+                eagle_choices=None,
+                dynamic_tree_max_topK=10,
+            )
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_spec_dec_tree
-            if get_sm_version() < 100 else False,
+            is_spec_dec_tree=is_tree_ref,
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_ref.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
             is_target_model=True,
-            model_is_wrapped=False)
+            model_is_wrapped=False,
+            spec_tree_manager=spec_tree_mgr_ref)
 
         gen_position_ids_ref = [
             torch.full((gen_input_ids_ref.size(-1), ),
