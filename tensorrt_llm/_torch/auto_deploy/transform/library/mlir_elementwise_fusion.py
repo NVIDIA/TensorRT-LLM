@@ -122,10 +122,16 @@ class MLIRElementwiseFusion(BaseTransform):
                 default=0,
             )
 
+        def _min_output_rank(sg):
+            return min(
+                (len(out.type.get_shape()) for out in sg.outputs if isinstance(out.type, _TT)),
+                default=0,
+            )
+
         num_replaced = 0
         num_skipped = 0
         for sg in subgraphs:
-            if _max_input_rank(sg) < 2:
+            if _max_input_rank(sg) < 2 or _min_output_rank(sg) < 2:
                 num_skipped += 1
                 continue
             try:
