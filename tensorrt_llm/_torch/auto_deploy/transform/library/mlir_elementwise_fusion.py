@@ -110,9 +110,24 @@ class MLIRElementwiseFusion(BaseTransform):
                 skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Step 4: Generate Triton kernels and replace subgraphs in MLIR
+        # Step 4: Generate Triton kernels and replace subgraphs in MLIR.
+        # Skip subgraphs where all inputs are 1D or lower — these are pure
+        # weight-space ops (e.g., weight + 1.0) that don't benefit from fusion
+        # and the row-based Triton kernel can't handle them correctly.
+        from xdsl.dialects.builtin import TensorType as _TT
+
+        def _max_input_rank(sg):
+            return max(
+                (len(inp.type.get_shape()) for inp in sg.inputs if isinstance(inp.type, _TT)),
+                default=0,
+            )
+
         num_replaced = 0
+        num_skipped = 0
         for sg in subgraphs:
+            if _max_input_rank(sg) < 2:
+                num_skipped += 1
+                continue
             try:
                 kernel_fn = generate_kernel_from_subgraph(sg)
                 if kernel_fn is not None:
@@ -122,7 +137,9 @@ class MLIRElementwiseFusion(BaseTransform):
             except Exception as e:
                 self._log_warning(f"Failed to fuse subgraph: {e}")
 
-        self._log_info(f"Replaced {num_replaced}/{len(subgraphs)} subgraphs with fused kernels")
+        self._log_info(
+            f"Replaced {num_replaced}/{len(subgraphs)} subgraphs (skipped {num_skipped} low-rank)"
+        )
 
         if num_replaced == 0:
             return gm, TransformInfo(
