@@ -46,6 +46,9 @@ def replace_subgraph_with_fused_op(
             added for the fused op so MLIR-to-FX can reconstruct it.
     """
     import torch
+    from xdsl.dialects.builtin import TensorType
+
+    from ..dialect import mlir_to_torch_dtype
 
     node_key = f"mlir_fused_{sg_hash}"
     op_fn = getattr(torch.ops.auto_deploy, node_key)
@@ -53,11 +56,24 @@ def replace_subgraph_with_fused_op(
     # Build the args template: each subgraph input maps to a positional operand
     args_template = tuple(("__mlir_operand__", i) for i in range(len(subgraph.inputs)))
 
+    # Build FakeTensor "val" metadata so downstream shape propagation works.
+    # The fused op returns a tuple of tensors matching the subgraph output shapes.
+    # Dynamic dimensions (-1 in MLIR) are replaced with a placeholder size (2)
+    # since shape_prop will recompute exact shapes later.
+    fake_vals = []
+    for out in subgraph.outputs:
+        if isinstance(out.type, TensorType):
+            shape = [s if s >= 0 else 2 for s in out.type.get_shape()]
+            dtype = mlir_to_torch_dtype(out.type.element_type)
+            fake_vals.append(torch.empty(shape, dtype=dtype, device="meta"))
+    val_meta = tuple(fake_vals) if len(fake_vals) > 1 else fake_vals[0] if fake_vals else None
+
     # Store synthetic metadata for the MLIR→FX converter
     metadata[node_key] = {
         "_original_target": op_fn,
         "_args_template": args_template,
         "_kwargs_template": {},
+        "val": val_meta,
     }
 
     # Determine the MLIR result types from the subgraph outputs

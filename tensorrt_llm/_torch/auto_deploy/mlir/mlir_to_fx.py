@@ -308,8 +308,12 @@ class MLIRToFXConverter:
         elif len(op.outputs) > 1:
             # Also map the base node by name
             self._node_name_map[node_key] = node
+            # Propagate per-element "val" metadata to getitem nodes
+            node_val = node.meta.get("val")
             for i, res in enumerate(op.outputs):
                 getitem_node = graph.call_function(operator.getitem, args=(node, i))
+                if isinstance(node_val, (tuple, list)) and i < len(node_val):
+                    getitem_node.meta["val"] = node_val[i]
                 self._map_value(res, getitem_node)
 
     # ------------------------------------------------------------------
