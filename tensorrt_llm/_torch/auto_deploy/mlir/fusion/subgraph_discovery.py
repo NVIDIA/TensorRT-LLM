@@ -112,6 +112,46 @@ def discover_fusible_subgraphs(mlir_module: ModuleOp) -> List[FusibleSubgraph]:
             groups[next_id] = [op]
             next_id += 1
 
+    # Second pass: pull in zero-operand fusible ops (e.g., AdSplat constants)
+    # whose outputs are consumed exclusively by ops in a single larger group.
+    for op in block.ops:
+        if not _is_fusible(op) or len(op.operands) > 0:
+            continue
+        # Skip if already in a multi-op group
+        current_group = op_to_group.get(op)
+        if current_group is not None and len(groups[current_group]) > 1:
+            continue
+        # Check if all users of this op's results are in a single group
+        target_group = None
+        all_in_one_group = True
+        for res in op.results:
+            for use in res.uses:
+                consumer = use.operation
+                if consumer not in op_to_group:
+                    all_in_one_group = False
+                    break
+                g = op_to_group[consumer]
+                if target_group is None:
+                    target_group = g
+                elif g != target_group:
+                    all_in_one_group = False
+                    break
+            if not all_in_one_group:
+                break
+        if all_in_one_group and target_group is not None and target_group != current_group:
+            # Remove from old single-op group if applicable
+            if current_group is not None:
+                groups[current_group].remove(op)
+            op_to_group[op] = target_group
+            # Insert at the position before its first consumer in the group
+            group_ops = groups[target_group]
+            insert_idx = len(group_ops)
+            for i, group_op in enumerate(group_ops):
+                for operand in group_op.operands:
+                    if operand.owner is op:
+                        insert_idx = min(insert_idx, i)
+            group_ops.insert(insert_idx, op)
+
     # Build FusibleSubgraph objects for groups with >=2 ops
     result = []
     for gid, ops in groups.items():

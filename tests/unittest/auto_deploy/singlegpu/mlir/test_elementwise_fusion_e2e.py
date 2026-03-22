@@ -112,11 +112,10 @@ def test_decompose_discover_codegen_numerical_correctness():
     largest_sg = max(subgraphs, key=lambda sg: len(sg.ops))
     kernel_fn = generate_kernel_from_subgraph(largest_sg)
 
-    # After decomposition, the subgraph inputs (in order) are:
+    # After decomposition with splat pulled into subgraph, the inputs are:
     #   input[0]: x (2D block arg)
     #   input[1]: residual (2D block arg)
-    #   input[2]: eps splat output (2D scalar-like, from AdSplat outside subgraph)
-    #   input[3]: weight (1D block arg)
+    #   input[2]: weight (1D block arg)
     # And the subgraph outputs are:
     #   output[0]: added = x + residual (from ad.add)
     #   output[1]: normed = rmsnorm(added, weight) (from ad.mul)
@@ -124,26 +123,8 @@ def test_decompose_discover_codegen_numerical_correctness():
     rest = torch.randn_like(xt)
     wt = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
 
-    # Build input tensors matching subgraph.inputs shapes
-    input_tensors = []
-    block_arg_tensors = [xt, rest, wt]  # ordered by block arg index
-    block_arg_idx = 0
-    for inp in largest_sg.inputs:
-        owner = inp.owner
-        if hasattr(owner, "name") and owner.name == "ad.splat":
-            # Eps constant from splat op — use the attribute value
-            from xdsl.dialects.builtin import FloatAttr as FA
-
-            eps_val = owner.attributes["value"]
-            scalar = eps_val.value.data if isinstance(eps_val, FA) else float(str(eps_val))
-            shape = tuple(inp.type.get_shape())
-            input_tensors.append(torch.full(shape, scalar, device="cuda", dtype=torch.bfloat16))
-        else:
-            input_tensors.append(block_arg_tensors[block_arg_idx])
-            block_arg_idx += 1
-
-    # Run generated kernel
-    result = kernel_fn(*input_tensors)
+    # Run generated kernel — inputs match subgraph.inputs (x, residual, weight)
+    result = kernel_fn(xt, rest, wt)
 
     # Reference: add + rmsnorm
     added_ref = xt + rest
