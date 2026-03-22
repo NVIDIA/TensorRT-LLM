@@ -549,9 +549,6 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        print(
-            f"creating kv cache manager with actual type = {self._kv_cache_manager_cls.__name__}"
-        )
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,

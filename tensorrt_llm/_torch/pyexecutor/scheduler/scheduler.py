@@ -490,7 +490,6 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
             need_chunking = True
 
-        print(f"need_chunking: {need_chunking}")
         # 3. Apply Chunking Strategy if needed
         if need_chunking:
             assert ctx_chunk_config is not None, (

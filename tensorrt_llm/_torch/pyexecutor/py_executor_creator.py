@@ -592,7 +592,6 @@ def create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
-        print(f"use FORCE_CHUNK for hybrid linear model")
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
                             kv_cache_config.mamba_prefix_cache_step)
 

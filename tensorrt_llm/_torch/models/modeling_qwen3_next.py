@@ -20,9 +20,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-import tensorrt_llm._utils
-from tensorrt_llm._utils import dump
-
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
@@ -623,9 +620,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             conv_state_indices=cache_indices,
         )
 
-        # torch.cuda.synchronize()
-        # print(f"Layer {self.layer_idx} mixed_qkv: {hex(mixed_qkv.data_ptr())} \n{mixed_qkv[0:3, 0:5]}")
-
         # Direct slicing instead of torch.split for better performance
         key_size = self.key_dim // self.attn_tp_size
         query = mixed_qkv[..., :key_size]
@@ -718,7 +712,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc).transpose(0, 1)
-        # print(f"EXTEND Layer {self.layer_idx} mixed_qkv: {hex(mixed_qkv.data_ptr())} \n{mixed_qkv[0:3, 0:5]}")
         key_split_dim = self.key_dim // self.attn_tp_size
         value_split_dim = self.value_dim // self.attn_tp_size
 
@@ -1180,7 +1173,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-        # after_mlp = hidden_states.clone()
         return hidden_states, residual
 
 
@@ -1194,7 +1186,6 @@ class Qwen3NextModel(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
         super().__init__(model_config)
-        self.context_count = 0
         config = self.model_config
         pretrained_config = self.model_config.pretrained_config
         self.aux_stream = torch.cuda.Stream()
@@ -1252,19 +1243,10 @@ class Qwen3NextModel(DecoderModel):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
-        if len(input_ids) > 1 and len(input_ids) < 500:
-            # print(f"input_ids: {len(input_ids)}")
-            tensorrt_llm._utils.dump.reset_iter()
-            tensorrt_llm._utils.dump.set_enable_layer(range(1))
-            tensorrt_llm._utils.dump.set_enable_iter(range(1))
-            tensorrt_llm._utils.dump.set_prefix(f"request{self.context_count}")
-            if dump.enabled:
-                self.context_count += 1
         mamba_metadata = attn_metadata.mamba_metadata
         if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
             attn_metadata.mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests, chunk_size=128)
-        # print(f"input_ids: {input_ids}")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1280,7 +1262,6 @@ class Qwen3NextModel(DecoderModel):
                 spec_metadata=spec_metadata,
                 mamba_metadata=mamba_metadata,
                 lora_params=lora_params)
-        tensorrt_llm._utils.dump.inc_iter()
         return hidden_states
 
 

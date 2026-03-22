@@ -609,7 +609,6 @@ class KVCacheManager(BaseResourceManager):
         return need_blocks
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        # print("KVCacheManager::prepare_resources")
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
@@ -622,7 +621,6 @@ class KVCacheManager(BaseResourceManager):
                     if req.ctx_iters == 0:
                         seq_len = sum(
                             len(ctx_block) for ctx_block in req.ctx_blocks)
-                        # print(f"add_sequence for request {req.py_request_id}")
                         self.impl.add_sequence(
                             req.py_request_id,
                             seq_len + (len(req.query_id) if self.mapping.cp_rank
@@ -659,7 +657,6 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
-                # print(f"request {req.py_request_id} get_num_tokens: {req.get_num_tokens(0)}")
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)

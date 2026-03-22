@@ -806,9 +806,6 @@ class LinearHybridCacheManager(KVCacheManager):
 
         self.use_fake_pool = os.getenv("USE_FAKE_POOL", "0") == "1"
 
-        print(
-            f"conv_state_shape: {self.conv_state_shape}, ssm_state_shape: {self.ssm_state_shape}, conv_bytes: {self.conv_bytes}, ssm_bytes: {self.ssm_bytes}"
-        )
         self.linear_attention_metadata = LinearAttentionMetadata()
         # TODO(xiweny): confirm if this is needed
         # self.linear_attention_metadata.linear_layer_indices = [0, 1]
@@ -817,7 +814,6 @@ class LinearHybridCacheManager(KVCacheManager):
             self.ssm_bytes + self.conv_bytes)
         self.linear_attention_metadata.input_features_bytes_per_token = 0
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_prefix_cache_step
-        # self.linear_attention_metadata.save_last_snapshot = True
 
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
@@ -834,9 +830,6 @@ class LinearHybridCacheManager(KVCacheManager):
                 kv_cache_config.max_attention_window.append(
                     LinearCacheType.RECURRENT_STATES.
                     value if mamba_layer_mask[i] else max_seq_len)
-        print(
-            f"kv_cache_config.max_attention_window: {kv_cache_config.max_attention_window}"
-        )
         # pass remaining arguments to super class
         super().__init__(
             kv_cache_config,
@@ -867,9 +860,6 @@ class LinearHybridCacheManager(KVCacheManager):
             mapping,
             layer_mask=mamba_layer_mask,
         )
-        print(f"mamba_layer_mask: {mamba_layer_mask}, layer_mask: {layer_mask}")
-        print(f"linear_pp_layers: {self.linear_pp_layers}")
-        print(f"pp_layers: {self.linear_pp_layers}")
         idx = 0
         self.linear_layer_offsets = {}
         for layer_id in self.linear_pp_layers:
@@ -884,13 +874,6 @@ class LinearHybridCacheManager(KVCacheManager):
         self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.linear_pp_layers[0]][0]
-        print(
-            f"recurrent_states_pool_index: {self.recurrent_states_pool_index}")
-        print(f"kv_cache_pool_mapping: {self.kv_cache_pool_mapping}")
-        print(f"layer_offsets: {self.layer_offsets}")
-        # for layer_id in self.linear_pp_layers:
-        #     assert self.kv_cache_pool_mapping[self.layer_offsets[layer_id]][
-        #         0] == self.recurrent_states_pool_index, f"All linear layers should be in the same pool, but layer_id: {layer_id} (self.layer_offsets[layer_id]={self.layer_offsets[layer_id]}) is in pool {self.kv_cache_pool_mapping[self.layer_offsets[layer_id]][0]} while the recurrent states pool is {self.recurrent_states_pool_index}"
         self._cuda_state_indices = torch.zeros([self.max_batch_size],
                                                dtype=torch.int32,
                                                device="cuda")
@@ -913,7 +896,6 @@ class LinearHybridCacheManager(KVCacheManager):
         self.pool = self.impl.get_recurrent_states_pool().view(
             torch.uint8).reshape(self.num_linear_layers, -1,
                                  self.ssm_bytes + self.conv_bytes)
-        print(f"shape of self.pool: {self.pool.shape}")
         torch.fill_(self.pool, 0)
         self.ssm_states_mapping = {}
         self.conv_states_mapping = {}
@@ -922,13 +904,6 @@ class LinearHybridCacheManager(KVCacheManager):
             conv_states = self._get_conv_states(layer_id)
             self.ssm_states_mapping[layer_id] = ssm_states
             self.conv_states_mapping[layer_id] = conv_states
-        pool_ref = self.impl.get_recurrent_states_pool()
-        print(
-            f"address range of linear pool: {hex(self.pool.data_ptr())} to {hex(self.pool.data_ptr() + self.pool.numel() * self.pool.itemsize)}"
-        )
-        print(
-            f"address range of linear pool: {hex(pool_ref.data_ptr())} to {hex(pool_ref.data_ptr() + pool_ref.numel() * pool_ref.itemsize)}"
-        )
 
         self._request_block_ids = {}
         self.iter = 0
@@ -964,7 +939,6 @@ class LinearHybridCacheManager(KVCacheManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
-        # print(f"add_dummy_requests for request_ids {request_ids}")
         requests = super().add_dummy_requests(request_ids, token_nums, is_gen,
                                               prepare_resource,
                                               max_num_draft_tokens, use_mrope,
@@ -982,23 +956,15 @@ class LinearHybridCacheManager(KVCacheManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        # print(f"iter {self.iter}: update_resources with {len(scheduled_batch.context_requests)} context requests and {len(scheduled_batch.generation_requests)} generation requests")
         super().update_resources(scheduled_batch, attn_metadata,
                                  kv_cache_dtype_byte_size)
 
     @nvtx_range("hybrid_prepare_resources")
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
-        # print(
-        #     f"iter {self.iter}: prepare_resources with {len(scheduled_batch.context_requests)} context requests and {len(scheduled_batch.generation_requests)} generation requests")
         self.iter += 1
         self.requests = scheduled_batch.context_requests + \
             scheduled_batch.generation_requests
         for req in self.requests:
-            # if req.is_context_finished:
-            #     print(f"request {req.py_request_id}: num_tokens={self.get_num_tokens(req)}, prompt_len={req.prompt_len}")
-            # else:
-            #     print(f"request {req.py_request_id}: num_tokens={self.get_num_tokens(req)}, prompt_len={req.prompt_len}, context_current_position={req.context_current_position}, context_chunk_size={req.context_chunk_size}")
-            # print(f"request {req.py_request_id}: block_ids={self.get_cache_indices(req, LinearCacheType.RECURRENT_STATES.value)}")
             self.impl.copy_linear_attention_block(req)
         self.impl.sync_transfer_manager_with_buffer_manager()
         self.impl.refresh_blocks()
@@ -1026,14 +992,12 @@ class LinearHybridCacheManager(KVCacheManager):
         return ret
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        # print(f"free_resources for request {request.py_request_id}")
         if request in self.requests:
             self.requests.remove(request)
         super().free_resources(request, pin_on_release)
 
     # TODO: this should be called only once per iteration (not per layer)
     def _setup_state_indices(self) -> torch.Tensor:
-        # return torch.tensor([req.py_request_id for req in self.requests], dtype=torch.int32, device="cuda")
         block_indices = []
         for req in self.requests:
             if req.is_context_finished:
@@ -1044,7 +1008,6 @@ class LinearHybridCacheManager(KVCacheManager):
             else:
                 next_step = req.prompt_len - 1
             block_indices.append(next_step // self.tokens_per_block)
-            # print(f"request {req.py_request_id}, next_step={next_step}, block_index={next_step // self.tokens_per_block} block_ids: {self.get_cache_indices(req, LinearCacheType.RECURRENT_STATES.value)}")
         self.impl.copy_batch_block_offsets(
             self.host_block_offsets,
             [req.py_request_id for req in self.requests], 1, 0)
@@ -1059,9 +1022,6 @@ class LinearHybridCacheManager(KVCacheManager):
             assert value >= 0 and value < self.blocks_per_window[LinearCacheType.RECURRENT_STATES.value][0], \
                 f"value: {value} at index {i} is not in the range of [0, {self.blocks_per_window[LinearCacheType.RECURRENT_STATES.value][0]}).\nself.host_block_offsets[self.recurrent_states_pool_index, :, 0, 0]: {self.host_block_offsets[self.recurrent_states_pool_index, :, 0, 0]}"
             host_linear_block_offsets[i] = value
-        # print(f"block_indices: {block_indices}")
-        # print(f"self.host_block_offsets: {self.host_block_offsets[self.recurrent_states_pool_index, :len(block_indices), 0, :20]}")
-        # print(f"host_linear_block_offsets: {host_linear_block_offsets}")
 
         torch.fill_(self._cuda_state_indices, 0)
         self._cuda_state_indices[:len(self.requests
