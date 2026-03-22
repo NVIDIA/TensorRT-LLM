@@ -9,9 +9,13 @@ attn_backend: trtllm
 max_batch_size: 256
 max_seq_len: 16384
 transforms:
+  match_fp8_swiglu_pattern:
+    enabled: true
   fuse_trtllm_attn_quant_fp8:
     enabled: true
   fuse_fp8_gemms:
+    enabled: true
+  fuse_fp8_swiglu:
     enabled: true
   fuse_rmsnorm_quant_fp8:
     enabled: true
