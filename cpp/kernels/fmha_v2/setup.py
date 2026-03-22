@@ -6792,11 +6792,11 @@ def enumerate_kernels():
                                      head_size_v=512)
         enumerate_qmma_kernels(specs, sm=120)
         enumerate_qmma_flash_kernels(specs, sm=120, dtype='e4m3_fp32')
-        # Add bf16 output MLA kernels.
+        # Add bf16 output kernels for e4m3 input (MLA and standard head sizes).
         enumerate_qmma_flash_kernels(specs,
                                      sm=120,
                                      dtype='e4m3_fp32',
-                                     head_sizes=[192, 576],
+                                     head_sizes=[128, 192, 576],
                                      output_dtype="bf16")
 
     if 'ENABLE_HMMA_FP32' in os.environ:
