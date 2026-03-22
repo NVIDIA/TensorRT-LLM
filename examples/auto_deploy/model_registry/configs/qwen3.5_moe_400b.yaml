@@ -23,7 +23,6 @@ transforms:
   fuse_nvfp4_moe:
     backend: trtllm_gen
   detect_sharding:
-    dist_mapping: {moe_tp: 8, moe_ep: 1}
     allreduce_strategy: SYMM_MEM
     shard_all_unprocessed: true
     simple_shard_filter: "lm_head"
