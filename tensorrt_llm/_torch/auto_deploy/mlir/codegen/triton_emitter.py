@@ -47,22 +47,21 @@ _kernel_cache = KernelCache()
 # ---------------------------------------------------------------------------
 
 _EMIT = {
+    # All computation is in f32 (loads upcast, stores downcast), so no per-op
+    # dtype management needed. This matches hand-written normalization kernels.
     "ad.add": lambda a, b: f"({a} + {b})",
     "ad.mul": lambda a, b: f"({a} * {b})",
     "ad.sub": lambda a, b: f"({a} - {b})",
     "ad.neg": lambda a: f"(-{a})",
     "ad.pow": None,  # handled specially — needs attribute extraction for exponent
-    "ad.rsqrt": (lambda a: f"(1.0 / tl.sqrt({a}.to(tl.float32))).to({a}.dtype)"),
+    "ad.rsqrt": lambda a: f"(1.0 / tl.sqrt({a}))",
     "ad.sqrt": lambda a: f"tl.sqrt({a})",
-    "ad.silu": (lambda a: f"({a} * tl.sigmoid({a}.to(tl.float32))).to({a}.dtype)"),
-    "ad.gelu": (
-        lambda a: f"({a} * 0.5 * (1.0 + tl.math.erf("
-        f"{a}.to(tl.float32) * 0.7071067811865476))).to({a}.dtype)"
-    ),
+    "ad.silu": lambda a: f"({a} * tl.sigmoid({a}))",
+    "ad.gelu": lambda a: f"({a} * 0.5 * (1.0 + tl.math.erf({a} * 0.7071067811865476)))",
     "ad.relu": lambda a: f"tl.maximum({a}, 0)",
-    "ad.tanh": (lambda a: f"tl.math.tanh({a}.to(tl.float32)).to({a}.dtype)"),
-    "ad.reduce_sum": lambda a: f"tl.sum({a}.to(tl.float32), 0)",
-    "ad.reduce_mean": (lambda a, ncols: f"(tl.sum({a}.to(tl.float32), 0) * (1.0 / {ncols}))"),
+    "ad.tanh": lambda a: f"tl.math.tanh({a})",
+    "ad.reduce_sum": lambda a: f"tl.sum({a}, 0)",
+    "ad.reduce_mean": lambda a, ncols: f"(tl.sum({a}, 0) * (1.0 / {ncols}))",
     "ad.splat": None,  # handled specially — just inline the scalar value
     "ad.cast": lambda a, dt: f"{a}.to({dt})",
 }
@@ -153,15 +152,19 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     # Track which inputs are broadcast (1D weights)
     broadcast_flags = [_is_broadcast_input(inp, max_rank) for inp in subgraph.inputs]
 
-    # Build kernel body lines
+    # Build kernel body lines.
+    # All computation is done in f32 for numerical stability (matching hand-written
+    # kernels). Loads upcast to f32; stores downcast to the original dtype.
     body_lines = []
 
-    # Load all subgraph inputs
+    # Load all subgraph inputs and upcast to f32
     for i, inp in enumerate(subgraph.inputs):
         if broadcast_flags[i]:
-            body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask)")
+            body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask).to(tl.float32)")
         else:
-            body_lines.append(f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask)")
+            body_lines.append(
+                f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask).to(tl.float32)"
+            )
 
     # Process ops in topological order
     temp_counter = 0
@@ -193,9 +196,7 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             else:
                 exp_val = float(str(exp_attr))
             result_name = f"t{temp_counter}"
-            body_lines.append(
-                f"    {result_name} = tl.math.pow({base_name}.to(tl.float32), {exp_val}).to({base_name}.dtype)"
-            )
+            body_lines.append(f"    {result_name} = tl.math.pow({base_name}, {exp_val})")
             temp_counter += 1
             for r in op.results:
                 val_names[id(r)] = result_name
@@ -246,15 +247,22 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         else:
             raise ValueError(f"Unsupported op for Triton codegen: {op_name}")
 
-    # Store all subgraph outputs
+    # Store all subgraph outputs, downcasting from f32 to the original dtype
     for i, out in enumerate(subgraph.outputs):
         out_name = val_names[id(out)]
         out_rank = _get_tensor_rank(out)
-        if out_rank < max_rank:
-            # Scalar-like output (from reduction) — store one value per row
-            body_lines.append(f"    tl.store(out{i}_ptr + pid, {out_name})")
+        # Determine original output dtype for downcast from f32
+        if isinstance(out.type, TensorType):
+            out_dt = _mlir_elem_to_triton_str(out.type)
         else:
-            body_lines.append(f"    tl.store(out{i}_ptr + row_off + offs, {out_name}, mask=mask)")
+            out_dt = "tl.bfloat16"
+        cast = f".to({out_dt})" if out_dt != "tl.float32" else ""
+        if out_rank < max_rank:
+            body_lines.append(f"    tl.store(out{i}_ptr + pid, {out_name}{cast})")
+        else:
+            body_lines.append(
+                f"    tl.store(out{i}_ptr + row_off + offs, {out_name}{cast}, mask=mask)"
+            )
 
     # Build parameter lists
     in_ptr_params = [f"in{i}_ptr" for i in range(n_inputs)]
