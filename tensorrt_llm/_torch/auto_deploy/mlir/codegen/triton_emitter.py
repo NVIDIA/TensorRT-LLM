@@ -351,13 +351,21 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     tensor_annotations = ", ".join(f"input{i}: torch.Tensor" for i in range(n_inputs))
     return_annotation = "tuple[" + ", ".join("torch.Tensor" for _ in range(n_outputs)) + "]"
 
-    # Build fake return expressions
+    # Build fake return expressions using explicit output shapes from MLIR types.
+    # Dynamic dims (-1) are replaced with the corresponding input dim.
     fake_returns = []
     for i, out in enumerate(subgraph.outputs):
-        out_rank = _get_tensor_rank(out)
-        if out_rank < max_rank:
+        if isinstance(out.type, TensorType):
+            shape_parts = []
+            for d, s in enumerate(out.type.get_shape()):
+                if s < 0:
+                    # Dynamic dim — derive from highest-rank input's same dim
+                    shape_parts.append(f"input0.shape[{d}]")
+                else:
+                    shape_parts.append(str(s))
+            shape_expr = "(" + ", ".join(shape_parts) + (",)" if len(shape_parts) == 1 else ")")
             fake_returns.append(
-                "torch.empty(input0.shape[:-1] + (1,), device=input0.device, dtype=input0.dtype)"
+                f"torch.empty({shape_expr}, device=input0.device, dtype=input0.dtype)"
             )
         else:
             fake_returns.append("torch.empty_like(input0)")
