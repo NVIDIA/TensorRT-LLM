@@ -31,6 +31,7 @@ from xdsl.ir import Operation, SSAValue
 from .codegen.triton_emitter import TritonCodegen
 from .dialect import (
     AdAdd,
+    AdCast,
     AdFusedAddRMSNorm,
     AdGelu,
     AdGraphInput,
@@ -38,14 +39,19 @@ from .dialect import (
     AdMul,
     AdNeg,
     AdOpaque,
+    AdPow,
+    AdReduceMean,
+    AdReduceSum,
     AdRelu,
     AdRMSNorm,
     AdRsqrt,
     AdSilu,
+    AdSplat,
     AdSqrt,
     AdSub,
     AdTanh,
     AdToDtype,
+    mlir_to_torch_dtype,
 )
 
 
@@ -139,6 +145,16 @@ class MLIRToFXConverter:
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.rsqrt.default)
         elif isinstance(mlir_op, AdSqrt):
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.sqrt.default)
+        elif isinstance(mlir_op, AdReduceMean):
+            self._convert_reduce(mlir_op, graph, metadata, torch.ops.aten.mean.dim)
+        elif isinstance(mlir_op, AdReduceSum):
+            self._convert_reduce(mlir_op, graph, metadata, torch.ops.aten.sum.dim_IntList)
+        elif isinstance(mlir_op, AdSplat):
+            self._convert_splat(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdCast):
+            self._convert_cast(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdPow):
+            self._convert_pow(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdRMSNorm):
             self._convert_rmsnorm(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdToDtype):
@@ -187,6 +203,49 @@ class MLIRToFXConverter:
         """Reconstruct a unary elementwise aten op from an ``ad.*`` op."""
         input_node = self._resolve(op.input)
         node = graph.call_function(aten_target, args=(input_node,))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_reduce(self, op, graph: Graph, metadata: dict, aten_target) -> None:
+        """Reconstruct a reduction aten op from ``ad.reduce_mean`` or ``ad.reduce_sum``."""
+        input_node = self._resolve(op.input)
+        dim = op.dim.value.data
+        keepdim = bool(op.keepdim.value.data)
+        node = graph.call_function(aten_target, args=(input_node, [dim], keepdim))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_splat(self, op, graph: Graph, metadata: dict) -> None:
+        """Reconstruct a scalar constant from ``ad.splat``."""
+        from xdsl.dialects.builtin import FloatAttr as FA
+
+        val = op.value
+        scalar = val.value.data if isinstance(val, FA) else float(str(val))
+        # Create a constant node — splat values appear as scalar args downstream
+        node = graph.call_function(torch.ops.aten.scalar_tensor.default, args=(scalar,))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_cast(self, op, graph: Graph, metadata: dict) -> None:
+        """Reconstruct dtype cast from ``ad.cast``."""
+        input_node = self._resolve(op.input)
+        result_type = op.output.type
+        if hasattr(result_type, "element_type"):
+            target_dtype = mlir_to_torch_dtype(result_type.element_type)
+        else:
+            target_dtype = op.target_dtype.value.data
+        node = graph.call_function(torch.ops.aten.to.dtype, args=(input_node, target_dtype))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_pow(self, op, graph: Graph, metadata: dict) -> None:
+        """Reconstruct pow from ``ad.pow``."""
+        from xdsl.dialects.builtin import FloatAttr as FA
+
+        base_node = self._resolve(op.base)
+        exp_attr = op.exponent
+        exp_val = exp_attr.value.data if isinstance(exp_attr, FA) else float(str(exp_attr))
+        node = graph.call_function(torch.ops.aten.pow.Tensor_Scalar, args=(base_node, exp_val))
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)
 
