@@ -302,10 +302,13 @@ class MLIRToFXConverter:
 
         self._restore_meta(node, node_key, metadata)
 
-        # Map outputs and register by node_key for name-based lookup
-        if len(op.outputs) == 1:
+        # Map outputs and register by node_key for name-based lookup.
+        # Generated fused kernels always return a tuple (even for single output),
+        # so they always need getitem extraction.
+        is_fused_kernel = node_key.startswith("mlir_fused_")
+        if len(op.outputs) == 1 and not is_fused_kernel:
             self._map_value(op.outputs[0], node, node_key)
-        elif len(op.outputs) > 1:
+        elif len(op.outputs) >= 1:
             # Also map the base node by name
             self._node_name_map[node_key] = node
             # Propagate per-element "val" metadata to getitem nodes
