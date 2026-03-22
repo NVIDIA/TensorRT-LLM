@@ -282,21 +282,31 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         f"):\n" + "\n".join(preamble_lines) + "\n" + "\n".join(body_lines) + "\n"
     )
 
+    # Find the highest-rank input index for shape reference in launcher + fake impl.
+    # This avoids using a 1D weight as the shape reference when the activation
+    # tensor (higher rank) should be used.
+    ref_input_idx = 0
+    ref_input_rank = 0
+    for i_inp, inp in enumerate(subgraph.inputs):
+        rank = _get_tensor_rank(inp)
+        if rank > ref_input_rank:
+            ref_input_rank = rank
+            ref_input_idx = i_inp
+
     # Build launcher function
     in_tensor_params = [f"input{i}" for i in range(n_inputs)]
+    ref = f"input{ref_input_idx}"
     out_alloc_lines = []
     # Determine output shapes from subgraph output types
     for i, out in enumerate(subgraph.outputs):
-        # Find which input to use as shape reference
         out_rank = _get_tensor_rank(out)
         if out_rank < max_rank:
-            # Scalar-like output (from reduction) — use first full-rank input shape
             out_alloc_lines.append(
                 f"    out{i} = torch.empty("
-                f"input0.shape[:-1] + (1,), device=input0.device, dtype=input0.dtype)"
+                f"{ref}.shape[:-1] + (1,), device={ref}.device, dtype={ref}.dtype)"
             )
         else:
-            out_alloc_lines.append(f"    out{i} = torch.empty_like(input0)")
+            out_alloc_lines.append(f"    out{i} = torch.empty_like({ref})")
 
     launch_args = [f"input{i}" for i in range(n_inputs)] + [f"out{i}" for i in range(n_outputs)]
 
@@ -305,9 +315,9 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     launcher_name = f"launch_{sg_hash}"
     launcher_src = (
         f"def {launcher_name}({', '.join(in_tensor_params)}):\n"
-        f"    feat_size = input0.size(-1)\n"
-        f"    seq_len = input0.numel() // feat_size\n"
-        f"    row_stride = input0.stride(-2) if input0.dim() >= 2 else feat_size\n"
+        f"    feat_size = {ref}.size(-1)\n"
+        f"    seq_len = {ref}.numel() // feat_size\n"
+        f"    row_stride = {ref}.stride(-2) if {ref}.dim() >= 2 else feat_size\n"
         f"    BLOCK_N = triton.next_power_of_2(feat_size)\n" + "\n".join(out_alloc_lines) + "\n"
         f"    grid = (seq_len,)\n"
         f"    {kernel_name}[grid](\n"
@@ -352,23 +362,25 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     return_annotation = "tuple[" + ", ".join("torch.Tensor" for _ in range(n_outputs)) + "]"
 
     # Build fake return expressions using explicit output shapes from MLIR types.
-    # Dynamic dims (-1) are replaced with the corresponding input dim.
+    # Dynamic dims (-1) are resolved from the highest-rank input (the activation
+    # tensor, not a weight/bias), using the matching dimension index.
+    ref_input = f"input{ref_input_idx}"
+
     fake_returns = []
     for i, out in enumerate(subgraph.outputs):
         if isinstance(out.type, TensorType):
             shape_parts = []
             for d, s in enumerate(out.type.get_shape()):
                 if s < 0:
-                    # Dynamic dim — derive from highest-rank input's same dim
-                    shape_parts.append(f"input0.shape[{d}]")
+                    shape_parts.append(f"{ref_input}.shape[{d}]")
                 else:
                     shape_parts.append(str(s))
             shape_expr = "(" + ", ".join(shape_parts) + (",)" if len(shape_parts) == 1 else ")")
             fake_returns.append(
-                f"torch.empty({shape_expr}, device=input0.device, dtype=input0.dtype)"
+                f"torch.empty({shape_expr}, device={ref_input}.device, dtype={ref_input}.dtype)"
             )
         else:
-            fake_returns.append("torch.empty_like(input0)")
+            fake_returns.append(f"torch.empty_like({ref_input})")
 
     fake_returns_str = ", ".join(fake_returns)
 
