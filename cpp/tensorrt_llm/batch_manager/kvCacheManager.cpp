@@ -925,12 +925,11 @@ bool WindowBlockManager::verifyQueueIntegrity()
     }
     // Negative blockIds are placeholder blocks. mAllPlaceholderBlocksById is indexed by abs(blockId).
     auto const idx = static_cast<size_t>(-blockId);
-    TLLM_CHECK_WITH_INFO(!mAllPlaceholderBlocksById.empty() && idx < mAllPlaceholderBlocksById.size(),
-        "Placeholder blockId %d out of range (mAllPlaceholderBlocksById.size()=%zu)", blockId,
-        mAllPlaceholderBlocksById.size());
-    auto block = mAllPlaceholderBlocksById[idx];
-    TLLM_CHECK_WITH_INFO(block != nullptr, "Placeholder block with id %d is null", blockId);
-    return block;
+    if (idx >= mAllPlaceholderBlocksById.size() || blockId == KVCacheBlock::kCachedBlocksRootId)
+    {
+        return nullptr;
+    }
+    return mAllPlaceholderBlocksById[idx];
 }
 
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
@@ -1505,7 +1504,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     // Somebody else is using block or it is not a leaf, copy reusable tokens
                     auto newBlock = getFreeBlock(
                         sequence, matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
-                    mTransferManager->onboard(matchingBlock, newBlock, mPools, 0, mode, directory);
+                    mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
                     // allBlockStats.emplace_back(newBlock,
                     // std::string("PC")+std::to_string(matchingBlock->getBlockId())+"+"+std::to_string(numMatched)+"/"+std::to_string(matchingBlock->getBlockKey().uniqueTokens.size()));
                     // TODO: (optional) Send out event
