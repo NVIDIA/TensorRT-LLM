@@ -13,17 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MLIR-based unified elementwise fusion transform (prototype).
+"""MLIR-based unified elementwise fusion transform.
 
-Runs the full decompose -> discover -> codegen pipeline:
+Runs the full decompose -> discover -> codegen -> replace pipeline:
 1. FX -> MLIR conversion
 2. Decompose high-level ops (e.g. RMSNorm) into elementwise primitives
 3. Discover maximal fusible subgraphs among the primitives
 4. Generate Triton kernels for each subgraph
-
-This is a prototype: it reports discovered subgraphs and generates kernels
-but does NOT yet replace ops in the FX graph (graph-level replacement is
-future work). The original graph module is returned unchanged.
+5. Replace subgraph ops in MLIR with fused opaque ops
+6. MLIR -> FX conversion (produces graph with generated kernel calls)
 """
 
 from typing import List, Tuple, Type
@@ -54,19 +52,15 @@ class MLIRElementwiseFusionConfig(TransformConfig):
 
 @TransformRegistry.register("mlir_elementwise_fusion")
 class MLIRElementwiseFusion(BaseTransform):
-    """Unified MLIR elementwise fusion: decompose + discover + codegen.
+    """Unified MLIR elementwise fusion: decompose + discover + codegen + replace.
 
-    This prototype transform:
+    This transform:
     1. Converts the FX graph to MLIR (xDSL) using the ``ad`` dialect
     2. Decomposes high-level ops into elementwise primitives
     3. Discovers maximal fusible subgraphs
     4. Generates Triton kernels for each discovered subgraph
-
-    The generated kernels are registered as ``torch.library.custom_op`` entries
-    and cached for reuse. However, this prototype does NOT yet replace the
-    corresponding ops in the FX graph — it returns the original graph unchanged
-    and reports the number of fusible subgraphs found. FX-level replacement
-    is planned for a follow-up.
+    5. Replaces subgraph ops in MLIR with fused opaque ops
+    6. Converts MLIR back to FX with generated kernel calls
 
     Requires ``pip install xdsl``. Skipped gracefully if xDSL is not installed.
     """
@@ -88,10 +82,13 @@ class MLIRElementwiseFusion(BaseTransform):
             self._log_warning("xDSL not installed, skipping MLIR elementwise fusion")
             return gm, TransformInfo(skipped=True)
 
+        from ...mlir.codegen.kernel_cache import KernelCache
         from ...mlir.codegen.triton_emitter import generate_kernel_from_subgraph
         from ...mlir.decompose import run_decomposition
         from ...mlir.fusion.subgraph_discovery import discover_fusible_subgraphs
+        from ...mlir.fusion.subgraph_replace import replace_subgraph_with_fused_op
         from ...mlir.fx_to_mlir import FXToMLIRConverter
+        from ...mlir.mlir_to_fx import MLIRToFXConverter
 
         # Step 1: FX -> MLIR
         converter = FXToMLIRConverter(gm)
@@ -113,26 +110,32 @@ class MLIRElementwiseFusion(BaseTransform):
                 skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Step 4: Generate Triton kernels for each subgraph
-        num_generated = 0
+        # Step 4: Generate Triton kernels and replace subgraphs in MLIR
+        num_replaced = 0
         for sg in subgraphs:
             try:
                 kernel_fn = generate_kernel_from_subgraph(sg)
                 if kernel_fn is not None:
-                    num_generated += 1
+                    sg_hash = KernelCache.hash_subgraph(sg)
+                    replace_subgraph_with_fused_op(sg, kernel_fn, sg_hash, converter.metadata)
+                    num_replaced += 1
             except Exception as e:
-                self._log_warning(f"Failed to generate kernel for subgraph: {e}")
+                self._log_warning(f"Failed to fuse subgraph: {e}")
 
-        self._log_info(
-            f"Generated {num_generated}/{len(subgraphs)} Triton kernels "
-            "(FX graph replacement is not yet implemented — returning original graph)"
-        )
+        self._log_info(f"Replaced {num_replaced}/{len(subgraphs)} subgraphs with fused kernels")
 
-        # NOTE: FX graph replacement is future work. For now we return the
-        # original graph module unchanged but report what we found.
-        return gm, TransformInfo(
+        if num_replaced == 0:
+            return gm, TransformInfo(
+                skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Step 5: MLIR -> FX (with fused ops becoming kernel calls)
+        back_converter = MLIRToFXConverter(gm, codegen_mode="generate")
+        new_gm = back_converter.convert(mlir_module, converter.metadata)
+
+        return new_gm, TransformInfo(
             skipped=False,
-            num_matches=len(subgraphs),
-            is_clean=True,
-            has_valid_shapes=True,
+            num_matches=num_replaced,
+            is_clean=False,
+            has_valid_shapes=False,
         )

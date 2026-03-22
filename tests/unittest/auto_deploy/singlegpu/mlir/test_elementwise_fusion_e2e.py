@@ -304,3 +304,83 @@ def test_novel_fusion_numerical_correctness():
     assert len(result) >= 2, f"Expected at least 2 outputs, got {len(result)}"
     torch.testing.assert_close(result[0], added_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(result[1], gated_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_full_fx_roundtrip_with_replacement():
+    """Full pipeline: FX → MLIR → decompose → discover → codegen → replace → MLIR → FX.
+
+    Verifies the generated FX graph module produces correct outputs when the
+    fused kernel is actually called through the graph.
+    """
+    import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm  # noqa: F401
+
+    # Import custom ops so they're registered
+    import tensorrt_llm._torch.auto_deploy.mlir  # noqa: F401
+    from tensorrt_llm._torch.auto_deploy.mlir.codegen.kernel_cache import KernelCache
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.subgraph_replace import (
+        replace_subgraph_with_fused_op,
+    )
+    from tensorrt_llm._torch.auto_deploy.mlir.fx_to_mlir import FXToMLIRConverter
+    from tensorrt_llm._torch.auto_deploy.mlir.mlir_to_fx import MLIRToFXConverter
+
+    hidden = 128
+
+    class AddNormModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+            )
+            self.eps = 1e-5
+
+        def forward(self, x, residual):
+            added = x + residual
+            norm = torch.ops.auto_deploy.torch_rmsnorm(added, self.weight, self.eps)
+            return norm, added
+
+    model = AddNormModel()
+    x = torch.randn(2, 8, hidden, device="cuda", dtype=torch.bfloat16)
+    res = torch.randn_like(x)
+
+    # Export to FX graph
+    from torch.export import Dim
+
+    from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+
+    gm = torch_export_to_gm(
+        model,
+        args=(x, res),
+        dynamic_shapes=({0: Dim.DYNAMIC}, {0: Dim.DYNAMIC}),
+        clone=True,
+    )
+
+    # Step 1: FX → MLIR
+    converter = FXToMLIRConverter(gm)
+    mlir_module = converter.convert()
+
+    # Step 2: Decompose
+    num_decomposed = run_decomposition(mlir_module)
+    assert num_decomposed >= 1
+
+    # Step 3: Discover
+    subgraphs = discover_fusible_subgraphs(mlir_module)
+    assert len(subgraphs) >= 1
+    sg = max(subgraphs, key=lambda s: len(s.ops))
+
+    # Step 4: Generate kernel + replace
+    kernel_fn = generate_kernel_from_subgraph(sg)
+    sg_hash = KernelCache.hash_subgraph(sg)
+    replace_subgraph_with_fused_op(sg, kernel_fn, sg_hash, converter.metadata)
+
+    # Step 5: MLIR → FX
+    back_converter = MLIRToFXConverter(gm, codegen_mode="generate")
+    new_gm = back_converter.convert(mlir_module, converter.metadata)
+
+    # Step 6: Run the new graph and verify correctness
+    result = new_gm(x.clone(), res.clone())
+    ref = model(x.clone(), res.clone())
+
+    assert len(result) == len(ref), f"Output count mismatch: {len(result)} vs {len(ref)}"
+    torch.testing.assert_close(result[0], ref[0], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(result[1], ref[1], atol=1e-2, rtol=1e-2)
