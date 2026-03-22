@@ -39,10 +39,19 @@ from xdsl.ir import Block, Region, SSAValue
 from ..utils.node_utils import is_op
 from .dialect import (
     AdAdd,
+    AdGelu,
     AdGraphInput,
     AdGraphOutput,
+    AdMul,
+    AdNeg,
     AdOpaque,
+    AdRelu,
     AdRMSNorm,
+    AdRsqrt,
+    AdSilu,
+    AdSqrt,
+    AdSub,
+    AdTanh,
     AdToDtype,
     register_ad_dialect,
     tensor_type_from_meta,
@@ -183,6 +192,24 @@ class FXToMLIRConverter:
 
         if is_op(node, torch.ops.aten.add.Tensor):
             self._convert_add(node, block)
+        elif is_op(node, torch.ops.aten.mul.Tensor):
+            self._convert_binary_elementwise(node, block, AdMul)
+        elif is_op(node, torch.ops.aten.sub.Tensor):
+            self._convert_binary_elementwise(node, block, AdSub)
+        elif is_op(node, [torch.ops.aten.neg, torch.ops.aten.neg.default]):
+            self._convert_unary_elementwise(node, block, AdNeg)
+        elif is_op(node, [torch.ops.aten.silu, torch.ops.aten.silu.default]):
+            self._convert_unary_elementwise(node, block, AdSilu)
+        elif is_op(node, [torch.ops.aten.gelu, torch.ops.aten.gelu.default]):
+            self._convert_unary_elementwise(node, block, AdGelu)
+        elif is_op(node, [torch.ops.aten.relu, torch.ops.aten.relu.default]):
+            self._convert_unary_elementwise(node, block, AdRelu)
+        elif is_op(node, [torch.ops.aten.tanh, torch.ops.aten.tanh.default]):
+            self._convert_unary_elementwise(node, block, AdTanh)
+        elif is_op(node, [torch.ops.aten.rsqrt, torch.ops.aten.rsqrt.default]):
+            self._convert_unary_elementwise(node, block, AdRsqrt)
+        elif is_op(node, [torch.ops.aten.sqrt, torch.ops.aten.sqrt.default]):
+            self._convert_unary_elementwise(node, block, AdSqrt)
         elif _is_rmsnorm(node):
             self._convert_rmsnorm(node, block)
         elif is_op(node, torch.ops.aten.to.dtype):
@@ -206,6 +233,27 @@ class FXToMLIRConverter:
         self._value_map[node.name] = op.output
         self._store_meta(node)
         # Store FX node name so MLIR→FX can reconstruct references
+        self.metadata[node.name]["_fx_node_name"] = node.name
+
+    def _convert_binary_elementwise(self, node: Node, block: Block, op_cls) -> None:
+        """Generic binary elementwise: two inputs, one output."""
+        lhs = self._resolve_operand(node.args[0])
+        rhs = self._resolve_operand(node.args[1])
+        result_type = _result_type_for_node(node)
+        op = op_cls.build(operands=[lhs, rhs], result_types=[result_type])
+        block.add_op(op)
+        self._value_map[node.name] = op.output
+        self._store_meta(node)
+        self.metadata[node.name]["_fx_node_name"] = node.name
+
+    def _convert_unary_elementwise(self, node: Node, block: Block, op_cls) -> None:
+        """Generic unary elementwise: one input, one output."""
+        input_val = self._resolve_operand(node.args[0])
+        result_type = _result_type_for_node(node)
+        op = op_cls.build(operands=[input_val], result_types=[result_type])
+        block.add_op(op)
+        self._value_map[node.name] = op.output
+        self._store_meta(node)
         self.metadata[node.name]["_fx_node_name"] = node.name
 
     def _convert_rmsnorm(self, node: Node, block: Block) -> None:

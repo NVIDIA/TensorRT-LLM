@@ -32,10 +32,19 @@ from .codegen.triton_emitter import TritonCodegen
 from .dialect import (
     AdAdd,
     AdFusedAddRMSNorm,
+    AdGelu,
     AdGraphInput,
     AdGraphOutput,
+    AdMul,
+    AdNeg,
     AdOpaque,
+    AdRelu,
     AdRMSNorm,
+    AdRsqrt,
+    AdSilu,
+    AdSqrt,
+    AdSub,
+    AdTanh,
     AdToDtype,
 )
 
@@ -112,6 +121,24 @@ class MLIRToFXConverter:
             self._convert_graph_input(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdAdd):
             self._convert_add(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdMul):
+            self._convert_binary_elementwise(mlir_op, graph, metadata, torch.ops.aten.mul.Tensor)
+        elif isinstance(mlir_op, AdSub):
+            self._convert_binary_elementwise(mlir_op, graph, metadata, torch.ops.aten.sub.Tensor)
+        elif isinstance(mlir_op, AdNeg):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.neg.default)
+        elif isinstance(mlir_op, AdSilu):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.silu.default)
+        elif isinstance(mlir_op, AdGelu):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.gelu.default)
+        elif isinstance(mlir_op, AdRelu):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.relu.default)
+        elif isinstance(mlir_op, AdTanh):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.tanh.default)
+        elif isinstance(mlir_op, AdRsqrt):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.rsqrt.default)
+        elif isinstance(mlir_op, AdSqrt):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.sqrt.default)
         elif isinstance(mlir_op, AdRMSNorm):
             self._convert_rmsnorm(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdToDtype):
@@ -145,6 +172,21 @@ class MLIRToFXConverter:
         lhs = self._resolve(op.lhs)
         rhs = self._resolve(op.rhs)
         node = graph.call_function(torch.ops.aten.add.Tensor, args=(lhs, rhs))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_binary_elementwise(self, op, graph: Graph, metadata: dict, aten_target) -> None:
+        """Reconstruct a binary elementwise aten op from an ``ad.*`` op."""
+        lhs = self._resolve(op.lhs)
+        rhs = self._resolve(op.rhs)
+        node = graph.call_function(aten_target, args=(lhs, rhs))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_unary_elementwise(self, op, graph: Graph, metadata: dict, aten_target) -> None:
+        """Reconstruct a unary elementwise aten op from an ``ad.*`` op."""
+        input_node = self._resolve(op.input)
+        node = graph.call_function(aten_target, args=(input_node,))
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)
 
