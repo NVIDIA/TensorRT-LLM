@@ -4452,9 +4452,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler, torch_compile):
-        pytest.skip("Skip due to OOM at prepare resources. GPU: (no CI data)")
-        "RCCA: https://nvbugspro.nvidia.com/bug/5284463"
-        "Need to check Ada support"
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
 
         pytorch_config = dict(
