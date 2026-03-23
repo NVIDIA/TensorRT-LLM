@@ -25,6 +25,7 @@ namespace routingRenormalize
 
 static constexpr int NumExperts128Experts = 128;
 static constexpr int NumExperts512Experts = 512;
+static constexpr int NumExperts768Experts = 768;
 static constexpr int MaxSupportedExperts = 2048;
 
 static constexpr int NumTop8Experts = 8;
@@ -38,6 +39,8 @@ static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThread
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 
 static constexpr int BlockKernelMaxNumTokens = 4;
+static constexpr int DynBlockKernelMaxNumTokens = 16;
+static constexpr int DynBlockKernelMaxNumExperts = 512;
 
 template <typename DataType, typename InputType, int VecSize, int K, bool DoSoftmaxBeforeTopK>
 __forceinline__ __device__ void routingTopKExperts(cg::thread_block_tile<WarpSize> const& warp,
@@ -101,6 +104,10 @@ int32_t constexpr getMaxNumExperts(int32_t numExperts)
     {
         return NumExperts512Experts;
     }
+    else if (numExperts <= NumExperts768Experts)
+    {
+        return NumExperts768Experts;
+    }
     else if (numExperts <= MaxSupportedExperts)
     {
         return MaxSupportedExperts;
@@ -143,6 +150,11 @@ int32_t constexpr getMaxNumExperts(int32_t numExperts)
     {                                                                                                                  \
         LAUNCH_ROUTING_WITH_TOPK(                                                                                      \
             data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, NumExperts512Experts);      \
+    }                                                                                                                  \
+    else if (data.mNumExperts <= NumExperts768Experts)                                                                 \
+    {                                                                                                                  \
+        LAUNCH_ROUTING_WITH_TOPK(                                                                                      \
+            data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, NumExperts768Experts);      \
     }                                                                                                                  \
     else if (data.mNumExperts <= MaxSupportedExperts)                                                                  \
     {                                                                                                                  \
