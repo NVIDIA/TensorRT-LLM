@@ -2645,8 +2645,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.context_remaining_length == 0:
                     kv_cache.stop_committing()
             else:
-                success = kv_cache.resize(new_capacity,
-                                          req.context_current_position)
+                success = kv_cache.resize(None, req.context_current_position)
                 if not success:
                     raise ValueError(
                         f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
