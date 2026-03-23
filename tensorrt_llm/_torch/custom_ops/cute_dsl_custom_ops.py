@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, is_sm_100f
@@ -324,6 +325,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
         SinglePassMultiCTARadixTopKKernel
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
+        STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
+    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
+        SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -2828,30 +2833,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         torch.float32: cutlass.Float32,
     }
 
-    def _get_or_alloc_buffer(buffer_cache, key, shape, dtype, device="cuda"):
-        """Get cached buffer or allocate a new one, growing if needed.
-
-        Buffers only grow, never shrink, to maintain stable addresses for
-        CUDA Graph capture/replay. Returns a slice of the cached buffer
-        matching the requested shape.
-        """
-        buf = buffer_cache.get(key)
-        need_realloc = (buf is None or buf.dtype != dtype
-                        or any(b < s for b, s in zip(buf.shape, shape)))
-        if need_realloc:
-            # Grow: take element-wise max of old and new shape
-            if buf is not None:
-                alloc_shape = tuple(max(b, s) for b, s in zip(buf.shape, shape))
-            else:
-                alloc_shape = shape
-            buffer_cache[key] = torch.empty(alloc_shape,
-                                            dtype=dtype,
-                                            device=device)
-            buf = buffer_cache[key]
-        # Slice each dim to the requested size
-        slices = tuple(slice(0, s) for s in shape)
-        return buf[slices]
-
     class CuteDSLTopKDecodeSingleCTARunner:
         """Runner for CuTE DSL Top-K decode kernel (single CTA version).
 
@@ -2877,7 +2858,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             - Automatically selects occupancy optimization based on batch size
         """
         kernel_cache = dict()
-        buffer_cache = dict()
+        buffers = get_memory_buffers()
 
         @classmethod
         def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
@@ -2994,18 +2975,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
+            reserve = torch.cuda.is_current_stream_capturing()
 
             # Prepare output tensors
             if output_indices is not None:
                 output_indices_torch = output_indices
             else:
-                output_indices_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_indices", (num_rows, top_k),
-                    torch.int32)
+                output_indices_torch = cls.buffers.get_buffer(
+                    [num_rows, top_k],
+                    torch.int32,
+                    buffer_name="single_cta_output_indices",
+                    reserve_buffer=reserve)
             if return_val:
-                output_values_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_values", (num_rows, top_k),
-                    torch_dtype)
+                output_values_torch = cls.buffers.get_buffer(
+                    [num_rows, top_k],
+                    torch_dtype,
+                    buffer_name="single_cta_output_values",
+                    reserve_buffer=reserve)
             else:
                 output_values_torch = None
 
@@ -3017,14 +3003,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 2
             else:
                 buffer_numbers = 1
-            buffer_torch = _get_or_alloc_buffer(
-                cls.buffer_cache, "buffer",
-                (num_rows, buffer_numbers, bucketed_num_cols), torch.int32)
+            buffer_torch = cls.buffers.get_buffer(
+                [num_rows, buffer_numbers, bucketed_num_cols],
+                torch.int32,
+                buffer_name="single_cta_buffer",
+                reserve_buffer=reserve)
             buffer_torch = buffer_torch[:, :, :num_cols]
             # Prepare global counter for persistent dynamic scheduling
             if load_balance:
-                g_global_counter_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "g_global_counter", (1, ), torch.int32)
+                g_global_counter_torch = cls.buffers.get_buffer(
+                    [1],
+                    torch.int32,
+                    buffer_name="single_cta_g_global_counter",
+                    reserve_buffer=reserve)
                 g_global_counter_torch.zero_()
             else:
                 g_global_counter_torch = None
@@ -3163,7 +3154,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             - Automatically selects occupancy optimization based on batch size
         """
         kernel_cache = dict()
-        buffer_cache = dict()
+        buffers = get_memory_buffers()
 
         @classmethod
         def _compile(cls,
@@ -3346,6 +3337,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cls._compile(*key)
             compiled_kernel_first, compiled_kernel_second = \
                 cls.kernel_cache[key]
+            reserve = torch.cuda.is_current_stream_capturing()
 
             if dtype == cutlass.Float32:
                 buffer_numbers = 2
@@ -3353,33 +3345,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 1
 
             # Intermediate buffers for first kernel output
-            first_output_indices = _get_or_alloc_buffer(cls.buffer_cache,
-                                                        "first_output_indices",
-                                                        (num_rows, merge_cols),
-                                                        torch.int32)
-            first_output_values = _get_or_alloc_buffer(cls.buffer_cache,
-                                                       "first_output_values",
-                                                       (num_rows, merge_cols),
-                                                       torch_dtype)
+            first_output_indices = cls.buffers.get_buffer(
+                [num_rows, merge_cols],
+                torch.int32,
+                buffer_name="multi_cta_first_output_indices",
+                reserve_buffer=reserve)
+            first_output_values = cls.buffers.get_buffer(
+                [num_rows, merge_cols],
+                torch_dtype,
+                buffer_name="multi_cta_first_output_values",
+                reserve_buffer=reserve)
 
             # Shared buffer for both kernels (they run sequentially)
             buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-            buffer_torch = _get_or_alloc_buffer(
-                cls.buffer_cache, "buffer",
-                (num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2),
-                torch.int32)
+            buffer_torch = cls.buffers.get_buffer(
+                [num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2],
+                torch.int32,
+                buffer_name="multi_cta_buffer",
+                reserve_buffer=reserve)
 
             # Final output tensors
             if output_indices is not None:
                 output_indices_torch = output_indices
             else:
-                output_indices_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_indices", (num_rows, top_k),
-                    torch.int32)
+                output_indices_torch = cls.buffers.get_buffer(
+                    [num_rows, top_k],
+                    torch.int32,
+                    buffer_name="multi_cta_output_indices",
+                    reserve_buffer=reserve)
             if return_val:
-                output_values_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_values", (num_rows, top_k),
-                    torch_dtype)
+                output_values_torch = cls.buffers.get_buffer(
+                    [num_rows, top_k],
+                    torch_dtype,
+                    buffer_name="multi_cta_output_values",
+                    reserve_buffer=reserve)
             else:
                 output_values_torch = None
 
@@ -3422,8 +3421,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          kernels.
         """
         kernel_cache = dict()
-        # buffer_cache is used to cache the row_states and output buffers.
-        buffer_cache = dict()
+        buffers = get_memory_buffers()
+        _row_states_initialized = False
+        _row_states_buffer_name = "sp_mcta_row_states"
+        _buf_prefix = "sp_mcta_"
+        _kernel_class = SinglePassMultiCTARadixTopKKernel
+        _state_size = DISTRIBUTED_TOPK_STATE_SIZE
 
         @classmethod
         def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
@@ -3446,7 +3449,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             row_states_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
-                (n_groups, DISTRIBUTED_TOPK_STATE_SIZE),
+                (n_groups, cls._state_size),
                 stride_order=(1, 0),
                 assumed_align=32,
             )
@@ -3471,7 +3474,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
-            kernel_obj = SinglePassMultiCTARadixTopKKernel(
+            kernel_obj = cls._kernel_class(
                 dtype=dtype,
                 chunk_size=chunk_size,
                 top_k=top_k,
@@ -3623,6 +3626,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                    ctas_per_group, num_sms, return_val)
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
+            reserve = torch.cuda.is_current_stream_capturing()
 
             # Allocate row_states once with num_sms rows — large enough for
             # any ctas_per_group config because group_id < num_groups
@@ -3630,26 +3634,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # the slots it used at end-of-kernel, so the buffer stays clean
             # across calls without re-zeroing (FlashInfer pattern).
             # extra buffer: 148 * 770 * 4 bytes = 452960 bytes = 440 KB
-            if "row_states" not in cls.buffer_cache:
-                cls.buffer_cache["row_states"] = torch.zeros(
-                    num_sms,
-                    DISTRIBUTED_TOPK_STATE_SIZE,
-                    dtype=torch.int32,
-                    device="cuda")
-            row_states = cls.buffer_cache["row_states"]
+            buf_name = cls._row_states_buffer_name
+            row_states = cls.buffers.get_buffer([num_sms, cls._state_size],
+                                                torch.int32,
+                                                buffer_name=buf_name,
+                                                reserve_buffer=reserve)
+            if not cls._row_states_initialized:
+                row_states.zero_()
+                cls._row_states_initialized = True
 
             # Allocate outputs
             if output_indices is not None:
                 output_indices_torch = output_indices
             else:
-                output_indices_torch = _get_or_alloc_buffer(
-                    cls.buffer_cache, "output_indices", (num_rows, top_k),
-                    torch.int32)
+                output_indices_torch = cls.buffers.get_buffer(
+                    [num_rows, top_k],
+                    torch.int32,
+                    buffer_name=cls._buf_prefix + "output_indices",
+                    reserve_buffer=reserve)
             if return_val:
-                output_values = _get_or_alloc_buffer(cls.buffer_cache,
-                                                     "output_values",
-                                                     (num_rows, top_k),
-                                                     torch_dtype)
+                output_values = cls.buffers.get_buffer(
+                    [num_rows, top_k],
+                    torch_dtype,
+                    buffer_name=cls._buf_prefix + "output_values",
+                    reserve_buffer=reserve)
             else:
                 output_values = None
 
@@ -3662,6 +3670,99 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
             return output_indices_torch, output_values
+
+    class CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner(
+            CuteDSLTopKDecodeSinglePassMultiCTARunner):
+        """Runner for cluster-accelerated single-pass multi-CTA radix top-k.
+
+        Uses Blackwell cluster barriers and DSMEM for inter-CTA histogram
+        merging instead of global memory atomics.  Only 1 int32 per group
+        is needed in global memory (the output counter).
+
+        Inherits compile, chunk heuristics, and forward from the base runner;
+        overrides _get_chunk_config (cluster-size clamping) and forward
+        (unsupported-size fallback).
+        """
+        kernel_cache = dict()
+        buffers = get_memory_buffers()
+        _row_states_initialized = False
+        _row_states_buffer_name = "sp_mcta_cluster_row_states"
+        _buf_prefix = "sp_mcta_cluster_"
+        _kernel_class = SinglePassMultiCTARadixTopKClusterKernel
+        _state_size = CLUSTER_TOPK_STATE_SIZE
+
+        @classmethod
+        def _get_chunk_config(cls,
+                              dtype,
+                              num_cols: int,
+                              chunk_size: Optional[int] = None,
+                              num_copy_bits: int = 256,
+                              num_rows: int = 1):
+            """Resolve chunk_size and ctas_per_group, clamped to hw max cluster.
+
+            Returns:
+                (chunk_size, ctas_per_group, vec_size) or (None, None, None)
+            """
+            chunk_size, ctas_per_group, vec_size = super()._get_chunk_config(
+                dtype, num_cols, chunk_size, num_copy_bits, num_rows)
+
+            hw_max_cluster = _query_max_cluster_size()
+            if ctas_per_group > hw_max_cluster:
+                max_chunk, vec_size = cls._compute_max_chunk(
+                    dtype, num_copy_bits)
+                chunk_size = math.ceil(num_cols / hw_max_cluster)
+                chunk_size = (
+                    (chunk_size + vec_size - 1) // vec_size) * vec_size
+                if chunk_size > max_chunk:
+                    logger.warning(
+                        f"Cluster top-k: num_cols={num_cols} requires "
+                        f"chunk_size={chunk_size} which exceeds max shared "
+                        f"memory capacity ({max_chunk}). Cannot handle this "
+                        f"problem size with cluster kernel.")
+                    return None, None, None
+                ctas_per_group = math.ceil(num_cols / chunk_size)
+
+            return chunk_size, ctas_per_group, vec_size
+
+        @classmethod
+        def forward(
+            cls,
+            input_values: torch.Tensor,
+            seq_lens: torch.Tensor,
+            top_k: int,
+            next_n: int,
+            return_val: bool = False,
+            num_copy_bits: int = 256,
+            chunk_size: Optional[int] = None,
+            output_indices: Optional[torch.Tensor] = None,
+        ):
+            """Execute cluster-accelerated single-pass multi-CTA radix top-k.
+
+            Returns (None, None) if the problem size exceeds what the cluster
+            kernel can handle (caller should fall back to the non-cluster runner).
+            """
+            torch_dtype = input_values.dtype
+            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+            num_cols = input_values.shape[1]
+
+            max_chunk, _ = cls._compute_max_chunk(dtype, num_copy_bits)
+            hw_max_cluster = _query_max_cluster_size()
+            max_supported_cols = max_chunk * hw_max_cluster
+            if num_cols > max_supported_cols:
+                logger.warning(
+                    f"Cluster top-k does not support num_cols={num_cols} "
+                    f"(max supported: {max_supported_cols} = "
+                    f"max_chunk={max_chunk} x max_cluster={hw_max_cluster} "
+                    f"for dtype={torch_dtype}). "
+                    f"Falling back to non-cluster runner.")
+                return None, None
+
+            result = super().forward(input_values, seq_lens, top_k, next_n,
+                                     return_val, num_copy_bits, chunk_size,
+                                     output_indices)
+            if result[0] is None:
+                return None, None
+            return result
 
     @torch.library.custom_op("trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
                              mutates_args=(),
@@ -3774,6 +3875,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_copy_bits: int = 256,
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
+        single_pass_multi_cta_cluster: bool = False,
     ) -> None:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
         single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
@@ -3799,6 +3901,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
           memory access patterns).
           fp32: always use single-CTA (single-pass multi-CTA overhead not worth it).
 
+        When ``single_pass_multi_cta_cluster=True`` (requires ``single_pass_multi_cta=True``),
+        the cluster-accelerated variant (DSMEM + cluster barriers) is used unconditionally
+        instead of the auto cluster/distributed heuristic.
+
         Benchmark: overhead vs oracle ~2.4%, speedup vs always-single ~1.14x
         (Blackwell SM100 148 SMs, top_k=2048, fp32/bf16/fp16).
 
@@ -3814,6 +3920,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
             single_pass_multi_cta: Use single-pass multi-CTA radix top-k
+            single_pass_multi_cta_cluster: Force cluster-accelerated variant
+                (only effective when single_pass_multi_cta=True)
         """
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
@@ -3860,15 +3968,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                  and num_rows <= num_sms)
 
             if use_single_pass_multi_cta:
-                CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
-                    input_values=input_values,
-                    seq_lens=seq_lens,
-                    top_k=top_k,
-                    next_n=next_n,
-                    return_val=False,
-                    num_copy_bits=num_copy_bits,
-                    output_indices=output_indices,
-                )
+                # Use cluster variant when explicitly requested or when
+                # SM resources are sufficient (small batch); fall back to
+                # distributed (global memory atomics) for large batch.
+                # TODO:
+                # use_cluster = (single_pass_multi_cta_cluster
+                #                or num_rows * ctas_per_group <= num_sms * 2)
+                use_cluster = (single_pass_multi_cta_cluster)
+                if use_cluster:
+                    result = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
+                        input_values=input_values,
+                        seq_lens=seq_lens,
+                        top_k=top_k,
+                        next_n=next_n,
+                        return_val=False,
+                        num_copy_bits=num_copy_bits,
+                        output_indices=output_indices,
+                    )
+                    if result[0] is None:
+                        use_cluster = False
+
+                if not use_cluster:
+                    CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
+                        input_values=input_values,
+                        seq_lens=seq_lens,
+                        top_k=top_k,
+                        next_n=next_n,
+                        return_val=False,
+                        num_copy_bits=num_copy_bits,
+                        output_indices=output_indices,
+                    )
             else:
                 CuteDSLTopKDecodeSingleCTARunner.forward(
                     input_values=input_values,
@@ -3933,6 +4062,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_copy_bits: int = 256,
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
+        single_pass_multi_cta_cluster: bool = False,
     ) -> None:
         return None
 
@@ -3944,6 +4074,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         min_seq_len_log2: int = 10,
         max_seq_len_log2: int = 18,
         single_pass_multi_cta: bool = False,
+        single_pass_multi_cta_cluster: bool = False,
     ) -> None:
         """Pre-compile all CuTE DSL top-k kernel variants for every
         power-of-2 bucketed_num_cols in [2^min_seq_len_log2, 2^max_seq_len_log2].
@@ -3964,6 +4095,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits: Vectorized memory copy width (128 or 256).
             min_seq_len_log2: Log2 of minimum bucketed_num_cols (default 10 → 1024).
             max_seq_len_log2: Log2 of maximum bucketed_num_cols (default 18 → 262144).
+            single_pass_multi_cta: Use single-pass multi-CTA radix top-k
+                dispatch path instead of the legacy two-pass kernels.
+            single_pass_multi_cta_cluster: Force cluster-accelerated variant
+                (only effective when single_pass_multi_cta=True).
         """
         cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[dtype]
         return_val = False
@@ -4021,9 +4156,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
                     cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
                     num_sms, return_val)
+
+            # Cluster variant: enumerate configs using the cluster runner's
+            # _get_chunk_config (which clamps to hw max cluster size).
+            cluster_configs = set()
+            if single_pass_multi_cta_cluster:
+                for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                    num_cols = 1 << log2_n
+                    for nr in [1, 4, 16, 64, 256]:
+                        cfg = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._get_chunk_config(
+                            cutlass_dtype,
+                            num_cols,
+                            num_copy_bits=num_copy_bits,
+                            num_rows=nr)
+                        if cfg[0] is not None:
+                            cluster_configs.add((cfg[0], cfg[1]))
+                for cs, ctas in sorted(cluster_configs):
+                    CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._compile(
+                        cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
+                        num_sms, return_val)
+
             multi_cta_info = (
-                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs)"
-            )
+                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs"
+                f", cluster {len(cluster_configs)} configs)")
         else:
             # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
             # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)
