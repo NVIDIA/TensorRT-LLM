@@ -361,8 +361,9 @@ class KvCacheCreator:
 
         free_mem, total_mem = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
-        max_num_tokens_in_memory = max_memory // self._get_kv_size_per_token(
-        ) // self._tokens_per_block * self._tokens_per_block
+        max_num_tokens_in_memory = int(
+            max_memory // self._get_kv_size_per_token() //
+            self._tokens_per_block * self._tokens_per_block)
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
         return min(
