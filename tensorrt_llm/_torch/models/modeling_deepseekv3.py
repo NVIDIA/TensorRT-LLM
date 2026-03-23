@@ -793,8 +793,6 @@ class DeepseekV32Attention(MLA):
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
 
-        self.indexer = self.mqa.indexer
-
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,

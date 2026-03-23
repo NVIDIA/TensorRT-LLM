@@ -962,85 +962,6 @@ def mla_custom_op_inplace(
                            latent_cache_gen=latent_cache_gen)
 
 
-@torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
-def mla_dsa_proj(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    """Token-wise projections for DSA MLA (CUDA-graph-capturable).
-
-    Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-    indexer.pre_indexer_proj (FP8 quantize, weight scaling).  Does NOT
-    update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
-    because the scatter kernel accesses batch-specific metadata.
-
-    Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
-    handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
-    k_fp8, k_scale, weights] when the indexer runs.  Under torch compile,
-    _should_use_short_mha returns False so the result is always length 8,
-    keeping control flow straight-line for CUDA graph capture.
-    """
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
-
-
-@mla_dsa_proj.register_fake
-def _mla_dsa_proj_fake(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    # Under torch compile _should_use_short_mha is False, so always 8 tensors.
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    num_tokens = hidden_states.shape[0]
-    indexer = mla_layer.mqa.indexer
-    q = hidden_states.new_empty(
-        [num_tokens, mla_layer.num_heads_tp * mla_layer.qk_head_dim])
-    compressed_kv = hidden_states.new_empty(
-        [num_tokens, mla_layer.kv_lora_rank])
-    k_pe = hidden_states.new_empty([num_tokens, mla_layer.qk_rope_head_dim])
-    latent_cache = hidden_states.new_empty(
-        [num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim])
-    # Indexer intermediates: q_fp8, k_fp8, k_scale, weights
-    q_fp8 = hidden_states.new_empty(
-        [num_tokens, indexer.n_heads, indexer.head_dim],
-        dtype=torch.float8_e4m3fn)
-    k_fp8 = hidden_states.new_empty([num_tokens, indexer.head_dim],
-                                    dtype=torch.float8_e4m3fn)
-    k_scale = hidden_states.new_empty([num_tokens, 1], dtype=torch.float32)
-    weights = hidden_states.new_empty([num_tokens, indexer.n_heads],
-                                      dtype=torch.float32)
-    return [
-        q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights
-    ]
-
-
-@torch.library.custom_op("trtllm::mla_dsa_attn_inplace",
-                         mutates_args=("output", ))
-def mla_dsa_attn_inplace(
-    q: torch.Tensor,
-    compressed_kv: torch.Tensor,
-    k_pe: torch.Tensor,
-    latent_cache: torch.Tensor,
-    indexer_intermediates: List[torch.Tensor],
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-    output: torch.Tensor,
-) -> None:
-    """Batch-structure-dependent attention dispatch for DSA MLA.
-
-    indexer_intermediates is [q_fp8, k_fp8, k_scale, weights] when the
-    indexer ran in Op 1, or [] when short-MHA handled all tokens.
-    Runs sparse_attn_indexer then dispatches context/generation attention.
-    This op is excluded from CUDA graph capture.
-    """
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    mla_layer.forward_dsa_attn(q, compressed_kv, k_pe, latent_cache,
-                               indexer_intermediates, position_ids, metadata,
-                               output)
-
-
 def fp8_block_scaling_bmm_out(
     mat1: torch.Tensor,
     mat2_fp8: torch.Tensor,
@@ -1358,6 +1279,10 @@ class MLA(nn.Module):
             aux_stream=aux_stream,
         )
 
+        # Register MLA context with DSA backend so it can access MLA helpers
+        if self.is_dsa and hasattr(self.mqa, 'register_mla_context'):
+            self.mqa.register_mla_context(self)
+
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
 
         self.aux_stream = aux_stream
@@ -1569,7 +1494,9 @@ class MLA(nn.Module):
                      output: torch.Tensor,
                      latent_cache_gen: Optional[torch.Tensor] = None) -> None:
         """
-        Forward pass for the MLA module. Writes result into output tensor in-place.
+        Unified forward pass for the MLA module. Writes result into output
+        tensor in-place. Handles both standard MLA and DSA sparse attention
+        via the backend's predict_sparse_indices() hook.
 
         Args:
             position_ids (Optional[torch.IntTensor]): The position IDs.
@@ -1607,12 +1534,24 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
+        # For DSA, capture qr (compressed query before q_b_proj) for the indexer
+        qr = q if self.is_dsa else None
+
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
             lambda: torch.concat([compressed_kv, k_pe], dim=-1),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+        )
+
+        # Ask the attention backend to predict sparse indices (no-op for
+        # non-DSA backends, runs the indexer for DSA).
+        topk_indices = self.mqa.predict_sparse_indices(
+            attn_metadata,
+            qr=qr,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
         )
 
         assert q.shape[
@@ -1633,15 +1572,44 @@ class MLA(nn.Module):
                 q_ctx = self._attention_scaling(
                     q_ctx, position_ids[..., :num_ctx_tokens])
 
-            self.forward_context(
-                q_ctx,
-                compressed_kv_ctx,
-                k_pe_ctx,
-                position_ids,
-                attn_metadata,
-                output[:num_ctx_tokens, :],
-                latent_cache_ctx,
-            )
+            topk_indices_ctx = (topk_indices[:num_ctx_tokens, :]
+                                if topk_indices is not None else None)
+
+            if topk_indices_ctx is not None:
+                # DSA sparse context path
+                if self._should_use_short_mha(attn_metadata, position_ids):
+                    self.forward_context(q_ctx, compressed_kv_ctx, k_pe_ctx,
+                                         position_ids, attn_metadata,
+                                         output[:num_ctx_tokens, :],
+                                         latent_cache_ctx)
+                elif get_sm_version() >= 100:
+                    self.forward_absorption_context(
+                        q_ctx,
+                        compressed_kv_ctx,
+                        k_pe_ctx,
+                        attn_metadata,
+                        output[:num_ctx_tokens, :],
+                        latent_cache=latent_cache_ctx,
+                        topk_indices=topk_indices_ctx)
+                else:
+                    self.forward_sparse_mla_kvcache_bf16(
+                        q_ctx,
+                        latent_cache_ctx,
+                        attn_metadata,
+                        output[:num_ctx_tokens, :],
+                        topk_indices_ctx,
+                        is_generation=False)
+            else:
+                # Standard (non-DSA) context path
+                self.forward_context(
+                    q_ctx,
+                    compressed_kv_ctx,
+                    k_pe_ctx,
+                    position_ids,
+                    attn_metadata,
+                    output[:num_ctx_tokens, :],
+                    latent_cache_ctx,
+                )
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
@@ -1657,196 +1625,47 @@ class MLA(nn.Module):
                 q_gen = self._attention_scaling(
                     q_gen, position_ids[..., num_ctx_tokens:])
 
-            self.forward_absorption_generation(
-                q_gen,
-                compressed_kv_gen,
-                k_pe_gen,
-                attn_metadata,
-                output[num_ctx_tokens:num_tokens, :],
-                position_ids=position_ids,
-                latent_cache=latent_cache_gen,
-            )
+            topk_indices_gen = (topk_indices[num_ctx_tokens:num_tokens, :]
+                                if topk_indices is not None else None)
+
+            if topk_indices_gen is not None:
+                # DSA sparse generation path
+                if get_sm_version() >= 100:
+                    self.forward_absorption_generation(
+                        q_gen,
+                        compressed_kv_gen,
+                        k_pe_gen,
+                        attn_metadata,
+                        output[num_ctx_tokens:num_tokens, :],
+                        latent_cache=latent_cache_gen,
+                        topk_indices=topk_indices_gen)
+                else:
+                    self.forward_sparse_mla_kvcache_bf16(
+                        q_gen,
+                        latent_cache_gen,
+                        attn_metadata,
+                        output[num_ctx_tokens:num_tokens, :],
+                        topk_indices_gen,
+                        is_generation=True)
+            else:
+                # Standard (non-DSA) generation path
+                self.forward_absorption_generation(
+                    q_gen,
+                    compressed_kv_gen,
+                    k_pe_gen,
+                    attn_metadata,
+                    output[num_ctx_tokens:num_tokens, :],
+                    position_ids=position_ids,
+                    latent_cache=latent_cache_gen,
+                )
 
     def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
                               hidden_states: torch.Tensor,
                               attn_metadata: AttentionMetadata,
                               output: torch.Tensor) -> None:
-        """
-        Forward pass for the MLA module with DSA (always in MQA mode).
-        Writes result into output tensor in-place.
-
-        Delegates to forward_dsa_proj (token-wise projections) followed by
-        forward_dsa_attn (batch-dependent attention dispatch).
-
-        Args:
-            position_ids (Optional[torch.IntTensor]): The position IDs.
-            hidden_states (torch.Tensor): The hidden states.
-            attn_metadata (AttentionMetadata): The attention metadata.
-            output (torch.Tensor): The output tensor to write results into.
-        """
-        proj_outputs = self.forward_dsa_proj(position_ids, hidden_states,
-                                             attn_metadata)
-        q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
-        indexer_intermediates = proj_outputs[4:]
-        self.forward_dsa_attn(q, compressed_kv, k_pe, latent_cache,
-                              indexer_intermediates, position_ids,
-                              attn_metadata, output)
-
-    def forward_dsa_proj(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> List[torch.Tensor]:
-        """Token-wise projections for DSA MLA (CUDA-graph-capturable Op 1).
-
-        Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-        indexer.pre_indexer_proj().
-
-        IMPORTANT: This method must NOT slice tensors by num_tokens or
-        access batch-specific metadata, so that all operations are
-        unconditionally straight-line for CUDA graph capture.  Slicing
-        to num_tokens happens in forward_dsa_attn (Op 2, outside graph).
-
-        Returns [q, compressed_kv, k_pe, latent_cache] when short-MHA
-        handles all tokens (eager only), or
-        [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
-        weights] when the indexer runs.  Under torch compile
-        _should_use_short_mha returns False so it is always length 8.
-        """
-        assert self.mqa is not None, "DSA is only supported in MQA mode"
-
-        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
-
-        q, compressed_kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(compressed_kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-
-        q = self.q_b_proj(q)
-
-        use_short_mha_for_ctx = self._should_use_short_mha(
-            attn_metadata, position_ids)
-
-        # Skip the indexer when the short MHA path handles all context
-        # tokens and there are no generation tokens.
-        if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
-            return [q, compressed_kv, k_pe, latent_cache]
-
-        # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
-        # compute (cublas_mm, rope, FP8 quantize, weight scaling) with no
-        # access to batch-specific metadata or the k cache.
-        q_fp8, k_fp8, k_scale, weights = self.mqa.indexer.pre_indexer_proj(
-            qr, hidden_states, position_ids)
-
-        return [
-            q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights
-        ]
-
-    def forward_dsa_attn(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        latent_cache: torch.Tensor,
-        indexer_intermediates: List[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-    ) -> None:
-        """Batch-structure-dependent attention for DSA MLA (Op 2, not graph-captured).
-
-        indexer_intermediates is [q_fp8, k_fp8, k_scale, weights] when the
-        indexer ran in Op 1, or [] when short-MHA handled all tokens.
-
-        All num_tokens slicing happens here (not in Op 1) because
-        num_tokens comes from batch-specific metadata and must not be
-        baked into CUDA graph capture.
-        """
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
-        num_ctx_tokens = attn_metadata.num_ctx_tokens
-        num_tokens = attn_metadata.num_tokens
-
-        # Slice Op 1 outputs to actual num_tokens (Op 1 operates on the
-        # full padded tensor for CUDA graph compatibility).
-        q = q[:num_tokens, ...]
-        compressed_kv = compressed_kv[:num_tokens, ...]
-        k_pe = k_pe[:num_tokens, ...]
-        latent_cache = latent_cache[:num_tokens, ...]
-        if position_ids is not None:
-            position_ids = position_ids[..., :num_tokens]
-
-        use_short_mha_for_ctx = (num_contexts > 0
-                                 and self._should_use_short_mha(
-                                     attn_metadata, position_ids))
-
-        if use_short_mha_for_ctx and num_generations == 0:
-            topk_indices = None
-        else:
-            q_fp8, k_fp8, k_scale, weights = indexer_intermediates
-            # Slice indexer intermediates to actual num_tokens (they were
-            # computed on the full padded tensor in Op 1).
-            q_fp8 = q_fp8[:num_tokens, ...]
-            k_fp8 = k_fp8[:num_tokens, ...]
-            k_scale = k_scale[:num_tokens, ...]
-            weights = weights[:num_tokens, ...]
-            topk_indices = self.mqa.indexer.sparse_attn_indexer(
-                attn_metadata,
-                q,  # only used for shape/device in buffer allocation
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-            )
-
-        assert output is not None, "output must be provided"
-
-        if num_contexts > 0:
-            q_ctx = q[:num_ctx_tokens, ...]
-            compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
-            k_pe_ctx = k_pe[:num_ctx_tokens, ...]
-            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
-
-            self.forward_context_dsa(
-                q_ctx,
-                compressed_kv_ctx,
-                k_pe_ctx,
-                attn_metadata,
-                output[:num_ctx_tokens, :],
-                latent_cache_ctx,
-                topk_indices=topk_indices[:num_ctx_tokens, :]
-                if topk_indices is not None else None,
-                position_ids=position_ids,
-            )
-
-        if num_generations > 0:
-            q_gen = q[num_ctx_tokens:, ...]
-            compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
-            k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
-
-            self.forward_generation_dsa(
-                q_gen,
-                compressed_kv_gen,
-                k_pe_gen,
-                attn_metadata,
-                output[num_ctx_tokens:num_tokens, :],
-                latent_cache_gen,
-                topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
-            )
+        """Deprecated: use forward_impl() which now handles DSA via
+        predict_sparse_indices(). Kept as a thin wrapper for compatibility."""
+        self.forward_impl(position_ids, hidden_states, attn_metadata, output)
 
     def forward_context_default(
         self,
@@ -1930,32 +1749,8 @@ class MLA(nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run context-phase attention for DSA models.
-
-        Dispatches to the short-seq MHA path (forward_context) when the max
-        per-sequence KV length (including cached tokens) is within the
-        threshold, or falls through to the absorption/sparse MLA path
-        otherwise.  forward_context() further dispatches to the appropriate
-        handler (forward_context_default, forward_context_with_cached_kv, or
-        forward_context_with_chunked_prefill) based on cached-KV state.
-
-        Args:
-            q: Query tensor, shape [num_ctx_tokens, num_heads * qk_head_dim].
-            compressed_kv: Latent KV, shape [num_ctx_tokens, kv_lora_rank].
-            k_pe: RoPE key portion, shape [num_ctx_tokens, qk_rope_head_dim].
-            attn_metadata: Attention metadata for the current batch.
-            output: Pre-allocated output tensor, written in-place.
-            latent_cache: Concatenated [compressed_kv, k_pe] for KV cache.
-            topk_indices: Sparse routing indices from the indexer (None when
-                the short-seq MHA path is used).
-            position_ids: Token position IDs (required for short-seq MHA).
-        """
-        # Short-sequence MHA: bypass absorption path for short prefills,
-        # using kv_b_proj expansion + standard attention instead.
-        # See __init__ comment for rationale. topk_indices is not used
-        # because dense attention is faster than sparse routing at this scale.
-        # forward_context() handles cached tokens by dispatching to
-        # forward_context_with_cached_kv or forward_context_with_chunked_prefill.
+        """Deprecated: DSA context dispatch is now inlined in forward_impl().
+        Kept for test compatibility."""
         if self._should_use_short_mha(attn_metadata, position_ids):
             return self.forward_context(q, compressed_kv, k_pe, position_ids,
                                         attn_metadata, output, latent_cache)
@@ -1986,6 +1781,8 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Deprecated: DSA generation dispatch is now inlined in forward_impl().
+        Kept for test compatibility."""
         if get_sm_version() >= 100:
             return self.forward_absorption_generation(q,
                                                       compressed_kv,
@@ -2769,25 +2566,9 @@ class MLA(nn.Module):
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
         if self.register_to_config:
-            if self.is_dsa:
-                proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                    hidden_states, position_ids, self.layer_idx_str)
-                q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
-                indexer_intermediates = proj_outputs[4:]
-                torch.ops.trtllm.mla_dsa_attn_inplace(
-                    q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
-                    position_ids, self.layer_idx_str, attn_output)
-            else:
-                torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
-                                                       position_ids,
-                                                       self.layer_idx_str,
-                                                       attn_output,
-                                                       latent_cache_gen)
-        elif self.is_dsa:
-            self.forward_impl_with_dsa(position_ids,
-                                       hidden_states,
-                                       attn_metadata,
-                                       output=attn_output)
+            torch.ops.trtllm.mla_custom_op_inplace(
+                hidden_states, position_ids, self.layer_idx_str, attn_output,
+                None if self.is_dsa else latent_cache_gen)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
