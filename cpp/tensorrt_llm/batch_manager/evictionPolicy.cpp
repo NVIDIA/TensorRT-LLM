@@ -136,7 +136,7 @@ void LRUEvictionPolicy::addToFreeBlockQueue(BlockPtr block, bool toFront)
     mNumFreeBlocksPerLevel[cacheLevel]++;
 }
 
-bool LRUEvictionPolicy::removeFromFreeBlockQueue(BlockPtr block) noexcept
+bool LRUEvictionPolicy::removeFromFreeBlockQueue(BlockPtr block)
 {
     SizeType32 const id = block->getBlockId();
     if (mFreeBlockIterators[id].has_value())
@@ -145,6 +145,7 @@ bool LRUEvictionPolicy::removeFromFreeBlockQueue(BlockPtr block) noexcept
         auto [cacheLevel, priority, it] = mFreeBlockIterators[id].value();
         mFreeQueues[cacheLevel][priority].erase(it);
         mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+        mFreeBlockIterators[id] = std::nullopt;
         return true;
     }
     else
@@ -192,14 +193,7 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block)
 void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
     std::optional<std::chrono::milliseconds> durationMs)
 {
-    SizeType32 const id = block->getBlockId();
-    SizeType32 const cacheLevel = getCacheLevel(block);
-
-    if (removeFromFreeBlockQueue(block))
-    {
-        mFreeBlockIterators[id] = std::nullopt;
-    }
-
+    TLLM_CHECK_WITH_INFO(removeFromFreeBlockQueue(block), "claimBlock called on a block (id=%d) that hasn't been released", block->getBlockId());
     if (priority.has_value())
     {
         block->setPriority(*priority);
