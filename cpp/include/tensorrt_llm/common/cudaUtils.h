@@ -304,10 +304,10 @@ inline int getSMVersion(bool queryRealSmArch = false)
     return sm;
 }
 
-inline bool isSM100Family()
+inline bool isBlackwellFamily()
 {
     int const sm = getSMVersion();
-    return sm == 100 || sm == 103; // To be continued...
+    return sm == 100 || sm == 103 || sm == 120 || sm == 121;
 }
 
 inline int getDevice()

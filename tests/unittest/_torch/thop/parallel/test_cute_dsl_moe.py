@@ -313,7 +313,7 @@ def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 
 
 @pytest.mark.skipif(
-    get_sm_version() not in (100, 103),
+    get_sm_version() not in (100, 103, 120, 121),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
 @pytest.mark.parametrize("tile_size", [128, 256])

@@ -21,9 +21,9 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+import tensorrt_llm._utils as _utils
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -62,7 +62,7 @@ class TRTLLMGenFusedMoE(MoE):
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
 
     MoE torch custom op:
-        Only support min-latency mode now (Blackwell: SM100/103/120/121).
+        Only support min-latency mode now (SM100 Blackwell only).
         Quant: fp8 block scales quant and nvfp4 quant and w4a16_mxfp4 quant
             FusedMoE Op: routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
 
@@ -107,7 +107,7 @@ class TRTLLMGenFusedMoE(MoE):
         """
         Check if TRTLLMGenFusedMoE can implement the given quantization algorithm.
 
-        TRTLLMGenFusedMoE only supports SM in {100, 103, 120, 121} and the following quantizations:
+        TRTLLMGenFusedMoE only supports SM in {100, 103} and the following quantizations:
         - NVFP4
         - FP8_BLOCK_SCALES
         - W4A8_NVFP4_FP8
@@ -129,12 +129,12 @@ class TRTLLMGenFusedMoE(MoE):
         """
         from .interface import _warn_and_return
 
-        sm_version = get_sm_version()
+        sm_version = _utils.get_sm_version()
 
-        # TRTLLMGenFusedMoE requires SM in {100, 103, 120, 121} (Blackwell family)
-        if sm_version not in {100, 103, 120, 121}:
+        # TRTLLMGenFusedMoE requires SM in {100, 103}
+        if sm_version not in {100, 103}:
             return _warn_and_return(
-                f"TRTLLMGenFusedMoE requires Blackwell (SM100/103/120/121), got SM{sm_version}"
+                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
             )
 
         # Check dtype_activation: only bfloat16 is supported
@@ -202,6 +202,11 @@ class TRTLLMGenFusedMoE(MoE):
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
         )
+
+        sm_version = _utils.get_sm_version()
+        if sm_version >= 120:
+            raise NotImplementedError(
+                "TRTLLMGenFusedMoE does not support SM120 and above.")
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 

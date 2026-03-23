@@ -170,7 +170,7 @@ class PrepareCustomMaskTest : public ::testing::Test
 protected:
     static bool shouldSkip()
     {
-        return !tensorrt_llm::common::isSM100Family();
+        return !tensorrt_llm::common::isBlackwellFamily();
     }
 
     void SetUp() override

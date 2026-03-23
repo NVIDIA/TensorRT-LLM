@@ -46,7 +46,8 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     MoeRunnerType& moe_runner, int64_t moeConfigIndex, std::optional<at::Tensor> const& topk_weights,
     std::optional<at::Tensor> const& topk_ids, std::optional<at::Tensor> const& out_tensor = std::nullopt)
 {
-    TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
+    TORCH_CHECK(tensorrt_llm::common::isBlackwellFamily(),
+        "Blackwell family (SM100/103/120/121) is required for FP8 block scale MOE");
 
     if (topk_ids.has_value() && topk_weights.has_value())
     {

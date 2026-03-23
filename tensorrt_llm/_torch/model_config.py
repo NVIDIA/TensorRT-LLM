@@ -11,11 +11,11 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+import tensorrt_llm._utils as _utils
 from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
     load_pretrained_config)
-from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
@@ -251,15 +251,14 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        # Blackwell family: use TRTLLM for all MoE architectures
+        if _utils.is_blackwell():
+            return "TRTLLM"
+
         if architecture == "GptOssForCausalLM":
-            sm_version = get_sm_version()
-            # Select the best performing backend based on SM version
-            if is_blackwell(sm_version):  # Blackwell (SM100/103/120/121)
-                return "TRTLLM"
-            elif 90 <= sm_version < 100:  # Hopper
+            sm_version = _utils.get_sm_version()
+            if 90 <= sm_version < 100:  # Hopper
                 return "TRITON"
-            else:
-                return "CUTLASS"  # Fallback for other SM versions
 
         return "CUTLASS"
 
@@ -335,7 +334,7 @@ class ModelConfig(Generic[TConfig]):
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
         quant_algo = ModelConfig.override_quant_algo()
         if quant_algo is None and not is_dynamic_quant:
-            if get_sm_version() >= 100:
+            if _utils.get_sm_version() >= 100:
                 if moe_backend == 'TRITON':
                     return QuantAlgo.W4A8_MXFP4_FP8
                 else:
@@ -677,7 +676,7 @@ class ModelConfig(Generic[TConfig]):
             num_rnn_layers=0,
             num_heads=num_heads,
             hidden_size=hidden_size,
-            data_type=torch_dtype_to_binding(
+            data_type=_utils.torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
         # For kv cache size calculation: set tokens_per_block

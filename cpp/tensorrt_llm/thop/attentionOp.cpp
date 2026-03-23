@@ -493,7 +493,7 @@ public:
             }
             if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding)
             {
-                bool useTllmGen = tensorrt_llm::common::isSM100Family();
+                bool useTllmGen = tensorrt_llm::common::isBlackwellFamily();
                 if (useTllmGen)
                 {
                     TORCH_CHECK(spec_decoding_tensor_params.size() == 6,
