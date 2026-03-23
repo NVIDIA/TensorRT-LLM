@@ -54,6 +54,101 @@ from tensorrt_llm.quantization.mode import QuantMode
 DEFAULT_KV_LAYOUT = "HND"
 
 
+@dataclass
+class TrtllmGenAttentionConfig:
+    """
+    Configuration for attention computation.
+
+    Encapsulates all parameters needed for attention to enable
+    clean parameter passing and validation.
+    """
+
+    # Input tensors
+    q: torch.Tensor
+
+    # Basic attention parameters
+    num_heads: int
+    num_kv_heads: int
+    head_size: int
+    layer_idx: int = 0
+
+    # KV Cache parameters
+    use_paged_kv_cache: bool = True
+    tokens_per_block: int = 64
+    max_num_requests: int = 256
+    max_context_length: int = 8192
+    attention_window_size: int = -1  # -1 means unlimited
+    kv_cache_manager: Optional[KVCacheManager] = None
+
+    # Data types
+    out_dtype: Optional[torch.dtype] = None
+
+    # Quantization config
+    quant_config: Optional[QuantConfig] = None
+
+    # RoPE parameters
+    position_embedding_type: int = 0
+    rotary_embedding_dim: int = 0
+    rotary_embedding_base: float = 10000.0
+    rotary_embedding_scale_type: int = 0
+    rotary_embedding_scales: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    rotary_embedding_max_position_info: List[int] = field(default_factory=lambda: [8192, 8192])
+
+    # Attention mask and features
+    mask_type: int = 1  # CAUSAL by default
+    q_scaling: float = 1.0
+    beam_width: int = 1
+    sink_token_length: int = 0
+
+    # Advanced features (not supported by trtllm-gen)
+    is_mla_enable: bool = False
+    is_fused_qkv: bool = True
+    update_kv_cache: bool = True
+    cross_attention: bool = False
+    is_spec_decoding: bool = False
+    has_alibi: bool = False
+    is_padded: bool = False
+    position_shift_enabled: bool = False
+
+    # Sparse attention config
+    sparse_attention_config: Optional[object] = None
+
+    @property
+    def kv_cache(self) -> torch.Tensor:
+        """
+        Get KV cache tensor from kv_cache_manager.
+        """
+        if self.kv_cache_manager is not None:
+            return self.kv_cache_manager.get_buffers(self.layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
+        return None
+
+    @property
+    def kv_cache_dtype(self) -> torch.dtype:
+        return self.kv_cache.dtype
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.q.dtype
+
+    @property
+    def has_fp4_kv_cache(self) -> bool:
+        """
+        Check if FP4 KV cache is enabled.
+
+        Returns:
+            bool: True if FP4 KV cache is enabled via quant_config, False otherwise.
+        """
+        if self.quant_config is not None:
+            return self.quant_config.layer_quant_mode.has_fp4_kv_cache()
+        return self.kv_cache_dtype == torch.uint8
+
+    @property
+    def heads_ratio(self) -> int:
+        """Get ratio of query heads to KV heads (for GQA)."""
+        return self.num_heads // self.num_kv_heads if self.num_kv_heads > 0 else 1
+
+
+
 class TrtllmGenSupportChecker:
     """
     Validates if a configuration is supported by trtllm-gen backend.
@@ -111,6 +206,209 @@ class TrtllmGenSupportChecker:
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
 
     @classmethod
+    def check_hardware(cls) -> Tuple[bool, str]:
+        """Check if hardware supports trtllm-gen (Blackwell SM100/SM103)."""
+        sm = get_sm_version()
+        if not is_sm_100f(sm):
+            return (False, f"trtllm-gen requires SM100 or SM103 (Blackwell). Current: SM{sm}.")
+        return True, ""
+
+    @classmethod
+    def check_basic_features(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
+        """Check basic feature requirements."""
+        if config.is_mla_enable:
+            return False, "MLA is not supported by trtllm-gen backend."
+
+        if not config.is_fused_qkv:
+            return False, "Only fused QKV is supported by trtllm-gen backend."
+
+        if config.update_kv_cache:
+            # trtllm-gen backend currently does not support KV cache update.
+            # The flashinfer trtllm-gen kernels only read from KV cache, they don't write to it.
+            # Fall back to thop.attention which handles KV cache update atomically.
+            return False, "KV cache update is not yet supported by trtllm-gen backend."
+
+        if config.cross_attention:
+            return False, "Cross attention is not supported by trtllm-gen backend."
+
+        if config.is_spec_decoding:
+            return False, "Speculative decoding is not supported by trtllm-gen backend."
+
+        return True, ""
+
+    @classmethod
+    def check_sparse_attention(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
+        """Check if sparse attention config is compatible with trtllm-gen."""
+        if config.sparse_attention_config is None:
+            return True, ""
+
+        algo = config.sparse_attention_config.algorithm
+        if algo in ("skip_softmax", "mqa_gqa"):
+            return True, ""
+
+        if algo == "dsa":
+            return False, "DSA can be supported by trtllm-gen backend, but not yet integrated."
+
+        return (
+            False,
+            f"Sparse attention algorithm {algo} is not "
+            "supported by trtllm-gen backend.",
+        )
+
+    @classmethod
+    def check_dtypes(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
+        """Check if data types are supported."""
+
+        if config.has_fp4_kv_cache:
+            return False, "NVFP4 KV cache is not supported by flashinfer trtllm-gen kernels."
+
+        if config.dtype not in cls.SUPPORTED_INPUT_DTYPES:
+            return (
+                False,
+                f"Input dtype {config.dtype} not supported. Supported: FP16, BF16, FP8 (E4M3).",
+            )
+
+        if config.kv_cache_dtype not in cls.SUPPORTED_KV_CACHE_DTYPES:
+            return (
+                False,
+                f"KV cache dtype {config.kv_cache_dtype} not supported. "
+                f"Supported: FP16, BF16, FP8.",
+            )
+
+        if config.out_dtype is not None:
+            if config.out_dtype not in cls.SUPPORTED_OUT_DTYPES:
+                return (
+                    False,
+                    f"Output dtype {config.out_dtype} not supported. Supported: FP16, BF16, FP8.",
+                )
+
+        return True, ""
+
+    @classmethod
+    def check_head_config(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
+        """Check head configuration validity."""
+        assert config.num_heads > 0, "num_heads must be positive."
+        assert config.num_kv_heads > 0, "num_kv_heads must be positive."
+
+        if config.num_heads % config.num_kv_heads != 0:
+            return (
+                False,
+                f"num_heads ({config.num_heads}) must be divisible by "
+                f"num_kv_heads ({config.num_kv_heads}).",
+            )
+
+        return True, ""
+
+    @classmethod
+    def check_context_phase(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
+        """Check context (prefill) phase specific requirements."""
+        if config.head_size in cls.UNSUPPORTED_HEAD_SIZES_CONTEXT:
+            return (False, f"[Context] Head size {config.head_size} is not supported.")
+
+        try:
+            mask_type_enum = AttentionMaskType(config.mask_type)
+            if mask_type_enum == AttentionMaskType.custom_mask:
+                return False, "[Context] Custom mask is not supported."
+        except ValueError:
+            return False, f"[Context] Invalid mask_type: {config.mask_type}."
+
+        if config.has_alibi:
+            return False, "[Context] ALiBi is not supported."
+
+        if config.is_padded:
+            return False, "[Context] Padded input is not supported."
+
+        # Check dtype combination for context phase
+        q_dtype = config.dtype
+        kv_dtype = config.kv_cache_dtype
+        o_dtype = config.out_dtype if config.out_dtype is not None else config.dtype
+        dtype_combo = (q_dtype, kv_dtype, o_dtype)
+
+        if dtype_combo not in cls.SUPPORTED_DTYPE_COMBOS_CONTEXT:
+            return (
+                False,
+                f"[Context] Unsupported dtype combination: Q={q_dtype}, KV={kv_dtype}, O={o_dtype}. "
+                f"Supported context combinations: fp16:fp16:fp16, bf16:bf16:bf16, "
+                f"e4m3:e4m3:e4m3, e4m3:e4m3:fp16, e4m3:e4m3:bf16.",
+            )
+
+        return True, ""
+
+    @classmethod
+    def check_generation_phase(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
+        """Check generation (decode) phase specific requirements."""
+        if config.beam_width != 1:
+            return (
+                False,
+                f"[Generation] Beam search (beam_width={config.beam_width}) "
+                "is not supported. Must be 1.",
+            )
+
+        if config.position_shift_enabled:
+            return False, "[Generation] Position shift is not supported."
+
+        if config.sink_token_length != 0:
+            return (
+                False,
+                f"[Generation] StreamingLLM (sink_token_length="
+                f"{config.sink_token_length}) is not supported.",
+            )
+
+        if config.tokens_per_block < cls.MIN_TOKENS_PER_BLOCK:
+            return (
+                False,
+                f"[Generation] tokens_per_block ({config.tokens_per_block}) "
+                f"must be >= {cls.MIN_TOKENS_PER_BLOCK}.",
+            )
+
+        if config.heads_ratio > cls.MAX_HEADS_RATIO_GENERATION:
+            return (
+                False,
+                f"[Generation] num_heads/num_kv_heads ratio ({config.heads_ratio}) "
+                f"must be <= {cls.MAX_HEADS_RATIO_GENERATION}.",
+            )
+
+        if config.has_alibi:
+            return False, "[Generation] ALiBi is not supported."
+
+        # Check dtype combination for generation phase
+        q_dtype = config.dtype
+        kv_dtype = config.kv_cache_dtype
+        o_dtype = config.out_dtype if config.out_dtype is not None else config.dtype
+        dtype_combo = (q_dtype, kv_dtype, o_dtype)
+
+        if dtype_combo not in cls.SUPPORTED_DTYPE_COMBOS_GENERATION:
+            return (
+                False,
+                f"[Generation] Unsupported dtype combination: Q={q_dtype}, KV={kv_dtype}, O={o_dtype}. "
+                f"Supported generation combinations: fp16:fp16:fp16, bf16:bf16:bf16, "
+                f"e4m3:e4m3:e4m3, e4m3:e4m3:fp16, e4m3:e4m3:bf16, bf16:e4m3:bf16, fp16:e4m3:fp16.",
+            )
+
+        return True, ""
+
+    @classmethod
+    def check_paged_kv_cache(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
+        """Check paged KV cache configuration."""
+        if config.use_paged_kv_cache:
+            if config.tokens_per_block <= 0:
+                return False, "tokens_per_block must be positive."
+
+            # Must be power of 2
+            if config.tokens_per_block & (config.tokens_per_block - 1) != 0:
+                return (False, f"tokens_per_block ({config.tokens_per_block}) must be power of 2.")
+
+            # Check if tokens_per_block is supported by trtllm-gen kernels
+            if config.tokens_per_block not in cls.SUPPORTED_TOKENS_PER_BLOCK:
+                return (
+                    False,
+                    f"tokens_per_block ({config.tokens_per_block}) is not supported by "
+                    f"trtllm-gen kernels. Supported values: {sorted(cls.SUPPORTED_TOKENS_PER_BLOCK)}.",
+                )
+
+        return True, ""
+
+    @classmethod
     def is_supported(
         cls,
         q_dtype: torch.dtype,
@@ -136,6 +434,7 @@ class TrtllmGenSupportChecker:
         quant_config: Optional[QuantConfig] = None,
         sparse_kv_indices: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
+        sparse_attention_config: Optional[object] = None,
         skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
         skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
     ) -> Tuple[bool, str]:
@@ -159,6 +458,15 @@ class TrtllmGenSupportChecker:
         has_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel() > 0
         if has_sparse_kv or has_sparse_attn:
             return False, "Sparse attention is not supported by trtllm-gen backend."
+
+        if sparse_attention_config is not None:
+            algo = getattr(sparse_attention_config, 'algorithm', None)
+            if algo not in (None, 'mqa_gqa', 'skip_softmax'):
+                return (
+                    False,
+                    f"Sparse attention algorithm '{algo}' is not supported "
+                    "by trtllm-gen backend.",
+                )
         if is_mla_enable:
             return False, "MLA is not supported by trtllm-gen backend."
         if not is_fused_qkv:
@@ -1401,6 +1709,7 @@ def is_supported(
     has_cross_kv: bool = False,
     quant_config: Optional[QuantConfig] = None,
     kv_cache_manager: Optional[KVCacheManager] = None,
+    sparse_attention_config: Optional[object] = None,
     phase: str = "both",
     sparse_kv_indices: Optional[torch.Tensor] = None,
     sparse_attn_indices: Optional[torch.Tensor] = None,
@@ -1475,6 +1784,7 @@ def is_supported(
         quant_config=quant_config,
         sparse_kv_indices=sparse_kv_indices,
         sparse_attn_indices=sparse_attn_indices,
+        sparse_attention_config=sparse_attention_config,
         skip_softmax_threshold_scale_factor_prefill=skip_softmax_threshold_scale_factor_prefill,
         skip_softmax_threshold_scale_factor_decode=skip_softmax_threshold_scale_factor_decode,
     )
@@ -1549,7 +1859,7 @@ def trtllm_gen_attention(
     sparse_attn_indices: Optional[torch.Tensor],
     sparse_attn_offsets: Optional[torch.Tensor],
     sparse_attn_indices_block_size: int,
-    sparse_mla_topk: Optional[int],
+    num_sparse_topk: Optional[int],
     skip_softmax_threshold_scale_factor_prefill: Optional[float],
     skip_softmax_threshold_scale_factor_decode: Optional[float],
     skip_softmax_stat: Optional[torch.Tensor],
@@ -1645,7 +1955,7 @@ def trtllm_gen_attention(
         sparse_attn_indices: Indices for sparse attention patterns.
         sparse_attn_offsets: Offsets for sparse attention patterns.
         sparse_attn_indices_block_size: Block size for sparse attention indices.
-        sparse_mla_topk: Top-K value for sparse MLA attention.
+        num_sparse_topk: Top-K value for sparse attention.
         skip_softmax_threshold_scale_factor_prefill: Scale factor for skip softmax threshold (prefill).
         skip_softmax_threshold_scale_factor_decode: Scale factor for skip softmax threshold (decode).
         skip_softmax_stat: Statistics for skip softmax optimization.
