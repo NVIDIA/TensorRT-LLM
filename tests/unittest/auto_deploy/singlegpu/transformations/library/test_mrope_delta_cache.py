@@ -34,8 +34,10 @@ def test_initialize_mrope_delta_cache_registers_state_resource():
     assert isinstance(mod, nn.Module)
     assert not info.skipped
     assert info.num_matches == 1
-    assert "mrope_delta_cache" in cm._resource_lookup
-    assert cm._resource_lookup["mrope_delta_cache"] == StateResourceHandler(1, dtype=torch.int32)
+    assert len(cm._resource_lookup) == 1
+    resource_name, resource_handler = next(iter(cm._resource_lookup.items()))
+    assert resource_name.endswith("_mrope_delta_cache")
+    assert resource_handler == StateResourceHandler(1, dtype=torch.int32)
 
 
 def test_initialize_mrope_delta_cache_disabled_in_default_config():

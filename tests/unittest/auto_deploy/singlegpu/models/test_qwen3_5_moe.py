@@ -1568,7 +1568,7 @@ def test_qwen3_mrope_delta_matches_compute_mrope_positions_for_mixed_items():
     )
 
     actual_delta = qwen3_mrope_delta(
-        batch_info_host=torch.tensor([1, 0, 0], dtype=torch.int32),
+        batch_info_host=torch.tensor([1, 0, 0, 0, 0, 0], dtype=torch.int32),
         mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
         mm_item_types=torch.tensor([0, 1], dtype=torch.int32),
         mm_token_lengths=torch.tensor(
@@ -1624,7 +1624,7 @@ def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
     cache = torch.zeros((8, 1), dtype=torch.int32)
     slot = 3
     deltas = qwen3_mrope_delta_with_cache(
-        batch_info_host=torch.tensor([1, 0, 1], dtype=torch.int32),
+        batch_info_host=torch.tensor([1, 0, 0, 0, 1, 1], dtype=torch.int32),
         slot_idx=torch.tensor([slot, slot], dtype=torch.int32),
         mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
         mm_item_types=torch.tensor([0], dtype=torch.int32),
