@@ -24,6 +24,7 @@ import math
 import pytest
 import torch
 
+import tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention as trtllm_attention
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention import (
     _GlobalTrtllmPlanner,
     prepare_trtllm_metadata_host,
@@ -665,3 +666,49 @@ def test_block_offsets_computation(num_sequences, pages_per_seq_list, block_offs
         for pg in range(n_pages, max_blocks_per_seq):
             assert bo[seq_id, 0, pg].item() == 0, f"K padding non-zero at seq={seq_id} pg={pg}"
             assert bo[seq_id, 1, pg].item() == 1, f"V padding not 1 at seq={seq_id} pg={pg}"
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_trtllm_attention_zeroes_only_padded_tail_without_out(device, monkeypatch):
+    n_heads = 2
+    d_head = 8
+    max_batch_size = 4
+    active_decode = 2
+    max_seq_len = 16
+
+    _reset_trtllm_planner()
+
+    q = torch.randn(max_batch_size, 1, n_heads, d_head, dtype=torch.float16, device=device)
+    k = torch.randn(max_batch_size, 1, n_heads, d_head, dtype=torch.float16, device=device)
+    v = torch.randn(max_batch_size, 1, n_heads, d_head, dtype=torch.float16, device=device)
+    kv_cache = torch.zeros(
+        max_batch_size, 2, n_heads, max_seq_len, d_head, dtype=torch.float16, device=device
+    )
+
+    def fake_attention(*args, **kwargs):
+        output = args[3]
+        output.fill_(7.0)
+
+    monkeypatch.setattr(trtllm_attention.thop, "attention", fake_attention)
+
+    output = _prepare_and_run(
+        q,
+        k,
+        v,
+        kv_cache,
+        seq_lens=[1] * active_decode,
+        input_positions=[0] * active_decode,
+        cache_locs=list(range(active_decode)),
+        pages_per_seq=[1] * active_decode,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        num_prefill=0,
+        num_prefill_tokens=0,
+        num_decode=active_decode,
+        device=device,
+    )
+
+    output_flat = output.view(-1, n_heads * d_head)
+    expected_active = torch.full_like(output_flat[:active_decode], 7.0)
+    assert torch.equal(output_flat[:active_decode], expected_active)
+    assert torch.count_nonzero(output_flat[active_decode:]).item() == 0

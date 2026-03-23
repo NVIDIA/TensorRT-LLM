@@ -393,7 +393,7 @@ def trtllm_mha_with_cache(
         out_flat = out.view(-1, num_heads * head_dim)
         output = out_flat[:num_tokens]
     else:
-        output = torch.zeros(
+        output = torch.empty(
             total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
         )
     # Map SequenceInfo fields to thop.attention args
@@ -506,6 +506,9 @@ def trtllm_mha_with_cache(
         if total_padded_tokens > num_tokens:
             out_flat[num_tokens:].zero_()
         return out.new_empty(0)
+
+    if total_padded_tokens > num_tokens:
+        output[num_tokens:].zero_()
 
     return output.view(*q_shape_og)
 
