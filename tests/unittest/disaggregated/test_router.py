@@ -364,8 +364,7 @@ async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
     def make_request(token_ids: list[int]):
         """Create a CompletionRequest or ChatCompletionRequest with pre-tokenized IDs."""
         if api_type == "completion":
-            return CompletionRequest(model="TinyLlama",
-                                     prompt=[token_ids])
+            return CompletionRequest(model="TinyLlama", prompt=[token_ids])
         else:
             # Use prompt_token_ids to skip tokenizer (no real model needed)
             return ChatCompletionRequest(
@@ -379,7 +378,7 @@ async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
 
     # -- dataset-inspired hash_ids per turn (new blocks only) -------------
     # Session A (the conversation under test)
-    sess_a_turn0_hids = list(range(10))        # 10 blocks
+    sess_a_turn0_hids = list(range(10))  # 10 blocks
     sess_a_turn1_hids = list(range(100, 103))  # 3 new blocks
     sess_a_turn2_hids = list(range(200, 202))  # 2 new blocks
 
@@ -391,16 +390,14 @@ async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
     sess_a_turn0_tokens = build_tokens(sess_a_turn0_hids)
 
     # Turn 1 accumulated: turn 0 tokens + simulated assistant reply + new user tokens
-    sess_a_turn1_tokens = build_tokens(
-        sess_a_turn0_hids + [9990, 9991] + sess_a_turn1_hids
-    )
+    sess_a_turn1_tokens = build_tokens(sess_a_turn0_hids + [9990, 9991] +
+                                       sess_a_turn1_hids)
     # (hash_ids 9990/9991 stand in for the assistant-reply blocks)
 
     # Turn 2 accumulated: extends turn 1 further
-    sess_a_turn2_tokens = build_tokens(
-        sess_a_turn0_hids + [9990, 9991] + sess_a_turn1_hids + [9992, 9993]
-        + sess_a_turn2_hids
-    )
+    sess_a_turn2_tokens = build_tokens(sess_a_turn0_hids + [9990, 9991] +
+                                       sess_a_turn1_hids + [9992, 9993] +
+                                       sess_a_turn2_hids)
 
     sess_b_tokens = build_tokens(sess_b_turn0_hids)
 
@@ -426,7 +423,8 @@ async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
     # Verify block hashes are disjoint between sessions
     blocks_a = set(info_a0["block_hashes"][0])
     blocks_b = set(info_b0["block_hashes"][0])
-    assert blocks_a.isdisjoint(blocks_b), "Different sessions must not share block hashes"
+    assert blocks_a.isdisjoint(
+        blocks_b), "Different sessions must not share block hashes"
 
     # -- Round 2: turn 1 of session A (prefix extends turn 0) ------------
     req_a1 = make_request(sess_a_turn1_tokens)
@@ -436,16 +434,14 @@ async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
     assert server_a1 == server_a, (
         f"Turn 1 must route to the same server as turn 0 ({server_a}) "
         f"due to KV cache prefix hit, but got {server_a1}. "
-        f"Matches: {info_a1['matches']}"
-    )
+        f"Matches: {info_a1['matches']}")
 
     # The match count on server_a must equal the prefix overlap
     server_a_idx = list(router._server_state.keys()).index(server_a)
     expected_prefix_match = len(sess_a_turn0_hids) * tokens_per_block
     assert info_a1["matches"][server_a_idx] == expected_prefix_match, (
         f"Expected {expected_prefix_match} matched tokens on server_a, "
-        f"got {info_a1['matches'][server_a_idx]}"
-    )
+        f"got {info_a1['matches'][server_a_idx]}")
 
     # Update server_a cache with new blocks from turn 1
     router._server_state[server_a].add_blocks(info_a1["block_hashes"][0])
@@ -458,17 +454,16 @@ async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
     assert server_a2 == server_a, (
         f"Turn 2 must route to the same server as turns 0-1 ({server_a}) "
         f"due to KV cache prefix hit, but got {server_a2}. "
-        f"Matches: {info_a2['matches']}"
-    )
+        f"Matches: {info_a2['matches']}")
 
     # Turn 2 should match all of turn 0 + turn 1 prefix blocks
     expected_full_match = (
-        len(sess_a_turn0_hids) + 2 + len(sess_a_turn1_hids)  # turn0 + reply + turn1
+        len(sess_a_turn0_hids) + 2 +
+        len(sess_a_turn1_hids)  # turn0 + reply + turn1
     ) * tokens_per_block
     assert info_a2["matches"][server_a_idx] == expected_full_match, (
         f"Expected {expected_full_match} matched tokens on turn 2, "
-        f"got {info_a2['matches'][server_a_idx]}"
-    )
+        f"got {info_a2['matches'][server_a_idx]}")
 
     # -- Verify session B still routes to its own server ------------------
     req_b1 = make_request(sess_b_tokens)
@@ -477,8 +472,7 @@ async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
 
     assert server_b1 == server_b, (
         f"Session B should route to its original server ({server_b}), "
-        f"but got {server_b1}"
-    )
+        f"but got {server_b1}")
 
 
 def test_create_router(servers):
