@@ -13,6 +13,7 @@ from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_tr
 from _model_test_utils import FakeFineGrainedFP8Linear, FakeFP8Linear
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMamba2Mixer
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
@@ -25,6 +26,10 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+    modelopt_fp4_scale_to_cutlass_fp4_scale,
+)
 from tensorrt_llm.functional import AllReduceStrategy
 
 
@@ -287,14 +292,10 @@ class GDN_Block(nn.Module):
         k_conv = k_conv.reshape(b, s, k_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
         v_conv = v_conv.reshape(b, s, v_conv.shape[-1] // self.head_v_dim, self.head_v_dim)
 
-        # Repeat q, k to match num_v_heads when num_v_heads > num_k_heads (GQA)
-        if self.num_v_heads // self.num_k_heads > 1:
-            q_conv = q_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            k_conv = k_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        beta = b_tensor.sigmoid()
-        g = -self.A_log.exp() * F.softplus(a + self.dt_bias)
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q_conv, k_conv, v_conv, g, beta)
+        # L2 norm, GQA repeat-interleave, and gating are handled inside the op
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q_conv, k_conv, v_conv, a, b_tensor, self.A_log, self.dt_bias
+        )
 
         # Gated norm on head_v_dim, then project
         attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
@@ -373,17 +374,12 @@ class GDN_Block_Unfused(nn.Module):
         k_conv = k_conv.reshape(b, s, k_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
         v_conv = v_conv.reshape(b, s, v_conv.shape[-1] // self.head_v_dim, self.head_v_dim)
 
-        # 4. Repeat q, k to match num_v_heads when num_v_heads > num_k_heads (GQA)
-        if self.num_v_heads // self.num_k_heads > 1:
-            q_conv = q_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            k_conv = k_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        # 4. Gated delta rule (L2 norm, GQA expand, gating handled inside the op)
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q_conv, k_conv, v_conv, a, b_tensor, self.A_log, self.dt_bias
+        )
 
-        # 5. Gated delta rule
-        beta = b_tensor.sigmoid()
-        g = -self.A_log.exp() * F.softplus(a + self.dt_bias)
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q_conv, k_conv, v_conv, g, beta)
-
-        # 6. Gated norm on head_v_dim, then project
+        # 5. Gated norm on head_v_dim, then project
         attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
         normed = self.norm(attn_out_flat) * z_flat
@@ -505,7 +501,6 @@ def _run_sharding_execution_job(
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
         )
-        # update the tp_plan in predefined_config to force simple sharding of the single linear layer
         predefined_config = {"tp_plan": {"*": "gather"}}
     elif model_cls == FineGrainedFP8MLP:
         # FineGrainedFP8MLP needs features divisible by 128 (block size)
@@ -728,7 +723,6 @@ def _run_pattern_detection_job(
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
         )
-        # update the tp_plan in predefined_config to force simple sharding of the single linear layer
         predefined_config = {"tp_plan": {"*": "gather"}}
     elif model_cls == FineGrainedFP8MLP:
         # FineGrainedFP8MLP needs features divisible by 128 (block size)
@@ -1041,9 +1035,7 @@ def _run_pattern_detection_job(
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = (
-        optimizer.shared_config.sharding_transform_container.weight_sharding_transforms
-    )
+    detected_transformations = gm._sharding_transform_container.weight_sharding_transforms
 
     print(f"detected_transformations: {detected_transformations}")
     print(f"expected_transformations: {expected_transformations}")
@@ -1225,3 +1217,54 @@ def test_unfused_delta_fused_weight_correctness(world_size: int):
         msg="After reloading original state dict, in_proj_qkv weight does not match "
         "expected fused slice. The load hook may not be applying fused slicing correctly.",
     )
+
+
+@pytest.mark.parametrize(
+    "n, k",
+    [
+        (144, 128),  # n%32=16, k%32=0: column-sharding misalignment (e.g. MoE experts)
+        (128, 144),  # n%32=0, k%32=16: row-sharding misalignment (e.g. shared expert down_proj)
+        (144, 176),  # both misaligned
+    ],
+)
+def test_pad_nvfp4_weight_scale_roundtrip(n, k):
+    """Verify _pad_nvfp4_weight preserves cutlass-format weight scales through padding.
+
+    After TP sharding, weight_scale is in cutlass format (swizzled/padded via
+    modelopt_fp4_scale_to_cutlass_fp4_scale). The _pad_nvfp4_weight function pads
+    weight/scale/alpha so dimensions become multiples of 32 for nvfp4_gemm.
+
+    A previous bug treated the cutlass-format (swizzled) scale buffer as row-major
+    data when reshaping for padding, silently corrupting scale values and causing
+    accuracy degradation proportional to world_size.
+    """
+    block_size = 16
+    device = "cuda"
+
+    torch.manual_seed(42)
+    modelopt_scale = torch.rand(n, k // block_size, device=device).to(torch.float8_e4m3fn)
+    cutlass_scale = modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale)
+
+    weight_fp4 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=device)
+    alpha = torch.ones(n, device=device)
+
+    _, padded_scale, _, n_padded, k_padded = _pad_nvfp4_weight(
+        weight_fp4, cutlass_scale, alpha, n, k
+    )
+
+    padded_modelopt = cutlass_fp4_scale_to_modelopt_fp4_scale(padded_scale, (n_padded, k_padded))
+    recovered = padded_modelopt[:n, : k // block_size]
+
+    torch.testing.assert_close(
+        recovered.float(),
+        modelopt_scale.float(),
+        msg="Scale values were corrupted during padding. "
+        "_pad_nvfp4_weight may be treating cutlass-format (swizzled) data as row-major.",
+    )
+
+    if n_padded > n:
+        pad_region_n = padded_modelopt[n:, : k // block_size]
+        assert (pad_region_n.float() == 0).all(), "n-padding region should be zero"
+    if k_padded > k:
+        pad_region_k = padded_modelopt[:n, k // block_size :]
+        assert (pad_region_k.float() == 0).all(), "k-padding region should be zero"

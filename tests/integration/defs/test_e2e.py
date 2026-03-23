@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1945,7 +1945,6 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
     print(f"Testing {model_path}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     run_cmd = [
-        "trtllm-llmapi-launch",
         "python3",
         str(example_root / "quickstart_advanced.py"),
         f"--model_dir={llm_models_root()}/{model_path}",
@@ -1957,7 +1956,8 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
         "--max_num_tokens=2048",
         "--disable_kv_cache_reuse",
     ]
-    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
+    output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
+    assert "Generated text:" in output, output[-4000:]
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -2792,84 +2792,6 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, model_name,
     print("Sanity check passed!")
 
 
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("model_name,model_path", [
-    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-])
-def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
-                                        model_path):
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    test_data_root = Path(
-        os.path.join(llm_models_root(), "multimodals", "test_data"))
-
-    print(f"Accuracy test {model_name} image mode with example inputs.")
-
-    # Define accuracy inputs for image modality
-    accuracy_inputs = {
-        "image": {
-            "prompt": [
-                "Describe the object and the weather condition in the image.",
-                "Describe the traffic condition on the road in the image.",
-            ],
-            "media": [
-                str(test_data_root / "inpaint.png"),
-                str(test_data_root / "61.jpg"),
-            ],
-        }
-    }
-
-    # Define expected keywords for each model
-    expected_keywords = {
-        "mistral-small-3.1-24b-instruct": {
-            "image": [
-                ["scenic", "rock", "landscape", "monolith", "formation"],
-                [
-                    "multi-lane", "highway", "moderate", "traffic", "flow",
-                    "vehicles", "congestion"
-                ],
-            ],
-        },
-    }
-
-    # Build command for image modality
-    cmd = [
-        str(example_root / "quickstart_multimodal.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--modality",
-        "image",
-        "--prompt",
-        *accuracy_inputs["image"]["prompt"],
-        "--media",
-        *accuracy_inputs["image"]["media"],
-        "--tp_size",
-        "2",
-    ]
-
-    # Add model-specific configurations
-    if model_name == "mistral-small-3.1-24b-instruct":
-        # TODO: remove this once kv cache reuse is supported for Mistral
-        cmd.append("--disable_kv_cache_reuse")
-
-    output = llm_venv.run_cmd(cmd, caller=check_output)
-
-    # Set match ratio based on model
-    match_ratio = 4.0 / 5
-
-    # Check output accuracy
-    parsed_outputs = parse_output(output)
-    for prompt_output, prompt_keywords in zip(
-            parsed_outputs, expected_keywords[model_name]["image"]):
-        matches = [
-            keyword in prompt_output.lower() for keyword in prompt_keywords
-        ]
-        obs_match_ratio = 1. * sum(matches) / len(matches)
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}\n\nParsed output for all prompts: {parsed_outputs}"
-
-    print("All answers are correct!")
-
-
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
@@ -3023,52 +2945,13 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     ])
 
 
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("model_path", [
-    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
-                 marks=(skip_pre_hopper, pytest.mark.timeout(5400))),
-    pytest.param('llama4-models/Llama-4-Maverick-17B-128E-Instruct',
-                 marks=skip_pre_hopper),
-])
-def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
-                                                   model_path):
-    print(f"Testing {model_path}.")
-    tp_size, pp_size = 16, 1
-    if "Llama-4" in model_path:
-        tp_size, pp_size = 8, 2
-
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    run_cmd = [
-        "trtllm-llmapi-launch",
-        "python3",
-        str(example_root / "quickstart_advanced.py"),
-        f"--model_dir={llm_models_root()}/{model_path}",
-        "--moe_ep_size=8",
-        f"--tp_size={tp_size}",
-        f"--pp_size={pp_size}",
-        "--use_cuda_graph",
-        f"--kv_cache_fraction={_MEM_FRACTION_50}",
-        "--max_batch_size=32",
-        "--max_num_tokens=2048",
-        "--disable_kv_cache_reuse",
-    ]
-    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
-
-
-@pytest.mark.timeout(7200)
+@pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
-@pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 8), (8, 2, 8)],
+@pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
 @pytest.mark.parametrize("model_path", [
-    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
-                 marks=skip_pre_hopper),
-    pytest.param('llama4-models/Llama-4-Maverick-17B-128E-Instruct',
-                 marks=skip_pre_hopper),
-    pytest.param('llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8',
-                 marks=skip_pre_hopper),
     pytest.param('Qwen3/Qwen3-235B-A22B', marks=skip_pre_hopper),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
@@ -3079,13 +2962,9 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                           mmlu_dataset_root):
-    if "Llama-4" in model_path and tp_size == 16:
-        pytest.skip("Llama-4 with tp16 is not supported")
-
     mmlu_threshold = 81.5
     model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
-        "trtllm-llmapi-launch",
         "trtllm-eval",
         f"--model={model_dir}",
         f"--ep_size={ep_size}",
@@ -3108,7 +2987,7 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         output = subprocess.check_output(run_cmd,
                                          text=True,
                                          stderr=subprocess.STDOUT,
-                                         timeout=7200)
+                                         timeout=5400)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print_warning(f"eval failed: {e.returncode}")
         print_warning(f"eval output:\n{e.output}")
@@ -3118,6 +2997,55 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
             print_info(f"eval output:\n{output}")
             mmlu_accuracy = get_mmlu_accuracy(output)
             assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_mpi_world_size(2)
+@pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (1, 2)],
+                         ids=["tp2", "pp2"])
+@pytest.mark.parametrize("model_path", [
+    pytest.param('llama-3.1-model/Meta-Llama-3.1-70B', marks=skip_pre_hopper),
+    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
+                 marks=skip_pre_hopper),
+    pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
+                 marks=skip_pre_blackwell),
+    pytest.param('DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B',
+                 marks=skip_pre_hopper),
+    pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8',
+                 marks=skip_pre_hopper),
+    pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct',
+                 marks=skip_pre_hopper),
+    pytest.param('modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
+                                           tp_size, pp_size):
+    print(
+        f"Testing quickstart {model_path} with tp_size={tp_size}, pp_size={pp_size}."
+    )
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    prompt = "Explain why New York is great city to live in, in 1 short paragraph"
+    run_cmd = [
+        "python3",
+        str(example_root / "quickstart_advanced.py"),
+        f"--model_dir={llm_models_root()}/{model_path}",
+        f"--tp_size={tp_size}",
+        f"--pp_size={pp_size}",
+        "--max_num_tokens=4096",
+        "--max_batch_size=1",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--prompt",
+        prompt,
+    ]
+
+    if ("Llama-4" in model_path or "Qwen3" in model_path) and tp_size > 1:
+        run_cmd.append(f"--moe_ep_size={tp_size}")
+
+    output = check_output(run_cmd, env=llm_venv._new_env)
+    print(output)
+    assert "Generated text:" in output, output[-4000:]
 
 
 @pytest.mark.skip_less_device_memory(80000)

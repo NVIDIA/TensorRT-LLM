@@ -131,7 +131,7 @@ def main():
 
     try:
         with open(full_path, "r", encoding="utf-8") as f:
-            timeoutTests = [line.strip() for line in f if line.strip()]
+            timeoutTests = list(dict.fromkeys(line.strip() for line in f if line.strip()))
     except IOError as e:
         print(f"Error reading {full_path}: {e}")
         return

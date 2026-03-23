@@ -19,6 +19,7 @@ import io
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -26,9 +27,9 @@ from typing import Dict, List, NamedTuple, Optional
 
 from _pytest.nodes import Item
 from _pytest.python import Function
-from defs.trt_test_alternative import check_output, print_error, print_info
+from defs.trt_test_alternative import print_error, print_info
 
-from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
+from ..common import get_trt_llm_lib_dir
 from ..local_venv import PythonVenvRunnerImpl
 from ..test_list_parser import parse_test_list
 from .data_export import (GPU_MONITORING_FORMAT_KEYS, write_csv,
@@ -134,7 +135,6 @@ class PerfBenchScriptTestCmds(NamedTuple):
     build_cmd: List[str]
     benchmark_cmds: List[List[str]]
     mpi_cmd: List[str]
-    is_python: bool
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -165,14 +165,6 @@ class PerfBenchScriptTestCmds(NamedTuple):
             #running build
             if len(self.build_cmd) == 0:
                 pass
-            elif self.build_cmd[0].endswith('.py'):
-                print_info(
-                    f'Running engine building command: "{build_cmd_str}"')
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd,
-                                                    self.build_cmd)
-                else:
-                    output += venv.run_cmd(self.build_cmd, caller=check_output)
             else:
                 envs = copy.deepcopy(os.environ)
                 print_info(
@@ -183,37 +175,23 @@ class PerfBenchScriptTestCmds(NamedTuple):
             #running throughput
             print_info(f'Now running benchmarking command: "{current_cmd_str}"')
             command = self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)]
-            if self.is_python:
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd, command)
-                else:
-                    output += venv.run_cmd(command, caller=check_output)
-            else:
-                envs = copy.deepcopy(os.environ)
-                # Set LD_LIBRARY_PATH to the directory where the binary is located to find libtensorrt_llm.so and
-                # libnvinfer_plugin_tensorrt_llm.so.x.
-                envs[
-                    "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
-                print(
-                    f'Augmented cpp runtime LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}'
-                )
-                benchmark_cmd = mpi_cmd + command
-                output += subprocess.check_output(benchmark_cmd,
-                                                  env=envs).decode()
-                # write config.json to output log
-                match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
-                if match:
-                    engine_dir = match.group(1)
-                    print_info(
-                        f'writing config.json in {engine_dir} to output log')
-                    with open(os.path.join(engine_dir, "config.json"),
-                              "r") as f:
-                        config_content = f.read()
-                        output += "\n" + "=" * 50 + "\n"
-                        output += "ENGINE CONFIG:\n"
-                        output += "=" * 50 + "\n"
-                        output += config_content
-                        output += "\n" + "=" * 50 + "\n"
+            envs = copy.deepcopy(os.environ)
+            envs[
+                "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
+            print(f'Augmented LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}')
+            benchmark_cmd = mpi_cmd + command
+            output += subprocess.check_output(benchmark_cmd, env=envs).decode()
+            match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
+            if match:
+                engine_dir = match.group(1)
+                print_info(f'writing config.json in {engine_dir} to output log')
+                with open(os.path.join(engine_dir, "config.json"), "r") as f:
+                    config_content = f.read()
+                    output += "\n" + "=" * 50 + "\n"
+                    output += "ENGINE CONFIG:\n"
+                    output += "=" * 50 + "\n"
+                    output += config_content
+                    output += "\n" + "=" * 50 + "\n"
         return output
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
@@ -221,19 +199,133 @@ class PerfBenchScriptTestCmds(NamedTuple):
                        " ") if len(self.mpi_cmd) > 0 else ""
         if cmd_idx <= len(self.data_cmds) - 1:
             cmd_str = " ".join(self.data_cmds[cmd_idx])
-        elif cmd_idx == len(self.data_cmds):  #for trtllm-bench build command
+        elif cmd_idx == len(self.data_cmds):
             if len(self.build_cmd) == 0:
                 cmd_str = ''
-            elif self.build_cmd[0].endswith('.py'):
-                cmd_str = mpi_cmd_str + "python3 " + " ".join(self.build_cmd)
             else:
-                cmd_str = mpi_cmd_str + "  " + " ".join(self.build_cmd)
+                cmd_str = mpi_cmd_str + " ".join(self.build_cmd)
         else:
-            python_str = "python3 " if self.is_python else ""
-            cmd_str = mpi_cmd_str + python_str + " ".join(
+            cmd_str = mpi_cmd_str + " ".join(
                 self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)])
 
         return cmd_str
+
+
+def _wait_for_server_ready(url: str,
+                           timeout: int = 600,
+                           server_proc: subprocess.Popen = None) -> None:
+    import requests
+
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if server_proc is not None:
+            exit_code = server_proc.poll()
+            if exit_code is not None:
+                raise RuntimeError(
+                    f"Server exited with code {exit_code} before becoming ready."
+                )
+        try:
+            time.sleep(1)
+            if requests.get(url, timeout=5).status_code == 200:
+                print_info(f"Server endpoint {url} is ready")
+                return
+        except requests.exceptions.RequestException:
+            pass
+    raise RuntimeError(f"Server {url} did not become ready within {timeout}s")
+
+
+class PerfServeScriptTestCmds:
+    """Commands for serve runtime perf tests (server-client model)."""
+
+    def __init__(self, server_cmd: List[str], client_cmds: List[List[str]],
+                 data_cmds: List[List[str]], server_env: Dict[str, str],
+                 server_timeout: int):
+        self.server_cmd = server_cmd
+        self.client_cmds = client_cmds
+        self.data_cmds = data_cmds
+        self.server_env = server_env
+        self.server_timeout = server_timeout
+        self._server_proc = None
+        self._server_log_path = None
+
+    def start_server(self) -> None:
+        if self._server_proc is not None:
+            return
+        from tensorrt_llm._utils import get_free_port
+        self._port = get_free_port()
+        self._host = "localhost"
+        cmd = self.server_cmd + [
+            "--host", self._host, "--port",
+            str(self._port)
+        ]
+        self._server_log_path = os.path.join(os.getcwd(),
+                                             "trtllm-serve-perf.log")
+        print_info(f"Starting trtllm-serve: {' '.join(cmd)}")
+        self._server_log_file = open(self._server_log_path, "w")
+        self._server_proc = subprocess.Popen(cmd,
+                                             env=self.server_env,
+                                             stdout=self._server_log_file,
+                                             stderr=subprocess.STDOUT)
+        _wait_for_server_ready(f"http://{self._host}:{self._port}/health",
+                               timeout=self.server_timeout,
+                               server_proc=self._server_proc)
+
+    def stop_server(self) -> None:
+        if self._server_proc is not None:
+            self._server_proc.terminate()
+            try:
+                self._server_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self._server_proc.kill()
+                self._server_proc.wait()
+            self._server_proc = None
+        if hasattr(self, '_server_log_file') and self._server_log_file:
+            self._server_log_file.close()
+            self._server_log_file = None
+
+    def run_cmd(self, cmd_idx: int, venv) -> str:
+        output = ""
+        if cmd_idx <= len(self.data_cmds) - 1:
+            print_info(f"Running prepare dataset command")
+            prepare_cmd = self.data_cmds[cmd_idx]
+            prepare_cmd_str = " ".join(prepare_cmd)
+            envs = copy.deepcopy(os.environ)
+            for sub_cmd in prepare_cmd_str.split(';'):
+                print_info(f'Now running prepare data command: "{sub_cmd}"')
+                if '>' in sub_cmd:
+                    cmd = sub_cmd.split('>')[0]
+                    dataset_file = sub_cmd.split('>')[1].split()[0]
+                else:
+                    cmd = sub_cmd
+                    dataset_file = None
+                output += subprocess.check_output(cmd.split(),
+                                                  env=envs).decode()
+                if dataset_file:
+                    with open(f"{dataset_file}", 'w+') as f:
+                        f.write(output)
+        elif cmd_idx == len(self.data_cmds):
+            self.start_server()
+        else:
+            client_cmd = self.client_cmds[cmd_idx - 1 - len(self.data_cmds)]
+            client_cmd_with_port = client_cmd + [
+                "--host", self._host, "--port",
+                str(self._port)
+            ]
+            print_info(
+                f"Running benchmark client: {' '.join(client_cmd_with_port)}")
+            output = subprocess.check_output(client_cmd_with_port,
+                                             stderr=subprocess.STDOUT,
+                                             env=copy.deepcopy(
+                                                 os.environ)).decode()
+        return output
+
+    def get_cmd_str(self, cmd_idx) -> str:
+        if cmd_idx <= len(self.data_cmds) - 1:
+            return " ".join(self.data_cmds[cmd_idx])
+        elif cmd_idx == len(self.data_cmds):
+            return " ".join(self.server_cmd)
+        else:
+            return " ".join(self.client_cmds[cmd_idx - 1 - len(self.data_cmds)])
 
 
 class AbstractPerfScriptTestClass(abc.ABC):
@@ -367,6 +459,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
         cmd_str = commands.get_cmd_str(cmd_idx)
         is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "prepare-dataset" in cmd_str
+        is_setup_cmd = is_prepare_dataset_cmd or metric_type is None
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -388,11 +481,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
 
-                    # Check whether output has error message
-                    if not is_prepare_dataset_cmd:
+                    if not is_setup_cmd:
                         self._check_benchmark_output_for_errors(output)
 
-                    # Print the output log to stdout and cache it.
                     if is_prepare_dataset_cmd:
                         # For prepare_dataset commands, only print the prepare command info
                         for line in buf.getvalue().split('\n'):
@@ -428,14 +519,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 print_error(e.stderr.decode() if e.stderr else "<empty>")
                 print_error("--------------")
 
-        # Only save perf result if the result is valid.
         if self._result_state == "valid":
-            # Parse the perf result from the test outputs.
-            if is_prepare_dataset_cmd:
+            if is_setup_cmd:
                 print_info(
-                    f"skip writing perf result when calling generating dataset in trtllm-bench."
+                    f"skip writing perf result for setup command (cmd_idx={cmd_idx})."
                 )
-                outputs.pop(cmd_idx)
+                outputs.pop(cmd_idx, None)
             else:
                 self._perf_result = self.get_perf_result(outputs)
 

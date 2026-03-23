@@ -691,7 +691,7 @@ class AllReduce(nn.Module):
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
-        if self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1 and not self.mapping.enable_attention_dp:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
                 try:
@@ -772,6 +772,7 @@ class AllReduce(nn.Module):
         Returns:
             A tensor lists with different tensor outptus according to the fusion_op.
             NONE: [hidden_states]
+            RMS_NORM: [hidden_states]
             RESIDUAL_RMS_NORM: [hidden_states, residual]
             RESIDUAL_RMS_NORM_QUANT_FP8: [norm_quant, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
@@ -943,8 +944,9 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
         else:
-            assert all_reduce_params.residual.shape[
-                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+            if all_reduce_params.residual is not None:
+                assert all_reduce_params.residual.shape[
+                    0] <= self.max_token, "Num tokens must be less than or equal to max_token"
 
             return torch.ops.trtllm.moe_finalize_allreduce(
                 input=input,

@@ -1834,20 +1834,25 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     # Only token == -1 should propagate as -1
     is_invalid_tok = tok < 0
 
+    # Clamp negative tokens to 0 for safe block_id computation.
+    # The result is discarded via is_invalid_tok below, but this prevents
+    # computing negative block_id which would cause OOB block_table loads.
+    safe_tok = tl.maximum(tok, 0)
+
     # Compute block id and in-block offset
-    block_id = tok // BLOCK_SIZE
-    inblock_off = tok % BLOCK_SIZE + layer_id * BLOCK_SIZE
+    block_id = safe_tok // BLOCK_SIZE
+    inblock_off = safe_tok % BLOCK_SIZE + layer_id * BLOCK_SIZE
 
     # Guard block_table access
     valid_block = block_id < max_num_blocks_per_req
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
-    base = tl.load(bt_ptr, mask=valid_block, other=0)
+    base = tl.load(bt_ptr, mask=valid_block & (~is_invalid_tok), other=0)
 
-    # If token == -1 OR block_id OOB, output -1
+    # If token == -1 OR block_id OOB OR block_table has -1 (padding), output -1
     # Otherwise: base * stride_factor + inblock_off
     # (stride_factor accounts for layer interleaving in strided KV cache pools)
-    out_val = tl.where(is_invalid_tok | (~valid_block), -1,
-                       base * stride_factor + inblock_off)
+    is_invalid = is_invalid_tok | (~valid_block) | (base < 0)
+    out_val = tl.where(is_invalid, -1, base * stride_factor + inblock_off)
 
     # Store results
     out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
@@ -1931,3 +1936,121 @@ def triton_convert_req_index_to_global_index(
         out_stride1,
     )
     return out
+
+
+########################################################
+# Fused K cache gather kernel
+########################################################
+
+
+@triton.jit
+def _triton_gather_k_cache_kernel(
+    k_cache_ptr,
+    slot_fp8_ptr,
+    slot_scale_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    k_token_start,
+    num_k_tokens,
+    HEAD_DIM: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    token_offsets = (pid * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)).to(
+        tl.int64)
+    token_mask = token_offsets < num_k_tokens
+
+    fp8_base = tl.load(slot_fp8_ptr + k_token_start + token_offsets,
+                       mask=token_mask,
+                       other=0)
+    scale_base = tl.load(slot_scale_ptr + k_token_start + token_offsets,
+                         mask=token_mask,
+                         other=0)
+
+    byte_offsets = tl.arange(0, HEAD_DIM).to(tl.int64)
+    src_fp8 = fp8_base[:, None] + byte_offsets[None, :]
+    dst_fp8 = token_offsets[:, None] * HEAD_DIM + byte_offsets[None, :]
+    gather_mask = token_mask[:, None]
+
+    fp8_data = tl.load(k_cache_ptr + src_fp8, mask=gather_mask, other=0)
+    tl.store(out_fp8_ptr + dst_fp8, fp8_data, mask=gather_mask)
+
+    scale_byte_offsets = tl.arange(0, SCALE_BYTES).to(tl.int64)
+    src_scale = scale_base[:, None] + scale_byte_offsets[None, :]
+    dst_scale = token_offsets[:,
+                              None] * SCALE_BYTES + scale_byte_offsets[None, :]
+
+    scale_data = tl.load(k_cache_ptr + src_scale, mask=gather_mask, other=0)
+    tl.store(out_scale_ptr + dst_scale, scale_data, mask=gather_mask)
+
+
+def triton_gather_k_cache(
+    k_cache: torch.Tensor,
+    slot_mapping_fp8: torch.Tensor,
+    slot_mapping_scale: torch.Tensor,
+    k_token_start: int,
+    k_token_end: int,
+    head_dim: int,
+):
+    """Gather K FP8 values and scales from the indexer K cache for a chunk.
+
+    Replaces ``_gather_k_cache_for_chunk``, fusing ~8-12 small PyTorch ops
+    (arange, unsqueeze, broadcast add, _unravel_indices, advanced indexing)
+    into a single Triton kernel that directly gathers from flat byte offsets.
+    This is purely data movement — bit-exact with the original.
+
+    Args:
+        k_cache: Indexer K cache pool data (2D contiguous), uint8.
+        slot_mapping_fp8: Flat byte indices for FP8 data
+            ``[total_kv_len]``, int64.
+        slot_mapping_scale: Flat byte indices for scale data
+            ``[total_kv_len]``, int64.
+        k_token_start: Start index into slot mapping arrays.
+        k_token_end: End index into slot mapping arrays.
+        head_dim: FP8 head dimension (typically 128).
+
+    Returns:
+        Tuple of (k_fp8, k_scale):
+            k_fp8: ``[num_k_tokens, head_dim]``, float8_e4m3fn.
+            k_scale: ``[num_k_tokens, 1]``, float32.
+    """
+    num_k_tokens = k_token_end - k_token_start
+    device = k_cache.device
+
+    if num_k_tokens == 0:
+        return (
+            torch.empty(0, head_dim, dtype=torch.float8_e4m3fn, device=device),
+            torch.empty(0, 1, dtype=torch.float32, device=device),
+        )
+
+    SCALE_BYTES = 4
+    BLOCK_TOKENS = 32
+
+    k_cache_flat = k_cache.reshape(-1)
+    out_fp8 = torch.empty(num_k_tokens,
+                          head_dim,
+                          dtype=torch.uint8,
+                          device=device)
+    out_scale = torch.empty(num_k_tokens,
+                            SCALE_BYTES,
+                            dtype=torch.uint8,
+                            device=device)
+
+    grid = (triton.cdiv(num_k_tokens, BLOCK_TOKENS), )
+    _triton_gather_k_cache_kernel[grid](
+        k_cache_flat,
+        slot_mapping_fp8,
+        slot_mapping_scale,
+        out_fp8.view(-1),
+        out_scale.view(-1),
+        k_token_start,
+        num_k_tokens,
+        HEAD_DIM=head_dim,
+        SCALE_BYTES=SCALE_BYTES,
+        BLOCK_TOKENS=BLOCK_TOKENS,
+    )
+
+    k_fp8 = out_fp8.view(torch.float8_e4m3fn)
+    k_scale = out_scale.view(torch.float32).view(num_k_tokens, 1)
+    return k_fp8, k_scale

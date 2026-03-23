@@ -12,8 +12,9 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
-                                                         load_pretrained_config)
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
+    load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -130,6 +131,9 @@ class ModelConfig(Generic[TConfig]):
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
+
+    # Video pruning rate for VLM models (None = EVS disabled)
+    video_pruning_rate: Optional[float] = None
 
     def __setattr__(self, key, value):
         """
@@ -360,10 +364,11 @@ class ModelConfig(Generic[TConfig]):
             quant_config.group_size = block_size[0]
 
             # Set default exclude_modules for FP8_BLOCK_SCALES
-            if moe_backend == 'TRTLLM':
-                default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
-            else:
-                default_exclude = ["*eh_proj"]
+            # kv_b_proj must always be excluded: FP8 128x128 block boundaries
+            # don't necessarily align with per-head dim boundaries (e.g. GLM-5
+            # has qk_nope_head_dim=192), so the scale tensor cannot be cleanly
+            # reshaped per-head. The dequant path handles this correctly.
+            default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
 
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
@@ -504,22 +509,29 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[
-                        0] == "DeepseekV32ForCausalLM":
+                if pretrained_config.architectures[0] in [
+                        "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
+                ]:
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
+                    indexer_rope_interleave = getattr(
+                        pretrained_config, 'indexer_rope_interleave', False)
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
                         index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                        use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                        q_split_threshold = sparse_attention_config.q_split_threshold
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
                         index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
+                        use_cute_dsl_topk = False
+                        q_split_threshold = 8192
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -527,7 +539,10 @@ class ModelConfig(Generic[TConfig]):
                             index_topk=index_topk,
                             indexer_max_chunk_size=indexer_max_chunk_size,
                             skip_indexer_for_short_seqs=
-                            skip_indexer_for_short_seqs)
+                            skip_indexer_for_short_seqs,
+                            use_cute_dsl_topk=use_cute_dsl_topk,
+                            q_split_threshold=q_split_threshold,
+                            indexer_rope_interleave=indexer_rope_interleave)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -770,12 +785,7 @@ class ModelConfig(Generic[TConfig]):
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif hasattr(
-                self.pretrained_config, "architectures"
-        ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
-                0] in ["Qwen3NextForCausalLM"]:
-            # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
-            # we need to calculate the number of fullattention layers
-            return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
+        elif is_qwen3_hybrid(self.pretrained_config):
+            return get_qwen3_hybrid_num_attention_layers(self.pretrained_config)
         else:
             return self.pretrained_config.num_hidden_layers

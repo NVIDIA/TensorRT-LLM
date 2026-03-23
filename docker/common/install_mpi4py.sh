@@ -83,4 +83,3 @@ pip3 install --no-cache-dir "$TMP_DIR/mpi4py-${MPI4PY_VERSION}"
 
 # Clean up
 rm -rf "$TMP_DIR"
-rm -rf ~/.cache/pip

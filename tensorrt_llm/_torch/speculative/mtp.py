@@ -45,25 +45,28 @@ class MTPHiddenStatesManager(BaseResourceManager):
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
-        self.slot_manager = SlotManager(max_num_requests)
+        # Reserve one extra slot for the CUDA graph padding dummy request,
+        # which is kept alive permanently and must not consume a real slot.
+        slot_pool_size = max_num_requests + 1
+        self.slot_manager = SlotManager(slot_pool_size)
         # Optional SA manager for MTP+SA mode
         self.sa_manager = sa_manager
 
         # Since golden token's hidden state will always be generated after target model
         self.mtp_past_hidden_states_pool = torch.zeros(
-            (max_num_requests, self.num_nextn_predict_layers, self.hidden_size),
+            (slot_pool_size, self.num_nextn_predict_layers, self.hidden_size),
             device='cuda',
             dtype=self.dtype,
         )
         self.mtp_past_tokens_pool = torch.zeros(
-            (max_num_requests, self.num_nextn_predict_layers),
+            (slot_pool_size, self.num_nextn_predict_layers),
             device='cuda',
             dtype=torch.int,
         )
         if self.use_relaxed_acceptance_for_thinking:
             # The relaxed_delta for relaxed acceptance
             self.mtp_relaxed_delta_pool = torch.zeros(
-                (self.max_num_requests),
+                (slot_pool_size),
                 dtype=torch.float,
                 device='cuda',
             )
@@ -813,7 +816,8 @@ class MTPWorker(SpecWorkerBase):
 
             # Apply force override for relaxed acceptance path
             num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts)
+                num_accepted_tokens, num_contexts,
+                spec_metadata.runtime_draft_len)
 
         # Strict acceptance
         else:
@@ -829,7 +833,8 @@ class MTPWorker(SpecWorkerBase):
 
                 # Apply force override for THOP path
                 num_accepted_tokens = self._apply_force_accepted_tokens(
-                    num_accepted_tokens, num_contexts)
+                    num_accepted_tokens, num_contexts,
+                    spec_metadata.runtime_draft_len)
             else:
                 # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
@@ -873,6 +878,7 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                 mtp_num_modules + 1 -
                 num_accepted_tokens[num_contexts:batch_size])
+            attn_metadata.on_update_kv_lens()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):
@@ -1137,6 +1143,7 @@ class MTPEagleWorker(MTPWorker):
         draft_model,
         resource_manager=None,
     ):
+
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts

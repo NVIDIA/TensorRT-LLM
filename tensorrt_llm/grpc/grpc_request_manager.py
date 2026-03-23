@@ -369,6 +369,8 @@ def create_sampling_params_from_proto(
             kwargs["guided_decoding"] = GuidedDecodingParams(regex=guide_content)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_EBNF_GRAMMAR:
             kwargs["guided_decoding"] = GuidedDecodingParams(grammar=guide_content)
+        elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_STRUCTURAL_TAG:
+            kwargs["guided_decoding"] = GuidedDecodingParams(structural_tag=guide_content)
 
     params = SamplingParams(**kwargs)
 
@@ -424,8 +426,7 @@ def create_disaggregated_params_from_proto(
 
     if proto_config.HasField("context_phase_params"):
         ctx_params = proto_config.context_phase_params
-        params.first_gen_token_id = ctx_params.first_gen_token_id
-        if ctx_params.kv_cache_blocks:
-            params.kv_cache_blocks = ctx_params.kv_cache_blocks
+        if ctx_params.first_gen_token_id:
+            params.first_gen_tokens = [ctx_params.first_gen_token_id]
 
     return params

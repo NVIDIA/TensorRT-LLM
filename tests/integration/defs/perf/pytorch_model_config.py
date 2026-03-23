@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -205,9 +205,10 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
-        # Llama Nemotron models with attention_dp disabled to prevent hangs
+        # Model-specific cases with attention_dp disabled to prevent hangs
         {
             'patterns': [
+                'deepseek_r1_distill_llama_70b',
                 'llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8',
                 'llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8',
                 'llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16'
