@@ -85,7 +85,7 @@ Note:
 
 # Visual Generation Models
 
-TensorRT-LLM supports diffusion-based image and video generation via the **VisualGen** subsystem (prototype).
+TensorRT-LLM provides prototype support for diffusion-based image and video generation.
 For full documentation, see the [Visual Generation](./visual-generation.md) page.
 
 ## Supported Models
