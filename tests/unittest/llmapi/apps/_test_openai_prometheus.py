@@ -45,7 +45,11 @@ def temp_extra_llm_api_options_file(request):
     try:
         extra_llm_api_options_dict = {
             "return_perf_metrics": True,
-            "enable_iter_perf_stats": True
+            "enable_iter_perf_stats": True,
+            "kv_cache_config": {
+                "enable_block_reuse": True,
+                "iteration_stats_interval": 1,
+            },
         }
 
         with open(temp_file_path, 'w') as f:
@@ -161,7 +165,9 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
         kv_metrics = _parse_all_kv_metrics(data, METRIC_PREFIX)
         if all(v is not None for v in kv_metrics.values()):
             hit_rate = kv_metrics[METRIC_PREFIX + "kv_cache_hit_rate"]
-            if hit_rate > 0.0:
+            has_utilization_rate = kv_metrics[METRIC_PREFIX + "kv_cache_utilization"] is not None
+            has_iter_reuse_rate = kv_metrics[METRIC_PREFIX + "kv_cache_iter_reuse_rate"] is not None
+            if hit_rate > 0.0 and has_utilization_rate and has_iter_reuse_rate:
                 # Wait until we have some kv cache reuse to check on iteration stats
                 iteration_stats_metrics_found = True
                 break

@@ -27,6 +27,20 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+/// @brief Statistics for block transfers. Returned by KVCacheTransferManager::getAndResetTransferStats().
+/// All counters are reset on read.
+/// - onboard/offload: transfers between secondary (host) and primary (GPU) memory.
+/// - intraDeviceCopy: GPU-to-GPU block copies (e.g. partial reuse when source block has refs).
+struct KvCacheTransferStats
+{
+    SizeType32 onboardBlocks{0};
+    std::size_t onboardBytes{0};
+    SizeType32 offloadBlocks{0};
+    std::size_t offloadBytes{0};
+    SizeType32 intraDeviceCopyBlocks{0};
+    std::size_t intraDeviceCopyBytes{0};
+};
+
 // The TransferManager accelerates transfers to/from the GPU by overlapping HtoD and DtoH transfers, and tracks ongoing
 // transfers in order to avoid race conditions. It is functionally equivalent to the prior approach of putting all
 // transfers into the forward pass stream. This is only ever used as a component of a KVCacheManager.
@@ -57,6 +71,9 @@ public:
     //! must be called after last call to KVCacheManager::addSequence in every step.
     void syncTransfers();
 
+    //! \brief Get transfer stats accumulated since last call, and reset the counters.
+    [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
+
 private:
     //! \brief Get pointer to pool specified by cache block.
     static tr::ITensor::SharedPtr computeBlockPointer(
@@ -79,6 +96,12 @@ private:
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
+    //! \brief Compute total bytes actually transferred for a block copy across all pools.
+    //! \param pools The pool descriptors.
+    //! \param numTokensToCopy Number of tokens for partial copy (0 means full block).
+    [[nodiscard]] std::size_t computeBlockTransferBytes(
+        std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy) const;
+
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
@@ -90,6 +113,16 @@ private:
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;
+
+    // Cumulative transfer statistics, reset on each call to getAndResetTransferStats().
+    // Protected by mStatsMutex for thread-safe access.
+    mutable std::mutex mStatsMutex;
+    SizeType32 mOnboardBlockCount{0};
+    std::size_t mOnboardByteCount{0};
+    SizeType32 mOffloadBlockCount{0};
+    std::size_t mOffloadByteCount{0};
+    SizeType32 mIntraDeviceCopyBlockCount{0};
+    std::size_t mIntraDeviceCopyByteCount{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

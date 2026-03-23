@@ -733,9 +733,12 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mTransferManager{std::make_shared<KVCacheTransferManager>(mBufferManager, mLoopbackAgent)}
     , mAllocTotalBlocks{0}
     , mAllocNewBlocks{0}
+    , mFullReusedBlocks{0}
+    , mPartialReusedBlocks{0}
     , mReusedBlocks{0}
     , mReusedUniqueBlocks{0}
     , mMissedBlocks{0}
+    , mGenAllocBlocks{0}
     , mKVFactor{(mCacheType == CacheType::kSELFKONLY
                     || (linearAttentionMetadata.has_value() && linearAttentionMetadata->hasRecurrentStatesCache()))
               ? 1
@@ -1494,6 +1497,14 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     reusedBlockIds.insert(matchingBlockId);
                     ++mReusedUniqueBlocks;
                 }
+                if (partialMatch)
+                {
+                    ++mPartialReusedBlocks;
+                }
+                else
+                {
+                    ++mFullReusedBlocks;
+                }
             }
             ++blockItr;
         }
@@ -1702,6 +1713,7 @@ void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
     {
         // Allocating a new block when the last token is a block boundary
         allocateBlock(sequence, /*shareAmongBeams=*/sequence.getBeamWidth() == 1);
+        ++mGenAllocBlocks;
         updateLastCacheBlockOffsets(sequence);
     }
 }
@@ -2194,6 +2206,73 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 [[nodiscard]] SizeType32 WindowBlockManager::getNumFreeBlocks() const noexcept
 {
     return mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
+}
+
+[[nodiscard]] SizeType32 WindowBlockManager::getNumFreeSecondaryBlocks() const noexcept
+{
+    return mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel);
+}
+
+KvCacheIterationStats WindowBlockManager::getAndResetIterationStats()
+{
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    KvCacheIterationStats stats;
+
+    // Instantaneous gauges
+    stats.primaryMaxNumBlocks = getNumPrimaryBlocks();
+    stats.primaryFreeNumBlocks = getNumFreeBlocks();
+    stats.primaryUsedNumBlocks = stats.primaryMaxNumBlocks - stats.primaryFreeNumBlocks;
+    stats.secondaryMaxNumBlocks = getNumSecondaryBlocks();
+    stats.secondaryFreeNumBlocks = getNumFreeSecondaryBlocks();
+    stats.secondaryUsedNumBlocks = stats.secondaryMaxNumBlocks - stats.secondaryFreeNumBlocks;
+
+    // Compute deltas since last call — context phase
+    stats.iterAllocTotalBlocks = mAllocTotalBlocks - mPrevAllocTotalBlocks;
+    stats.iterAllocNewBlocks = mAllocNewBlocks - mPrevAllocNewBlocks;
+    stats.iterReusedBlocks = mReusedBlocks - mPrevReusedBlocks;
+    stats.iterFullReusedBlocks = mFullReusedBlocks - mPrevFullReusedBlocks;
+    stats.iterPartialReusedBlocks = mPartialReusedBlocks - mPrevPartialReusedBlocks;
+    stats.iterMissedBlocks = mMissedBlocks - mPrevMissedBlocks;
+
+    auto const iterTotal = stats.iterReusedBlocks + stats.iterMissedBlocks;
+    stats.iterCacheHitRate
+        = iterTotal == 0 ? 0.0f : static_cast<float>(stats.iterReusedBlocks) / static_cast<float>(iterTotal);
+
+    // Generation phase
+    stats.iterGenAllocBlocks = mGenAllocBlocks - mPrevGenAllocBlocks;
+
+    // Snapshot current values for next delta
+    mPrevAllocTotalBlocks = mAllocTotalBlocks;
+    mPrevAllocNewBlocks = mAllocNewBlocks;
+    mPrevReusedBlocks = mReusedBlocks;
+    mPrevFullReusedBlocks = mFullReusedBlocks;
+    mPrevPartialReusedBlocks = mPartialReusedBlocks;
+    mPrevMissedBlocks = mMissedBlocks;
+    mPrevGenAllocBlocks = mGenAllocBlocks;
+
+    // Transfer stats (collected from transfer manager)
+    if (mTransferManager)
+    {
+        auto transferStats = mTransferManager->getAndResetTransferStats();
+        stats.iterOnboardBlocks = transferStats.onboardBlocks;
+        stats.iterOnboardBytes = transferStats.onboardBytes;
+        stats.iterOffloadBlocks = transferStats.offloadBlocks;
+        stats.iterOffloadBytes = transferStats.offloadBytes;
+        stats.iterIntraDeviceCopyBlocks = transferStats.intraDeviceCopyBlocks;
+        stats.iterIntraDeviceCopyBytes = transferStats.intraDeviceCopyBytes;
+    }
+
+    return stats;
+}
+
+std::map<SizeType32, KvCacheIterationStats> BlockManager::getAndResetIterationStats()
+{
+    std::map<SizeType32, KvCacheIterationStats> perWindowStats;
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        perWindowStats[windowSize] = manager.getAndResetIterationStats();
+    }
+    return perWindowStats;
 }
 
 std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::chrono::milliseconds> timeout) const
