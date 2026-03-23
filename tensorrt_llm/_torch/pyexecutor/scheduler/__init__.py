@@ -20,24 +20,20 @@ This module contains:
 - Waiting queues (FCFS)
 """
 
-# Re-export from scheduler.py
+# Re-export from scheduler.py (interfaces and data structures)
 from .adp_router import ADPRouter, DefaultADPRouter, RankState
 from .scheduler import (
-    BindCapacityScheduler,
-    BindMicroBatchScheduler,
-    CapacityScheduler,
-    MicroBatchScheduler,
-    PyCapacityScheduler,
-    PyMicroBatchScheduler,
     RequestList,
     RequestScheduler,
     ScheduledRequests,
     SchedulerOutput,
+    ScheduleStepConfig,
+    ScheduleStepResult,
     SerializableSchedulerOutput,
-    SimpleScheduler,
-    SimpleUnifiedScheduler,
 )
 from .scheduler_v2 import KVCacheV2Scheduler
+from .simple_scheduler import BindCapacityScheduler, BindMicroBatchScheduler, SimpleScheduler
+from .unified_scheduler import PyCapacityScheduler, UnifiedScheduler
 
 # Re-export from waiting_queue.py
 from .waiting_queue import FCFSWaitingQueue, WaitingQueue, create_waiting_queue
@@ -46,18 +42,17 @@ __all__ = [
     # Schedulers
     "BindCapacityScheduler",
     "BindMicroBatchScheduler",
-    "CapacityScheduler",
     "KVCacheV2Scheduler",
-    "MicroBatchScheduler",
     "PyCapacityScheduler",
-    "PyMicroBatchScheduler",
     "RequestList",
     "RequestScheduler",
+    "ScheduleStepConfig",
+    "ScheduleStepResult",
     "ScheduledRequests",
     "SchedulerOutput",
     "SerializableSchedulerOutput",
     "SimpleScheduler",
-    "SimpleUnifiedScheduler",
+    "UnifiedScheduler",
     # ADP
     "ADPRouter",
     "DefaultADPRouter",

@@ -159,6 +159,9 @@ else:
         'runtime/kv_cache_manager_v2/rawref/*.py',
         'runtime/kv_cache_manager_v2/rawref/*.pyi',
         'runtime/*__mypyc*.so',
+        '_torch/pyexecutor/scheduler/*.so',
+        '_torch/pyexecutor/scheduler/*.pyi',
+        '_torch/pyexecutor/*__mypyc*.so',
     ]
 
 package_data += [
@@ -372,7 +375,10 @@ else:
     package_data = [
         p for p in package_data if p not in [
             'runtime/kv_cache_manager_v2/*.so',
-            'runtime/kv_cache_manager_v2/**/*.so', 'runtime/*__mypyc*.so'
+            'runtime/kv_cache_manager_v2/**/*.so',
+            'runtime/*__mypyc*.so',
+            '_torch/pyexecutor/scheduler/*.so',
+            '_torch/pyexecutor/*__mypyc*.so',
         ]
     ]
     # Ensure rawref is included

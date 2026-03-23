@@ -20,9 +20,8 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-
-    from ..executor_request_queue import RequestQueueItem
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 

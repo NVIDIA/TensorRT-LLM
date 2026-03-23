@@ -3,9 +3,8 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import Callable, Optional
 
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
-
-from ..executor_request_queue import RequestQueueItem
 
 
 class WaitingQueue(ABC):

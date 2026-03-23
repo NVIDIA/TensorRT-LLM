@@ -20,7 +20,14 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from .scheduler import RequestList, RequestScheduler, SchedulerOutput
+from .scheduler import (
+    RequestList,
+    RequestScheduler,
+    SchedulerOutput,
+    ScheduleStepConfig,
+    compute_fcfs_context_chunk_size,
+    sort_requests_by_lora,
+)
 
 
 class ScheduleAction(enum.Enum):
@@ -122,7 +129,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
         draft_kv_cache_manager=None,  # KVCacheManagerV2 for MTP draft layers
+        schedule_step_config: Optional[ScheduleStepConfig] = None,
+        dist=None,
     ):
+        super(KVCacheV2Scheduler, self).__init__(
+            schedule_step_config=schedule_step_config, dist=dist
+        )
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -178,7 +190,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
 
         # Sort by LoRA task ID
-        self._sort_requests(scheduled_ctx, scheduled_gen, has_chunking)
+        sort_requests_by_lora(scheduled_ctx, scheduled_gen, has_chunking)
 
         return SchedulerOutput(
             context_requests=scheduled_ctx,
@@ -379,18 +391,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
         context_remaining = req.context_remaining_length
-        chunk_size = (
-            min(remaining_budget, context_remaining)
-            if remaining_budget is not None
-            else context_remaining
+        chunk_size = compute_fcfs_context_chunk_size(
+            context_remaining,
+            remaining_budget,
+            self.max_context_length,
+            self.chunk_unit_size,
         )
-
-        if self.max_context_length is not None:
-            chunk_size = min(chunk_size, self.max_context_length)
-
-        # Round down to chunk_unit_size boundary (unless last chunk).
-        if chunk_size < context_remaining:
-            chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:
             # TODO: consider suspending first-chunk KVCache to release
@@ -534,29 +540,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 return req_it_end, True
 
         return req_it_end, False
-
-    # ---- Sorting ----
-
-    @staticmethod
-    def _lora_key(req: LlmRequest):
-        lora_id = getattr(req, "lora_task_id", None)
-        if lora_id is None:
-            return (0, 0)
-        return (1, lora_id)
-
-    def _sort_requests(self, context_requests, generation_requests, has_chunks):
-        """Sort by LoRA task ID. Non-last chunks before last chunks."""
-        if has_chunks:
-            not_last = [r for r in context_requests if not r.is_last_context_chunk]
-            last = [r for r in context_requests if r.is_last_context_chunk]
-            not_last.sort(key=self._lora_key)
-            last.sort(key=self._lora_key)
-            context_requests.clear()
-            context_requests.extend(not_last)
-            context_requests.extend(last)
-        else:
-            context_requests.sort(key=self._lora_key)
-        generation_requests.sort(key=self._lora_key)
 
     # ---- can_schedule (PP dry-run) ----
 

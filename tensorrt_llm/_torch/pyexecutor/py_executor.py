@@ -336,16 +336,7 @@ class PyExecutor:
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
-        self.attention_dp_enable_balance = (
-            self.llm_args.attention_dp_config is not None
-            and self.llm_args.attention_dp_config.enable_balance)
-        if self.attention_dp_enable_balance:
-            self.attention_dp_time_out_iters = self.llm_args.attention_dp_config.timeout_iters
-            self.attention_dp_batching_wait_iters = self.llm_args.attention_dp_config.batching_wait_iters
         self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
-        self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
-        self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
-        self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -451,9 +442,6 @@ class PyExecutor:
 
         self.is_shutdown = False
         self.max_batch_size = max_batch_size
-        self.adp_ctx_waiting_iters_count = 0
-        self.adp_ctx_batching_wait_iters_count = 0
-        self.batch_wait_iters_count = 0
 
         def on_detected():
             self._handle_errors(
@@ -1173,8 +1161,11 @@ class PyExecutor:
         is_dp_broadcast = self.dist.tp_size > 1 and self.enable_attention_dp
         if self.dist.rank == 0 or (self.dist.is_first_pp_rank
                                    and is_dp_broadcast):
-            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-            )
+            step_result = self.scheduler.schedule_step(self.active_requests,
+                                                       self.inflight_req_ids)
+            scheduled_batch = step_result.scheduled_requests
+            fitting_disagg_gen_init_requests = step_result.fitting_disagg_gen_init_requests
+            num_fitting_reqs = step_result.num_fitting_requests
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs)
@@ -1291,7 +1282,7 @@ class PyExecutor:
                 if self.dist.rank != 0:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
-                    # Run scheduler locally because scheduler may change llm requests' state.
+                    # Replay scheduler-local request state changes only.
                     self.scheduler.schedule_request(self.active_requests,
                                                     self.inflight_req_ids)
 
@@ -1780,8 +1771,11 @@ class PyExecutor:
             # that speculation is about to happen.
             self._prepare_draft_requests()
 
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-        )
+        step_result = self.scheduler.schedule_step(self.active_requests,
+                                                   self.inflight_req_ids)
+        scheduled_batch = step_result.scheduled_requests
+        fitting_disagg_gen_init_requests = step_result.fitting_disagg_gen_init_requests
+        num_fitting_reqs = step_result.num_fitting_requests
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -2661,108 +2655,6 @@ class PyExecutor:
         # Flush iteration events at each iteration to ensure that events have enough time
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
-
-    def _balance_adp_requests(self, context_requests: list[LlmRequest],
-                              generation_requests: list[LlmRequest]):
-        balanced_context_requests = context_requests
-        num_scheduled_context_requests = len(context_requests)
-        num_scheduled_generation_requests = len(generation_requests)
-        num_scheduled_tokens = sum(
-            [len(req.get_tokens(0))
-             for req in context_requests]) + num_scheduled_generation_requests
-        # Note: We use tp_allgather instead of tp_cp_allgather because we want to
-        # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather([
-            num_scheduled_context_requests, num_scheduled_generation_requests,
-            num_scheduled_tokens
-        ])
-        all_ranks_num_scheduled_context_requests = [
-            response[0] for response in responses_list
-        ]
-        all_ranks_num_scheduled_generation_requests = [
-            response[1] for response in responses_list
-        ]
-        all_ranks_have_free_ctx_slots = all([
-            num_gen < self.max_batch_size
-            for num_gen in all_ranks_num_scheduled_generation_requests
-        ])
-        all_ranks_have_ctx_requests = all([
-            num_ctx > 0 for num_ctx in all_ranks_num_scheduled_context_requests
-        ])
-        all_ranks_have_gen_requests = all([
-            num_gen > 0
-            for num_gen in all_ranks_num_scheduled_generation_requests
-        ])
-
-        if self.attention_dp_enable_balance:
-            # wait for all ranks have context requests
-            if all_ranks_have_free_ctx_slots and all_ranks_have_ctx_requests:
-                self.adp_ctx_waiting_iters_count = 0
-                # balance number of context requests across ranks
-                if all_ranks_have_gen_requests:
-                    if self.adp_ctx_batching_wait_iters_count < self.attention_dp_batching_wait_iters:
-                        self.adp_ctx_batching_wait_iters_count += 1
-                        balanced_context_requests = []
-                    else:
-                        self.adp_ctx_batching_wait_iters_count = 0
-            else:
-                self.adp_ctx_waiting_iters_count += 1
-                balanced_context_requests = []
-                timeout_reached = self.adp_ctx_waiting_iters_count >= self.attention_dp_time_out_iters
-                if timeout_reached or not all_ranks_have_gen_requests:
-                    self.adp_ctx_waiting_iters_count = 0
-                    balanced_context_requests = context_requests
-        return balanced_context_requests
-
-    def _waiting_requests(self, context_requests: list[LlmRequest],
-                          generation_requests: list[LlmRequest]):
-        """
-        Return an empty list if scheduled requests fulfill the waiting conditions, otherwise return the original context requests.
-        Waiting conditions:
-        - The number of scheduled tokens (both context and generation) is smaller than `self.batch_wait_max_tokens_ratio * self.max_num_tokens`
-        - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
-        """
-
-        num_scheduled_ctx_tokens = sum(
-            len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
-        num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
-
-        should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
-        if should_waiting:
-            self.batch_wait_iters_count += 1
-            return []
-
-        self.batch_wait_iters_count = 0
-        return context_requests
-
-    @nvtx_range("_schedule")
-    def _schedule(self):
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
-
-        scheduled_context_requests = scheduler_output.context_requests
-        if self.enable_attention_dp and self.attention_dp_enable_balance:
-            scheduled_context_requests = self._balance_adp_requests(
-                scheduler_output.context_requests,
-                scheduler_output.generation_requests)
-
-        # If no generation requests, no need to wait, to avoid dead waiting
-        should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
-            scheduler_output.context_requests) > 0 and len(
-                scheduler_output.generation_requests) > 0
-        if should_check_waiting:
-            scheduled_context_requests = self._waiting_requests(
-                scheduler_output.context_requests,
-                scheduler_output.generation_requests)
-
-        scheduled_requests = ScheduledRequests()
-        scheduled_requests.reset_context_requests(scheduled_context_requests)
-        scheduled_requests.generation_requests = scheduler_output.generation_requests
-        scheduled_requests.paused_requests = scheduler_output.paused_requests
-
-        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
