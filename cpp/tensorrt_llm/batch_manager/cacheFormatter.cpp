@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -176,18 +176,29 @@ void sendAllBuffers(TransferSession& session, int deviceId,
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+bool senderHasMultimodalBlockKeys(LlmRequest const& llmRequest)
+{
+    auto const mmHashes = llmRequest.getMultimodalHashes();
+    return mmHashes.has_value() && *mmHashes && !(*mmHashes)->empty();
+}
+
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
 
+    // fromReuseTree does not support multimodal requests: it copies the top-level
+    // extraKeys to every sub-block, but stored blocks have per-block extraKeys
+    // computed from multimodal positions. Additionally, the receiver (decode side)
+    // may not carry multimodal metadata, so its lastBlockKey lacks the mm extraKeys
+    // the sender stored. Fall back to fromAllBlockIds for multimodal requests.
+    bool const senderHasMultimodal = senderHasMultimodalBlockKeys(llmRequest);
+
     // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
     // distributed among CP ranks. So, we transfer all blocks from send side.
-    // TODO: Remove the condition on the PP size once disagg support from KVCache reuse
-    // path is fixed.
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
-        || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
+        || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1 || senderHasMultimodal)
     {
         // disable reuse path, and vwsa don't support reuse.
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
