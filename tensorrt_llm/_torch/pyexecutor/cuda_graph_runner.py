@@ -357,6 +357,15 @@ class CUDAGraphRunner:
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
 
+            # Ensure all async operations from warmup complete before capture.
+            # In PP mode, PPCommNCCL.send uses a separate send_stream for
+            # warmup runs but the capturing stream during capture. Without
+            # this sync, in-flight warmup sends on send_stream can race with
+            # the captured graph's NCCL send during replay, causing NCCL
+            # operation mismatching between PP ranks and a deadlock.
+            if self.config.mapping is not None and self.config.mapping.pp_size > 1:
+                torch.cuda.synchronize()
+
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
