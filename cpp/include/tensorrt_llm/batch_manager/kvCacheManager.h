@@ -181,6 +181,9 @@ public:
     using IdType = std::int32_t;
 
     static constexpr IdType kCachedBlocksRootId = -1;
+    //! Sentinel block ID used by placeholder blocks; chosen to be out of range so
+    //! any accidental mAllBlocksById[id] lookup produces an obvious OOB failure.
+    static constexpr IdType kPlaceholderBlockId = std::numeric_limits<IdType>::min();
 
     explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx);
 
@@ -259,9 +262,10 @@ public:
     [[nodiscard]] bool isPlaceholder() const;
 
     //! \brief Create a placeholder KVCacheBlock with no GPU memory.
-    //! \details The placeholder holds a block ID for sequence bookkeeping but mIsPlaceholder
-    //! is set so that getCacheBlockIndices returns a nil index and the eviction pool ignores it.
-    static BlockPtr createPlaceholder(IdType blockId);
+    //! \details mIsPlaceholder is set so that getCacheBlockIndices returns a nil index and
+    //! the eviction pool ignores it. The block ID is set to kPlaceholderBlockId to ensure
+    //! any accidental mAllBlocksById[id] lookup produces an obvious OOB failure.
+    static BlockPtr createPlaceholder();
 
     void detachDescendantsFromLookupTree();
     void freeBlockAndAllDescendants();
@@ -850,16 +854,23 @@ public:
 
     [[nodiscard]] static bool blockInRadixTree(BlockPtr const& block);
 
-    //! \brief Store blocks in cached blocks.
+    //! \brief Store context blocks in the reuse trie for this window.
+    //! \details Called after context phase for both SWA and non-SWA windows.
+    //!          Must be called before any detachFrontBlock call so that OOW blocks
+    //!          are already in the trie when they are replaced with placeholders.
+    void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
+
+    //! \brief Store blocks in the reuse trie.
     //! \param blockKeys Key of each block.
-    //! \param blockIds Id of each block.
-    //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
+    //! \param blocks Block pointers (beam 0 only). OOW slots contain placeholder blocks
+    //!        (isPlaceholder()==true); storeBlocks advances the search root past them via
+    //!        a trie lookup rather than re-inserting, and stops if the OOW block was evicted.
+    //! \param pinBlocks If true, increment ref count for blocks while storing.
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        bool pinBlocks = false);
+        std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks = false);
 
-    [[nodiscard]] bool verifyQueueIntegrity();
+    [[nodiscard]] bool verifyQueueIntegrity() const;
 
     // Only needed when sliding window attention + paged context fmha are used together.
     // In that case, a temporary kv cache buffer with maximum chunk size (maxNumTokens) is needed.
@@ -895,26 +906,9 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
-    void initializeSequenceStorageValidity(LlmRequest::RequestIdType requestId)
-    {
-        mIsValidStoreForReuseSequence[requestId] = true;
-    }
-
-    void releaseSequenceStorageValidity(LlmRequest::RequestIdType requestId)
-    {
-        mIsValidStoreForReuseSequence.erase(requestId);
-    }
-
-    //! \brief Return whether this sequence is valid for store for reuse
-    [[nodiscard]] bool isSequenceValidForStoreForReuse(LlmRequest::RequestIdType requestId) const
-    {
-        TLLM_CHECK_WITH_INFO(mIsValidStoreForReuseSequence.count(requestId) > 0, "Sequence should be bookkeeped");
-        return mIsValidStoreForReuseSequence.at(requestId);
-    }
-
     void resetReuseState()
     {
-        std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+        std::lock_guard<std::mutex> lock(mLookupTree->getMutex());
         // The shared lookup tree is reset once by BlockManager::resetReuseState() before
         // this method is called.  Here we only need to re-create the per-window root block
         // and wire it into the (already fresh) shared tree.
@@ -938,9 +932,6 @@ private:
     SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
-
-    //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
-    void freeChildren(BlockPtr const& block);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
@@ -1031,17 +1022,6 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
-
-    // Mutex for the cached blocks root
-    mutable std::mutex mCachedBlocksRootMutex;
-
-    // Record which sequence is using the block
-    std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;
-    // Record whether a sequence has all blocks held valid.
-    // The boolean value is set to true upon first encounter of a new sequence.
-    // It may be invalidated to false when other sequence acquires a block that
-    // is used by another sequence.
-    std::map<LlmRequest::RequestIdType, bool> mIsValidStoreForReuseSequence;
 
     // Whether to enable indexer K cache
     bool mEnableIndexerKCache;
@@ -1159,14 +1139,13 @@ public:
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        SizeType32 windowSize, bool pinBlocks = false)
+    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(std::vector<BlockKey> blockKeys,
+        std::vector<BlockPtr> const& blocks, SizeType32 windowSize, bool pinBlocks = false)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(std::move(blockKeys), blocks, pinBlocks);
     }
 
-    [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
+    [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize) const;
 
     void releasePools();
 
@@ -1400,48 +1379,6 @@ public:
     //! context block that goes OOW.
     void adjustBlocksIfNeeded(GenerationRequest& sequence);
 
-    //! \brief Return whether the sequence is already managed by the block manager
-    [[nodiscard]] bool isSequenceHeld(LlmRequest::RequestIdType requestId) const
-    {
-        return mManagedSequences.count(requestId) > 0;
-    }
-
-    //! \brief Add a sequence to the managed sequences
-    //! \details Take the sequence into account for the manager. Initialize
-    //! sequence storage validity under all window sizes.
-    void holdSequence(LlmRequest::RequestIdType requestId)
-    {
-        mManagedSequences.insert(requestId);
-        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
-        {
-            mWindowBlockManagers.at(windowSize).initializeSequenceStorageValidity(requestId);
-        }
-    }
-
-    //! \brief Remove a sequence from the managed sequences.
-    //! \details Remove sequence from the managed sequences and remove sequence
-    //! storage
-    void releaseSequence(LlmRequest::RequestIdType requestId)
-    {
-        mManagedSequences.erase(requestId);
-        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
-        {
-            mWindowBlockManagers.at(windowSize).releaseSequenceStorageValidity(requestId);
-        }
-    }
-
-    //! \brief Return whether the sequence is still valid for store-for-reuse
-    //! regarding the specific window size.
-    //! \details Currently this utility function is only used under
-    //! kvCacheManagerTest.cpp. Checking for store-for-reuse for each window
-    //! size is done in an iterating fashion under BlockManager::releaseBlocks.
-    bool isSequenceValidForStoreForReuse(LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
-    {
-        TLLM_CHECK_WITH_INFO(
-            mWindowBlockManagers.count(windowSize) > 0, "Querying window size is not found under mWindowBlockManager");
-        return mWindowBlockManagers.at(windowSize).isSequenceValidForStoreForReuse(requestId);
-    }
-
     void resetReuseState()
     {
         // Reset the shared tree once; all blocks' LookupNodePtr references to the old
@@ -1491,9 +1428,6 @@ private:
     std::vector<SizeType32> mLayerToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
-    // Record what sequences are currently managed by the block manager
-    std::set<LlmRequest::RequestIdType> mManagedSequences;
-
     bool mIsEnableIndexerKCache{false};
     SizeType32 mIndexerKCacheQuantBlockSize{0};
     SizeType32 mIndexerKCacheIndexHeadDim{0};

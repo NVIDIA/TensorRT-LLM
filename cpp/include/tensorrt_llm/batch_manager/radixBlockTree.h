@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -69,6 +70,30 @@ class UnifiedBlockTree : public templated_trie::Trie<BlockKey, BlockKeyHasher, i
 {
 public:
     UnifiedBlockTree() = default;
+
+    // std::mutex is not movable, so define move operations explicitly.
+    // The trie contents (parent class data) are moved; each instance keeps its own mutex.
+    UnifiedBlockTree(UnifiedBlockTree&& other) noexcept
+        : Trie(std::move(other))
+    {
+    }
+
+    UnifiedBlockTree& operator=(UnifiedBlockTree&& other) noexcept
+    {
+        if (this != &other)
+        {
+            Trie::operator=(std::move(other));
+        }
+        return *this;
+    }
+
+    //! \brief Returns the shared mutex that guards all trie operations.
+    //! All reads and writes to the trie (insertions, lookups, detachFromLookupNode)
+    //! must be performed while holding this mutex.
+    [[nodiscard]] std::mutex& getMutex() noexcept
+    {
+        return mMutex;
+    }
 
     //! \brief Insert a block into the tree at the given prefix position for a specific window size.
     //! \details This is a tree-only insertion: it does NOT set block->mLookupNode. The block is
@@ -203,6 +228,9 @@ public:
             }
         }
     }
+
+private:
+    std::mutex mMutex;
 };
 
 } // namespace tensorrt_llm::batch_manager::radix_block_tree
