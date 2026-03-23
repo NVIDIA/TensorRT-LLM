@@ -136,8 +136,7 @@ void LRUEvictionPolicy::addToFreeBlockQueue(BlockPtr block, bool toFront)
     mNumFreeBlocksPerLevel[cacheLevel]++;
 }
 
-bool LRUEvictionPolicy::removeFromFreeBlockQueue(
-    std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>& v) noexcept
+bool LRUEvictionPolicy::removeFromFreeBlockQueue(BlockPtr block) noexcept
 {
     SizeType32 const id = block->getBlockId();
     if (mFreeBlockIterators[id].has_value())
