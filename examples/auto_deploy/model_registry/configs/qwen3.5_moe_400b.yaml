@@ -21,6 +21,8 @@ transforms:
     enabled: true
   detect_sharding:
     allreduce_strategy: SYMM_MEM
+    shard_all_unprocessed: true
+    simple_shard_filter: "lm_head"
   multi_stream_moe:
     stage: compile
     enabled: true
@@ -29,3 +31,5 @@ transforms:
     enabled: true
   gather_logits_before_lm_head:
     enabled: true
+  compile_model:
+    piecewise_enabled: true

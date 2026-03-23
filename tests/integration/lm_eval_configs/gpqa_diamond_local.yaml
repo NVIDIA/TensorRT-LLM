@@ -1,6 +1,10 @@
 # Modified from tensorrt_llm/evaluate/lm_eval_tasks/gpqa/cot_zeroshot_aa/gpqa_diamond_cot_zeroshot_aa.yaml
 task: gpqa_diamond_local
-dataset_path: HF_HOME/datasets/Idavidrein___gpqa
+dataset_path: csv
+dataset_name: null
+dataset_kwargs:
+  data_files:
+    train: LLM_MODELS_ROOT/datasets/gpqa/gpqa_diamond.csv
 tag: gpqa
 output_type: generate_until
 process_docs: !function utils.process_gpqa_docs

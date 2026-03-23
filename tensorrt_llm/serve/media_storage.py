@@ -581,13 +581,18 @@ class MediaStorage:
         """Convert torch.Tensor to PIL Image.
 
         Args:
-            image: torch.Tensor (H, W, C) uint8
+            image: torch.Tensor (H, W, C) or (B, H, W, C) uint8.
+                   If a batch dimension is present, the first image is extracted.
 
         Returns:
             PIL Image
         """
         if not isinstance(image, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor, got {type(image)}")
+
+        # Squeeze batch dimension if present: (B, H, W, C) -> (H, W, C)
+        if image.dim() == 4:
+            image = image[0]
 
         # Convert to numpy for PIL
         image_np = image.cpu().numpy()

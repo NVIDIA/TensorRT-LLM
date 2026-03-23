@@ -72,7 +72,6 @@ init_ubuntu() {
     lld \
     llvm \
     libclang-rt-dev \
-    libffi-dev \
     libstdc++-14-dev \
     libnuma1 \
     libnuma-dev \
@@ -148,7 +147,6 @@ install_gcctoolset_rockylinux() {
     wget \
     git-lfs \
     gcc-toolset-11 \
-    libffi-devel \
     -y
   dnf install \
     openmpi \

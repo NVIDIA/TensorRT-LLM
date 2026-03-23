@@ -22,6 +22,7 @@ from defs.conftest import get_llm_root, get_sm_version, skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -212,6 +213,85 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
 
 
+class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
+    """Accuracy test for Eagle3 one-model speculative decoding with AutoDeploy."""
+
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
+    EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
+        "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
+
+    def get_default_kwargs(self):
+        speculative_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=self.EAGLE_MODEL_PATH,
+            eagle3_one_model=True,
+            eagle3_layers_to_capture={1, 15, 28},
+        )
+        return {
+            "compile_backend": "torch-simple",
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "max_batch_size": 128,
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "skip_loading_weights": False,
+            "disable_overlap_scheduler": False,
+            "enable_iter_perf_stats": True,  # Enable stats for acceptance rate
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.7
+            },
+            "speculative_config": speculative_config,
+        }
+
+    def get_default_sampling_params(self):
+        return SamplingParams(
+            max_tokens=GSM8K.MAX_OUTPUT_LEN,  # 256 tokens
+            truncate_prompt_tokens=GSM8K.MAX_INPUT_LEN,
+        )
+
+    def check_acceptance_rate(self, llm, min_acceptance_rate: float):
+        """Check speculative decoding acceptance rate.
+
+        Args:
+            llm: The LLM instance with enable_iter_perf_stats=True.
+            min_acceptance_rate: Minimum acceptance rate threshold (default 7%).
+        """
+        stats = llm.get_stats(timeout=2)
+        total_drafted = 0
+        total_accepted = 0
+
+        for stat in stats:
+            spec_stats = stat.get("specDecodingStats", {})
+            num_draft = spec_stats.get("numDraftTokens", 0)
+            num_accepted = spec_stats.get("numAcceptedTokens", 0)
+            if num_draft > 0:
+                total_drafted += num_draft
+                total_accepted += num_accepted
+
+        accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
+        print(f"Spec dec acceptance rate: {accept_rate:.2%} "
+              f"({total_accepted}/{total_drafted} tokens)")
+        assert accept_rate >= min_acceptance_rate, (
+            f"Acceptance rate {accept_rate:.2%} below threshold {min_acceptance_rate:.0%}"
+        )
+
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_eagle3_one_model(self):
+        """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
+        kwargs = self.get_default_kwargs()
+
+        with AutoDeployLLM(
+                model=self.MODEL_PATH,
+                tokenizer=self.MODEL_PATH,
+                **kwargs,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.25)
+
+
 class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
     MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
@@ -349,14 +429,17 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nemotron-MOE"
+    MODEL_NAME = "nvidia/Nemotron-3-Nano"
 
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
     MODEL_PATHS = {
-        "bf16": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024",
-        "fp8": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
-        "nvfp4": f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+        "bf16":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
+        "fp8":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"),
+        "nvfp4":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -398,19 +481,19 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
     MODEL_PATHS = {
         "bf16":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"),
         "fp8":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"),
         "nvfp4":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -440,10 +523,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         if model_id == "bf16":
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
-        if enable_attention_dp:
-            kwargs.setdefault("transforms", {})["detect_sharding"] = {
-                "enable_attention_dp": True
-            }
+        kwargs.setdefault("transforms", {}).setdefault(
+            "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
@@ -453,7 +534,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            trust_remote_code=True,
                            **kwargs) as llm:
             _set_quant_config(llm, model_id)
-
+            # the nvfp4 model is mixed precision, should be tested against higher thresholds
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             print_memory_usage("after engine build")
 
             sampling_params = self.get_default_sampling_params()
