@@ -80,7 +80,6 @@ struct BenchmarkParams
 
     // KV cache block offloading
     size_t kvHostCacheSize{0};
-    bool kvOnboardBlocks{true};
 
     // Weights offloading
     float gpuWeightsPercent{1.0};

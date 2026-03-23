@@ -630,7 +630,7 @@ public:
 
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
             benchmarkParams.maxAttentionWindowVec, benchmarkParams.sinkTokenLength,
-            benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks,
+            benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize,
             benchmarkParams.crossKvCacheFraction);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
@@ -1133,8 +1133,6 @@ int main(int argc, char* argv[])
     options.add_options()("kv_host_cache_bytes",
         "Size of secondary memory pool used for offloading kv cache blocks (in bytes).",
         cxxopts::value<size_t>()->default_value("0"));
-    options.add_options()("kv_onboard_blocks", "If offloaded blocks should be onboarded to primary memory before reuse",
-        cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
         "max_prompt_len", "Truncate all prompts from dataset to the length specified.", cxxopts::value<SizeType32>());
 
@@ -1354,9 +1352,6 @@ int main(int argc, char* argv[])
 
     // Argument: How many KV cache blocks (as fraction of number of GPU kv cache blocks).
     benchmarkParams.kvHostCacheSize = result["kv_host_cache_bytes"].as<size_t>();
-
-    // Argument: If offloaded blocks should be onboarded to primary memory before they are reused.
-    benchmarkParams.kvOnboardBlocks = result["kv_onboard_blocks"].as<bool>();
 
     // Argument: Medusa choices for the Medusa speculative decoding.
     if (result.count("medusa_choices"))

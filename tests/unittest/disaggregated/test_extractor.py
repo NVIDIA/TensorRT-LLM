@@ -66,7 +66,6 @@ def test_extract():
         max_attention_window=None,
         enable_block_reuse=False,
         event_buffer_max_size=0,
-        onboard_blocks=0,
         host_cache_size=0,
         enable_partial_reuse=False,
         copy_on_partial_reuse=False,
