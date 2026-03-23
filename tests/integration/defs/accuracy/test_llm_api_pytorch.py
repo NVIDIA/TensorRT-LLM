@@ -203,8 +203,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_bfloat16(self, attn_backend, torch_compile):
-        pytest.skip(
-            "Skip Ray due to OOM at prepare resources. GPU: (no CI data)")
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -244,7 +242,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     @parametrize_with_ids("fp8kv", [False, True])
     def test_fp8(self, fp8kv, attn_backend, torch_compile):
-        pytest.skip("OOM at prepare resources. GPU: (no CI data)")
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -1414,7 +1411,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_without_reuse_low_memory_available(self):
-        pytest.skip("OOM. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1488,7 +1484,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse(self):
-        pytest.skip("OOM. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1504,7 +1499,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse(self):
-        pytest.skip("OOM. GPU: DGX_H100")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -4340,6 +4334,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ])
     def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
                     enable_max_concurrency, enable_draft_len_schedule):
+        if not eagle3_one_model:
+            pytest.skip("v2 does not support two model")
         max_concurrency = 100 if enable_max_concurrency else None
         draft_len_schedule = {
             50: 4,
@@ -4351,7 +4347,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                              or enable_max_concurrency else None)
 
         max_draft_len = 4
-        pytest.skip("Skip due to OOM. GPU: DGX_H100")
         pytorch_config = dict(
             disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=cuda_graph_config,
