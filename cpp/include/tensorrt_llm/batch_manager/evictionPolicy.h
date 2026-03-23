@@ -131,10 +131,8 @@ public:
 
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
 
-    void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;
 
-    void claimBlock(BlockPtr block) override;
     void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
         std::optional<std::chrono::milliseconds> durationMs) override;
 

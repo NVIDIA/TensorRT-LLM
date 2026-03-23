@@ -39,6 +39,10 @@ namespace
 {
 SizeType32 getCacheLevel(BlockPtr const& block)
 {
+    if (block->isPlaceholder())
+    {
+        return 0;
+    }
     return block->isPrimary() ? 0 : 1;
 }
 
@@ -229,8 +233,7 @@ void LRUEvictionPolicy::refresh()
 
 // ---- PlaceholderInnerLRUEvictionPolicy ----
 // Manages pre-allocated placeholder blocks (with negative IDs starting at -2) via the standard queue
-// system. Overrides blockIdx() to map negative IDs to 0-based queue indices, and overrides
-// releaseBlock/claimBlock to bypass the placeholder-pool path used by the base LRUEvictionPolicy.
+// system. Overrides blockIdx() to map negative IDs to 0-based queue indices.
 namespace
 {
 class PlaceholderInnerLRUEvictionPolicy : public LRUEvictionPolicy
@@ -244,49 +247,6 @@ protected:
     }
 
 public:
-    void releaseBlock(BlockPtr block) override
-    {
-        releaseBlock(block, false);
-    }
-
-    void releaseBlock(BlockPtr block, bool toFront) override
-    {
-        TLLM_CHECK_WITH_INFO(block->isPlaceholder(),
-            "PlaceholderInnerLRUEvictionPolicy should only manage placeholder blocks, got blockId=%d",
-            block->getBlockId());
-        auto const idx = blockIdx(block->getBlockId());
-        auto& q = mFreeQueues[kPrimaryLevel][getPriorityIdx(block->getPriority())];
-        if (toFront)
-        {
-            mFreeBlockIterators[idx] = q.insert(q.begin(), block);
-        }
-        else
-        {
-            mFreeBlockIterators[idx] = q.insert(q.end(), block);
-        }
-        mNumFreeBlocksPerLevel[kPrimaryLevel]++;
-    }
-
-    void claimBlock(BlockPtr block) override
-    {
-        claimBlock(block, std::nullopt, std::nullopt);
-    }
-
-    void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
-        std::optional<std::chrono::milliseconds> durationMs) override
-    {
-        TLLM_CHECK_WITH_INFO(block->isPlaceholder(),
-            "PlaceholderInnerLRUEvictionPolicy should only manage placeholder blocks, got blockId=%d",
-            block->getBlockId());
-        auto const idx = blockIdx(block->getBlockId());
-        if (mFreeBlockIterators[idx] != std::nullopt)
-        {
-            mFreeQueues[kPrimaryLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[idx]);
-            mNumFreeBlocksPerLevel[kPrimaryLevel] -= 1;
-        }
-        mFreeBlockIterators[idx] = std::nullopt;
-    }
-
     bool verifyQueueIntegrity() override
     {
         bool queueCompromised = false;
@@ -339,11 +299,6 @@ std::tuple<BlockPtr, bool> MaybePlaceholderLRUEvictionPolicy::getFreeBlock(SizeT
     return LRUEvictionPolicy::getFreeBlock(cacheLevel);
 }
 
-void MaybePlaceholderLRUEvictionPolicy::releaseBlock(BlockPtr block)
-{
-    releaseBlock(block, false);
-}
-
 void MaybePlaceholderLRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 {
     if (block->isPlaceholder())
@@ -354,11 +309,6 @@ void MaybePlaceholderLRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFron
         return;
     }
     LRUEvictionPolicy::releaseBlock(block, toFront);
-}
-
-void MaybePlaceholderLRUEvictionPolicy::claimBlock(BlockPtr block)
-{
-    claimBlock(block, std::nullopt, std::nullopt);
 }
 
 void MaybePlaceholderLRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
