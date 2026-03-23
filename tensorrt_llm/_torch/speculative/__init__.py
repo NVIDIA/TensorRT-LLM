@@ -1,12 +1,12 @@
 from .auto_heuristic import suggest_spec_config
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .eagle3 import Eagle3SpecMetadata
+from .eagle3 import Eagle3SpecMetadata, MTPEagleWorker
 from .interface import (SpecMetadata, SpecWorkerBase,
                         prepare_attn_metadata_for_draft_replay,
                         restore_attn_metadata_after_draft_replay,
                         should_use_separate_draft_kv_cache)
-from .mtp import MTPEagleWorker, MTPSampler, MTPSpecMetadata, MTPWorker
+from .mtp import MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_enhancer import SADraftEnhancer

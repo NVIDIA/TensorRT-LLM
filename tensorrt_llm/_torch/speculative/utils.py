@@ -18,10 +18,9 @@ from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelWorker)
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
-                     Eagle3SpecMetadata)
+                     Eagle3SpecMetadata, MTPEagleWorker)
 from .model_drafter import ModelDrafter
-from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
-                  MTPSpecMetadata, MTPWorker)
+from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
@@ -37,6 +36,19 @@ def get_spec_metadata(spec_config,
                       spec_resource_manager=None,
                       is_draft_model=False,
                       max_seq_len=262144):
+    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        return Eagle3OneModelSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            layers_to_capture={model_config.num_hidden_layers - 1},
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            spec_resource_manager=spec_resource_manager,
+        )
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -161,11 +173,13 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
                                                 max_seq_len)
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
-            return MTPHiddenStatesManager(
+            return Eagle3ResourceManager(
                 spec_config,
                 model_config.torch_dtype,
                 model_config.hidden_size,
                 max_num_requests,
+                max_seq_len,
+                max_num_tokens,
                 sa_manager=sa_manager,
             )
         else:
@@ -187,7 +201,8 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         if getattr(spec_config, 'use_sa_spec', False):
             sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
                                                 max_seq_len)
-        if sa_manager is not None:
+        if (spec_config.use_relaxed_acceptance_for_thinking
+                or sa_manager is not None):
             return Eagle3ResourceManager(
                 spec_config,
                 model_config.torch_dtype,
@@ -235,6 +250,8 @@ def get_spec_decoder(
     sampler_args: TorchSampler.Args,
     spec_config: "DecodingBaseConfig",
 ):
+    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        return Eagle3OneModelSampler(sampler_args)
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_eagle3(
@@ -286,6 +303,8 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
+    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        return 1
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return spec_config.num_nextn_predict_layers
     if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -302,11 +321,15 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_eagle_one_model():
-        return MTPEagleWorker(spec_config, model_config,
-                              use_separate_draft_kv_cache)
+        return MTPEagleWorker(
+            spec_config,
+            model_config=model_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelWorker(spec_config, mapping,
-                                    use_separate_draft_kv_cache)
+        return Eagle3OneModelWorker(
+            spec_config,
+            mapping=mapping,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():

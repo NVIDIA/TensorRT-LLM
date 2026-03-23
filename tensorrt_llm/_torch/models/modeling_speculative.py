@@ -376,7 +376,12 @@ class Eagle3DraftModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        # Allow the caller to override all_rank_num_tokens for this forward pass
+        # (used by Eagle3OneModelWorker to avoid mutating attn_metadata externally).
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
         assert self.embed_tokens is not None
 
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -800,7 +805,8 @@ class MTPForCausalLM(nn.Module):
                     f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
-        assert spec_dec_mode.is_mtp_one_model()
+        assert (spec_dec_mode.is_mtp_one_model()
+                or spec_dec_mode.is_mtp_eagle_one_model())
         mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle_one_model(
         ) else model_config.pretrained_config.num_nextn_predict_layers
 
@@ -979,7 +985,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif spec_dec_mode.is_mtp_one_model():
+    elif (spec_dec_mode.is_mtp_one_model()
+          or spec_dec_mode.is_mtp_eagle_one_model()):
         return MTPForCausalLM(model_config,
                               model_config.pretrained_config.num_hidden_layers,
                               lm_head, model)
