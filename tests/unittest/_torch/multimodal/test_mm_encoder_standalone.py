@@ -1197,10 +1197,9 @@ def test_epd_disagg_output_matches_raw_with_block_reuse():
                 "prompt_token_ids":
                 prefill_outputs[0].prompt_token_ids,
             }]
-            outputs_epd = llm_decode.generate(
-                decode_inputs,
-                sampling_params=sampling_params,
-                disaggregated_params=pd_params)
+            outputs_epd = llm_decode.generate(decode_inputs,
+                                              sampling_params=sampling_params,
+                                              disaggregated_params=pd_params)
 
     assert outputs_epd is not None and len(outputs_epd) == 1
     assert len(outputs_epd[0].outputs) > 0
