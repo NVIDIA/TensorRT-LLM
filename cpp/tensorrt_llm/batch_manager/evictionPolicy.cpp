@@ -123,20 +123,34 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
     TLLM_THROW("No free block found. This shouldn't happen!");
 }
 
-void LRUEvictionPolicy::addToFreeBlockQueue(SizeType32 cacheLevel, SizeType32 priority, BlockPtr block, bool toFront)
+void LRUEvictionPolicy::addToFreeBlockQueue(BlockPtr block, bool toFront)
 {
-    SizeType32 const id = block->getBlockId(); // safe to get id from block, it never changes
+    // Info needed to add (and later remove) block to queue.
+    SizeType32 const cacheLevel = getCacheLevel(block);
+    SizeType32 const id = block->getBlockId();
+    SizeType32 const priority = getPriorityIdx(block->getPriority());
+    // Add block to queue along with all info required to later remove it
     auto& q = mFreeQueues[cacheLevel][priority];
     auto insertItr = toFront ? q.begin() : q.end();
     mFreeBlockIterators[id] = std::make_tuple(cacheLevel, priority, q.insert(insertItr, block));
     mNumFreeBlocksPerLevel[cacheLevel]++;
 }
 
-void LRUEvictionPolicy::removeFromFreeBlockQueue(std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>& v)
+bool LRUEvictionPolicy::removeFromFreeBlockQueue(std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>& v) noexcept
 {
-    auto [cacheLevel, priority, it] = v;
-    mFreeQueues[cacheLevel][priority].erase(it);
-    mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+    SizeType32 const id = block->getBlockId();
+    if (mFreeBlockIterators[id].has_value())
+    {
+        // Remove block using stored values, not current values
+        auto [cacheLevel, priority, it] = mFreeBlockIterators[id].value();
+        mFreeQueues[cacheLevel][priority].erase(it);
+        mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
 }
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
@@ -153,10 +167,8 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
         "Attempted to release the cached-blocks root into the eviction queue");
     // Placeholder blocks have no physical GPU memory and must never enter the eviction queue.
     TLLM_CHECK_WITH_INFO(!block->isPlaceholder(), "Attempted to release a placeholder block into the eviction queue");
-    SizeType32 const cacheLevel = getCacheLevel(block);
-    SizeType32 const id = block->getBlockId();
 
-    addToFreeBlockQueue(cacheLevel, getPriorityIdx(block->getPriority()), block, toFront);
+    addToFreeBlockQueue(block, toFront);
 
     if (block->getDurationMs().has_value()
         && block->getPriority() != executor::KvCacheRetentionConfig::kDefaultRetentionPriority)
@@ -183,9 +195,8 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     SizeType32 const id = block->getBlockId();
     SizeType32 const cacheLevel = getCacheLevel(block);
 
-    if (mFreeBlockIterators[id].has_value())
+    if (removeFromFreeBlockQueue(block))
     {
-        removeFromFreeBlockQueue(mFreeBlockIterators[id].value());
         mFreeBlockIterators[id] = std::nullopt;
     }
 
@@ -214,18 +225,15 @@ void LRUEvictionPolicy::refresh()
         }
 
         auto const id = block->getBlockId();
-        auto const level = getCacheLevel(block);
 
         mExpiringBlockHeap.erase(mExpiringBlockHeap.begin());
 
-        if (mFreeBlockIterators[id].has_value())
+        // Add block to free blocks queue with default priority if it was removed from another priority free blocks queue
+        if (removeFromFreeBlockQueue(block))
         {
-            // Delete from current queue
-            removeFromFreeBlockQueue(mFreeBlockIterators[id].value());
-            // Add to default priority queue
-            addToFreeBlockQueue(level, kDefaultPriority, block, false);
+            block->setPriority(kDefaultPriority);
+            addToFreeBlockQueue(block, /*toFront*/false);
         }
-        block->setPriority(kDefaultPriority);
     }
 }
 
