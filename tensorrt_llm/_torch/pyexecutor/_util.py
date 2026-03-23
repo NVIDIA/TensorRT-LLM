@@ -1338,8 +1338,7 @@ def create_py_executor_instance(
         capacity_scheduler = BindCapacityScheduler(
             scheduler_capacity,
             kv_cache_manager.impl if kv_cache_manager is not None else None,
-            peft_cache_manager.impl
-            if peft_cache_manager is not None else None,
+            peft_cache_manager.impl if peft_cache_manager is not None else None,
             scheduler_config.capacity_scheduler_policy,
             two_step_lookahead=mapping.has_pp())
 
