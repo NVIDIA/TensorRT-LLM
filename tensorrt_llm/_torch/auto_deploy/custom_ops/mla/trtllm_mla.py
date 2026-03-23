@@ -60,9 +60,18 @@ from torch.fx import Node
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from .....llmapi.llm_args import KvCacheConfig
+from ....attention_backend.interface import (
+    AttentionInputType,
+    MLAParams,
+    PositionalEmbeddingParams,
+    PositionEmbeddingType,
+    RopeParams,
+)
+from ....attention_backend.trtllm import TrtllmAttentionWrapper
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
@@ -111,6 +120,7 @@ class _TrtllmMLAPlanner:
     def __init__(self):
         self.workspace: Optional[torch.Tensor] = None
         self._per_layer_pool_ptrs: dict = {}
+        self.kv_cache_manager = None  # Set externally after cache init
         self.host_pool_mapping: Optional[torch.Tensor] = None
         self.host_request_types: Optional[torch.Tensor] = None
         self.host_total_kv_lens: Optional[torch.Tensor] = None
@@ -144,6 +154,62 @@ class _TrtllmMLAPlanner:
         self._prefill_rotary_cos_sin: Optional[torch.Tensor] = None
         self._prefill_rcs_max_pos: int = 0
         self._prefill_rcs_dim: int = 0
+
+        # Per-layer TrtllmAttentionWrapper instances (created on first use)
+        self._attn_wrappers: dict = {}
+
+    def get_or_create_wrapper(
+        self,
+        layer_idx: int,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+    ) -> TrtllmAttentionWrapper:
+        """Return a cached TrtllmAttentionWrapper for this layer, creating if needed.
+
+        Uses the same wrapper class as the PT backend so that plan()/run()
+        correctly initializes C++ AttentionOp internal state (workspace,
+        cuBLAS handles, tile scheduling) before every attention call.
+        """
+        w = self._attn_wrappers.get(layer_idx)
+        if w is not None:
+            return w
+
+        rope_params = RopeParams(
+            dim=qk_rope_head_dim,
+            theta=10000.0,
+            max_positions=8192,
+            original_max_positions=4096,
+        )
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,  # match PT backend
+            rope=rope_params,
+            is_neox=False,
+        )
+        # q_lora_rank: PT backend uses hidden_size when config.q_lora_rank is None.
+        # Derive hidden_size from num_heads * (qk_nope_head_dim + qk_rope_head_dim)
+        # which gives the same value as hidden_size for standard MLA configs.
+        q_lora_rank = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
+        mla_params = MLAParams(
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            qk_nope_head_dim=qk_nope_head_dim,
+            v_head_dim=kv_lora_rank,  # latent space (matches PT backend)
+        )
+        w = TrtllmAttentionWrapper(
+            num_heads=num_heads,
+            head_size=kv_lora_rank + qk_rope_head_dim,
+            num_kv_heads=1,
+            pos_embd_params=pos_embd_params,
+            q_scaling=1.0,
+            mla_params=mla_params,
+        )
+        w.update_quant_config()  # default quant_mode=0, updated below if FP8
+        self._attn_wrappers[layer_idx] = w
+        return w
 
     def get_or_create_rotary_cos_sin(
         self,
@@ -184,9 +250,15 @@ class _TrtllmMLAPlanner:
         # Start with empty workspace — the C++ AttentionOp auto-resizes it
         # on the first call (matching the PT backend's approach).
         self.workspace = torch.empty(0, dtype=torch.int8, device=device)
+        # Shape: (num_layers, 2) — maps each layer to [primary_pool, secondary_pool].
+        # Shape: [num_layers, 2] — maps [layer_idx] to [pool_idx, layer_within_pool].
+        # Pool 0 for all layers. Column 1 = layer index within pool (matches PT backend).
+        num_layers = 30  # accommodates typical DeepSeek layer counts
         self.host_pool_mapping = torch.zeros(
-            1, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+            num_layers, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+        for i in range(num_layers):
+            self.host_pool_mapping[i, 1] = i
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
@@ -312,7 +384,8 @@ class _TrtllmMLAPlanner:
         Uses ``ragged_to_block_table_triton`` to scatter ``cache_loc`` pages into
         ``block_ids_per_seq`` on the GPU, then derives ``block_offsets``.
         """
-        if self.host_pool_mapping.size(0) != block_offset_multiplier:
+        # Ensure pool_mapping has enough rows for block_offset_multiplier
+        if self.host_pool_mapping.size(0) < block_offset_multiplier:
             self.host_pool_mapping = torch.zeros(
                 block_offset_multiplier,
                 2,
@@ -344,6 +417,16 @@ class _TrtllmMLAPlanner:
 
 
 _GlobalTrtllmMLAPlanner = _TrtllmMLAPlanner()
+
+
+def set_mla_kv_cache_manager(kv_cache_manager) -> None:
+    """Set the KVCacheManager on the global MLA planner.
+
+    Called after cache initialization so that the wrapper's plan() can pass it
+    to trtllm_gen_attention for MLA context (which requires kv_cache_manager
+    for proper workspace sizing and kernel selection).
+    """
+    _GlobalTrtllmMLAPlanner.kv_cache_manager = kv_cache_manager
 
 
 # =============================================================================
@@ -402,12 +485,28 @@ def prepare_trtllm_mla_metadata(
     num_seq = num_prefill + num_decode
     block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
+    if not hasattr(_GlobalTrtllmMLAPlanner, "_dbg_bom"):
+        with open("/tmp/mla_block_offsets.log", "w") as f:
+            f.write(f"block_offset_multiplier={block_offset_multiplier}\n")
+            f.write(f"num_seq={num_seq} num_prefill={num_prefill} num_decode={num_decode}\n")
+            f.write(f"cu_num_pages={cu_num_pages.tolist()}\n")
+            f.write(f"cache_loc first 20={cache_loc[:20].tolist()}\n")
+        _GlobalTrtllmMLAPlanner._dbg_bom = True
+
     _GlobalTrtllmMLAPlanner.plan_device(
         num_seq=num_seq,
         block_offset_multiplier=block_offset_multiplier,
         cu_num_pages=cu_num_pages,
         cache_loc=cache_loc,
     )
+
+    if not hasattr(_GlobalTrtllmMLAPlanner, "_dbg_bom2"):
+        bo = _GlobalTrtllmMLAPlanner.block_offsets
+        bi = _GlobalTrtllmMLAPlanner.block_ids_per_seq
+        with open("/tmp/mla_block_offsets.log", "a") as f:
+            f.write(f"block_offsets shape={bo.shape} first_seq={bo[0, 0, :, :4].tolist()}\n")
+            f.write(f"block_ids shape={bi.shape} first_seq={bi[0, :4].tolist()}\n")
+        _GlobalTrtllmMLAPlanner._dbg_bom2 = True
 
     return [_GlobalTrtllmMLAPlanner.block_offsets]
 
@@ -668,6 +767,14 @@ def _handle_prefill_thop(
         return output
 
     planner = _GlobalTrtllmMLAPlanner
+    wrapper = planner.get_or_create_wrapper(
+        layer_idx,
+        num_heads,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+    )
 
     # Pinned single-sequence host tensors (allocated once, reused).
     if not hasattr(planner, "_pfx_host_total_kv"):
@@ -681,8 +788,7 @@ def _handle_prefill_thop(
     # Only iterate over prefill sequences (type==0); they precede decode in metadata.
     num_prefill_seqs = int((host_request_types == 0).sum())
 
-    # Process each prefill sequence independently (matches PT backend's
-    # one-sequence-at-a-time context processing).
+    # Process each prefill sequence independently via plan()/run().
     tok_offset = 0
     for i in range(num_prefill_seqs):
         seq_ctx_len = int(host_context_lengths[i])
@@ -692,45 +798,44 @@ def _handle_prefill_thop(
         t0 = tok_offset
         t1 = tok_offset + seq_ctx_len
 
-        # Use host tensors to avoid GPU→CPU transfer (forbidden during CUDA graph capture).
         planner._pfx_host_total_kv[0] = int(host_past_kv_lengths[i]) + seq_ctx_len
         planner._pfx_host_total_kv[1] = 0
 
-        _call_thop_attention_mla(
-            q[t0:t1].contiguous(),
-            k[t0:t1].contiguous(),
-            v[t0:t1].contiguous(),
-            output[t0:t1],
-            latent_cache[t0:t1].contiguous(),
-            None,
-            False,
-            1,  # attention_input_type = context_only
-            num_heads,
-            num_kv_heads,
-            kv_lora_rank + qk_rope_head_dim,  # head_size: latent dim (matches PT backend)
-            tokens_per_block,
-            max_num_requests,
-            max_context_length,
-            1.0,
-            quant_mode,
-            kv_lora_rank,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            v_head_dim,
-            sequence_length[i : i + 1],
-            context_lengths[i : i + 1],
-            host_past_kv_lengths[i : i + 1],
-            host_context_lengths[i : i + 1],
-            planner._pfx_host_req_type,
-            planner._pfx_host_total_kv,
-            kv_cache_block_offsets[:, i : i + 1, :, :],
-            host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping,
-            block_ids_per_seq=planner.block_ids_per_seq[i : i + 1],
-            position_embedding_type=position_embedding_type,
-            rotary_embedding_dim=rotary_embedding_dim,
-            rotary_cos_sin=rotary_cos_sin,
+        wrapper.plan(
             layer_idx=layer_idx,
+            tokens_per_block=tokens_per_block,
+            max_num_requests=max_num_requests,
+            max_sequence_length=max_context_length,
+            max_context_length=max_context_length,
+            beam_width=1,
+            sequence_length=sequence_length[i : i + 1],
+            context_lengths=context_lengths[i : i + 1],
+            host_past_key_value_lengths=host_past_kv_lengths[i : i + 1],
+            host_total_kv_lens=planner._pfx_host_total_kv,
+            host_context_lengths=host_context_lengths[i : i + 1],
+            host_request_types=planner._pfx_host_req_type,
+            kv_cache_block_offsets=kv_cache_block_offsets[:, i : i + 1, :, :],
+            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+            block_ids_per_seq=planner.block_ids_per_seq[i : i + 1],
+            latent_cache=latent_cache[t0:t1].contiguous(),
+            workspace=planner.workspace,
+            use_paged_context_fmha=False,
+            attention_input_type=AttentionInputType.context_only,
+            chunked_prefill_buffer_batch_size=1,
+            kv_scale_orig_quant=planner.kv_scale_orig_quant,
+            kv_scale_quant_orig=planner.kv_scale_quant_orig,
+            kv_cache_manager=planner.kv_cache_manager,
+            quant_config=QuantConfig(),
+        )
+
+        wrapper.run(
+            q=q[t0:t1].contiguous(),
+            output=output[t0:t1],
+            k=k[t0:t1].contiguous(),
+            v=v[t0:t1].contiguous(),
+            is_fused_qkv=False,
+            update_kv_cache=True,
         )
 
         tok_offset = t1
@@ -957,36 +1062,45 @@ def _handle_decode_impl(
 
     output_latent = planner.output_latent[:num_tokens]
 
-    _call_thop_attention_mla(
-        fused_q_flat,
-        None,
-        None,
-        output_latent,
-        latent_cache,
-        q_pe_flat,
-        True,
-        2,  # attention_input_type = generation_only
+    wrapper = planner.get_or_create_wrapper(
+        layer_idx,
         num_heads,
-        num_kv_heads,
-        gen_head_size,
-        tokens_per_block,
-        max_num_requests,
-        max_context_length,
-        scale,
-        quant_mode,
         kv_lora_rank,
         qk_nope_head_dim,
         qk_rope_head_dim,
-        kv_lora_rank,
-        sequence_length,
-        context_lengths,
-        host_past_kv_lengths,
-        host_context_lengths,
-        host_request_types,
-        host_total_kv_lens,
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
+        v_head_dim,
+    )
+    wrapper.plan(
+        layer_idx=layer_idx,
+        tokens_per_block=tokens_per_block,
+        max_num_requests=max_num_requests,
+        max_sequence_length=max_context_length,
+        max_context_length=max_context_length,
+        beam_width=1,
+        sequence_length=sequence_length,
+        context_lengths=context_lengths,
+        host_past_key_value_lengths=host_past_kv_lengths,
+        host_total_kv_lens=host_total_kv_lens,
+        host_context_lengths=host_context_lengths,
+        host_request_types=host_request_types,
+        kv_cache_block_offsets=kv_cache_block_offsets,
+        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+        block_ids_per_seq=planner.block_ids_per_seq,
+        latent_cache=latent_cache,
+        q_pe=q_pe_flat,
+        workspace=planner.workspace,
+        use_paged_context_fmha=False,
+        attention_input_type=AttentionInputType.generation_only,
+        kv_scale_orig_quant=planner.kv_scale_orig_quant,
+        kv_scale_quant_orig=planner.kv_scale_quant_orig,
+        kv_cache_manager=planner.kv_cache_manager,
+    )
+    wrapper.run(
+        q=fused_q_flat,
+        output=output_latent,
+        is_fused_qkv=True,
+        update_kv_cache=True,
         cu_q_seqlens=cu_q,
         cu_kv_seqlens=cu_kv,
         fmha_scheduler_counter=planner.fmha_scheduler_counter_decode,
@@ -1062,6 +1176,7 @@ def _mla_with_cache_impl(
 
     quant_mode = 0
     if kv_cache.dtype == torch.float8_e4m3fn:
+        quant_mode = int(QuantMode.FP8_KV_CACHE)
         if planner.kv_scale_orig_quant is None:
             planner.kv_scale_orig_quant = torch.tensor(
                 [1.0], dtype=torch.float32, device=q_nope.device
@@ -1069,6 +1184,11 @@ def _mla_with_cache_impl(
             planner.kv_scale_quant_orig = torch.tensor(
                 [1.0], dtype=torch.float32, device=q_nope.device
             )
+        # Configure wrapper quant_mode for FP8 KV cache (once per layer).
+        for w in planner._attn_wrappers.values():
+            if not hasattr(w, "_quant_configured"):
+                w.quant_mode = quant_mode
+                w._quant_configured = True
         quant_mode = int(QuantMode.FP8_KV_CACHE)
 
     # Flatten from [B, S, ...] to [bs, ...] using actual tensor dims (not
@@ -1520,15 +1640,15 @@ class TrtllmMLAAttention(AttentionDescriptor):
                 f"Use the flashinfer_mla backend for this model instead."
             )
 
-        # NOTE: FP8 KV cache is NOT auto-enabled because the C++ MLA decode
-        # FMHA kernel does not support FP8 with num_kv_heads=1 and MLA latent
-        # dimensions (headSize=576, headSizeV=512).  The PT backend also uses
-        # BF16 KV cache by default for MLA models.  Users can still explicitly
-        # set cache_config.dtype="fp8" if a future kernel adds support.
-        cache_dtype = cls.resolve_cache_dtype(
-            cache_config.dtype,
-            compressed_kv_fake.dtype,
-        )
+        # For FP8 models, use FP8 KV cache to match the PT backend which
+        # auto-detects FP8 and sets quant_mode=FP8_KV_CACHE.
+        if cache_config.dtype == "auto" and cls._has_fp8_model_weights(source_attn_node):
+            cache_dtype = torch.float8_e4m3fn
+        else:
+            cache_dtype = cls.resolve_cache_dtype(
+                cache_config.dtype,
+                compressed_kv_fake.dtype,
+            )
 
         return {
             "kv_cache": KVPagedResourceHandler(

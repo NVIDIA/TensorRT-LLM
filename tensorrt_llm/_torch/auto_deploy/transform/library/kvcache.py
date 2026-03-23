@@ -300,6 +300,14 @@ class ResizeKVCache(BaseTransform):
         # Resize - KVCacheManager will compute optimal capacity based on free memory
         cm.resize_kv_cache_manager(mem_reserved_for_forward)
 
+        # Update MLA planner with the new (resized) kv_cache_manager.
+        try:
+            from ..custom_ops.mla.trtllm_mla import set_mla_kv_cache_manager
+
+            set_mla_kv_cache_manager(cm.kv_cache_manager)
+        except (ImportError, AssertionError):
+            pass
+
         info = TransformInfo(
             skipped=False,
             num_matches=0,
