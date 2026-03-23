@@ -22,6 +22,7 @@ from torch.export import Dim
 from torch.fx import GraphModule
 
 # Import to register custom op
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
@@ -55,10 +56,12 @@ class TestGatherTokensOp:
 
         # Create gather info: num_tokens_to_gather=batch_size, gather_required=0 (False)
         token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
 
         output = torch.ops.auto_deploy.gather_tokens.default(
-            hidden_states, token_gather_indices, tokens_gather_info_host
+            hidden_states, token_gather_indices, batch_info_host
         )
 
         # Should return [batch, 1, hidden] for generate format (3D shape preserved)
@@ -81,10 +84,12 @@ class TestGatherTokensOp:
         gather_indices = torch.arange(0, num_gather, dtype=torch.long, device="cuda")
 
         # Create gather info: num_tokens_to_gather=num_gather, gather_required=1 (True)
-        tokens_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(num_gather, True)
+        batch_info_host = batch_info.serialize()
 
         output = torch.ops.auto_deploy.gather_tokens.default(
-            hidden_states, gather_indices, tokens_gather_info_host
+            hidden_states, gather_indices, batch_info_host
         )
 
         # Should return [1, num_gather, hidden] for packed format (3D shape preserved)
@@ -101,10 +106,12 @@ class TestGatherTokensOp:
         hidden_size = 128
         hidden_states = torch.randn(1, 1, hidden_size, device="cuda", dtype=torch.float16)
         gather_indices = torch.tensor([0], dtype=torch.long, device="cuda")
-        logits_gather_info_host = torch.tensor([1, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(1, True)
+        batch_info_host = batch_info.serialize()
 
         output = torch.ops.auto_deploy.gather_tokens.default(
-            hidden_states, gather_indices, logits_gather_info_host
+            hidden_states, gather_indices, batch_info_host
         )
 
         # 2D input should stay 2D to preserve vocab axis after LM head.
@@ -119,15 +126,17 @@ class TestGatherTokensOp:
 
         # Create gather info
         token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
 
         # Use fake implementation directly
         with FakeTensorMode() as mode:
             hidden_states_fake = mode.from_tensor(hidden_states)
             token_gather_indices_fake = mode.from_tensor(token_gather_indices)
-            tokens_gather_info_host_fake = mode.from_tensor(tokens_gather_info_host)
+            batch_info_host_fake = mode.from_tensor(batch_info_host)
             output = torch.ops.auto_deploy.gather_tokens.default(
-                hidden_states_fake, token_gather_indices_fake, tokens_gather_info_host_fake
+                hidden_states_fake, token_gather_indices_fake, batch_info_host_fake
             )
 
         # Should return [batch, 1, hidden_size] (fake returns empty_like which preserves 3D shape)
@@ -146,15 +155,17 @@ class TestGatherTokensOp:
 
         # Create gather info
         token_gather_indices = torch.arange(num_gather, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(num_gather, True)
+        batch_info_host = batch_info.serialize()
 
         # Use fake implementation directly
         with FakeTensorMode() as mode:
             hidden_states_fake = mode.from_tensor(hidden_states)
             token_gather_indices_fake = mode.from_tensor(token_gather_indices)
-            tokens_gather_info_host_fake = mode.from_tensor(tokens_gather_info_host)
+            batch_info_host_fake = mode.from_tensor(batch_info_host)
             output = torch.ops.auto_deploy.gather_tokens.default(
-                hidden_states_fake, token_gather_indices_fake, tokens_gather_info_host_fake
+                hidden_states_fake, token_gather_indices_fake, batch_info_host_fake
             )
 
         # The fake implementation returns empty_like which preserves input shape [1, total_tokens, hidden]
@@ -227,13 +238,15 @@ class TestGatherLogitsBeforeLmHeadTransform:
 
         # Test forward pass
         token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
         output = gm_transformed(
             hidden_states,
             logit_gather_ids,
             seq_len,
             token_gather_indices=token_gather_indices,
-            tokens_gather_info_host=tokens_gather_info_host,
+            batch_info_host=batch_info_host,
         )
         # Output should be [batch_size, 1, vocab_size] since gather now returns 3D
         assert output.shape == (batch_size, 1, vocab_size)
@@ -287,13 +300,15 @@ class TestGatherLogitsBeforeLmHeadTransform:
         # Test forward pass
         num_gather = len(logit_gather_ids)
         token_gather_indices = logit_gather_ids
-        tokens_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(num_gather, True)
+        batch_info_host = batch_info.serialize()
         output = gm_transformed(
             hidden_states,
             logit_gather_ids_padded,
             seq_len,
             token_gather_indices=token_gather_indices,
-            tokens_gather_info_host=tokens_gather_info_host,
+            batch_info_host=batch_info_host,
         )
         # Output should be [1, num_gather, vocab_size] since gather now returns 3D
         assert output.shape == (1, num_gather, vocab_size)
