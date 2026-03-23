@@ -407,10 +407,13 @@ class KVCacheManager(BaseResourceManager):
                 for window_size in set(self.max_attention_window_vec)
             }
             if self.is_linear_attention:
-                max_snapshots = max(
-                    kv_cache_config.max_tokens //
-                    linear_attention_metadata.states_snapshot_interval,
-                    self.max_batch_size)
+                if kv_cache_config.enable_block_reuse:
+                    max_snapshots = max(
+                        kv_cache_config.max_tokens //
+                        linear_attention_metadata.states_snapshot_interval,
+                        self.max_batch_size)
+                else:
+                    max_snapshots = self.max_batch_size
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
             logger.info(
@@ -418,11 +421,6 @@ class KVCacheManager(BaseResourceManager):
             )
         else:
             if self.is_vswa or self.is_linear_attention:
-                # VSWA case: use C++ implementation for variable window sizes
-                if model_config is None:
-                    raise ValueError(
-                        "model_config is required for VSWA (Variable Sliding Window Attention)"
-                    )
                 assert isinstance(
                     kv_cache_config, KvCacheConfig
                 ), "calculate_max_num_blocks_for_vswa only accepts KvCacheConfig"
@@ -1313,7 +1311,7 @@ class KVCacheManager(BaseResourceManager):
     def calculate_max_num_blocks_for_vswa(
             self,
             kv_cache_config: KvCacheConfig,
-            model_config: ModelConfigCpp,
+            model_config: Optional[ModelConfigCpp],
             extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
         """
         Currently, this function is added to support *ONLY* VSWA.
@@ -1381,6 +1379,11 @@ class KVCacheManager(BaseResourceManager):
             )
             return blocks_per_window
 
+        # VSWA case: use C++ implementation for variable window sizes
+        if model_config is None:
+            raise ValueError(
+                "model_config is required for VSWA (Variable Sliding Window Attention)"
+            )
         assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
         if self.is_vswa:
             # Adjust the window sizes to fit the memory if even a single sequence
