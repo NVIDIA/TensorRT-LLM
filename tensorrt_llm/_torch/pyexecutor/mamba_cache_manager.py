@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 import torch
 
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.model_config import ModelConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
@@ -762,7 +761,6 @@ class LinearHybridCacheManager(KVCacheManager):
         kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
         *,
-        model_config_py: Optional[ModelConfig] = None,
         num_layers: int,
         num_kv_heads: Union[int, List[Optional[int]]],
         head_dim: int,
@@ -821,9 +819,12 @@ class LinearHybridCacheManager(KVCacheManager):
                 "Partial reuse is not supported for linear hybrid cache, disabling partial reuse"
             )
             kv_cache_config.enable_partial_reuse = False
+
+        full_attention_layer_mask = layer_mask.copy()
+
         kv_cache_config.max_attention_window = []
         layer_mask = [
-            mamba_layer_mask[i] or layer_mask[i]
+            mamba_layer_mask[i] or full_attention_layer_mask[i]
             for i, _ in enumerate(mamba_layer_mask)
         ]
         for i in range(len(layer_mask)):
@@ -846,10 +847,6 @@ class LinearHybridCacheManager(KVCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             max_num_tokens=max_num_tokens,
-            model_config=model_config_py.get_bindings_model_config(
-                tokens_per_block=tokens_per_block,
-                kv_cache_config=kv_cache_config,
-                spec_config=spec_config),
             max_beam_width=max_beam_width,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager,
@@ -877,7 +874,7 @@ class LinearHybridCacheManager(KVCacheManager):
                                               device="cpu")
         self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
-            self.linear_pp_layers[0]][0]
+            self.layer_offsets[self.linear_pp_layers[0]]][0]
         self._cuda_state_indices = torch.zeros([self.max_batch_size],
                                                dtype=torch.int32,
                                                device="cuda")

@@ -1339,7 +1339,6 @@ class KVCacheManager(BaseResourceManager):
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
         # check model config
-        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
@@ -1363,6 +1362,26 @@ class KVCacheManager(BaseResourceManager):
             f"secondary_pool_memory_bytes is set to {self._secondary_pool_memory_bytes/1024**3}GB"
         )
 
+        if self.is_linear_attention:
+            blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
+                config=PybindMirror.maybe_to_pybind(kv_cache_config),
+                dtype=self.dtype,
+                num_kv_heads_per_layer=list(self.num_kv_heads_per_layer),
+                size_per_head=self.head_dim,
+                tokens_per_block=self.tokens_per_block,
+                world_config=world_config_cpp,
+                window_size_to_layers=window_size_to_layers,
+                allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
+                allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
+                extra_cost_memory=extra_cost_memory,
+                kv_factor=self.kv_factor,
+                max_batch_size=self.max_batch_size,
+                linear_attention_metadata=PybindMirror.maybe_to_pybind(
+                    self.linear_attention_metadata),
+            )
+            return blocks_per_window
+
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
         if self.is_vswa:
             # Adjust the window sizes to fit the memory if even a single sequence
             # cannot fit in the memory.
@@ -1377,24 +1396,6 @@ class KVCacheManager(BaseResourceManager):
                 is_cross_attention=is_cross_attention,
             )
             self.max_attention_window_vec = max_attention_window_vec
-
-        if self.is_linear_attention:
-            blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
-                config=PybindMirror.maybe_to_pybind(kv_cache_config),
-                is_cross_attention=is_cross_attention,
-                dtype=self.dtype,
-                model_config=model_config,
-                world_config=world_config_cpp,
-                window_size_to_layers=window_size_to_layers,
-                allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
-                allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
-                extra_cost_memory=extra_cost_memory,
-                kv_factor=self.kv_factor,
-                max_batch_size=self.max_batch_size,
-                linear_attention_metadata=PybindMirror.maybe_to_pybind(
-                    self.linear_attention_metadata),
-            )
-            return blocks_per_window
 
         def calculate_cache_size_per_token(layers: Set[int]) -> int:
             # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize

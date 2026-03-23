@@ -31,7 +31,6 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
@@ -1924,10 +1923,15 @@ public:
 
     // Sum of numLayers * kvFactor * numKvHeads * sizePerHead for each pool
     [[nodiscard]] static SizeType32 calculateCacheSizePerTokenForSingleWindowSize(
-        tensorrt_llm::runtime::ModelConfig const& modelConfig, std::vector<SizeType32> const& windowSizeLayers,
-        bool isCrossAttention, SizeType32 kvFactor)
+        std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
+        std::vector<SizeType32> const& windowSizeLayers, SizeType32 kvFactor)
     {
-        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(windowSizeLayers, isCrossAttention);
+        std::vector<SizeType32> nkvh;
+        nkvh.reserve(windowSizeLayers.size());
+        for (auto const layer : windowSizeLayers)
+        {
+            nkvh.push_back(numKvHeadsPerLayer.at(layer));
+        }
         std::stringstream ss;
         for (auto const& n : nkvh)
         {
@@ -1937,11 +1941,10 @@ public:
         auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
         TLLM_LOG_DEBUG(
             "[calculateCacheSizePerTokenForSingleWindowSize] sumLocalHeads: %d, kvFactor: %d, sizePerHead: %d",
-            sumLocalHeads, kvFactor, modelConfig.getSizePerHead());
-        // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
-        // address it here
+            sumLocalHeads, kvFactor, sizePerHead);
+        // NOTE: We expect the caller to have already taken the tp size into account for numKvHeadsPerLayer
         // consider only local layers for the calculation
-        return sumLocalHeads * kvFactor * modelConfig.getSizePerHead();
+        return sumLocalHeads * kvFactor * sizePerHead;
     }
 
     /// @brief Groups model layers by their attention window size.
@@ -1965,19 +1968,21 @@ public:
     ///          of memory requirements. The weighting considers both the window size and the number of
     ///          layers using each window size, as well as the sum of cache sizes per token for each window.
     /// @param config KV cache configuration parameters
-    /// @param isCrossAttention Whether this is for cross-attention KV cache
     /// @param dtype Data type used for KV cache values
-    /// @param modelConfig Model configuration containing layer and head information
+    /// @param numKvHeadsPerLayer Number of KV heads for each local layer (caller selects self/cross attention heads)
+    /// @param sizePerHead Size of each attention head
+    /// @param tokensPerBlock Number of tokens per KV cache block
     /// @param worldConfig World configuration for multi-GPU setups
     /// @param windowSizeToLayers Map from attention window size to vector of layer indices using that window size
     /// @param allottedPrimaryMemBytes Allotted primary memory
     /// @param allottedSecondaryMemBytes Allotted secondary memory
     /// @param extraCostMemory Additional memory cost to account for CacheTransBufferManager::preAllocBufferSize
     /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
+    /// @param maxBatchSize Maximum batch size
     /// @return Map from window size to tuple of (primary blocks, secondary blocks)
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(executor::KvCacheConfig const& config,
-        bool isCrossAttention, nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
-        tensorrt_llm::runtime::WorldConfig const& worldConfig,
+        nvinfer1::DataType dtype, std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
+        SizeType32 tokensPerBlock, tensorrt_llm::runtime::WorldConfig const& worldConfig,
         std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
         uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
         std::optional<LinearAttentionMetadata> const& linearAttentionMetadata = std::nullopt);

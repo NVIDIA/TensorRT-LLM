@@ -952,7 +952,7 @@ def _create_kv_cache_manager(
             # - If layer_mask[i] is True, include layer i
             # - For layers beyond hybrid_override_pattern, treat them as attention layers
             pattern_len = len(config.hybrid_override_pattern)
-            hybrid_layer_mask = []
+            full_attention_layer_mask = []
             mamba_layer_mask = []
             for i, include in enumerate(layer_mask):
                 if i < pattern_len:
@@ -963,13 +963,14 @@ def _create_kv_cache_manager(
                     # Beyond the pattern (e.g., MTP/draft layers), treat as attention-only
                     is_attention = True
                     is_mamba = False
-                hybrid_layer_mask.append(is_attention and include)
+                full_attention_layer_mask.append(is_attention and include)
                 mamba_layer_mask.append(is_mamba and include)
-            num_layers = sum(hybrid_layer_mask)
+            num_full_attention_layers = sum(full_attention_layer_mask)
             mamba_num_layers = sum(mamba_layer_mask)
         else:
-            num_layers = config.hybrid_override_pattern.count("*")
-            hybrid_layer_mask = [
+            num_full_attention_layers = config.hybrid_override_pattern.count(
+                "*")
+            full_attention_layer_mask = [
                 char == "*" for char in config.hybrid_override_pattern
             ]
             mamba_num_layers = config.hybrid_override_pattern.count("M")
@@ -985,9 +986,9 @@ def _create_kv_cache_manager(
                 from ..speculative.utils import get_num_spec_layers
                 num_spec_layers = get_num_spec_layers(spec_config)
                 if num_spec_layers > 0:
-                    hybrid_layer_mask.extend([True] * num_spec_layers)
+                    full_attention_layer_mask.extend([True] * num_spec_layers)
                     mamba_layer_mask.extend([False] * num_spec_layers)
-                    num_layers += num_spec_layers
+                    num_full_attention_layers += num_spec_layers
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
@@ -1003,8 +1004,8 @@ def _create_kv_cache_manager(
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            layer_mask=hybrid_layer_mask,
+            num_layers=num_full_attention_layers,
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -1015,7 +1016,6 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_config_py=model_engine.model.model_config,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1026,9 +1026,9 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-        hybrid_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
+        full_attention_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
             config)
-        num_layers = sum(hybrid_layer_mask)
+        num_full_attention_layers = sum(full_attention_layer_mask)
         num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
@@ -1045,8 +1045,8 @@ def _create_kv_cache_manager(
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            layer_mask=hybrid_layer_mask,
+            num_layers=num_full_attention_layers,
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -1057,7 +1057,6 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_config_py=model_engine.model.model_config,
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
