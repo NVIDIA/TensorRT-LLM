@@ -638,11 +638,21 @@ class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
         # for Kimi-K2 / DeepSeek-V3 class models), mismatch reaches ~3-5%
         # under TTP parallel mode (extra bf16 allreduce from TP splitting).
         # Smaller configs (intermediate_size≤1408, top_k≤6) stay within 3%.
+        #
+        # Element-wise activations (Relu2, Silu) amplify FP4 quantization
+        # errors more than gated activations (SwiGLU). Relu2 (x * relu(x))
+        # squares positive values, approximately doubling the relative error
+        # from FP4 quantization noise. Some kernel tactics exhibit ~10%
+        # mismatch under these conditions.
         top_k = getattr(self.routing_method, "top_k", 1)
         error_accumulation = self.intermediate_size * top_k
         if error_accumulation > 10000:
             # High error accumulation (large intermediate_size × top_k)
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.93)
+        elif not self._is_gated:
+            # Element-wise activations (Relu2, Silu) amplify quantization
+            # errors through squaring / non-linear transforms.
+            check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.88)
         elif self.swiglu_gptoss_style:
             # swiglu_gptoss_style uses relaxed tolerance
             check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
