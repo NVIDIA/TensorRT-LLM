@@ -340,6 +340,29 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
 
+        # Deadlock detection: if generation requests exist but none were
+        # scheduled and none were evicted, no forward pass will run and no
+        # KV cache pages will ever be freed — the scheduler will spin
+        # forever.  This typically happens when the KV cache pool is
+        # exhausted and no host cache tier is available for suspend/resume.
+        if not scheduled_gen and not scheduled_ctx:
+            num_gen_candidates = sum(
+                1
+                for r in active_requests
+                if r.is_generation_in_progress_state
+                and not r.is_generation_to_complete_state
+                and r.request_id not in inflight_request_ids
+            )
+            if num_gen_candidates > 0 and not evicted:
+                raise RuntimeError(
+                    f"V2 scheduler deadlock: {num_gen_candidates} generation "
+                    f"request(s) active but none could be scheduled or "
+                    f"evicted. KV cache pool is likely exhausted with no "
+                    f"host cache tier for suspend/resume offload. "
+                    f"Configure kv_cache_config.host_cache_size or increase "
+                    f"kv_cache_config.max_tokens."
+                )
+
         return scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking
 
     # ---- Per-type scheduling methods ----

@@ -98,7 +98,6 @@ def test_llm_rpc_tp2():
 @pytest.mark.gpu2
 @pytest.mark.asyncio
 async def test_llm_rpc_streaming_tp2():
-    pytest.skip("OOM")
     with LLM(model=llama_model_path,
              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
              orchestrator_type="rpc",
