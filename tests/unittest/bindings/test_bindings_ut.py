@@ -476,8 +476,6 @@ def test_KvCache_events_binding():
         'max_beam_width':
         1,
         'max_attention_window_vec': [max_sequence_length],
-        'temp_attention_window_inputs':
-        None,
         'dtype':
         _tb.DataType.FLOAT,
         'sink_token_length':
@@ -485,6 +483,8 @@ def test_KvCache_events_binding():
         'stream':
         stream.cuda_stream,
         'max_sequence_length':
+        max_sequence_length,
+        'chunk_size':
         max_sequence_length,
         'enable_block_reuse':
         True,
