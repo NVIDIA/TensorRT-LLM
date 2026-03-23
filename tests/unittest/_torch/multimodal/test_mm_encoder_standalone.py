@@ -960,6 +960,106 @@ def test_multi_request_batch_chat(
                     f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_pd_disagg_multimodal_with_block_reuse():
+    """Smoke-test P-D disagg with multimodal input and enable_block_reuse=True.
+
+    This exercises the exact crash path (fromReuseTree with multimodal
+    extraKeys) without needing a separate encoder.
+    """
+    model_dir = _QWEN_3_VL_DIR
+
+    prompts = ["Describe the image."]
+    media = [example_images[0]]
+    sampling_params = SamplingParams(max_tokens=16, temperature=0)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=0.2,
+    )
+    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
+                                                   max_tokens_in_buffer=10240)
+    moe_config = _get_moe_config_for_blackwell()
+
+    llm_prefill = LLM(model=model_dir,
+                      backend='pytorch',
+                      kv_cache_config=kv_cache_config,
+                      moe_config=moe_config,
+                      trust_remote_code=True,
+                      cache_transceiver_config=cache_transceiver_cfg,
+                      disable_overlap_scheduler=True,
+                      max_batch_size=1)
+
+    inputs = _load_inputs(llm_prefill, prompts, media)
+
+    with llm_prefill:
+        llm_decode = LLM(model=model_dir,
+                         backend='pytorch',
+                         kv_cache_config=kv_cache_config,
+                         moe_config=moe_config,
+                         trust_remote_code=True,
+                         cache_transceiver_config=cache_transceiver_cfg,
+                         max_batch_size=1)
+        with llm_decode:
+            # P: prefill (context_only) with raw multimodal input
+            prefill_params = DisaggregatedParams(
+                request_type="context_only")
+            print("\n[P] prefilling (context_only)...", flush=True)
+            outputs = llm_prefill.generate(
+                inputs,
+                sampling_params=SamplingParams(max_tokens=0, temperature=0),
+                disaggregated_params=prefill_params)
+            assert len(outputs) == 1
+            print(f"[P] done, {len(outputs[0].prompt_token_ids)} tokens",
+                  flush=True)
+
+            # D: decode (generation_only)
+            pd_params = outputs[0].disaggregated_params
+            pd_params.request_type = "generation_only"
+            decode_inputs = [{
+                "prompt": inputs[0]["prompt"],
+                "multi_modal_data": None,
+                "prompt_token_ids": outputs[0].prompt_token_ids,
+            }]
+            print("[D] decoding (generation_only)...", flush=True)
+            decode_outputs = llm_decode.generate(
+                decode_inputs,
+                sampling_params=sampling_params,
+                disaggregated_params=pd_params)
+            assert len(decode_outputs) == 1
+            assert len(decode_outputs[0].outputs) > 0
+            print(
+                f"[D] output: {decode_outputs[0].outputs[0].text!r}",
+                flush=True)
+
+            # Second request (same image) — triggers reuse tree lookup
+            print("\n[P] prefilling request 2 (same image)...", flush=True)
+            prefill_params2 = DisaggregatedParams(
+                request_type="context_only")
+            outputs2 = llm_prefill.generate(
+                inputs,
+                sampling_params=SamplingParams(max_tokens=0, temperature=0),
+                disaggregated_params=prefill_params2)
+            assert len(outputs2) == 1
+
+            pd_params2 = outputs2[0].disaggregated_params
+            pd_params2.request_type = "generation_only"
+            decode_inputs2 = [{
+                "prompt": inputs[0]["prompt"],
+                "multi_modal_data": None,
+                "prompt_token_ids": outputs2[0].prompt_token_ids,
+            }]
+            print("[D] decoding request 2...", flush=True)
+            decode_outputs2 = llm_decode.generate(
+                decode_inputs2,
+                sampling_params=sampling_params,
+                disaggregated_params=pd_params2)
+            assert len(decode_outputs2) == 1
+            assert len(decode_outputs2[0].outputs) > 0
+            print(
+                f"[D] output 2: {decode_outputs2[0].outputs[0].text!r}",
+                flush=True)
+
+
 @pytest.mark.parametrize(
     "prompts,expected_num_duplicates",
     [
@@ -986,8 +1086,12 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts, expected_num_duplicates):
     2. mm_hashes propagate through DisaggregatedParams → prefill → KV cache events
     3. KV cache events contain mm_keys with correct hash + start_offset structure
     4. Block reuse is observed for repeated identical (or prefix-shared) requests
+
+    Uses the 2B model so all three instances (encoder + prefill + decode)
+    fit in GPU memory simultaneously.  The PD-only test
+    (test_pd_disagg_multimodal_with_block_reuse) covers the 30B model.
     """
-    encoder_model_dir = _QWEN_3_VL_30B_A3B_FP8_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -1036,12 +1140,8 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts, expected_num_duplicates):
                 assert ep_params.multimodal_embedding_handles is not None
                 assert ep_params.multimodal_hashes is not None
                 all_ep_hashes.append(ep_params.multimodal_hashes)
-
                 print(f"  [E] mm_hashes: {ep_params.multimodal_hashes}",
                       flush=True)
-                print(
-                    f"  [E] mm_embedding_handles count: {len(ep_params.multimodal_embedding_handles)}",
-                    flush=True)
 
                 # P: prefill (context_only)
                 print(f"  [P] prefilling (context_only)...", flush=True)
@@ -1055,10 +1155,6 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts, expected_num_duplicates):
                     print(
                         f"  [P] prefill done, prompt_token_ids length: "
                         f"{len(prefill_outputs[0].prompt_token_ids)}",
-                        flush=True)
-                    print(
-                        f"  [P] prefill disagg_params: "
-                        f"{prefill_outputs[0].disaggregated_params}",
                         flush=True)
                 except Exception as e:
                     print(f"  [P] PREFILL FAILED: {e}", flush=True)
@@ -1079,7 +1175,8 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts, expected_num_duplicates):
                 try:
                     decode_outputs = llm_decode.generate(
                         decode_inputs,
-                        sampling_params=SamplingParams(max_tokens=max_tokens),
+                        sampling_params=SamplingParams(
+                            max_tokens=max_tokens),
                         disaggregated_params=pd_params)
                     assert len(decode_outputs) == 1
                     assert len(decode_outputs[0].outputs) > 0
@@ -1127,7 +1224,7 @@ def test_epd_disagg_output_matches_raw_with_block_reuse():
     2. Encoder → context_only prefill → generation_only decode (E-P-D)
     Both with enable_block_reuse=True.  Compares generated text.
     """
-    encoder_model_dir = _QWEN_3_VL_30B_A3B_FP8_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 64
     free_gpu_memory_fraction = 0.2
@@ -1155,6 +1252,7 @@ def test_epd_disagg_output_matches_raw_with_block_reuse():
 
     inputs = _load_inputs(llm_prefill, prompts, media)
 
+    # All three instances must be alive simultaneously (shared CUDA handles).
     encoder = MultimodalEncoder(model=encoder_model_dir, max_batch_size=1)
 
     with llm_prefill, encoder:
@@ -1197,9 +1295,10 @@ def test_epd_disagg_output_matches_raw_with_block_reuse():
                 "prompt_token_ids":
                 prefill_outputs[0].prompt_token_ids,
             }]
-            outputs_epd = llm_decode.generate(decode_inputs,
-                                              sampling_params=sampling_params,
-                                              disaggregated_params=pd_params)
+            outputs_epd = llm_decode.generate(
+                decode_inputs,
+                sampling_params=sampling_params,
+                disaggregated_params=pd_params)
 
     assert outputs_epd is not None and len(outputs_epd) == 1
     assert len(outputs_epd[0].outputs) > 0

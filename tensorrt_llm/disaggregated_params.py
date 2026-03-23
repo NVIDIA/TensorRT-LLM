@@ -62,6 +62,12 @@ class DisaggregatedParams:
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
+    # MM metadata for generation_only (Decode) requests — needed so the Decode
+    # side can construct correct BlockKeys for KV cache reuse tree lookups.
+    mm_hashes_for_reuse: Optional[List[List[int]]] = None
+    mm_positions_for_reuse: Optional[List[int]] = None
+    mm_lengths_for_reuse: Optional[List[int]] = None
+
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         # Prefer disagg_request_id over ctx_request_id
         request_id = (

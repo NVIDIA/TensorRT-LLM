@@ -3400,14 +3400,9 @@ class PyExecutor:
                                 )
 
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
-                # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
-                # path is fixed.
-                # Multimodal requests must not be terminated early: the
-                # async sender needs the sequence alive for
-                # fromAllBlockIds (the reuse tree doesn't support
-                # per-block multimodal extraKeys yet).
-                has_multimodal = request.multimodal_hashes is not None
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1 and not has_multimodal:
+                # then we need to terminate the request. TODO: Remove the condition on the PP size once disagg
+                # support from KVCache reuse path is fixed.
+                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
                     requests_to_terminate.append(request)
                 else:
                     if not request.is_disagg_context_transmission_state:

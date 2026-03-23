@@ -1221,23 +1221,31 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
-std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(
+    BlockKey const& blockKey, OptionalRef<LlmRequest const> llmRequest)
 {
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
 
     std::vector<BlockKey> blockKeys;
-    for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
+    if (llmRequest.has_value())
     {
-        blockKeys.push_back(blockKey);
-        blockKeys.back().uniqueTokens = blockedUniqueTokensList;
+        blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
+    }
+    else
+    {
+        for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
+        {
+            blockKeys.push_back(blockKey);
+            blockKeys.back().uniqueTokens = blockedUniqueTokensList;
+        }
     }
     auto searchRoot = mCachedBlocksRoot;
-    for (auto const& blockKey : blockKeys)
+    for (auto const& key : blockKeys)
     {
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, true, true)
+            ? searchRoot->findMatchingBlock(key, true, true)
             : std::make_tuple(false, 0, nullptr);
 
         if (matchingBlock == nullptr)

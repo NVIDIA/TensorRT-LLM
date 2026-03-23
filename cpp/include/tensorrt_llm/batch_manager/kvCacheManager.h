@@ -890,7 +890,8 @@ public:
         return mEnablePartialReuse;
     }
 
-    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
 
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
@@ -1347,9 +1348,9 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
+        BlockKey const& blockKey, SizeType32 windowSize, OptionalRef<LlmRequest const> llmRequest = std::nullopt)
     {
-        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey, llmRequest);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -1730,7 +1731,7 @@ public:
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 
     [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
+        BlockKey const& blockKey, SizeType32 windowSize, OptionalRef<LlmRequest const> llmRequest = std::nullopt)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2081,9 +2082,9 @@ public:
     }
 
     std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize) override
+        BlockKey const& blockKey, SizeType32 windowSize, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override
     {
-        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
+        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize, llmRequest);
     }
 
     void resetReuseState() override

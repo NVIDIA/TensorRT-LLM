@@ -832,7 +832,6 @@ public:
             auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
             auto lastBlockKey
                 = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
-            if (llmRequest.getInputTokensExtraIds().has_value())
             {
                 auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
                 SizeType32 startTokenIdx

@@ -544,6 +544,7 @@ class BaseLLM:
             prompt_token_ids = inputs['prompt_token_ids']
             query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
+            multimodal_input = None
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
                 # PyTorchModelEngine assumes both are present when using mrope.
@@ -557,9 +558,18 @@ class BaseLLM:
                 mrope_config[
                     "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
                 multimodal_data["mrope_config"] = mrope_config
-            if multimodal_data:
+            if (disaggregated_params is not None
+                    and disaggregated_params.mm_hashes_for_reuse is not None):
+                multimodal_input = MultimodalInput.from_components(
+                    mm_hashes=disaggregated_params.mm_hashes_for_reuse,
+                    mm_positions=disaggregated_params.mm_positions_for_reuse,
+                    mm_lengths=disaggregated_params.mm_lengths_for_reuse,
+                )
+            if multimodal_data or multimodal_input is not None:
                 multimodal_params = MultimodalParams(
-                    multimodal_data=multimodal_data)
+                    multimodal_input=multimodal_input,
+                    multimodal_data=multimodal_data,
+                )
         elif "prompt" in inputs:
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
