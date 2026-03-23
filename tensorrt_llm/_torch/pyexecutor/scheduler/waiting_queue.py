@@ -1,13 +1,12 @@
 import heapq
 import itertools
-import warnings
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
-from typing import Callable, Optional
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
+from tensorrt_llm.logger import logger
 
 from ..executor_request_queue import RequestQueueItem
 
@@ -82,27 +81,24 @@ class FCFSWaitingQueue(deque, WaitingQueue):
     """A first-come-first-served queue that supports deque operations."""
 
     @staticmethod
-    def _warn_if_priority_set(request: RequestQueueItem, stacklevel: int = 3) -> None:
+    def _warn_if_priority_set(request: RequestQueueItem) -> None:
         if request.request is not None and request.request.priority != DEFAULT_REQUEST_PRIORITY:
-            warnings.warn(
+            logger.warning(
                 "A request has a non-default priority but the FCFS waiting "
                 "queue is in use; the priority value will be ignored. "
-                "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling.",
-                UserWarning,
-                stacklevel=stacklevel,
+                "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling."
             )
 
     def add_request(self, request: RequestQueueItem) -> None:
         """Add a request to the queue according to FCFS policy."""
-        # stacklevel=3: caller → add_request → _warn_if_priority_set
-        self._warn_if_priority_set(request, stacklevel=3)
+        self._warn_if_priority_set(request)
         self.append(request)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Add multiple requests to the queue according to FCFS policy."""
         requests = list(requests)
         for request in requests:
-            self._warn_if_priority_set(request, stacklevel=3)
+            self._warn_if_priority_set(request)
         self.extend(requests)
 
     def pop_request(self) -> RequestQueueItem:
@@ -253,24 +249,15 @@ class PriorityWaitingQueue(WaitingQueue):
 
 def create_waiting_queue(
     policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
-    priority_fn: Optional[Callable[[RequestQueueItem], float]] = None,
 ) -> WaitingQueue:
     """Create a waiting queue based on the specified policy.
 
     Args:
         policy: The scheduling policy to use.
-        priority_fn: Reserved for future use.
 
     Returns:
         A WaitingQueue instance.
     """
-    if priority_fn is not None:
-        warnings.warn(
-            "priority_fn is not supported and will be ignored. "
-            "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling.",
-            UserWarning,
-            stacklevel=2,
-        )
     if policy == WaitingQueuePolicy.FCFS:
         return FCFSWaitingQueue()
     elif policy == WaitingQueuePolicy.PRIORITY:
