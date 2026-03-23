@@ -193,7 +193,8 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block)
 void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
     std::optional<std::chrono::milliseconds> durationMs)
 {
-    TLLM_CHECK_WITH_INFO(removeFromFreeBlockQueue(block), "claimBlock called on a block (id=%d) that hasn't been released", block->getBlockId());
+    TLLM_CHECK_WITH_INFO(removeFromFreeBlockQueue(block),
+        "claimBlock called on a block (id=%d) that hasn't been released", block->getBlockId());
     if (priority.has_value())
     {
         block->setPriority(*priority);
