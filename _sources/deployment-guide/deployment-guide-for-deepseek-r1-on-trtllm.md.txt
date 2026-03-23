@@ -47,7 +47,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc8 \
+nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc9 \
 /bin/bash
 ```
 
@@ -445,18 +445,4 @@ The following sections help you pick a known-good `trtllm-serve --config` for yo
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
-```
-
-### Recipe database
-
-```{eval-rst}
-.. include:: config_table.rst
-   :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
-   :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
-```
-
-```{eval-rst}
-.. include:: config_table.rst
-   :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
-   :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
 ```
