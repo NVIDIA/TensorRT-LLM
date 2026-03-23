@@ -2265,13 +2265,13 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             validLineCount += count
         }
     }
-    if (validLineCount > 5) {
-        echo "There are more than 5 failed ${testType} tests, skip the rerun step."
-        return true
-    } else if (validLineCount == 0) {
-        echo "No failed ${testType} tests need to be rerun, skip the rerun step."
-        return true
-    }
+    // if (validLineCount > 5) {
+    //     echo "There are more than 5 failed ${testType} tests, skip the rerun step."
+    //     return true
+    // } else if (validLineCount == 0) {
+    //     echo "No failed ${testType} tests need to be rerun, skip the rerun step."
+    //     return true
+    // }
 
     // Rerun tests
     def isRerunFailed = false
