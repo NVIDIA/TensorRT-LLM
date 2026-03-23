@@ -1252,23 +1252,27 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
     return searchRoot;
 }
 
-SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
-    GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
-    executor::KvCacheTransferMode mode, std::string const& directory)
+SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 inputLength,
+    SizeType32 numContextBlocks, GenerationRequest& sequence,
+    std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions, executor::KvCacheTransferMode mode,
+    std::string const& directory, bool isEnableBlockReuse)
 {
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     SizeType32 numMatchedTokens{0};
     auto searchRoot = mCachedBlocksRoot;
 
-    // The last block cannot be shared between beams because it will be written to.
-    // Make sure a unique block is allocated per beam.
+    // The last block can be shared between beams if it is fully filled (won't be written to during generation)
+    // or if this is cross-attention KV cache (read-only). Otherwise, allocate a unique block per beam.
     auto const beamWidth = sequence.getBeamWidth();
-    SizeType32 numSharedContextBlocks = beamWidth > 1 ? numContextBlocks - 1 : numContextBlocks;
+    bool const isShareLastContextBlock = mCacheType == CacheType::kCROSS || inputLength % mTokensPerBlock == 0;
+    SizeType32 numSharedContextBlocks
+        = (beamWidth > 1 && !isShareLastContextBlock) ? numContextBlocks - 1 : numContextBlocks;
 
     auto blockItr = blockKeys.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
-        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr && blockItr != blockKeys.end()
+        auto [partialMatch, numMatched, matchingBlock]
+            = searchRoot != nullptr && blockItr != blockKeys.end() && isEnableBlockReuse
             ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
             : std::make_tuple(false, 0, nullptr);
         if (matchingBlock != nullptr && numMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
@@ -1416,19 +1420,15 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
-// There are two versions of BlockManager::addSequence function.
-// This is called when block reuse is enabled.
 SizeType32 BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-    LlmRequest& llmRequest, SizeType32 windowSize)
+    LlmRequest& llmRequest, SizeType32 windowSize, bool isEnableBlockReuse)
 {
-    return mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
+    return mWindowBlockManagers.at(windowSize)
+        .addSequence(sequence, inputLength, numContextBlocks, llmRequest, isEnableBlockReuse);
 }
 
-// There are two versions of WindowBlockManager::addSequence function.
-// This is called when block reuse is enabled.
-// Returns the total prepopulatedPromptLen (including connector matched tokens) for this window.
-SizeType32 WindowBlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
+SizeType32 WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength,
+    SizeType32 numContextBlocks, LlmRequest& llmRequest, bool isEnableBlockReuse)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1466,8 +1466,8 @@ SizeType32 WindowBlockManager::addSequence(
 
     TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
 
-    auto const prepopulatedPromptLen
-        = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions, mode, directory);
+    auto const prepopulatedPromptLen = loadOrAllocateBlocks(
+        blockKeys, inputLength, numContextBlocks, sequence, perBlockRetentions, mode, directory, isEnableBlockReuse);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
 
@@ -1514,38 +1514,6 @@ void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
         allocateBlock(sequence, /*shareAmongBeams=*/sequence.getBeamWidth() == 1);
         updateLastCacheBlockOffsets(sequence);
     }
-}
-
-// There are two versions of BlockManager::addSequence function.
-// This is called when block reuse is disabled.
-void BlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 numContextBlocks, SizeType32 windowSize, bool isShareLastContextBlock)
-{
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, numContextBlocks, isShareLastContextBlock);
-}
-
-// There are two versions of WindowBlockManager::addSequence function.
-// This is called when block reuse is disabled.
-void WindowBlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock)
-{
-    if (mKvCacheConnectorManager)
-    {
-        TLLM_LOG_WARNING(
-            "KV Cache Connector specified when block reuse is disabled. The KV Cache Connector will be "
-            "ignored.");
-    }
-
-    auto const requestId = sequence.getRequestId();
-    auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
-    TLLM_CHECK(emplaceDone);
-
-    TLLM_CHECK_WITH_INFO(numContextBlocks > 0, "numContextBlocks must be greater than 0");
-    for (SizeType32 bi = 0; bi < numContextBlocks - 1; ++bi)
-    {
-        allocateBlock(sequence, /*shareAmongBeams=*/true);
-    }
-    allocateBlock(sequence, /*shareAmongBeams=*/isShareLastContextBlock);
 }
 
 void WindowBlockManager::addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx)
@@ -2542,28 +2510,11 @@ void KVCacheManager::addSequence(
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
-        if (mEnableBlockReuse)
-        {
-            auto const prepopulatedLen
-                = mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
-            // Use the minimum prepopulated length across all windows to ensure correctness
-            // when there's a mix of SWA and non-SWA windows (e.g., VSWA case)
-            minPrepopulatedPromptLen = std::min(minPrepopulatedPromptLen, prepopulatedLen);
-        }
-        else
-        {
-            if (!mEnableBlockReuse && llmRequest && llmRequest->getKvCacheRetentionConfig().has_value())
-            {
-                TLLM_LOG_WARNING(
-                    "Request %d has a retention configuration set, but block reuse is disabled. The retention "
-                    "config "
-                    "will "
-                    "have no effect.",
-                    llmRequest->mRequestId);
-            }
-            bool isShareLastContextBlock = isCrossKv() || effectiveInputLength % getTokensPerBlock() == 0;
-            mBlockManager.addSequence(sequence, numContextBlocks, windowSize, isShareLastContextBlock);
-        }
+        auto const prepopulatedLen = mBlockManager.addSequence(
+            sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize, mEnableBlockReuse);
+        // Use the minimum prepopulated length across all windows to ensure correctness
+        // when there's a mix of SWA and non-SWA windows (e.g., VSWA case)
+        minPrepopulatedPromptLen = std::min(minPrepopulatedPromptLen, prepopulatedLen);
         mBlockManager.updateSequenceCacheBlockOffsets(sequence, windowSize);
     }
 
