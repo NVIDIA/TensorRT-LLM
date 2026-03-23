@@ -452,9 +452,6 @@ def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
     """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
     llm.generate call, that's repeated twice.
     """  # noqa: D205
-    pytest.skip(
-        "KV cache v2 scheduler peft budget tracker doesn't account for ongoing generation adapters"
-    )
     _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call=[2],
         max_loras=1,
