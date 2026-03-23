@@ -3074,6 +3074,21 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     auto const homogeneousLayers = GetParam();
     auto const expectedNumPools = homogeneousLayers ? 1 : static_cast<SizeType32>(expectedHeadsPerPool.size());
 
+    // Setup for LlmRequest construction
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{maxBeamWidth};
+    bool constexpr isStreaming{false};
+
+    auto makeInputTokens = [](SizeType32 len)
+    {
+        auto tokens = std::make_shared<VecTokens>();
+        for (SizeType32 i = 0; i < len; ++i)
+        {
+            tokens->push_back(i);
+        }
+        return tokens;
+    };
+
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager = homogeneousLayers
@@ -3092,7 +3107,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     auto const& blockManager = kvCacheManager.getBlockManager();
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
-    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+    auto inputTokens0 = makeInputTokens(inputLength);
+    auto llmReq0 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReq0));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocks - maxBeamWidth);
 
     tr::ITensor::SharedPtr kvCacheBlockOffsets = tr::BufferManager::cpu(
@@ -3182,7 +3200,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     auto currentNumBlocks = totalNumBlocks;
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
-        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+        auto inputTokensLoop = makeInputTokens(inputLength);
+        auto llmReqLoop = std::make_shared<LlmRequest>(
+            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         currentNumBlocks -= numSharedBlocks + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
         EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
@@ -3222,6 +3243,21 @@ TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
     auto constexpr onboardBlocks = true;
     auto const homogeneousLayers = GetParam();
 
+    // Setup for LlmRequest construction
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{maxBeamWidth};
+    bool constexpr isStreaming{false};
+
+    auto makeInputTokens = [](SizeType32 len)
+    {
+        auto tokens = std::make_shared<VecTokens>();
+        for (SizeType32 i = 0; i < len; ++i)
+        {
+            tokens->push_back(i);
+        }
+        return tokens;
+    };
+
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager = homogeneousLayers
@@ -3240,7 +3276,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
     auto const& blockManager = kvCacheManager.getBlockManager();
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
-    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+    auto inputTokens0 = makeInputTokens(inputLength);
+    auto llmReq0 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReq0));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocks - maxBeamWidth);
 
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
@@ -3259,7 +3298,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
     auto currentNumBlocks = totalNumBlocks;
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
-        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+        auto inputTokensLoop = makeInputTokens(inputLength);
+        auto llmReqLoop = std::make_shared<LlmRequest>(
+            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         currentNumBlocks -= numSharedBlocks + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
         EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
@@ -3309,6 +3351,21 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     auto const homogeneousLayers = GetParam();
     auto const expectedNumPools = homogeneousLayers ? 1 : static_cast<SizeType32>(expectedHeadsPerPool.size());
 
+    // Setup for LlmRequest construction
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{maxBeamWidth};
+    bool constexpr isStreaming{false};
+
+    auto makeInputTokens = [](SizeType32 len)
+    {
+        auto tokens = std::make_shared<VecTokens>();
+        for (SizeType32 i = 0; i < len; ++i)
+        {
+            tokens->push_back(i);
+        }
+        return tokens;
+    };
+
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager = homogeneousLayers
@@ -3327,7 +3384,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     auto const& blockManager = kvCacheManager.getBlockManager();
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
-    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+    auto inputTokens0 = makeInputTokens(inputLength);
+    auto llmReq0 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReq0));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocks - maxBeamWidth);
 
     tr::ITensor::SharedPtr const kvCacheBlockOffsets = tr::BufferManager::cpu(
@@ -3398,7 +3458,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     auto currentNumBlocks = totalNumBlocks;
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
-        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+        auto inputTokensLoop = makeInputTokens(inputLength);
+        auto llmReqLoop = std::make_shared<LlmRequest>(
+            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         currentNumBlocks -= numSharedBlocks + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
         EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
@@ -4467,6 +4530,21 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
     auto const homogeneousLayers = GetParam();
     auto const expectedNumPools = homogeneousLayers ? 1 : static_cast<SizeType32>(expectedHeadsPerPool.size());
 
+    // Setup for LlmRequest construction
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{maxBeamWidth};
+    bool constexpr isStreaming{false};
+
+    auto makeInputTokens = [](SizeType32 len)
+    {
+        auto tokens = std::make_shared<VecTokens>();
+        for (SizeType32 i = 0; i < len; ++i)
+        {
+            tokens->push_back(i);
+        }
+        return tokens;
+    };
+
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
     auto const maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
@@ -4486,7 +4564,10 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
     auto const& blockManager = kvCacheManager.getBlockManager();
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
-    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+    auto inputTokens0 = makeInputTokens(inputLength);
+    auto llmReq0 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReq0));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocksCtx - maxBeamWidth);
 
     tr::ITensor::SharedPtr kvCacheBlockOffsets = tr::BufferManager::cpu(
@@ -4561,7 +4642,10 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
     for (auto requestCounter = 0; requestCounter < maxNumSequences; ++requestCounter)
     {
         auto const nextRequestId = static_cast<RequestIdType>(requestId + requestCounter);
-        EXPECT_NO_THROW(kvCacheManager.addSequence(nextRequestId, inputLength, maxBeamWidth));
+        auto inputTokensLoop = makeInputTokens(inputLength);
+        auto llmReqLoop = std::make_shared<LlmRequest>(
+            LlmRequest::RequestIdType{nextRequestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        EXPECT_NO_THROW(kvCacheManager.addSequence(nextRequestId, inputLength, maxBeamWidth, llmReqLoop));
         currentNumBlocks -= numSharedBlocksCtx + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
         EXPECT_NO_THROW(kvCacheManager.addToken(nextRequestId));
@@ -4608,6 +4692,21 @@ TEST_P(KVCacheManagerTest, KVCacheManagerBatchTest)
     auto const homogeneousLayers = GetParam();
     auto const expectedNumPools = homogeneousLayers ? 1 : static_cast<SizeType32>(expectedHeadsPerPool.size());
 
+    // Setup for LlmRequest construction
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{maxBeamWidth};
+    bool constexpr isStreaming{false};
+
+    auto makeInputTokens = [](SizeType32 len)
+    {
+        auto tokens = std::make_shared<VecTokens>();
+        for (SizeType32 i = 0; i < len; ++i)
+        {
+            tokens->push_back(i);
+        }
+        return tokens;
+    };
+
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager = homogeneousLayers
@@ -4628,7 +4727,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerBatchTest)
 
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
-        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth));
+        auto inputTokensLoop = makeInputTokens(inputLength);
+        auto llmReqLoop = std::make_shared<LlmRequest>(
+            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         auto const currentNumBlocks = totalNumBlocks - (requestId + 1) * (numSharedBlocks + maxBeamWidth);
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
     }
