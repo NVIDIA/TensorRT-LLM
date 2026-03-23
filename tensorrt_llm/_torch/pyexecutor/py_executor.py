@@ -2,7 +2,6 @@ import dataclasses
 import datetime
 import functools
 import os
-import queue
 import threading
 import time
 import traceback
@@ -32,8 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
-from tensorrt_llm.executor.request import (KVCacheHintRequest,
-                                           TruncateKVCacheRequest)
+from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -517,8 +515,12 @@ class PyExecutor:
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
 
-        # Control queue for the executor loop
-        self.control_queue: queue.Queue[KVCacheHintRequest] = queue.Queue()
+        # Control queue for the executor loop.
+        # Replaced by an IpcQueue via set_control_ipc_queue() when running
+        # behind a proxy (multi-process mode). The IpcQueue allows the
+        # ControlPlaneServer in the main process to send control requests
+        # directly to this PyExecutor without going through the worker loop.
+        self._control_ipc_queue = None
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -846,8 +848,9 @@ class PyExecutor:
                 self.result_wait_queues[req_id] = result_wait_queue
         return req_id
 
-    def enqueue_kv_cache_hint_request(self, request: KVCacheHintRequest):
-        self.control_queue.put(request)
+    def set_control_ipc_queue(self, ipc_queue):
+        """Set the IPC queue for receiving control requests from the main process."""
+        self._control_ipc_queue = ipc_queue
 
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
@@ -2150,21 +2153,20 @@ class PyExecutor:
         This method ensures that control queue items (like TruncateKVCacheRequest)
         are broadcast from rank 0 to all other ranks, so that all ranks execute
         the same control operations for consistency (e.g., KV cache truncation).
+
+        The control IPC queue is written to directly by the ControlPlaneServer
+        in the main process, bypassing the proxy/worker dispatch chain.
         """
-        # Rank 0 collects items from the control queue
+        if self._control_ipc_queue is None:
+            return
+
         if self.dist.rank == 0:
-            control_requests = []
-            while self.control_queue.qsize() > 0:
-                request = self.control_queue.get_nowait()
-                if request is not None:
-                    control_requests.append(request)
+            control_requests = self._control_ipc_queue.drain()
         else:
             control_requests = None
 
-        # Broadcast control requests to all ranks
         control_requests = self.dist.broadcast(control_requests, root=0)
 
-        # All ranks process the control requests
         for request in control_requests:
             if isinstance(request, TruncateKVCacheRequest):
                 self.kv_cache_manager.truncate_blocks(

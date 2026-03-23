@@ -1,7 +1,7 @@
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -20,7 +20,7 @@ __all__ = [
     "PromptAdapterRequest",
     "GenerationRequest",
     "TruncateKVCacheRequest",
-    "KVCacheHintRequest",
+    "KVCacheControlRequest",
     "CancellingRequest",
 ]
 
@@ -148,17 +148,13 @@ class GenerationRequest:
         return self
 
 
-class KVCacheHintRequest:
-    ''' The request to set KV cache hints. '''
-
-    def __init__(self, action: Literal["truncate"]):
-        self.action = action
+class KVCacheControlRequest:
+    ''' Base class for KV cache control requests. '''
 
 
-class TruncateKVCacheRequest(KVCacheHintRequest):
+class TruncateKVCacheRequest(KVCacheControlRequest):
 
     def __init__(self, messages_to_retain: List[int], messages: List[int]):
-        super().__init__("truncate")
         self.messages_to_retain = messages_to_retain
         self.messages = messages
 

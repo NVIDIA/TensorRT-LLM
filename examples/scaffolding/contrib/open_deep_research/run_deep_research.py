@@ -23,6 +23,7 @@ def parse_arguments():
     parser.add_argument("--model", type=str, default="Qwen3/Qwen3-30B-A3B")
     parser.add_argument("--enable_statistics", action="store_true")
     parser.add_argument("--enable_query_collector", action="store_true")
+    parser.add_argument("--kv_cache_hint_enabled", action="store_true")
     return parser.parse_args()
 
 
@@ -30,7 +31,7 @@ async def main():
     args = parse_arguments()
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
 
-    generation_worker = TRTOpenaiWorker(client, args.model)
+    generation_worker = TRTOpenaiWorker(client, args.model, args.kv_cache_hint_enabled)
 
     mcp_worker = MCPWorker.init_with_urls(["http://0.0.0.0:8082/sse"])
     await mcp_worker.init_in_asyncio_event_loop()

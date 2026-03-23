@@ -348,22 +348,6 @@ methods:
     parameters: {}
     return_annotation: None
     status: beta
-  set_kv_cache_hints:
-    parameters:
-      action:
-        annotation: Literal['truncate']
-        default: inspect._empty
-      messages_to_retain:
-        annotation: Union[str, List[int]]
-        default: inspect._empty
-      messages:
-        annotation: Union[str, List[int]]
-        default: inspect._empty
-      sampling_params:
-        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
-        default: null
-    return_annotation: None
-    status: prototype
 properties:
   llm_id:
     annotation: str

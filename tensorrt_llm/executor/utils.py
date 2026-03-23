@@ -142,6 +142,7 @@ class WorkerCommIpcAddrs(NamedTuple):
     request_queue_addr: tuple[str, Optional[bytes]]
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
+    control_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
 
 
 def is_llm_response(instance):

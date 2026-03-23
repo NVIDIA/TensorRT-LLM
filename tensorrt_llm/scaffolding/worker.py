@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import os
-import types
 from abc import ABC
 from enum import Enum
 from typing import Callable, List, Optional
@@ -83,42 +82,6 @@ class OpenaiWorker(Worker):
         model: str,
         kv_cache_hint_enabled: bool = False,
     ):
-        # Dynamic patch to support KV cache hint
-        async def send_kv_cache_hint(self, task: DropKVCacheTask, params: dict):
-            base_url = str(self.base_url)
-            if not base_url.endswith("/"):
-                base_url += "/"
-            url = base_url + "kv_cache_hints"
-
-            headers = {}
-            if self.api_key is not None:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-
-            kv_cache_hint_params = {
-                "action":
-                "truncate",
-                "messages":
-                [message.to_dict() for message in task.chat_task.messages],
-                "messages_to_retain":
-                [message.to_dict() for message in task.messages_to_retain],
-            }
-
-            # Spread extra_body contents into the request (like OpenAI client does)
-            extra_body = params.pop("extra_body", {})
-            kv_cache_hint_params.update(params)
-            kv_cache_hint_params.update(
-                extra_body)  # Spread extra_body contents
-
-            async with httpx.AsyncClient() as client:
-                return await client.post(
-                    url,
-                    json=kv_cache_hint_params,
-                    headers=headers,
-                )
-
-        async_client.create_kv_cache_hint = types.MethodType(
-            send_kv_cache_hint, async_client)
-
         self.model = model
         self.async_client = async_client
         self.kv_cache_hint_enabled = kv_cache_hint_enabled
@@ -227,13 +190,28 @@ class OpenaiWorker(Worker):
         if not self.kv_cache_hint_enabled:
             return TaskStatus.SUCCESS
 
-        params = self.convert_task_params(task.chat_task)
-        params["messages"] = task.chat_task.messages_to_dict_content()
-        params["model"] = self.model
-        if task.chat_task.tools is not None:
-            params["tools"] = [tool.to_dict() for tool in task.chat_task.tools]
+        base_url = str(self.async_client.base_url).rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        url = base_url + "/_control/kv_cache/truncate"
 
-        response = await self.async_client.create_kv_cache_hint(task, params)
+        headers = {}
+        if self.async_client.api_key is not None:
+            headers["Authorization"] = f"Bearer {self.async_client.api_key}"
+
+        payload = {
+            "model":
+            self.model,
+            "messages":
+            [message.to_dict() for message in task.chat_task.messages],
+            "messages_to_retain":
+            [message.to_dict() for message in task.messages_to_retain],
+        }
+        if task.chat_task.tools is not None:
+            payload["tools"] = [tool.to_dict() for tool in task.chat_task.tools]
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=headers)
         if response.status_code != 200:
             return TaskStatus.WORKER_EXECEPTION
         return TaskStatus.SUCCESS

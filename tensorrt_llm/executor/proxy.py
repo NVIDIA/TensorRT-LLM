@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import weakref
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Optional
 
 import torch
 import zmq
@@ -21,8 +21,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import (CancellingRequest, GenerationRequest,
-                      TruncateKVCacheRequest)
+from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
@@ -140,11 +139,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue")
+        self.control_queue = IpcQueue(is_server=True,
+                                      name="proxy_control_queue")
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
+            control_queue_addr=self.control_queue.address,
         )
 
     def abort_request(self, request_id: int) -> None:
@@ -371,23 +373,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._handle_background_error()
 
         return result
-
-    def set_kv_cache_hints(
-        self,
-        action: Literal["truncate"],
-        messages_to_retain: List[int],
-        messages: List[int],
-    ) -> None:
-        if action == "truncate":
-            request = TruncateKVCacheRequest(
-                messages_to_retain=messages_to_retain,
-                messages=messages,
-            )
-        else:
-            raise ValueError(f"Invalid action: {action}")
-
-        with nvtx_range_debug("request_queue.put"):
-            self.request_queue.put(request)
 
     def get_stats(self, timeout: float) -> List[dict]:
         """Get iteration statistics from the runtime via RPC.

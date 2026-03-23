@@ -866,9 +866,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         return v
 
 
-class KVCacheHintRequest(ChatCompletionRequest):
-    action: Literal["truncate"]
-    messages_to_retain: List[ChatCompletionMessageParam]
+class KVCacheTruncateRequest(OpenAIBaseModel):
+    model: str
+    messages: List[ChatCompletionMessageParam] = []
+    messages_to_retain: List[ChatCompletionMessageParam] = []
+    tools: Optional[List[ChatCompletionToolsParam]] = None
+    add_generation_prompt: Optional[bool] = True
+    documents: Optional[list] = None
+    chat_template: Optional[str] = None
+    chat_template_kwargs: Optional[dict] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,

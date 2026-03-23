@@ -24,7 +24,7 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import CancellingRequest, GenerationRequest, KVCacheHintRequest
+from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import ErrorResponse, RequestError, WorkerCommIpcAddrs
 
@@ -215,6 +215,10 @@ def worker_main(
             is_server=False,
             socket_type=zmq.DEALER,
             name="worker_init_status_queue")
+        control_queue = IpcQueue(worker_queues.control_queue_addr,
+                                 is_server=False,
+                                 name="worker_control_queue"
+                                 ) if worker_queues.control_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -320,6 +324,9 @@ def worker_main(
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
+                if control_queue is not None:
+                    worker.engine.set_control_ipc_queue(control_queue)
+
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
@@ -331,8 +338,6 @@ def worker_main(
                             logger.error(traceback.format_exc())
                             worker._await_response_helper.temp_error_responses.put(
                                 ErrorResponse(req.id, e, req.id))
-                    elif isinstance(req, KVCacheHintRequest):
-                        worker.set_kv_cache_hints(req)
                     else:
                         raise ValueError(f"Unknown request type: {type(req)}")
 

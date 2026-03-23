@@ -32,23 +32,20 @@ echo "=== END FIRST GENERATION ==="
 echo
 
 echo
-echo "=== SET KV CACHE HINTS ==="
+echo "=== TRUNCATE KV CACHE ==="
 echo
 
-curl http://localhost:8000/kv_cache_hints \
+curl http://localhost:8000/_control/kv_cache/truncate \
   -H "Content-Type: application/json" \
   -d "{
         \"model\": \"Qwen3-8B\",
-        \"action\": \"truncate\",
-        \"messages\": [],
-        \"context_to_retain\": [
-          {\"role\": \"system\", \"content\": \"$prompt\"}
-        ],
-        \"context_to_remove\": [
+        \"messages\": [
+          {\"role\": \"system\", \"content\": \"$prompt\"},
           {\"role\": \"user\", \"content\": \"$prompt\"}
         ],
-        \"temperature\": 0.8,
-        \"top_p\": 0.95
+        \"messages_to_retain\": [
+          {\"role\": \"system\", \"content\": \"$prompt\"}
+        ]
       }"
 
 
