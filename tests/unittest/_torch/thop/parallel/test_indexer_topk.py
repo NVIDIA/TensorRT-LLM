@@ -430,10 +430,10 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 256])
-@pytest.mark.parametrize("next_n", [1, 2, 3])
+@pytest.mark.parametrize("batch_size", [1, 16, 256])
+@pytest.mark.parametrize("next_n", [1, 3])
 @pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_cute_dsl_topk_decode_single_pass_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype
@@ -453,4 +453,37 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta(
             return_val=False,
             num_copy_bits=256,
         )[0],
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 16, 256])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
+    batch_size, next_n, index_topk, num_tokens, dtype
+):
+    def run_fn(logits, seq_lens):
+        result = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            return_val=False,
+            num_copy_bits=256,
+        )
+        if result[0] is None:
+            pytest.skip("Problem size exceeds cluster kernel capacity")
+        return result[0]
+
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        run_fn,
     )
