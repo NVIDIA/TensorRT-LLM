@@ -647,7 +647,13 @@ def _handle_prefill_thop(
 
     q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
-    kv = torch.nn.functional.linear(compressed_kv_flat, kv_b_proj_weight)
+    # Cast FP8 weights to compute dtype (FP8 checkpoints store kv_b_proj in FP8).
+    w = (
+        kv_b_proj_weight.to(dtype)
+        if kv_b_proj_weight.dtype == torch.float8_e4m3fn
+        else kv_b_proj_weight
+    )
+    kv = torch.nn.functional.linear(compressed_kv_flat, w)
     kv = kv.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
     k_nope = kv[:, :, :qk_nope_head_dim]
     v = kv[:, :, qk_nope_head_dim:].contiguous().view(num_tokens, num_heads * v_head_dim)
@@ -656,6 +662,10 @@ def _handle_prefill_thop(
     k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
+
+    # During CUDA graph stream capture, skip prefill (can't capture data-dependent loops).
+    if torch.cuda.is_current_stream_capturing():
+        return output
 
     planner = _GlobalTrtllmMLAPlanner
 
@@ -682,7 +692,8 @@ def _handle_prefill_thop(
         t0 = tok_offset
         t1 = tok_offset + seq_ctx_len
 
-        planner._pfx_host_total_kv[0] = int(sequence_length[i])
+        # Use host tensors to avoid GPU→CPU transfer (forbidden during CUDA graph capture).
+        planner._pfx_host_total_kv[0] = int(host_past_kv_lengths[i]) + seq_ctx_len
         planner._pfx_host_total_kv[1] = 0
 
         _call_thop_attention_mla(
@@ -873,16 +884,28 @@ def _handle_decode_impl(
     planner = _GlobalTrtllmMLAPlanner
     gen_head_size = kv_lora_rank + qk_rope_head_dim
 
-    weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-    w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
-    w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
+    # Cast FP8 weights to compute dtype for BMM (FP8 checkpoints store kv_b_proj in FP8).
+    # Cache the casted/reshaped weights so CUDA graph replay uses stable addresses.
+    ptr = kv_b_proj_weight.data_ptr()
+    cached = planner._per_layer_pool_ptrs.get(("w_kn_v_t", ptr))
+    if cached is not None:
+        w_kn, w_v_t = cached
+    else:
+        if kv_b_proj_weight.dtype == torch.float8_e4m3fn:
+            kv_b_proj_weight = kv_b_proj_weight.to(q_nope_flat.dtype)
+        weight_reshaped = kv_b_proj_weight.view(
+            num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank
+        )
+        w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
+        w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
+        planner._per_layer_pool_ptrs[("w_kn_v_t", ptr)] = (w_kn, w_v_t)
 
     fused_q_flat = planner.fused_q_flat[:num_tokens]
     fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
 
-    q_nope_t = q_nope_flat.transpose(0, 1)
-    q_absorbed_target = fused_q_view[:, :, :kv_lora_rank].transpose(0, 1)
-    torch.ops.trtllm.bmm_out(q_nope_t, w_kn, q_absorbed_target)
+    # BMM: [num_heads, num_tokens, qk_nope_head_dim] @ [num_heads, qk_nope_head_dim, kv_lora_rank]
+    q_absorbed = torch.bmm(q_nope_flat.transpose(0, 1), w_kn)
+    fused_q_view[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
 
     cu_q = planner.cu_q_decode[: num_tokens + 1]
     cu_kv = planner.cu_kv_decode[: num_tokens + 1]
@@ -970,13 +993,8 @@ def _handle_decode_impl(
     )
 
     output_reshaped = output_latent.view(num_tokens, num_heads, kv_lora_rank)
-    v_proj_out = planner.v_proj_output[:num_tokens]
-    torch.ops.trtllm.bmm_out(
-        output_reshaped.transpose(0, 1),
-        w_v_t,
-        v_proj_out.transpose(0, 1),
-    )
-    return v_proj_out.reshape(num_tokens, num_heads * v_head_dim)
+    v_proj_result = torch.bmm(output_reshaped.transpose(0, 1), w_v_t)
+    return v_proj_result.transpose(0, 1).reshape(num_tokens, num_heads * v_head_dim)
 
 
 # =============================================================================
@@ -1294,6 +1312,7 @@ def trtllm_mla_with_cache(
     scale: Optional[float],
     kv_lora_rank: int,
     layer_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM MLA attention with paged latent cache (post-RoPE inputs)."""
     return _mla_with_cache_impl(
@@ -1328,6 +1347,7 @@ def trtllm_mla_with_cache_fake(
     scale: Optional[float],
     kv_lora_rank: int,
     layer_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
@@ -1355,6 +1375,7 @@ def trtllm_mla_fused_rope_with_cache(
     scale: Optional[float],
     kv_lora_rank: int,
     layer_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM MLA attention with fused RoPE and paged latent cache (pre-RoPE inputs)."""
     return _mla_with_cache_impl(
@@ -1391,6 +1412,7 @@ def trtllm_mla_fused_rope_with_cache_fake(
     scale: Optional[float],
     kv_lora_rank: int,
     layer_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
