@@ -114,7 +114,7 @@ Run DeepSeek-V3/R1 models with MTP, use [examples/llm-api/quickstart_advanced.py
 
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
 To benchmark min-latency performance with MTP, you need to follow [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation) to prepare your dataset, then follow the steps below:
@@ -170,7 +170,7 @@ Run DeepSeek-R1 models with MTP Relaxed Acceptance, use [examples/llm-api/quicks
 
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 10 --relaxed_delta 0.6
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N --use_relaxed_acceptance_for_thinking --relaxed_topk 10 --relaxed_delta 0.6
 ```
 
 To benchmark min-latency performance with MTP Relaxed Acceptance, you need to follow [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation) to prepare your dataset, then follow the steps below:
