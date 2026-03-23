@@ -1001,13 +1001,12 @@ def test_pd_disagg_multimodal_with_block_reuse():
                          max_batch_size=1)
         with llm_decode:
             # P: prefill (context_only) with raw multimodal input
-            prefill_params = DisaggregatedParams(
-                request_type="context_only")
+            prefill_params = DisaggregatedParams(request_type="context_only")
             print("\n[P] prefilling (context_only)...", flush=True)
-            outputs = llm_prefill.generate(
-                inputs,
-                sampling_params=SamplingParams(max_tokens=0, temperature=0),
-                disaggregated_params=prefill_params)
+            outputs = llm_prefill.generate(inputs,
+                                           sampling_params=SamplingParams(
+                                               max_tokens=0, temperature=0),
+                                           disaggregated_params=prefill_params)
             assert len(outputs) == 1
             print(f"[P] done, {len(outputs[0].prompt_token_ids)} tokens",
                   flush=True)
@@ -1027,14 +1026,12 @@ def test_pd_disagg_multimodal_with_block_reuse():
                 disaggregated_params=pd_params)
             assert len(decode_outputs) == 1
             assert len(decode_outputs[0].outputs) > 0
-            print(
-                f"[D] output: {decode_outputs[0].outputs[0].text!r}",
-                flush=True)
+            print(f"[D] output: {decode_outputs[0].outputs[0].text!r}",
+                  flush=True)
 
             # Second request (same image) — triggers reuse tree lookup
             print("\n[P] prefilling request 2 (same image)...", flush=True)
-            prefill_params2 = DisaggregatedParams(
-                request_type="context_only")
+            prefill_params2 = DisaggregatedParams(request_type="context_only")
             outputs2 = llm_prefill.generate(
                 inputs,
                 sampling_params=SamplingParams(max_tokens=0, temperature=0),
@@ -1055,9 +1052,8 @@ def test_pd_disagg_multimodal_with_block_reuse():
                 disaggregated_params=pd_params2)
             assert len(decode_outputs2) == 1
             assert len(decode_outputs2[0].outputs) > 0
-            print(
-                f"[D] output 2: {decode_outputs2[0].outputs[0].text!r}",
-                flush=True)
+            print(f"[D] output 2: {decode_outputs2[0].outputs[0].text!r}",
+                  flush=True)
 
 
 @pytest.mark.parametrize(
@@ -1175,8 +1171,7 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts, expected_num_duplicates):
                 try:
                     decode_outputs = llm_decode.generate(
                         decode_inputs,
-                        sampling_params=SamplingParams(
-                            max_tokens=max_tokens),
+                        sampling_params=SamplingParams(max_tokens=max_tokens),
                         disaggregated_params=pd_params)
                     assert len(decode_outputs) == 1
                     assert len(decode_outputs[0].outputs) > 0
@@ -1295,10 +1290,9 @@ def test_epd_disagg_output_matches_raw_with_block_reuse():
                 "prompt_token_ids":
                 prefill_outputs[0].prompt_token_ids,
             }]
-            outputs_epd = llm_decode.generate(
-                decode_inputs,
-                sampling_params=sampling_params,
-                disaggregated_params=pd_params)
+            outputs_epd = llm_decode.generate(decode_inputs,
+                                              sampling_params=sampling_params,
+                                              disaggregated_params=pd_params)
 
     assert outputs_epd is not None and len(outputs_epd) == 1
     assert len(outputs_epd[0].outputs) > 0

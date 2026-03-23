@@ -2081,8 +2081,8 @@ public:
         mBlockManager.flushIterationEvents();
     }
 
-    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey, SizeType32 windowSize,
+        OptionalRef<LlmRequest const> llmRequest = std::nullopt) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize, llmRequest);
     }
