@@ -2939,6 +2939,14 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
+                    # Capture ctx response before the poll below (https://nvbugs/5961736):
+                    # the poll can advance state to DISAGG_CONTEXT_COMPLETE before
+                    # _handle_responses runs, causing createResult() to return nullopt.
+                    # create_response() calls releaseState() and must only be called once.
+                    response = req.create_response(False, self.dist.rank)
+                    if response is not None:
+                        req._prebuilt_ctx_response = response
+
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
 
@@ -3398,7 +3406,16 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
+            prebuilt_ctx_response = getattr(request, '_prebuilt_ctx_response',
+                                            None)
+            if prebuilt_ctx_response:
+                # Use response prebuilt in _send_kv_async; do not call create_response()
+                # again — releaseState() already consumed the opaque KV handoff state.
+                request._prebuilt_ctx_response = None
+                prebuilt_ctx_response.result.cached_tokens = request.cached_tokens
+                new_responses.append((req_id, prebuilt_ctx_response))
+                request_done = True
+            elif request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
@@ -3432,14 +3449,18 @@ class PyExecutor:
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
 
-                # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
-                # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
-                # path is fixed.
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
-                    requests_to_terminate.append(request)
-                else:
-                    if not request.is_disagg_context_transmission_state:
+                # Ctx-only requests with a prebuilt response are terminated by
+                # _check_disagg_ctx_cache_transfer_status; skipping here avoids
+                # double-free if the transfer already completed in _send_kv_async.
+                if not prebuilt_ctx_response:
+                    # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
+                    # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
+                    # path is fixed.
+                    if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
                         requests_to_terminate.append(request)
+                    else:
+                        if not request.is_disagg_context_transmission_state:
+                            requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
 
