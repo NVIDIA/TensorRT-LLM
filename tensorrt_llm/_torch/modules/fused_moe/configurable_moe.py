@@ -35,8 +35,8 @@ import torch
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
-from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
+from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -305,7 +305,9 @@ class ConfigurableMoE(MoE):
             return False
 
         quant_mode = getattr(quant_config, "layer_quant_mode", None)
-        return bool(quant_mode is not None and hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4())
+        return bool(
+            quant_mode is not None and hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4()
+        )
 
     def _create_comm_strategy(self, model_config: ModelConfig) -> Optional[Communication]:
         """

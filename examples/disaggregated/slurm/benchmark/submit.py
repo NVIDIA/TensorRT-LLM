@@ -53,6 +53,7 @@ def generate_mpi_worker_config(worker_config, allocations, env_config,
                                disagg_hostname, disagg_port, output_path):
     """Generate a config YAML compatible with ``trtllm-serve disaggregated_mpi_worker``.
     """
+
     def _build_urls(server_type):
         urls = []
         for server_id in sorted(allocations.get(server_type, {}).keys()):
@@ -229,7 +230,6 @@ def replace_env_in_file(log_dir, file_path, env_var):
     return tmp_dir
 
 
-
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                              nsys_on, profile_range, concurrency):
     """Build complete environment dictionary for worker processes.
@@ -362,7 +362,6 @@ def format_export_string(env_dict):
     return ",".join(export_list)
 
 
-
 def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
                   gen_worker_env_var):
 
@@ -451,9 +450,10 @@ def submit_job(config, log_dir, dry_run):
 
     # Detect DWDP mode: when enabled, use a single srun with
     # trtllm-serve disaggregated_mpi_worker instead of per-instance sruns
-    dwdp_enabled = worker_config.get('ctx', {}).get(
-        'dwdp_config', {}).get('enabled', False)
-    dwdp_size = worker_config.get('ctx', {}).get('dwdp_config', {}).get('dwdp_size', 1)
+    dwdp_enabled = worker_config.get('ctx', {}).get('dwdp_config',
+                                                    {}).get('enabled', False)
+    dwdp_size = worker_config.get('ctx', {}).get('dwdp_config',
+                                                 {}).get('dwdp_size', 1)
 
     # Generate log directory path based on configuration
     isl = benchmark_config['input_length']
@@ -560,7 +560,8 @@ def submit_job(config, log_dir, dry_run):
 
     if dwdp_enabled:
         # --- DWDP mode: single srun with disaggregated_mpi_worker ---
-        mpi_config_base_path = os.path.join(log_dir, 'mpi_worker_config_base.yaml')
+        mpi_config_base_path = os.path.join(log_dir,
+                                            'mpi_worker_config_base.yaml')
         mpi_config_path = os.path.join(log_dir, 'mpi_worker_config.yaml')
         generate_mpi_worker_config(worker_config, allocations, env_config,
                                    disagg_server_hostname, disagg_server_port,
@@ -627,7 +628,8 @@ def submit_job(config, log_dir, dry_run):
                     benchmark_mode=benchmark_config['mode'],
                     nsys_on=profiling_config['nsys_on'],
                     profile_range=server_cfg['profile_range'],
-                    concurrency=benchmark_config['concurrency_list'].split(',')[0],
+                    concurrency=benchmark_config['concurrency_list'].split(',')
+                    [0],
                 )
                 export_str = format_export_string(worker_env)
 

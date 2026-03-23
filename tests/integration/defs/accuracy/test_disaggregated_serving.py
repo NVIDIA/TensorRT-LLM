@@ -1237,9 +1237,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
         }
 
-        with launch_dwdp_disaggregated_llm(
-                worker_config, frontend_config, model_path,
-                total_gpus=4, max_workers=128) as llm:
+        with launch_dwdp_disaggregated_llm(worker_config,
+                                           frontend_config,
+                                           model_path,
+                                           total_gpus=4,
+                                           max_workers=128) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
@@ -1948,8 +1950,11 @@ def launch_dwdp_disaggregated_llm(
     # Prevent the parent process's MPI state (set by mpi4py init during
     # tensorrt_llm import) from leaking into the mpirun subprocess.
     # mpirun must create a fresh MPI world for the DWDP workers.
-    child_env = {k: v for k, v in os.environ.items()
-                 if not k.startswith(('OMPI_', 'PMIX_', 'PMI_'))}
+    child_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(('OMPI_', 'PMIX_', 'PMI_'))
+    }
 
     mpi_cmd = [
         "mpirun", "--allow-run-as-root", "-n",
@@ -1979,8 +1984,7 @@ def launch_dwdp_disaggregated_llm(
             ]:
                 if proc.poll() is not None:
                     raise Exception(
-                        f"{name} process exited with code {proc.returncode}"
-                    )
+                        f"{name} process exited with code {proc.returncode}")
             try:
                 response = requests.get(
                     f"http://localhost:{serve_port}/cluster_info")

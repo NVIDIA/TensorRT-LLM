@@ -2378,14 +2378,17 @@ class DwdpConfig(StrictBaseModel):
     Configuration for DWDP.
     """
     enabled: bool = Field(default=False, description="Whether to enable DWDP.")
-    dwdp_size: int = Field(default=1, description="The number of GPUs per DWDP group.")
-    num_group: int = Field(default=1, description="The number of DWDP groups. Total workers = num_group * dwdp_size.")
-    experts_per_worker: int = Field(default=0, description="The number of experts per worker.")
-    num_prefetch_experts: int = Field(default=0, description="The number of prefetch experts per worker.")
+    dwdp_size: int = Field(default=1,
+                           description="The number of GPUs per DWDP group.")
+    num_group: int = Field(
+        default=1,
+        description=
+        "The number of DWDP groups. Total workers = num_group * dwdp_size.")
+    experts_per_worker: int = Field(
+        default=0, description="The number of experts per worker.")
+    num_prefetch_experts: int = Field(
+        default=0, description="The number of prefetch experts per worker.")
 
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(**data)
 
 class BaseLlmArgs(StrictBaseModel):
     """

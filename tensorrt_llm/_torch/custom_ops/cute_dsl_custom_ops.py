@@ -1272,7 +1272,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert alpha0.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            l = sum(bi.size(0) for bi in b_list)
+            sum(bi.size(0) for bi in b_list)
             n = b0.size(1)
             scale_k = k // self.scaling_vector_size
             assert m % self.tile_size == 0
@@ -1337,17 +1337,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 make_ptr(cutlass.Float4E2M1FN,
                          bi.data_ptr(),
                          cute.AddressSpace.gmem,
-                         assumed_align=32)
-                for bi in b_list)
+                         assumed_align=32) for bi in b_list)
             b_sf_ptr = tuple(
                 make_ptr(cutlass.Float8E4M3FN,
                          bsfi.data_ptr(),
                          cute.AddressSpace.gmem,
-                         assumed_align=16)
-                for bsfi in b_sf_list)
+                         assumed_align=16) for bsfi in b_sf_list)
             alpha_ptr = tuple(
-                make_ptr(cutlass.Float32, ai.data_ptr(),
-                         cute.AddressSpace.gmem)
+                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
                 for ai in alpha_list)
 
             torch_stream = torch.cuda.current_stream()
@@ -1393,7 +1390,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m,
                     n,
                     k,
-                    num_tokens, self.top_k,
+                    num_tokens,
+                    self.top_k,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -1423,7 +1421,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
-                num_tokens, self.top_k,
+                num_tokens,
+                self.top_k,
             ]
             compiled_gemm(*exec_args, stream=stream)
             return c
@@ -2049,7 +2048,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             orig_m, k = a.size(0), a.size(1) * 2
             m = permuted_idx_to_expanded_idx.size(0)
             n = b0.size(1)
-            l = sum(bi.size(0) for bi in b_list)
+            sum(bi.size(0) for bi in b_list)
             scale_k = k // self.scaling_vector_size
             interm_size = n // 2
 
@@ -2114,17 +2113,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 make_ptr(cutlass.Float4E2M1FN,
                          bi.data_ptr(),
                          cute.AddressSpace.gmem,
-                         assumed_align=32)
-                for bi in b_list)
+                         assumed_align=32) for bi in b_list)
             b_sf_ptr = tuple(
                 make_ptr(cutlass.Float8E4M3FN,
                          bsfi.data_ptr(),
                          cute.AddressSpace.gmem,
-                         assumed_align=16)
-                for bsfi in b_sf_list)
+                         assumed_align=16) for bsfi in b_sf_list)
             alpha_ptr = tuple(
-                make_ptr(cutlass.Float32, ai.data_ptr(),
-                         cute.AddressSpace.gmem)
+                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
                 for ai in alpha_list)
 
             torch_stream = torch.cuda.current_stream()
@@ -2158,10 +2154,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
                 compile_args = [
-                    a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
-                    alpha_ptr, tile_idx_to_group_idx_ptr,
-                    tile_idx_to_mn_limit_ptr, permuted_idx_to_expanded_idx_ptr,
-                    num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    c_sf_ptr,
+                    alpha_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr,
+                    global_sf_ptr,
+                    orig_m,
+                    m,
+                    n,
+                    k,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -2177,10 +2185,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
             exec_args = [
-                a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
-                tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
-                permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
-                global_sf_ptr, orig_m, m, n, k,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                c_sf_ptr,
+                alpha_ptr,
+                tile_idx_to_group_idx_ptr,
+                tile_idx_to_mn_limit_ptr,
+                permuted_idx_to_expanded_idx_ptr,
+                num_non_exiting_tiles_ptr,
+                global_sf_ptr,
+                orig_m,
+                m,
+                n,
+                k,
             ]
 
             compiled_gemm(*exec_args, stream=stream)
@@ -2300,11 +2320,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b.
         """
         return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
-            input, [weight], input_scale, [weight_scale], [alpha],
-            tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf,
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size,
+            input,
+            [weight],
+            input_scale,
+            [weight_scale],
+            [alpha],
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            global_sf,
+            num_experts,
+            top_k,
+            num_local_experts,
+            local_expert_offset,
+            tile_size,
+            scaling_vector_size,
         )
 
     @torch.library.register_fake(

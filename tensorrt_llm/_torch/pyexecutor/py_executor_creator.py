@@ -37,12 +37,12 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
 from .config_utils import is_nemotron_hybrid, is_qwen3_hybrid
+from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
-from .dwdp import DwdpManager
 
 
 class _ExecutorMemoryMonitor:

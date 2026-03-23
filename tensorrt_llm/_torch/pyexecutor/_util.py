@@ -31,6 +31,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid)
+from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -47,7 +48,7 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
-from .dwdp import DwdpManager
+
 GB = 1 << 30
 
 

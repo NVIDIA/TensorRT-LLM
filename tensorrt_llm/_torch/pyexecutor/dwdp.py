@@ -1,27 +1,25 @@
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-
-from tensorrt_llm.llmapi.llm_args import DwdpConfig
-from typing import List, Optional, Dict, Tuple
-from tensorrt_llm._torch.distributed import MPIDist
-from tensorrt_llm._utils import global_mpi_rank
+from cuda.bindings import driver as cuda_driver
+from cuda.bindings import runtime as cudart
 from mpi4py.MPI import COMM_WORLD
 
-from cuda.bindings import runtime as cudart
-from cuda.bindings import driver as cuda_driver
-from tensorrt_llm._utils import nvtx_range
-
-
+from tensorrt_llm._torch.distributed import MPIDist
+from tensorrt_llm._utils import global_mpi_rank, nvtx_range
+from tensorrt_llm.llmapi.llm_args import DwdpConfig
 
 # Parameter names to collect handles for
-WEIGHT_PARAMS = ['w3_w1_weight', 'w2_weight']
-BIAS_PARAMS = ['w3_w1_bias', 'w2_bias']
+WEIGHT_PARAMS = ["w3_w1_weight", "w2_weight"]
+BIAS_PARAMS = ["w3_w1_bias", "w2_bias"]
 # Quant scale params vary by quantization method
 QUANT_SCALE_PARAMS = [
-    'w3_w1_weight_scale', 'w2_weight_scale',  # NVFP4/MXFP4
-    'fc31_alpha', 'fc2_alpha',  # NVFP4 alpha
+    "w3_w1_weight_scale",
+    "w2_weight_scale",  # NVFP4/MXFP4
+    "fc31_alpha",
+    "fc2_alpha",  # NVFP4 alpha
 ]
-
 
 
 _global_dwdp_manager: Optional["DwdpManager"] = None
@@ -46,12 +44,11 @@ class DwdpLayerHandleCollector:
     """
     Dwdp Layer Handle Collector for IPC handle coordination and prefetch buffer management.
     """
-    
+
     def __init__(
         self,
         layer_idx: int,
     ):
-
         self.layer_idx = layer_idx
 
         # Local IPC handles: param_name -> handle_bytes
@@ -71,9 +68,9 @@ class DwdpLayerHandleCollector:
     def register_weights(self, module: nn.Module):
         """
         Register weights from a MoE module and create IPC handles.
-        
+
         Called after module.load_weights() completes.
-        
+
         Args:
             module: The MoE module with loaded weights
         """
@@ -83,7 +80,7 @@ class DwdpLayerHandleCollector:
             if hasattr(module, param_name) and getattr(module, param_name, None) is not None:
                 params_to_register.append(param_name)
         # Bias (optional)
-        if hasattr(module, 'bias'):
+        if hasattr(module, "bias"):
             params_to_register.extend(BIAS_PARAMS)
         # Quant scales (optional, depends on quant method)
         for param_name in QUANT_SCALE_PARAMS:
@@ -106,18 +103,18 @@ class DwdpLayerHandleCollector:
         tensor_ptr = param.data_ptr()
         err, handle = cudart.cudaIpcGetMemHandle(tensor_ptr)
         check_cuda_error(err, f"get handle for {param_name}")
-        
+
         # Get allocation base address using Driver API cuMemGetAddressRange
         # This returns the actual base address and size of the CUDA allocation
         # cudaPointerGetAttributes.devicePointer returns the input pointer, not base!
         err, alloc_base, alloc_size = cuda_driver.cuMemGetAddressRange(tensor_ptr)
         if err != cuda_driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f"cuMemGetAddressRange failed for {param_name}: {err}")
-        
+
         # Calculate offset from allocation base
         # Convert CUdeviceptr to int for arithmetic
         offset = tensor_ptr - int(alloc_base)
-        
+
         self.local_ipc_handles[param_name] = bytes(handle.reserved)
         self.local_ptrs[param_name] = tensor_ptr
         self.local_offsets[param_name] = offset
@@ -127,7 +124,7 @@ class DwdpLayerHandleCollector:
     def get_peer_ptr(self, peer_rank: int, param_name: str) -> int:
         """Get pointer to parameter on peer rank."""
         return self.peer_ptrs[(peer_rank, param_name)]
-        
+
     def cleanup(self):
         """Clean up peer handles."""
         for _, ptr in self.peer_ptrs.items():
@@ -138,24 +135,25 @@ class DwdpLayerHandleCollector:
 class DwdpPrefetchBuffer:
     """
     Ping-pong buffer for expert weight prefetching.
-    
+
     Buffer Selection Strategy:
     - Even layers (0, 2, 4, ...) use buffer[0]
     - Odd layers (1, 3, 5, ...) use buffer[1]
     - This ensures layer N-1's prefetch doesn't overwrite layer N's data
-    
+
     Synchronization Strategy:
     - prefetch_events[buffer_idx][layer_idx]: Recorded when prefetch completes
       Waited by forward() before using prefetched data
     - compute_events[buffer_idx][layer_idx]: Recorded when forward() completes
       Waited by next prefetch before overwriting buffer
-    
+
     Buffer Layout (organized by rank):
     - buffers[buffer_idx][param_name] = List[Optional[Tensor]]
     - len(list) == dwdp_size
     - list[peer_rank] = Tensor[num_prefetch_experts, ...] for peer_rank != dwdp_rank
     - list[dwdp_rank] = None (local weight used directly, not prefetched)
     """
+
     def __init__(
         self,
         dwdp_size: int,
@@ -167,7 +165,6 @@ class DwdpPrefetchBuffer:
         param_shapes: Dict[str, torch.Size],
         param_dtypes: Dict[str, torch.dtype],
     ):
-
         self.dwdp_size = dwdp_size
         self.num_prefetch_experts = num_prefetch_experts
         self.experts_per_worker = experts_per_worker
@@ -178,9 +175,9 @@ class DwdpPrefetchBuffer:
 
         self.param_shapes = param_shapes
         self.param_dtypes = param_dtypes
-        
+
         self.device = torch.cuda.current_device()
-        
+
         # buffers[buffer_idx][param_name] = List[Optional[Tensor]]
         # list[peer_rank] contains prefetched weights from that rank
         # list[dwdp_rank] = None (local weights used directly)
@@ -204,14 +201,14 @@ class DwdpPrefetchBuffer:
                         )
                 buffer[param_name] = tensor_list
             self.buffers.append(buffer)
-            
+
         self.max_layer_idx = num_layers + first_moe_layer_idx
         self.prefetch_events: List[List[torch.cuda.Event]] = [
-            [torch.cuda.Event() for _ in range(self.max_layer_idx//self.num_buffers + 1)]
+            [torch.cuda.Event() for _ in range(self.max_layer_idx // self.num_buffers + 1)]
             for _ in range(self.num_buffers)
         ]
         self.compute_events: List[List[torch.cuda.Event]] = [
-            [torch.cuda.Event() for _ in range(self.max_layer_idx//self.num_buffers + 1)]
+            [torch.cuda.Event() for _ in range(self.max_layer_idx // self.num_buffers + 1)]
             for _ in range(self.num_buffers)
         ]
         self.prefetch_stream = torch.cuda.Stream(device=self.device)
@@ -219,37 +216,44 @@ class DwdpPrefetchBuffer:
     def initialize_compute_events(self):
         for buffer_idx in range(self.num_buffers):
             self.compute_events[buffer_idx][0].record(torch.cuda.current_stream())
-    
+
     def record_prefetch_event(self, layer_idx: int):
-        self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(self.prefetch_stream)
+        self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(
+            self.prefetch_stream
+        )
 
     def record_compute_event(self, layer_idx: int):
-        self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(torch.cuda.current_stream())
+        self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(
+            torch.cuda.current_stream()
+        )
 
     def wait_prefetch_event(self, layer_idx: int):
-        torch.cuda.current_stream().wait_event(self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
+        torch.cuda.current_stream().wait_event(
+            self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers]
+        )
 
     def wait_compute_event(self, layer_idx: int):
-        self.prefetch_stream.wait_event(self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
+        self.prefetch_stream.wait_event(
+            self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers]
+        )
 
 
 class DwdpManager:
     """
     Dwdp Manager for IPC handle coordination and prefetch buffer management.
-    
+
     This manager:
     - Tracks IPC handles for all MoE layers across Context workers
     - Manages double-buffered prefetch buffers for remote expert weights
     - Provides expert tensor routing (local vs. prefetched)
-    
+
     """
-    
+
     def __init__(
         self,
         config: DwdpConfig,
         dist: Optional[object] = None,
     ):
-
         self.config = config
         self.dist = dist
         self.dwdp_size = config.dwdp_size
@@ -257,10 +261,10 @@ class DwdpManager:
         self.num_group = config.num_group
 
         self._init_dwdp_group()
-        
+
         # Per-layer IPC handle collectors (indexed by layer_idx)
         self.ipc_collectors: List[DwdpLayerHandleCollector] = []
-        
+
         # Prefetch buffer (initialized later in create_py_executor)
         self.prefetch_buffer: Optional[DwdpPrefetchBuffer] = None
         # Auto-detected from first add_layer() call
@@ -277,12 +281,11 @@ class DwdpManager:
         set_global_dwdp_manager(self)
 
     def _init_dwdp_group(self):
-
         if not isinstance(self.dist, MPIDist):
             raise RuntimeError("DWDP requires MPI backend (MPIDist)")
 
         self.rank = global_mpi_rank()
-        
+
         # Calculate which group this rank belongs to
         # With num_group=2, dwdp_size=4:
         #   Group 0: ranks [0, 1, 2, 3]
@@ -290,75 +293,77 @@ class DwdpManager:
         self.group_id = self.rank // self.dwdp_size
         group_start_rank = self.group_id * self.dwdp_size
         ranks = list(range(group_start_rank, group_start_rank + self.dwdp_size))
-        
+
         new_group = COMM_WORLD.group.Incl(ranks)
         self.dwdp_group = COMM_WORLD.Create_group(new_group)
 
     def is_enabled(self) -> bool:
         return self.config.enabled and self.dwdp_size > 1
-        
+
     def add_layer(
         self,
         layer_idx: int,
     ) -> "DwdpLayerHandleCollector":
         """
         Add a new layer IPC handle collector.
-        
+
         Called from CuteDslFusedMoE.__init__() during model construction.
         """
         if self.first_moe_layer_idx is None:
             self.first_moe_layer_idx = layer_idx
-        collector = DwdpLayerHandleCollector(
-            layer_idx=layer_idx
-        )
+        collector = DwdpLayerHandleCollector(layer_idx=layer_idx)
         self.ipc_collectors.append(collector)
         return collector
-        
+
     def exchange_all_handles(self):
         """
         Exchange IPC handles with peer Context workers via Dwdp Group AllGather.
-        
+
         Called after all weights are loaded, before creating prefetch buffer.
         """
-            
+
         # Collect all local handles with explicit worker info
         local_data = {
-            'dwdp_rank': self.dwdp_rank,
-            'expert_start_id': self.start_expert_id,
-            'expert_end_id': self.end_expert_id,
-            'ipc_collectors': [],
+            "dwdp_rank": self.dwdp_rank,
+            "expert_start_id": self.start_expert_id,
+            "expert_end_id": self.end_expert_id,
+            "ipc_collectors": [],
         }
         for collector in self.ipc_collectors:
-            local_data['ipc_collectors'].append({
-                'layer_idx': collector.layer_idx,
-                'handles': collector.local_ipc_handles,
-                'offsets': collector.local_offsets,
-            })
-            
+            local_data["ipc_collectors"].append(
+                {
+                    "layer_idx": collector.layer_idx,
+                    "handles": collector.local_ipc_handles,
+                    "offsets": collector.local_offsets,
+                }
+            )
+
         # AllGather from all Context workers in DWDP group
         all_data = self.dwdp_group.allgather(local_data)
-        
+
         # Open handles from peer workers
         for peer_data in all_data:
-            peer_rank = peer_data['dwdp_rank']
-            self.peer_expert_ranges[peer_rank] = (peer_data['expert_start_id'], peer_data['expert_end_id'])
+            peer_rank = peer_data["dwdp_rank"]
+            self.peer_expert_ranges[peer_rank] = (
+                peer_data["expert_start_id"],
+                peer_data["expert_end_id"],
+            )
 
             if peer_rank == self.dwdp_rank:
                 continue
-            for layer_idx, ipc_collector in enumerate(peer_data['ipc_collectors']):
+            for layer_idx, ipc_collector in enumerate(peer_data["ipc_collectors"]):
                 collector = self.ipc_collectors[layer_idx]
-                peer_offsets = ipc_collector['offsets']
-                for param_name, handle_bytes in ipc_collector['handles'].items():
+                peer_offsets = ipc_collector["offsets"]
+                for param_name, handle_bytes in ipc_collector["handles"].items():
                     # Reconstruct and open handle
                     handle = cudart.cudaIpcMemHandle_t()
                     handle.reserved = list(handle_bytes)
-                    
+
                     err, base_ptr = cudart.cudaIpcOpenMemHandle(
-                        handle,
-                        cudart.cudaIpcMemLazyEnablePeerAccess
+                        handle, cudart.cudaIpcMemLazyEnablePeerAccess
                     )
                     check_cuda_error(err, f"open handle rank={peer_rank}")
-                    
+
                     # Apply offset to get actual tensor pointer
                     # IPC handle points to allocation base, offset gives us the tensor location
                     offset = peer_offsets[param_name]
@@ -368,7 +373,7 @@ class DwdpManager:
     def initialize_prefetch_buffer(self):
         """
         Initialize the prefetch buffer.
-        
+
         Called in create_py_executor() after model loading.
         """
         self.prefetch_buffer = DwdpPrefetchBuffer(
@@ -382,7 +387,7 @@ class DwdpManager:
             param_dtypes=self.ipc_collectors[0].param_dtypes,
         )
         self.prefetch_buffer.initialize_compute_events()
-        
+
     def prefetch_first_layers(self):
         """Prefetch the first num_buffers layers as warmup."""
         if self.prefetch_buffer is None:
@@ -410,8 +415,12 @@ class DwdpManager:
 
         buffer_data = self.wait_prefetch_and_get_buffer(layer_idx)
         required_keys = (
-            "w3_w1_weight", "w3_w1_weight_scale", "fc31_alpha",
-            "w2_weight", "w2_weight_scale", "fc2_alpha",
+            "w3_w1_weight",
+            "w3_w1_weight_scale",
+            "fc31_alpha",
+            "w2_weight",
+            "w2_weight_scale",
+            "fc2_alpha",
         )
         missing_keys = [key for key in required_keys if key not in buffer_data]
         if missing_keys:
@@ -444,9 +453,11 @@ class DwdpManager:
             slot_start=0,
         )
 
-    def wait_prefetch_and_get_buffer(self, layer_idx: int) -> Optional[Dict[str, List[Optional[torch.Tensor]]]]:
+    def wait_prefetch_and_get_buffer(
+        self, layer_idx: int
+    ) -> Optional[Dict[str, List[Optional[torch.Tensor]]]]:
         """Wait for prefetch to complete and return the buffer for this layer.
-        
+
         Returns:
             Dict mapping param_name to List[Optional[Tensor]] where:
             - list[peer_rank] = Tensor for prefetched weights from that peer
@@ -475,10 +486,10 @@ class DwdpManager:
     def _get_prefetch_src_offset_from_peer(self, peer_rank: int) -> int:
         """
         Calculate the source offset (in number of experts) to fetch from a peer.
-        
+
         Returns:
             src_offset: Offset into peer's local expert tensor to start copying from
-            
+
         Example: 256 experts, rank0: [0, 200), rank1: [56, 256)
         - rank0 needs [200, 256) from rank1:
           src_offset = 200 - 56 = 144 (fetch last 56 experts from rank1)
@@ -486,7 +497,7 @@ class DwdpManager:
           src_offset = 0 - 0 = 0 (fetch first 56 experts from rank0)
         """
         peer_start, peer_end = self.peer_expert_ranges[peer_rank]
-        
+
         # What I need = global - what I have
         # From peer = what I need ∩ what peer has
         if self.dwdp_rank < peer_rank:
@@ -496,7 +507,7 @@ class DwdpManager:
         else:
             # I'm later rank, need experts before my start (head of peer's experts)
             prefetch_start = peer_start
-        
+
         src_offset = prefetch_start - peer_start
         return src_offset
 
@@ -504,12 +515,12 @@ class DwdpManager:
     def prefetch_layer(self, layer_idx: int, wait_compute_layer_idx: Optional[int] = None):
         """
         Prefetch layer data from peer ranks.
-        
+
         Args:
             layer_idx: The layer to prefetch
             wait_compute_layer_idx: If provided, wait for this layer's compute to complete
                                     before overwriting buffer (used when prefetching next layer)
-        
+
         Note: Local weights are used directly by the kernel, no copy needed.
         Peer copy runs on prefetch stream.
         """
@@ -524,33 +535,35 @@ class DwdpManager:
             # Wait for compute to complete before overwriting buffer
             if wait_compute_layer_idx is not None:
                 self.prefetch_buffer.wait_compute_event(wait_compute_layer_idx)
-            
+
             for peer_rank in range(self.dwdp_size):
                 if peer_rank == self.dwdp_rank:
                     continue  # Skip local rank - local weights used directly
-                
+
                 src_expert_offset = self._get_prefetch_src_offset_from_peer(peer_rank)
-                
+
                 for param_name in param_names:
                     param_shape = collector.param_shapes[param_name]
                     param_dtype = collector.param_dtypes[param_name]
                     expert_size = param_shape.numel() * param_dtype.itemsize
-                    
+
                     # src_ptr points to peer's tensor start, add offset for specific experts
                     base_ptr = collector.get_peer_ptr(peer_rank, param_name)
                     src_ptr = base_ptr + src_expert_offset * expert_size
-                    
+
                     # dst_tensor is directly indexed by peer_rank in the list
                     dst_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name][peer_rank]
                     dst_ptr = dst_tensor.data_ptr()
-                    
+
                     data_size = self.num_prefetch_experts * expert_size
 
-                    err, = cudart.cudaMemcpyAsync(
+                    (err,) = cudart.cudaMemcpyAsync(
                         dst_ptr,
                         src_ptr,
                         data_size,
                         cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
                         self.prefetch_buffer.prefetch_stream.cuda_stream,
                     )
-                    check_cuda_error(err, f"prefetch layer {layer_idx} peer_rank {peer_rank} {param_name}")
+                    check_cuda_error(
+                        err, f"prefetch layer {layer_idx} peer_rank {peer_rank} {param_name}"
+                    )
