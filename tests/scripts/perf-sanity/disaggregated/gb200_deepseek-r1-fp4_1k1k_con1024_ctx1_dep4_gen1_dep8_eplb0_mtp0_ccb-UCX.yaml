@@ -20,7 +20,7 @@ benchmark:
   mode: e2e
   use_nv_sa_benchmark: true
   multi_round: 8
-  benchmark_ratio: 0.8
+  benchmark_ratio: 0.65
   streaming: true
   concurrency_list: '1024'
   input_length: 1024
@@ -60,7 +60,7 @@ worker_config:
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
+      free_gpu_memory_fraction: 0.45
       dtype: fp8
     moe_config:
       backend: CUTLASS
@@ -84,7 +84,7 @@ worker_config:
     disable_overlap_scheduler: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.75
+      free_gpu_memory_fraction: 0.45
       dtype: fp8
     moe_config:
       backend: CUTEDSL

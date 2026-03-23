@@ -1928,6 +1928,8 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
         "\"NVIDIA is a great company because\"",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
+        "--kv_cache_fraction",
+        f"0.5",
     ])
 
 
