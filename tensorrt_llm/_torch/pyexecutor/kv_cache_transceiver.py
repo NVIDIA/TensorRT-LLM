@@ -84,7 +84,7 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    attention_type, cache_transceiver_config)
+                                    cache_transceiver_config)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,

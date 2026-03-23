@@ -7,6 +7,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 
 
@@ -51,7 +52,7 @@ class RankInfo:
     def from_kv_cache_manager(
         cls,
         instance_name: str,
-        kv_cache_manager,
+        kv_cache_manager: KVCacheManager,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
     ) -> "RankInfo":

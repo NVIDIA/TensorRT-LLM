@@ -299,6 +299,13 @@ class Sender(SenderBase):
     @staticmethod
     @nvtx_range("_make_agent_request")
     def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
+        if not (len(write_meta.src_ptrs) == len(write_meta.dst_ptrs) == len(write_meta.sizes)):
+            raise ValueError(
+                f"Pointer/size mismatch for unique_rid={write_meta.unique_rid}: "
+                f"{len(write_meta.src_ptrs)=}, "
+                f"{len(write_meta.dst_ptrs)=}, "
+                f"{len(write_meta.sizes)=}"
+            )
         if write_meta.meta_type == WriteMetaType.AUX:
             src_dev, dst_dev, mem_type = 0, 0, MemoryType.DRAM
         else:
@@ -311,11 +318,11 @@ class Sender(SenderBase):
 
         src_list = [
             MemoryDesc(ptr, size, src_dev)
-            for ptr, size in zip(write_meta.src_ptrs, write_meta.sizes)
+            for ptr, size in zip(write_meta.src_ptrs, write_meta.sizes, strict=True)
         ]
         dst_list = [
             MemoryDesc(ptr, size, dst_dev)
-            for ptr, size in zip(write_meta.dst_ptrs, write_meta.sizes)
+            for ptr, size in zip(write_meta.dst_ptrs, write_meta.sizes, strict=True)
         ]
         return TransferRequest(
             TransferOp.WRITE,  # type: ignore[arg-type]
@@ -809,9 +816,10 @@ class TxSession(TxSessionBase):
         Returns WaitResult.COMPLETED, WaitResult.FAILED, or WaitResult.TIMEOUT.
         """
         try:
-            kv_status = self.kv_tasks[0].future.result(timeout=timeout)
-            if kv_status != AgentResult.SUCCESS:
-                return WaitResult.FAILED
+            for task in self.kv_tasks:
+                kv_status = task.future.result(timeout=timeout)
+                if kv_status != AgentResult.SUCCESS:
+                    return WaitResult.FAILED
             if need_aux and self.aux_task is not None:
                 aux_status = self.aux_task.future.result(timeout=timeout)
                 if aux_status != AgentResult.SUCCESS:
@@ -1132,17 +1140,15 @@ class RxSession(RxSessionBase):
 
     @property
     def status(self) -> SessionStatus:
-        if self._exception is not None or (
-            self._kv_tasks and self._kv_tasks[0].status == TaskStatus.ERROR
-        ):
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self._kv_tasks):
             return SessionStatus.ERROR
         if self._kv_tasks:
-            task_status = self._kv_tasks[0].status
-            if task_status == TaskStatus.TRANSFERRED and self._aux_status == TaskStatus.TRANSFERRED:
+            kv_all_transferred = all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks)
+            if kv_all_transferred and self._aux_status == TaskStatus.TRANSFERRED:
                 return SessionStatus.FULLY_TRANSFERRED
-            if task_status == TaskStatus.TRANSFERRED:
+            if kv_all_transferred:
                 return SessionStatus.KV_TRANSFERRED
-            if task_status == TaskStatus.TRANSFERRING:
+            if any(t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
@@ -1196,7 +1202,9 @@ class RxSession(RxSessionBase):
             )
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
-        task = self._kv_tasks[0]  # TODO: index by slice_id when multi-slice is supported
+        # Aux is session-level (not per-slice); expected_transfers is identical
+        # across all kv_tasks, so any task provides the right count.
+        task = self._kv_tasks[0]
         if status == AgentResult.SUCCESS:
             self._aux_count += 1
 
@@ -1248,9 +1256,10 @@ class RxSession(RxSessionBase):
         Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error.
         """
         try:
-            kv_status = self._kv_tasks[0].future.result()
-            if kv_status != AgentResult.SUCCESS:
-                return WaitResult.FAILED
+            for task in self._kv_tasks:
+                kv_status = task.future.result()
+                if kv_status != AgentResult.SUCCESS:
+                    return WaitResult.FAILED
             if need_aux:
                 while True:
                     status = self.status
@@ -1447,16 +1456,20 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
         self._registered_mem: list = []
-        self._register_kv_cache()
-        if self._aux_buffer is not None:
-            self._register_aux_buffer()
-        self._sender = Sender(self._peer_registrar, self._agent)
-        self._receiver = Receiver(self._peer_registrar, self._agent)
-        self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
-        self._rank_info.self_endpoint = self._receiver.endpoint
         self._finalizer = weakref.finalize(
-            self, _deregister_registered_memory, self._agent, list(self._registered_mem)
+            self, _deregister_registered_memory, self._agent, self._registered_mem
         )
+        try:
+            self._register_kv_cache()
+            if self._aux_buffer is not None:
+                self._register_aux_buffer()
+            self._sender = Sender(self._peer_registrar, self._agent)
+            self._receiver = Receiver(self._peer_registrar, self._agent)
+            self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
+            self._rank_info.self_endpoint = self._receiver.endpoint
+        except Exception:
+            self._finalizer()
+            raise
 
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None

@@ -1,11 +1,10 @@
 import uuid
 from collections import defaultdict
 from itertools import chain
-from typing import Any, Callable, Dict, List, cast
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import torch
 
-import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, WaitResult, get_unique_rid
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
@@ -13,17 +12,12 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_i
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
-
-CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
-AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
-CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
-BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -45,7 +39,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         mapping: Mapping,
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
-        attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig,
     ):
         self._dist: Distributed = dist
@@ -80,7 +73,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
-        self._is_v2_manager = hasattr(kv_cache_manager, "kv_cache_map")
+        self._is_v2_manager = isinstance(kv_cache_manager, KVCacheManagerV2)
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -113,13 +106,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
         )
-        logger.info(f"transfer worker  ctx_server_endpoints: {endpoints}")
+        logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")
 
     def shutdown(self):
-        if self._transfer_worker is not None:
-            self._transfer_worker.shutdown()
+        if getattr(self, "_shutdown", False):
+            return
+        self._shutdown = True
+        for session in list(self._send_sessions.values()):
+            session.close()
+        for session in list(self._recv_sessions.values()):
+            session.close()
+        self._send_sessions.clear()
+        self._send_reqs.clear()
+        self._recv_sessions.clear()
+        self._recv_reqs.clear()
+        self._transfer_worker.shutdown()
 
     def _get_block_ids(self, req: LlmRequest, group_idx: int, lg) -> list:
         if self._is_v2_manager:
@@ -196,7 +199,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     ) -> list:
         if block_all:
             return list(sessions.keys())
-        to_process = consensus
+        to_process = list(consensus)
         for rid in sessions:
             if len(to_process) >= wait_num:
                 break
@@ -256,13 +259,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def request_and_receive_async(self, req: LlmRequest):
         rid = get_unique_rid(req)
+        if rid in self._recv_sessions:
+            logger.warning(
+                f"request_and_receive_async: rid={rid} already has a recv session, skipping"
+            )
+            return
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = self._transfer_worker.create_rx_session(req)
         self._recv_sessions[rid] = session
         session.receive(self._create_kv_slice(req))
         self._recv_reqs[rid] = req
 
-    def check_context_transfer_status(self, at_least_request_num: int, mark_complete: bool = False):
+    def check_context_transfer_status(
+        self, at_least_request_num: Optional[int], mark_complete: bool = False
+    ):
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
@@ -302,7 +312,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         return completed, failed
 
-    def check_gen_transfer_status(self, at_least_request_num: int):
+    def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
@@ -335,6 +345,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
+
+        return completed, failed
 
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
