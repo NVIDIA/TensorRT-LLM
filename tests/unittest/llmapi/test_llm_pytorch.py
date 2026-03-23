@@ -28,6 +28,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness, llm_test_harness,
                        prompts, run_llm_abort_request,
+                       sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, similarity_score,
@@ -106,14 +107,19 @@ def test_llm_capture_request_error():
 
 @force_ampere
 @pytest.mark.mpi_ray_parity
-@pytest.mark.parametrize(
-    "sampling_params",
-    [
-        SamplingParams()  # pytorch only supports n=1
-    ])
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
 @pytest.mark.part0
 def test_llm_abort_request(sampling_params):
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    llm_kwargs = {}
+    if sampling_params.use_beam_search:
+        if sampling_params.best_of is None:
+            llm_kwargs["max_beam_width"] = sampling_params.n
+        else:
+            llm_kwargs["max_beam_width"] = sampling_params.best_of
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              **llm_kwargs)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
