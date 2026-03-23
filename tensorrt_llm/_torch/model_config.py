@@ -656,10 +656,13 @@ class ModelConfig(Generic[TConfig]):
         attn_tp_size = self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else 1
         attn_cp_size = self.mapping.attn_cp_size
 
-        num_heads = self.pretrained_config.num_attention_heads // (
-            attn_tp_size * attn_cp_size)
+        def ceil_div(a, b):
+            return (a + b - 1) // b
 
-        hidden_size = self.pretrained_config.hidden_size // attn_tp_size
+        num_heads = ceil_div(self.pretrained_config.num_attention_heads,
+                             attn_tp_size * attn_cp_size)
+
+        hidden_size = ceil_div(self.pretrained_config.hidden_size, attn_tp_size)
         num_layers = self.pretrained_config.num_hidden_layers
         num_attention_layers = self.get_num_attention_layers()
         if (self.spec_config is not None
@@ -690,17 +693,19 @@ class ModelConfig(Generic[TConfig]):
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
-                kv_heads // (attn_tp_size * attn_cp_size)
+                ceil_div(kv_heads, attn_tp_size * attn_cp_size)
                 for kv_heads in num_key_value_heads
             ]
             model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
         else:
-            num_kv_heads = num_key_value_heads // (attn_tp_size * attn_cp_size)
+            num_kv_heads = ceil_div(num_key_value_heads,
+                                    attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
-            mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+            mlp_hidden_size = ceil_div(self.pretrained_config.intermediate_size,
+                                       self.mapping.tp_size)
         else:
             # TODO: once tensorrt_llm._torch.AutoConfig is implemented, the following logic
             # should be moved to tensorrt_llm._torch.AutoConfig of the relevant modeling_xxx file
@@ -709,8 +714,8 @@ class ModelConfig(Generic[TConfig]):
                 architectures = self.pretrained_config.architectures
                 if len(architectures
                        ) == 1 and architectures[0] == "DeciLMForCausalLM":
-                    mlp_hidden_size = self._infer_nemotron_ffn_mult(
-                    ) // self.mapping.tp_size
+                    mlp_hidden_size = ceil_div(self._infer_nemotron_ffn_mult(),
+                                               self.mapping.tp_size)
                 else:
                     raise ValueError(
                         f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"
