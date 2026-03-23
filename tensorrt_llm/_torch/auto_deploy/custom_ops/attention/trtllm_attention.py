@@ -530,7 +530,7 @@ def trtllm_mha_with_cache_fake(
     kv_cache_block_offsets: torch.Tensor,
     # CACHE
     kv_cache: torch.Tensor,
-    # CONSTANTS (only truly un-inferable values)
+    # CONSTANTS
     scale: Optional[float],
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
@@ -633,14 +633,14 @@ class TrtllmAttention(AttentionDescriptor):
         else:
             attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
 
-        # RoPE cos_sin: materialize tensor as get_attr node
+        # RoPE cos_sin: materialize tensor as get_attr node right before the
+        # attention node (which is about to be replaced by the cached version).
         rope_info = attn_node.meta.get(_TRTLLM_ROPE_INFO_KEY)
         if rope_info is not None and "cos_sin_tensor" in rope_info:
             cos_sin_tensor = rope_info["cos_sin_tensor"]
             attr_name = "_trtllm_rope_cos_sin"
             counter = 0
             while hasattr(gm, attr_name):
-                # Reuse existing buffer if tensor matches
                 existing = getattr(gm, attr_name)
                 if existing.data_ptr() == cos_sin_tensor.data_ptr():
                     break

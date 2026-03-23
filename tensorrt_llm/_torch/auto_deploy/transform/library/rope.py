@@ -1156,8 +1156,8 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
         num_fused = 0
-        # Cache: rope_node → thop_cache_node (reuse across layers sharing same rope)
-        rope_cache_nodes: Dict[int, Tuple[Node, int, int]] = {}
+        # Cache: rope_node id → (thop_tensor, position_embedding_type, rotary_embedding_dim)
+        rope_cache_nodes: Dict[int, Tuple[torch.Tensor, int, int]] = {}
 
         for attn_node in list(graph.nodes):
             if not is_op(attn_node, torch.ops.auto_deploy.torch_attention):
@@ -1179,7 +1179,7 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
         self,
         gm: GraphModule,
         attn_node: Node,
-        rope_cache_nodes: Dict[int, Tuple[Node, int, int]],
+        rope_cache_nodes: Dict[int, Tuple[torch.Tensor, int, int]],
     ) -> bool:
         """Try to fuse RoPE into a single torch_attention node. Returns True on success."""
         # Step 1: Get Q and K input nodes from the attention node
@@ -1277,8 +1277,8 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
         attn_node.args = tuple(args_list)
 
         # Step 8: Store rope info in meta for get_constants to pick up.
-        # Store the tensor (not a Node) — the get_attr node will be created
-        # during insert_cached_attention via prepare_node_for_cache_insertion.
+        # cos_sin_tensor is materialized as a get_attr node during
+        # prepare_node_for_cache_insertion; scalar params flow as constants.
         attn_node.meta[_TRTLLM_ROPE_INFO_KEY] = {
             "cos_sin_tensor": thop_cache,
             "position_embedding_type": position_embedding_type,
