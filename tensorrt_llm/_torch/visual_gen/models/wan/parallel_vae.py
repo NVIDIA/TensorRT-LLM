@@ -51,18 +51,22 @@ class ParallelVAE_Wan(ParallelVAEBase):
     # encode / decode
     # ------------------------------------------------------------------
 
-    def _encode_impl(self, x: torch.Tensor, return_dict: bool = True, **kwargs):
+    def _encode_impl(self, x: torch.Tensor, **kwargs):
+        return_dict = kwargs.pop("return_dict", True)
         x_local, _ = self._split_tensor(x)
-        posterior_local = self.vae_backend.encode(x_local, return_dict=False)[0]
+        posterior_local = self.vae_backend.encode(x_local, return_dict=False, **kwargs)[0]
         params_gathered = self._gather_tensor(posterior_local.parameters)
         dist = DiagonalGaussianDistribution(params_gathered)
         if not return_dict:
             return (dist,)
         return AutoencoderKLOutput(latent_dist=dist)
 
-    def _decode_impl(self, z: torch.Tensor, return_dict: bool = True, **kwargs):
+    def _decode_impl(self, z: torch.Tensor, **kwargs):
+        return_dict = kwargs.pop("return_dict", True)
         z_local, _ = self._split_tensor(z)
-        sample = self._gather_tensor(self.vae_backend.decode(z_local, return_dict=False)[0])
+        sample = self._gather_tensor(
+            self.vae_backend.decode(z_local, return_dict=False, **kwargs)[0]
+        )
         if not return_dict:
             return (sample,)
         return DecoderOutput(sample=sample)
