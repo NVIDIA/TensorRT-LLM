@@ -26,8 +26,6 @@ from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
-AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
-
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
@@ -397,13 +395,11 @@ def worker_fn(
         )
 
         # Create KvCacheTransceiverV2
-        attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
         print(f"[Rank {rank}] CTX: Creating transceiver...", flush=True)
         transceiver = KvCacheTransceiverV2(
             mapping=mapping,
             dist=dist_wrapper,
             kv_cache_manager=kv_cache_manager,
-            attention_type=attention_type,
             cache_transceiver_config=cache_transceiver_config,
         )
         print(f"[Rank {rank}] CTX: Transceiver created", flush=True)
@@ -466,13 +462,11 @@ def worker_fn(
         )
 
         # Create KvCacheTransceiverV2
-        attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
         print(f"[Rank {rank}] GEN: Creating transceiver...", flush=True)
         transceiver = KvCacheTransceiverV2(
             mapping=mapping,
             dist=dist_wrapper,
             kv_cache_manager=kv_cache_manager,
-            attention_type=attention_type,
             cache_transceiver_config=cache_transceiver_config,
         )
         print(f"[Rank {rank}] GEN: Transceiver created", flush=True)
