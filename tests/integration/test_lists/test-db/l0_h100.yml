@@ -432,6 +432,17 @@ l0_h100:
   - unittest/trt/attention/test_gpt_attention_no_cache.py
   - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
   - unittest/kv_cache_manager_v2_tests/ # 4 min
+  # ------------- KV Cache Iteration Stats ---------------
+  - unittest/executor/test_stats_serializer.py
+  - unittest/metrics/test_collector.py
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_shared_prefix
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_batch_generation
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
 - condition:
     ranges:
       system_gpu_count:
