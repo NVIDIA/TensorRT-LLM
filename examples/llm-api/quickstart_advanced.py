@@ -98,8 +98,7 @@ def add_llm_args(parser):
         '--moe_load_balancer_config',
         type=str,
         default=None,
-        help=
-        'Path to a YAML file for MoE load balancer (EPLB) configuration.')
+        help='Path to a YAML file for MoE load balancer (EPLB) configuration.')
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
