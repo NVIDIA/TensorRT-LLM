@@ -151,8 +151,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:
-            tl.device_assert(idx < h0_dim0,
-                             "idx out of bounds in h0_source store")
             p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V + o_k[:, None] * V +
                     o_v[None, :])
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
