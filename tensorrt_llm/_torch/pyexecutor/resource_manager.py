@@ -2138,6 +2138,25 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return True
 
+    def extend_capacity_for_tokens(self, request: LlmRequest,
+                                   num_tokens: int) -> None:
+        """Extend KV cache capacity for *request* by *num_tokens* extra tokens.
+
+        Used after ``pad_draft_tokens_for_cuda_graph`` to ensure the KV cache
+        has enough capacity for the padded draft tokens so that the subsequent
+        rewind does not underflow.
+        """
+        if num_tokens <= 0:
+            return
+        kv_cache = self.kv_cache_map[request.py_request_id]
+        new_capacity = kv_cache.capacity + num_tokens
+        success = kv_cache.resize(new_capacity)
+        if not success:
+            raise ValueError(
+                f"Failed to extend capacity of KV cache for request "
+                f"{request.py_request_id} by {num_tokens} tokens "
+                f"(target capacity {new_capacity})")
+
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache (move to host tier)."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
