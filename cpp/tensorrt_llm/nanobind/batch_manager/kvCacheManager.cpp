@@ -106,6 +106,11 @@ public:
         NB_OVERRIDE_PURE(getKvCacheStats);
     }
 
+    std::map<SizeType32, tbk::KvCacheIterationStats> getIterationStats() override
+    {
+        NB_OVERRIDE_PURE(getIterationStats);
+    }
+
     void addToken(tb::LlmRequest::RequestIdType requestId) override
     {
         NB_OVERRIDE_PURE(addToken, requestId);
@@ -346,6 +351,29 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("num_free_blocks_per_window_size", &tbk::KvCacheStats::numFreeBlocksPerWindowSize)
         .def_rw("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
 
+    nb::class_<tbk::KvCacheIterationStats>(m, "KvCacheIterationStats")
+        .def(nb::init<>())
+        .def_rw("primary_max_num_blocks", &tbk::KvCacheIterationStats::primaryMaxNumBlocks)
+        .def_rw("primary_free_num_blocks", &tbk::KvCacheIterationStats::primaryFreeNumBlocks)
+        .def_rw("primary_used_num_blocks", &tbk::KvCacheIterationStats::primaryUsedNumBlocks)
+        .def_rw("secondary_max_num_blocks", &tbk::KvCacheIterationStats::secondaryMaxNumBlocks)
+        .def_rw("secondary_free_num_blocks", &tbk::KvCacheIterationStats::secondaryFreeNumBlocks)
+        .def_rw("secondary_used_num_blocks", &tbk::KvCacheIterationStats::secondaryUsedNumBlocks)
+        .def_rw("iter_alloc_total_blocks", &tbk::KvCacheIterationStats::iterAllocTotalBlocks)
+        .def_rw("iter_alloc_new_blocks", &tbk::KvCacheIterationStats::iterAllocNewBlocks)
+        .def_rw("iter_reused_blocks", &tbk::KvCacheIterationStats::iterReusedBlocks)
+        .def_rw("iter_full_reused_blocks", &tbk::KvCacheIterationStats::iterFullReusedBlocks)
+        .def_rw("iter_partial_reused_blocks", &tbk::KvCacheIterationStats::iterPartialReusedBlocks)
+        .def_rw("iter_missed_blocks", &tbk::KvCacheIterationStats::iterMissedBlocks)
+        .def_rw("iter_cache_hit_rate", &tbk::KvCacheIterationStats::iterCacheHitRate)
+        .def_rw("iter_gen_alloc_blocks", &tbk::KvCacheIterationStats::iterGenAllocBlocks)
+        .def_rw("iter_onboard_blocks", &tbk::KvCacheIterationStats::iterOnboardBlocks)
+        .def_rw("iter_onboard_bytes", &tbk::KvCacheIterationStats::iterOnboardBytes)
+        .def_rw("iter_offload_blocks", &tbk::KvCacheIterationStats::iterOffloadBlocks)
+        .def_rw("iter_offload_bytes", &tbk::KvCacheIterationStats::iterOffloadBytes)
+        .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
+        .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes);
+
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
         .def(nb::init<>())
         .def_rw("paged_context_fmha", &tbk::TempAttentionWindowInputs::pagedContextFMHA)
@@ -384,6 +412,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_prop_ro("max_num_blocks", &BaseKVCacheManager::getMaxNumBlocks)
         .def_prop_ro("num_pools", &BaseKVCacheManager::getNumPools)
         .def("get_kv_cache_stats", &BaseKVCacheManager::getKvCacheStats, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_iteration_stats", &BaseKVCacheManager::getIterationStats, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_blocks_per_seq",
             [](tbk::BaseKVCacheManager& self) { return self.getOffsetTableDimensions().maxBlocksPerSeq; })
         .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep,

@@ -297,6 +297,22 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
 
     copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
 
+    // Update transfer statistics — distinguish host→GPU onboard from GPU→GPU intra-device copy
+    {
+        std::lock_guard<std::mutex> lock(mStatsMutex);
+        auto bytes = computeBlockTransferBytes(pools, numTokensToCopy);
+        if (offloadedBlock->isPrimary())
+        {
+            ++mIntraDeviceCopyBlockCount;
+            mIntraDeviceCopyByteCount += bytes;
+        }
+        else
+        {
+            ++mOnboardBlockCount;
+            mOnboardByteCount += bytes;
+        }
+    }
+
     // Record new pending read from offloadedBlock
     mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
     mOnboardManager.getStream().record(mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()]);
@@ -332,6 +348,13 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
     }
 
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
+
+    // Update transfer statistics
+    {
+        std::lock_guard<std::mutex> lock(mStatsMutex);
+        ++mOffloadBlockCount;
+        mOffloadByteCount += computeBlockTransferBytes(pools, numTokensToCopy);
+    }
 
     // Record new pending read from block
     mPendingReads[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
@@ -369,6 +392,62 @@ void KVCacheTransferManager::syncTransfers()
     // Once we synchronize, clear our list of pending thransfers.
     mPendingReads.clear();
     mPendingWrites.clear();
+}
+
+KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
+{
+    std::lock_guard<std::mutex> lock(mStatsMutex);
+    KvCacheTransferStats stats;
+    stats.onboardBlocks = mOnboardBlockCount;
+    stats.onboardBytes = mOnboardByteCount;
+    stats.offloadBlocks = mOffloadBlockCount;
+    stats.offloadBytes = mOffloadByteCount;
+    stats.intraDeviceCopyBlocks = mIntraDeviceCopyBlockCount;
+    stats.intraDeviceCopyBytes = mIntraDeviceCopyByteCount;
+    mOnboardBlockCount = 0;
+    mOnboardByteCount = 0;
+    mOffloadBlockCount = 0;
+    mOffloadByteCount = 0;
+    mIntraDeviceCopyBlockCount = 0;
+    mIntraDeviceCopyByteCount = 0;
+    return stats;
+}
+
+std::size_t KVCacheTransferManager::computeBlockTransferBytes(
+    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy) const
+{
+    std::size_t totalBytes = 0;
+    for (auto const& pool : pools)
+    {
+        if (!pool.primaryPtr)
+        {
+            continue;
+        }
+
+        auto const dataType = pool.primaryPtr->getDataType();
+        auto const bytesPerElement
+            = pool.primaryPtr->getSizeInBytes() / static_cast<std::size_t>(pool.primaryPtr->getSize());
+
+        // Mirror the logic in copyBlock: a partial copy only happens when numTokensToCopy > 0,
+        // the data type supports it (not kINT4/kFP4), not block scales, and numTokensToCopy < tokensPerBlock.
+        bool const isPartialCopy = numTokensToCopy > 0 && dataType != nvinfer1::DataType::kINT4
+            && dataType != nvinfer1::DataType::kFP4 && !pool.containsBlockScales
+            && numTokensToCopy < pool.tokensPerBlock;
+
+        if (isPartialCopy)
+        {
+            // Partial copy transfers: numLayers * kvFactor * numKvHeads * sizePerHead * numTokensToCopy elements
+            totalBytes += static_cast<std::size_t>(pool.numLayers) * pool.kvFactor * pool.numKvHeads * pool.sizePerHead
+                * numTokensToCopy * bytesPerElement;
+        }
+        else
+        {
+            // Full block copy: numLayers * kvFactor * blockSize elements
+            // where blockSize = numKvHeads * sizePerHead * tokensPerBlock
+            totalBytes += static_cast<std::size_t>(pool.numLayers) * pool.kvFactor * pool.blockSize * bytesPerElement;
+        }
+    }
+    return totalBytes;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
