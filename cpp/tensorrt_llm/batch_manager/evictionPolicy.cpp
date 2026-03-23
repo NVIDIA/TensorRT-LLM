@@ -136,7 +136,8 @@ void LRUEvictionPolicy::addToFreeBlockQueue(BlockPtr block, bool toFront)
     mNumFreeBlocksPerLevel[cacheLevel]++;
 }
 
-bool LRUEvictionPolicy::removeFromFreeBlockQueue(std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>& v) noexcept
+bool LRUEvictionPolicy::removeFromFreeBlockQueue(
+    std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>& v) noexcept
 {
     SizeType32 const id = block->getBlockId();
     if (mFreeBlockIterators[id].has_value())
@@ -228,11 +229,12 @@ void LRUEvictionPolicy::refresh()
 
         mExpiringBlockHeap.erase(mExpiringBlockHeap.begin());
 
-        // Add block to free blocks queue with default priority if it was removed from another priority free blocks queue
+        // Add block to free blocks queue with default priority if it was removed from another priority free blocks
+        // queue
         if (removeFromFreeBlockQueue(block))
         {
             block->setPriority(kDefaultPriority);
-            addToFreeBlockQueue(block, /*toFront*/false);
+            addToFreeBlockQueue(block, /*toFront*/ false);
         }
     }
 }

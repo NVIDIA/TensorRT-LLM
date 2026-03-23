@@ -95,8 +95,8 @@ private:
     //! \brief Add block to free block queue. Records all info needed to remove block from queue
     void addToFreeBlockQueue(BlockPtr block, bool toFront);
 
-    //! \brief Remove block from free block queue, using info stored when block was added. It is always safe to call this method
-    //! \param block The block to be removed from free blocks queue. NOOP if block is not currently in queue
+    //! \brief Remove block from free block queue, using info stored when block was added. It is always safe to call
+    //! this method \param block The block to be removed from free blocks queue. NOOP if block is not currently in queue
     //! \return True if block was removed from free queue.
     [[nodiscard]] bool removeFromFreeBlockQueue(BlockPtr block) noexcept;
 
