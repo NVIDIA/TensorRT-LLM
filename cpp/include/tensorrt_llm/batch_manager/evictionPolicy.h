@@ -92,10 +92,17 @@ public:
     bool verifyQueueIntegrity() override;
 
 private:
+    // Add block to free queue along with all the arguments needed to remove it.
+    // Storing cacheLevel and priority at the time of inclusion in free queue avoids having
+    // to call claimBlock before changing cache level or priority.
+    void addToFreeBlockQueue(SizeType32 cacheLevel, SizeType32 priority, BlockPtr block, bool toFront);
+    void removeFromFreeBlockQueue(std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>& v);
+
+private:
     // Queues of available leaf blocks, split by cache level and priority level
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
-    // Iterators to block entries in mFreeQueues
-    std::vector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
+    // Iterators to block entries in mFreeQueues. Holds ALL arguments needed to remove block from free queue
+    std::vector<std::optional<std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>>> mFreeBlockIterators;
     // Amount of free blocks at each cache level
     std::vector<SizeType32> mNumFreeBlocksPerLevel;
     // Secondary offload threshold. Blocks below this priority won't be evicted.

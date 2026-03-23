@@ -99,7 +99,6 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mWindowSize{std::numeric_limits<int>::max()}
     // sentinel: unattached; valid sizes are >= 1 or kRecurrentStates (-1)
     , mIsPlaceholder{false}
-    , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
     , mDurationMs{std::nullopt}

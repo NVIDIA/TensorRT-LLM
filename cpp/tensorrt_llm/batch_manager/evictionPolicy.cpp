@@ -65,7 +65,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
         for (SizeType32 blockId = 0; blockId < sizes[cacheLevel]; blockId++)
         {
             // Initialize all blocks to be the default priority level
-            mFreeBlockIterators.emplace_back(freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]));
+            mFreeBlockIterators.emplace_back(std::make_tuple(cacheLevel, defaultPriorityIdx, freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId])));
         }
 
         startIdx += sizes[cacheLevel];
@@ -122,6 +122,22 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
     TLLM_THROW("No free block found. This shouldn't happen!");
 }
 
+void LRUEvictionPolicy::addToFreeBlockQueue(SizeType32 cacheLevel, SizeType32 priority, BlockPtr block, bool toFront)
+{
+    SizeType32 const id = block->getBlockId(); // safe to get id from block, it never changes
+    auto& q = mFreeQueues[cacheLevel][priority];
+    auto insertItr = toFront ? q.begin() : q.end();
+    mFreeBlockIterators[id] = std::make_tuple(cacheLevel, priority, q.insert(insertItr, block));
+    mNumFreeBlocksPerLevel[cacheLevel]++;
+}
+
+void LRUEvictionPolicy::removeFromFreeBlockQueue(std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>& v)
+{
+    auto [cacheLevel, priority, it] = v;
+    mFreeQueues[cacheLevel][priority].erase(it);
+    mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+}
+
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 {
     releaseBlock(block, false);
@@ -139,18 +155,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
-    // If there are no children, this is a leaf block. Insert into a queue.
-    auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
-    if (toFront)
-    {
-        mFreeBlockIterators[id] = q.insert(q.begin(), block);
-    }
-    else
-    {
-        mFreeBlockIterators[id] = q.insert(q.end(), block);
-    }
-
-    mNumFreeBlocksPerLevel[cacheLevel]++;
+    addToFreeBlockQueue(cacheLevel, getPriorityIdx(block->getPriority()), block, toFront);
 
     if (block->getDurationMs().has_value()
         && block->getPriority() != executor::KvCacheRetentionConfig::kDefaultRetentionPriority)
@@ -177,13 +182,11 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     SizeType32 const id = block->getBlockId();
     SizeType32 const cacheLevel = getCacheLevel(block);
 
-    if (mFreeBlockIterators[id] != std::nullopt)
+    if (mFreeBlockIterators[id].has_value())
     {
-        mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
-        mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+        removeFromFreeBlockQueue(mFreeBlockIterators[id].value());
+        mFreeBlockIterators[id] = std::nullopt;
     }
-
-    mFreeBlockIterators[id] = std::nullopt;
 
     if (priority.has_value())
     {
@@ -214,12 +217,12 @@ void LRUEvictionPolicy::refresh()
 
         mExpiringBlockHeap.erase(mExpiringBlockHeap.begin());
 
-        if (mFreeBlockIterators[id] != std::nullopt)
+        if (mFreeBlockIterators[id].has_value())
         {
-            // This is already in another queue. Delete it, and bring it down to the default queue
-            mFreeQueues[level][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
-            auto& q = mFreeQueues[level][getPriorityIdx(kDefaultPriority)];
-            mFreeBlockIterators[id] = q.insert(q.end(), block);
+            // Delete from current queue
+            removeFromFreeBlockQueue(mFreeBlockIterators[id].value());
+            // Add to default priority queue
+            addToFreeBlockQueue(level, kDefaultPriority, block, false);
         }
         block->setPriority(kDefaultPriority);
     }
