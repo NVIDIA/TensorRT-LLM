@@ -85,15 +85,25 @@ def generate_rerun_tests_list(outdir,
             with open(test_list_filename, 'r') as f:
                 all_tests = [line.strip() for line in f if line.strip()]
 
+            # unfinished_lines: list of (original_line, stripped_test)
+            # The original line has a node prefix, e.g. "A10-PyTorch-1/path::test",
+            # while all_tests entries have no prefix, e.g. "path::test".
+            unfinished_lines = []
             unfinished_tests = set()
             if unfinished_test_filename and os.path.exists(
                     unfinished_test_filename):
                 with open(unfinished_test_filename, 'r') as f:
-                    unfinished_tests = {
-                        line.strip()
-                        for line in f if line.strip()
-                    }
+                    for line in f:
+                        original = line.strip()
+                        if not original:
+                            continue
+                        slash_idx = original.find('/')
+                        stripped = original[slash_idx +
+                                            1:] if slash_idx != -1 else original
+                        unfinished_lines.append((original, stripped))
+                        unfinished_tests.add(stripped)
 
+            all_tests_set = set(all_tests)
             for test in all_tests:
                 if test in unfinished_tests:
                     # Part 2: test appears in unfinished list
@@ -103,6 +113,18 @@ def generate_rerun_tests_list(outdir,
                     # Part 3: test never ran (not in results xml, not unfinished)
                     rerun_1_file.write(test + '\n')
                     print(test + " will rerun 1 time, because it did not run")
+
+            # Remove matched tests from unfinished_test_file
+            if unfinished_test_filename and os.path.exists(
+                    unfinished_test_filename):
+                remaining = [
+                    orig for orig, stripped in unfinished_lines
+                    if stripped not in all_tests_set
+                ]
+                print(f"Remaining unfinished tests: {remaining}")
+                with open(unfinished_test_filename, 'w') as f:
+                    f.write('\n'.join(remaining) +
+                            '\n' if remaining else '')
 
     # Remove empty files
     for filename in [rerun_0_filename, rerun_1_filename, rerun_2_filename]:
