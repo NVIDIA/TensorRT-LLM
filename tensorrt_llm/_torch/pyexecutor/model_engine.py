@@ -752,6 +752,9 @@ class PyTorchModelEngine(ModelEngine):
             # Currently graph has not been captured, disable cuda graph for this warmup.
             with self.no_cuda_graph():
                 self._general_warmup(resource_manager, warmup_requests_configs)
+                # Clear Cache now as autotuner may use additional memory.
+                # Memory pool will be warmed up latter.
+                torch.cuda.empty_cache()
 
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
