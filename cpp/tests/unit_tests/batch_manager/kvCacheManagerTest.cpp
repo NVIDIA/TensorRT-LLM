@@ -4339,10 +4339,14 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
 
     events = getEvents(kvCacheManager);
 
-    // Expecting only 1 event, storeContextBlock is not called for sliding window.
-    EXPECT_EQ(events.size(), 1);
+    EXPECT_EQ(events.size(), 2);
 
-    EXPECT_EQ(events.back().windowSize, maxAttentionWindow);
+    // storeContextBlocks iterates windows in descending order (largest first) to preserve
+    // per-window event ordering, so the full-attention window is emitted before the SWA window.
+    EXPECT_EQ(events.front().windowSize, maxAttentionWindow);
+    EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
+
+    EXPECT_EQ(events.back().windowSize, slidingWindow);
     EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.back().data));
 }
 
@@ -5819,9 +5823,16 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     auto const remainingBeforeAdd = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remainingBeforeAdd, numContextBlocks + numGenBlocks);
 
+    // Verify estimatedReusableTokens is still set after getRemainingBlocksToCompletion
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+
     // After addSequence, context blocks are allocated (reuse already applied during allocation)
     // Only generation blocks remain to be allocated
     kvCacheManager->addSequence(req1.mRequestId, req1.getPromptLen(), maxBeamWidth, req1);
+
+    // Verify estimatedReusableTokens is cleared to 0 after addSequence
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+
     auto const remainingAfterContextAlloc = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remainingAfterContextAlloc, maxNewTokens / tokensPerBlock);
 }
@@ -5934,6 +5945,9 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
+
+    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -5989,12 +6003,18 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     };
 
     // After removeSequence, reusable blocks are free (no active refs).
-    // getRemainingBlocksToCompletion must NOT subtract free reusable blocks.
+    // getRemainingBlocksToCompletion must NOT subtract free reusable blocks from the BLOCK budget.
     // Needs all 5 context + 3 generation = 8 blocks.
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     auto const numContextBlocks = promptLength / tokensPerBlock; // 5 blocks
     auto const numGenBlocks = maxNewTokens / tokensPerBlock;     // 3 blocks
     EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);       // 5 context + 3 generation = 8
+
+    // storeContextBlocks stores (promptLength - 1) / tokensPerBlock = 4 full blocks.
+    // getRemainingBlocksToCompletion counts ALL reusable blocks (free or allocated) for the
+    // TOKEN budget, so estimatedReusableTokens = min(4, 5) * tokensPerBlock = 64.
+    auto const numStoredBlocks = (promptLength - 1) / tokensPerBlock; // 4
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), std::min(numStoredBlocks, numContextBlocks) * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
@@ -6055,6 +6075,9 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
     EXPECT_EQ(neededOneStep, numSharedBlocks);                  // All 3 context blocks
+
+    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -6100,11 +6123,17 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
     auto const neededOneStep = kvCacheManager->getNeededBlocksOneStep(req, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
+    // Verify estimatedReusableTokens stays 0 when reuse is disabled
+    EXPECT_EQ(req.getEstimatedReusableTokens(), 0);
+
     // getRemainingBlocksToCompletion should include both context and generation blocks
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req, onlyWindowSize);
     auto const expectedContextBlocks = promptLength / tokensPerBlock;
     auto const expectedGenBlocks = maxNewTokens / tokensPerBlock;
     EXPECT_EQ(remaining, expectedContextBlocks + expectedGenBlocks); // 4 + 2 = 6 blocks
+
+    // Verify estimatedReusableTokens still 0 after getRemainingBlocksToCompletion
+    EXPECT_EQ(req.getEstimatedReusableTokens(), 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
@@ -6184,7 +6213,10 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction)
+    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+
+    // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction; blocks are free)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remaining, (promptLength / tokensPerBlock) + (maxNewTokens / tokensPerBlock));
 }
