@@ -66,18 +66,61 @@ class Drafter(ABC):
 
     @final
     def pad_draft_tokens_for_cuda_graph(
-            self, scheduled_requests: ScheduledRequests) -> None:
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
+    ) -> None:
         """
-        Pad draft tokens to the static max total draft tokens for CUDA graph compatibility.
+        Pad draft tokens to the static max total draft tokens for CUDA graph
+        compatibility, then extend KV cache capacity to match the padded length.
+
+        When draft_len_schedule reduces the draft length below the static max,
+        prepare_resources allocates KV cache capacity for the shorter length.
+        After padding restores py_draft_tokens to the static max, the sampler
+        will compute py_rewind_len from the padded length.  Without extending
+        capacity here, the rewind would exceed the allocated capacity.
+
+        Subclasses override ``_extend_kv_cache_for_padding`` to extend the
+        appropriate KV cache managers (main-only for NGram, main + draft for
+        two-model).  One-model drafters inherit the default no-op because
+        SpecSamplerBase computes rewind from runtime_draft_len, not
+        len(py_draft_tokens).
 
         Args:
             scheduled_requests: The scheduled requests to pad
+            resource_manager: The composite resource manager (needed for
+                KV cache extension when draft_len_schedule is active)
         """
+        # Capture pre-padding draft token lengths per request
+        pre_padding_lens: Dict[int, int] = {}
+        pad_to = self._static_max_total_draft_tokens
         for req in scheduled_requests.generation_requests:
             num_draft_tokens = get_draft_token_length(req)
+            pre_padding_lens[req.py_request_id] = num_draft_tokens
             req.py_draft_tokens.extend(
-                0 for _ in range(self._static_max_total_draft_tokens -
-                                 num_draft_tokens))
+                0 for _ in range(pad_to - num_draft_tokens))
+
+        # Let subclasses extend KV cache capacity for the extra padding
+        if resource_manager is not None:
+            self._extend_kv_cache_for_padding(scheduled_requests,
+                                              resource_manager,
+                                              pre_padding_lens)
+
+    def _extend_kv_cache_for_padding(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        pre_padding_lens: Dict[int, int],
+    ) -> None:
+        """Extend KV cache capacity to cover CUDA-graph padding tokens.
+
+        Default implementation is a no-op, which is correct for one-model
+        drafters (MTP / Eagle3 / SA) whose sampler computes rewind from
+        ``runtime_draft_len`` rather than ``len(py_draft_tokens)``.
+
+        Subclasses that use ``TorchSampler`` (NGram, two-model) must override
+        to extend the appropriate KV cache manager(s).
+        """
 
     def get_draft_len_for_batch_size(self, batch_size: int) -> int:
         """

@@ -1,12 +1,14 @@
-from typing import Optional
+from typing import Dict, Optional
 
 from ordered_set import OrderedSet
 
 from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
-from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
+from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
+                                      get_draft_token_length)
+from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
+                                           ResourceManagerType)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
 
@@ -201,6 +203,29 @@ class NGramDrafter(Drafter):
                 request.py_max_new_tokens,
             )
             request.py_draft_tokens = draft_tokens
+
+    def _extend_kv_cache_for_padding(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        pre_padding_lens: Dict[int, int],
+    ) -> None:
+        """Extend main-model KV cache capacity for the CUDA-graph padding tokens.
+
+        NGram uses TorchSampler which computes py_rewind_len from the padded
+        len(py_draft_tokens).  Without this extension, rewind would exceed the
+        capacity allocated by prepare_resources (which used the shorter,
+        schedule-based draft length).
+        """
+        kv_mgr = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_mgr is None:
+            return
+        for req in scheduled_requests.generation_requests:
+            extra = get_draft_token_length(req) - pre_padding_lens.get(
+                req.py_request_id, 0)
+            if extra > 0:
+                kv_mgr.extend_capacity_for_tokens(req, extra)
 
     def update_max_total_draft_tokens(self,
                                       new_max_total_draft_tokens: int) -> None:
