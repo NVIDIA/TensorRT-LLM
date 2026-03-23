@@ -65,7 +65,8 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
         for (SizeType32 blockId = 0; blockId < sizes[cacheLevel]; blockId++)
         {
             // Initialize all blocks to be the default priority level
-            mFreeBlockIterators.emplace_back(std::make_tuple(cacheLevel, defaultPriorityIdx, freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId])));
+            mFreeBlockIterators.emplace_back(std::make_tuple(
+                cacheLevel, defaultPriorityIdx, freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId])));
         }
 
         startIdx += sizes[cacheLevel];
