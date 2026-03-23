@@ -11,7 +11,8 @@ from tensorrt_llm.logger import logger
 from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
+                                      get_draft_token_length)
 from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
                                            ResourceManagerType)
 from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
@@ -108,6 +109,32 @@ class ModelDrafter(Drafter):
         self.previous_scheduled_batch: Optional[ScheduledRequests] = None
         # Map from request ID to original request
         self.req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None
+
+    def _extend_kv_cache_for_padding(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        pre_padding_lens: Dict[int, int],
+    ) -> None:
+        """Extend main-model and draft-model KV cache capacity for padding.
+
+        Two-model mode uses TorchSampler which computes py_rewind_len from
+        the padded len(py_draft_tokens).  Both KV cache managers (main and
+        draft) are rewound by the same py_rewind_len in update_resources,
+        so both must have capacity extended to match the padded length.
+        """
+        kv_mgr = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        draft_kv_mgr = resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        for req in scheduled_requests.generation_requests:
+            extra = get_draft_token_length(req) - pre_padding_lens.get(
+                req.py_request_id, 0)
+            if extra > 0:
+                if kv_mgr is not None:
+                    kv_mgr.extend_capacity_for_tokens(req, extra)
+                if draft_kv_mgr is not None:
+                    draft_kv_mgr.extend_capacity_for_tokens(req, extra)
 
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
@@ -744,7 +771,8 @@ class ModelDrafter(Drafter):
         return outputs, sample_state
 
     @nvtx_range("_process_previous_draft_results")
-    def _process_previous_draft_results(self) -> None:
+    def _process_previous_draft_results(
+            self, resource_manager: Optional[ResourceManager] = None) -> None:
         """
         Process the previous draft batch results.
         This should be called after the current draft forward to enable overlap scheduling.
@@ -774,7 +802,8 @@ class ModelDrafter(Drafter):
         self.req_id_to_old_request = current_req_id_to_old_request
 
         # Pad draft tokens to the max draft length for CUDA graph compatibility
-        self.pad_draft_tokens_for_cuda_graph(self.previous_scheduled_batch)
+        self.pad_draft_tokens_for_cuda_graph(self.previous_scheduled_batch,
+                                             resource_manager)
 
     def cleanup_previous_draft_resources(self) -> None:
         if self.previous_draft_batch is None:
@@ -893,7 +922,7 @@ class ModelDrafter(Drafter):
 
         # Process previous draft results after current forward pass
         # This enables overlap scheduling: process old batch while new batch is prepared
-        self._process_previous_draft_results()
+        self._process_previous_draft_results(resource_manager)
 
         num_draft_reqs = len(draft_batch.all_requests())
         if self.use_static_draft_loop:
