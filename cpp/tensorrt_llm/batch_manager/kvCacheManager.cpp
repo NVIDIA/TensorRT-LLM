@@ -1012,11 +1012,14 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         // We have the offloaded block as the block to use now.
         block = offloadBlock;
     }
+    else
+    {
+        // Claim the block in primary block queue
+        mEvictionPolicy->claimBlock(block, priority, durationMs);
+    }
 
     // Removes children of the block from the search tree
     freeChildren(block);
-    // Claim the block in primary block queue
-    mEvictionPolicy->claimBlock(block, priority, durationMs);
 
     // Deal with invalidating block save for reuse for the sequence
     if (mBlockToSequence.count(block->getBlockId()) > 0)
