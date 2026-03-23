@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modules.fla.utils import input_guard_exclude
+from tensorrt_llm._torch.modules.fla.utils import input_guard
 
 
 @triton.heuristics({
@@ -83,6 +83,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n).to(tl.int64)  # prevent int32 overflow
         if idx >= 0:
+            tl.device_assert(idx < h0_dim0,
+                             "idx out of bounds in h0_source load")
             p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V + o_k[:, None] * V +
                     o_v[None, :])
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
@@ -149,14 +151,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:
-            tl.device_assert(idx < h0_dim0,
-                             "idx out of bounds in h0_source store")
             p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V + o_k[:, None] * V +
                     o_v[None, :])
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-@input_guard_exclude(["initial_state_source"])
+@input_guard(exclude_args=["initial_state_source"])
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -204,6 +204,7 @@ def fused_sigmoid_gating_delta_rule_update(
         assert s_h0_1 == K * V, f"s_h0_1: {s_h0_1} is not {K * V}"
     else:
         s_h0_0 = 0
+        slot_num = 0
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
