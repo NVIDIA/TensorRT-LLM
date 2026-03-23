@@ -35,7 +35,7 @@ By NVIDIA TensorRT LLM Team
 
 The development of model like DeepSeek-V3/R1, which use large-scale fine-grained Mixture-of-Experts (MoE) designs, has significantly advanced open-source model quality. Newly released open-source models such as LLaMA4 and Qwen3 also adopt a similar large-scale fine-grained MoE design principle. However, large-scale MoE models introduce new challenges for inference systems, including high memory demands and inherent expert-level workload imbalance.
 
-In the past, we have shared TensorRT-LLM’s optimization experience to [push the latency boundary](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) of DeepSeek R1 model, [the implementation and optimization of MTP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md)(Multi-Token Prediction) and [the optimizations for DeepSeek R1 throughput oriented performance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md).
+In the past, we have shared TensorRT-LLM’s optimization experience to [push the latency boundary](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) of DeepSeek R1 model, [the implementation and optimization of MTP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.md)(Multi-Token Prediction) and [the optimizations for DeepSeek R1 throughput oriented performance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md).
 
 The DeepSeek team has also shared their valuable experience and practice on how to optimize this kind of large-scale Expert Parallelism (EP) model, including [DeepEP](https://github.com/deepseek-ai/DeepEP) and [EPLB](https://github.com/deepseek-ai/EPLB). Also, the DeepSeek team has shared their concrete design considerations in [this](https://arxiv.org/abs/2412.19437) tech report. On top of those great sharings, there are also nice community efforts to implement large-scale EP in other inference engines, such as [this](https://lmsys.org/blog/2025-05-05-large-scale-ep/) effort from the SGLang team.
 
@@ -396,7 +396,7 @@ On servers without C2C but with PCIe, if cross-node communication is required, n
 
 ### Offline EP Load Balancer
 
-Online EP balancer is more suitable for production deployment needs to react timely to online traffic changes. However, Offline EP Balancer provides a lightweight way for performance study/debugging and validation. You can refer to [this PR](https://github.com/NVIDIA/TensorRT-LLM/pull/4695) to learn more about the implementation of the Offline EP Load Balancer. Also there is a tool provided to collect statistics about the expert activation distribution which can be used as the input to deduce the EP balancing placement strategy. You can refer to [this](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/examples/ep_load_balancer#offline-ep-load-balancer) doc to learn more details as well as how how to run through the Offline EP Load Balancer in E2E approach.
+Online EP balancer is more suitable for production deployment needs to react timely to online traffic changes. However, Offline EP Balancer provides a lightweight way for performance study/debugging and validation. You can refer to [this PR](https://github.com/NVIDIA/TensorRT-LLM/pull/4695) to learn more about the implementation of the Offline EP Load Balancer. Also there is a tool provided to collect statistics about the expert activation distribution which can be used as the input to deduce the EP balancing placement strategy. You can refer to [this](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#offline-ep-load-balancer) doc to learn more details as well as how to run through the Offline EP Load Balancer in E2E approach.
 
 ## E2E evaluation
 
@@ -519,7 +519,7 @@ The code and scripts required in the reproducing steps described in this section
 
 ### The effect of EP Load Balancer
 
-Please, refer to the [EP Load Balancer example](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/examples/ep_load_balancer) for how to reproduce the results for the offline EP Load Balancer.
+Please, refer to the [EP Load Balancer example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer) for how to reproduce the results for the offline EP Load Balancer.
 
 ##### Step 1: Run inference and collect statistics
 
@@ -536,7 +536,7 @@ export EXPERT_STATISTIC_PATH=./expert_statistic
 export EXPERT_STATISTIC_ITER_RANGE=100-200
 ```
 
-Prepare a dataset following the [benchmarking documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-benchmarking.md#preparing-a-dataset) and save it as `./dataset.json`.
+Prepare a dataset following the [benchmarking documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-benchmarking.md#preparing-a-dataset) and save it as `./dataset.json`.
 
 Run 32-way expert parallelism inference on the prepared dataset. Please refer to the [LLM API MGMN example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_bench.sh) for details on running `trtllm-bench` on Slurm.
 
@@ -559,10 +559,10 @@ trtllm-bench --model ${MODEL_NAME} \
     --eos_id -1
 ```
 
-After inference, review the dumped statistic files in `$EXPERT_STATISTIC_PATH`. Run the `examples/ep_load_balancer/report_load_statistics.py` script to show the standard deviation and imbalance ratio metrics:
+After inference, review the dumped statistic files in `$EXPERT_STATISTIC_PATH`. Run the `examples/wide_ep/ep_load_balancer/report_load_statistics.py` script to show the standard deviation and imbalance ratio metrics:
 
 ```bash
-python examples/ep_load_balancer/report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
+python examples/wide_ep/ep_load_balancer/report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
 ```
 
 The output would look like:
@@ -582,10 +582,10 @@ average  1024.0  491.651199         1.564272
 
 ##### Step 2: Generate the EPLB configuration
 
-Use the provided `examples/ep_load_balancer/generate_eplb_config.py` script to convert the collected statistics into an EPLB configuration file. Specify the target expert parallelism size (`--ep_size`) and the total number of slots (`--num_slots`) that will be used for deployment. For example, if we choose to maintain 8 expert slots per rank while increasing expert parallelism to 36 ways, there should be 32 redundant experts and 288 expert slots in total.
+Use the provided `examples/wide_ep/ep_load_balancer/generate_eplb_config.py` script to convert the collected statistics into an EPLB configuration file. Specify the target expert parallelism size (`--ep_size`) and the total number of slots (`--num_slots`) that will be used for deployment. For example, if we choose to maintain 8 expert slots per rank while increasing expert parallelism to 36 ways, there should be 32 redundant experts and 288 expert slots in total.
 
 ```bash
-python examples/ep_load_balancer/generate_eplb_config.py \
+python examples/wide_ep/ep_load_balancer/generate_eplb_config.py \
     --ep_size 36 \
     --num_slots 288 \
     --expert_statistic_path $EXPERT_STATISTIC_PATH \
@@ -641,10 +641,10 @@ trtllm-bench --model ${MODEL_NAME} \
     --eos_id -1
 ```
 
-Run the `examples/ep_load_balancer/report_load_statistics.py` script again:
+Run the `examples/wide_ep/ep_load_balancer/report_load_statistics.py` script again:
 
 ```bash
-python examples/ep_load_balancer/report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
+python examples/wide_ep/ep_load_balancer/report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
 ```
 
 The output would look like:

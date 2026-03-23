@@ -102,9 +102,37 @@ def exact_div(x: int, y: int) -> int:
     return x // y
 
 
-def overlap(a: tuple[Index, Index], b: tuple[Index, Index]) -> tuple[Index, Index] | tuple[()]:
-    "Returns the overlap of two ranges, or an empty tuple if they do not overlap."
-    return (max(a[0], b[0]), min(a[1], b[1])) if a[0] < b[1] and b[0] < a[1] else ()
+Idx = TypeVar("Idx", bound=int)
+
+
+class HalfOpenRange(tuple[Idx, Idx], Generic[Idx]):
+    """A half-open range [beg, end). Falsy when empty (beg >= end).
+    Generic over index type. Supports unpacking into (beg, end)."""
+
+    __slots__ = ()
+
+    def __new__(cls, beg: Idx, end: Idx) -> "HalfOpenRange[Idx]":
+        return tuple.__new__(cls, (beg, end))
+
+    @property
+    def beg(self) -> Idx:
+        return self[0]
+
+    @property
+    def end(self) -> Idx:
+        return self[1]
+
+    def __bool__(self) -> bool:
+        return self[0] < self[1]
+
+    def __len__(self) -> int:
+        return max(0, self[1] - self[0])
+
+
+def intersect(a: HalfOpenRange[Idx], b: HalfOpenRange[Idx]) -> HalfOpenRange[Idx]:
+    """Returns the intersection of two half-open ranges [beg, end).
+    The result may be empty (beg >= end), which is safe to chain into further intersections."""
+    return HalfOpenRange(max(a[0], b[0]), min(a[1], b[1]))
 
 
 def value_or(opt: T | None, default: T) -> T:
@@ -851,7 +879,7 @@ class TemporaryCudaStream(CachedCudaStream):
     """
     A cached non-blocking CUDA stream. Mainly used as temporary worker streams.
     Requires a list of prior events to wait for dependencies. A finish event is recorded when exiting
-    normally. Call take_finish_event() to get the finish event.
+    normally. Call take_finish_event() to consume the finish event, otherwise you get a warning.
     """
 
     __slots__ = "_finish_event"
