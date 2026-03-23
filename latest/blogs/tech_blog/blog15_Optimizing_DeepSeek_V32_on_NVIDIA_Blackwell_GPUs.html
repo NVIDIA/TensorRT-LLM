@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=6097372f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=83e831d6" />
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../_static/config_selector.js?v=04c94837"></script>
+    <script src="../../_static/config_selector.js?v=52eb2d38"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc9';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,13 +74,13 @@
 
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="Accelerating Long-Context Inference with Skip Softmax Attention" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html" />
-    <link rel="prev" title="Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html" />
+    <link rel="next" title="Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html" />
+    <link rel="prev" title="Accelerating Long-Context Inference with Skip Softmax Attention" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc9" />
 
 
   </head>
@@ -388,6 +388,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
@@ -452,27 +453,30 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
 <ul class="nav bd-sidenav">
@@ -616,7 +620,7 @@
 <div class="math notranslate nohighlight">
 \[I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)\]</div>
 <p>Finally, a Top-K operation is applied to the index scores to identify the most relevant indices, which are subsequently used for the sparse MLA computation. To reduce computational overhead, the K tensor <span class="math notranslate nohighlight">\(K_t^I\)</span> is stored in the indexer K cache, allowing for reuse in subsequent iterations.</p>
-<p>Regarding implementation, DSA diverges from the MLA used in DeepSeek-V3/R1/V3.1 models, which alternates between MHA mode (prefill) and MQA mode (decoding) as discussed in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a>. Instead, our current DSA implementation operates only in MQA mode for both prefill and decoding phases to maximize kernel efficiency. We are continuing to explore further optimizations, including potential support for MHA mode in future iterations.</p>
+<p>Regarding implementation, DSA diverges from the MLA used in DeepSeek-V3/R1/V3.1 models, which alternates between MHA mode (prefill) and MQA mode (decoding) as discussed in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a>. Instead, our current DSA implementation operates only in MQA mode for both prefill and decoding phases to maximize kernel efficiency. We are continuing to explore further optimizations, including potential support for MHA mode in future iterations.</p>
 <p>The DSA implementation is built upon the TensorRT LLM sparse attention framework, which is designed to provide flexible and extensible support for various sparse attention methods. For more information, please refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/sparse-attention.md">sparse attention documentation</a>, and a technical blog providing further details will be released soon.</p>
 </section>
 <section id="precision-strategy">
@@ -645,7 +649,7 @@
 </ul>
 </li>
 </ul>
-<p>The MoE layers use NVFP4, which is the same as the DeepSeek-R1. Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md">Tech Blog 1</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a> for the MoE precision strategy. In addition to the NVFP4 version of DeepSeek-V3.2, TensorRT-LLM also supports the original FP8 model, as well as both BF16 and per-tensor FP8 KV caches.</p>
+<p>The MoE layers use NVFP4, which is the same as the DeepSeek-R1. Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md">Tech Blog 1</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a> for the MoE precision strategy. In addition to the NVFP4 version of DeepSeek-V3.2, TensorRT-LLM also supports the original FP8 model, as well as both BF16 and per-tensor FP8 KV caches.</p>
 <p>We evaluated the accuracy of this NVFP4 checkpoint on the same datasets:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -674,7 +678,7 @@
 </section>
 <section id="parallel-strategy">
 <h2>Parallel Strategy<a class="headerlink" href="#parallel-strategy" title="Link to this heading">#</a></h2>
-<p>To achieve optimal throughput, DeepSeek-V3.2 adopts the same parallel strategy as DeepSeek-R1. Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a> for a detailed explanation of the performance benefits:</p>
+<p>To achieve optimal throughput, DeepSeek-V3.2 adopts the same parallel strategy as DeepSeek-R1. Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a> for a detailed explanation of the performance benefits:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Components</p></th>
@@ -697,16 +701,16 @@
 </tbody>
 </table>
 </div>
-<p>To scale DeepSeek-V3.2 inference on high-performance systems such as the GB200 NVL72, the model also leverages the parallel strategy from DeepSeek-R1. Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">Tech Blog 4</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md">Tech Blog 8</a>, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md">Tech Blog 14</a> for more details.</p>
+<p>To scale DeepSeek-V3.2 inference on high-performance systems such as the GB200 NVL72, the model also leverages the parallel strategy from DeepSeek-R1. Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">Tech Blog 4</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md">Tech Blog 8</a>, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md">Tech Blog 14</a> for more details.</p>
 <p>The difference lies in the DSA indexer. When utilizing Tensor Parallelism (TP) for attention modules, typically in latency-oriented scenarios, TP is not applied to the indexer layers. Instead, it is applied exclusively to the MLA components (i.e., the remaining layers of the attention module).</p>
 </section>
 <section id="key-features">
 <h2>Key Features<a class="headerlink" href="#key-features" title="Link to this heading">#</a></h2>
 <p>In TensorRT LLM, there are many advanced features that are crucial for maximizing LLM inference performance, such as CUDA Graph, Overlap Scheduler, Speculative Decoding, etc. Given the architectural innovations in DeepSeek-V3.2, ensuring its compatibility with these features is important.</p>
-<p>As illustrated in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a>, both CUDA Graph and the Overlap Scheduler offer significant throughput improvements. For CUDA Graph support, which is typically enabled during decoding-only iterations where all requests are in the decoding phase, we must ensure that kernels in the DSA module support graph capture and that input/output tensor shapes remain consistent for a given batch size. Regarding the Overlap Scheduler, it is critical to eliminate any CPU-GPU synchronization within the DSA forward, as this would disrupt the execution pipeline. Other key features are discussed in the following subsections.</p>
+<p>As illustrated in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a>, both CUDA Graph and the Overlap Scheduler offer significant throughput improvements. For CUDA Graph support, which is typically enabled during decoding-only iterations where all requests are in the decoding phase, we must ensure that kernels in the DSA module support graph capture and that input/output tensor shapes remain consistent for a given batch size. Regarding the Overlap Scheduler, it is critical to eliminate any CPU-GPU synchronization within the DSA forward, as this would disrupt the execution pipeline. Other key features are discussed in the following subsections.</p>
 <section id="mtp">
 <h3>MTP<a class="headerlink" href="#mtp" title="Link to this heading">#</a></h3>
-<p>Multi-Token Prediction (MTP) is a speculative decoding method used in DeepSeek series models. It verifies and accepts multiple draft tokens in a single iteration, significantly improving inference performance in both low-latency and high-throughput scenarios. The DeepSeek-V3.2 also supports MTP. For latency-critical scenarios, as detailed in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md">Tech Blog 1</a>, MTP-3 is recommended to maximize GPU utilization and achieve optimal performance. For other scenarios, MTP-1 typically offers performance gains as well.</p>
+<p>Multi-Token Prediction (MTP) is a speculative decoding method used in DeepSeek series models. It verifies and accepts multiple draft tokens in a single iteration, significantly improving inference performance in both low-latency and high-throughput scenarios. The DeepSeek-V3.2 also supports MTP. For latency-critical scenarios, as detailed in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md">Tech Blog 1</a>, MTP-3 is recommended to maximize GPU utilization and achieve optimal performance. For other scenarios, MTP-1 typically offers performance gains as well.</p>
 <p>However, the decoding indexer MQA kernel supports sequence lengths of only 1 or 2, limiting native support to MTP-off or MTP-1. To enable MTP &gt; 1, we offer two solutions. The long-term solution involves updating the MQA kernel to support larger sequence lengths, which will be introduced in the MQA kernel optimization section. The immediate workaround (in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/9045">PR-9045</a>) uses the existing kernel by flattening the sequence length dimension into the batch dimension, treating the input as a tensor with a sequence length of 1. While this approach ignores the causal mask during the indexer MQA forward, causing discrepancies in the diagonal regions compared to ground truth, the subsequent Top-K kernel handles causal masking correctly. Therefore, the final Top-K indices remain unaffected, allowing this workaround to support MTP-N for any N.</p>
 </section>
 <section id="disaggregated-serving">
@@ -1099,7 +1103,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
 </section>
 <section id="benchmark-with-wide-ep-on-gb200">
 <h3>Benchmark with Wide-EP on GB200<a class="headerlink" href="#benchmark-with-wide-ep-on-gb200" title="Link to this heading">#</a></h3>
-<p>To validate the efficacy of Wide-EP on DeepSeek-V3.2, we evaluated performance using the NVFP4 model on a GB200 NVL72 system. We compared EP16 and EP32 configurations against EP4 and EP8 baselines, with benchmarks conducted at ISL=8K and OSL=1K using the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md#measurement-methodology">Rate Matching</a> methodology.</p>
+<p>To validate the efficacy of Wide-EP on DeepSeek-V3.2, we evaluated performance using the NVFP4 model on a GB200 NVL72 system. We compared EP16 and EP32 configurations against EP4 and EP8 baselines, with benchmarks conducted at ISL=8K and OSL=1K using the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.md#measurement-methodology">Rate Matching</a> methodology.</p>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog15_ds32_wide_ep.png" alt="tech_blog15_ds32_wide_ep" width="700" height="auto">
@@ -1138,20 +1142,20 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html"
+       href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</p>
+        <p class="prev-next-title">Accelerating Long-Context Inference with Skip Softmax Attention</p>
       </div>
     </a>
     <a class="right-next"
-       href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html"
+       href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Accelerating Long-Context Inference with Skip Softmax Attention</p>
+        <p class="prev-next-title">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1313,9 +1317,9 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 16, 2026.</p>
+  <p>Last updated on March 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/73cca36">73cca36</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3353334">3353334</a>.</p>
   
 </div></div>
       

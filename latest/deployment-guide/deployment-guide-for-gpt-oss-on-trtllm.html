@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=6097372f" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=83e831d6" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=04c94837"></script>
+    <script src="../_static/config_selector.js?v=52eb2d38"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc9';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -80,7 +80,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc9" />
 
 
   </head>
@@ -388,6 +388,7 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
@@ -452,27 +453,30 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
 <ul class="nav bd-sidenav">
@@ -601,7 +605,7 @@
 -p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 -v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
 --name<span class="w"> </span>tensorrt_llm<span class="w"> </span><span class="se">\</span>
-nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc8<span class="w"> </span><span class="se">\</span>
+nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc9<span class="w"> </span><span class="se">\</span>
 /bin/bash
 </pre></div>
 </div>
@@ -1005,685 +1009,6 @@ requiring them to fit within a single prefill operation. Note that enabling chun
 does <strong>not</strong> guarantee optimal performance—these configs are tuned for the specified ISL/OSL.</p>
 </div>
 </section>
-<section id="recipe-database">
-<h3>Recipe database<a class="headerlink" href="#recipe-database" title="Link to this heading">#</a></h3>
-<section id="openai-gpt-oss-120b">
-<span id="id1"></span><h4><a class="reference external" href="https://huggingface.co/openai/gpt-oss-120b">gpt-oss-120b</a><a class="headerlink" href="#openai-gpt-oss-120b" title="Link to this heading">#</a></h4>
-<div class="pst-scrollable-table-container"><table class="table" style="width: 100%">
-<colgroup>
-<col style="width: 10.0%" />
-<col style="width: 15.0%" />
-<col style="width: 15.0%" />
-<col style="width: 13.0%" />
-<col style="width: 18.0%" />
-<col style="width: 29.0%" />
-</colgroup>
-<thead>
-<tr class="row-odd"><th class="head"><p>GPU</p></th>
-<th class="head"><p>Performance Profile</p></th>
-<th class="head"><p>ISL / OSL</p></th>
-<th class="head"><p>Concurrency</p></th>
-<th class="head"><p>Config</p></th>
-<th class="head"><p>Command</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>2xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>4</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc4.yaml">1k8k_tp2_conc4.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc4.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>2xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>256</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc256.yaml">1k8k_tp2_conc256.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc256.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>2xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>768</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc768.yaml">8k1k_tp2_conc768.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc768.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>2xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>1280</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc1280.yaml">8k1k_tp2_conc1280.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc1280.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>8</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc8.yaml">1k1k_tp4_conc8.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc8.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>128</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc128.yaml">1k1k_tp4_conc128.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc128.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>256</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc256.yaml">1k1k_tp4_conc256.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc256.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>1280</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc1280.yaml">1k1k_tp4_conc1280.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc1280.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>1536</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc1536.yaml">1k1k_tp4_conc1536.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc1536.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>10</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc10.yaml">1k8k_tp4_conc10.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc10.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>64</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc64.yaml">1k8k_tp4_conc64.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc64.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>128</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc128.yaml">1k8k_tp4_conc128.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc128.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>384</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc384.yaml">1k8k_tp4_conc384.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc384.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>640</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc640.yaml">1k8k_tp4_conc640.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc640.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>896</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc896.yaml">1k8k_tp4_conc896.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc896.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>1</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc1.yaml">8k1k_tp4_conc1.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc1.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>2</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc2.yaml">8k1k_tp4_conc2.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc2.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>4</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc4.yaml">8k1k_tp4_conc4.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc4.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>10</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc10.yaml">8k1k_tp4_conc10.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc10.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>32</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc32.yaml">8k1k_tp4_conc32.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc32.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>64</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc64.yaml">8k1k_tp4_conc64.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc64.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>256</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc256.yaml">8k1k_tp4_conc256.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc256.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>1536</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc1536.yaml">8k1k_tp4_conc1536.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc1536.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>1792</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc1792.yaml">8k1k_tp4_conc1792.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc1792.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>1</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc1.yaml">1k1k_tp8_conc1.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc1.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>2</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc2.yaml">1k1k_tp8_conc2.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc2.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>4</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc4.yaml">1k1k_tp8_conc4.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc4.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>16</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc16.yaml">1k1k_tp8_conc16.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc16.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>32</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc32.yaml">1k1k_tp8_conc32.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc32.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>64</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc64.yaml">1k1k_tp8_conc64.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc64.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>384</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc384.yaml">1k1k_tp8_conc384.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc384.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>512</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc512.yaml">1k1k_tp8_conc512.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc512.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>640</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc640.yaml">1k1k_tp8_conc640.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc640.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>768</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc768.yaml">1k1k_tp8_conc768.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc768.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>896</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc896.yaml">1k1k_tp8_conc896.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc896.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>1792</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc1792.yaml">1k1k_tp8_conc1792.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc1792.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>2048</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc2048.yaml">1k1k_tp8_conc2048.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc2048.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>1</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1.yaml">1k8k_tp8_conc1.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>2</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc2.yaml">1k8k_tp8_conc2.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc2.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>8</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc8.yaml">1k8k_tp8_conc8.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc8.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>16</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc16.yaml">1k8k_tp8_conc16.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc16.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>32</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc32.yaml">1k8k_tp8_conc32.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc32.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>768</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc768.yaml">1k8k_tp8_conc768.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc768.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>1024</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1024.yaml">1k8k_tp8_conc1024.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1024.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>1280</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1280.yaml">1k8k_tp8_conc1280.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1280.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>1792</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1792.yaml">1k8k_tp8_conc1792.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1792.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>2048</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc2048.yaml">1k8k_tp8_conc2048.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc2048.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Min Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>8</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc8.yaml">8k1k_tp8_conc8.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc8.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Low Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>16</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc16.yaml">8k1k_tp8_conc16.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc16.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>128</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc128.yaml">8k1k_tp8_conc128.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc128.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Balanced</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>384</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc384.yaml">8k1k_tp8_conc384.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc384.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xB200_NVL</p></td>
-<td><p>High Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>640</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc640.yaml">8k1k_tp8_conc640.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc640.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xB200_NVL</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>2048</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc2048.yaml">8k1k_tp8_conc2048.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc2048.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>2xH200_SXM</p></td>
-<td><p>Min Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>16</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc16.yaml">8k1k_tp2_conc16.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc16.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>2xH200_SXM</p></td>
-<td><p>Balanced</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>256</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc256.yaml">8k1k_tp2_conc256.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc256.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>2xH200_SXM</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>384</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc384.yaml">8k1k_tp2_conc384.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc384.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xH200_SXM</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>128</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc128.yaml">1k1k_tp4_conc128.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc128.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xH200_SXM</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>384</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc384.yaml">1k1k_tp4_conc384.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc384.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xH200_SXM</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>1024</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc1024.yaml">1k1k_tp4_conc1024.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc1024.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>512</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp4_conc512.yaml">1k8k_tp4_conc512.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp4_conc512.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xH200_SXM</p></td>
-<td><p>Min Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>2</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc2.yaml">8k1k_tp4_conc2.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc2.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>4xH200_SXM</p></td>
-<td><p>Balanced</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>4</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc4.yaml">8k1k_tp4_conc4.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc4.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>4xH200_SXM</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>768</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc768.yaml">8k1k_tp4_conc768.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc768.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>4</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc4.yaml">1k1k_tp8_conc4.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc4.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>8</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc8.yaml">1k1k_tp8_conc8.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc8.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>16</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc16.yaml">1k1k_tp8_conc16.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc16.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>32</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc32.yaml">1k1k_tp8_conc32.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc32.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>64</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc64.yaml">1k1k_tp8_conc64.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc64.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>512</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc512.yaml">1k1k_tp8_conc512.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc512.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>768</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc768.yaml">1k1k_tp8_conc768.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc768.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>896</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc896.yaml">1k1k_tp8_conc896.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc896.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 1024</p></td>
-<td><p>2048</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc2048.yaml">1k1k_tp8_conc2048.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc2048.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Min Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>1</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc1.yaml">1k8k_tp8_conc1.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc1.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>2</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc2.yaml">1k8k_tp8_conc2.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc2.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>4</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc4.yaml">1k8k_tp8_conc4.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc4.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>8</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc8.yaml">1k8k_tp8_conc8.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc8.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>16</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc16.yaml">1k8k_tp8_conc16.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc16.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>32</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc32.yaml">1k8k_tp8_conc32.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc32.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Balanced</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>64</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc64.yaml">1k8k_tp8_conc64.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc64.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>128</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc128.yaml">1k8k_tp8_conc128.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc128.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>256</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc256.yaml">1k8k_tp8_conc256.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc256.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>768</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc768.yaml">1k8k_tp8_conc768.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc768.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>896</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc896.yaml">1k8k_tp8_conc896.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc896.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>1024</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc1024.yaml">1k8k_tp8_conc1024.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc1024.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>1024 / 8192</p></td>
-<td><p>1280</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc1280.yaml">1k8k_tp8_conc1280.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc1280.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Min Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>1</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc1.yaml">8k1k_tp8_conc1.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc1.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>8</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc8.yaml">8k1k_tp8_conc8.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc8.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Low Latency</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>32</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc32.yaml">8k1k_tp8_conc32.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc32.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Balanced</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>64</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc64.yaml">8k1k_tp8_conc64.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc64.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>Balanced</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>128</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc128.yaml">8k1k_tp8_conc128.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc128.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>512</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc512.yaml">8k1k_tp8_conc512.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc512.yaml</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>8xH200_SXM</p></td>
-<td><p>High Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>640</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc640.yaml">8k1k_tp8_conc640.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc640.yaml</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>8xH200_SXM</p></td>
-<td><p>Max Throughput</p></td>
-<td><p>8192 / 1024</p></td>
-<td><p>1536</p></td>
-<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc1536.yaml">8k1k_tp8_conc1536.yaml</a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--config</span> <span class="pre">${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc1536.yaml</span></code></p></td>
-</tr>
-</tbody>
-</table>
-</div>
-</section>
-</section>
 </section>
 </section>
 
@@ -1777,10 +1102,6 @@ does <strong>not</strong> guarantee optimal performance—these configs are tune
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#preconfigured-recipes">Preconfigured Recipes</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recipe-selector">Recipe selector</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recipe-database">Recipe database</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#openai-gpt-oss-120b">gpt-oss-120b</a></li>
-</ul>
-</li>
 </ul>
 </li>
 </ul>
@@ -1874,9 +1195,9 @@ does <strong>not</strong> guarantee optimal performance—these configs are tune
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 16, 2026.</p>
+  <p>Last updated on March 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/73cca36">73cca36</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3353334">3353334</a>.</p>
   
 </div></div>
       

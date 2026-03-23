@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=6097372f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=83e831d6" />
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,18 +52,18 @@
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../_static/config_selector.js?v=04c94837"></script>
+    <script src="../../_static/config_selector.js?v=52eb2d38"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
     <script src="../../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc9';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -72,13 +72,13 @@
 
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html" />
-    <link rel="prev" title="N-Gram Speculative Decoding in TensorRT LLM" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html" />
+    <link rel="next" title="N-Gram Speculative Decoding in TensorRT LLM" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html" />
+    <link rel="prev" title="Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc9" />
 
 
   </head>
@@ -386,6 +386,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
@@ -450,27 +451,30 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
 <ul class="nav bd-sidenav">
@@ -534,7 +538,7 @@
                   
   <section class="tex2jax_ignore mathjax_ignore" id="scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization">
 <h1>Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)<a class="headerlink" href="#scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization" title="Link to this heading">#</a></h1>
-<p>This blog post continues our previous work on <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a>, where we introduced the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM. Building upon that foundation, we have made significant performance improvements through various optimizations, achieving better throughput and latency for large-scale MoE models.</p>
+<p>This blog post continues our previous work on <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a>, where we introduced the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM. Building upon that foundation, we have made significant performance improvements through various optimizations, achieving better throughput and latency for large-scale MoE models.</p>
 <p><em>By NVIDIA TensorRT LLM Team</em></p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
@@ -584,7 +588,7 @@
 </section>
 <section id="optimization-highlights">
 <h2>Optimization Highlights<a class="headerlink" href="#optimization-highlights" title="Link to this heading">#</a></h2>
-<p>Following the introduction of the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM in our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">previous blog</a>, the TensorRT LLM team has focused on optimizing the large EP implementation to improve performance.</p>
+<p>Following the introduction of the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM in our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">previous blog</a>, the TensorRT LLM team has focused on optimizing the large EP implementation to improve performance.</p>
 <p>At the kernel level, we analyzed kernel duration and optimized performance by either improving existing kernels or developing new kernels that perform better. At the system level, we refined and optimized the EPLB implementation (which also helps reduce kernel scalability issues), integrated additional features such as MTP, and optimized host overhead to prevent Python code from slowing down inference.</p>
 <section id="kernel-optimizations">
 <h3>Kernel Optimizations<a class="headerlink" href="#kernel-optimizations" title="Link to this heading">#</a></h3>
@@ -623,7 +627,7 @@
 </section>
 <section id="communication-kernels">
 <h4>Communication Kernels<a class="headerlink" href="#communication-kernels" title="Link to this heading">#</a></h4>
-<p>As introduced in our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-communication-kernels-implementation">previous blog</a>, we developed EP communication kernels to transfer hidden state tensors of MoE. In the original design, each rank needs to determine which tokens it needs to send and receive, along with the expert IDs and scaling factors selected by those tokens. We initially used <code class="docutils literal notranslate"><span class="pre">allgather</span></code> to collect expert IDs and scaling factors, then each rank calculated the required metadata. However, we found that although the transmission size of this data is not large, the performance of <code class="docutils literal notranslate"><span class="pre">allgather</span></code> is unsatisfactory and may become a performance bottleneck when EP size increases. Therefore, we developed new communication kernels to optimize this process.</p>
+<p>As introduced in our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-communication-kernels-implementation">previous blog</a>, we developed EP communication kernels to transfer hidden state tensors of MoE. In the original design, each rank needs to determine which tokens it needs to send and receive, along with the expert IDs and scaling factors selected by those tokens. We initially used <code class="docutils literal notranslate"><span class="pre">allgather</span></code> to collect expert IDs and scaling factors, then each rank calculated the required metadata. However, we found that although the transmission size of this data is not large, the performance of <code class="docutils literal notranslate"><span class="pre">allgather</span></code> is unsatisfactory and may become a performance bottleneck when EP size increases. Therefore, we developed new communication kernels to optimize this process.</p>
 <p>First, a kernel counts the number of tokens needed to be transferred to another rank and transfers the count to that rank. Then each rank can calculate the index information for subsequent alltoall kernels. Finally, an alltoall kernel transfers expert IDs and scaling factors. These kernels make EP more scalable because the communication size no longer increases with EP size. The implementation of the communication part of these kernels is similar to the previous communication kernel of hidden states, are used in a FIFO manner. But an important difference is that these kernels use release-acquire instructions to ensure memory consistency, which has the advantage of being able to support various forms of data more flexibly. Although it is not as efficient as LL128 primitive in terms of performance, it is more helpful for fast iteration before the functionality converges.</p>
 <p>Note that although these kernels achieve better performance compared to <code class="docutils literal notranslate"><span class="pre">allgather</span></code>, there is still considerable room for optimization, especially in latency-bound scenarios.</p>
 <p>This optimization was implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/5570">PR 5570</a>, with the following performance improvement:</p>
@@ -637,7 +641,7 @@
 </section>
 <section id="expert-parallelism-load-balancer-eplb">
 <h3>Expert Parallelism Load Balancer (EPLB)<a class="headerlink" href="#expert-parallelism-load-balancer-eplb" title="Link to this heading">#</a></h3>
-<p>As introduced in our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-load-balancer">previous blog</a>, EP-level workload imbalance is common for large-scale EP inference across multiple datasets and has significant performance impacts. TensorRT LLM implements a set of functionalities to address this issue. We have refined the code and improved the usability of this feature, and the benefits of EPLB are directly reflected in kernel duration improvements.</p>
+<p>As introduced in our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-load-balancer">previous blog</a>, EP-level workload imbalance is common for large-scale EP inference across multiple datasets and has significant performance impacts. TensorRT LLM implements a set of functionalities to address this issue. We have refined the code and improved the usability of this feature, and the benefits of EPLB are directly reflected in kernel duration improvements.</p>
 <p>The core challenge with EP scaling is that different experts receive varying amounts of work based on the routing decisions made by the MoE layer. This imbalance becomes more pronounced as EP size increases, leading to scenarios where some GPUs are heavily loaded while others remain underutilized. The Expert Parallelism Load Balancer (EPLB) addresses this by dynamically redistributing expert assignments to achieve better load balance across all participating GPUs.</p>
 <p>EPLB operates in two main modes:</p>
 <ul class="simple">
@@ -648,7 +652,7 @@
 <p>In the previous <a class="reference internal" href="#kernel-optimizations">Kernel Optimizations</a> section, we noted that <code class="docutils literal notranslate"><span class="pre">reduce_scatter</span></code> and <code class="docutils literal notranslate"><span class="pre">alltoall</span></code> kernels do not show good scalability, with load imbalance being the major root cause. After applying proper EPLB strategy, those kernels perform well even when EP size scales to larger extents.</p>
 <section id="attempts-at-online-eplb-implementation">
 <h4>Attempts at Online EPLB Implementation<a class="headerlink" href="#attempts-at-online-eplb-implementation" title="Link to this heading">#</a></h4>
-<p>We discussed the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#high-level-design-introduction">high-level design</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#online-ep-load-balancer">implementation considerations</a> of Online EPLB in our previous blog. However, several unexpected issues arose during implementation.</p>
+<p>We discussed the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#high-level-design-introduction">high-level design</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#online-ep-load-balancer">implementation considerations</a> of Online EPLB in our previous blog. However, several unexpected issues arose during implementation.</p>
 <p>These issues primarily stem from the weight updating mechanism.</p>
 <section id="initial-approach-for-weight-updating-cudamemcpyasync">
 <h5>1. Initial Approach for Weight Updating - cudaMemcpyAsync<a class="headerlink" href="#initial-approach-for-weight-updating-cudamemcpyasync" title="Link to this heading">#</a></h5>
@@ -757,7 +761,7 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
 </section>
 <section id="multi-token-prediction-mtp">
 <h3>Multi-Token Prediction (MTP)<a class="headerlink" href="#multi-token-prediction-mtp" title="Link to this heading">#</a></h3>
-<p>MTP allows verifying and accepting several draft tokens in a single iteration, which is very beneficial for scenarios that prefer low latency. TensorRT LLM has supported MTP, and we refer to our previous <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md#mtp-implementation-in-tensorrt-llm">MTP blog</a> for more details on the implementation.</p>
+<p>MTP allows verifying and accepting several draft tokens in a single iteration, which is very beneficial for scenarios that prefer low latency. TensorRT LLM has supported MTP, and we refer to our previous <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.md#mtp-implementation-in-tensorrt-llm">MTP blog</a> for more details on the implementation.</p>
 <p>For large EP, we have also extended the implementation so that it works well with online EPLB. This was implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/5213">PR 5213</a>.</p>
 </section>
 <section id="host-overhead-optimization">
@@ -842,20 +846,20 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html"
+       href="blog09_Deploying_GPT_OSS_on_TRTLLM.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">N-Gram Speculative Decoding in TensorRT LLM</p>
+        <p class="prev-next-title">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</p>
       </div>
     </a>
     <a class="right-next"
-       href="blog9_Deploying_GPT_OSS_on_TRTLLM.html"
+       href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</p>
+        <p class="prev-next-title">N-Gram Speculative Decoding in TensorRT LLM</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1002,9 +1006,9 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 16, 2026.</p>
+  <p>Last updated on March 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/73cca36">73cca36</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3353334">3353334</a>.</p>
   
 </div></div>
       
