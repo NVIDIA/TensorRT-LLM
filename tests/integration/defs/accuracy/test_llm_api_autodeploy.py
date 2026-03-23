@@ -734,8 +734,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
-    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
 
     def get_default_kwargs(self):
         return {
@@ -780,8 +780,9 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         return config, world_size
 
     @pytest.mark.skip_less_device_memory(80000)
-    def test_bf16_small(self):
-        config, world_size = self._load_small_config()
+    @pytest.mark.parametrize("world_size", [8])
+    def test_bf16_small(self, world_size):
+        config, _ = self._load_small_config()
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
@@ -794,6 +795,12 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME_SMALL)
             task.evaluate(llm)
+            task = MMMU(self.MODEL_NAME_SMALL)
+            task.EVALUATE_KWARGS = dict(MMMU.EVALUATE_KWARGS,
+                                        model_type="qwen3_vl",
+                                        is_force_single_image=False)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
@@ -968,63 +975,3 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, sampling_params=sampling_params)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
-
-
-class TestQwen3_5_35B_MoE(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for Qwen3.5-35B-A3B via AutoDeploy.
-
-    Runs the model via AutoDeploy and verifies MMMU performance.
-    Configuration derived from the AutoDeploy model registry entry for Qwen3.5 35B.
-    """
-
-    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
-    MAX_SEQ_LEN = max(MMMU.MAX_INPUT_LEN + MMMU.MAX_OUTPUT_LEN, 8192)
-    MAX_NUM_TOKENS = 4096
-    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
-        enable_thinking=False))
-
-    def get_default_kwargs(self):
-        kwargs = {
-            "max_seq_len": self.MAX_SEQ_LEN,
-            "max_num_tokens": self.MAX_NUM_TOKENS,
-            "skip_tokenizer_init": False,
-            "trust_remote_code": True,
-        }
-        low_memory_overrides(kwargs,
-                             max_batch_size=32,
-                             free_gpu_memory_fraction=0.4,
-                             max_seq_len=self.MAX_SEQ_LEN,
-                             max_num_tokens=self.MAX_NUM_TOKENS,
-                             cuda_graph_batch_sizes=[1, 2, 4, 8, 16, 32])
-        return kwargs
-
-    def get_default_sampling_params(self):
-        eos_id = -1
-        beam_width = 1
-        return SamplingParams(end_id=eos_id,
-                              pad_id=eos_id,
-                              n=beam_width,
-                              use_beam_search=beam_width > 1)
-
-    @pytest.mark.skip_less_device_memory(60000)
-    @pytest.mark.parametrize("world_size", [2])
-    def test_bf16(self, world_size):
-        if get_device_count() < world_size:
-            pytest.skip("Not enough devices for world size, skipping test")
-        kwargs = self.get_default_kwargs()
-        self.get_default_sampling_params()
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(
-            self.MODEL_NAME)
-        assert registry_world_size == world_size
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
-                           dtype="bfloat16",
-                           world_size=world_size,
-                           yaml_extra=yaml_paths,
-                           **kwargs) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.EVALUATE_KWARGS = dict(MMMU.EVALUATE_KWARGS,
-                                        model_type="qwen3_vl",
-                                        is_force_single_image=False)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
