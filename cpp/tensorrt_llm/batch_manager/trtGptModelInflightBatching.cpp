@@ -2047,26 +2047,20 @@ void TrtGptModelInflightBatching::reorderGenerationLogitsForBeamSearch(LlmReques
         TLLM_CHECK_WITH_INFO(startSlot >= 0,
             "Could not determine beam slot mapping for beam %d during generation logits reordering.", beam);
 
-        // Build the slot trace by tracing parentIds backward from the starting slot.
-        // After this loop, slotTrace[beam][g] = the slot the beam was assigned to
-        // after beam search at generation step g (the post-reassignment slot).
+        // Build the slot trace: slotTrace[beam][g] = the pre-reassignment slot whose
+        // logits correspond to generation step g of this beam.
+        //
+        // The model runs BEFORE beam search reassigns beams to slots, so
+        // generationLogits[slot][g] was produced by the pre-reassignment slot —
+        // i.e. the slot the beam occupied in the *previous* step.
+        // parentIds[postSlot][promptLen+g] gives exactly that pre-reassignment slot,
+        // so taking the parentIds lookup before storing (rather than after) yields
+        // the correct source slot in a single pass.
         SizeType32 slot = startSlot;
-        slotTrace[beam][genLen - 1] = slot;
-        for (SizeType32 t = seqLen - 1; t > promptLen; --t)
+        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
         {
             slot = parentIdsData[slot * maxSeqLength + t];
-            slotTrace[beam][t - 1 - promptLen] = slot;
-        }
-
-        // Convert from post-reassignment slot to pre-reassignment slot.
-        // At each step, the model computes logits BEFORE beam search reassigns
-        // beams to slots. So generationLogits[slot][g] holds logits from the
-        // pre-reassignment slot — not the post-reassignment slot that ids/parentIds
-        // reference. parentIds[postSlot][pos] points back to the pre-reassignment
-        // slot (the slot the beam was in when the model ran).
-        for (SizeType32 g = 0; g < genLen; ++g)
-        {
-            slotTrace[beam][g] = parentIdsData[slotTrace[beam][g] * maxSeqLength + (promptLen + g)];
+            slotTrace[beam][t - promptLen] = slot;
         }
 
         // Check if any reordering is actually needed for this beam
