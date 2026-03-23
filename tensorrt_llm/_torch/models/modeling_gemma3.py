@@ -15,6 +15,7 @@ from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -115,7 +116,10 @@ class Gemma3Attention(QKNormRoPEAttention):
 
 
 # This function is written to be compatible with TRTLLM's GatedMLP class.
-def pytorch_gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+    if IS_FLASHINFER_AVAILABLE:
+        return torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(gate_x)
+
     gate, x = gate_x.chunk(2, dim=-1)
     return nn.functional.gelu(gate, approximate="tanh") * x
 
@@ -140,7 +144,7 @@ class Gemma3DecoderLayer(DecoderLayer):
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
                             intermediate_size=config.intermediate_size,
                             bias=False,
-                            activation=pytorch_gelu_tanh,
+                            activation=gelu_tanh,
                             dtype=config.torch_dtype,
                             config=model_config,
                             layer_idx=layer_idx)

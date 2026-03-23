@@ -1908,6 +1908,9 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
             input, module.weight, weight_dtype, module.weight_scale,
             module.dtype)
 
+        if bias is not None:
+            output = output + bias
+
         return output
 
     def load_weight_scales(
@@ -2426,7 +2429,10 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
-        return NVFP4LinearMethod()
+        if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
+            return NVFP4ARCLinearMethod()
+        else:
+            return NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
         return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
@@ -2522,6 +2528,7 @@ class Linear(nn.Module):
                 f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
             )
             local_out_features = out_features // self.tp_size
+            reduce_output = False if self.mapping.enable_attention_dp else reduce_output
         else:
             assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
 
@@ -2743,3 +2750,42 @@ class Linear(nn.Module):
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
         self.quant_method.pre_reload_weights(self)
+
+
+class NVFP4ARCLinearMethod(NVFP4LinearMethod):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        module.residual_dim = in_features
+        module.in_features_with_residual = in_features + module.residual_dim
+        module.reorder_index = Parameter(torch.arange(in_features,
+                                                      dtype=torch.int16),
+                                         requires_grad=False)
+        super().create_weights(module, module.in_features_with_residual,
+                               out_features, bias, dtype)
+
+    def _input_prepare(self, module: Linear, input: torch.Tensor):
+        if isinstance(input, Fp4QuantizedTensor) or isinstance(input, tuple):
+            raise RuntimeError(
+                "No quantization fusion for TwoFP4 now. Please run with TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0"
+            )
+        else:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
+                input,
+                module.input_scale,
+                module.reorder_index,
+                module.residual_dim,
+                is_act=True)
+        return act_fp4, act_sf, module.alpha
+
+    def load_weights(self,
+                     module: Linear,
+                     weights: List[Dict],
+                     weight_mode: WeightMode,
+                     allow_partial_loading: bool = False):
+        """
+        Load weights from the checkpoint.
+        """
+        super().load_weights(module, weights, weight_mode,
+                             allow_partial_loading)
+        module.reorder_index.data = weights[0]['reorder_index']

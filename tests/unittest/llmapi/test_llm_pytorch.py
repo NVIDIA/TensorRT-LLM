@@ -920,6 +920,72 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
         llm.shutdown()
 
 
+@skip_gpu_memory_less_than_40gb
+@pytest.mark.part0
+def test_qwen_moe_shared_expert_lora():
+    """Test MoE shared expert LoRA on Qwen1.5-MoE with PyTorch backend.
+
+    Verifies that LoRA adapters targeting the shared expert in MoE models
+    are correctly applied and produce different outputs from the base model.
+    Uses the same model/adapter/prompt as the TRT integration test
+    (test_llm_qwen1_5_moe_single_gpu_lora in test_qwen.py).
+    """
+    model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
+    lora_dir = f"{llm_models_root()}/Upcycled-Qwen1.5-MoE2.7B-LoRA"
+
+    lora_config = LoraConfig(
+        lora_dir=[lora_dir],
+        lora_target_modules=[
+            'attn_q',
+            'attn_k',
+            'attn_v',
+            'attn_dense',
+            'mlp_h_to_4h',
+            'mlp_gate',
+            'mlp_4h_to_h',
+        ],
+        max_lora_rank=64,
+        max_loras=2,
+        max_cpu_loras=2,
+    )
+
+    llm = LLM(model=model_dir,
+              lora_config=lora_config,
+              gather_generation_logits=True)
+    sampling_params = SamplingParams(max_tokens=20, temperature=0.0, logprobs=0)
+
+    try:
+        lora_request = LoRARequest("moe-lora", 0, lora_dir)
+        outputs_with = llm.generate(["What is your name?"],
+                                    sampling_params,
+                                    lora_request=lora_request)
+        tokens_with = list(outputs_with[0].outputs[0].token_ids)
+        logprobs_with = outputs_with[0].outputs[0].logprobs
+
+        outputs_without = llm.generate(["What is your name?"],
+                                       sampling_params,
+                                       lora_request=None)
+        tokens_without = list(outputs_without[0].outputs[0].token_ids)
+        logprobs_without = outputs_without[0].outputs[0].logprobs
+
+        tokens_differ = tokens_with != tokens_without
+        logprobs_differ = False
+        if logprobs_with and logprobs_without:
+            for lp_w, lp_wo in zip(logprobs_with, logprobs_without,
+                                   strict=True):
+                lp_val_w = next(iter(lp_w.values())).logprob
+                lp_val_wo = next(iter(lp_wo.values())).logprob
+                if abs(lp_val_w - lp_val_wo) > 1e-6:
+                    logprobs_differ = True
+                    break
+
+        assert tokens_differ or logprobs_differ, (
+            "LoRA outputs identical to base model (same tokens AND same "
+            "logprobs) -- shared expert LoRA not applied")
+    finally:
+        llm.shutdown()
+
+
 class TestLlmError:
 
     @pytest.mark.part3
@@ -1008,6 +1074,44 @@ def test_min_tokens(use_speculative: bool):
 
     assert len(res.outputs) == 1
     assert len(res.outputs[0].token_ids) == output_len
+
+
+@pytest.mark.part0
+def test_min_tokens_long_prompt():
+    """Check min_tokens is respected when prompt is longer than min_tokens.
+
+    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    total token count (prompt + generated) against the raw min_tokens value
+    instead of comparing generated token count only.  When prompt_len >=
+    min_tokens the EOS suppression was never activated, allowing early
+    termination.
+    """
+    min_tok = 50
+    max_tok = 100
+    # Prompt long enough so that prompt_len > min_tok.  "Hello " tokenises
+    # to ~1-2 tokens with most tokenizers, so 200 repetitions ≈ 200-400
+    # tokens >> min_tok.
+    long_prompt = "Hello " * 200
+
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=2,
+        kv_cache_config=global_kvcache_config,
+        max_num_tokens=2048,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tok,
+        min_tokens=min_tok,
+        temperature=1,
+    )
+    res = llm.generate(long_prompt, sampling_params=sampling_params)
+
+    assert len(res.outputs) == 1
+    generated_len = len(res.outputs[0].token_ids)
+    assert generated_len >= min_tok, (
+        f"Generated only {generated_len} tokens with min_tokens={min_tok} "
+        f"and a long prompt.  Bug 5823135 regression.")
 
 
 @skip_ray

@@ -5,11 +5,13 @@ import math
 import os
 import types
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (Annotated, Any, Dict, List, Literal, Optional, Set, Tuple,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+from typing import (TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List,
+                    Literal, Optional, Set, Tuple, Type, TypeAlias, TypeVar,
+                    Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -28,7 +30,7 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import _str_to_torch_dtype_dict, mpi_rank
+from .._utils import _str_to_torch_dtype_dict, mpi_rank, prefer_pinned
 
 # yapf: disable
 # isort: off
@@ -63,6 +65,12 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.virtual_memory import \
+        RestoreMode as _VirtualMemoryRestoreMode
+else:
+    _VirtualMemoryRestoreMode = Enum
 
 
 def Field(default: Any = ...,
@@ -178,6 +186,45 @@ class CudaGraphConfig(StrictBaseModel):
 
         return batch_sizes
 
+    @staticmethod
+    def _merge_schedule_keys(batch_sizes: List[int],
+                             schedule: dict[int, int]) -> List[int]:
+        """Merge draft_len_schedule keys into batch_sizes so that each
+        schedule threshold has a corresponding CUDA graph.
+
+        e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300
+        into batch_sizes.
+
+        Args:
+            batch_sizes: Sorted list of existing CUDA graph batch sizes.
+            schedule: draft_len_schedule mapping batch-size thresholds to
+                draft lengths.
+
+        Returns:
+            Sorted, deduplicated list of batch sizes.
+        """
+        max_bs = batch_sizes[-1]
+        extra = sorted(bs for bs in schedule if bs <= max_bs)
+        if not extra:
+            return batch_sizes
+
+        merged = []
+        i, j = 0, 0
+        while i < len(batch_sizes) and j < len(extra):
+            if batch_sizes[i] < extra[j]:
+                merged.append(batch_sizes[i])
+                i += 1
+            elif batch_sizes[i] > extra[j]:
+                merged.append(extra[j])
+                j += 1
+            else:
+                merged.append(batch_sizes[i])
+                i += 1
+                j += 1
+        merged.extend(batch_sizes[i:])
+        merged.extend(extra[j:])
+        return merged
+
 
 class GuidedDecodingConfig(StrictBaseModel):
 
@@ -275,6 +322,20 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+    use_cute_dsl_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
+    )
+    q_split_threshold: int = Field(
+        default=8192,
+        description=
+        "If number of packed tokens in prefill chunk exceeds this threshold, \
+            q tokens will be evenly distributed across ranks for indexer computation. \
+            If negative, q split will always be disabled.")
+    indexer_rope_interleave: bool = Field(
+        default=False,
+        description="Whether to use interleaved RoPE layout for the indexer.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -655,21 +716,25 @@ class DecodingBaseConfig(StrictBaseModel):
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
     )
 
-    max_concurrency: Optional[NonNegativeInt] = Field(
+    max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
-        "When specified, speculation will be disabled at batch sizes above this value. Otherwise, "
-        "speculation will always be on. PyTorch backend only.")
+        "When specified (>0), speculation will be disabled at batch sizes above this value. Otherwise, "
+        "speculation will always be on. PyTorch backend only. "
+        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly supports max concurrency control."
+    )
 
     draft_len_schedule: Optional[dict[int, int]] = Field(
         default=None,
         description=
-        "Developer interface: dynamically adjust draft length based on active batch size in runtime. "
-        "Maps batch size to draft lengths. For example, {1: 4, 4: 2, 8: 0} means: "
-        "batch_size >= 1 uses draft_len=4, batch_size >= 4 uses draft_len=2, "
-        "batch_size >= 8 uses draft_len=0 (disable speculation). "
-        "draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals "
-        "max_draft_len for consistency; for example, if max_draft_len=4, the schedule must contain {1: 4}."
+        "Developer interface: dynamically adjust draft length based on active batch size in runtime."
+        "Maps batch size to draft lengths."
+        "For example: draft_len_schedule = {4:4, 8:2, 32:1}"
+        " - Batch sizes 1-4:   use draft_len=4"
+        " - Batch sizes 5-8:   use draft_len=2"
+        " - Batch sizes 9-32:  use draft_len=1"
+        " - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). "
+        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
     )
 
     load_format: Optional[str] = Field(
@@ -705,6 +770,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
+    _translated_from_max_concurrency: bool = PrivateAttr(False)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -722,20 +789,16 @@ class DecodingBaseConfig(StrictBaseModel):
                         f"draft_len_schedule: draft length must be >= 0, got {draft_len}"
                     )
 
-            # Require batch_size=1 in schedule
-            if 1 not in v:
-                raise ValueError(
-                    "draft_len_schedule must include batch_size=1. "
-                    "All systems can have batch_size=1. Add {1: <max_draft_len>} to your schedule."
-                )
-
-            # Enforce schedule[1] == max_draft_len for consistency
+            # Enforce smallest schedule key maps to max_draft_len for consistency.
+            smallest_batch_size = min(v.keys())
             max_draft_len = info.data.get('max_draft_len')
-            if max_draft_len is not None and v[1] != max_draft_len:
+            if max_draft_len is not None and v[
+                    smallest_batch_size] != max_draft_len:
                 raise ValueError(
-                    f"draft_len_schedule[1] must equal max_draft_len for consistency. "
-                    f"Got schedule[1]={v[1]}, but max_draft_len={max_draft_len}. "
-                    f"batch_size=1 should use maximum draft length.")
+                    f"draft_len_schedule[{smallest_batch_size}] must equal max_draft_len "
+                    f"because it is the smallest batch-size key. "
+                    f"Got schedule[{smallest_batch_size}]={v[smallest_batch_size]}, "
+                    f"but max_draft_len={max_draft_len}.")
 
             # Enforce all draft lengths <= max_draft_len
             if max_draft_len is not None:
@@ -750,6 +813,34 @@ class DecodingBaseConfig(StrictBaseModel):
             # This ensures efficient lookup
             return dict(sorted(v.items(), key=lambda x: x[0]))
         return v
+
+    @model_validator(mode='after')
+    # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
+    # 2. If max_concurrency is set, translate it to the corresponding draft_len_schedule.
+    def validate_max_concurrency_and_draft_len_schedule_mutually_exclusive(
+            self) -> "DecodingBaseConfig":
+        if self.max_concurrency is not None and self.draft_len_schedule is not None:
+            # Avoid ValueError during nested re-validation when only max_concurrency is set and draft_len_schedule is translated from max_concurrency
+            if self._translated_from_max_concurrency:
+                return self
+            raise ValueError(
+                "max_concurrency and draft_len_schedule are mutually exclusive. "
+                "Use max_concurrency for a simple speculation cutoff, or "
+                "draft_len_schedule for dynamic draft-length control.")
+
+        if self.max_concurrency is None:
+            return self
+
+        if (self.max_draft_len is None
+                or not self.spec_dec_mode.support_dynamic_draft_len()):
+            return self
+
+        self.draft_len_schedule = {
+            int(self.max_concurrency): int(self.max_draft_len)
+        }
+        self._translated_from_max_concurrency = True
+
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         """
@@ -1463,6 +1554,119 @@ class RayPlacementConfig(StrictBaseModel):
         return self
 
 
+class ExecutorMemoryType(StrEnum):
+    """Types of GPU memory used by executor.
+
+     These are used by the sleep/wakeup feature to target specific type of memory.
+     """
+    SAMPLER = "sampler"
+    DRAFTER = "drafter"
+    GUIDED_DECODER = "guided_decoder"
+    SPEC_RESOURCES = "spec_resource_manager"
+    INIT_KV_CACHE = "_no_capture_init_kv_cache"
+    INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
+    MODEL_EXTRA = "model_extra"
+    EXTRA_RESOURCES = "executor_extra"
+    KV_CACHE = "kv_cache"
+    MODEL_ENGINE_MAIN = "model"
+    MODEL_ENGINE_DRAFT = "draft_model"
+    MODEL_WEIGHTS_MAIN = "model_weights"
+    MODEL_WEIGHTS_DRAFT = "draft_model_weights"
+
+
+class SleepConfig(StrictBaseModel):
+    """Configuration for the LLM sleep/wakeup feature.
+    """
+
+    restore_modes: dict[
+        ExecutorMemoryType, Literal["NONE", "MEMSET", "CPU", "PINNED"]
+        | _VirtualMemoryRestoreMode] = Field(
+            default_factory=lambda: SleepConfig._make_defaulted_restore_modes(),
+            description="Per-component RestoreMode for the sleep feature. "
+            "Keys are ExecutorMemoryType values (e.g. 'model', 'kv_cache'), "
+            "values can be RestoreMode names (NONE, MEMSET, CPU, PINNED) or "
+            "RestoreMode enum values. "
+            "Unlisted entries default to the suitable mode selected between "
+            "PINNED and CPU.")
+
+    DEFAULT_RESTORE_MODES: ClassVar[dict[str, str]] = {
+        ExecutorMemoryType.KV_CACHE: "NONE",
+    }
+
+    @staticmethod
+    def _normalize_restore_mode(
+            value: str | _VirtualMemoryRestoreMode
+    ) -> _VirtualMemoryRestoreMode:
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        if isinstance(value, RestoreMode):
+            return value
+        if isinstance(value, str):
+            try:
+                return RestoreMode[value]
+            except KeyError as e:
+                valid = ", ".join(mode.name for mode in RestoreMode)
+                raise ValueError(
+                    f"invalid restore_mode: {value}. Expected one of: {valid}"
+                ) from e
+        raise ValueError(f"invalid restore_mode type: {type(value).__name__}")
+
+    @staticmethod
+    def _normalize_executor_memory_type(
+            key: ExecutorMemoryType | str) -> ExecutorMemoryType:
+        if isinstance(key, ExecutorMemoryType):
+            return key
+        if isinstance(key, str):
+            try:
+                return ExecutorMemoryType(key)
+            except ValueError as e:
+                valid = ", ".join(member.value for member in ExecutorMemoryType)
+                raise ValueError(
+                    f"invalid executor memory type: {key}. Expected one of: {valid}"
+                ) from e
+        raise ValueError(
+            f"executor memory type must be ExecutorMemoryType or str, got {type(key).__name__}"
+        )
+
+    @classmethod
+    def _make_defaulted_restore_modes(
+        cls,
+        cases: Optional[dict[ExecutorMemoryType,
+                             str | _VirtualMemoryRestoreMode]] = None,
+        *,
+        default_mode: Optional[_VirtualMemoryRestoreMode] = None
+    ) -> defaultdict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        default_mode: _VirtualMemoryRestoreMode = default_mode or (
+            RestoreMode.PINNED if prefer_pinned() else RestoreMode.CPU)
+
+        if cases is None:
+            cases = cls.DEFAULT_RESTORE_MODES
+        normalized_cases = {
+            cls._normalize_executor_memory_type(key):
+            cls._normalize_restore_mode(value)
+            for key, value in cases.items()
+        }
+        return defaultdict(lambda: default_mode, normalized_cases)
+
+    @field_validator('restore_modes', mode='plain')
+    @classmethod
+    def _validate_restore_modes(cls, v):
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"restore_modes must be dict, got {type(v).__name__}")
+
+        default_mode = None
+        if isinstance(v, defaultdict) and v.default_factory is not None:
+            try:
+                default_mode = cls._normalize_restore_mode(v.default_factory())
+            except Exception as e:
+                raise ValueError(
+                    "restore_modes defaultdict default_factory must return a valid RestoreMode"
+                ) from e
+
+        return cls._make_defaulted_restore_modes(v, default_mode=default_mode)
+
+
 class PybindMirror(ABC):
     ''' A class containing the utilities for mirroring Python classes to
     pybind classes.
@@ -1943,6 +2147,22 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
         )
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_stochastic_rounding: bool = Field(
+        default=False,
+        description=
+        "Enable stochastic rounding for Mamba SSM state updates. Only applicable with float16 cache dtype."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_philox_rounds: int = Field(
+        default=10,
+        ge=1,
+        description=
+        "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness "
+        "but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled."
+    )
+
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
@@ -2093,7 +2313,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         description="The max number of tokens the transfer buffer can fit.")
 
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
-        default=None,
+        default=60000,
         description=
         "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
     )
@@ -2241,7 +2461,7 @@ class BaseLlmArgs(StrictBaseModel):
     moe_cluster_parallel_size: Optional[int] = Field(
         default=None,
         description="The cluster parallel size for MoE model's expert weights.",
-        status="beta")
+        status="deprecated")
 
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
@@ -2416,6 +2636,12 @@ class BaseLlmArgs(StrictBaseModel):
         "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
         status="prototype")
 
+    enable_energy_metrics: bool = Field(
+        default=False,
+        description=
+        "Enable GPU energy monitoring via NVML. When enabled, the server exposes an /energy_metrics endpoint that reports cumulative GPU energy consumption in joules.",
+        status="prototype")
+
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
         description=
@@ -2541,6 +2767,8 @@ class BaseLlmArgs(StrictBaseModel):
             TOKENIZER_ALIASES = {
                 'deepseek_v32':
                 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+                'glm_moe_dsa':
+                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
             }
 
             tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
@@ -2633,10 +2861,10 @@ class TrtLlmArgs(BaseLlmArgs):
                                      description="The workspace for the model.")
 
     fail_fast_on_attention_window_too_large: bool = Field(
-        default=False,
+        default=True,
         description=
         "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
-        status="prototype")
+        status="deprecated")
 
     # Once set, the model will reuse the build_cache
     enable_build_cache: Union[BuildCacheConfig,
@@ -3213,10 +3441,10 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    enable_sleep: bool = Field(
-        default=False,
-        description=
-        "Enable LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. "
+    sleep_config: Optional[SleepConfig] = Field(
+        default=None,
+        description="Configuration for the LLM sleep feature. "
+        "Sleep feature requires extra setup that may slow down model loading. "
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
@@ -3251,6 +3479,15 @@ class TorchLlmArgs(BaseLlmArgs):
     layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
         default_factory=LayerwiseBenchmarksConfig,
         description="Configuration for layer-wise benchmarks calibration.",
+        status="prototype")
+
+    video_pruning_rate: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        lt=1.0,
+        description="Pruning rate for video frames in multimodal models. "
+        "Applied by Efficient Video Sampling (EVS) in NemotronH_Nano_VL_V2. "
+        "None (default) disables EVS, values in [0, 1) enable pruning.",
         status="prototype")
 
     @property
@@ -3338,6 +3575,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
                 if self.backend == "_autodeploy":
                     self.speculative_config._draft_target_one_model = False
+
+            # If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.
+            # Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.
+            if (self.cuda_graph_config is not None
+                    and self.speculative_config.draft_len_schedule is not None):
+                if not self.cuda_graph_config.enable_padding:
+                    logger.info(
+                        "Automatically enabling cuda_graph_config.enable_padding "
+                        "because draft_len_schedule is set.")
+                    self.cuda_graph_config.enable_padding = True
+                self.cuda_graph_config.batch_sizes = CudaGraphConfig._merge_schedule_keys(
+                    self.cuda_graph_config.batch_sizes,
+                    self.speculative_config.draft_len_schedule)
+                logger.debug(
+                    f"draft_len_schedule keys added to cuda_graph_config.batch_sizes, current batch_sizes: {self.cuda_graph_config.batch_sizes}"
+                )
 
         else:
             self.decoding_config = None
@@ -3473,6 +3726,9 @@ def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
+
+    if 'hf_revision' in llm_args_dict:
+        llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:

@@ -211,14 +211,23 @@ def pulseScan(llmRepo, branchName) {
         sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
         sh "cat sbom_toupload.json"
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+            def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc/posting"
+            def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
+            def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc"
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
-            sh """
-                export TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}
-                python3 -m venv venv
-                venv/bin/pip install requests
-                venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
-            """
+            withEnv([
+                "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
+                "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
+                "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
+                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
+            ]) {
+                sh """
+                    python3 -m venv venv
+                    venv/bin/pip install requests elasticsearch==7.13.4
+                    venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl} --build-number ${env.BUILD_NUMBER} --branch ${params.branchName}
+                """
+            }
         }
     }
 }
@@ -243,10 +252,12 @@ pipeline {
     }
 
     triggers {
-        parameterizedCron('''
+        // Schedule is only active when running from the official pipeline folder.
+        // Jobs in other folders (e.g. personal/dev pipelines) will have no cron trigger.
+        parameterizedCron(env.JOB_NAME.startsWith('LLM/helpers/') ? '''
             H 2 * * * %branchName=main;repoUrlKey=tensorrt_llm_github
             H 3 * * * %branchName=release/1.2;repoUrlKey=tensorrt_llm_github
-        ''')
+        ''' : '')
     }
     stages {
         stage("Prepare Environment"){

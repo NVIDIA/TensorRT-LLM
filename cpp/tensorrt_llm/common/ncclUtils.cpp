@@ -211,136 +211,10 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
 }
 
 //==============================================================================
-// NCCLHelper Implementation
-//==============================================================================
-
-NCCLHelper& NCCLHelper::getInstance()
-{
-    static NCCLHelper instance;
-    return instance;
-}
-
-NCCLHelper::NCCLHelper()
-    : mLibraryHandle(nullptr)
-    , mNCCLCommWindowRegister(nullptr)
-    , mNCCLMemAlloc(nullptr)
-    , mIsLoaded(false)
-{
-    loadNCCLLibrary();
-}
-
-NCCLHelper::~NCCLHelper()
-{
-    if (mLibraryHandle)
-    {
-#ifdef _WIN32
-        FreeLibrary(mLibraryHandle);
-#else
-        dlclose(mLibraryHandle);
-#endif
-        mLibraryHandle = nullptr;
-    }
-}
-
-void NCCLHelper::loadNCCLLibrary()
-{
-    try
-    {
-#ifdef _WIN32
-        char const* libraryNames[] = {"nccl.dll"};
-#else
-        char const* libraryNames[] = {"libnccl.so"};
-#endif
-
-        for (auto const* name : libraryNames)
-        {
-            mLibraryHandle = loadLibraryHandle(name);
-            if (mLibraryHandle)
-            {
-                TLLM_LOG_INFO("Successfully loaded NCCL library: %s", name);
-                break;
-            }
-        }
-
-        if (!mLibraryHandle)
-        {
-            TLLM_LOG_WARNING("Failed to load NCCL library");
-            return;
-        }
-
-        // Load the required symbols
-        mNCCLCommWindowRegister
-            = reinterpret_cast<ncclCommWindowRegisterFunc>(getSymbolAddress(mLibraryHandle, "ncclCommWindowRegister"));
-
-        mNCCLMemAlloc = reinterpret_cast<ncclMemAllocFunc>(getSymbolAddress(mLibraryHandle, "ncclMemAlloc"));
-
-        if (mNCCLCommWindowRegister == nullptr)
-        {
-            TLLM_LOG_WARNING("Failed to load ncclCommWindowRegister symbol, NCCL symmetric will not be supported.");
-        }
-
-        if (mNCCLMemAlloc == nullptr)
-        {
-            TLLM_LOG_WARNING("Failed to load ncclMemAlloc symbol, NCCL symmetric will not be supported.");
-        }
-
-        if (mNCCLCommWindowRegister != nullptr && mNCCLMemAlloc != nullptr)
-        {
-            mIsLoaded = true;
-        }
-        else
-        {
-            TLLM_LOG_WARNING(
-                "Failed to load required NCCL symbols (both ncclCommWindowRegister and ncclMemAlloc are required)");
-        }
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_WARNING("Exception while loading NCCL library: %s", e.what());
-    }
-}
-
-void* NCCLHelper::loadLibraryHandle(char const* libName)
-{
-#ifdef _WIN32
-    return LoadLibraryA(libName);
-#else
-    return dlopen(libName, RTLD_LAZY | RTLD_GLOBAL);
-#endif
-}
-
-void* NCCLHelper::getSymbolAddress(void* handle, char const* symbolName)
-{
-    if (!handle)
-    {
-        return nullptr;
-    }
-
-#ifdef _WIN32
-    return GetProcAddress(static_cast<HMODULE>(handle), symbolName);
-#else
-    return dlsym(handle, symbolName);
-#endif
-}
-
-NCCLHelper::ncclCommWindowRegisterFunc NCCLHelper::getNCCLCommWindowRegister()
-{
-    return mNCCLCommWindowRegister;
-}
-
-NCCLHelper::ncclMemAllocFunc NCCLHelper::getNCCLMemAlloc()
-{
-    return mNCCLMemAlloc;
-}
-
-bool NCCLHelper::isLoaded() const
-{
-    return mIsLoaded;
-}
-
-//==============================================================================
 // NCCLWindowAllocator Implementation
 //==============================================================================
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 {
@@ -350,6 +224,30 @@ NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 
 NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size)
 {
+    // One-time runtime version check: the runtime NCCL library must also support window buffers.
+    static std::once_flag versionCheckFlag;
+    static bool runtimeVersionOk = false;
+    std::call_once(versionCheckFlag,
+        []()
+        {
+            int version = 0;
+            if (ncclGetVersion(&version) == ncclSuccess && version >= NCCL_VERSION(2, 28, 0))
+            {
+                runtimeVersionOk = true;
+            }
+            else
+            {
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] NCCL runtime version %d.%d.%d does not support window buffers; "
+                    "falling back to regular tensors.",
+                    version / 10000, (version % 10000) / 100, version % 100);
+            }
+        });
+    if (!runtimeVersionOk)
+    {
+        return NCCLWindowBuffer();
+    }
+
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
@@ -508,29 +406,8 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     NCCLWindowBuffer buffer;
     buffer.handle = handle;
 
-    // Get NCCL helper for dynamic symbol loading
-    auto& ncclHelper = NCCLHelper::getInstance();
-    if (!ncclHelper.isLoaded())
-    {
-        TLLM_THROW("NCCL library could not be loaded for dynamic symbol access");
-    }
-
-    auto ncclMemAllocFunc = ncclHelper.getNCCLMemAlloc();
-    auto ncclCommWindowRegisterFunc = ncclHelper.getNCCLCommWindowRegister();
-
-    // Defensive checks: both function pointers must be non-null
-    if (ncclMemAllocFunc == nullptr)
-    {
-        TLLM_THROW("ncclMemAlloc function pointer is null, cannot allocate NCCL window buffer");
-    }
-
-    if (ncclCommWindowRegisterFunc == nullptr)
-    {
-        TLLM_THROW("ncclCommWindowRegister function pointer is null, cannot register NCCL window buffer");
-    }
-
     // Allocate device memory using ncclMemAlloc
-    ncclResult_t allocResult = ncclMemAllocFunc(&buffer.ptr, size);
+    ncclResult_t allocResult = ncclMemAlloc(&buffer.ptr, size);
     if (allocResult != ncclSuccess)
     {
         TLLM_THROW("ncclMemAlloc failed with error: %d", allocResult);
@@ -538,8 +415,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     buffer.size = size;
 
     // Register the buffer with NCCL as a window
-    ncclResult_t regResult
-        = ncclCommWindowRegisterFunc(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
+    ncclResult_t regResult = ncclCommWindowRegister(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
     if (regResult != ncclSuccess)
     {
         ncclMemFree(buffer.ptr);
@@ -693,6 +569,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
 }
+
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 } // namespace tensorrt_llm::common::nccl_util
 

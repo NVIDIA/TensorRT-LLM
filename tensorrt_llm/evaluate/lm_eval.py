@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,7 +40,8 @@ from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .interface import Evaluator, dump_inference_results
+from .interface import (Evaluator, dump_inference_results,
+                        get_chat_template_kwargs)
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -74,12 +75,14 @@ class LmEvalWrapper(TemplateLM):
         """
         Method to apply a chat template to a list of chat history between user and model.
         """
+        chat_template_kwargs = get_chat_template_kwargs(
+            self.llm.tokenizer, self.chat_template_kwargs)
         return self.llm.tokenizer.apply_chat_template(
             chat_history,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=not add_generation_prompt,
-            **(self.chat_template_kwargs or {}),
+            **chat_template_kwargs,
         )
 
     @property
@@ -271,11 +274,13 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             add_generation_prompt=add_generation_prompt,
             mm_placeholder_counts=mm_placeholder_counts,
             tools=None,
-            chat_template_kwargs={
-                **(self.chat_template_kwargs or {}),
-                "continue_final_message":
-                not add_generation_prompt,
-            })
+            chat_template_kwargs=get_chat_template_kwargs(
+                getattr(self.llm.input_processor, 'processor', None)
+                or self.llm.tokenizer, {
+                    **(self.chat_template_kwargs or {}),
+                    "continue_final_message":
+                    not add_generation_prompt,
+                }))
         return output
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:

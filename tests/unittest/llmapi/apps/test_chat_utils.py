@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from transformers import AutoConfig
@@ -7,6 +7,7 @@ from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.serve.chat_utils import (
     load_chat_template,
     parse_chat_message_content,
+    parse_chat_message_content_part,
     parse_chat_messages_coroutines,
 )
 
@@ -157,6 +158,56 @@ class TestParseAssistantMessages:
             ],
         }
         assert result == expected
+
+    @pytest.mark.parametrize(
+        "message_extra_fields, expected_reasoning",
+        [
+            # reasoning field is used directly.
+            ({"reasoning": "Let me think step by step..."}, "Let me think step by step..."),
+            # reasoning field falls back to reasoning_content.
+            ({"reasoning_content": "Let me think step by step..."}, "Let me think step by step..."),
+            # reasoning takes priority over reasoning_content.
+            (
+                {"reasoning": "Primary reasoning.", "reasoning_content": "Fallback reasoning."},
+                "Primary reasoning.",
+            ),
+            # Neither field provided -> key absent.
+            ({}, None),
+        ],
+    )
+    def test_assistant_message_reasoning(
+        self, mock_mm_data_tracker, message_extra_fields, expected_reasoning
+    ):
+        """Test parsing assistant messages with various reasoning field combinations."""
+        message = {"role": "assistant", "content": "The answer is 42.", **message_extra_fields}
+
+        result = parse_chat_message_content(message, mock_mm_data_tracker)
+
+        assert result["role"] == "assistant"
+        assert result["content"] == "The answer is 42."
+        assert result["media"] == []
+        assert result.get("reasoning_content", None) == expected_reasoning
+
+    def test_assistant_message_with_reasoning_and_tool_calls(self, mock_mm_data_tracker):
+        """Test parsing an assistant message with both reasoning and tool calls."""
+        message = {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "I need to check the weather.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "NYC"}'},
+                }
+            ],
+        }
+
+        result = parse_chat_message_content(message, mock_mm_data_tracker)
+
+        assert result["reasoning_content"] == "I need to check the weather."
+        assert len(result["tool_calls"]) == 1
+        assert result["tool_calls"][0]["function"]["arguments"] == {"city": "NYC"}
 
 
 class TestParseToolMessages:
@@ -348,3 +399,47 @@ class TestMultimodalPlaceholderCounts:
         _, _, mm_placeholder_counts = parse_chat_messages_coroutines(messages, mock_config, None)
 
         assert mm_placeholder_counts == expected_mm_placeholder_counts
+
+
+class CustomError(Exception):
+    pass
+
+
+class TestMultimodalLoadErrorPropagation:
+    """Verify that errors from multimodal loading propagate."""
+
+    @pytest.fixture
+    def mm_tracker(self):
+        tracker = MagicMock()
+        tracker._multimodal_server_config.media_io_kwargs = None
+        return tracker
+
+    @pytest.mark.parametrize(
+        "part, loader_path",
+        [
+            (
+                {"type": "image_url", "image_url": {"url": "http://bad-url/img.png"}},
+                "tensorrt_llm.serve.chat_utils.async_load_image",
+            ),
+            (
+                {"type": "video_url", "video_url": {"url": "http://bad-url/vid.mp4"}},
+                "tensorrt_llm.serve.chat_utils.async_load_video",
+            ),
+            (
+                {"type": "audio_url", "audio_url": {"url": "http://bad-url/aud.wav"}},
+                "tensorrt_llm.serve.chat_utils.async_load_audio",
+            ),
+            (
+                {"type": "image_embeds", "image_embeds": {"data": "notbase64"}},
+                "tensorrt_llm.serve.chat_utils.load_base64_image_embeds",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_loader_exception_propagates(self, mm_tracker, part, loader_path):
+        """Exceptions from async loaders must propagate, not be swallowed."""
+        with patch(loader_path, side_effect=CustomError):
+            result = parse_chat_message_content_part(part, mm_tracker)
+            assert result is not None
+            with pytest.raises(CustomError):
+                await result["data"]

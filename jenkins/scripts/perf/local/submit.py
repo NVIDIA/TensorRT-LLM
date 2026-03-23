@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import json
 import os
 import re
+import shutil
 from datetime import datetime
 
 import yaml
@@ -296,8 +299,8 @@ def generate_sbatch_params(args, hardware_config, work_dir):
 
 def generate_srun_args(args, runtime_mode, timestamp):
     """Generate srun arguments."""
-    is_disagg = runtime_mode == "disaggregated"
-    container_name = f"{'disagg' if is_disagg else 'aggr'}_test-{timestamp}"
+    is_aggr = runtime_mode == "aggregated"
+    container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
 
     lines = [
         f"--container-name={container_name}",
@@ -312,16 +315,16 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    if is_disagg:
-        lines.append("--mpi=pmix")
-    else:
+    if args.mpi_type:
+        lines.append(f"--mpi={args.mpi_type}")
+    elif is_aggr:
         lines.append("--mpi=pmi2")
 
     return lines
 
 
 def generate_pytest_command(
-    llm_src, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
@@ -344,14 +347,34 @@ def generate_pytest_command(
     test_list_path = os.path.join(work_dir, "test_list.txt")
 
     pytest_command = (
-        f"pytest -v -s "
-        f"--test-prefix={llm_src}/tests/integration/defs "
+        f"pytest -v "
+        f"--test-prefix={test_prefix} "
         f"--test-list={test_list_path} "
         f"--output-dir={work_dir} "
         f"-o junit_logging=out-err"
     )
 
     return pytest_command, test_list_content, test_list_path
+
+
+def replace_env_in_file(work_dir: str, file_path: str, env_vars: dict) -> str:
+    """Read a file, replace env var placeholders, write to work_dir/lm_eval_configs/.
+
+    Returns the lm_eval_configs directory path (for use as --include_path).
+    Also copies utils.py from the same directory if present (needed for GPQA task).
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    for key, value in env_vars.items():
+        content = content.replace(key, value)
+    tmp_dir = os.path.join(work_dir, "lm_eval_configs")
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(os.path.join(tmp_dir, os.path.basename(file_path)), "w", encoding="utf-8") as f:
+        f.write(content)
+    utils_py = os.path.join(os.path.dirname(file_path), "utils.py")
+    if os.path.exists(utils_py):
+        shutil.copy(utils_py, tmp_dir)
+    return tmp_dir
 
 
 def remove_whitespace_lines(lines):
@@ -423,6 +446,13 @@ def main():
         default="1-100",
         help="Nsys start-stop range for generation workers in disaggregated mode (default: 1-100)",
     )
+    parser.add_argument("--test-prefix", default="", help="Test prefix")
+    parser.add_argument(
+        "--mpi-type",
+        default="",
+        help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
+        " --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
+    )
 
     args = parser.parse_args()
 
@@ -480,6 +510,8 @@ def main():
         work_dir = os.path.join(llm_src, "jenkins", "scripts", "perf", "local", timestamp)
     os.makedirs(work_dir, exist_ok=True)
 
+    test_prefix = args.test_prefix if args.test_prefix else f"{llm_src}/tests/integration/defs"
+
     # Determine paths
     launch_sh = args.launch_sh if args.launch_sh else os.path.join(work_dir, "slurm_launch.sh")
     run_sh = (
@@ -521,7 +553,7 @@ def main():
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
-        llm_src, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
     )
 
     # Write test list file
@@ -645,7 +677,10 @@ def main():
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
-                'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
+                (
+                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
+                ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",
                 f"export numGenServers={hardware_config.get('num_gen_servers', '')}",
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",
@@ -687,6 +722,22 @@ def main():
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
             ]
         )
+
+    # Export accuracy config to BENCHMARK node (disagg only)
+    if runtime_mode == "disaggregated":
+        acc_cfg = config.get("accuracy", {})
+        if acc_cfg.get("enable_accuracy_test"):
+            env_sub = {"LLM_MODELS_ROOT": args.llm_models_root}
+            processed = copy.deepcopy(acc_cfg)
+            for task_cfg in processed.get("tasks", {}).values():
+                extra = task_cfg.get("extra_kwargs", {})
+                if "custom_config" in extra:
+                    cfg_path = extra.pop("custom_config")
+                    if not os.path.isabs(cfg_path):
+                        cfg_path = os.path.join(llm_src, cfg_path)
+                    extra["include_path"] = replace_env_in_file(work_dir, cfg_path, env_sub)
+            script_prefix_lines.append(f"export ACCURACY_CONFIG_JSON='{json.dumps(processed)}'")
+            srun_args_lines.append("--container-env=ACCURACY_CONFIG_JSON")
 
     # Remove whitespace lines
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
