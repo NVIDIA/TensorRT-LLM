@@ -206,7 +206,7 @@ class QuantizationFusionMixin(ABC):
         for name, buf in buffers_fused.items():
             gm.register_buffer(f"{key_fused}_{name}", buf)
 
-        ad_logger.warning(
+        ad_logger.debug(
             f"Fusing {len(linear_nodes)} quantized GEMMs ({keys_unfused}) into {key_fused}"
         )
 

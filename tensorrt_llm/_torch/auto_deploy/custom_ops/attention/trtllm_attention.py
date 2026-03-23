@@ -393,9 +393,18 @@ def trtllm_mha_with_cache(
     v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
 
     # Zero-copy QKV fusion: when Q/K/V are narrow() views of a fused GEMM output
-    # (preserved because RoPE no longer breaks them), detect via stride and avoid copy.
+    # (preserved because RoPE no longer breaks them), detect via storage adjacency
+    # and avoid copy.
     total_qkv_dim = (num_heads + 2 * num_kv_heads) * head_dim
-    if q_flat.stride(0) == total_qkv_dim and q_flat.is_contiguous():
+    q_dim = num_heads * head_dim
+    k_dim = num_kv_heads * head_dim
+    elem_size = q_flat.element_size()
+    if (
+        q_flat.stride(0) == total_qkv_dim
+        and q_flat.is_contiguous()
+        and q_flat.data_ptr() + q_dim * elem_size == k_flat.data_ptr()
+        and k_flat.data_ptr() + k_dim * elem_size == v_flat.data_ptr()
+    ):
         qkv_fused = torch.as_strided(q_flat, (num_tokens, total_qkv_dim), (total_qkv_dim, 1))
     else:
         qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
@@ -640,6 +649,9 @@ class TrtllmAttention(AttentionDescriptor):
             cos_sin_tensor = rope_info["cos_sin_tensor"]
             attr_name = "_trtllm_rope_cos_sin"
             counter = 0
+            # Find a free attr name, or reuse one that already points to the same tensor.
+            # The else clause runs only when the loop exits without break (no match found),
+            # meaning we need to register a new buffer.
             while hasattr(gm, attr_name):
                 existing = getattr(gm, attr_name)
                 if existing.data_ptr() == cos_sin_tensor.data_ptr():

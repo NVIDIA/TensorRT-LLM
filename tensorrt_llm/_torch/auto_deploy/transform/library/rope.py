@@ -46,13 +46,16 @@ TODO: Support other variants:
 """
 
 import operator
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, DefaultDict, Dict, Optional, Sequence, Tuple, Type
 
 import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+# Reuse the canonical key defined in trtllm_attention. Imported lazily inside
+# methods that need it to avoid circular imports at module level.
+from ...custom_ops.attention.trtllm_attention import _TRTLLM_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
@@ -1111,11 +1114,6 @@ def _get_position_ids(
     return position_ids
 
 
-# Import the metadata key from trtllm_attention to avoid duplication.
-# Imported lazily (string constant) to avoid circular imports at module level.
-_TRTLLM_ROPE_INFO_KEY = "_trtllm_rope_info"
-
-
 def _convert_flashinfer_to_thop_cos_sin(
     fi_cache: torch.Tensor, rotary_embedding_dim: int
 ) -> torch.Tensor:
@@ -1156,14 +1154,14 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
         num_fused = 0
-        # Cache: rope_node id → (thop_tensor, position_embedding_type, rotary_embedding_dim)
-        rope_cache_nodes: Dict[int, Tuple[torch.Tensor, int, int]] = {}
+        # Cache: rope_node → (thop_tensor, position_embedding_type, rotary_embedding_dim)
+        rope_cache_nodes: Dict[Node, Tuple[torch.Tensor, int, int]] = {}
 
         for attn_node in list(graph.nodes):
             if not is_op(attn_node, torch.ops.auto_deploy.torch_attention):
                 continue
 
-            result = self._try_fuse_one(gm, attn_node, rope_cache_nodes)
+            result = self._try_fuse_one(gm, attn_node, rope_cache_nodes, cm)
             if result:
                 num_fused += 1
 
@@ -1179,7 +1177,8 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
         self,
         gm: GraphModule,
         attn_node: Node,
-        rope_cache_nodes: Dict[int, Tuple[torch.Tensor, int, int]],
+        rope_cache_nodes: Dict[Node, Tuple[torch.Tensor, int, int]],
+        cm: CachedSequenceInterface,
     ) -> bool:
         """Try to fuse RoPE into a single torch_attention node. Returns True on success."""
         # Step 1: Get Q and K input nodes from the attention node
@@ -1244,7 +1243,7 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
             q_fake = pre_rope_q.meta.get("val", None)
             head_dim_hint = q_fake.shape[-1] if q_fake is not None else 128
             fi_cache_tensor = self._try_materialize_cos_sin_cache(
-                gm, cos_sin_cache_node, head_dim_hint
+                gm, cos_sin_cache_node, head_dim_hint, cm.info.max_seq_len
             )
 
         if fi_cache_tensor is None:
@@ -1258,17 +1257,16 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
         # is_neox=True → rope_gpt_neox (2), is_neox=False → rope_gptj (1)
         position_embedding_type = 2 if is_neox else 1
 
-        # Step 6: Compute thop cache tensor (reuse across layers sharing same rope)
-        rope_key = id(rope_node_q)
-        if rope_key not in rope_cache_nodes:
+        # Step 6: Compute thop cache tensor (reuse across layers sharing same rope node)
+        if rope_node_q not in rope_cache_nodes:
             thop_cache = _convert_flashinfer_to_thop_cos_sin(fi_cache_tensor, rotary_embedding_dim)
-            rope_cache_nodes[rope_key] = (
+            rope_cache_nodes[rope_node_q] = (
                 thop_cache,
                 position_embedding_type,
                 rotary_embedding_dim,
             )
         else:
-            thop_cache, _, _ = rope_cache_nodes[rope_key]
+            thop_cache, _, _ = rope_cache_nodes[rope_node_q]
 
         # Step 7: Rewire Q/K to pre-RoPE inputs
         args_list = list(attn_node.args)
@@ -1289,22 +1287,22 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
 
     @staticmethod
     def _try_materialize_cos_sin_cache(
-        gm: GraphModule, cos_sin_node: Node, rotary_dim_hint: int
+        gm: GraphModule, cos_sin_node: Node, rotary_dim_hint: int, max_seq_len: int
     ) -> Optional[torch.Tensor]:
         """Try to materialize the cos_sin_cache tensor from a runtime-computed node.
 
         BFS backward from ``cos_sin_node`` to find an ``inv_freq`` buffer (a 1-D
         tensor of size ``rotary_dim_hint // 2``), then compute the FlashInfer-format
-        fused cos_sin_cache from it.
+        fused cos_sin_cache from it using ``max_seq_len`` as the number of positions.
         """
         half_dim = rotary_dim_hint // 2
         max_bfs = 50
         visited: set = set()
-        queue = [cos_sin_node]
+        queue: deque = deque([cos_sin_node])
         inv_freq_tensor = None
 
         while queue and len(visited) < max_bfs:
-            current = queue.pop(0)
+            current = queue.popleft()
             if id(current) in visited:
                 continue
             visited.add(id(current))
@@ -1331,22 +1329,9 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
         if inv_freq_tensor is None:
             return None
 
-        # Compute FlashInfer-format cache: [max_pos, head_dim]
-        # Use the model's max_seq_len from meta["val"] shape if available,
-        # or a sensible default.
-        fake_val = cos_sin_node.meta.get("val", None)
-        if fake_val is not None and hasattr(fake_val, "shape") and len(fake_val.shape) >= 2:
-            # cos_sin_cache shape is typically [B*S, head_dim] or [max_pos, head_dim]
-            max_pos = fake_val.shape[0]
-            if isinstance(max_pos, int):
-                num_positions = max_pos
-            else:
-                num_positions = 131072  # fallback
-        else:
-            num_positions = 131072
-
-        t = torch.arange(num_positions, dtype=inv_freq_tensor.dtype, device=inv_freq_tensor.device)
-        freqs = torch.outer(t, inv_freq_tensor)  # [max_pos, half_dim]
+        # Compute FlashInfer-format cache: [max_seq_len, head_dim]
+        t = torch.arange(max_seq_len, dtype=inv_freq_tensor.dtype, device=inv_freq_tensor.device)
+        freqs = torch.outer(t, inv_freq_tensor)  # [max_seq_len, half_dim]
         fused = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.float32)
         return fused
 
