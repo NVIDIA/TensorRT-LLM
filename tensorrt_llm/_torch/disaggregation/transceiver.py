@@ -58,8 +58,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 kv_cache_manager=kv_cache_manager,
                 device_id=self._device_id,
                 instance_name=self._instance_name,
-                # * 2: allow back-to-back batches, one in transferring, one preparing next batch
-                max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 2,
+                # Context-only requests are released after KV transfer completes, so many batches
+                # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
+                # large multiplier is cheap.
+                max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
