@@ -1760,12 +1760,6 @@ class KVCacheManagerV2(BaseResourceManager):
         (self.kv_cache_pool_pointers,
          self.kv_cache_pool_mapping) = self._build_pool_mapping_tensors()
 
-        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
-        self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
-                                   1) // tokens_per_block
-        if self.max_blocks_per_seq % 4 != 0:
-            self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
-
         self.kv_cache_map: dict[int, _KVCache] = {}
 
         # Defensive cap for get_num_available_tokens: when host cache is
@@ -1786,6 +1780,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} that can be allocated in kv cache manager, setting max_seq_len to {max_num_tokens}"
             )
             self.max_seq_len = max_num_tokens
+
+        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel.
+        # Computed after max_seq_len clamping, but account for extra tokens
+        # (num_extra_kv_tokens + max_total_draft_tokens) so the host
+        # page-index buffer is large enough for the maximum capacity a single
+        # sequence can reach during warmup or normal operation.
+        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self.max_total_draft_tokens
+        self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block -
+                                   1) // tokens_per_block
+        if self.max_blocks_per_seq % 4 != 0:
+            self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
