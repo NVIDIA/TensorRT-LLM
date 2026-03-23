@@ -38,7 +38,7 @@ WAN_T2V_WIDTH = 832
 WAN_T2V_NUM_FRAMES = 165
 
 # LTX-2 configuration
-LTX2_MODEL_SUBPATH = "ltx-video-2-0.9.7"
+LTX2_MODEL_SUBPATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
 LTX2_T2V_PROMPT = (
     "A woman with long brown hair and light skin smiles at the camera while "
