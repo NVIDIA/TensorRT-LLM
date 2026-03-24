@@ -856,7 +856,9 @@ def _compute_pytorch_prompt_logprobs(
             )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
     context_logits = response.result.context_logits
     assert context_logits is not None, "context_logits cannot be None when prompt_logprobs is requested."
-    prompt_token_ids = generation_result._generation_request.prompt_token_ids
+    # Pass prompt_token_ids with an offset of 1 for correct mapping to the context logits
+    prompt_token_ids = generation_result._generation_request.prompt_token_ids[
+        1:]
     logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
                                        context_logits, None, None,
                                        prompt_token_ids)

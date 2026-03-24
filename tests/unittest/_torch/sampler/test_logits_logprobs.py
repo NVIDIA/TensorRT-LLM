@@ -303,7 +303,7 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
         print(f"Prompt token IDs: {output.prompt_token_ids}")
 
         logprobs = output.outputs[0].prompt_logprobs
-        token_ids = output.prompt_token_ids
+        token_ids = output.prompt_token_ids[1:]
 
         assert len(logprobs) == len(token_ids), (
             f"Expected {len(token_ids)} logprob entries, got {len(logprobs)}"
@@ -372,6 +372,7 @@ def test_logprobs_against_logits(
         logprobs: TokenLogprobs,
         logits_cuda: torch.Tensor,
         case_str: str,
+        logprobs_offset: int = 0,
     ):
         """Checks if the provided logprobs match the logprobs calculated from the logits"""
         expected_logprobs = torch.nn.functional.log_softmax(logits_cuda, dim=-1).to(device="cpu")
@@ -385,7 +386,7 @@ def test_logprobs_against_logits(
             processed_ranks_and_logprobs: dict[int, float] = {}
             for token_id, logprob_obj in token_logprobs.items():
                 # the sampled token may have any rank > 0
-                if token_id != tokens[generation_idx]:
+                if token_id != tokens[generation_idx + logprobs_offset]:
                     # All other tokens should have a rank <= num_logprobs
                     assert logprob_obj.rank <= num_logprobs, (
                         f"{case_str} logprob rank is greater than {num_logprobs}"
@@ -427,6 +428,7 @@ def test_logprobs_against_logits(
                 generation_logprobs,
                 generation_logits,
                 "generation",
+                logprobs_offset=0,
             )
         if prompt_logprobs_k is not None:
             context_tokens = output.prompt_token_ids
@@ -438,6 +440,7 @@ def test_logprobs_against_logits(
                 context_logprobs,
                 context_logits,
                 "context",
+                logprobs_offset=1,  # Prompt logprobs are offset by 1 relative to the prompt token ids
             )
 
 
