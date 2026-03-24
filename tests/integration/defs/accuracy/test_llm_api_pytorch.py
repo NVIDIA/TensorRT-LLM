@@ -1659,7 +1659,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.2)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -2598,7 +2598,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.40)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -2892,12 +2892,12 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if is_sm_100f():
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -3012,7 +3012,7 @@ class TestDeepSeekV3(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.60,
                                         enable_block_reuse=False)
 
         sm_version = get_sm_version()
@@ -3064,12 +3064,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -3888,7 +3888,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, ep_size, attention_dp):
         model_name = "moonshotai/Kimi-K2.5"
         model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
         with LLM(model_path,
                  tensor_parallel_size=8,
@@ -4296,12 +4296,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5, )
+
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B"
                  if is_cached else "Qwen/Qwen3-8B",
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
                  **pytorch_config,
+                 kv_cache_config=kv_cache_config,
                  enable_attention_dp=attention_dp) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -4859,7 +4862,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.45,
                                         enable_block_reuse=False)
 
         with LLM(self.MODEL_PATH,
@@ -5773,8 +5776,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
                        overlap_scheduler, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
-
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=False)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -5969,7 +5971,7 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(14400)
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         chat_template_kwargs = dict(thinking_budget=-1)
 
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:

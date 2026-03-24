@@ -249,7 +249,7 @@ def create_py_executor(
         A fully initialized PyExecutor instance.
     """
 
-    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '1') == '1'
     torch.cuda.set_per_process_memory_fraction(1.0)
     # Apply model-specific defaults early, before destructuring llm_args fields
     checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
