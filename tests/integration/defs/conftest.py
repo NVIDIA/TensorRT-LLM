@@ -1982,7 +1982,7 @@ skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")
 
-skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
+skip_no_sm120 = pytest.mark.skipif(not is_sm_120f(),
                                    reason="This test is for SM120")
 
 skip_arm = pytest.mark.skipif(

@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version, is_blackwell
+import tensorrt_llm._utils as _utils
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -63,7 +63,7 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     b_tmp = b.permute(1, 2, 0)
 
     # Note: we have different output scale shape for fp8_quantize_1x128, so we need to handle it differently for Blackwell and other archs.
-    if is_blackwell():
+    if _utils.is_blackwell():
         input_scale_tmp = a_sf.permute(1, 0).as_strided((m, w_k, 1),
                                                         (1, m, m * w_k))
     else:
@@ -356,7 +356,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         """
         from .interface import _warn_and_return
 
-        sm_version = get_sm_version()
+        sm_version = _utils.get_sm_version()
 
         # CuteDslFusedMoE requires at least SM90
         if sm_version < 90:
@@ -381,11 +381,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
-        # NVFP4 - SM in {100, 103, 120, 121} (Blackwell family)
+        # NVFP4 - SM100 family only (SM120/SM121 has scale dtype mismatch)
         if quant_algo == QuantAlgo.NVFP4:
-            if sm_version not in {100, 103, 120, 121}:
+            if not _utils.is_sm_100f(sm_version):
                 return _warn_and_return(
-                    f"NVFP4 requires Blackwell (SM100/103/120/121), got SM{sm_version}"
+                    f"CuteDSL NVFP4 requires SM100 family (SM120/SM121 excluded due to scale dtype mismatch), got SM{sm_version}"
                 )
             return True, None
 

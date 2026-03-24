@@ -645,3 +645,21 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+
+class TestResolveMoeBackendSM121:
+    """Test that resolve_moe_backend returns CUTLASS (not TRTLLM) on SM121.
+
+    SM120/SM121 lack tcgen05.mma instructions required by trtllm-gen kernels,
+    so the AUTO backend must fall back to CUTLASS.
+    """
+
+    def test_resolve_moe_backend_returns_cutlass_on_sm121(self):
+        from unittest.mock import patch
+
+        with patch("tensorrt_llm._utils.get_sm_version", return_value=121):
+            result = ModelConfig.resolve_moe_backend("AUTO", "SomeArchitecture")
+        assert result == "CUTLASS", (
+            f"Expected CUTLASS on SM121 but got {result}; "
+            "trtllm-gen kernels use tcgen05.mma which is unavailable on SM120/SM121"
+        )

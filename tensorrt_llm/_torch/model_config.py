@@ -251,8 +251,8 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
-        # Blackwell family: use TRTLLM for all MoE architectures
-        if _utils.is_blackwell():
+        # SM100 family: use TRTLLM (trtllm-gen kernels need tcgen05.mma, not available on SM120/SM121)
+        if _utils.is_sm_100f():
             return "TRTLLM"
 
         if architecture == "GptOssForCausalLM":
