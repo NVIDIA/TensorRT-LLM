@@ -305,6 +305,7 @@ class SimpleScheduler(RequestScheduler):
 class ChunkingPolicy(Enum):
     EQUAL_PROGRESS = 1
     FIRST_COME_FIRST_SERVED = 2
+    FORCE_CHUNK = 3
 
 
 @dataclasses.dataclass
@@ -485,8 +486,12 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         if max_num_tokens is not None and num_chunked_tokens > (max_num_tokens - batch_num_tokens):
             all_context_requests_fit = False
 
+        need_chunking = not all_context_requests_fit and contexts_to_be_chunked
+        if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
+            need_chunking = True
+
         # 3. Apply Chunking Strategy if needed
-        if not all_context_requests_fit and contexts_to_be_chunked:
+        if need_chunking:
             assert ctx_chunk_config is not None, (
                 "If chunking is not enabled, context scheduling should be completed."
             )
@@ -567,6 +572,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             self._chunk_equal_progress(requests, capacity, unit_size)
         elif policy == ChunkingPolicy.FIRST_COME_FIRST_SERVED:
             self._chunk_fcfs(requests, capacity, unit_size)
+        elif policy == ChunkingPolicy.FORCE_CHUNK:
+            self._chunk_forced(requests, capacity, unit_size)
         else:
             raise ValueError(f"Invalid chunking policy: {policy}")
 
@@ -630,6 +637,18 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             # C++: ctxTokensCapacity = ctxTokensCapacity - actualChunkSize
             if capacity is not None:
                 current_capacity -= req.context_chunk_size
+
+    def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+        total_tokens = 0
+        for req in requests:
+            req.context_chunk_size = min(req.context_remaining_length, unit_size)
+            if capacity is not None and total_tokens + req.context_chunk_size > capacity:
+                req.context_chunk_size = 0
+            total_tokens += req.context_chunk_size
+        if total_tokens > capacity:
+            logger.warning(
+                f"Total tokens {total_tokens} exceeds capacity {capacity} but FORCE_CHUNK is used"
+            )
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         # Calculate tokens already taken by the batch so far
@@ -1341,6 +1360,8 @@ class SimpleUnifiedScheduler(RequestScheduler):
 
             if "EQUAL_PROGRESS" in str(input_policy):
                 policy_enum = ChunkingPolicy.EQUAL_PROGRESS
+            elif "FORCE_CHUNK" in str(input_policy):
+                policy_enum = ChunkingPolicy.FORCE_CHUNK
             else:
                 # Default to FCFS for FIRST_COME_FIRST_SERVED or others
                 policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED
