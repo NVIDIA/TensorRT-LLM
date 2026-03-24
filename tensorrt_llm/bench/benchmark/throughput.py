@@ -434,6 +434,12 @@ def throughput_command(
 
         post_proc_params = None  # No detokenization
 
+        has_multi_turn = any(r.is_multi_turn for r in requests)
+        multi_turn_tokenizer = tokenizer if has_multi_turn else None
+        if has_multi_turn:
+            logger.info("Multi-turn requests detected. Turns will be processed "
+                        "sequentially within each request.")
+
         # Perform warmup if requested.
         if options.warmup > 0:
             logger.info("Setting up for warmup...")
@@ -446,7 +452,8 @@ def throughput_command(
                                 warmup_dataset,
                                 False,
                                 options.concurrency,
-                                modality=options.modality))
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -463,7 +470,8 @@ def throughput_command(
                                 options.streaming,
                                 options.concurrency,
                                 iteration_writer.full_address,
-                                modality=options.modality))
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer))
 
         logger.info("Benchmark done. Reporting results...")
         if options.modality is not None:
