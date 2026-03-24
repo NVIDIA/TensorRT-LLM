@@ -394,11 +394,3 @@ The following sections help you pick a known-good `trtllm-serve --config` for yo
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
 ```
-
-### Recipe database
-
-```{eval-rst}
-.. include:: config_table.rst
-   :start-after: .. start-openai/gpt-oss-120b
-   :end-before: .. end-openai/gpt-oss-120b
-```

@@ -1,10 +1,15 @@
 from .auto_heuristic import suggest_spec_config
+from .draft_target import (DraftTargetOneModelSpecMetadata,
+                           DraftTargetOneModelWorker)
 from .eagle3 import Eagle3SpecMetadata
 from .interface import (SpecMetadata, SpecWorkerBase,
+                        prepare_attn_metadata_for_draft_replay,
+                        restore_attn_metadata_after_draft_replay,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPEagleWorker, MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
+from .sa_enhancer import SADraftEnhancer
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
@@ -18,6 +23,8 @@ from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
                     get_spec_worker, update_spec_config_from_model_config)
 
 __all__ = [
+    "DraftTargetOneModelSpecMetadata",
+    "DraftTargetOneModelWorker",
     "Eagle3SpecMetadata",
     "MTPEagleWorker",
     "MTPSampler",
@@ -27,6 +34,7 @@ __all__ = [
     "NGramPoolManager",
     "PARDSpecMetadata",
     "PARDWorker",
+    "SADraftEnhancer",
     "SASampler",
     "SASpecMetadata",
     "SAWorker",
@@ -46,6 +54,8 @@ __all__ = [
     "get_spec_metadata",
     "get_spec_resource_manager",
     "get_spec_worker",
+    "prepare_attn_metadata_for_draft_replay",
+    "restore_attn_metadata_after_draft_replay",
     "should_use_separate_draft_kv_cache",
     "update_spec_config_from_model_config",
     "suggest_spec_config",

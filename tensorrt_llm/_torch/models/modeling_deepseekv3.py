@@ -50,10 +50,10 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather,
-                           cp_allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import MLA
+from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+                                 maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
@@ -414,7 +414,12 @@ class DeepseekV3WeightLoader:
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = self.model_config.get_quant_config(
                     ).layer_quant_mode.has_nvfp4() and weights[
-                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2 and weights[
+                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2
+                    # Non-lite models (V3, R1, V3.2) fuse q_a_proj into
+                    # kv_a_proj_with_mqa, so both must be NVFP4 for the fused
+                    # path. Lite models (V3-Lite) have no q_a_proj.
+                    if not is_lite:
+                        nvfp4_fused_a &= weights[
                             f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
                     if nvfp4_fused_a:
                         ########### input_scale
@@ -497,8 +502,6 @@ class DeepseekV3WeightLoader:
                         else:
                             fused_a = kv_a_proj_with_mqa
 
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
 
                         ########### fuse weight_scale
@@ -508,8 +511,6 @@ class DeepseekV3WeightLoader:
                                 dim=0)
                         else:
                             fused_a_scale = kv_a_proj_with_mqa_scale
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight_scale.data[0:fused_a_scale.
                                                  shape[0]].copy_(fused_a_scale)
                     else:
@@ -531,8 +532,6 @@ class DeepseekV3WeightLoader:
 
                             module.weight_scale.data[
                                 0:fused_a_scale.shape[0]].copy_(fused_a_scale)
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                     # Mark consumed kv_a_proj_with_mqa and q_a_proj weights
                     if can_mark_consumed:
@@ -765,6 +764,7 @@ class DeepseekV32Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
@@ -790,50 +790,20 @@ class DeepseekV32Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream,
+                         mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
 
         self.indexer = self.mqa.indexer
 
-        # For DeepseekV32, the kv_a_proj_with_mqa includes:
-        # q_a_proj + kv_a_proj_with_mqa + indexer.wk
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank +
-            self.indexer.head_dim,
+            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,
             bias=False,
             dtype=config.torch_dtype,
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True)
-
-    def post_load_weights(self):
-        """
-        Concatenate indexer.wk weights into kv_a_proj_with_mqa's last dimension, to fuse indexer.wk projection with kv_a_proj_with_mqa GEMM.
-        """
-        assert self.kv_a_proj_with_mqa.weight.data.dtype == self.indexer.wk.weight.data.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
-        # Copy indexer weights into the fused kv_a_proj_with_mqa module
-        indexer_wk_weight = self.indexer.wk.weight.data
-        offset = self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank
-        self.kv_a_proj_with_mqa.weight.data[offset:offset +
-                                            self.indexer.head_dim].copy_(
-                                                indexer_wk_weight)
-
-        # Copy indexer scale data if it exists
-        if hasattr(self.indexer.wk,
-                   'weight_scale') and self.indexer.wk.weight_scale is not None:
-            indexer_wk_scale = self.indexer.wk.weight_scale.data
-            assert self.kv_a_proj_with_mqa.weight_scale.dim(
-            ) == 2, "weight_scale must be a 2D tensor"
-            group_size = self.kv_a_proj_with_mqa.weight.shape[
-                0] // self.kv_a_proj_with_mqa.weight_scale.shape[0]
-            scale_offset = offset // group_size
-            scale_size = indexer_wk_scale.shape[0]
-            # Copy indexer scale to the corresponding position in the fused module
-            self.kv_a_proj_with_mqa.weight_scale.data[
-                scale_offset:scale_offset + scale_size].copy_(indexer_wk_scale)
-
-        self.indexer.wk = None
 
 
 class DeepseekV3Gate(nn.Module):
@@ -1021,7 +991,7 @@ class Deepseekv3MoE(nn.Module):
                 num_experts=num_experts,
                 experts_per_token=top_k,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=dtype)
+                dtype=torch.float32)
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -1083,7 +1053,7 @@ class Deepseekv3MoE(nn.Module):
             experts_per_token=self.top_k,
             moe_ep_size=self.model_config.mapping.moe_ep_size,
             device=device,
-            dtype=self.dtype)
+            dtype=torch.float32)
 
     @staticmethod
     def _get_shared_experts_quant_config(model_config,
@@ -1226,6 +1196,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         self.model_config = model_config
+        self.layer_idx = layer_idx
+        self.mapping_with_cp = mapping_with_cp
         self.config = model_config.pretrained_config
         config = self.config
 
@@ -1246,21 +1218,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
+        # When enable_attention_dp is True, TP reduction is skipped since each DP rank
+        # works on different batch elements. However, with CP > 1, attention is split
+        # across CP ranks for the SAME batch element, so reduction is still needed
+        # within the CP group.
+        needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
+        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        )
         if config.model_type == "deepseek_v32":
             self.self_attn = DeepseekV32Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                reduce_output=not self.enable_attention_dp
-                and self.mapping.tp_size > 1)
+                mapping_with_cp=mapping_with_cp,
+                reduce_output=needs_tp_reduce or needs_cp_reduce)
         else:
-            # When enable_attention_dp is True, TP reduction is skipped since each DP rank
-            # works on different batch elements. However, with CP > 1, attention is split
-            # across CP ranks for the SAME batch element, so reduction is still needed
-            # within the CP group.
-            needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
-            needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
-            )
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
@@ -1349,7 +1321,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.layer_idx = layer_idx
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
@@ -1418,15 +1389,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, residual = self.self_attn(
+        hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
-            residual=residual,
             **kwargs,
         )
+        residual = maybe_slice_for_helix_cp(residual, attn_metadata,
+                                            self.mapping_with_cp,
+                                            self.layer_idx)
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1686,13 +1659,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, residual = self.self_attn(
+        hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
-            residual=residual,
             **kwargs,
         )
 
@@ -1806,20 +1778,13 @@ class DeepseekV3Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
-        # With CP helix, the last layer's reduce-scatter leaves each rank
-        # with only its chunk of tokens.  AllGather restores the full token
-        # count so the LM head (and norm) see every token.
-        if (self.mapping_with_cp is not None
-                and self.mapping_with_cp.has_cp_helix()
-                and self.mapping_with_cp.enable_attention_dp):
-            hidden_states = cp_allgather(hidden_states,
-                                         self.mapping_with_cp,
-                                         dim=0)
-            hidden_states = hidden_states[:attn_metadata.num_tokens]
-
+        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
+                                                     attn_metadata,
+                                                     self.mapping_with_cp)
         return hidden_states
 
 
+@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
@@ -1854,6 +1819,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 quant_config_dict[key] = val
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
+            model_config._frozen = True
+
+        if model_config.pretrained_config.model_type == 'glm_moe_dsa':
+            model_config._frozen = False
+            model_config.pretrained_config.model_type = 'deepseek_v32'
             model_config._frozen = True
 
         super().__init__(model=DeepseekV3Model(

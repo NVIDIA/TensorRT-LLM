@@ -7,6 +7,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import SchedulerConfig
 
 
 # A test case of mmlu_llama from lm_eval
@@ -24,8 +25,10 @@ def model_path():
 def create_llm(model_dir,
                disable_overlap_scheduler,
                sampler_type,
-               env_overrides=None):
+               scheduler_config=None):
     """Create LLM with specific overlap scheduler setting"""
+    if scheduler_config is None:
+        scheduler_config = SchedulerConfig()
     pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
                           sampler_type=sampler_type)
 
@@ -41,7 +44,7 @@ def create_llm(model_dir,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=
         128,  # Only one request longer than max_num_tokens is required to test chunked prefill
-        env_overrides=env_overrides,
+        scheduler_config=scheduler_config,
     )
 
 
@@ -52,10 +55,8 @@ def create_llm(model_dir,
 @pytest.mark.mpi_ray_parity
 def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
                                        use_python_scheduler):
-    # Use env_overrides to pass env var to MPI subprocess
-    env_overrides = {
-        "TLLM_USE_PYTHON_SCHEDULER": "1"
-    } if use_python_scheduler else {}
+    scheduler_config = SchedulerConfig(
+        use_python_scheduler=use_python_scheduler)
 
     # Test configuration
     prompts = test_case["prompts"]
@@ -75,7 +76,7 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     with create_llm(model_path,
                     disable_overlap_scheduler=False,
                     sampler_type=sampler_type,
-                    env_overrides=env_overrides) as llm:
+                    scheduler_config=scheduler_config) as llm:
         outputs_with_overlap = llm.generate(prompts,
                                             sampling_params=sampling_config,
                                             use_tqdm=True)
@@ -87,7 +88,7 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     with create_llm(model_path,
                     disable_overlap_scheduler=True,
                     sampler_type=sampler_type,
-                    env_overrides=env_overrides) as llm:
+                    scheduler_config=scheduler_config) as llm:
         outputs_without_overlap = llm.generate(prompts,
                                                sampling_params=sampling_config,
                                                use_tqdm=True)

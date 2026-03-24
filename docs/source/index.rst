@@ -34,6 +34,7 @@ Welcome to TensorRT LLM's Documentation!
    :name: Models
 
    models/supported-models.md
+   models/visual-generation.md
    models/adding-new-model.md
 
 
@@ -67,7 +68,6 @@ Welcome to TensorRT LLM's Documentation!
    features/long-sequence.md
    features/lora.md
    features/multi-modality.md
-   features/visual-generation.md
    features/overlap-scheduler.md
    features/paged-attention-ifb-scheduler.md
    features/parallel-strategy.md
@@ -102,12 +102,15 @@ Welcome to TensorRT LLM's Documentation!
    :maxdepth: 2
    :caption: Blogs
    :glob:
+   :reversed:
 
-   blogs/tech_blog/*
-   blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md
-   blogs/H200launch.md
-   blogs/XQA-kernel.md
+   blogs/quantization-in-TRT-LLM.md
+   blogs/Falcon180B-H200.md
    blogs/H100vsA100.md
+   blogs/XQA-kernel.md
+   blogs/H200launch.md
+   blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md
+   blogs/tech_blog/*
 
 
 .. toctree::

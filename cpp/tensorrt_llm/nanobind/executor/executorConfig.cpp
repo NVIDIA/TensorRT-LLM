@@ -589,7 +589,7 @@ void initConfigBindings(nb::module_& m)
                  >(),
             nb::arg("max_beam_width") = 1, nb::arg("scheduler_config") = tle::SchedulerConfig(),
             nb::arg("kv_cache_config") = tle::KvCacheConfig(), nb::arg("enable_chunked_context") = false,
-            nb::arg("normalize_log_probs") = true,
+            nb::arg("normalize_log_probs") = false,
             nb::arg("iter_stats_max_iterations") = tle::ExecutorConfig::kDefaultIterStatsMaxIterations,
             nb::arg("request_stats_max_iterations") = tle::ExecutorConfig::kDefaultRequestStatsMaxIterations,
             nb::arg("batching_type") = tle::BatchingType::kINFLIGHT, nb::arg("max_batch_size") = nb::none(),

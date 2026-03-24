@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import re
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,7 +31,7 @@ from tensorrt_llm._torch.utils import ActivationType, relu2
 from tensorrt_llm.logger import logger
 
 from ..attention_backend import AttentionMetadata
-from ..distributed import AllReduce
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -58,6 +59,7 @@ class MLPLayer(MLP):
         self,
         model_config: ModelConfig[NemotronHConfig],
         layer_idx: int,
+        reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
         if isinstance(config.intermediate_size, list):
@@ -75,6 +77,7 @@ class MLPLayer(MLP):
             activation=relu2,
             dtype=config.torch_dtype,
             config=model_config,
+            reduce_output=reduce_output,
         )
         self.layer_idx = layer_idx
 
@@ -118,7 +121,8 @@ class TransformerLayer(Attention):
     ) -> torch.Tensor:
         return super().forward(position_ids=None,
                                hidden_states=hidden_states,
-                               attn_metadata=attn_metadata)
+                               attn_metadata=attn_metadata,
+                               **kwargs)
 
 
 # Ref code: https://huggingface.co/nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024/blob/main/modeling_nemotron_h.py#L818
@@ -129,6 +133,7 @@ class NemotronHMOE(nn.Module):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
+        reduce_output: bool = False,
     ):
         super().__init__()
 
@@ -196,6 +201,19 @@ class NemotronHMOE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
+        # For MIXED_PRECISION models, the global quant_config has quant_algo=MIXED_PRECISION
+        # which maps to QuantMode(0) (no quant). This would cause the MoE backend to select
+        # UnquantizedFusedMoEMethod and allocate BF16 weight buffers, causing a shape mismatch
+        # when loading NVFP4/W4A8_NVFP4_FP8 quantized expert weights.
+        # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
+        moe_model_config = model_config
+        if model_config.quant_config_dict is not None:
+            experts_prefix = f"model.layers.{layer_idx}.mixer.experts."
+            for key, cfg in model_config.quant_config_dict.items():
+                if key.startswith(experts_prefix):
+                    moe_model_config = replace(model_config, quant_config=cfg)
+                    break
+
         # Setup MoE experts.
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
@@ -205,15 +223,14 @@ class NemotronHMOE(nn.Module):
             aux_stream_dict=aux_stream_dict,
             dtype=config.torch_dtype,
             reduce_results=self.reduce_results,
-            model_config=model_config,
+            model_config=moe_model_config,
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,
             activation_type=self.activation_type,
         )
 
-        if not model_config.mapping.enable_attention_dp:
-            # AllReduce for combining shared and routed expert outputs in multi-GPU settings.
+        if reduce_output:
             self.allreduce = AllReduce(
                 mapping=model_config.mapping,
                 strategy=model_config.allreduce_strategy,
@@ -268,11 +285,14 @@ class NemotronHMOE(nn.Module):
         assert hidden_states_hp.shape[-1] == self.hidden_dim
         orig_shape = hidden_states_hp.shape
         hidden_states_hp_2d = hidden_states_hp.view(-1, self.hidden_dim)
-        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        # MTP sublayer may pass a corrected all_rank_num_tokens via kwargs,
+        # since attn_metadata still holds the main model's token count.
+        all_rank_num_tokens = kwargs.get('all_rank_num_tokens',
+                                         attn_metadata.all_rank_num_tokens)
 
         def _compute_shared_output():
             if self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states)
+                shared_expert_output = self.shared_experts(hidden_states_hp)
             else:
                 shared_expert_output = 0
             return shared_expert_output
@@ -307,8 +327,10 @@ class NemotronHMOE(nn.Module):
         final_hidden_states = shared_output + routed_output
 
         # Perform all-reduce after combining outputs for multi-GPU support.
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
-            final_hidden_states = self.allreduce(final_hidden_states)
+        if self.allreduce is not None:
+            final_hidden_states = self.allreduce(
+                final_hidden_states,
+                all_reduce_params=kwargs.get('all_reduce_params'))
 
         return final_hidden_states.view(orig_shape)
 
@@ -324,6 +346,7 @@ class NemotronHLayer(DecoderLayer):
         # * -> TransformerLayer
         layer_type: str,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
+        fuse_allreduce_norm: bool = False,
     ):
         super().__init__()
 
@@ -332,9 +355,17 @@ class NemotronHLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
-        self.is_nvfp4 = (model_config.quant_config is not None
-                         and model_config.quant_config.quant_mode is not None
-                         and model_config.quant_config.quant_mode.has_nvfp4())
+        quant_mode = (model_config.quant_config.quant_mode
+                      if model_config.quant_config is not None else None)
+        self.is_nvfp4 = quant_mode is not None and quant_mode.has_nvfp4()
+        # For MIXED_PRECISION models, the global quant_mode is QuantMode(0). Check per-layer
+        # quant_config_dict to see if this specific layer is NVFP4-quantized.
+        if not self.is_nvfp4 and model_config.quant_config_dict is not None:
+            layer_prefix = f"model.layers.{layer_idx}."
+            for key, cfg in model_config.quant_config_dict.items():
+                if key.startswith(layer_prefix) and cfg.quant_mode.has_nvfp4():
+                    self.is_nvfp4 = True
+                    break
         # The fused RMSNorm+NVFP4 CUDA kernel requires hidden_size to be
         # a supported tile size. Non-power-of-2 hidden sizes within tile
         # ranges may cause kernel hangs. Disable fused NVFP4 for such cases.
@@ -348,6 +379,13 @@ class NemotronHLayer(DecoderLayer):
             )
             self.is_nvfp4 = False
 
+        # fuse_allreduce_norm is the model-level flag.  When enabled, ALL
+        # layers defer mixer AllReduce to the next layer's pre_allreduce (or
+        # the model's final_allreduce).  Only layers 1+ create a pre_allreduce
+        # module; layer 0's input is already reduced from the embedding.
+        self.fuse_allreduce_norm = fuse_allreduce_norm
+        self.is_moe_layer = (layer_type == "E")
+
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -357,8 +395,21 @@ class NemotronHLayer(DecoderLayer):
             quantize_type="nvfp4" if self.is_nvfp4 else None,
             # Enable high precision output for MoE layer (only with NVFP4).
             # It might be overridden in `_try_attach_nvfp4_scale` function.
-            return_hp_output=layer_type == "E" and self.is_nvfp4,
+            return_hp_output=self.is_moe_layer and self.is_nvfp4,
         )
+
+        if fuse_allreduce_norm and layer_idx > 0:
+            self.pre_allreduce = AllReduce(
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+            )
+
+        # Mixer creation.  The fuse_allreduce_norm optimization is orthogonal
+        # to AllReduce topology: Transformer/MoE gate it at forward time via
+        # AllReduceParams; MLP/Mamba gate it at init time via reduce_output
+        # (their base classes don't thread all_reduce_params through forward).
+        has_tp_allreduce = (not model_config.mapping.enable_attention_dp
+                            and model_config.mapping.tp_size > 1)
 
         if layer_type == "M":
             self.mixer = Mamba2Mixer(
@@ -374,19 +425,27 @@ class NemotronHLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 config=model_config,
             )
+            if fuse_allreduce_norm:
+                self.mixer.out_proj.reduce_output = False
         elif layer_type == "-":
-            self.mixer = MLPLayer(model_config, layer_idx)
+            self.mixer = MLPLayer(
+                model_config,
+                layer_idx,
+                reduce_output=not fuse_allreduce_norm,
+            )
         elif layer_type == "*":
             self.mixer = TransformerLayer(
                 model_config,
                 layer_idx,
-                reduce_output=not model_config.mapping.enable_attention_dp
-                and model_config.mapping.tp_size > 1,
+                reduce_output=has_tp_allreduce,
             )
         elif layer_type == "E":
-            self.mixer = NemotronHMOE(model_config,
-                                      layer_idx=layer_idx,
-                                      aux_stream_dict=aux_stream_dict)
+            self.mixer = NemotronHMOE(
+                model_config,
+                layer_idx=layer_idx,
+                aux_stream_dict=aux_stream_dict,
+                reduce_output=has_tp_allreduce,
+            )
         else:
             raise ValueError(f"{layer_type} is not supported")
 
@@ -411,7 +470,7 @@ class NemotronHLayer(DecoderLayer):
 
         # Special handling for MoE layer: fetch shared_expert.up_proj.input_scale
         # as representation of the input scale.
-        if self.layer_type == "E":
+        if self.is_moe_layer:
             if (hasattr(self.mixer, "shared_experts")
                     and self.mixer.shared_experts is not None
                     and hasattr(self.mixer.shared_experts, "up_proj")
@@ -438,16 +497,50 @@ class NemotronHLayer(DecoderLayer):
         if residual is None:
             residual = torch.zeros_like(hidden_states)
 
-        if self.norm.return_hp_output:
+        if hasattr(self, 'pre_allreduce'):
+            norm = self.norm
+            has_nvfp4_scale = hasattr(norm, 'nvfp4_scale')
+            if norm.is_nvfp4 and has_nvfp4_scale and norm.return_hp_output:
+                fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+            elif norm.is_nvfp4 and has_nvfp4_scale:
+                fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
+            else:
+                fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+            all_reduce_params = AllReduceParams(
+                fusion_op=fusion_op,
+                residual=residual,
+                norm_weight=norm.weight,
+                eps=norm.variance_epsilon,
+                trigger_completion_at_end=False,
+                **(dict(scale=norm.nvfp4_scale)
+                   if has_nvfp4_scale and norm.is_nvfp4 else {}),
+            )
+            result = self.pre_allreduce(hidden_states,
+                                        all_reduce_params=all_reduce_params)
+            if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+                norm_out, act_fp4, act_sf, residual = result
+                hidden_states = (Fp4QuantizedTensor(act_fp4, act_sf), norm_out)
+            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                act_fp4, act_sf, residual = result
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = result
+        elif self.norm.return_hp_output:
             hidden_states, residual, high_precision_normed_output = self.norm(
                 hidden_states, residual)
             hidden_states = (hidden_states, high_precision_normed_output)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
-        hidden_states = self.mixer(hidden_states,
-                                   attn_metadata,
-                                   spec_metadata=spec_metadata,
-                                   **kwargs)
+
+        # When fuse_allreduce_norm is active, tell Transformer/MoE mixers to
+        # skip their own AllReduce (it is handled by pre_allreduce /
+        # final_allreduce instead).  MLP/Mamba ignore this kwarg; their
+        # reduce_output was set at init time.
+        mixer_kwargs = dict(spec_metadata=spec_metadata, **kwargs)
+        if self.fuse_allreduce_norm:
+            mixer_kwargs['all_reduce_params'] = AllReduceParams(
+                enable_allreduce=False)
+        hidden_states = self.mixer(hidden_states, attn_metadata, **mixer_kwargs)
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
@@ -494,14 +587,20 @@ class NemotronHModel(DecoderModel):
                 gather_output=True,
             )
 
+        self.fuse_allreduce_norm = (not model_config.mapping.enable_attention_dp
+                                    and model_config.mapping.tp_size > 1)
+
         # create layers
         layers = []
         for layer_idx, layer_type in enumerate(config.hybrid_override_pattern):
             layers.append(
-                NemotronHLayer(model_config,
-                               layer_idx,
-                               layer_type,
-                               aux_stream_dict=self.aux_stream_dict))
+                NemotronHLayer(
+                    model_config,
+                    layer_idx,
+                    layer_type,
+                    aux_stream_dict=self.aux_stream_dict,
+                    fuse_allreduce_norm=self.fuse_allreduce_norm,
+                ))
         self.layers = nn.ModuleList(layers)
         self.num_hidden_layers = config.num_hidden_layers
 
@@ -511,6 +610,13 @@ class NemotronHModel(DecoderModel):
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
+
+        # AllReduce for fusing with final norm (after last layer's mixer)
+        if self.fuse_allreduce_norm:
+            self.final_allreduce = AllReduce(
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+            )
 
     def forward(
         self,
@@ -542,7 +648,19 @@ class NemotronHModel(DecoderModel):
                 spec_metadata=spec_metadata,
                 mamba_metadata=mamba_metadata,
             )
-        hidden_states, _ = self.norm_f(hidden_states, residual)
+
+        if self.fuse_allreduce_norm:
+            hidden_states, _ = self.final_allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.norm_f.weight,
+                    eps=self.norm_f.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ))
+        else:
+            hidden_states, _ = self.norm_f(hidden_states, residual)
         return hidden_states
 
 
@@ -571,6 +689,17 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 re.sub(r"(model\.layers\.)?backbone", "model", k)
                 for k in model_config.quant_config.exclude_modules
             ]
+
+        # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
+        # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use
+        # 'model.layers.' as root rather than 'backbone.layers.' from the HF checkpoint.
+        if model_config.quant_config_dict is not None:
+            model_config._frozen = False
+            model_config.quant_config_dict = {
+                re.sub(r"(model\.layers\.)?backbone", "model", k): v
+                for k, v in model_config.quant_config_dict.items()
+            }
+            model_config._frozen = True
 
         super().__init__(
             model=NemotronHModel(model_config),
@@ -725,6 +854,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.has_start_projections:
             assert inputs_embeds is not None
@@ -753,6 +883,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states = self.mixer(
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            **kwargs,
         )
 
         if self.has_end_norm:
@@ -798,14 +929,14 @@ class NemotronHMTP(nn.Module):
             sublayer_quant_config = self._get_mtp_sublayer_quant_config(
                 model_config, self.layer_idx)
 
-            # Create a temporary model_config with the override quant_config
-            sublayer_model_config = ModelConfig(
-                pretrained_config=model_config.pretrained_config,
-                mapping=model_config.mapping,
-                quant_config=sublayer_quant_config,
-                skip_create_weights_in_init=model_config.
-                skip_create_weights_in_init,
-            )
+            # Create a model_config copy with quant_config overridden and
+            # spec_config cleared. All other fields (use_cuda_graph,
+            # moe_backend, moe_max_num_tokens, etc.) must be inherited
+            # so MoE layers are configured correctly for CUDA graph
+            # capture and communication (e.g., DeepEP).
+            sublayer_model_config = replace(model_config,
+                                            quant_config=sublayer_quant_config,
+                                            spec_config=None)
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,
@@ -859,6 +990,7 @@ class NemotronHMTP(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 attn_metadata=attn_metadata,
+                all_rank_num_tokens=all_rank_num_tokens,
             )
         return hidden_states
 

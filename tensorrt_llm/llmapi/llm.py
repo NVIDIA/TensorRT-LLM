@@ -491,7 +491,7 @@ class BaseLLM:
             inputs = TextPrompt(
                 prompt=prompt,
                 multi_modal_data=inputs.get("multi_modal_data"),
-                mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
+                mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {})
             if sampling_params.add_special_tokens:
                 logger.debug(
                     "Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt."
@@ -1226,9 +1226,14 @@ class _TorchLLM(BaseLLM):
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         checkpoint_format = getattr(self.args, "checkpoint_format", None)
+        input_processor_kwargs = {}
+        if self.args.video_pruning_rate is not None:
+            input_processor_kwargs[
+                'video_pruning_rate'] = self.args.video_pruning_rate
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer,
-                                                      checkpoint_format)
+                                                      checkpoint_format,
+                                                      **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 
         # TODO: revisit gather_context_logits

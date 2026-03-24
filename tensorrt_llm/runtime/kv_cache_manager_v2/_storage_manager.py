@@ -29,10 +29,9 @@ from ._common import (
     CacheTier,
     LayerId,
     MemAddress,
-    PageIndex,
     PageStatus,
 )
-from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
+from ._config import BatchDesc, CacheTierConfig, DataRole, DiskCacheTierConfig, KVCacheDesc
 from ._copy_engine import CopyTask, batched_copy
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import OutOfPagesError
@@ -47,25 +46,27 @@ from ._storage._core import (
     PoolGroupBase,
     PoolGroupIndex,
     PoolIndex,
-    PoolIndex0,
     Slot,
     SlotId,
 )
 from ._utils import (
     Array2D,
     CachedCudaEvent,
+    HalfOpenRange,
     HomoTuple,
     TemporaryCudaStream,
     TypedIndexList,
+    div_up,
     filled_array2d,
     filled_list,
     get_uniform_attribute,
+    intersect,
     make_typed,
-    map_optional,
     partition,
     remove_if,
     round_up,
     typed_enumerate,
+    typed_len,
     typed_map,
     typed_range,
 )
@@ -87,10 +88,10 @@ class CacheLevelManager:
         cache_level: CacheLevel,
         config: CacheTierConfig,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
-        init_ratio: TypedIndexList[PoolGroupIndex, float],
+        slot_count_list: TypedIndexList[PoolGroupIndex, int],
     ):
         self.cache_level = cache_level
-        self.storage = self._create_cache_level_storage(config, slot_size_lists, init_ratio)
+        self.storage = self._create_cache_level_storage(config, slot_size_lists, slot_count_list)
         self.controller = PerLevelEvictionController(life_cycle_grouping, cache_level)
 
     @property
@@ -99,35 +100,42 @@ class CacheLevelManager:
         return self.storage.num_pool_groups
 
     @staticmethod
+    def cache_tier_granularity(tier: CacheTier, quota: int) -> int:
+        """Compute pool size granularity for a given cache tier and quota."""
+        match tier:
+            case CacheTier.GPU_MEM:
+                page_size = 2 << 20
+                return page_size << min(4, max(0, int(math.log(quota / (page_size * 512), 2))))
+            case CacheTier.HOST_MEM:
+                return HostCacheLevelStorage.POOL_SIZE_GRANULARITY
+            case CacheTier.DISK:
+                return DiskCacheLevelStorage.POOL_SIZE_GRANULARITY
+            case _:
+                raise ValueError(f"Invalid cache tier: {tier}")
+
+    @staticmethod
     def _create_cache_level_storage(
         config: CacheTierConfig,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
-        init_ratio: TypedIndexList[PoolGroupIndex, float],
+        slot_count_list: TypedIndexList[PoolGroupIndex, int],
     ) -> CacheLevelStorage:
-        quota = config.quota
-        total_num_pools = sum(len(sizes) for sizes in slot_size_lists)
-
-        def adjust_quota(quota: int, granularity: int) -> int:
-            return max(granularity * total_num_pools, round_up(quota, granularity))
-
-        if config.tier == CacheTier.GPU_MEM:
-            page_size = 2 << 20
-            phys_mem_size = page_size << min(4, max(0, int(math.log(quota / (page_size * 512), 2))))
-            quota = adjust_quota(quota, phys_mem_size)
-            return GpuCacheLevelStorage(quota, slot_size_lists, init_ratio, phys_mem_size)
-        elif config.tier == CacheTier.HOST_MEM:
-            quota = adjust_quota(quota, HostCacheLevelStorage.POOL_SIZE_GRANULARITY)
-            return HostCacheLevelStorage(quota, slot_size_lists, init_ratio)
-        elif config.tier == CacheTier.DISK:
-            assert isinstance(config, DiskCacheTierConfig)
-            assert os.path.isdir(config.path), (
-                f"Disk path {config.path} does not exist or is not a directory"
-            )
-            quota = adjust_quota(quota, DiskCacheLevelStorage.POOL_SIZE_GRANULARITY)
-            filename_template = os.path.join(config.path, "g{}p{}.bin")
-            return DiskCacheLevelStorage(quota, slot_size_lists, init_ratio, filename_template)
-        else:
-            raise ValueError(f"Invalid cache tier: {config.tier}")
+        match config.tier:
+            case CacheTier.GPU_MEM:
+                granularity = CacheLevelManager.cache_tier_granularity(
+                    CacheTier.GPU_MEM, config.quota
+                )
+                return GpuCacheLevelStorage(slot_size_lists, slot_count_list, granularity)
+            case CacheTier.HOST_MEM:
+                return HostCacheLevelStorage(slot_size_lists, slot_count_list)
+            case CacheTier.DISK:
+                assert isinstance(config, DiskCacheTierConfig)
+                assert os.path.isdir(config.path), (
+                    f"Disk path {config.path} does not exist or is not a directory"
+                )
+                filename_template = os.path.join(config.path, "g{}p{}.bin")
+                return DiskCacheLevelStorage(slot_size_lists, slot_count_list, filename_template)
+            case _:
+                raise ValueError(f"Invalid cache tier: {config.tier}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -155,9 +163,9 @@ class StorageManager:
         "_slot_to_page_indices",
         "_buffer_attr",
         "_life_cycle_grouping",
-        "_levels",
-        "_cached_num_pool_groups",
         "_slot_desc_list",
+        "_levels",
+        "_min_slots",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -165,12 +173,19 @@ class StorageManager:
     _slot_to_page_indices: TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
-    _levels: TypedIndexList[CacheLevel, CacheLevelManager]
-    _cached_num_pool_groups: PoolGroupIndex
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
+    _levels: TypedIndexList[CacheLevel, CacheLevelManager]
+    _min_slots: TypedIndexList[PoolGroupIndex, int]
     __rawref__: rawref.ref["StorageManager"]
 
-    def __init__(self, life_cycles: LifeCycleRegistry, config: StorageConfig) -> None:
+    def __init__(
+        self,
+        life_cycles: LifeCycleRegistry,
+        config: StorageConfig,
+        tokens_per_block: int,
+        typical_batch: BatchDesc | None = None,
+        constraints: list[BatchDesc] | None = None,
+    ) -> None:
         self.__rawref__ = rawref.NULL
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
@@ -180,27 +195,52 @@ class StorageManager:
         self._slot_to_page_indices = config.slot_to_page_indices()
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
-        slot_size_lists = typed_map(config.slot_desc_list, lambda pg: pg.slot_size_list)
-        # @TODO: accept an optional avg_seq_len param and consider sliding window.
-        init_ratio = typed_map(
-            config.slot_desc_list, lambda pg: float(sum(pg.slot_size_list) * len(pg.variants))
+        self._slot_desc_list = config.slot_desc_list
+        assert all(pg < self.num_pool_groups for pg in self._life_cycle_grouping)
+        assert self.num_pool_groups == PoolGroupIndex(len(set(self._life_cycle_grouping)))
+        slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.slot_size_list)
+
+        gpu_quota = config.cache_tiers[GPU_LEVEL].quota
+        gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
+
+        self._min_slots = self._compute_min_slots_from_constraints(
+            constraints or [], tokens_per_block
         )
-        total = sum(init_ratio)
-        init_ratio = typed_map(init_ratio, lambda x: x / total)
+
+        # Compute init_ratio from typical_batch, constraints, or fallback.
+        if typical_batch is not None:
+            init_ratio = self.ratio_from_batch(typical_batch, tokens_per_block, gpu_granularity)
+        elif constraints:
+            # Use the constraint slot counts as the ratio basis.
+            min_bytes = self._slots_to_bytes(self._min_slots, gpu_granularity)
+            total = sum(min_bytes)
+            init_ratio = typed_map(min_bytes, lambda x: x / total)
+        else:
+            init_ratio = self.ratio_from_batch(
+                BatchDesc([KVCacheDesc(capacity=2049, history_length=2048)]),
+                tokens_per_block,
+                gpu_granularity,
+            )
+
         num_levels = CacheLevel(len(config.cache_tiers))
         self._levels = cast(
             TypedIndexList,
             [
                 CacheLevelManager(
-                    self._life_cycle_grouping, i, config.cache_tiers[i], slot_size_lists, init_ratio
+                    self._life_cycle_grouping,
+                    i,
+                    config.cache_tiers[i],
+                    slot_size_lists,
+                    self._compute_slot_count_for_level(
+                        config.cache_tiers[i], slot_size_lists, init_ratio
+                    ),
                 )
                 for i in typed_range(num_levels)
             ],
         )
-        self._cached_num_pool_groups = get_uniform_attribute(
+        assert self.num_pool_groups == get_uniform_attribute(
             self._levels, lambda level: level.storage.num_pool_groups
         )
-        self._slot_desc_list = config.slot_desc_list
 
     def __del__(self) -> None:
         self.destroy()
@@ -271,11 +311,11 @@ class StorageManager:
 
     @property
     def num_life_cycles(self) -> LifeCycleId:
-        return LifeCycleId(len(self._life_cycle_grouping))
+        return typed_len(self._life_cycle_grouping)
 
     @property
     def num_pool_groups(self) -> PoolGroupIndex:
-        return self._cached_num_pool_groups
+        return typed_len(self._slot_desc_list)
 
     @property
     def num_cache_levels(self) -> CacheLevel:
@@ -316,9 +356,15 @@ class StorageManager:
     def force_evict(
         self, level: CacheLevel, min_num_pages: TypedIndexList[PoolGroupIndex, int]
     ) -> None:
-        assert int(level) + 1 < self.num_cache_levels, "Cannot force eviction from last level"
-        next_lvl = CacheLevel(level + 1)
+        # If we break inside this function with debugpy, pages in `evicted` won't be
+        # released even after the function returns. This is a debugpy artifact.
         evicted = self._levels[level].controller.evict(min_num_pages)
+        if int(level) == self.num_cache_levels - 1:
+            assert all(p.status == PageStatus.DROPPABLE for pages in evicted for p in pages), (
+                "Corrupted eviction controller"
+            )
+            return
+        next_lvl = CacheLevel(level + 1)
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         self._prepare_free_slots(
             goals, next_lvl, cast(TypedIndexList[PoolGroupIndex, list[Page]], evicted)
@@ -491,9 +537,7 @@ class StorageManager:
         )
 
     def slot_size(self, pool_group_index: PoolGroupIndex) -> TypedIndexList[PoolIndex, int]:
-        return get_uniform_attribute(
-            self._levels, lambda level: level.storage.slot_size(pool_group_index)
-        )
+        return self._slot_desc_list[pool_group_index].slot_size_list
 
     def num_slots(
         self, pool_group_index: PoolGroupIndex, cache_level: CacheLevel = GPU_LEVEL
@@ -520,14 +564,6 @@ class StorageManager:
             cast(int, storage.slot_address(pg_idx, attr.pool_index, SlotId(0))) + attr.offset
         )
 
-    def get_page_indices_ref(
-        self, lc_id: LifeCycleId, pages: Iterator[Page | None]
-    ) -> Iterator[int | None]:
-        "Reference implementation. Not fast enough for production."
-        scale = self._slot_to_page_indices[lc_id][PoolIndex0]
-        assert all(scale == s for s in self._slot_to_page_indices[lc_id])
-        return (map_optional(page, lambda p: scale * int(p.slot_id)) for page in pages)
-
     def get_buffer_attr(self, layer_id: LayerId, data_role: DataRole) -> BufferAttr:
         return self._buffer_attr[BufferId(layer_id, data_role)]
 
@@ -535,10 +571,6 @@ class StorageManager:
         self, level: CacheLevel, pg_idx: PoolGroupIndex, slot_id: SlotId, pool_idx: PoolIndex
     ) -> Address:
         return self._levels[level].storage.slot_address(pg_idx, pool_idx, slot_id)
-
-    def get_page_indices_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
-        scale = self._slot_to_page_indices[life_cycle][PoolIndex0]
-        return PageIndex(scale * int(slot_id))
 
     def get_statistics(
         self, level: CacheLevel = GPU_LEVEL
@@ -585,6 +617,7 @@ class StorageManager:
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         assert new_num_slots < pool_group.num_slots, "Not required for expansion of pools"
         ctrl = self._levels[level].controller
+        # pages with overflow slots and their indices in the eviction queue.
         overflow_slots = deque[tuple[int, Page]]()
         for i, p in enumerate(cast(Iterator[Page], ctrl.page_iterator(pg_idx))):
             if p.slot_id >= new_num_slots:
@@ -597,10 +630,15 @@ class StorageManager:
         # prevent allocating slots with id >= new_num_slots
         allocator.prepare_for_shrink(new_num_slots)
         min_num_evicted = 0
+        # Need this because evicted overflow pages won't become free, because only free
+        # non-overflow slots can be used for defragmentation.
+        num_evicted_overflow_slots = 0
         while overflow_slots and len(overflow_slots) + num_overflow_persistent > min(
-            new_num_slots, overflow_slots[0][0] + allocator.num_free_slots
+            new_num_slots,
+            overflow_slots[0][0] + allocator.num_free_slots - num_evicted_overflow_slots,
         ):
             min_num_evicted = overflow_slots.popleft()[0] + 1
+            num_evicted_overflow_slots += 1
         self.force_evict(
             level, make_typed(lambda i: min_num_evicted if i == pg_idx else 0, self.num_pool_groups)
         )
@@ -644,7 +682,17 @@ class StorageManager:
             if new_quota is None
             else round_up(new_quota, lvl_storage.pool_size_granularity)
         )
-        new_num_slots = lvl_storage._compute_slot_count_list(new_quota, new_ratio_list)
+        min_quota = self._min_quota_for_level(
+            lvl_storage.slot_size_lists, lvl_storage.pool_size_granularity
+        )
+        if new_quota < min_quota:
+            raise ValueError(
+                f"Quota {new_quota} is insufficient for min_slots constraints "
+                f"(requires at least {min_quota})"
+            )
+        new_num_slots = lvl_storage.compute_slot_count_list(
+            new_ratio_list, self._min_slots, new_quota
+        )
         if level != num_cache_levels - 1:
             assert persistent_pages is None, (
                 "Persistent pages should be None for non-last level cache"
@@ -661,3 +709,141 @@ class StorageManager:
                 continue
             self.expand_pool_group(level, pg_idx, new_num_slots[pg_idx])
         lvl_storage.post_resize()
+
+    def ratio_from_length(
+        self, tokens_per_block: int, history_length: int, capacity: int
+    ) -> TypedIndexList[PoolGroupIndex, float]:
+        num_blocks = div_up(capacity, tokens_per_block)
+        num_bytes = filled_list(0.0, self.num_pool_groups)
+        ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
+        for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
+            pg_idx = self.get_pool_group_index(lc_idx)
+            slot_size = self.slot_size(pg_idx)
+            num_required_blocks: int
+            if lc_idx == ssm_lc_idx:
+                num_required_blocks = 1
+            else:
+                stale = lc.get_stale_range(history_length, tokens_per_block)
+                num_required_blocks = num_blocks - len(stale)
+            num_bytes[pg_idx] += num_required_blocks * sum(slot_size)
+        total = sum(num_bytes)
+        assert total > 0
+        return typed_map(num_bytes, lambda x: x / total)
+
+    def ratio_from_batch(
+        self, batch: BatchDesc, tokens_per_block: int, granularity: int
+    ) -> TypedIndexList[PoolGroupIndex, float]:
+        """Compute the ratio of bytes needed per pool group for a batch described by a BatchDesc."""
+        num_slots = self._compute_slots_for_batch(batch, tokens_per_block)
+        num_bytes = self._slots_to_bytes(num_slots, granularity)
+        total = sum(num_bytes)
+        assert total > 0
+        return typed_map(num_bytes, lambda x: x / total)
+
+    def _compute_min_slots_from_constraints(
+        self, constraints: list[BatchDesc], tokens_per_block: int
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Compute the minimum slots per pool group across all constraints (element-wise max).
+
+        Always returns at least 1 slot per life cycle in each pool group.
+        """
+        # Default floor: 1 slot per life cycle in each pool group.
+        max_slots = filled_list(0, self.num_pool_groups)
+        for pg_idx in self._life_cycle_grouping:
+            max_slots[pg_idx] += 1
+        for batch in constraints:
+            slots = self._compute_slots_for_batch(batch, tokens_per_block)
+            for pg_idx in typed_range(self.num_pool_groups):
+                max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
+        return max_slots
+
+    def _compute_slots_for_batch(
+        self, batch: BatchDesc, tokens_per_block: int
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Compute the minimum number of slots per pool group to support a BatchDesc."""
+        num_slots = filled_list(0, self.num_pool_groups)
+        ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
+        sys_blocks = batch.system_prompt_length // tokens_per_block
+        for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
+            pg_idx = self.get_pool_group_index(lc_idx)
+            if lc_idx == ssm_lc_idx:
+                # SSM: always 1 dedicated block per request, never shared.
+                num_slots[pg_idx] += len(batch.kv_caches)
+                continue
+            # Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
+            # A sys block needs memory if it's non-stale for ANY request.
+            # = sys_blocks - (blocks stale for ALL requests within [0, sys_blocks))
+            sys_range = HalfOpenRange(0, sys_blocks)
+            # Intersection of per-request stale ranges, clamped to sys_range.
+            stale_intersection = sys_range
+            for kv in batch.kv_caches:
+                stale = lc.get_stale_range(kv.history_length, tokens_per_block)
+                stale_intersection = intersect(stale_intersection, stale)
+            num_slots[pg_idx] += sys_blocks - len(stale_intersection)
+            # Per-request unique blocks (excluding shared sys blocks already counted above).
+            for kv in batch.kv_caches:
+                total_blocks = div_up(kv.capacity, tokens_per_block)
+                stale = lc.get_stale_range(kv.history_length, tokens_per_block)
+                non_stale = total_blocks - len(stale)
+                # Non-stale sys blocks for this request.
+                non_stale_sys = sys_blocks - len(intersect(stale, sys_range))
+                num_slots[pg_idx] += max(0, non_stale - non_stale_sys)
+        return num_slots
+
+    def _slots_to_bytes(
+        self, num_slots: TypedIndexList[PoolGroupIndex, int], granularity: int
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Convert slot counts to bytes, rounding up each pool to granularity."""
+        num_bytes = filled_list(0, self.num_pool_groups)
+        for pg_idx in typed_range(self.num_pool_groups):
+            for pool_size in self.slot_size(pg_idx):
+                num_bytes[pg_idx] += round_up(num_slots[pg_idx] * pool_size, granularity)
+        return num_bytes
+
+    def _min_quota_for_level(
+        self,
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        granularity: int,
+    ) -> int:
+        """Minimum quota (in bytes) required to satisfy _min_slots constraints."""
+        return sum(
+            round_up(ms * s, granularity)
+            for ms, sizes in zip(self._min_slots, slot_size_lists)
+            for s in sizes
+        )
+
+    def _compute_slot_count_for_level(
+        self,
+        tier_config: CacheTierConfig,
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        ratio: TypedIndexList[PoolGroupIndex, float],
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Compute slot counts for a cache level from its tier config and ratio.
+
+        Applies min_slots constraints (always at least 1 per life cycle).
+        """
+        granularity = CacheLevelManager.cache_tier_granularity(tier_config.tier, tier_config.quota)
+        quota = max(
+            self._min_quota_for_level(slot_size_lists, granularity),
+            round_up(tier_config.quota, granularity),
+        )
+        return CacheLevelStorage.ratio_to_slot_count_list(
+            quota, slot_size_lists, ratio, granularity, self._min_slots
+        )
+
+    def constrain_ratio(
+        self,
+        ratio: TypedIndexList[PoolGroupIndex, float],
+    ) -> TypedIndexList[PoolGroupIndex, float]:
+        """Apply the stored min_slots constraint to a ratio list for GPU level.
+
+        Converts ratio to slot counts (with min_slots floor),
+        then converts back to a bytes-based ratio.
+        """
+        gpu_storage = self._levels[GPU_LEVEL].storage
+        granularity = gpu_storage.pool_size_granularity
+        slot_count_list = gpu_storage.compute_slot_count_list(ratio, self._min_slots)
+        num_bytes = self._slots_to_bytes(slot_count_list, granularity)
+        total = sum(num_bytes)
+        assert total > 0
+        return typed_map(num_bytes, lambda x: x / total)

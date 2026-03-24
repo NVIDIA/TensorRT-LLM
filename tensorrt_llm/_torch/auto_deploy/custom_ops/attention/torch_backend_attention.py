@@ -30,6 +30,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -284,7 +285,9 @@ def _torch_context_mha(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::torch_cached_attention_with_cache", mutates_args=("k_cache", "v_cache")
+)
 def torch_backend_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -308,6 +311,7 @@ def torch_backend_mha_with_cache(
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Torch backend MHA with cache that takes q, k, v in BSND layout."""
     # Get dimensions
@@ -316,7 +320,8 @@ def torch_backend_mha_with_cache(
     b, s = q.shape[:2]
 
     # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]
@@ -341,7 +346,7 @@ def torch_backend_mha_with_cache(
 
     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
 
-    # Create output tensor
+    # Preallocate output tensor
     y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
 
     # Compute attention
@@ -380,6 +385,20 @@ def torch_backend_mha_with_cache(
             sinks,
         )
 
+    num_total_tokens = num_prefill_tokens + num_decode
+    bs = b * s
+
+    if out is not None:
+        out_flat = out.view(*bs_view, num_heads, v_head_dim)
+        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
+        if num_total_tokens < bs:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
+    # Zero padding positions so downstream ops don't see garbage (piecewise CG)
+    if num_total_tokens < bs:
+        y[num_total_tokens:].zero_()
+
     return y.view(*output_shape)
 
 
@@ -407,7 +426,10 @@ def torch_backend_mha_with_cache_fake(
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
-):
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is not None:
+        return out.new_empty(0)
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 

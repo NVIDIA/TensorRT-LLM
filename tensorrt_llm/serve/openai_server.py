@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import json
 import os
 import re
 import signal
@@ -21,11 +22,13 @@ from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
+from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -80,6 +83,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
                                                  parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
@@ -129,6 +133,9 @@ class OpenAIServer:
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
+        # Energy monitoring
+        self.energy_monitor = None
+
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
@@ -165,14 +172,28 @@ class OpenAIServer:
                     self.disagg_cluster_config, self.disagg_cluster_storage)
                 await self.disagg_cluster_worker.register_worker()
 
-            # Start background iteration stats collector if metrics are enabled
-            # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
-            # tensorrt backend does not have this attribute but it always has iter stats enabled.
-            if self.metrics_collector and getattr(
-                    self.generator.args, "enable_iter_perf_stats", True):
-                self._iteration_stats_collector_task = asyncio.create_task(
-                    self._iteration_stats_collector_loop())
-                logger.info("Started background iteration stats collector task")
+            # VisualGen has no args
+            if not isinstance(self.generator, VisualGen):
+                # Start energy monitoring if enabled
+                if getattr(self.generator.args, "enable_energy_metrics", False):
+                    try:
+                        world_size = self.generator.args.parallel_config.world_size
+                        self.energy_monitor = EnergyMonitor(world_size)
+                        logger.info("Initialized GPU energy monitoring")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to initialize GPU energy monitoring: {e}")
+                        self.energy_monitor = None
+
+                # Start background iteration stats collector if metrics are enabled
+                # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
+                # tensorrt backend does not have this attribute but it always has iter stats enabled.
+                if self.metrics_collector and getattr(
+                        self.generator.args, "enable_iter_perf_stats", True):
+                    self._iteration_stats_collector_task = asyncio.create_task(
+                        self._iteration_stats_collector_loop())
+                    logger.info(
+                        "Started background iteration stats collector task")
 
             # terminate rank0 worker
             yield
@@ -296,6 +317,9 @@ class OpenAIServer:
 
     @property
     def postproc_worker_enabled(self) -> bool:
+        if isinstance(self.generator, VisualGen):
+            return False
+
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
     @staticmethod
@@ -351,6 +375,9 @@ class OpenAIServer:
                                methods=["GET"])
         self.app.add_api_route("/perf_metrics",
                                self.get_perf_metrics,
+                               methods=["GET"])
+        self.app.add_api_route("/energy_metrics",
+                               self.get_energy_metrics,
                                methods=["GET"])
         self.app.add_api_route("/steady_clock_offset",
                                self.get_steady_clock_offset,
@@ -552,6 +579,21 @@ class OpenAIServer:
         async for stat in self.generator.get_stats_async(2):
             stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def get_energy_metrics(self) -> JSONResponse:
+        if self.energy_monitor is None:
+            return JSONResponse(
+                content={"error": "Energy monitoring is not available"},
+                status_code=503)
+        total_energy = self.energy_monitor.get_current_energy()
+        if total_energy is None:
+            return JSONResponse(content={"error": "Failed to read GPU energy"},
+                                status_code=503)
+        return JSONResponse(
+            content={
+                "total_energy_j": round(total_energy, 4),
+                "query_time": time.perf_counter(),
+            })
 
     async def set_steady_clock_offset(
             self, offset: Annotated[float, Body(embed=True)]) -> Response:
@@ -808,13 +850,27 @@ class OpenAIServer:
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            if self.tool_parser and request.tools:
+                tool_parser_cls = ToolParserFactory.parsers.get(
+                    self.tool_parser.lower())
+                if tool_parser_cls and getattr(
+                        tool_parser_cls, 'needs_raw_special_tokens', False):
+                    sampling_params.skip_special_tokens = False
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                request.messages, self.model_config,
-                self.multimodal_server_config)
+            try:
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    request.messages, self.model_config,
+                    self.multimodal_server_config)
+            except ValidationError:
+                # ValidatorIterator rejects extra fields; fall back to raw JSON.
+                raw_body = await raw_request.json()
+                raw_messages = raw_body.get("messages", [])
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    raw_messages, self.model_config,
+                    self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -946,8 +1002,15 @@ class OpenAIServer:
                 tool.model_dump() for tool in request.tools
             ]
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                request.messages, self.model_config)
+            try:
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    request.messages, self.model_config)
+            except ValidationError:
+                # ValidatorIterator rejects extra fields; fall back to raw JSON.
+                raw_body = await raw_request.json()
+                raw_messages = raw_body.get("messages", [])
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    raw_messages, self.model_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -1047,9 +1110,22 @@ class OpenAIServer:
                     for pp_res in pp_result:
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
-            except:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first
+                # chunk, so we cannot change the status code.  Yield
+                # an SSE error event so the stream terminates cleanly
+                # instead of breaking the HTTP connection.
+                error_data = json.dumps({
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": None,
+                        "param": None,
+                    }
+                })
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -1252,8 +1328,6 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 trace_headers=trace_headers,
             )
-            postproc_args.request_id = promise.request_id
-
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
@@ -1656,7 +1730,8 @@ class OpenAIServer:
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
+                output_path=self.media_storage_path /
+                f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,
@@ -1836,7 +1911,8 @@ class OpenAIServer:
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
+                output_path=self.media_storage_path /
+                f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,
