@@ -1,3 +1,5 @@
+"""Fake implementations of C++ custom ops for torch.compile shape inference."""
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -12,6 +14,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
+    """Register fake implementations of all TensorRT-LLM custom ops for shape inference."""
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
@@ -27,6 +30,7 @@ def _register_fake():
         eps: float,
         trigger_completion_at_end: bool,
     ) -> List[torch.Tensor]:
+        """Fake implementation of trtllm::allreduce for shape inference."""
         from tensorrt_llm.functional import AllReduceFusionOp
         if op == int(AllReduceFusionOp.NONE):
             return [torch.empty_like(input)]
@@ -75,6 +79,7 @@ def _register_fake():
         eps: float,
         trigger_completion_at_end: bool,
     ):
+        """Fake implementation of trtllm::allreduce_pg for shape inference."""
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
 
@@ -82,6 +87,7 @@ def _register_fake():
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
     def _(input, residual, gamma, epsilon, buffer, buffer_flags,
           rmsnorm_fusion):
+        """Fake implementation of trtllm::mnnvl_fusion_allreduce for shape inference."""
         output = input.new_empty(input.shape)
         if rmsnorm_fusion:
             residual_out = residual.new_empty(residual.shape)
@@ -93,12 +99,14 @@ def _register_fake():
     def _(residual, norm_weight, device_num_experts, scale_input,
           active_experts_token_input, token_input, workspace, rank, nranks,
           eps):
+        """Fake implementation of trtllm::moe_allreduce for shape inference."""
         norm_out = torch.empty_like(token_input)
         residual_out = torch.empty_like(residual)
         return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
+        """Fake implementation of trtllm::allgather for shape inference."""
         if sizes is None:
             output_shape = (len(group) * input.shape[0], *input.shape[1:])
         else:
@@ -107,6 +115,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::allgather_pg")
     def _(input, sizes, group, process_group):
+        """Fake implementation of trtllm::allgather_pg for shape inference."""
         return allgather(input, sizes, group)
 
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
@@ -119,6 +128,7 @@ def _register_fake():
         out_dtype,
         userbuffers_id=False,
     ):
+        """Fake implementation of trtllm::cublas_scaled_mm for shape inference."""
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(shape, dtype=out_dtype)
@@ -134,6 +144,7 @@ def _register_fake():
         out_dtype: Optional[torch.dtype] = None,
         userbuffers_id: bool = False,
     ):
+        """Fake implementation of trtllm::cuda_scaled_mm for shape inference."""
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(shape, dtype=out_dtype)
@@ -141,6 +152,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::cublas_mm")
     def _(mat_a, mat_b, bias, out_dtype):
+        """Fake implementation of trtllm::cublas_mm for shape inference."""
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(
@@ -149,6 +161,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
+        """Fake implementation of trtllm::dsv3_router_gemm_op for shape inference."""
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(
@@ -157,6 +170,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
+        """Fake implementation of trtllm::dsv3_fused_a_gemm_op for shape inference."""
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(
@@ -173,6 +187,7 @@ def _register_fake():
         sf_use_ue8m0: bool,
         out_dtype=None,
     ):
+        """Fake implementation of trtllm::fp4_gemm for shape inference."""
         shape = list(mat1.shape)
         shape[-1] = mat2.shape[0]
         ret = mat1.new_empty(shape, dtype=out_dtype)
@@ -181,6 +196,7 @@ def _register_fake():
     @torch.library.register_fake("trtllm::noaux_tc_op")
     def _(scores, scores_with_bias, n_group, topk_group, topk,
           routed_scaling_factor):
+        """Fake implementation of trtllm::noaux_tc_op for shape inference."""
         shape = list(scores.shape)
         shape[-1] = topk
         return scores.new_empty(shape,
@@ -189,8 +205,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::indexer_topk_prefill")
     def _(logits, row_starts, row_ends, indices, index_topk):
-        # In-place operation, no return value (void function)
-        pass
+        """Fake implementation of trtllm::indexer_topk_prefill for shape inference."""
 
     @torch.library.register_fake("trtllm::indexer_topk_decode")
     def _(logits,
@@ -200,21 +215,23 @@ def _register_fake():
           index_topk,
           pre_idx=None,
           heuristic_scratch=None):
-        # In-place operation, no return value (void function)
-        pass
+        """Fake implementation of trtllm::indexer_topk_decode for shape inference."""
 
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
+        """Fake implementation of trtllm::userbuffers_allreduce_finalize for shape inference."""
         return torch.empty_like(input)
 
     @torch.library.register_fake("trtllm::fp8_block_scaling_gemm_impl")
     def _(a, b, a_scale, b_scale):
+        """Fake implementation of trtllm::fp8_block_scaling_gemm_impl for shape inference."""
         m = a.shape[0]
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
 
     @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
     def _(input: torch.Tensor):
+        """Fake implementation of tensorrt_llm::quantize_e4m3_per_tensor for shape inference."""
         scale_shape = [1] * input.dim()
         return (input.new_empty(input.shape, dtype=torch.float8_e4m3fn),
                 input.new_empty(scale_shape, dtype=input.dtype))
@@ -222,6 +239,7 @@ def _register_fake():
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
+        """Fake implementation of tensorrt_llm::static_quantize_e4m3_per_tensor for shape inference."""
         return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale.clone()
 
     @torch.library.register_fake("trtllm::fp4_quantize")
@@ -232,6 +250,7 @@ def _register_fake():
         sf_use_ue8m0=False,
         swizzled_layout=True,
     ):
+        """Fake implementation of trtllm::fp4_quantize for shape inference."""
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, swizzled_layout)
 
@@ -246,6 +265,7 @@ def _register_fake():
         KE: int,
         is_act: bool,
     ):
+        """Fake implementation of trtllm::fp4_quantize_with_reorder_residual for shape inference."""
         M = X.size(0)
         KQ = X.size(1)
         K = KQ + KE
@@ -266,9 +286,11 @@ def _register_fake():
         swizzled_layout: bool = True,
         alignment: int = 32,
     ):
+        """Fake implementation of trtllm::mxfp8_quantize for shape inference."""
         SF_VEC_SIZE = 32
 
         def pad_up(x, m: int):
+            """Round x up to the nearest multiple of m."""
             return (x + m - 1) // m * m
 
         m_val = 1
@@ -325,6 +347,7 @@ def _register_fake():
         topk_ids: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Fake implementation of trtllm::mxe4m3_mxe2m1_block_scale_moe_runner for shape inference."""
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
         out_hidden_size = valid_hidden_size if valid_hidden_size is not None else hidden_size
@@ -337,6 +360,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::calculate_nvfp4_global_scale")
     def _(input: torch.Tensor, tokens_per_batch: Optional[torch.Tensor]):
+        """Fake implementation of trtllm::calculate_nvfp4_global_scale for shape inference."""
         return input.new_empty((input.shape[:-1], 1), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::moe_comm")
@@ -352,6 +376,7 @@ def _register_fake():
         ep_size: int,
         need_zero_output: Optional[List[bool]],
     ):
+        """Fake implementation of trtllm::moe_comm for shape inference."""
         outputs = []
         for input_tensor in inputs:
             output_tensor = torch.empty(
@@ -374,6 +399,7 @@ def _register_fake():
         num_experts: int,
         eplb_local_stats: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
+        """Fake implementation of trtllm::moe_a2a_dispatch for shape inference."""
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
             elements_per_token = payload.shape[1]
@@ -404,6 +430,7 @@ def _register_fake():
         payload_in_workspace: bool,
         use_low_precision: bool = False,
     ) -> torch.Tensor:
+        """Fake implementation of trtllm::moe_a2a_combine for shape inference."""
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
     @torch.library.register_fake("trtllm::moe_a2a_initialize")
@@ -414,6 +441,7 @@ def _register_fake():
         max_num_tokens_per_rank: int,
         eplb_stats_num_experts: Optional[int] = None,
     ) -> torch.Tensor:
+        """Fake implementation of trtllm::moe_a2a_initialize for shape inference."""
         return torch.empty((10, ), dtype=torch.int64, device="cpu")
 
     @torch.library.register_fake("trtllm::moe_a2a_sanitize_expert_ids")
@@ -424,6 +452,7 @@ def _register_fake():
         ep_rank: int,
         invalid_expert_id: int,
     ) -> None:
+        """Fake implementation of trtllm::moe_a2a_sanitize_expert_ids for shape inference."""
         return None
 
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
@@ -436,33 +465,36 @@ def _register_fake():
         out_dtype: torch.dtype,
         hidden_size: int,
     ) -> torch.Tensor:
+        """Fake implementation of trtllm::moe_a2a_get_combine_payload_tensor for shape inference."""
         return workspace.new_empty(
             (ep_size * runtime_max_tokens_per_rank, hidden_size),
             dtype=out_dtype)
 
     @torch.library.register_fake("trtllm::get_moe_commworkspace_size_per_rank")
     def _(ep_size: int):
+        """Fake implementation of trtllm::get_moe_commworkspace_size_per_rank for shape inference."""
         return 0
 
     @torch.library.register_fake("trtllm::set_moe_max_usable_sm_count")
     def _(max_sm_count: int):
-        pass
+        """Fake implementation of trtllm::set_moe_max_usable_sm_count for shape inference."""
 
     @torch.library.register_fake("trtllm::moe_load_balance_wait_gpu_stage")
     def _(single_layer_load_balancer_ptr: int):
+        """Fake implementation of trtllm::moe_load_balance_wait_gpu_stage for shape inference."""
         return torch.empty((1, ),
                            dtype=torch.int32,
                            device=torch.device("cuda"))
 
     @torch.library.register_fake("trtllm::moe_load_balance_set_cpu_stage")
     def _(single_layer_load_balancer_ptr: int):
-        pass
+        """Fake implementation of trtllm::moe_load_balance_set_cpu_stage for shape inference."""
 
     @torch.library.register_fake("trtllm::moe_load_balance_statistic")
     def _(gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
           single_layer_load_balancer_ptr: int, is_first_stage: bool,
           is_last_stage: bool):
-        pass
+        """Fake implementation of trtllm::moe_load_balance_statistic for shape inference."""
 
     @torch.library.register_fake(
         "trtllm::moe_hierarchical_statistic_local_device")
@@ -470,23 +502,24 @@ def _register_fake():
           local_expert_token_count: torch.Tensor, enabled: torch.Tensor,
           single_layer_load_balancer_ptr: int, is_first_stage: bool,
           is_last_stage: bool):
-        pass
+        """Fake implementation of trtllm::moe_hierarchical_statistic_local_device for shape inference."""
 
     @torch.library.register_fake("trtllm::moe_hierarchical_statistic_update")
     def _(global_expert_token_count: torch.Tensor, enabled: torch.Tensor,
           single_layer_load_balancer_ptr: int):
-        pass
+        """Fake implementation of trtllm::moe_hierarchical_statistic_update for shape inference."""
 
     @torch.library.register_fake("trtllm::moe_load_balance_routing")
     def _(single_layer_load_balancer_ptr: int,
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
+        """Fake implementation of trtllm::moe_load_balance_routing for shape inference."""
         return torch.empty_like(token_selected_experts)
 
     @torch.library.register_fake("trtllm::memset_expert_ids")
     def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
           max_token_count_per_rank: int, top_k: int, invalid_expert_id: int,
           ep_size: int):
-        pass
+        """Fake implementation of trtllm::memset_expert_ids for shape inference."""
 
     @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
@@ -497,7 +530,7 @@ def _register_fake():
         eps: float,
         weight_bias: float,
     ) -> None:
-        pass
+        """Apply group RMS normalization using the base kernel."""
 
     @group_rms_norm_base.register_fake
     def _(
@@ -507,6 +540,7 @@ def _register_fake():
         eps: float,
         weight_bias: float,
     ) -> List[torch.Tensor]:
+        """Fake implementation of trtllm::group_rms_norm_base for shape inference."""
         return outputs
 
     @torch.library.custom_op("trtllm::group_rms_norm_large_batch",
@@ -518,7 +552,7 @@ def _register_fake():
         eps: float,
         weight_bias: float,
     ) -> None:
-        pass
+        """Apply group RMS normalization using the large batch kernel."""
 
     @group_rms_norm_large_batch.register_fake
     def _(
@@ -528,6 +562,7 @@ def _register_fake():
         eps: float,
         weight_bias: float,
     ) -> List[torch.Tensor]:
+        """Fake implementation of trtllm::group_rms_norm_large_batch for shape inference."""
         return outputs
 
     # Use groupRMSNormHeuristic which automatically selects between regular and large batch kernels
@@ -540,7 +575,7 @@ def _register_fake():
         eps: float,
         weight_bias: float,
     ) -> None:
-        pass
+        """Apply group RMS normalization with automatic kernel selection heuristic."""
 
     @group_rms_norm_heuristic.register_fake
     def _(
@@ -550,6 +585,7 @@ def _register_fake():
         eps: float,
         weight_bias: float,
     ) -> List[torch.Tensor]:
+        """Fake implementation of trtllm::group_rms_norm_heuristic for shape inference."""
         return outputs
 
     @torch.library.register_fake(
@@ -557,12 +593,14 @@ def _register_fake():
     def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
           target_tokens: torch.Tensor, num_mtp_modules: int, batch_size: int,
           num_context_request: int, vocab_size: int):
+        """Fake implementation of trtllm::mtp_sampling_and_accepted_draft_tokens_op for shape inference."""
         return logits.new_empty((batch_size, num_mtp_modules + 1),
                                 dtype=torch.int32), logits.new_empty(
                                     (batch_size, ), dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128")
     def _(input: torch.Tensor, use_ue8m0: bool = False):
+        """Fake implementation of trtllm::fp8_quantize_1x128 for shape inference."""
         pad_m = fp4_utils.pad_up(input.shape[0], 4)
         blocked_n = (input.shape[1] + 127) // 128
         if get_sm_version() >= 100:
@@ -575,6 +613,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::fused_cat_fp8")
     def _(pe: torch.Tensor, nope: torch.Tensor, use_ue8m0: bool = False):
+        """Fake implementation of trtllm::fused_cat_fp8 for shape inference."""
         pe_dim = pe.shape[-1]
         nope_dim = nope.shape[-1]
         head_dim = pe_dim + nope_dim
@@ -595,7 +634,7 @@ def _register_fake():
         silu_activation: bool,
         pad_slot_id: int,
     ) -> None:
-        pass
+        """Fake implementation of trtllm::causal_conv1d_fwd for shape inference."""
 
     @torch.library.register_fake("trtllm::causal_conv1d_update")
     def _(
@@ -608,7 +647,7 @@ def _register_fake():
         conv_state_indices_: Optional[torch.Tensor],
         pad_slot_id: int,
     ) -> None:
-        pass
+        """Fake implementation of trtllm::causal_conv1d_update for shape inference."""
 
     @torch.library.register_fake("trtllm::moe_permute_op")
     def _(
@@ -629,7 +668,7 @@ def _register_fake():
         min_latency_mode: bool,
         use_fp8_block_scaling: bool,
     ):
-
+        """Fake implementation of trtllm::moe_permute_op for shape inference."""
         experts_per_token = token_selected_experts.shape[1]
         num_rows = input.shape[0]
         hidden_size = input.shape[1]
@@ -682,6 +721,7 @@ def _register_fake():
         ep_size: int,
         ep_rank: int,
     ):
+        """Fake implementation of trtllm::moe_finalize_scale_op for shape inference."""
         num_rows_val = int(num_rows)
         unpadded_hidden_size_val = int(unpadded_hidden_size)
         return gemm2_output.new_empty((num_rows_val, unpadded_hidden_size_val),
@@ -703,6 +743,7 @@ def _register_fake():
             tile_tokens_dim: int,
             routing_method_type: int,
         ) -> List[torch.Tensor]:
+            """Fake implementation of trtllm::moe_topk_sort for shape inference."""
             helper = GroupedGemmInputsHelper(
                 num_experts=num_experts,
                 top_k=top_k,
@@ -753,6 +794,7 @@ def _register_fake():
             local_num_experts: int,
             tile_tokens_dim: int,
         ) -> List[torch.Tensor]:
+            """Fake implementation of trtllm::moe_sort for shape inference."""
             helper = GroupedGemmInputsHelper(
                 num_experts=num_experts,
                 top_k=top_k,
@@ -798,6 +840,7 @@ def _register_fake():
         tile_tokens_dim: int,
         top_k: int,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Fake implementation of trtllm::moe_permute for shape inference."""
         max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
         permuted_output = torch.empty((max_num_permuted_tokens, input.size(1)),
                                       dtype=input.dtype,
@@ -819,6 +862,7 @@ def _register_fake():
         expanded_idx_to_permuted_idx: torch.Tensor,
         topk_scales: torch.Tensor,
     ) -> torch.Tensor:
+        """Fake implementation of trtllm::moe_unpermute for shape inference."""
         num_tokens = expanded_idx_to_permuted_idx.size(0)
         output = torch.empty((num_tokens, permuted_input.size(1)),
                              dtype=permuted_input.dtype,
@@ -832,6 +876,7 @@ def _register_fake():
         num_non_exiting_tiles: torch.Tensor,
         tile_tokens_dim: int,
     ) -> torch.Tensor:
+        """Fake implementation of trtllm::moe_swiglu for shape inference."""
         output = torch.empty((input.size(0), input.size(1) // 2),
                              dtype=input.dtype,
                              device=input.device)
@@ -845,6 +890,7 @@ def _register_fake():
         num_non_exiting_tiles: torch.Tensor,
         tile_tokens_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fake implementation of trtllm::moe_swiglu_nvfp4_quantize for shape inference."""
         max_num_permuted_tokens = input.size(0)
         interm_size = input.size(1) // 2
         sf_vec_size = 16
@@ -864,13 +910,16 @@ def _register_fake():
         num_non_exiting_tiles: torch.Tensor,
         tile_tokens_dim: int,
     ) -> torch.Tensor:
+        """Fake implementation of trtllm::moe_gelu for shape inference."""
         return torch.empty_like(input)
 
     @torch.library.register_fake("trtllm::allgather_list")
     def allgather_list(input_list, sizes, group):
+        """Fake implementation of trtllm::allgather_list for shape inference."""
         assert len(input_list) > 0
 
         def create_output_tensor(i):
+            """Create an empty output tensor with the gathered shape."""
             shape = list(i.shape)
             if sizes is None:
                 shape[0] *= len(group)
@@ -882,10 +931,12 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::allgather_list_pg")
     def _(input_list, sizes, group, process_group):
+        """Fake implementation of trtllm::allgather_list_pg for shape inference."""
         return allgather_list(input_list, sizes, group)
 
     @torch.library.register_fake("trtllm::reducescatter")
     def reducescatter(input, sizes, group):
+        """Fake implementation of trtllm::reducescatter for shape inference."""
         import tensorrt_llm
         local_rank = tensorrt_llm.mpi_rank()
 
@@ -898,10 +949,12 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::reducescatter_pg")
     def _(input, sizes, group, process_group):
+        """Fake implementation of trtllm::reducescatter_pg for shape inference."""
         return reducescatter(input, sizes, group)
 
     @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
+        """Fake implementation of trtllm::block_scale_interleave for shape inference."""
         rows = sf.shape[-2]
         cols = sf.shape[-1]
         expert_out_size = fp4_utils.pad_up(rows, 128) * fp4_utils.pad_up(
@@ -912,12 +965,14 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::block_scale_interleave_reverse")
     def _(sf: torch.Tensor):
+        """Fake implementation of trtllm::block_scale_interleave_reverse for shape inference."""
         return torch.empty_like(sf, dtype=torch.uint8)
 
     @torch.library.register_fake("trtllm::moe_finalize_allreduce")
     def _(input, residual, norm_weight, expanded_idx_to_permuted_idx,
           shared_expert_output, expert_scale_factor, workspace, rank, nranks,
           eps) -> List[torch.Tensor]:
+        """Fake implementation of trtllm::moe_finalize_allreduce for shape inference."""
         return [
             torch.empty_like(residual),
             torch.empty_like(residual),
@@ -925,6 +980,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
     def _(router_logits, topk, output_dtype: torch.dtype = None):
+        """Fake implementation of trtllm::renorm_moe_routing_op for shape inference."""
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)
         output_dtype = output_dtype or torch.float32
@@ -934,6 +990,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::default_moe_routing_op")
     def _(router_logits, topk, output_dtype: torch.dtype = None):
+        """Fake implementation of trtllm::default_moe_routing_op for shape inference."""
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)
         output_dtype = output_dtype or torch.float32
@@ -943,6 +1000,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::alltoall_helix")
     def _(input_list, group, num_lists):
+        """Fake implementation of trtllm::alltoall_helix for shape inference."""
         num_ranks = len(group)
         len(input_list) // num_ranks
         return [
@@ -952,30 +1010,30 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::alltoall_helix_native")
     def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
-        # Returns outputs with same shapes as inputs
+        """Fake implementation of trtllm::alltoall_helix_native for shape inference."""
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
 
     @torch.library.register_fake("trtllm::initialize_helix_workspace")
     def _(workspace, cp_rank, cp_size):
-        # This op initializes workspace in-place and returns nothing
+        """Fake implementation of trtllm::initialize_helix_workspace for shape inference."""
         return None
 
     @torch.library.register_fake("trtllm::helix_post_process")
     def _(gathered_o, gathered_stats, scale):
+        """Fake implementation of trtllm::helix_post_process for shape inference."""
         return gathered_o.new_empty(*gathered_o.shape[1:])
 
     @torch.library.register_fake("trtllm::helix_post_process_native")
     def _(gathered_o, gathered_stats, scale, cp_dim):
-        # Remove the dimension at cp_dim (context parallelism dimension)
+        """Fake implementation of trtllm::helix_post_process_native for shape inference."""
         out_shape = list(gathered_o.shape)
         del out_shape[cp_dim]
         return gathered_o.new_empty(*out_shape)
 
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
-        # input [M, K], weight [N, K], bias [N]
-        # Output should be [M, N]
+        """Fake implementation of trtllm::tinygemm2 for shape inference."""
         m = input.shape[0]
         n = weight.shape[0]
         return input.new_empty((m, n), dtype=input.dtype)
@@ -989,8 +1047,7 @@ def _register_fake():
           bias: Optional[torch.Tensor],
           out_dtype: Optional[torch.dtype],
           to_userbuffers: bool = False):
-        # mat_a: [M, K/2], mat_b: [N, K/2]
-        # Output should be [M, N] with dtype=out_dtype
+        """Fake implementation of trtllm::cuda_core_nvfp4_gemm for shape inference."""
         m = mat_a.shape[0]
         n = mat_b.shape[0]
         return mat_a.new_empty((m, n), dtype=out_dtype)
@@ -1036,8 +1093,7 @@ def _register_fake():
         qk_rope_head_dim: int,
         v_head_dim: int,
     ) -> None:
-        # This is a fake implementation for shape inference
-        # The actual operation modifies fused_q and q_pe in-place
+        """Fake implementation of trtllm::mla_rope_generation for shape inference."""
         return None
 
     @torch.library.register_fake("trtllm::fused_add_rms_norm_quant")
@@ -1051,8 +1107,8 @@ def _register_fake():
         output_hp_norm: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                Optional[torch.Tensor]]:
+        """Fake implementation of trtllm::fused_add_rms_norm_quant for shape inference."""
         m, n = input.shape
-        # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
         normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
         # output: [M, N] pre-norm output, same dtype as input
         output = input.new_empty((m, n), dtype=input.dtype)
@@ -1074,8 +1130,8 @@ def _register_fake():
         eps: float = 1e-5,
         sf_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fake implementation of trtllm::fused_gated_rmsnorm_quant for shape inference."""
         m, n = x.shape
-        # y_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
         y_fp4 = x.new_empty((m, n // 8), dtype=torch.int32)
         # sf_out: scale factors in swizzled layout
         sf_vec_size = 16
@@ -1089,9 +1145,7 @@ def _register_fake():
         sf_scale: torch.Tensor,
         sf_vec_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # input: 2D tensor [M, N] (bf16 or fp16)
-        # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
-        # output_sf: swizzled scale factors
+        """Fake implementation of trtllm::fused_relu2_quantize for shape inference."""
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, is_swizzled_layout=True)
         output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
@@ -1110,4 +1164,5 @@ def _register_fake():
           num_tokens, remove_padding, attention_mask_type,
           rotary_embedding_scale, rotary_embedding_base, rotary_embedding_dim,
           rotary_scaling_type, rotary_embedding_max_positions):
+        """Fake implementation of trtllm::build_decoder_info for shape inference."""
         return True

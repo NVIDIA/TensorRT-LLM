@@ -1,3 +1,5 @@
+"""Configuration classes and utilities for PyTorch-based model loading and quantization."""
+
 import contextlib
 import json
 import os
@@ -74,6 +76,8 @@ def config_file_lock(timeout: int = 10):
 
 @dataclass(kw_only=True)
 class ModelConfig(Generic[TConfig]):
+    """Dataclass holding model configuration, quantization, and runtime settings."""
+
     pretrained_config: Optional[TConfig] = None
     mapping: Mapping = field(default_factory=Mapping)
 
@@ -153,6 +157,7 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        """Initialize derived attributes and resolve strategy enums after dataclass init."""
         if self.pretrained_config and hasattr(self.pretrained_config,
                                               "architectures"):
             self.is_generation = self.is_generation_model(
@@ -160,6 +165,7 @@ class ModelConfig(Generic[TConfig]):
                 mm_encoder_only=self.mm_encoder_only)
 
         def get_all_reduce_strategy(strategy: str = "AUTO"):
+            """Convert a strategy string to an AllReduceStrategy enum value."""
             maps = {
                 "AUTO": AllReduceStrategy.AUTO,
                 "NCCL": AllReduceStrategy.NCCL,
@@ -193,6 +199,7 @@ class ModelConfig(Generic[TConfig]):
 
     @property
     def fuse_pos_embd(self):
+        """Return whether positional embeddings should be fused based on attention backend."""
         if self.attn_backend == 'TRTLLM':
             return True
         elif self.attn_backend == 'FLASHINFER':
@@ -201,6 +208,7 @@ class ModelConfig(Generic[TConfig]):
 
     @property
     def enable_flash_mla(self):
+        """Return whether Flash MLA is enabled for the current config and hardware."""
         if self.attn_backend == 'TRTLLM':
             if getattr(self.pretrained_config,
                        "kv_lora_rank", None) and getattr(
@@ -212,6 +220,7 @@ class ModelConfig(Generic[TConfig]):
         return False
 
     def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
+        """Return the quantization config for a given layer name, or the global default."""
         if name is None or self.per_layer_quant_configs is None:
             return self.quant_config
 
@@ -223,6 +232,7 @@ class ModelConfig(Generic[TConfig]):
     @staticmethod
     def is_generation_model(model_architectures: Optional[List[str]],
                             mm_encoder_only: bool = False) -> bool:
+        """Return True if the model architecture is a generation (non-encoder-only) model."""
         if model_architectures is None:
             logger.warning(
                 "Model architectures is None, default to is_generation_model=True"
@@ -266,6 +276,7 @@ class ModelConfig(Generic[TConfig]):
     @staticmethod
     def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
                                    moe_backend):
+        """Load quantization config from a ModelOpt hf_quant_config.json file."""
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -294,7 +305,7 @@ class ModelConfig(Generic[TConfig]):
                     json_extended_quant_configs = json.load(fm)
             except Exception:
                 logger.info(
-                    f"No quant_cfg.json found for layer quant info, using hf_quant_config.json."
+                    "No quant_cfg.json found for layer quant info, using hf_quant_config.json."
                 )
             json_quant_configs.update(json_extended_quant_configs)
             # kv_cache_quant_algo is global regardless of MIXED_PRECISION
@@ -333,6 +344,7 @@ class ModelConfig(Generic[TConfig]):
 
     @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
+        """Determine the MXFP4 quantization algorithm based on backend and SM version."""
         quant_algo = ModelConfig.override_quant_algo()
         if quant_algo is None and not is_dynamic_quant:
             if get_sm_version() >= 100:
@@ -347,6 +359,7 @@ class ModelConfig(Generic[TConfig]):
 
     @staticmethod
     def load_hf_quant_config(hf_quant_config, moe_backend):
+        """Load quantization config from a HuggingFace quantization_config dict."""
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -443,6 +456,7 @@ class ModelConfig(Generic[TConfig]):
 
     @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
+        """Load quantization config from a dtypes.json file."""
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -478,6 +492,7 @@ class ModelConfig(Generic[TConfig]):
 
     @staticmethod
     def override_quant_algo():
+        """Return a QuantAlgo override from the OVERRIDE_QUANT_ALGO env var, or None."""
         new_algo = os.environ.get("OVERRIDE_QUANT_ALGO", None)
         supported_algos = {
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
@@ -498,6 +513,7 @@ class ModelConfig(Generic[TConfig]):
                         checkpoint_dir: str,
                         trust_remote_code=False,
                         **kwargs):
+        """Construct a ModelConfig by loading a pretrained HuggingFace checkpoint."""
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
         with config_file_lock():
@@ -553,6 +569,7 @@ class ModelConfig(Generic[TConfig]):
 
         # Get cached file from path or repo id, return None if not exists.
         def cached_file(path_or_repo_id, file_name):
+            """Return the cached file path, or None if it does not exist."""
             try:
                 return transformers.utils.hub.cached_file(
                     path_or_repo_id, file_name)
@@ -660,6 +677,7 @@ class ModelConfig(Generic[TConfig]):
         attn_cp_size = self.mapping.attn_cp_size
 
         def ceil_div(a, b):
+            """Return the ceiling division of a by b."""
             return (a + b - 1) // b
 
         num_heads = ceil_div(self.pretrained_config.num_attention_heads,
@@ -759,6 +777,7 @@ class ModelConfig(Generic[TConfig]):
         return model_config_cpp
 
     def _infer_nemotron_ffn_mult(self):
+        """Infer the maximum FFN intermediate size for Nemotron-NAS models."""
         # TODO smor: this is a hack to support Nemotron-Super-49B-v1 with LoRA, tracked by TRTLLM-5045 ticket
         # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
         # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
@@ -791,6 +810,7 @@ class ModelConfig(Generic[TConfig]):
             return None
 
     def get_num_attention_layers(self):
+        """Return the number of attention layers, accounting for hybrid architectures."""
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
         elif is_qwen3_hybrid(self.pretrained_config):
