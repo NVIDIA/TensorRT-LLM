@@ -340,23 +340,28 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         if block_all:
             to_complete_request_ids = list(self.recv_sessions.keys())
         completed_request_ids = []
+        timeout_request_ids = []
         failed_request_ids = []
         for request_id in to_complete_request_ids:
             recv_task_id = self.recv_task_ids[request_id]
             recv_session = self.recv_sessions[request_id]
             req = self.recv_req_id_to_request[request_id]
-            if recv_session.wait_complete(recv_task_id, wait_aux=self._need_aux_transfer(req)):
+            if recv_session.wait_complete(
+                recv_task_id,
+                wait_aux=self._need_aux_transfer(req),
+                timeout_ms=self.sender_future_timeout_ms,
+            ):
                 completed_request_ids.append(request_id)
             else:
-                failed_request_ids.append(request_id)
+                # RxSession.wait_complete returns False on timeout or error.
+                # Keep the request for retry on next iteration instead of
+                # marking it as a terminal error immediately.
+                timeout_request_ids.append(request_id)
 
-        for request_id in completed_request_ids + failed_request_ids:
-            if request_id in completed_request_ids:
-                self.recv_req_id_to_request[
-                    request_id
-                ].state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            elif request_id in failed_request_ids:
-                self.recv_req_id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
+        for request_id in completed_request_ids:
+            self.recv_req_id_to_request[
+                request_id
+            ].state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self.recv_req_id_to_request[request_id]
             self.transfer_worker.clear_session(self.recv_sessions[request_id])
             del self.recv_sessions[request_id]
