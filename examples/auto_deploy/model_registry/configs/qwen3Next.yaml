@@ -18,3 +18,6 @@ model_kwargs:
 transforms:
   export_to_gm:
     num_moe_experts_for_export: 2
+  detect_sharding:
+    shard_all_unprocessed: true
+    simple_shard_filter: "lm_head"

@@ -175,6 +175,9 @@ class AttentionMetadata:
             self.cross
         ), "Top level and cross attention sub metadata type mismatched"
 
+    def on_update_kv_lens(self):
+        pass
+
     def on_update(self):
         if (self._seq_lens is not None
                 and self._seq_lens.shape[0] >= self.num_contexts

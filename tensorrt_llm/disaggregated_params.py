@@ -49,7 +49,7 @@ class DisaggregatedParams:
     # If disagg_request_id is set, both context and generation requests will use it as underlying request id.
     disagg_request_id: Optional[int] = None
     ctx_dp_rank: Optional[int] = None
-    ctx_info_endpoint: Optional[List[str]] = None
+    ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
 
     # E-P Disaggregated Params
