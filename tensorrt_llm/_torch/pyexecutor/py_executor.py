@@ -1911,6 +1911,8 @@ class PyExecutor:
         allgather is needed to obtain the global count.  Without ADP every
         request is local, and we can compare directly.
 
+        This method must only be called when ``is_benchmark_disagg`` is True.
+
         Args:
             scheduled_batch: The current iteration's scheduled requests,
                 used to count generation requests that have completed
@@ -1920,6 +1922,9 @@ class PyExecutor:
             True when the total number of generation-ready requests
             reaches ``benchmark_req_queues_size``.
         """
+        assert self.is_benchmark_disagg, (
+            "_is_benchmark_disagg_fill_complete called outside benchmark "
+            "disagg mode")
         local_gen_count = sum(1 for req in scheduled_batch.generation_requests
                               if not req.is_attention_dp_dummy)
         if self.enable_attention_dp:
@@ -1930,11 +1935,36 @@ class PyExecutor:
         if total_gen_count >= self.benchmark_req_queues_size:
             return True
         if self.dist.rank == 0:
-            logger.info(
+            logger.debug(
                 f"Benchmark disagg fill in progress: "
                 f"num_fetched={self.num_fetch_requests}, "
                 f"total_gen_count={total_gen_count} (local={local_gen_count})")
         return False
+
+    def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
+                                     can_forward: bool) -> tuple:
+        """Gate the forward pass until all benchmark disagg requests are ready.
+
+        In benchmark disagg mode the GEN executor must defer the forward
+        pass until every request has completed KV transfer.  This helper
+        consolidates the check used by both ``_executor_loop`` and
+        ``_executor_loop_overlap``.
+
+        Args:
+            scheduled_batch: The current scheduled batch.
+            can_forward: Current gate state.
+
+        Returns:
+            ``(can_forward, should_retry)`` — when *should_retry* is True
+            the caller should ``continue`` to the next loop iteration.
+        """
+        if not self.is_warmup and not can_forward:
+            can_forward = self._is_benchmark_disagg_fill_complete(
+                scheduled_batch)
+            if not can_forward:
+                time.sleep(1)
+                return can_forward, True
+        return can_forward, False
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -1957,12 +1987,10 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
-                if not self.is_warmup and not can_forward:
-                    can_forward = self._is_benchmark_disagg_fill_complete(
-                        scheduled_batch)
-                    if not can_forward:
-                        time.sleep(1)
-                        continue
+                can_forward, should_retry = self._check_benchmark_disagg_gate(
+                    scheduled_batch, can_forward)
+                if should_retry:
+                    continue
 
                 if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -2198,12 +2226,10 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
-                if not self.is_warmup and not can_forward:
-                    can_forward = self._is_benchmark_disagg_fill_complete(
-                        scheduled_batch)
-                    if not can_forward:
-                        time.sleep(1)
-                        continue
+                can_forward, should_retry = self._check_benchmark_disagg_gate(
+                    scheduled_batch, can_forward)
+                if should_retry:
+                    continue
 
                 if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
