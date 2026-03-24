@@ -16,12 +16,14 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -34,6 +36,8 @@ from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import \
     fused_sigmoid_gating_delta_rule_update
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor.config_utils import \
+    get_qwen3_hybrid_layer_types
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import get_sm_version
@@ -45,7 +49,7 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, create_moe)
@@ -154,6 +158,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
+        # Qwen3.5 BF16 checkpoints store fused [gate_up_proj, down_proj] per
+        # expert, while Qwen3Next and Qwen3.5 FP8 checkpoints store separate
+        # gate_proj/up_proj/down_proj (vanilla).  The model_type is set by HF
+        # config.json: "qwen3_5_moe_text" for Qwen3.5, "qwen3_next" otherwise.
+        weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+                               if config.model_type == "qwen3_5_moe_text" else
+                               MoEWeightLoadingMode.VANILLA)
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -164,6 +175,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             reduce_results=False,
             model_config=model_config,
             layer_idx=layer_idx,
+            weight_loading_mode=weight_loading_mode,
         )
 
         self.shared_expert = GatedMLP(
@@ -450,20 +462,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.conv1d = Linear(
-            self.conv_kernel_size,
-            self.conv_dim,
-            bias=False,
-            dtype=config.torch_dtype,
-            mapping=mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            quant_config=model_config.get_quant_config(),
-            reduce_output=False,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
-            allreduce_strategy=model_config.allreduce_strategy,
-            force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False)
+        # conv1d in_features = conv_kernel_size (e.g. 4), which is too small
+        # for block-scaled quantization (NVFP4/FP8).  Always keep it unquantized.
+        self.conv1d = Linear(self.conv_kernel_size,
+                             self.conv_dim,
+                             bias=False,
+                             dtype=config.torch_dtype,
+                             mapping=mapping,
+                             tensor_parallel_mode=TensorParallelMode.COLUMN,
+                             reduce_output=False,
+                             skip_create_weights_in_init=model_config.
+                             skip_create_weights_in_init,
+                             allreduce_strategy=model_config.allreduce_strategy,
+                             use_cute_dsl_blockscaling_mm=False)
 
         self.in_proj_qkvz = Linear(
             self.hidden_size,
@@ -849,6 +860,62 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         return output
 
 
+class _DenseMlpAdapter(nn.Module):
+    """Wraps GatedMLP to match Qwen3NextSparseMoeBlock's forward interface.
+
+    This allows the decoder layer forward methods to call self.mlp(...)
+    with the same arguments regardless of whether MoE or dense MLP is used.
+    """
+
+    def __init__(self, mlp: GatedMLP, mapping):
+        super().__init__()
+        self.mlp = mlp
+        self.mapping = mapping
+        self.enable_attention_dp = mapping.enable_attention_dp
+        # Provide a dummy `experts` attribute so that
+        # `self.mlp.experts.has_nvfp4` checks in decoder forward don't crash.
+        self.experts = SimpleNamespace(has_nvfp4=False)
+
+    def forward(
+        self,
+        hidden_states,
+        attn_metadata=None,
+        all_reduce_params=None,
+        do_finalize=True,
+        lora_params=None,
+    ):
+        all_rank_num_tokens = (attn_metadata.all_rank_num_tokens
+                               if attn_metadata is not None else None)
+        return self.mlp(
+            hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            final_all_reduce_params=all_reduce_params,
+            lora_params=lora_params,
+        )
+
+
+def _create_mlp(model_config, aux_stream, layer_idx):
+    """Create the appropriate MLP for this layer: MoE or dense GatedMLP."""
+    config = model_config.pretrained_config
+    num_experts = getattr(config, "num_experts", 0) or 0
+    if num_experts > 0:
+        return Qwen3NextSparseMoeBlock(model_config,
+                                       aux_stream,
+                                       layer_idx=layer_idx)
+    return _DenseMlpAdapter(
+        GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=getattr(config, "mlp_bias", False),
+            dtype=config.torch_dtype,
+            overridden_tp_size=1
+            if model_config.mapping.enable_attention_dp else None,
+            config=model_config,
+        ),
+        model_config.mapping,
+    )
+
+
 class Qwen3NextLinearDecoderLayer(DecoderLayer):
 
     def __init__(
@@ -866,9 +933,7 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3NextSparseMoeBlock(model_config,
-                                           aux_stream,
-                                           layer_idx=layer_idx)
+        self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -1028,9 +1093,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             fuse_qk_norm_rope=False,
         )
 
-        self.mlp = Qwen3NextSparseMoeBlock(model_config,
-                                           aux_stream,
-                                           layer_idx=layer_idx)
+        self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -1202,12 +1265,12 @@ class Qwen3NextModel(DecoderModel):
                 gather_output=True,
             )
 
+        layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
         self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[pretrained_config.layer_types[layer_idx]](
-                model_config,
-                layer_idx,
-                self.aux_stream,
-            ) for layer_idx in range(pretrained_config.num_hidden_layers)
+            ALL_DECODER_LAYER_TYPES[layer_types[layer_idx]](model_config,
+                                                            layer_idx,
+                                                            self.aux_stream)
+            for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
 
         self.norm = RMSNorm(

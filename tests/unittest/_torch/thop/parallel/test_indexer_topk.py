@@ -4,6 +4,7 @@ from utils.util import getSMVersion, skip_pre_blackwell, skip_pre_hopper
 
 # Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
 # Import CuTE DSL utils
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -287,6 +288,11 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
     next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
 
     seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    # Clamp seq_lens so that every effective row length >= index_topk.
+    # With next_n > 1, effective length = seq_len - next_n + offset + 1,
+    # and the minimum (offset=0) is seq_len - next_n + 1.
+    # Ensure seq_len >= next_n so effective length is at least 1.
+    seq_lens = seq_lens.clamp(min=next_n)
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
 
     logits = create_random_logits(row_starts, row_ends, dtype, 42)
@@ -306,13 +312,15 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64])
+@pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype, load_balance):
+def test_cute_dsl_topk_decode_single_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
+):
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -367,17 +375,86 @@ def test_cute_dsl_topk_decode_multi_cta(
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
 def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
+    num_gen_tokens = batch_size * next_n
+
+    def run_fn(logits, seq_lens):
+        output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            input_values=logits,
+            seq_lens=seq_lens,
+            output_indices=output_indices,
+            top_k=index_topk,
+            next_n=next_n,
+            num_copy_bits=256,
+        )
+        return output_indices
+
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
         index_topk,
         num_tokens,
         torch.float32,
-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+        run_fn,
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 16, 256])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_topk_decode_single_pass_multi_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype
+):
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        lambda logits,
+        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
             input_values=logits,
             seq_lens=seq_lens,
             top_k=index_topk,
             next_n=next_n,
+            return_val=False,
             num_copy_bits=256,
-        ),
+        )[0],
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 16, 256])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
+    batch_size, next_n, index_topk, num_tokens, dtype
+):
+    def run_fn(logits, seq_lens):
+        result = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            return_val=False,
+            num_copy_bits=256,
+        )
+        if result[0] is None:
+            pytest.skip("Problem size exceeds cluster kernel capacity")
+        return result[0]
+
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        run_fn,
     )
