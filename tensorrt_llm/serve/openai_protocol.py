@@ -618,6 +618,7 @@ class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
