@@ -2015,7 +2015,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
         clamped = self.impl.clamp_max_seq_len_for_mem(
-            batch_size, token_num_upper_bound + extra_tokens) - extra_tokens
+            batch_size, token_num_upper_bound + extra_tokens) - 2 * extra_tokens
         # clamp_max_seq_len_for_mem considers all tiers (GPU + host).  When
         # max_tokens is explicitly set, cap by GPU-only capacity so callers
         # (e.g. CUDA graph warmup) don't exceed the GPU pool.
