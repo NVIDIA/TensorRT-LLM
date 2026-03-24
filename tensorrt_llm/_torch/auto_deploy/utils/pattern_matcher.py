@@ -23,14 +23,24 @@ from torch._inductor.pattern_matcher import (
     KeywordArg,
     Match,
     MultiOutputPattern,
+    PatternEntry,
     PatternExpr,
     PatternMatcherPass,
+    ReplacementPatternEntry,
     T,
-    register_replacement,
+    _transfer_meta,
+    check_and_add_duplicate_pattern,
+    functorch_config,
+    gen_pattern_and_search_gm,
+    is_match,
+    joint_fwd_bwd,
+    log_trace_failure,
 )
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+
+from ._graph import toposort_single_gm
 
 
 @contextlib.contextmanager
@@ -94,6 +104,196 @@ def _not_implemented(*args: Any, **kwargs: Any) -> NoReturn:
 
 def _return_true(match: Match) -> bool:
     return True
+
+
+class ADReplacementPatternEntry(ReplacementPatternEntry):
+    """Pattern replacement entry with local topological repair for multi-output rewrites."""
+
+    def apply(self, match: Match, graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+        del node
+        assert match.replacement_graph is not None
+        output_nodes = match.output_nodes()
+        self.replace_with_graph(
+            match,
+            graph,
+            match.replacement_graph,
+            self.normalize_args(*match.args, **match.kwargs),
+        )
+
+        if len(output_nodes) > 1:
+            # Torch's generic replacement path inserts the copied replacement graph relative to the
+            # earliest matched output node. That is usually fine for single-output rewrites, but it
+            # can leave multi-output replacements non-topological: some inputs to the later tuple
+            # outputs may still appear later in the linked-list order, or the copied tuple producer
+            # and its getitem users can end up reversed. Rebuilding the graph order here keeps the
+            # repair local to the rewrite site instead of paying a global toposort in every later
+            # canonicalization step.
+            assert isinstance(graph.owning_module, GraphModule)
+            toposort_single_gm(graph.owning_module)
+
+
+def _register_replacement_with_safe_insertion(
+    search_fn: Callable,
+    replace_fn: Callable,
+    example_inputs: Iterable[Any],
+    trace_fn: Callable[[Callable, Sequence[torch.Tensor]], GraphModule],
+    pass_dicts: Union[PatternMatcherPass, Sequence[PatternMatcherPass]],
+    extra_check: Callable[[Match], bool] = _return_true,
+    scalar_workaround: Union[dict[str, Union[float, int]], None] = None,
+    exclusive_arg_names: Sequence[str] = (),
+    search_fn_pattern: Union[PatternExpr, None] = None,
+    skip_duplicates: bool = False,
+) -> bool:
+    """Register a replacement rule with topologically safe insertion."""
+    argnames_static = [*inspect.signature(search_fn).parameters.keys()]
+
+    def check_fn(match: Match) -> bool:
+        argnames = list(argnames_static)
+        for name in argnames:
+            if name not in match.kwargs:
+                raise RuntimeError(
+                    "Not all inputs to pattern found in match.kwargs. Perhaps one "
+                    f"of the inputs is unused? argnames={argnames}, match.kwargs={match.kwargs}"
+                )
+
+        args = list(
+            torch.fx.map_arg([match.kwargs[name] for name in argnames], lambda n: n.meta["val"])
+        )
+
+        sym_args: list[torch.SymInt] = []
+        fake_mode = torch._dynamo.utils.detect_fake_mode(args)
+        assert fake_mode is not None
+        with fake_mode:
+            for idx, grad in enumerate(requires_grad):
+                if isinstance(args[idx], torch.Tensor):
+                    if grad and torch._prims_common.is_integer_dtype(args[idx].dtype):
+                        return False
+
+                    args[idx] = torch.empty_strided(
+                        args[idx].size(),
+                        args[idx].stride(),
+                        dtype=args[idx].dtype,
+                        device=args[idx].device,
+                        requires_grad=grad,
+                    )
+                    for value in itertools.chain(args[idx].shape, args[idx].stride()):
+                        if isinstance(value, torch.SymInt) and all(
+                            torch.fx.experimental.symbolic_shapes.statically_known_true(
+                                value != known_value
+                            )
+                            for known_value in sym_args
+                        ):
+                            sym_args.append(value)
+
+            specific_pattern = search_fn_pattern
+
+            if not specific_pattern:
+                if sym_args:
+
+                    def search_fn_new(*args_new: Any) -> Any:
+                        return search_fn(*args_new[len(args_new) - len(args) :])
+
+                    try:
+                        specific_graph = trace_fn(search_fn_new, sym_args + args)
+                    except RuntimeError as err:
+                        log_trace_failure(search_fn, err)
+                        return False
+
+                    sym_arg_names = []
+                    for idx, placeholder in zip(
+                        range(len(sym_args) + len(args)), specific_graph.graph.nodes
+                    ):
+                        if idx < len(sym_args):
+                            sym_arg_names.append(placeholder.target)
+                            continue
+
+                        with specific_graph.graph.inserting_after(placeholder):
+                            new_node = specific_graph.graph.placeholder(
+                                argnames[idx - len(sym_args)]
+                            )
+                            new_node.target = new_node.name
+                            placeholder.replace_all_uses_with(new_node)
+                            specific_graph.graph.erase_node(placeholder)
+
+                    argnames = sym_arg_names + argnames
+                else:
+                    try:
+                        specific_graph = trace_fn(search_fn, args)
+                    except RuntimeError as err:
+                        log_trace_failure(search_fn, err)
+                        return False
+
+                specific_pattern = _fx_to_ad_pattern_with_op_ignore(
+                    specific_graph,
+                    argnames=argnames,
+                    scalar_workaround=scalar_workaround,
+                    exclusive_arg_names=exclusive_arg_names,
+                )
+
+            node = match.output_nodes()[0]
+            assert node is not None
+            specific_pattern_match = specific_pattern.match(node)
+
+            if is_match(specific_pattern_match) and extra_check(specific_pattern_match):
+                match.replacement_graph = trace_fn(replace_fn, args)
+                if len(match.nodes) == 1:
+                    for replacement_node in match.replacement_graph.graph.nodes:
+                        _transfer_meta(
+                            new_meta=replacement_node.meta,
+                            old_node=match.nodes[0],
+                            pass_name="replacement",
+                        )
+                return True
+            return False
+
+    def normalize_args(**kwargs: Any) -> list[Any]:
+        args = [kwargs.pop(name) for name in argnames_static]
+        for idx in range(1, len(kwargs) + 1):
+            tangent_name = f"tangents_{idx}"
+            if tangent_name not in kwargs:
+                break
+            args.append(kwargs.pop(tangent_name))
+        assert not kwargs, f"leftover kwargs: {kwargs!r}"
+        return args
+
+    if trace_fn is joint_fwd_bwd and torch.is_inference_mode_enabled():
+        return False
+
+    with functorch_config.patch(functionalize_rng_ops=False):
+        requires_grad: list[bool] = [
+            isinstance(example_input, torch.Tensor) and example_input.requires_grad
+            for example_input in example_inputs
+        ]
+        if search_fn_pattern is None:
+            pattern, gm = gen_pattern_and_search_gm(
+                search_fn,
+                example_inputs,
+                trace_fn,
+                scalar_workaround,
+                exclusive_arg_names,
+            )
+        else:
+            pattern = search_fn_pattern
+            gm = None
+
+        pattern_passes = pass_dicts if isinstance(pass_dicts, Sequence) else [pass_dicts]
+        for pattern_matcher_pass in pattern_passes:
+            if isinstance(pattern_matcher_pass, PatternMatcherPass):
+                if check_and_add_duplicate_pattern(
+                    pattern,
+                    gm.graph if gm else None,
+                    pattern_matcher_pass.seen_patterns,
+                    skip_duplicates=skip_duplicates,
+                ):
+                    return False
+
+        pattern_entry: PatternEntry = ADReplacementPatternEntry(
+            pattern=pattern,
+            extra_check=check_fn,
+            normalize_args=normalize_args,
+        )
+        pattern_entry.register(pass_dicts)
+        return pattern_entry.pattern  # type: ignore[return-value]
 
 
 def register_ad_pattern(
@@ -170,7 +370,7 @@ def register_ad_pattern(
         scalar_workaround=scalar_workaround,
     )
 
-    register_replacement(
+    _register_replacement_with_safe_insertion(
         search_fn=search_fn,
         replace_fn=replace_fn,
         example_inputs=[None],

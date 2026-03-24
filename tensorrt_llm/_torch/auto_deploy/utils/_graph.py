@@ -343,14 +343,12 @@ def lint(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
-def _toposort_single_gm(gm: GraphModule) -> None:
+def toposort_single_gm(gm: GraphModule) -> None:
     """Rebuild one FX graph in dependency order.
 
-    Some pattern-based rewrites insert replacement nodes at a legal edit point for the matched
-    anchor node but still leave other arguments physically later in the linked-list order. FX
-    recompilation does not fix that ordering on its own, and ``graph.lint()`` then fails with a
-    "used before it has been defined" error. Rebuilding via recursive ``node_copy`` restores a
-    valid topological order while preserving node metadata.
+    Some graph rewrites leave the FX linked-list order non-topological even though the dataflow is
+    otherwise valid. Rebuilding the graph via recursive ``node_copy`` restores producer-before-
+    consumer order while preserving node metadata.
     """
     old_graph = gm.graph
     new_graph = Graph()
@@ -378,10 +376,6 @@ def _toposort_single_gm(gm: GraphModule) -> None:
 
 
 def _canonicalize_single_gm(gm: GraphModule) -> None:
-    # Restore dependency order before recompilation/lint. Some transforms leave the
-    # linked-list order invalid even though data dependencies are otherwise correct.
-    _toposort_single_gm(gm)
-
     # clean up graph (needs to be done repeatedly until no more dead code)
     eliminate_dead_code(gm, is_impure_node=_is_impure_node)
 
