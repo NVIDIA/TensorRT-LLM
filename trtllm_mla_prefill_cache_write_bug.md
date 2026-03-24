@@ -3,7 +3,7 @@
 ## Reproduction Commit
 
 - **Branch**: `eg/ds_with_mla_enablement`
-- **Repro commit SHA**: `8da6118f98` (`trtllm_mla: BF16 KV cache, warmup skip, Flash MLA + prefill cache write bug`)
+- **Repro commit SHA**: `8e949a9b4d` (`trtllm_mla: BF16 KV cache, warmup skip, Flash MLA + prefill cache write bug`)
 - This commit contains the crashing `_call_thop_attention_mla` call with `update_kv_cache=True`
   in `_handle_prefill_thop`. Run the benchmark command below to reproduce the illegal memory access.
 
