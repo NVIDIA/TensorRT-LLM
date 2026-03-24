@@ -1132,6 +1132,160 @@ def _convert_flashinfer_to_thop_cos_sin(
     return thop_cache.reshape(1, -1).float()
 
 
+def _try_trace_to_fused_qkv(
+    pre_rope_q: Node, pre_rope_k: Node, bind_v: Node
+) -> Optional[Tuple[Node, int, int, int]]:
+    """Trace pre-RoPE Q, K, and V back to a flat fused QKV GEMM output.
+
+    Supports two graph patterns produced by GEMM fusion:
+
+    1. **split_with_sizes pattern**: ``fused_qkv → split_with_sizes → getitem → view``
+    2. **narrow pattern**: ``fused_qkv → narrow(dim, offset, size) → view``
+
+    When identified, the flat fused QKV tensor can be passed directly to
+    ``trtllm_mha_with_cache``, eliminating 2 bf16 copy + 1 cat kernel per layer.
+
+    Returns ``(fused_qkv_node, num_heads, num_kv_heads, head_dim)`` on success, or ``None``.
+    """
+
+    def _trace_one_split(node: Node):
+        """Trace via split_with_sizes pattern: contiguous? → view → getitem → split."""
+        current = node
+        if is_op(current, torch.ops.aten.contiguous.default):
+            if isinstance(current.args[0], Node):
+                current = current.args[0]
+        if not (
+            is_op(current, torch.ops.aten.view.default)
+            or is_op(current, torch.ops.aten.reshape.default)
+        ):
+            return None
+        view_input = current.args[0]
+        if not isinstance(view_input, Node):
+            return None
+        view_shape = current.args[1] if len(current.args) > 1 else None
+        if not isinstance(view_shape, (list, tuple)) or len(view_shape) < 4:
+            return None
+        nh, hd = view_shape[2], view_shape[3]
+        if not isinstance(nh, int) or not isinstance(hd, int):
+            return None
+        if not is_op(view_input, operator.getitem):
+            return None
+        getitem_source = view_input.args[0]
+        getitem_idx = view_input.args[1]
+        if not isinstance(getitem_source, Node) or not isinstance(getitem_idx, int):
+            return None
+        if not is_op(getitem_source, torch.ops.aten.split_with_sizes.default):
+            return None
+        fused_node = getitem_source.args[0]
+        if not isinstance(fused_node, Node):
+            return None
+        return fused_node, getitem_idx, nh * hd, nh, hd
+
+    def _trace_one_narrow(node: Node):
+        """Trace via narrow pattern: contiguous? → view → narrow → fused_qkv."""
+        current = node
+        # Skip through one or more contiguous ops
+        while (
+            isinstance(current, Node)
+            and current.op == "call_function"
+            and getattr(current.target, "__name__", "") == "contiguous"
+        ):
+            if isinstance(current.args[0], Node):
+                current = current.args[0]
+            else:
+                break
+        # Also handle aten.contiguous.default
+        if is_op(current, torch.ops.aten.contiguous.default):
+            if isinstance(current.args[0], Node):
+                current = current.args[0]
+        if not (
+            is_op(current, torch.ops.aten.view.default)
+            or is_op(current, torch.ops.aten.reshape.default)
+        ):
+            return None
+        view_input = current.args[0]
+        if not isinstance(view_input, Node):
+            return None
+        view_shape = current.args[1] if len(current.args) > 1 else None
+        if not isinstance(view_shape, (list, tuple)) or len(view_shape) < 4:
+            return None
+        hd = view_shape[3]
+        if not isinstance(hd, int):
+            return None
+        # Check for narrow: torch.narrow, torch.Tensor.narrow, or aten.narrow
+        _narrow_ops = {torch.narrow, torch.Tensor.narrow, torch.ops.aten.narrow.default}
+        if view_input.op != "call_function" or view_input.target not in _narrow_ops:
+            return None
+        if len(view_input.args) < 4:
+            return None
+        narrow_parent = view_input.args[0]
+        narrow_dim = view_input.args[1]
+        narrow_offset = view_input.args[2]
+        narrow_length = view_input.args[3]
+        if not isinstance(narrow_parent, Node):
+            return None
+        if narrow_dim != -1:
+            return None
+        if not isinstance(narrow_offset, int) or not isinstance(narrow_length, int):
+            return None
+        # Infer num_heads from narrow_length and head_dim
+        # (view_shape[2] may be -1 when the model uses view(B, S, -1, head_dim))
+        nh = narrow_length // hd
+        if nh * hd != narrow_length:
+            return None
+        return narrow_parent, narrow_offset, narrow_length, nh, hd
+
+    # Try split_with_sizes pattern first
+    q_split = _trace_one_split(pre_rope_q)
+    k_split = _trace_one_split(pre_rope_k)
+    v_split = _trace_one_split(bind_v)
+
+    if q_split is not None and k_split is not None and v_split is not None:
+        q_src, q_idx, q_dim, q_nh, q_hd = q_split
+        k_src, k_idx, k_dim, k_nh, k_hd = k_split
+        v_src, v_idx, v_dim, v_nh, v_hd = v_split
+        if (
+            q_src is k_src
+            and q_src is v_src
+            and q_idx == 0
+            and k_idx == 1
+            and v_idx == 2
+            and k_dim == v_dim
+            and k_hd == v_hd
+            and q_hd == k_hd
+        ):
+            return q_src, q_nh, k_nh, q_hd
+
+    # Try narrow pattern
+    q_narrow = _trace_one_narrow(pre_rope_q)
+    k_narrow = _trace_one_narrow(pre_rope_k)
+    v_narrow = _trace_one_narrow(bind_v)
+
+    if q_narrow is not None and k_narrow is not None and v_narrow is not None:
+        q_parent, q_off, q_len, q_nh, q_hd = q_narrow
+        k_parent, k_off, k_len, k_nh, k_hd = k_narrow
+        v_parent, v_off, v_len, v_nh, v_hd = v_narrow
+        # All three must narrow from the same parent
+        if q_parent is not k_parent or q_parent is not v_parent:
+            return None
+        # Q starts at 0, K starts at Q end, V starts at K end
+        if q_off != 0:
+            return None
+        if k_off != q_len:
+            return None
+        if v_off != q_len + k_len:
+            return None
+        # K and V must have same head_dim
+        if k_hd != v_hd or q_hd != k_hd:
+            return None
+        # K and V must have same narrow length
+        if k_len != v_len:
+            return None
+        return q_parent, q_nh, k_nh, q_hd
+
+    return None
+
+
 @TransformRegistry.register("fuse_rope_into_trtllm_attention")
 class FuseRopeIntoTrtllmAttention(BaseTransform):
     """Fuse RoPE into trtllm attention op by rewiring Q/K to pre-RoPE inputs.
@@ -1282,6 +1436,25 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
             "position_embedding_type": position_embedding_type,
             "rotary_embedding_dim": rotary_embedding_dim,
         }
+
+        # Step 9: Try to trace pre-RoPE Q/K/V back to a flat fused QKV GEMM output.
+        # When gate_up GEMM fusion produces (B, S, total_qkv_dim) and the model
+        # splits it via split_with_sizes → getitem → view, the non-contiguous views
+        # force copies when reshaped for trtllm_mha_with_cache. By passing the flat
+        # fused QKV directly, we eliminate 2 bf16 copy kernels + 1 cat per layer.
+        bind_v = attn_node.args[2]  # V input
+        fused_qkv_result = _try_trace_to_fused_qkv(pre_rope_q, pre_rope_k, bind_v)
+        if fused_qkv_result is not None:
+            fused_qkv_node, num_heads, num_kv_heads, head_dim = fused_qkv_result
+            args_list = list(attn_node.args)
+            args_list[0] = fused_qkv_node  # Q → fused QKV
+            args_list[1] = fused_qkv_node  # K → fused QKV
+            args_list[2] = fused_qkv_node  # V → fused QKV
+            attn_node.args = tuple(args_list)
+            attn_node.meta["_trtllm_fused_qkv"] = True
+            attn_node.meta["_trtllm_num_heads"] = num_heads
+            attn_node.meta["_trtllm_num_kv_heads"] = num_kv_heads
+            attn_node.meta["_trtllm_head_dim"] = head_dim
 
         return True
 

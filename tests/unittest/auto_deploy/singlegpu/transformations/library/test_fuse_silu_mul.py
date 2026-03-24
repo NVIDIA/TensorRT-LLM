@@ -88,7 +88,7 @@ def test_fuse_silu_mul_basic():
     gm = io.run(gm)
 
     # Verify silu+mul fusion happened
-    assert _count_ops(gm, torch.ops.auto_deploy.silu_and_mul.default) >= 1
+    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) >= 1
     # Original silu and mul ops should be gone
     assert _count_ops(gm, torch.ops.aten.silu.default) == 0
     assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 0
@@ -115,7 +115,7 @@ def test_fuse_silu_mul_multi_layer():
     gm = io.run(gm)
 
     # Should have one silu_and_mul per layer
-    assert _count_ops(gm, torch.ops.auto_deploy.silu_and_mul.default) == num_layers
+    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == num_layers
     assert _count_ops(gm, torch.ops.aten.silu.default) == 0
     assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 0
 
@@ -139,6 +139,6 @@ def test_fuse_silu_mul_disabled():
     gm = io.run(gm)
 
     # silu_and_mul should NOT be present when disabled
-    assert _count_ops(gm, torch.ops.auto_deploy.silu_and_mul.default) == 0
+    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == 0
     # Original ops should still be there
     assert _count_ops(gm, torch.ops.aten.silu.default) >= 1

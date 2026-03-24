@@ -207,6 +207,7 @@ transforms:
   fuse_silu_mul:
     stage: post_load_fusion
     enabled: false
+    backend: flashinfer
   fuse_swiglu:
     stage: post_load_fusion
     enabled: false
