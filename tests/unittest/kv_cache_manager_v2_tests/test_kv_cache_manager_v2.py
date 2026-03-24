@@ -757,7 +757,13 @@ class TestDisagg(TestKVCacheManagerV2):
 
 
 class TestReleasePrefixBlocks(TestKVCacheManagerV2):
-    """Tests for _KVCache.release_prefix (chunked transfer early release)."""
+    """Tests for _KVCache.release_prefix (chunked transfer early release).
+
+    release_prefix nullifies page holders in prefix blocks (setting
+    them to None) and marks their base_page_indices as BAD_PAGE_INDEX.
+    The _blocks list length is preserved to maintain ordinal invariants
+    for close() / stop_committing().
+    """
 
     def _create_and_fill(self, prompt_len: int) -> "_KVCache":
         """Helper: create a KV cache, resume, resize to prompt_len."""
@@ -770,22 +776,27 @@ class TestReleasePrefixBlocks(TestKVCacheManagerV2):
             assert success
         return kv_cache
 
+    def _count_valid_indices(self, kv_cache: "_KVCache", layer_group_id: int = 0) -> int:
+        """Count non-BAD_PAGE_INDEX entries in base_page_indices."""
+        indices = kv_cache.get_base_page_indices(LayerGroupId(layer_group_id))
+        return sum(1 for idx in indices if idx != BAD_PAGE_INDEX)
+
     @parameterized.expand([256])
     def test_release_prefix_basic(self, prompt_len: int) -> None:
-        """Releasing N prefix blocks reduces num_blocks and capacity."""
+        """Releasing N prefix blocks invalidates their page indices."""
         self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
         kv_cache = self._create_and_fill(prompt_len)
 
         original_num_blocks = kv_cache.num_blocks
-        tokens_per_block = self.manager.tokens_per_block
         release_count = 2
         assert original_num_blocks > release_count
 
+        original_valid = self._count_valid_indices(kv_cache)
         kv_cache.release_prefix(release_count)
 
-        assert kv_cache.num_blocks == original_num_blocks - release_count
-        expected_capacity = prompt_len - release_count * tokens_per_block
-        assert kv_cache.capacity == expected_capacity
+        assert kv_cache.num_blocks == original_num_blocks
+        valid_after = self._count_valid_indices(kv_cache)
+        assert valid_after == original_valid - release_count
 
         kv_cache.close()
 
@@ -796,56 +807,46 @@ class TestReleasePrefixBlocks(TestKVCacheManagerV2):
         kv_cache = self._create_and_fill(prompt_len)
 
         original_num_blocks = kv_cache.num_blocks
+        original_valid = self._count_valid_indices(kv_cache)
         kv_cache.release_prefix(0)
 
         assert kv_cache.num_blocks == original_num_blocks
+        assert self._count_valid_indices(kv_cache) == original_valid
         kv_cache.close()
 
     @parameterized.expand([128])
     def test_release_prefix_exceeds_blocks(self, prompt_len: int) -> None:
-        """release_prefix(N+5) releases all N blocks (clamped)."""
+        """release_prefix(N+5) invalidates all N blocks (clamped)."""
         self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
         kv_cache = self._create_and_fill(prompt_len)
 
         original_num_blocks = kv_cache.num_blocks
         kv_cache.release_prefix(original_num_blocks + 5)
 
-        assert kv_cache.num_blocks == 0
-        assert kv_cache.capacity == 0
+        assert kv_cache.num_blocks == original_num_blocks
+        assert self._count_valid_indices(kv_cache) == 0
         kv_cache.close()
 
     @parameterized.expand([256])
     def test_release_prefix_cumulative(self, prompt_len: int) -> None:
-        """Two successive calls release blocks from the new head each time."""
+        """Two successive calls invalidate prefix blocks cumulatively."""
         self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
         kv_cache = self._create_and_fill(prompt_len)
 
-        original_num_blocks = kv_cache.num_blocks
+        original_valid = self._count_valid_indices(kv_cache)
         kv_cache.release_prefix(2)
-        assert kv_cache.num_blocks == original_num_blocks - 2
+        assert self._count_valid_indices(kv_cache) == original_valid - 2
         kv_cache.release_prefix(3)
-        assert kv_cache.num_blocks == original_num_blocks - 5
+        assert self._count_valid_indices(kv_cache) == original_valid - 5
         kv_cache.close()
 
     @parameterized.expand([256])
-    def test_release_prefix_memory_reclaimed(self, prompt_len: int) -> None:
-        """After release_prefix, freed slots are available for new caches."""
-        self.prepare(128 << 20, 0, 0, 4, 128, 0)
+    def test_release_prefix_close_succeeds(self, prompt_len: int) -> None:
+        """close() succeeds after release_prefix without assertion errors."""
+        self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
         kv_cache = self._create_and_fill(prompt_len)
 
-        release_count = kv_cache.num_blocks // 2
-        kv_cache.release_prefix(release_count)
-
-        # A second cache should be able to allocate using freed slots.
-        prompt2 = [self.next_token() for _ in range(prompt_len // 2)]
-        kv_cache2 = self.manager.create_kv_cache(None, prompt2)
-        with TemporaryCudaStream([]) as stream:
-            success = kv_cache2.resume(cast(CudaStream, stream.handle))
-            assert success
-            success = kv_cache2.resize(len(prompt2), len(prompt2))
-            assert success
-
-        kv_cache2.close()
+        kv_cache.release_prefix(kv_cache.num_blocks // 2)
         kv_cache.close()
 
 

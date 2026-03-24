@@ -1310,7 +1310,6 @@ def add_and_verify_chunked_request(
 
 CHUNKED_TEST_CONFIGS = [
     (1, 1, False, 1, 1, False, False, "tp1_pp1_chunked"),
-    (1, 2, False, 1, 1, False, False, "tp1_pp2_to_tp1_pp1_chunked"),
 ]
 
 

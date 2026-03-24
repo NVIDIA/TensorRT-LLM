@@ -1126,14 +1126,15 @@ class _KVCache:
             self._blocks.pop()
 
     def release_prefix(self, num_blocks: int) -> None:
-        """Release the first ``num_blocks`` blocks from this cache.
+        """Release page holders for the first ``num_blocks`` blocks.
 
         Used by disaggregated serving to free sender-side KV memory
-        for blocks whose data has already been transferred.  The blocks
-        are removed from the head of ``_blocks`` and their page holders
-        are released back to the storage pool.  ``_capacity``,
-        ``_history_length``, and ``_base_page_indices`` are adjusted to
-        reflect the smaller cache.
+        for blocks whose data has already been transferred.  The page
+        holders within each ``SeqBlock`` are set to ``None``, which
+        drops the ``_PageHolder`` references and triggers
+        ``schedule_for_eviction`` on committed pages.  The ``_blocks``
+        list itself is **not** shortened so that block ordinals and
+        ``close()`` / ``stop_committing()`` invariants are preserved.
 
         Args:
             num_blocks: Number of leading blocks to release.  Clamped
@@ -1146,27 +1147,18 @@ class _KVCache:
         if num_blocks <= 0:
             return
         num_blocks = min(num_blocks, len(self._blocks))
-        tokens_per_block = self._tokens_per_block
 
         with self._record_event():
-            # Release blocks from the head.  Popping one at a time lets
-            # each SeqBlock's page holders run their destructors, which
-            # return physical slots to the allocator.
-            for _ in range(num_blocks):
-                self._blocks.pop(0)
+            for i in range(num_blocks):
+                block = self._blocks[i]
+                for beam_pages in block.pages:
+                    for lc_idx in range(len(beam_pages)):
+                        beam_pages[lc_idx] = None
 
-        # Trim the leading entries from _base_page_indices for every
-        # (beam, layer_group) combination.
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:
-                if type(indices) is array.array:
-                    del indices[:num_blocks]
-                else:
-                    indices[:num_blocks] = array.array("i", [BAD_PAGE_INDEX] * num_blocks)
-
-        released_tokens = num_blocks * tokens_per_block
-        self._capacity = max(0, self._capacity - released_tokens)
-        self._history_length = max(0, self._history_length - released_tokens)
+                for i in range(min(num_blocks, len(indices))):
+                    indices[i] = BAD_PAGE_INDEX
 
     @contextmanager
     def _record_event(self) -> Iterator[None]:
