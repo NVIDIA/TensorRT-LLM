@@ -1670,14 +1670,43 @@ class Indexer(nn.Module):
         return fp8_out, scale
 
     @torch.inference_mode()
-    def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
-                metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor):
-        quant_block_size = metadata.kv_cache_manager.quant_block_size
-        assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
+    def pre_indexer(
+        self, qr: torch.Tensor, hidden_states: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Token-wise projections, FP8 quantize, weight scaling, and k cache update.
 
-        # Single fused FP32 cuBLAS GEMM (TF32 on Ampere+): wk + weights_proj
-        # hidden_states (FP32) @ fused_weight^T -> [N, head_dim + n_heads]
+        Runs the full indexer pre-computation including k cache update.
+        Used by the eager path (Indexer.forward) where everything runs
+        outside CUDA graph capture.
+
+        Returns (q_fp8, k_fp8, k_scale, weights).
+        """
+        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(
+            qr, hidden_states, position_ids)
+
+        weights, _ = maybe_execute_in_parallel(
+            lambda: weights,
+            lambda: self._update_k_cache(k_fp8, k_scale, metadata),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+        return q_fp8, k_fp8, k_scale, weights
+
+    def pre_indexer_proj(
+        self, qr: torch.Tensor, hidden_states: torch.Tensor,
+        position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure token-wise projections (CUDA-graph-capturable).
+
+        Runs cublas_mm, qk_projection_and_rope, FP8 quantize, and weight
+        scaling.  Does NOT touch the k cache or any batch-specific metadata,
+        so this can safely run inside a captured CUDA graph partition.
+
+        Returns (q_fp8, k_fp8, k_scale, weights).
+        """
         assert self._fused_wk_wp_weight is not None, \
             "post_load_weights() must be called before forward()"
         hidden_float = _to_float(hidden_states)
@@ -1704,14 +1733,16 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights, _ = maybe_execute_in_parallel(
-            lambda: self._weight_scale(weights, q_scale),
-            lambda: self._update_k_cache(
-                k_fp8, k_scale, metadata),  # store k_fp8 and k_scale in k cache
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        weights = self._weight_scale(weights, q_scale)
+
+        return q_fp8, k_fp8, k_scale, weights
+
+    @torch.inference_mode()
+    def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
+                metadata: DSAtrtllmAttentionMetadata,
+                position_ids: torch.Tensor):
+        q_fp8, k_fp8, k_scale, weights = self.pre_indexer(
+            qr, hidden_states, metadata, position_ids)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
