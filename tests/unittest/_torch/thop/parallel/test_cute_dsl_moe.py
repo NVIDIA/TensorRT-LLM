@@ -763,7 +763,6 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     interm_size = 8192
     num_experts = 256
     num_local_experts = num_experts // ep_size
-    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
 
     # Generate routing information
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
