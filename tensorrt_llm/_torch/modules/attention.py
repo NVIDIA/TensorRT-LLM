@@ -2132,13 +2132,10 @@ class MLA(nn.Module):
                     self.qk_rope_head_dim, self.kv_lora_rank, self.v_head_dim,
                     q.dtype, q.device)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
-                    attn_metadata) and get_sm_version() >= 100:
+                    attn_metadata):
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output)
-            elif trtllm_attention.has_cached_kv_for_mla_context(
-                    attn_metadata
-            ) or trtllm_attention.is_chunked_prefill_for_mla_context(
-                    attn_metadata):
+            elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
         return self.forward_context_default(q, compressed_kv, k_pe,
