@@ -36,7 +36,7 @@ SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
 ES_HEADERS = {"Content-Type": "application/json"}
 
 
-def post_slack_msg():
+def post_slack_msg(report_content):
     starttime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     base = (
         "https://gpuwa.nvidia.com/kibana/s/tensorrt/app/dashboards"
@@ -49,10 +49,9 @@ def post_slack_msg():
         f' and s_branch:"{args.branch}"\'))'
     )
     dashboard_link = f"{base}?_g={quote(g)}&_a={quote(a)}"
-    hasNewDependencyReported = False
-    dependencyReport = f"New TRTLLM dependency found from nightly scanning ({args.branch} branch)\n"
-    if not hasNewDependencyReported:
-        return
+    dependencyReport = (
+        f"New risk found from nightly scanning ({args.branch} branch)\n{report_content}"
+    )
     slack_payload = {"report": dependencyReport, "dashboardUrl": dashboard_link}
     slack_resp = requests.post(SLACK_WEBHOOK_URL, json=slack_payload, timeout=60)
     slack_resp.raise_for_status()
@@ -90,15 +89,15 @@ if len(new_source_licenses) > 0:
 
 last_container_vulns = get_last_scan_results("container_vulnerability", args.branch)
 new_amd64_container_vulns = submit_container_vulns(
-    os.path.join(args.report_directory, "release_amd64_amd64/vulns.json"),
-    os.path.join(args.report_directory, "base_amd64_amd64/vulns.json"),
+    os.path.join(args.report_directory, "release_amd64/vulns.json"),
+    os.path.join(args.report_directory, "base_amd64/vulns.json"),
     "amd64",
     last_container_vulns,
     **SUBMIT_KWARG,
 )
 new_arm64_container_vulns = submit_container_vulns(
-    os.path.join(args.report_directory, "release_arm64_arm64/vulns.json"),
-    os.path.join(args.report_directory, "base_arm64_arm64/vulns.json"),
+    os.path.join(args.report_directory, "release_arm64/vulns.json"),
+    os.path.join(args.report_directory, "base_arm64/vulns.json"),
     "arm64",
     last_container_vulns,
     **SUBMIT_KWARG,
@@ -109,15 +108,15 @@ if count_container_vulns > 0:
 
 last_container_licneses = get_last_scan_results("container_license", args.branch)
 new_amd64_container_licenses = submit_container_licenses(
-    os.path.join(args.report_directory, "release_amd64_amd64/licenses.json"),
-    os.path.join(args.report_directory, "base_amd64_amd64/licenses.json"),
+    os.path.join(args.report_directory, "release_amd64/licenses.json"),
+    os.path.join(args.report_directory, "base_amd64/licenses.json"),
     "amd64",
     last_container_licneses,
     **SUBMIT_KWARG,
 )
 new_arm64_container_licenses = submit_container_licenses(
-    os.path.join(args.report_directory, "release_arm64_arm64/licenses.json"),
-    os.path.join(args.report_directory, "base_arm64_arm64/licenses.json"),
+    os.path.join(args.report_directory, "release_arm64/licenses.json"),
+    os.path.join(args.report_directory, "base_arm64/licenses.json"),
     "arm64",
     last_container_licneses,
     **SUBMIT_KWARG,
@@ -127,6 +126,4 @@ if count_container_licenses > 0:
     NEW_RISKY_DEPENDENCIES.append(f"{count_container_licenses} new container unpermissive license")
 
 if NEW_RISKY_DEPENDENCIES:
-    print(",".join(NEW_RISKY_DEPENDENCIES))
-else:
-    print("All Good")
+    post_slack_msg(", ".join(NEW_RISKY_DEPENDENCIES))

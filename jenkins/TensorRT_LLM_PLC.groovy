@@ -218,9 +218,9 @@ def pulseScanSourceCode(llmRepo, branchName) {
         sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
         sh "cat sbom_toupload.json"
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
-            def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc/posting"
+            def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-scan/posting"
             def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
-            def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc"
+            def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
             withEnv([
@@ -243,7 +243,8 @@ def processContainerScanResults(branchName) {
     container("cpu") {
         def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc/posting"
         def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
-        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc"
+        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
+        def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
         def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
         def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
@@ -251,6 +252,7 @@ def processContainerScanResults(branchName) {
                 "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
                 "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                 "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
+                "TRTLLM_ES_INDEX_PREAPPROVED_BASE=${TRTLLM_ES_INDEX_PREAPPROVED_BASE}",
                 "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
             ]) {
                 sh """
@@ -369,26 +371,26 @@ pipeline {
         }
         stage('Run TRT-LLM PLC Jobs') {
             parallel {
-                //stage("Source Code OSS Scanning"){
-                    //stages {
-                        //stage("Generate Lock Files"){
-                            //steps
-                            //{
-                                //script {
-                                    //generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
-                                //}
-                            //}
-                        //}
-                        //stage("Run Pulse Scanning"){
-                            //steps
-                            //{
-                                //script {
-                                    //pulseScanSourceCode(env.LLM_REPO, env.BRANCH_NAME)
-                                //}
-                            //}
-                        //}
-                    //}
-                //}
+                stage("Source Code OSS Scanning"){
+                    stages {
+                        stage("Generate Lock Files"){
+                            steps
+                            {
+                                script {
+                                    generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                                }
+                            }
+                        }
+                        stage("Run Pulse Scanning"){
+                            steps
+                            {
+                                script {
+                                    pulseScanSourceCode(env.LLM_REPO, env.BRANCH_NAME)
+                                }
+                            }
+                        }
+                    }
+                }
                 stage("Container OSS Scanning"){
                     stages {
                         stage("Run Container Scanning"){
@@ -409,14 +411,14 @@ pipeline {
                         }
                     }
                 }
-                //stage("SonarQube Code Analysis"){
-                    //steps
-                    //{
-                        //script {
-                            //sonarScan()
-                        //}
-                    //}
-                //}
+                stage("SonarQube Code Analysis"){
+                    steps
+                    {
+                        script {
+                            sonarScan()
+                        }
+                    }
+                }
             }
         }
     } // stages
