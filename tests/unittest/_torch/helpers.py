@@ -59,18 +59,28 @@ def per_token_cast_to_fp8_e8m0(
 
 def per_block_cast_to_fp8_e8m0(
         x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, n = x.shape
-    x_padded = torch.zeros((align(m, 128), align(n, 128)),
+    assert x.dim() == 2 or x.dim() == 3
+    squeezed = x.dim() == 2
+    if squeezed:
+        x = x.unsqueeze(0)
+
+    g, m, n = x.shape
+    x_padded = torch.zeros((g, align(m, 128), align(n, 128)),
                            dtype=x.dtype,
                            device=x.device)
-    x_padded[:m, :n] = x
-    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
-    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    x_padded[:, :m, :n] = x
+    x_view = x_padded.view(g, -1, 128, x_padded.size(-1) // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=(2, 4), keepdim=True).clamp(1e-4)
     sf = ceil_to_ue8m0(x_amax / 448.0)
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
-        x_view.size(0), x_view.size(2))
+    x_scaled = x_scaled.view_as(x_padded)[:, :m, :n].contiguous()
+    sf = sf.view(x_view.size(0), x_view.size(1), x_view.size(3))
+
+    if squeezed:
+        x_scaled = x_scaled.squeeze(0)
+        sf = sf.squeeze(0)
+
+    return x_scaled, sf
 
 
 def calc_diff(x, y):

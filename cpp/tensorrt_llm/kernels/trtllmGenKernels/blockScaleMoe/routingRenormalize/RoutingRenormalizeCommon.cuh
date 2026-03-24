@@ -38,6 +38,8 @@ static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThread
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 
 static constexpr int BlockKernelMaxNumTokens = 4;
+static constexpr int DynBlockKernelMaxNumTokens = 16;
+static constexpr int DynBlockKernelMaxNumExperts = 512;
 
 template <typename DataType, typename InputType, int VecSize, int K, bool DoSoftmaxBeforeTopK>
 __forceinline__ __device__ void routingTopKExperts(cg::thread_block_tile<WarpSize> const& warp,

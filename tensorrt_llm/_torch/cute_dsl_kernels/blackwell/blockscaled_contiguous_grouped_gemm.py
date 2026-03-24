@@ -60,6 +60,143 @@ from .utils import (
 )
 
 
+def hooked_PersistentTileSchedulerParams_init(
+    self,
+    problem_shape_ntile_mnl: cute.Shape,
+    cluster_shape_mnk: cute.Shape,
+    swizzle_size: int = 1,
+    raster_along_m: bool = True,
+    *,
+    loc=None,
+    ip=None,
+):
+    if cluster_shape_mnk[2] != 1:
+        raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")
+    if swizzle_size < 1:
+        raise ValueError(f"expect swizzle_size >= 1, but get {swizzle_size}")
+
+    self.problem_shape_ntile_mnl = problem_shape_ntile_mnl
+    # cluster_shape_mnk is kept for reconstruction
+    self._cluster_shape_mnk = cluster_shape_mnk
+    self.cluster_shape_mn = cluster_shape_mnk[:2]
+    self.swizzle_size = swizzle_size
+    self._raster_along_m = raster_along_m
+    self._loc = loc
+
+    # Apply swizzle if swizzle_size > 1
+    if swizzle_size > 1:
+        problem_shape_ncluster_mnl = cute.round_up(
+            self.problem_layout_ncluster_mnl.shape,
+            (1, swizzle_size, 1) if raster_along_m else (swizzle_size, 1, 1),
+        )
+
+        if raster_along_m:
+            self.problem_layout_ncluster_mnl = cute.make_layout(
+                (
+                    problem_shape_ncluster_mnl[0],
+                    (swizzle_size, problem_shape_ncluster_mnl[1] // swizzle_size),
+                    problem_shape_ncluster_mnl[2],
+                ),
+                stride=(
+                    swizzle_size,
+                    (1, swizzle_size * problem_shape_ncluster_mnl[0]),
+                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
+                ),
+                loc=loc,
+                ip=ip,
+            )
+        else:
+            self.problem_layout_ncluster_mnl = cute.make_layout(
+                (
+                    (swizzle_size, problem_shape_ncluster_mnl[0] // swizzle_size),
+                    problem_shape_ncluster_mnl[1],
+                    problem_shape_ncluster_mnl[2],
+                ),
+                stride=(
+                    (1, swizzle_size * problem_shape_ncluster_mnl[1]),
+                    swizzle_size,
+                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
+                ),
+                loc=loc,
+                ip=ip,
+            )
+
+    # Create FastDivmod divisors (only when swizzle_size == 1 for correctness)
+    # FastDivmod assumes simple col-major/row-major layout, incompatible with swizzled layouts
+    if swizzle_size == 1:
+        problem_shape_ncluster_mnl = cute.ceil_div(
+            self.problem_shape_ntile_mnl, cluster_shape_mnk[:2], loc=loc, ip=ip
+        )
+        if raster_along_m:
+            self.problem_layout_ncluster_mnl = cute.make_layout(
+                problem_shape_ncluster_mnl,
+                stride=(
+                    1,
+                    problem_shape_ncluster_mnl[0],
+                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
+                ),
+                loc=loc,
+                ip=ip,
+            )
+        else:
+            self.problem_layout_ncluster_mnl = cute.make_layout(
+                problem_shape_ncluster_mnl,
+                stride=(
+                    problem_shape_ncluster_mnl[1],
+                    1,
+                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
+                ),
+                loc=loc,
+                ip=ip,
+            )
+        problem_layout_size = cute.size(self.problem_layout_ncluster_mnl, loc=loc, ip=ip)
+        cluster_count_m = self.problem_layout_ncluster_mnl.shape[0]
+        cluster_count_n = self.problem_layout_ncluster_mnl.shape[1]
+
+        # batch_fdd: Used to map linear_idx to work_unit_id (handles persistent scheduling)
+        self.batch_fdd = cute.fast_divmod_create_divisor(problem_layout_size, loc=loc, ip=ip)
+
+        # cluster_shape_m_fdd: Used to decode work_unit_id to cluster coordinates
+        self.cluster_shape_m_fdd = cute.fast_divmod_create_divisor(cluster_count_m, loc=loc, ip=ip)
+
+        # cluster_shape_n_fdd: Used for the second level decomposition
+        self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor(cluster_count_n, loc=loc, ip=ip)
+    else:
+        # FastDivmod not applicable with swizzling, set to None
+        self.batch_fdd = None
+        self.cluster_shape_m_fdd = None
+        self.cluster_shape_n_fdd = None
+
+
+def hooked_get_cluster_work_idx_with_fastdivmod(
+    self, current_work_linear_idx: cutlass.Int32, *, loc=None, ip=None
+) -> Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+    work_iteration, work_unit_id = divmod(current_work_linear_idx, self.params.batch_fdd)
+
+    if self.params._raster_along_m:
+        # raster_along_m=True means column major (m is fastest)
+        # First, get cluster_m using cluster_shape_m_fdd
+        cluster_n_batch, cluster_m = divmod(work_unit_id, self.params.cluster_shape_m_fdd)
+
+        # Then decode cluster_n_batch to get cluster_n and batch_l using FastDivmod
+        batch_l, cluster_n = divmod(cluster_n_batch, self.params.cluster_shape_n_fdd)
+    else:
+        # raster_along_m=False means row major (n is fastest)
+        # First, get cluster_n using cluster_shape_n_fdd
+        cluster_m_batch, cluster_n = divmod(work_unit_id, self.params.cluster_shape_n_fdd)
+
+        # Then decode cluster_m_batch to get cluster_m and batch_l using FastDivmod
+        batch_l, cluster_m = divmod(cluster_m_batch, self.params.cluster_shape_m_fdd)
+
+    return (cluster_m, cluster_n, batch_l)
+
+
+cutlass.utils.PersistentTileSchedulerParams.__init__ = hooked_PersistentTileSchedulerParams_init
+cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = (
+    hooked_get_cluster_work_idx_with_fastdivmod
+)
+
+
 class Sm100BlockScaledContiguousGroupedGemmKernel:
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -106,6 +243,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        raster_along_m: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -122,9 +260,12 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
+        :param raster_along_m: If True, raster along M dimension for tile scheduler.
+        :type raster_along_m: bool
         """
 
         self.sf_vec_size = sf_vec_size
+        self.raster_along_m = raster_along_m
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -535,7 +676,11 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
-            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
+            c,
+            self.cta_tile_shape_mnk,
+            self.cluster_shape_mn,
+            max_active_clusters,
+            self.raster_along_m,
         )
 
         self.buffer_align_bytes = 1024
@@ -998,34 +1143,68 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
 
             num_valid_tiles = num_non_exiting_tiles[0]
 
-            while work_tile.is_valid_tile:
-                cur_tile_coord = work_tile.tile_idx
-                mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
+            if cutlass.const_expr(self.raster_along_m):
+                while work_tile.is_valid_tile:
+                    cur_tile_coord = work_tile.tile_idx
+                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
 
-                expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
-                tile_idx = mma_tile_coord_m
+                    expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
+                    tile_idx = mma_tile_coord_m
 
-                if tile_idx < num_valid_tiles:
-                    tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                    with cute.arch.elect_one():
-                        sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
-                        sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
-                        sInfo[(2, tile_info_producer_state.index)] = expert_idx
-                        sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
-                            work_tile.is_valid_tile
+                    if tile_idx < num_valid_tiles:
+                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        with cute.arch.elect_one():
+                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
+                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
+                            sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                            sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
+                                work_tile.is_valid_tile
+                            )
+                            # fence view async shared
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
                         )
-                        # fence view async shared
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
 
-                    self.sched_sync_barrier.arrive_and_wait()
-                    tile_info_pipeline.producer_commit(tile_info_producer_state)
-                    tile_info_producer_state.advance()
+                        self.sched_sync_barrier.arrive_and_wait()
+                        tile_info_pipeline.producer_commit(tile_info_producer_state)
+                        tile_info_producer_state.advance()
 
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+            else:
+                is_continue = cutlass.Boolean(1)
+                while work_tile.is_valid_tile and is_continue:
+                    cur_tile_coord = work_tile.tile_idx
+                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
+
+                    expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
+                    tile_idx = mma_tile_coord_m
+
+                    if tile_idx < num_valid_tiles:
+                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        with cute.arch.elect_one():
+                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
+                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
+                            sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                            sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
+                                work_tile.is_valid_tile
+                            )
+                            # fence view async shared
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+
+                        self.sched_sync_barrier.arrive_and_wait()
+                        tile_info_pipeline.producer_commit(tile_info_producer_state)
+                        tile_info_producer_state.advance()
+
+                    else:
+                        is_continue = cutlass.Boolean(0)
+
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
             tile_info_pipeline.producer_acquire(tile_info_producer_state)
             with cute.arch.elect_one():
@@ -1949,6 +2128,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
+        raster_along_m: bool = False,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -1960,6 +2140,8 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
         :type max_active_clusters: cutlass.Constexpr
+        :param raster_along_m: If True, raster along M dimension for tile scheduler.
+        :type raster_along_m: bool
 
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
@@ -1971,7 +2153,9 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            num_ctas_mnl, cluster_shape_mnl, raster_along_m=raster_along_m
+        )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )

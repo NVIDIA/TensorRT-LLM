@@ -1908,6 +1908,9 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
             input, module.weight, weight_dtype, module.weight_scale,
             module.dtype)
 
+        if bias is not None:
+            output = output + bias
+
         return output
 
     def load_weight_scales(
@@ -2525,6 +2528,7 @@ class Linear(nn.Module):
                 f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
             )
             local_out_features = out_features // self.tp_size
+            reduce_output = False if self.mapping.enable_attention_dp else reduce_output
         else:
             assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
 
