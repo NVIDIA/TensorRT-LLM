@@ -1786,9 +1786,6 @@ class MLA(nn.Module):
             k_fp8 = k_fp8[:num_tokens, ...]
             k_scale = k_scale[:num_tokens, ...]
             weights = weights[:num_tokens, ...]
-            # Update the indexer k cache here (outside CUDA graph) because
-            # it accesses batch-specific metadata (slot_mapping_fp8/scale).
-            self.mqa.indexer._update_k_cache(k_fp8, k_scale, attn_metadata)
             topk_indices = self.mqa.indexer.sparse_attn_indexer(
                 attn_metadata,
                 q,  # only used for shape/device in buffer allocation
