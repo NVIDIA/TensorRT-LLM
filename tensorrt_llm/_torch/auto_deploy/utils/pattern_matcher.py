@@ -247,9 +247,9 @@ def _register_replacement_with_safe_insertion(
                 if len(match.nodes) == 1:
                     for replacement_node in match.replacement_graph.graph.nodes:
                         _transfer_meta(
-                            new_meta=replacement_node.meta,
-                            old_node=match.nodes[0],
-                            pass_name="replacement",
+                            replacement_node.meta,
+                            match.nodes[0],
+                            "replacement",
                         )
                 return True
             return False
