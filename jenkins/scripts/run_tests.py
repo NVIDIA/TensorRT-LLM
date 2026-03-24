@@ -85,12 +85,9 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
         # (same prefixes as slurm_run.sh and trtllm-llmapi-launch)
         mpi_prefixes = ("PMI", "PMIX", "MPI", "OMPI", "SLURM", "UCX")
         env_vars = {
-            k: v for k, v in os.environ.items()
-            if not any(k.startswith(p) for p in mpi_prefixes)
+            k: v for k, v in os.environ.items() if not any(k.startswith(p) for p in mpi_prefixes)
         }
-        collect_output_dir = os.path.join(
-            os.path.dirname(test_db_list), "collect_output"
-        )
+        collect_output_dir = os.path.join(os.path.dirname(test_db_list), "collect_output")
         os.makedirs(collect_output_dir, exist_ok=True)
         collect_cmd = (
             f"pytest --collect-only --splitting-algorithm least_duration "
@@ -149,7 +146,9 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
             if not trimmed:
                 continue
             # Handle test_unittests.py::test_unittests_v2[xxxx] pattern
-            if trimmed.startswith("test_unittests.py::test_unittests_v2[") and trimmed.endswith("]"):
+            if trimmed.startswith("test_unittests.py::test_unittests_v2[") and trimmed.endswith(
+                "]"
+            ):
                 start = trimmed.index("[") + 1
                 end = trimmed.rindex("]")
                 trimmed = trimmed[start:end]
@@ -278,8 +277,9 @@ def build_isolated_command(base_cmd, test_list, xml_path, csv_path):
 # ---------------------------------------------------------------------------
 # Rerun logic: replaces Groovy rerunFailedTests()
 # ---------------------------------------------------------------------------
-def check_and_rerun(result_xml, base_cmd, working_dir, output_dir, rerun_tag, fail_signatures,
-                    max_rerun_tests):
+def check_and_rerun(
+    result_xml, base_cmd, working_dir, output_dir, rerun_tag, fail_signatures, max_rerun_tests
+):
     """Analyze test failures and rerun eligible tests.
 
     Args:
@@ -318,13 +318,15 @@ def check_and_rerun(result_xml, base_cmd, working_dir, output_dir, rerun_tag, fa
     for times in [1, 2]:
         rerun_file = os.path.join(rerun_dir, f"rerun_{times}.txt")
         if os.path.exists(rerun_file):
-            lines = [l for l in Path(rerun_file).read_text().splitlines() if l.strip()]
+            lines = [line for line in Path(rerun_file).read_text().splitlines() if line.strip()]
             count = len(lines)
             print(f"Found {count} {rerun_tag} tests to rerun {times} time(s)")
             valid_count += count
 
     if valid_count > max_rerun_tests:
-        print(f"There are more than {max_rerun_tests} failed {rerun_tag} tests, skip the rerun step.")
+        print(
+            f"There are more than {max_rerun_tests} failed {rerun_tag} tests, skip the rerun step."
+        )
         return True, []
     elif valid_count == 0:
         print(f"No failed {rerun_tag} tests need to be rerun.")
@@ -366,8 +368,9 @@ def check_and_rerun(result_xml, base_cmd, working_dir, output_dir, rerun_tag, fa
 # ---------------------------------------------------------------------------
 # Regular test execution
 # ---------------------------------------------------------------------------
-def run_regular_tests(pytest_cmd, regular_list, working_dir, output_dir, stage_name,
-                      fail_signatures, max_rerun_tests):
+def run_regular_tests(
+    pytest_cmd, regular_list, working_dir, output_dir, stage_name, fail_signatures, max_rerun_tests
+):
     """Run regular tests and rerun failures if applicable.
 
     Args:
@@ -389,8 +392,13 @@ def run_regular_tests(pytest_cmd, regular_list, working_dir, output_dir, stage_n
 
     if rc != 0:
         is_rerun_failed, rerun_xmls = check_and_rerun(
-            result_xml, pytest_cmd, working_dir, output_dir, "regular",
-            fail_signatures, max_rerun_tests,
+            result_xml,
+            pytest_cmd,
+            working_dir,
+            output_dir,
+            "regular",
+            fail_signatures,
+            max_rerun_tests,
         )
         all_xml_files.extend(rerun_xmls)
         return is_rerun_failed, all_xml_files
@@ -401,8 +409,9 @@ def run_regular_tests(pytest_cmd, regular_list, working_dir, output_dir, stage_n
 # ---------------------------------------------------------------------------
 # Isolated test execution: replaces Groovy runIsolatedTests()
 # ---------------------------------------------------------------------------
-def run_isolated_tests(pytest_cmd, isolate_list, working_dir, output_dir, stage_name,
-                       fail_signatures, max_rerun_tests):
+def run_isolated_tests(
+    pytest_cmd, isolate_list, working_dir, output_dir, stage_name, fail_signatures, max_rerun_tests
+):
     """Run isolated tests one by one, rerunning each on failure.
 
     Args:
@@ -417,7 +426,9 @@ def run_isolated_tests(pytest_cmd, isolate_list, working_dir, output_dir, stage_
     Returns:
         Tuple of (rerun_failed: bool, all_xml_files: list of result XML paths).
     """
-    isolate_tests = [l.strip() for l in Path(isolate_list).read_text().splitlines() if l.strip()]
+    isolate_tests = [
+        line.strip() for line in Path(isolate_list).read_text().splitlines() if line.strip()
+    ]
     rerun_failed = False
     all_xml_files = []
 
@@ -438,8 +449,13 @@ def run_isolated_tests(pytest_cmd, isolate_list, working_dir, output_dir, stage_
         if rc != 0:
             try:
                 is_rerun_failed, rerun_xmls = check_and_rerun(
-                    xml_path, isolated_cmd, working_dir, output_dir, f"isolated_{i}",
-                    fail_signatures, max_rerun_tests,
+                    xml_path,
+                    isolated_cmd,
+                    working_dir,
+                    output_dir,
+                    f"isolated_{i}",
+                    fail_signatures,
+                    max_rerun_tests,
                 )
                 all_xml_files.extend(rerun_xmls)
                 if is_rerun_failed:
@@ -477,7 +493,9 @@ def merge_results(output_dir, stage_name, all_xml_files):
         if os.path.exists(xml_file):
             try:
                 content = Path(xml_file).read_text()
-                content = content.replace('testsuite name="pytest"', f'testsuite name="{stage_name}"')
+                content = content.replace(
+                    'testsuite name="pytest"', f'testsuite name="{stage_name}"'
+                )
                 Path(xml_file).write_text(content)
             except Exception as e:
                 print(f"Warning: Failed to fix testsuite name in {xml_file}: {e}")
@@ -589,13 +607,15 @@ def parse_args():
 
     # Run mode arguments
     parser.add_argument("--pytest-base-cmd", help="Base pytest command string")
-    parser.add_argument("--regular-test-list", help="Path to regular test list (if not using --render)")
-    parser.add_argument("--isolate-test-list", help="Path to isolate test list (if not using --render)")
+    parser.add_argument(
+        "--regular-test-list", help="Path to regular test list (if not using --render)"
+    )
+    parser.add_argument(
+        "--isolate-test-list", help="Path to isolate test list (if not using --render)"
+    )
     parser.add_argument("--stage-name", required=True, help="Name of the test stage")
     parser.add_argument("--output-dir", required=True, help="Output directory for the stage")
-    parser.add_argument(
-        "--working-dir", help="Working directory for pytest (defaults to cwd)"
-    )
+    parser.add_argument("--working-dir", help="Working directory for pytest (defaults to cwd)")
     parser.add_argument(
         "--fail-signatures",
         default="",
@@ -634,9 +654,13 @@ def main():
         )
     else:
         if regular_list and os.path.exists(regular_list):
-            regular_count = len([l for l in Path(regular_list).read_text().splitlines() if l.strip()])
+            regular_count = len(
+                [line for line in Path(regular_list).read_text().splitlines() if line.strip()]
+            )
         if isolate_list and os.path.exists(isolate_list):
-            isolate_count = len([l for l in Path(isolate_list).read_text().splitlines() if l.strip()])
+            isolate_count = len(
+                [line for line in Path(isolate_list).read_text().splitlines() if line.strip()]
+            )
 
     if not args.pytest_base_cmd:
         # Render-only mode: just output the lists and exit
@@ -660,8 +684,13 @@ def main():
         # Add --test-list to the base command for regular tests
         regular_cmd = f"{pytest_base_cmd} --test-list={regular_list}"
         failed, xml_files = run_regular_tests(
-            regular_cmd, regular_list, working_dir, output_dir, stage_name,
-            fail_signatures, max_rerun_tests,
+            regular_cmd,
+            regular_list,
+            working_dir,
+            output_dir,
+            stage_name,
+            fail_signatures,
+            max_rerun_tests,
         )
         rerun_failed = rerun_failed or failed
         all_xml_files.extend(xml_files)
@@ -672,12 +701,17 @@ def main():
 
     # Step 3: Run isolated tests
     if isolate_count > 0:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running {isolate_count} isolated tests")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         failed, xml_files = run_isolated_tests(
-            pytest_base_cmd, isolate_list, working_dir, output_dir, stage_name,
-            fail_signatures, max_rerun_tests,
+            pytest_base_cmd,
+            isolate_list,
+            working_dir,
+            output_dir,
+            stage_name,
+            fail_signatures,
+            max_rerun_tests,
         )
         rerun_failed = rerun_failed or failed
         all_xml_files.extend(xml_files)
