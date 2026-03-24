@@ -64,8 +64,9 @@ enum class NodeType : SizeType32
 {
     kCHATBOT = 0,
     kAGENT_CHATBOT = 1,
-    kAGENT_LATENCY = 2,
-    kAGENT_DEEP_RESEARCH = 3
+    kAGENT_DEEP_RESEARCH = 2,
+    kRESEARCHER = 3,
+    kMULTIROUND_CHAT = 4,
 };
 
 using AgentHierarchyVector = std::vector<std::pair<NodeType, SizeType32>>;
@@ -103,6 +104,16 @@ public:
         return NodeType::kCHATBOT;
     }
 
+    std::optional<NodeType> tryStringToNodeType(std::string const& typeStr) const
+    {
+        auto it = mStringToType.find(typeStr);
+        if (it != mStringToType.end())
+        {
+            return it->second;
+        }
+        return std::nullopt;
+    }
+
     std::shared_ptr<AgentTreeNode> createNode(NodeType type, SizeType32 level, std::shared_ptr<NodeParams> params) const
     {
         auto it = mCreators.find(type);
@@ -122,6 +133,11 @@ private:
 inline NodeType stringToNodeType(std::string const& typeStr)
 {
     return NodeFactory::instance().stringToNodeType(typeStr);
+}
+
+inline std::optional<NodeType> tryStringToNodeType(std::string const& typeStr)
+{
+    return NodeFactory::instance().tryStringToNodeType(typeStr);
 }
 
 inline std::vector<NodeType> convertAgentTypes(std::optional<std::vector<std::string>> const& agentTypes)
@@ -243,20 +259,30 @@ private:
     float mAgentRatio;
 };
 
-class AgentLatencyNode : public AgentTreeNode
+class AgentDeepResearchNode : public AgentTreeNode
 {
 public:
-    explicit AgentLatencyNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
+    explicit AgentDeepResearchNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
 
 protected:
     [[nodiscard]] RequestVector mergeNodesSequence(
         std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs) override;
 };
 
-class AgentDeepResearchNode : public AgentTreeNode
+class ResearcherNode : public AgentTreeNode
 {
 public:
-    explicit AgentDeepResearchNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
+    explicit ResearcherNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
+
+protected:
+    [[nodiscard]] RequestVector mergeNodesSequence(
+        std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs) override;
+};
+
+class MultiroundChatNode : public AgentTreeNode
+{
+public:
+    explicit MultiroundChatNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
 
 protected:
     [[nodiscard]] RequestVector mergeNodesSequence(
@@ -297,7 +323,7 @@ protected:
 [[nodiscard]] SizeType32 getNodeId(LlmRequestPtr const& request, SizeType32 level);
 
 // Auto-registration macro: call this in .cpp after all class definitions
-// Usage: REGISTER_NODE_TYPE(ChatbotNode, NodeType::kCHATBOT, "chatbot")
+// Usage: REGISTER_NODE_TYPE(ChatbotNode, NodeType::kCHATBOT, "Chatbot")
 #define REGISTER_NODE_TYPE(ClassName, EnumType, StringName)                                                            \
     namespace                                                                                                          \
     {                                                                                                                  \

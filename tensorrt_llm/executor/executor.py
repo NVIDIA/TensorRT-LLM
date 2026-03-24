@@ -78,6 +78,7 @@ class IterationResultQueue:
 
 
 class GenerationExecutor(ABC):
+    control_queue = None
 
     def __init__(self,
                  num_postprocess_workers: int = 0,

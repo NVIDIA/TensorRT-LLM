@@ -2147,23 +2147,25 @@ class PyExecutor:
             self.control_action_done.clear()
 
     def _sync_and_process_control_queue(self):
+        """Synchronize and process control queue items across all ranks.
+
+        Uses a two-phase broadcast: first broadcast the count (a single int),
+        then broadcast the actual requests only when count > 0.  This avoids
+        serializing and deserializing an empty Python list on every iteration.
         """
-        Synchronizes and processes control queue items across all ranks.
-
-        This method ensures that control queue items (like TruncateKVCacheRequest)
-        are broadcast from rank 0 to all other ranks, so that all ranks execute
-        the same control operations for consistency (e.g., KV cache truncation).
-
-        The control IPC queue is written to directly by the ControlPlaneServer
-        in the main process, bypassing the proxy/worker dispatch chain.
-        """
-        if self._control_ipc_queue is None:
-            return
-
         if self.dist.rank == 0:
-            control_requests = self._control_ipc_queue.drain()
+            if self._control_ipc_queue is not None:
+                control_requests = self._control_ipc_queue.drain()
+            else:
+                control_requests = []
+            count = len(control_requests)
         else:
             control_requests = None
+            count = 0
+
+        count = self.dist.broadcast(count, root=0)
+        if count == 0:
+            return
 
         control_requests = self.dist.broadcast(control_requests, root=0)
 

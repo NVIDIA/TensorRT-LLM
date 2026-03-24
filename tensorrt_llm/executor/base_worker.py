@@ -258,6 +258,10 @@ class BaseWorker(GenerationExecutor):
         ) if self.llm_args is not None else _create_engine(
             self._executor_config)
 
+        if hasattr(self.engine, 'set_control_ipc_queue'):
+            self.control_queue = IntraProcessQueue()
+            self.engine.set_control_ipc_queue(self.control_queue)
+
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None

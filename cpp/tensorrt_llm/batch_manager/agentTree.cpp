@@ -69,8 +69,13 @@ void AgentTreeNode::insertRequest(LlmRequestPtr const& request)
         NodeType nodeType = getNodeType(request, nextLevel);
 
         auto it = mTypeToChild.find(nodeType);
-        TLLM_CHECK_WITH_INFO(it != mTypeToChild.end(), "Node type %d not found in children at level %d",
-            static_cast<SizeType32>(nodeType), nextLevel);
+        if (it == mTypeToChild.end())
+        {
+            TLLM_LOG_WARNING("Node type %d not found in children at level %d — routing to Chatbot",
+                static_cast<SizeType32>(nodeType), nextLevel);
+            it = mTypeToChild.find(NodeType::kCHATBOT);
+            TLLM_CHECK_WITH_INFO(it != mTypeToChild.end(), "Chatbot fallback node not found at level %d", nextLevel);
+        }
 
         it->second->insertRequest(request);
     }
@@ -174,9 +179,10 @@ RequestVector AgentChatbotNode::mergeRequestsByReqId(std::vector<RequestVector c
             --activeVectors;
             if (activeVectors == 1 && !pq.empty())
             {
-                auto [reqId, listIdx, itemIdx, req] = pq.top();
-                auto const* lastVec = nonEmptyVectors[listIdx];
-                result.insert(result.end(), lastVec->begin() + itemIdx, lastVec->end());
+                auto [lastReqId, lastListIdx, lastItemIdx, lastReq] = pq.top();
+                auto const* lastVec = nonEmptyVectors[lastListIdx];
+                result.insert(result.end(), lastVec->begin() + lastItemIdx, lastVec->end());
+                break;
             }
         }
     }
@@ -235,24 +241,6 @@ RequestVector AgentChatbotNode::mergeNodesSequence(
     return mixRequestsByRatio(agentReqs, chatbotReqs, mAgentRatio);
 }
 
-AgentLatencyNode::AgentLatencyNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams)
-    : AgentTreeNode(level, nodeParams)
-{
-}
-
-RequestVector AgentLatencyNode::mergeNodesSequence(
-    std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs)
-{
-    TLLM_CHECK_WITH_INFO(typeToChildReqs.empty(), "AgentLatencyNode should not have child nodes");
-
-    RequestVector allReqs = reqs;
-
-    std::sort(allReqs.begin(), allReqs.end(),
-        [this](LlmRequestPtr const& a, LlmRequestPtr const& b) { return getNodeId(a, mLevel) < getNodeId(b, mLevel); });
-
-    return allReqs;
-}
-
 AgentDeepResearchNode::AgentDeepResearchNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams)
     : AgentTreeNode(level, nodeParams)
 {
@@ -262,6 +250,40 @@ RequestVector AgentDeepResearchNode::mergeNodesSequence(
     std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs)
 {
     TLLM_CHECK_WITH_INFO(typeToChildReqs.empty(), "AgentDeepResearchNode should not have child nodes");
+    RequestVector allReqs = reqs;
+
+    std::sort(allReqs.begin(), allReqs.end(),
+        [this](LlmRequestPtr const& a, LlmRequestPtr const& b) { return getNodeId(a, mLevel) < getNodeId(b, mLevel); });
+
+    return allReqs;
+}
+
+ResearcherNode::ResearcherNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams)
+    : AgentTreeNode(level, nodeParams)
+{
+}
+
+RequestVector ResearcherNode::mergeNodesSequence(
+    std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs)
+{
+    TLLM_CHECK_WITH_INFO(typeToChildReqs.empty(), "ResearcherNode should not have child nodes");
+    RequestVector allReqs = reqs;
+
+    std::sort(allReqs.begin(), allReqs.end(),
+        [this](LlmRequestPtr const& a, LlmRequestPtr const& b) { return getNodeId(a, mLevel) < getNodeId(b, mLevel); });
+
+    return allReqs;
+}
+
+MultiroundChatNode::MultiroundChatNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams)
+    : AgentTreeNode(level, nodeParams)
+{
+}
+
+RequestVector MultiroundChatNode::mergeNodesSequence(
+    std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs)
+{
+    TLLM_CHECK_WITH_INFO(typeToChildReqs.empty(), "MultiroundChatNode should not have child nodes");
     RequestVector allReqs = reqs;
 
     std::sort(allReqs.begin(), allReqs.end(),
@@ -350,7 +372,14 @@ NodeType getNodeType(LlmRequestPtr const& request, SizeType32 level)
     auto const& agentHierarchyRaw = request->getAgentHierarchy();
     TLLM_CHECK_WITH_INFO(agentHierarchyRaw.has_value(), "Request must have agent hierarchy");
 
-    return stringToNodeType(std::get<0>(agentHierarchyRaw->at(level)));
+    auto const& typeStr = std::get<0>(agentHierarchyRaw->at(level));
+    auto nodeType = tryStringToNodeType(typeStr);
+    if (!nodeType.has_value())
+    {
+        TLLM_LOG_WARNING("Unknown agent hierarchy name '%s' at level %d — treating as Chatbot", typeStr.c_str(), level);
+        return NodeType::kCHATBOT;
+    }
+    return nodeType.value();
 }
 
 SizeType32 getNodeId(LlmRequestPtr const& request, SizeType32 level)
@@ -373,10 +402,12 @@ SizeType32 getLevelNum(LlmRequestPtr const& request)
 
 // Register all node types - uses AgentTreeNode::createInstance<T> automatically
 // To add a new node type: just add one line here!
-REGISTER_NODE_TYPE(ChatbotNode, NodeType::kCHATBOT, "chatbot")
-REGISTER_NODE_TYPE(AgentChatbotNode, NodeType::kAGENT_CHATBOT, "agent_chatbot")
-REGISTER_NODE_TYPE(AgentLatencyNode, NodeType::kAGENT_LATENCY, "agent_latency")
-REGISTER_NODE_TYPE(AgentDeepResearchNode, NodeType::kAGENT_DEEP_RESEARCH, "agent_deep_research")
+// NOTE: registration names use UpperCamelCase, matching the Python @sub_request_node() convention.
+REGISTER_NODE_TYPE(ChatbotNode, NodeType::kCHATBOT, "Chatbot")
+REGISTER_NODE_TYPE(AgentChatbotNode, NodeType::kAGENT_CHATBOT, "AgentChatbot")
+REGISTER_NODE_TYPE(AgentDeepResearchNode, NodeType::kAGENT_DEEP_RESEARCH, "AgentDeepResearch")
+REGISTER_NODE_TYPE(ResearcherNode, NodeType::kRESEARCHER, "Researcher")
+REGISTER_NODE_TYPE(MultiroundChatNode, NodeType::kMULTIROUND_CHAT, "MultiroundChat")
 
 AgentTreePolicy::AgentTreePolicy(std::optional<batch_scheduler::AgentTreeConfig> agentTreeConfig)
     : mAgentTreeConfig(std::move(agentTreeConfig))

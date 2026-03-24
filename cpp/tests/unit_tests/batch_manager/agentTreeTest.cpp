@@ -67,24 +67,17 @@ protected:
             false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, agentHierarchy);
     }
 
-    LlmRequestPtr createAgentLatencyRequest(SizeType32 nodeId, SizeType32 requestId)
-    {
-        std::vector<std::tuple<std::string, int>> agentHierarchy;
-        agentHierarchy.emplace_back("agent_latency", nodeId);
-        return createRequestWithHierarchy(requestId, std::make_optional(std::move(agentHierarchy)));
-    }
-
     LlmRequestPtr createAgentDeepResearchRequest(SizeType32 nodeId, SizeType32 requestId)
     {
         std::vector<std::tuple<std::string, int>> agentHierarchy;
-        agentHierarchy.emplace_back("agent_deep_research", nodeId);
+        agentHierarchy.emplace_back("AgentDeepResearch", nodeId);
         return createRequestWithHierarchy(requestId, std::make_optional(std::move(agentHierarchy)));
     }
 
     LlmRequestPtr createChatbotRequest(SizeType32 nodeId, SizeType32 requestId)
     {
         std::vector<std::tuple<std::string, int>> agentHierarchy;
-        agentHierarchy.emplace_back("chatbot", nodeId);
+        agentHierarchy.emplace_back("Chatbot", nodeId);
         return createRequestWithHierarchy(requestId, std::make_optional(std::move(agentHierarchy)));
     }
 
@@ -108,7 +101,7 @@ protected:
         {
             SizeType32 nodeId = i;
             SizeType32 requestId = getRandomNodeId();
-            requests.push_back(createAgentLatencyRequest(nodeId, requestId));
+            requests.push_back(createAgentDeepResearchRequest(nodeId, requestId));
         }
 
         for (SizeType32 i = 0; i < chatbotReqNum; ++i)
@@ -153,7 +146,7 @@ protected:
         {
             auto const& req = sortedReqs[i];
             auto nodeType = tbat::getNodeType(req, 0);
-            if (nodeType == tbat::NodeType::kAGENT_LATENCY)
+            if (nodeType == tbat::NodeType::kAGENT_DEEP_RESEARCH)
             {
                 agentCount++;
             }
@@ -172,7 +165,7 @@ protected:
         for (auto const& req : sortedReqs)
         {
             auto nodeType = tbat::getNodeType(req, 0);
-            if (nodeType == tbat::NodeType::kAGENT_LATENCY)
+            if (nodeType == tbat::NodeType::kAGENT_DEEP_RESEARCH)
             {
                 SizeType32 nodeId = tbat::getNodeId(req, 0);
                 agentNodeIds.push_back(nodeId);
@@ -192,7 +185,7 @@ TEST_F(AgentTreeTest, AgentChatbotNodeBasic)
     SizeType32 agentReqNum = 100;
     SizeType32 chatbotReqNum = 100;
 
-    auto agentTypes = std::make_optional<std::vector<std::string>>({"agent_latency"});
+    auto agentTypes = std::make_optional<std::vector<std::string>>({"AgentDeepResearch"});
     auto requests = createAgentChatbotRequests(agentReqNum, chatbotReqNum);
     auto sortedReqs = sortByAgentTree(agentRatio, agentTypes, requests);
 
@@ -203,7 +196,7 @@ TEST_F(AgentTreeTest, AgentChatbotNodeBasic)
 TEST_F(AgentTreeTest, EmptyRequestList)
 {
     float agentRatio = 0.7f;
-    auto agentTypes = std::make_optional<std::vector<std::string>>({"agent_latency"});
+    auto agentTypes = std::make_optional<std::vector<std::string>>({"AgentDeepResearch"});
 
     RequestVector emptyRequests;
     auto sortedReqs = sortByAgentTree(agentRatio, agentTypes, emptyRequests);
@@ -217,11 +210,11 @@ TEST_F(AgentTreeTest, RequestWithoutAgentHierarchy)
 
     EXPECT_FALSE(reqWithoutHierarchy->getAgentHierarchy().has_value()) << "Request should not have agent_hierarchy";
 
-    auto agentReq1 = createAgentLatencyRequest(1, 1);
-    auto agentReq2 = createAgentLatencyRequest(2, 2);
+    auto agentReq1 = createAgentDeepResearchRequest(1, 1);
+    auto agentReq2 = createAgentDeepResearchRequest(2, 2);
     auto chatbotReq = createChatbotRequest(3, 3);
 
-    auto agentTypes = std::make_optional<std::vector<std::string>>({"agent_latency"});
+    auto agentTypes = std::make_optional<std::vector<std::string>>({"AgentDeepResearch"});
     RequestVector requests = {reqWithoutHierarchy, agentReq1, chatbotReq, agentReq2};
 
     auto sortedReqs = sortByAgentTree(0.5f, agentTypes, requests);
@@ -265,8 +258,8 @@ TEST_F(AgentTreeTest, NulloptAgentTypes)
 
 TEST_F(AgentTreeTest, AgentDeepResearchNodeBasic)
 {
-    // Test that AgentDeepResearchNode inherits AgentLatencyNode behavior correctly
-    auto agentTypes = std::make_optional<std::vector<std::string>>({"agent_deep_research"});
+    // Test that AgentDeepResearchNode sorts requests by node ID
+    auto agentTypes = std::make_optional<std::vector<std::string>>({"AgentDeepResearch"});
 
     // Create deep research requests with ascending node IDs
     RequestVector requests;
@@ -280,7 +273,7 @@ TEST_F(AgentTreeTest, AgentDeepResearchNodeBasic)
     // Verify all requests are returned
     EXPECT_EQ(sortedReqs.size(), requests.size());
 
-    // Verify node IDs are sorted (inherited from AgentLatencyNode)
+    // Verify node IDs are sorted in ascending order
     std::vector<SizeType32> nodeIds;
     for (auto const& req : sortedReqs)
     {
@@ -293,4 +286,35 @@ TEST_F(AgentTreeTest, AgentDeepResearchNodeBasic)
 
     bool isSorted = std::is_sorted(nodeIds.begin(), nodeIds.end());
     EXPECT_TRUE(isSorted) << "Deep research node IDs should be sorted in ascending order";
+}
+
+TEST_F(AgentTreeTest, UnknownNodeTypeFallsBackToChatbot)
+{
+    // getNodeType should return kCHATBOT for unregistered names (no crash)
+    std::vector<std::tuple<std::string, int>> hierarchy;
+    hierarchy.emplace_back("SomeUnregisteredController", 42);
+    auto req = createRequestWithHierarchy(1, std::make_optional(std::move(hierarchy)));
+
+    auto nodeType = tbat::getNodeType(req, 0);
+    EXPECT_EQ(nodeType, tbat::NodeType::kCHATBOT) << "Unknown name should fall back to kCHATBOT";
+}
+
+TEST_F(AgentTreeTest, UnknownNodeTypeRoutedAsChatbotInTree)
+{
+    // Requests with unregistered agent names should be routed to the Chatbot
+    // child instead of crashing.
+    auto agentTypes = std::make_optional<std::vector<std::string>>({"AgentDeepResearch"});
+
+    auto knownReq = createAgentDeepResearchRequest(0, 100);
+
+    std::vector<std::tuple<std::string, int>> unknownHierarchy;
+    unknownHierarchy.emplace_back("FancyNewAgent", 1);
+    auto unknownReq = createRequestWithHierarchy(200, std::make_optional(std::move(unknownHierarchy)));
+
+    auto chatbotReq = createChatbotRequest(2, 300);
+
+    RequestVector requests = {knownReq, unknownReq, chatbotReq};
+    auto sortedReqs = sortByAgentTree(0.5f, agentTypes, requests);
+
+    EXPECT_EQ(sortedReqs.size(), requests.size()) << "All requests should be returned";
 }

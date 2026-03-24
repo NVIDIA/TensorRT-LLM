@@ -694,7 +694,7 @@ class MultiroundChatWorker(Worker):
     enable_print=False,
     capture_messages=False,
 )
-@sub_request_node("multiround_chat", is_top_level=True)
+@sub_request_node("MultiroundChat", is_top_level=True)
 class MultiroundChatController(Controller):
     """Controller for multi-turn chat conversations."""
 

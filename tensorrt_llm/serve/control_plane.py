@@ -77,7 +77,7 @@ class ControlPlaneServer:
         """Convert chat messages to token IDs via chat template + tokenization."""
         conversation: List[ConversationMessage] = []
         conversation, _, __ = parse_chat_messages_coroutines(messages, self.model_config, None)
-        prompt: str = apply_chat_template(
+        return apply_chat_template(
             model_type=self.model_config.model_type,
             tokenizer=self.tokenizer,
             processor=self.processor,
@@ -87,9 +87,9 @@ class ControlPlaneServer:
             tools=tool_dicts,
             documents=documents,
             chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs or {},
+            enable_tokenize=True,
         )
-        return self.tokenizer.tokenizer.encode(prompt, add_special_tokens=False)
 
     async def _truncate_kv_cache(self, request: KVCacheTruncateRequest) -> Response:
         try:
@@ -144,10 +144,22 @@ class ControlPlaneServer:
             if request.tools:
                 tools_dict = [tool.model_dump() for tool in request.tools]
 
+            from tensorrt_llm.serve.harmony_adapter import maybe_transform_reasoning_effort
+
+            reasoning_effort = maybe_transform_reasoning_effort(request.reasoning_effort)
+
             messages_to_retain = self._harmony_adapter.openai_to_harmony_tokens(
-                request.messages_to_retain, tools_dict
+                request.messages_to_retain,
+                tools_dict,
+                reasoning_effort=reasoning_effort,
+                tool_choice=request.tool_choice,
             )
-            messages = self._harmony_adapter.openai_to_harmony_tokens(request.messages, tools_dict)
+            messages = self._harmony_adapter.openai_to_harmony_tokens(
+                request.messages,
+                tools_dict,
+                reasoning_effort=reasoning_effort,
+                tool_choice=request.tool_choice,
+            )
 
             self.control_queue.put(
                 TruncateKVCacheRequest(

@@ -6,7 +6,7 @@ client = OpenAI(
 )
 
 # Test different agent types
-agent_types = ["agent_deep_research", "chatbot"]
+agent_types = ["AgentDeepResearch", "Chatbot"]
 question = "Where is New York?"
 node_id = 1
 

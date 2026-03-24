@@ -875,6 +875,8 @@ class KVCacheTruncateRequest(OpenAIBaseModel):
     documents: Optional[list] = None
     chat_template: Optional[str] = None
     chat_template_kwargs: Optional[dict] = None
+    reasoning_effort: Optional[str] = None
+    tool_choice: Optional[str] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,

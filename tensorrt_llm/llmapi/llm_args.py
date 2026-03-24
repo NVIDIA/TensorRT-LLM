@@ -2189,7 +2189,8 @@ class AgentTreeConfig(StrictBaseModel, PybindMirror):
     agent_types: Optional[List[str]] = Field(
         default=None,
         description=
-        "Types of agents to schedule. Now Only Support DeepResearchAgent.")
+        "Types of agents to schedule (e.g. 'AgentDeepResearch', 'Researcher', 'MultiroundChat')."
+    )
     agent_inflight_seq_num: int = Field(
         default=2**31 - 1,
         description="Max number of inflight sequences for agent requests.")

@@ -57,7 +57,7 @@ class SupervisorTask(Task):
         return task
 
 
-@sub_request_node("agent_deep_research", is_top_level=True)
+@sub_request_node("AgentDeepResearch", is_top_level=True)
 @drop_kv_cache_scope()
 class Supervisor(Controller):
     tools = [conduct_research_tool, complete_research_tool, think_tool]
