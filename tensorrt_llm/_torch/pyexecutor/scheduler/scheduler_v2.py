@@ -283,7 +283,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req_state_value == self._encoder_init_state_value
                 or req_state_value == self._context_init_state_value
             ):
-                # Always defer to phase 2.
+                # Defer to phase 2 so gen PEFT budget is settled first.
                 pending_ctx.append(req)
                 req_it += 1
                 continue
@@ -291,12 +291,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             else:
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
-                    # V1 parity: never reject gen requests for PEFT budget.
-                    # Gen adapters were loaded during their context phase
-                    # and remain on device.  The phase-2 budget guard on
-                    # context requests ensures conflicting adapters cannot
-                    # enter gen simultaneously.
-                    peft_pages = 0
+                    break
                 action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
                     req,
                     budget,
