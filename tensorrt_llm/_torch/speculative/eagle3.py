@@ -477,20 +477,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
-        if not self.is_mtp_eagle:
-            batch_size = attn_metadata.num_seqs
-            self._saved_kv_lens_cuda = (
-                attn_metadata.kv_lens_cuda[:batch_size].clone() if hasattr(
-                    attn_metadata, 'kv_lens_cuda') else None)
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
-        if not self.is_mtp_eagle and self._saved_kv_lens_cuda is not None:
-            # Eagle3: restore the saved kv_lens_cuda
-            batch_size = self._saved_kv_lens_cuda.shape[0]
-            attn_metadata.kv_lens_cuda[:batch_size].copy_(
-                self._saved_kv_lens_cuda)
-            self._saved_kv_lens_cuda = None
+
+    def _prepare_flash_mla_generation_layout(self, attn_metadata, num_contexts,
+                                             batch_size):
+        if num_contexts <= 0 or not attn_metadata.enable_flash_mla:
+            return
+        reorder_block_ids_per_seq = torch.cat([
+            attn_metadata.kv_block_ids_per_seq[num_contexts:batch_size],
+            attn_metadata.kv_block_ids_per_seq[:num_contexts]
+        ])
+        attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+            reorder_block_ids_per_seq, non_blocking=True)
 
     def sample_and_accept_draft_tokens(
         self,
@@ -874,26 +874,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                             num_accepted_tokens[num_contexts:])
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
 
-                    if self.is_mtp_eagle:
-                        if has_kv_cache and num_contexts > 0 and \
-                                attn_metadata.enable_flash_mla:
-                            reorder_block_ids_per_seq = torch.cat([
-                                attn_metadata.
-                                kv_block_ids_per_seq[num_contexts:batch_size],
-                                attn_metadata.
-                                kv_block_ids_per_seq[:num_contexts]
-                            ])
-                            attn_metadata.block_ids_per_seq[:batch_size, :]\
-                                .copy_(reorder_block_ids_per_seq,
-                                       non_blocking=True)
+                    if has_kv_cache:
+                        self._prepare_flash_mla_generation_layout(
+                            attn_metadata, num_contexts, batch_size)
+                    if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.update_for_spec_dec()
 
                     attn_metadata.use_spec_decoding = False
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[:batch_size] += 1
-                    # MTP Eagle: additional metadata update for subsequent steps
-                    if self.is_mtp_eagle:
                         attn_metadata.update_for_spec_dec()
 
                 inputs = {
