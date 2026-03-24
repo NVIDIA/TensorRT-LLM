@@ -60,7 +60,6 @@ from torch.fx import Node
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from .....llmapi.llm_args import KvCacheConfig
@@ -120,6 +119,7 @@ class _TrtllmMLAPlanner:
     def __init__(self):
         self.workspace: Optional[torch.Tensor] = None
         self._per_layer_pool_ptrs: dict = {}
+        self.skip_attention: bool = False  # Set True during resize forward
         self.kv_cache_manager = None  # Set externally after cache init
         self.host_pool_mapping: Optional[torch.Tensor] = None
         self.host_request_types: Optional[torch.Tensor] = None
@@ -166,14 +166,20 @@ class _TrtllmMLAPlanner:
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
         v_head_dim: int,
+        *,
+        for_context: bool = False,
     ) -> TrtllmAttentionWrapper:
         """Return a cached TrtllmAttentionWrapper for this layer, creating if needed.
 
-        Uses the same wrapper class as the PT backend so that plan()/run()
-        correctly initializes C++ AttentionOp internal state (workspace,
-        cuBLAS handles, tile scheduling) before every attention call.
+        The PT backend creates TWO wrappers per layer for MLA:
+        - **context** (self.mha): head_size=qk_head_dim, num_kv_heads=num_heads, v_head_dim=v_head_dim
+        - **decode** (self.mqa): head_size=kv_lora_rank+qk_rope_head_dim, num_kv_heads=1, v_head_dim=kv_lora_rank
+
+        Args:
+            for_context: If True, return context wrapper; if False, decode wrapper.
         """
-        w = self._attn_wrappers.get(layer_idx)
+        key = (layer_idx, for_context)
+        w = self._attn_wrappers.get(key)
         if w is not None:
             return w
 
@@ -184,31 +190,49 @@ class _TrtllmMLAPlanner:
             original_max_positions=4096,
         )
         pos_embd_params = PositionalEmbeddingParams(
-            type=PositionEmbeddingType.yarn,  # match PT backend
+            type=PositionEmbeddingType.yarn,
             rope=rope_params,
             is_neox=False,
         )
-        # q_lora_rank: PT backend uses hidden_size when config.q_lora_rank is None.
-        # Derive hidden_size from num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-        # which gives the same value as hidden_size for standard MLA configs.
         q_lora_rank = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-        mla_params = MLAParams(
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            qk_nope_head_dim=qk_nope_head_dim,
-            v_head_dim=kv_lora_rank,  # latent space (matches PT backend)
-        )
-        w = TrtllmAttentionWrapper(
-            num_heads=num_heads,
-            head_size=kv_lora_rank + qk_rope_head_dim,
-            num_kv_heads=1,
-            pos_embd_params=pos_embd_params,
-            q_scaling=1.0,
-            mla_params=mla_params,
-        )
-        w.update_quant_config()  # default quant_mode=0, updated below if FP8
-        self._attn_wrappers[layer_idx] = w
+
+        if for_context:
+            # Context wrapper: standard QKV dimensions (matches PT's self.mha)
+            mla_params = MLAParams(
+                q_lora_rank=q_lora_rank,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                qk_nope_head_dim=qk_nope_head_dim,
+                v_head_dim=v_head_dim,
+            )
+            w = TrtllmAttentionWrapper(
+                num_heads=num_heads,
+                head_size=qk_nope_head_dim + qk_rope_head_dim,
+                num_kv_heads=num_heads,
+                pos_embd_params=pos_embd_params,
+                q_scaling=1.0,
+                mla_params=mla_params,
+            )
+        else:
+            # Decode wrapper: latent dimensions (matches PT's self.mqa)
+            mla_params = MLAParams(
+                q_lora_rank=q_lora_rank,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                qk_nope_head_dim=qk_nope_head_dim,
+                v_head_dim=kv_lora_rank,
+            )
+            w = TrtllmAttentionWrapper(
+                num_heads=num_heads,
+                head_size=kv_lora_rank + qk_rope_head_dim,
+                num_kv_heads=1,
+                pos_embd_params=pos_embd_params,
+                q_scaling=1.0,
+                mla_params=mla_params,
+            )
+
+        w.update_quant_config()
+        self._attn_wrappers[key] = w
         return w
 
     def get_or_create_rotary_cos_sin(
@@ -762,83 +786,47 @@ def _handle_prefill_thop(
 
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    # During CUDA graph stream capture, skip prefill (can't capture data-dependent loops).
-    if torch.cuda.is_current_stream_capturing():
+    # Skip during CUDA graph capture or resize forward (estimation-mode cache too small).
+    if torch.cuda.is_current_stream_capturing() or _GlobalTrtllmMLAPlanner.skip_attention:
         return output
 
-    planner = _GlobalTrtllmMLAPlanner
-    wrapper = planner.get_or_create_wrapper(
-        layer_idx,
+    # Full-batch prefill using raw thop.attention with CONTEXT params:
+    # head_size=192 (qk_head_dim), num_kv_heads=32 (num_heads) — matching PT backend.
+    _call_thop_attention_mla(
+        q,
+        k,
+        v,
+        output,
+        latent_cache,
+        None,
+        False,
+        1,  # attention_input_type = context_only
         num_heads,
+        num_heads,  # num_kv_heads = num_heads for context (PT backend pattern)
+        qk_head_dim,  # head_size = 192 (not 576) for context
+        tokens_per_block,
+        max_num_requests,
+        max_context_length,
+        1.0,
+        quant_mode,
         kv_lora_rank,
         qk_nope_head_dim,
         qk_rope_head_dim,
         v_head_dim,
+        sequence_length,
+        context_lengths,
+        host_past_kv_lengths,
+        host_context_lengths,
+        host_request_types,
+        host_total_kv_lens,
+        kv_cache_block_offsets,
+        host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping,
+        position_embedding_type=position_embedding_type,
+        rotary_embedding_dim=rotary_embedding_dim,
+        rotary_cos_sin=rotary_cos_sin,
+        layer_idx=layer_idx,
     )
-
-    # Pinned single-sequence host tensors (allocated once, reused).
-    if not hasattr(planner, "_pfx_host_total_kv"):
-        planner._pfx_host_total_kv = torch.zeros(
-            2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
-        )
-        planner._pfx_host_req_type = torch.zeros(
-            1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
-        )
-
-    # Only iterate over prefill sequences (type==0); they precede decode in metadata.
-    num_prefill_seqs = int((host_request_types == 0).sum())
-
-    # Process each prefill sequence independently via plan()/run().
-    tok_offset = 0
-    for i in range(num_prefill_seqs):
-        seq_ctx_len = int(host_context_lengths[i])
-        if seq_ctx_len == 0:
-            continue
-
-        t0 = tok_offset
-        t1 = tok_offset + seq_ctx_len
-
-        planner._pfx_host_total_kv[0] = int(host_past_kv_lengths[i]) + seq_ctx_len
-        planner._pfx_host_total_kv[1] = 0
-
-        wrapper.plan(
-            layer_idx=layer_idx,
-            tokens_per_block=tokens_per_block,
-            max_num_requests=max_num_requests,
-            max_sequence_length=max_context_length,
-            max_context_length=max_context_length,
-            beam_width=1,
-            sequence_length=sequence_length[i : i + 1],
-            context_lengths=context_lengths[i : i + 1],
-            host_past_key_value_lengths=host_past_kv_lengths[i : i + 1],
-            host_total_kv_lens=planner._pfx_host_total_kv,
-            host_context_lengths=host_context_lengths[i : i + 1],
-            host_request_types=planner._pfx_host_req_type,
-            kv_cache_block_offsets=kv_cache_block_offsets[:, i : i + 1, :, :],
-            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-            block_ids_per_seq=planner.block_ids_per_seq[i : i + 1],
-            latent_cache=latent_cache[t0:t1].contiguous(),
-            workspace=planner.workspace,
-            use_paged_context_fmha=False,
-            attention_input_type=AttentionInputType.context_only,
-            chunked_prefill_buffer_batch_size=1,
-            kv_scale_orig_quant=planner.kv_scale_orig_quant,
-            kv_scale_quant_orig=planner.kv_scale_quant_orig,
-            kv_cache_manager=planner.kv_cache_manager,
-            quant_config=QuantConfig(),
-        )
-
-        wrapper.run(
-            q=q[t0:t1].contiguous(),
-            output=output[t0:t1],
-            k=k[t0:t1].contiguous(),
-            v=v[t0:t1].contiguous(),
-            is_fused_qkv=False,
-            update_kv_cache=True,
-        )
-
-        tok_offset = t1
 
     return output
 
@@ -987,6 +975,13 @@ def _handle_decode_impl(
     copies q_pe manually and zeros the scheduler counter.
     """
     planner = _GlobalTrtllmMLAPlanner
+
+    # Skip during resize forward (estimation-mode cache too small).
+    if planner.skip_attention:
+        return torch.zeros(
+            num_tokens, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device
+        )
+
     gen_head_size = kv_lora_rank + qk_rope_head_dim
 
     # Cast FP8 weights to compute dtype for BMM (FP8 checkpoints store kv_b_proj in FP8).
