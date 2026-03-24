@@ -37,25 +37,62 @@ class ScheduledRequests:
     - only context requests that are at the last chunk and generation requests sample new tokens.
     """
 
-    context_requests_chunking: RequestList
-    """Requests that are in the middle of the context phase."""
-    context_requests_last_chunk: RequestList
-    """Requests that are in the last chunk of the context phase."""
-    generation_requests: RequestList
-    """Requests that are in the generation phase."""
-    paused_requests: RequestList
-    """Requests that are paused."""
+    __slots__ = (
+        "_context_requests_chunking",
+        "_context_requests_last_chunk",
+        "_generation_requests",
+        "paused_requests",
+        "_cached_context_requests",
+        "_cached_all_requests",
+    )
 
     def __init__(self):
-        self.context_requests_chunking: RequestList = []
-        self.context_requests_last_chunk: RequestList = []
-        self.generation_requests: RequestList = []
+        self._context_requests_chunking: RequestList = []
+        self._context_requests_last_chunk: RequestList = []
+        self._generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self._cached_context_requests: RequestList | None = None
+        self._cached_all_requests: RequestList | None = None
+
+    @property
+    def context_requests_chunking(self) -> RequestList:
+        """Requests that are in the middle of the context phase."""
+        return self._context_requests_chunking
+
+    @context_requests_chunking.setter
+    def context_requests_chunking(self, value: RequestList) -> None:
+        self._context_requests_chunking = value
+        self._cached_context_requests = None
+        self._cached_all_requests = None
+
+    @property
+    def context_requests_last_chunk(self) -> RequestList:
+        """Requests that are in the last chunk of the context phase."""
+        return self._context_requests_last_chunk
+
+    @context_requests_last_chunk.setter
+    def context_requests_last_chunk(self, value: RequestList) -> None:
+        self._context_requests_last_chunk = value
+        self._cached_context_requests = None
+        self._cached_all_requests = None
+
+    @property
+    def generation_requests(self) -> RequestList:
+        return self._generation_requests
+
+    @generation_requests.setter
+    def generation_requests(self, value: RequestList) -> None:
+        self._generation_requests = value
+        self._cached_all_requests = None
+
+    def _invalidate_cache(self) -> None:
+        self._cached_context_requests = None
+        self._cached_all_requests = None
 
     @property
     def is_generation_only(self) -> bool:
         return self.num_context_requests == 0 and all(
-            len(req.draft_tokens) == 0 for req in self.generation_requests
+            len(req.draft_tokens) == 0 for req in self._generation_requests
         )
 
     @property
@@ -64,40 +101,53 @@ class ScheduledRequests:
 
     @property
     def batch_size(self) -> int:
-        return self.num_context_requests + len(self.generation_requests)
+        return self.num_context_requests + len(self._generation_requests)
 
     @property
     def num_context_requests(self) -> int:
-        return len(self.context_requests_chunking) + len(self.context_requests_last_chunk)
+        return len(self._context_requests_chunking) + len(self._context_requests_last_chunk)
 
     @property
     def num_generation_requests(self) -> int:
-        return len(self.generation_requests)
+        return len(self._generation_requests)
 
     @property
     def context_requests(self) -> RequestList:
-        return self.context_requests_chunking + self.context_requests_last_chunk
+        if self._cached_context_requests is None:
+            self._cached_context_requests = (
+                self._context_requests_chunking + self._context_requests_last_chunk
+            )
+        return self._cached_context_requests
 
     def all_requests(self) -> RequestList:
-        return self.context_requests + self.generation_requests
+        if self._cached_all_requests is None:
+            self._cached_all_requests = self.context_requests + self._generation_requests
+        return self._cached_all_requests
 
     def append_context_request(self, request: LlmRequest) -> None:
+        self._invalidate_cache()
         if request.is_last_context_chunk:
-            self.context_requests_last_chunk.append(request)
+            self._context_requests_last_chunk.append(request)
         else:
-            self.context_requests_chunking.append(request)
+            self._context_requests_chunking.append(request)
 
     def append_generation_request(self, request: LlmRequest) -> None:
-        self.generation_requests.append(request)
+        self._invalidate_cache()
+        self._generation_requests.append(request)
 
     def reset_context_requests(self, context_requests: RequestList | None = None) -> None:
         context_requests = (
             context_requests if context_requests is not None else self.context_requests
         )
-        self.context_requests_chunking = []
-        self.context_requests_last_chunk = []
+        self._invalidate_cache()
+        self._context_requests_chunking = []
+        self._context_requests_last_chunk = []
         for req in context_requests:
-            self.append_context_request(req)
+            # Use direct append to avoid repeated invalidation
+            if req.is_last_context_chunk:
+                self._context_requests_last_chunk.append(req)
+            else:
+                self._context_requests_chunking.append(req)
 
 
 class RequestScheduler(ABC):
