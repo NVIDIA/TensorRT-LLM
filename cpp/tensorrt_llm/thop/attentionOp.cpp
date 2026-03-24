@@ -308,7 +308,6 @@ public:
         int32_t const layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
             ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
             : 0;
-        // TLLM_LOG_INFO("pool_index: %d, layer_idx_in_cache_pool: %d", pool_index, layer_idx_in_cache_pool);
         KVBlockArray::DataType* block_offsets
             = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
                     ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()

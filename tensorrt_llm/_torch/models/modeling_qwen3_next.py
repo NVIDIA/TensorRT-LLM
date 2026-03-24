@@ -146,7 +146,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                    strategy=model_config.allreduce_strategy)
 
         self.aux_stream = aux_stream
-        self.layer_idx = layer_idx
 
         self.gate = Qwen3NextGate(
             hidden_size=self.hidden_dim,
@@ -237,7 +236,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 do_finalize=do_finalize,
             )
 
-            return router_logits, final_hidden_states
+            return final_hidden_states
 
         def _compute_shared_output():
             shared_expert_output = self.shared_expert(
@@ -248,7 +247,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 self.shared_expert_gate(hidden_states)) * shared_expert_output
             return shared_expert_output
 
-        routed_output, shared_expert_output = maybe_execute_in_parallel(
+        final_hidden_states, shared_expert_output = maybe_execute_in_parallel(
             _compute_routed_output,
             _compute_shared_output,
             self.event_dict[EventType.Main],
@@ -256,11 +255,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             self.aux_stream,
         )
         if not do_finalize:
-            return routed_output[0]
+            return final_hidden_states
 
-        router_logits, routed_output = routed_output
-
-        final_hidden_states = routed_output + shared_expert_output
+        final_hidden_states = final_hidden_states + shared_expert_output
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(
@@ -611,6 +608,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         a = kwargs["a"]
         b = kwargs["b"]
         cache_indices = kwargs["cache_indices"]
+
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -647,7 +645,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
-            layer_idx=self.layer_idx,
         )
 
         return core_attn_out
@@ -712,6 +709,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc).transpose(0, 1)
+
         key_split_dim = self.key_dim // self.attn_tp_size
         value_split_dim = self.value_dim // self.attn_tp_size
 
@@ -752,6 +750,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         last_recurrent_state = last_recurrent_state.to(ssm_states.dtype,
                                                        copy=False)
         ssm_states[cache_indices] = last_recurrent_state
+
         return core_attn_out
 
     def forward(
@@ -1095,6 +1094,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
+
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1105,6 +1105,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             lora_params=lora_params,
             **kwargs,
         )
+
         if self.fusion_config.PRE_MOE_FUSION and self.enable_attention_dp:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -1173,6 +1174,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
+
         return hidden_states, residual
 
 
@@ -1243,6 +1245,7 @@ class Qwen3NextModel(DecoderModel):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
+
         mamba_metadata = attn_metadata.mamba_metadata
         if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
             attn_metadata.mamba_metadata = Mamba2Metadata(

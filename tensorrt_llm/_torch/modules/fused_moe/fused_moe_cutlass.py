@@ -655,7 +655,6 @@ class CutlassFusedMoE(MoE):
             use_dp_padding: Optional[bool] = None,
             repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
-        self.layer_idx if self.layer_idx is not None else 0
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
         else:
@@ -929,7 +928,6 @@ class CutlassFusedMoE(MoE):
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
 
-        self.layer_idx if self.layer_idx is not None else 0
         if num_chunks == 1:
             is_first_call = self.repeat_idx == 0
             is_last_call = self.repeat_idx == self.repeat_count - 1

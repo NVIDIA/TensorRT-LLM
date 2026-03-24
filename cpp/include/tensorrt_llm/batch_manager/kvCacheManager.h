@@ -499,20 +499,6 @@ private:
     size_t mHash;
 };
 
-//! \brief Stream block id for trie printTree (e.g. Node prints mValue as block ids).
-inline std::ostream& operator<<(std::ostream& out, BlockPtr const& block)
-{
-    if (block)
-    {
-        out << block->getBlockId();
-    }
-    else
-    {
-        out << "null";
-    }
-    return out;
-}
-
 class KVCacheBlockSet
 {
 public:
@@ -1115,12 +1101,6 @@ public:
             tensorrt_llm::kernels::KVCacheIndex{
                 std::numeric_limits<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>::max()});
         mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize);
-    }
-
-    void printTree() const
-    {
-        std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-        mLookupTree->printTree();
     }
 
 private:
