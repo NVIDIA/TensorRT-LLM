@@ -123,10 +123,19 @@ class TxSessionBase(ABC):
         return self._base_args.params.disagg_request_id
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> concurrent.futures.Future:
-        """
-        Sends a slice of KV cache data and returns a Future for the transfer.
-        :param slice: The KV slice to send.
+    def send(self, slice: KVSlice, chunk_block_offset: int = 0) -> concurrent.futures.Future:
+        """Send a KV slice and return a Future for the transfer.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+            chunk_block_offset: Block offset into the receiver's full
+                destination block list for this chunk.  Used by
+                sender-side chunking to slice the receiver's
+                destination blocks correctly.  Defaults to 0
+                (monolithic transfer).
+
+        Returns:
+            A ``Future`` that resolves when the transfer completes.
         """
         ...
 

@@ -8,7 +8,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import msgpack
 import torch
@@ -162,16 +162,29 @@ class AuxSendTask(SendTaskBase):
 
 
 class KVSendTask(SendTaskBase):
+    """A per-slice send task within a TxSession.
+
+    Args:
+        kv_slice: The KV slice describing which blocks to transfer.
+        params: Disaggregated serving parameters for this request.
+        slice_id: Index of this slice within the session's task list.
+        chunk_block_offset: Block offset into the receiver's full
+            destination block list.  Used by sender-side chunking to
+            slice the receiver's destination blocks correctly.
+    """
+
     def __init__(
         self,
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
-    ):
+        chunk_block_offset: int = 0,
+    ) -> None:
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
+        self.chunk_block_offset = chunk_block_offset
 
 
 class Sender(SenderBase):
@@ -370,13 +383,17 @@ class Sender(SenderBase):
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
-        ## TODO: just last slice need to send task state?
+        # The receiver always has a single monolithic task (slice_id=0).
+        # Sender-side chunking is transparent to the receiver: only the
+        # last chunk carries is_last_slice=True so the receiver knows
+        # when all data has arrived.
+        receiver_slice_id = 0
         self._get_or_connect_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.KV_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
                 str(write_meta.unique_rid).encode("ascii"),
-                str(write_meta.slice_id).encode("ascii"),
+                str(receiver_slice_id).encode("ascii"),
                 str(write_meta.is_last_slice).encode("ascii"),
                 agent_result.value.encode("ascii"),
             ]
@@ -400,6 +417,22 @@ class Sender(SenderBase):
             else:
                 write_meta.task_future.set_result(AgentResult.SUCCESS)
                 task.status = TaskStatus.TRANSFERRED
+                if session._on_chunk_transferred is not None:
+                    try:
+                        num_blocks = max(
+                            (len(ids) for ids in task._slice.block_ids_per_layer_groups),
+                            default=0,
+                        )
+                        session._on_chunk_transferred(
+                            request_id=session.request_id,
+                            chunk_block_offset=task.chunk_block_offset,
+                            num_blocks=num_blocks,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"on_chunk_transferred callback failed for "
+                            f"request {session.request_id} slice {write_meta.slice_id}: {e}"
+                        )
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -488,9 +521,20 @@ class Sender(SenderBase):
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
             # Aggregate fragments from all matching pools
+            chunk_offset = task.chunk_block_offset
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
-                dst_block_ids = dst_block_ids_per_groups[peer_lg]
+                full_dst_block_ids = dst_block_ids_per_groups[peer_lg]
+
+                # When sender uses chunking, the receiver sends all dst
+                # blocks in a single RecvReqInfo.  Slice dst to match
+                # this task's src chunk position.
+                if chunk_offset > 0 or len(src_block_ids) < len(full_dst_block_ids):
+                    dst_block_ids = full_dst_block_ids[
+                        chunk_offset : chunk_offset + len(src_block_ids)
+                    ]
+                else:
+                    dst_block_ids = full_dst_block_ids
 
                 if len(src_block_ids) + 1 == len(dst_block_ids):
                     # FIXME: this is a temporary solution, need to be fixed for the draft tokens
@@ -743,6 +787,7 @@ class TxSession(TxSessionBase):
         sender: Sender,
         aux_slot: Optional[int],
         aux_buffer: Optional[AuxBuffer] = None,
+        on_chunk_transferred: Optional[Callable] = None,
     ):
         super().__init__(sender, SessionArgsBase(params))
         self._sender: Sender  # narrow base class type for Pylance
@@ -753,6 +798,7 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
+        self._on_chunk_transferred = on_chunk_transferred
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -775,11 +821,22 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
-    def send(self, slice: KVSlice) -> concurrent.futures.Future:
+    def send(self, slice: KVSlice, chunk_block_offset: int = 0) -> concurrent.futures.Future:
+        """Enqueue a KV slice for transfer and return a Future.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+            chunk_block_offset: Block offset into the receiver's full
+                destination block list for this chunk.
+
+        Returns:
+            A ``Future[AgentResult]`` that resolves when all peers have
+            completed the transfer for this slice.
+        """
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
-            task = KVSendTask(slice, params, slice_id)
+            task = KVSendTask(slice, params, slice_id, chunk_block_offset=chunk_block_offset)
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)
@@ -812,14 +869,25 @@ class TxSession(TxSessionBase):
         return self.status == SessionStatus.ERROR
 
     def wait_complete(self, need_aux: bool, timeout: float) -> WaitResult:
-        """Block until KV (and optionally aux) transfer finishes.
+        """Block until all KV slices (and optionally aux) transfer finish.
 
-        Returns WaitResult.COMPLETED, WaitResult.FAILED, or WaitResult.TIMEOUT.
+        Waits on every ``KVSendTask`` future in order.  The timeout
+        applies to each individual future, so the worst-case wall time
+        is ``timeout × len(kv_tasks)``.
+
+        Args:
+            need_aux: Whether to also wait for the aux task.
+            timeout: Per-task timeout in seconds.
+
+        Returns:
+            ``WaitResult.COMPLETED``, ``WaitResult.FAILED``, or
+            ``WaitResult.TIMEOUT``.
         """
         try:
-            kv_status = self.kv_tasks[0].future.result(timeout=timeout)
-            if kv_status != AgentResult.SUCCESS:
-                return WaitResult.FAILED
+            for task in self.kv_tasks:
+                kv_status = task.future.result(timeout=timeout)
+                if kv_status != AgentResult.SUCCESS:
+                    return WaitResult.FAILED
             if need_aux and self.aux_task is not None:
                 aux_status = self.aux_task.future.result(timeout=timeout)
                 if aux_status != AgentResult.SUCCESS:
@@ -1140,18 +1208,19 @@ class RxSession(RxSessionBase):
 
     @property
     def status(self) -> SessionStatus:
-        if self._exception is not None or (
-            self._kv_tasks and self._kv_tasks[0].status == TaskStatus.ERROR
-        ):
+        if self._exception is not None:
             return SessionStatus.ERROR
-        if self._kv_tasks:
-            task_status = self._kv_tasks[0].status
-            if task_status == TaskStatus.TRANSFERRED and self._aux_status == TaskStatus.TRANSFERRED:
+        if not self._kv_tasks:
+            return SessionStatus.INIT
+        if any(t.status == TaskStatus.ERROR for t in self._kv_tasks):
+            return SessionStatus.ERROR
+        all_transferred = all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks)
+        if all_transferred:
+            if self._aux_status == TaskStatus.TRANSFERRED:
                 return SessionStatus.FULLY_TRANSFERRED
-            if task_status == TaskStatus.TRANSFERRED:
-                return SessionStatus.KV_TRANSFERRED
-            if task_status == TaskStatus.TRANSFERRING:
-                return SessionStatus.TRANSFERRING
+            return SessionStatus.KV_TRANSFERRED
+        if any(t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks):
+            return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
     def mark_transferring(self, slice_id: int):
@@ -1203,14 +1272,30 @@ class RxSession(RxSessionBase):
                 f"Session {self.request_id} received unknown task status: {status.value}"
             )
 
-    def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
-        task = self._kv_tasks[0]  # TODO: index by slice_id when multi-slice is supported
+    def process_aux_agent_result(self, _peer_rank: int, status: AgentResult) -> None:
+        """Handle an incoming aux transfer result from a peer.
+
+        Aux transfer is independent of KV slice chunking.  The
+        expected transfer count is taken from the last KV task (all
+        tasks share the same value since it is per-session).
+
+        Args:
+            _peer_rank: The peer rank that sent the result (unused).
+            status: The transfer result from the peer.
+        """
+        if not self._kv_tasks:
+            logger.error(f"Session {self.request_id}: aux result with no KV tasks")
+            return
+        # Aux transfer is independent of KV slice chunking. Use the last
+        # task's expected_transfers (all tasks share the same value since it
+        # is determined per-session by the peer overlap).
+        expected = self._kv_tasks[-1].expected_transfers
         if status == AgentResult.SUCCESS:
             self._aux_count += 1
 
-            if self._aux_count == task.expected_transfers:
+            if self._aux_count == expected:
                 self._aux_status = TaskStatus.TRANSFERRED
-            elif self._aux_count > task.expected_transfers:
+            elif self._aux_count > expected:
                 self._aux_status = TaskStatus.ERROR
                 self._exception = RuntimeError(
                     f"Session {self.request_id} received too many aux transfers"
@@ -1248,17 +1333,28 @@ class RxSession(RxSessionBase):
         return self.status == SessionStatus.ERROR
 
     def wait_complete(self, need_aux: bool, block_for_aux: bool = False) -> Optional[WaitResult]:
-        """Block until KV transfer is done; optionally wait for aux too.
+        """Block until all KV tasks complete; optionally wait for aux.
 
-        With block_for_aux=False (default): returns None if KV is done but aux
-        is still in flight — caller should re-poll next cycle.
-        With block_for_aux=True: spins until aux also arrives (use for block_all).
-        Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error.
+        Waits on every ``KVRecvTask`` future in order.
+
+        Args:
+            need_aux: Whether aux data must also be received.
+            block_for_aux: If ``True``, spin-wait for aux after KV
+                completes.  If ``False`` (default), return ``None``
+                when KV is done but aux is still in flight so the
+                caller can re-poll next cycle.
+
+        Returns:
+            ``WaitResult.COMPLETED`` on full success,
+            ``WaitResult.FAILED`` on error, or ``None`` when KV is
+            done but aux is still pending (only when
+            ``block_for_aux=False``).
         """
         try:
-            kv_status = self._kv_tasks[0].future.result()
-            if kv_status != AgentResult.SUCCESS:
-                return WaitResult.FAILED
+            for task in self._kv_tasks:
+                kv_status = task.future.result()
+                if kv_status != AgentResult.SUCCESS:
+                    return WaitResult.FAILED
             if need_aux:
                 while True:
                     status = self.status
@@ -1427,9 +1523,22 @@ class TransferWorker:
         self._rank_info.sender_endpoints = endpoints
         self._rank_info.layer_num_per_pp = layer_num_per_pp
 
-    def create_tx_session(self, request: LlmRequest) -> TxSession:
-        """
-        Create a txSession for the request.
+    def create_tx_session(
+        self,
+        request: LlmRequest,
+        on_chunk_transferred: Optional[Callable] = None,
+    ) -> TxSession:
+        """Create a TxSession for the given request.
+
+        Args:
+            request: The LLM request to create a send session for.
+            on_chunk_transferred: Optional callback invoked on the
+                sender worker thread after each chunk's RDMA completes.
+                Signature: ``(request_id: int, chunk_block_offset: int,
+                num_blocks: int) -> None``.
+
+        Returns:
+            A new ``TxSession`` ready to accept ``send()`` calls.
         """
         if self._aux_buffer is not None:
             aux_slot = self._aux_buffer.alloc_slot().id
@@ -1443,6 +1552,7 @@ class TransferWorker:
             sender=self._sender,
             aux_slot=aux_slot,
             aux_buffer=self._aux_buffer,
+            on_chunk_transferred=on_chunk_transferred,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:

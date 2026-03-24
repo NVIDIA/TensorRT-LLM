@@ -1,7 +1,9 @@
+import math
+import queue
 import uuid
 from collections import defaultdict
 from itertools import chain
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -126,19 +128,33 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.page_table = self.transfer_worker.page_table
         # Check if using V2 manager (has kv_cache_map attribute)
         self.is_v2_manager = hasattr(self.kv_cache_manager, "kv_cache_map")
+        self.chunk_size_blocks = cache_transceiver_config.chunk_size_blocks
+        # Thread-safe queue for deferred prefix block releases.  The
+        # sender worker thread enqueues (request_id, num_blocks) after
+        # each chunk's RDMA completes; the main executor thread drains
+        # the queue during check_context_transfer_status.
+        self._pending_prefix_releases: queue.Queue[Tuple[int, int]] = queue.Queue()
 
     def shutdown(self):
         if self.transfer_worker is not None:
             self.transfer_worker.shutdown()
 
-    def _create_kv_slice(self, req: LlmRequest):
-        # Get block_ids for each layer group
+    def _collect_block_ids(self, req: LlmRequest) -> List[List[int]]:
+        """Collect all valid block IDs per layer group for a request.
+
+        Args:
+            req: The LLM request whose KV cache block IDs to collect.
+
+        Returns:
+            A list of block ID lists, one per layer group.  Each inner
+            list contains the physical block IDs for that layer group,
+            filtered for sliding-window relevance.
+        """
         block_ids_per_layer_groups: List[List[int]] = []
         tokens_per_block = self.kv_cache_manager.tokens_per_block
 
         for group_idx, lg in enumerate(self.page_table.layer_groups):
             if self.is_v2_manager:
-                # V2: Use get_aggregated_page_indices for efficient slot indices
                 group_id = group_idx
                 block_ids = list(
                     self.kv_cache_manager.kv_cache_map[
@@ -146,7 +162,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                     ].get_aggregated_page_indices(group_id, valid_only=True)
                 )
             else:
-                # V1: Use get_batch_cache_indices
                 first_global_layer_id = get_global_layer_ids(lg)[0]
                 block_ids = self.kv_cache_manager.get_batch_cache_indices(
                     [req.py_request_id], layer_idx=first_global_layer_id
@@ -172,27 +187,130 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
             block_ids_per_layer_groups.append(list(block_ids))
 
-        return KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_layer_groups)
+        return block_ids_per_layer_groups
+
+    def _create_kv_slices(self, req: LlmRequest) -> List[KVSlice]:
+        """Create one or more KVSlice objects for a request.
+
+        When ``chunk_size_blocks`` is ``None``, returns a single slice
+        covering all blocks (backward-compatible).  Otherwise, each layer
+        group's block ID list is partitioned into slices of at most
+        ``chunk_size_blocks`` blocks.  The chunking boundary is driven by
+        the largest layer group; shorter groups produce empty sub-lists in
+        later chunks (harmless — they generate no RDMA operations).
+
+        Args:
+            req: The LLM request to create slices for.
+
+        Returns:
+            A list of ``KVSlice`` objects.  Only the last slice has
+            ``is_last_slice=True``.
+
+        Raises:
+            AssertionError: If the reassembled block IDs from all slices
+                do not match the original block IDs (chunking integrity
+                check).
+        """
+        all_block_ids = self._collect_block_ids(req)
+
+        if self.chunk_size_blocks is None:
+            return [KVSlice(is_last_slice=True, block_ids_per_layer_groups=all_block_ids)]
+
+        max_blocks = max((len(ids) for ids in all_block_ids), default=0)
+        if max_blocks == 0:
+            return [KVSlice(is_last_slice=True, block_ids_per_layer_groups=all_block_ids)]
+
+        num_chunks = math.ceil(max_blocks / self.chunk_size_blocks)
+        slices: List[KVSlice] = []
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * self.chunk_size_blocks
+            end = start + self.chunk_size_blocks
+            is_last = chunk_idx == num_chunks - 1
+
+            chunk_block_ids = [ids[start:end] for ids in all_block_ids]
+            slices.append(
+                KVSlice(is_last_slice=is_last, block_ids_per_layer_groups=chunk_block_ids)
+            )
+
+        # Verify every block is covered exactly once.
+        for lg_idx, original_ids in enumerate(all_block_ids):
+            reassembled = []
+            for s in slices:
+                reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
+            assert reassembled == original_ids, (
+                f"Chunking integrity check failed for layer group {lg_idx}: "
+                f"expected {len(original_ids)} blocks, got {len(reassembled)}"
+            )
+
+        return slices
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
-    # starts background transfer to send this request's KV cache to the gen server, attaches ContextPhaseParams metadata
-    def respond_and_send_async(self, req: LlmRequest):
+    def _make_chunk_callback(self) -> Optional[Callable]:
+        """Return a callback for early prefix block release.
+
+        The callback is invoked on the sender worker thread after each
+        chunk's RDMA finishes.  It enqueues a release request that the
+        main thread drains via ``_drain_pending_releases``.
+
+        Returns:
+            A callback ``(request_id, chunk_block_offset, num_blocks) -> None``
+            if chunking and V2 manager are both enabled, otherwise ``None``.
+        """
+        if not self.is_v2_manager or self.chunk_size_blocks is None:
+            return None
+
+        release_queue = self._pending_prefix_releases
+
+        def _on_chunk_transferred(request_id: int, chunk_block_offset: int, num_blocks: int):
+            cumulative_blocks = chunk_block_offset + num_blocks
+            release_queue.put((request_id, cumulative_blocks))
+
+        return _on_chunk_transferred
+
+    def _drain_pending_releases(self) -> None:
+        """Process all queued prefix block releases on the main thread.
+
+        Drains the ``_pending_prefix_releases`` queue and calls
+        ``release_prefix_blocks`` on the KV cache manager for each
+        entry.  Must be called from the main executor thread only.
+        """
+        while not self._pending_prefix_releases.empty():
+            try:
+                request_id, num_blocks = self._pending_prefix_releases.get_nowait()
+            except queue.Empty:
+                break
+            self.kv_cache_manager.release_prefix_blocks(request_id, num_blocks)
+
+    def respond_and_send_async(self, req: LlmRequest) -> None:
+        """Start background KV cache transfer to the generation server.
+
+        Creates (or reuses) a ``TxSession`` and sends each KV slice with
+        its chunk block offset.  When chunking is enabled with V2 manager,
+        a per-chunk callback is attached for early prefix block release.
+
+        Args:
+            req: The completed context request whose KV cache to transfer.
+        """
         unique_rid = get_unique_rid(req)
         if unique_rid not in self.send_sessions:
-            send_session = self.transfer_worker.create_tx_session(req)
+            send_session = self.transfer_worker.create_tx_session(
+                req, on_chunk_transferred=self._make_chunk_callback()
+            )
             self.send_sessions[unique_rid] = send_session
         else:
             send_session = self.send_sessions[unique_rid]
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-        # stores block ids, not raw data
-        kv_slice = self._create_kv_slice(req)
-        # sending actual kv data
-        send_session.send(kv_slice)
+        kv_slices = self._create_kv_slices(req)
+        chunk_block_offset = 0
+        for kv_slice in kv_slices:
+            send_session.send(kv_slice, chunk_block_offset=chunk_block_offset)
+            if self.chunk_size_blocks is not None:
+                chunk_block_offset += self.chunk_size_blocks
         if self._need_aux_transfer(req):
             send_session.pack_aux(req)
             send_session.send_aux()
@@ -213,19 +331,33 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
     def request_and_receive_sync(self, req: LlmRequest):
         raise NotImplementedError("request_and_receive_sync is not implemented")
 
-    # starts background listener to receive KV cache from the ctx server into this request's pre-allocated blocks.
-    def request_and_receive_async(self, req: LlmRequest):
+    def request_and_receive_async(self, req: LlmRequest) -> None:
+        """Start background KV cache receive from the context server.
+
+        The receiver always uses a single monolithic slice.  Chunking is
+        sender-only: the sender splits its source blocks into chunks and
+        slices the receiver's destination blocks to match each chunk.
+
+        Args:
+            req: The generation request whose KV cache blocks to receive
+                into.
+        """
         unique_rid = get_unique_rid(req)
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 
-        # create rx session for receiving blocks
         recv_session = self.transfer_worker.create_rx_session(req)
         self.recv_sessions[unique_rid] = recv_session
-        kv_slice = self._create_kv_slice(req)
-        recv_session.receive(kv_slice)
+        # Receiver always uses a single monolithic slice. Chunking is
+        # sender-only: the sender splits src blocks into chunks and
+        # slices the receiver's dst blocks to match each chunk.
+        all_block_ids = self._collect_block_ids(req)
+        full_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=all_block_ids)
+        recv_session.receive(full_slice)
         self.recv_req_id_to_request[unique_rid] = req
 
     def check_context_transfer_status(self, at_least_request_num: int, mark_complete: bool = False):
+        self._drain_pending_releases()
+
         block_all = at_least_request_num is None
 
         wait_num = at_least_request_num if not block_all else 0

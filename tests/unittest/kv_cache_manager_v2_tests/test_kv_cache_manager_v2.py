@@ -756,6 +756,99 @@ class TestDisagg(TestKVCacheManagerV2):
         stream.take_finish_event().synchronize()
 
 
+class TestReleasePrefixBlocks(TestKVCacheManagerV2):
+    """Tests for _KVCache.release_prefix (chunked transfer early release)."""
+
+    def _create_and_fill(self, prompt_len: int) -> "_KVCache":
+        """Helper: create a KV cache, resume, resize to prompt_len."""
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        kv_cache = self.manager.create_kv_cache(None, prompt)
+        with TemporaryCudaStream([]) as stream:
+            success = kv_cache.resume(cast(CudaStream, stream.handle))
+            assert success
+            success = kv_cache.resize(prompt_len, prompt_len)
+            assert success
+        return kv_cache
+
+    @parameterized.expand([256])
+    def test_release_prefix_basic(self, prompt_len: int) -> None:
+        """Releasing N prefix blocks reduces num_blocks and capacity."""
+        self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
+        kv_cache = self._create_and_fill(prompt_len)
+
+        original_num_blocks = kv_cache.num_blocks
+        tokens_per_block = self.manager.tokens_per_block
+        release_count = 2
+        assert original_num_blocks > release_count
+
+        kv_cache.release_prefix(release_count)
+
+        assert kv_cache.num_blocks == original_num_blocks - release_count
+        expected_capacity = prompt_len - release_count * tokens_per_block
+        assert kv_cache.capacity == expected_capacity
+
+        kv_cache.close()
+
+    @parameterized.expand([128])
+    def test_release_prefix_zero(self, prompt_len: int) -> None:
+        """release_prefix(0) is a no-op."""
+        self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
+        kv_cache = self._create_and_fill(prompt_len)
+
+        original_num_blocks = kv_cache.num_blocks
+        kv_cache.release_prefix(0)
+
+        assert kv_cache.num_blocks == original_num_blocks
+        kv_cache.close()
+
+    @parameterized.expand([128])
+    def test_release_prefix_exceeds_blocks(self, prompt_len: int) -> None:
+        """release_prefix(N+5) releases all N blocks (clamped)."""
+        self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
+        kv_cache = self._create_and_fill(prompt_len)
+
+        original_num_blocks = kv_cache.num_blocks
+        kv_cache.release_prefix(original_num_blocks + 5)
+
+        assert kv_cache.num_blocks == 0
+        assert kv_cache.capacity == 0
+        kv_cache.close()
+
+    @parameterized.expand([256])
+    def test_release_prefix_cumulative(self, prompt_len: int) -> None:
+        """Two successive calls release blocks from the new head each time."""
+        self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
+        kv_cache = self._create_and_fill(prompt_len)
+
+        original_num_blocks = kv_cache.num_blocks
+        kv_cache.release_prefix(2)
+        assert kv_cache.num_blocks == original_num_blocks - 2
+        kv_cache.release_prefix(3)
+        assert kv_cache.num_blocks == original_num_blocks - 5
+        kv_cache.close()
+
+    @parameterized.expand([256])
+    def test_release_prefix_memory_reclaimed(self, prompt_len: int) -> None:
+        """After release_prefix, freed slots are available for new caches."""
+        self.prepare(128 << 20, 0, 0, 4, 128, 0)
+        kv_cache = self._create_and_fill(prompt_len)
+
+        release_count = kv_cache.num_blocks // 2
+        kv_cache.release_prefix(release_count)
+
+        # A second cache should be able to allocate using freed slots.
+        prompt2 = [self.next_token() for _ in range(prompt_len // 2)]
+        kv_cache2 = self.manager.create_kv_cache(None, prompt2)
+        with TemporaryCudaStream([]) as stream:
+            success = kv_cache2.resume(cast(CudaStream, stream.handle))
+            assert success
+            success = kv_cache2.resize(len(prompt2), len(prompt2))
+            assert success
+
+        kv_cache2.close()
+        kv_cache.close()
+
+
 class TestDisaggregatedServing(unittest.TestCase):
     @dataclass(slots=True)
     class NodeGroup:
