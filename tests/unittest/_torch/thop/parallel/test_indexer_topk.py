@@ -978,7 +978,10 @@ def test_indexer_topk_decode_dist(
 
     # 4. Run heuristic CUDA kernel
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
-    torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n, index_topk, pre_idx)
+    heuristic_scratch = torch.empty(num_gen_tokens * index_topk, dtype=torch.float32, device="cuda")
+    torch.ops.trtllm.indexer_topk_decode(
+        logits, seq_lens, indices, next_n, index_topk, pre_idx, heuristic_scratch
+    )
     torch.cuda.synchronize()
 
     # 5. Reference: exact torch.topk masked to valid range
