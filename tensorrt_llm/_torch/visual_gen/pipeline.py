@@ -526,7 +526,6 @@ class BasePipeline(nn.Module):
         cfg_size = vgm.cfg_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
 
-        cfg_group = vgm.cfg_rank if vgm else 0
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
         do_cfg_parallel = cfg_size >= 2 and guidance_scale > 1.0
@@ -569,7 +568,7 @@ class BasePipeline(nn.Module):
             "enabled": do_cfg_parallel,
             "cfg_size": cfg_size,
             "ulysses_size": ulysses_size,
-            "cfg_group": cfg_group,
+            "cfg_rank": vgm.cfg_rank if vgm else 0,
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
