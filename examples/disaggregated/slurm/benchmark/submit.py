@@ -722,6 +722,7 @@ def submit_job(config, log_dir, dry_run, config_file=None):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
+        '--enable-nsys', str(profiling_config['nsys_on']).lower(),
     ]
     # yapf: enable
 
