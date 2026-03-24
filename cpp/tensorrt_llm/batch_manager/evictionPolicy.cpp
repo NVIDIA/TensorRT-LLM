@@ -221,8 +221,6 @@ void LRUEvictionPolicy::refresh()
             break;
         }
 
-        auto const id = block->getBlockId();
-
         mExpiringBlockHeap.erase(mExpiringBlockHeap.begin());
 
         // Add block to free blocks queue with default priority if it was removed from another priority free blocks
