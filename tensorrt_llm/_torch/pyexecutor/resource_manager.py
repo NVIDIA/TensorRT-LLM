@@ -674,8 +674,7 @@ class KVCacheManager(BaseResourceManager):
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
 
-    def extend_capacity_for_tokens(self, request: LlmRequest,
-                                   num_tokens: int) -> None:
+    def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """No-op for V1; interface kept consistent with V2."""
 
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
@@ -2166,8 +2165,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return True
 
-    def extend_capacity_for_tokens(self, request: LlmRequest,
-                                   num_tokens: int) -> None:
+    def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """Extend KV cache capacity for the CUDA-graph padding delta.
 
         ``try_allocate_generation`` allocated capacity for the schedule-reduced
@@ -2175,11 +2173,8 @@ class KVCacheManagerV2(BaseResourceManager):
         max, we must extend by exactly the difference so that the subsequent
         rewind (which operates on the padded length) does not underflow.
 
-        The *num_tokens* argument from the caller is the full post-padding
-        draft length minus the pre-padding length.  However, the schedule-
-        reduced length used by ``try_allocate_generation`` may differ from
-        the pre-padding length, so we recompute the delta from the recorded
-        ``_allocated_draft_lens`` to stay consistent.
+        The delta is computed from ``_allocated_draft_lens`` (recorded by
+        ``try_allocate_generation``) vs the current draft length (post-padding).
         """
         allocated = self._allocated_draft_lens.pop(request.py_request_id, None)
         if allocated is None:
