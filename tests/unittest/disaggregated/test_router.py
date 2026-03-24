@@ -8,8 +8,9 @@ from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (KvCacheAwareRouter, LoadBalancingRouter,
-                                       RoundRobinRouter, create_router)
+from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
+                                       LoadBalancingRouter, RoundRobinRouter,
+                                       create_router)
 
 
 # Mock class for metadata server
@@ -498,6 +499,14 @@ def test_create_router(servers):
     kv_cache_aware_router = create_router(router_config, servers)
     assert isinstance(kv_cache_aware_router, KvCacheAwareRouter)
 
+    conversation_router_config = RouterConfig(type="conversation",
+                                              args={
+                                                  "chars_per_block": 64,
+                                                  "max_conversations": 500
+                                              })
+    conversation_router = create_router(conversation_router_config, servers)
+    assert isinstance(conversation_router, ConversationRouter)
+
     with pytest.raises(ValueError):
         create_router(RouterConfig(type="unsupported_router"), servers)
 
@@ -508,8 +517,10 @@ def mock_metadata_server():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+@pytest.mark.parametrize("router_class", [
+    RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter,
+    ConversationRouter
+])
 async def test_fetch_live_servers_context(mock_metadata_server, router_class):
     # Create router with mock metadata server
     router = router_class(server_role="context",
@@ -555,8 +566,10 @@ async def test_fetch_live_servers_context(mock_metadata_server, router_class):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+@pytest.mark.parametrize("router_class", [
+    RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter,
+    ConversationRouter
+])
 async def test_server_health_check(mock_metadata_server, router_class):
     router = router_class(server_role="context",
                           metadata_server=mock_metadata_server)
@@ -583,8 +596,10 @@ async def test_server_health_check(mock_metadata_server, router_class):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+@pytest.mark.parametrize("router_class", [
+    RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter,
+    ConversationRouter
+])
 async def test_get_next_server_exclude_server(router_class):
     servers = ["server1", "server2", "server3"]
     router = router_class(server_role="context", servers=servers)
@@ -599,8 +614,8 @@ async def test_get_next_server_exclude_server(router_class):
             model="TinyLlama", prompt=[[10] * 10]),
                                                  exclude_server="server3")
         exclude_server3[server] += 1
-    if router_class == KvCacheAwareRouter:
-        # KvCacheAwareRouter is not load-balanced
+    if router_class in (KvCacheAwareRouter, ConversationRouter):
+        # KvCacheAwareRouter and ConversationRouter are not purely round-robin
         assert exclude_server2["server2"] == 0
         assert exclude_server3["server3"] == 0
     else:
@@ -611,8 +626,10 @@ async def test_get_next_server_exclude_server(router_class):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+@pytest.mark.parametrize("router_class", [
+    RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter,
+    ConversationRouter
+])
 async def test_get_next_server_exclude_server_insufficient(router_class):
     servers = ["server1"]
     router = router_class(server_role="context",
@@ -622,3 +639,261 @@ async def test_get_next_server_exclude_server_insufficient(router_class):
         await router.get_next_server(CompletionRequest(model="TinyLlama",
                                                        prompt=[[10] * 10]),
                                      exclude_server=servers[0])
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_basic():
+    """Same prompt submitted twice should return the same conversation ID and same server."""
+    server_list = ["server1", "server2", "server3"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=32,
+                                max_conversations=100)
+    req1 = CompletionRequest(model="TinyLlama",
+                             prompt="Hello, how are you doing today?" * 5)
+    req2 = CompletionRequest(model="TinyLlama",
+                             prompt="Hello, how are you doing today?" * 5)
+
+    server1, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+    server2, info2 = await router.get_next_server(req2)
+    await router.finish_request(req2)
+
+    assert info1["conversation_id"] is not None
+    assert info1["conversation_id"] == info2["conversation_id"]
+    assert server1 == server2
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_different_conversations():
+    """Completely different prompts should get different conversation IDs."""
+    server_list = ["server1", "server2", "server3"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=32,
+                                max_conversations=100)
+    req1 = CompletionRequest(model="TinyLlama",
+                             prompt="Tell me about cats and dogs. " * 5)
+    req2 = CompletionRequest(model="TinyLlama",
+                             prompt="Explain quantum physics now. " * 5)
+
+    _, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+    _, info2 = await router.get_next_server(req2)
+    await router.finish_request(req2)
+
+    assert info1["conversation_id"] is not None
+    assert info2["conversation_id"] is not None
+    assert info1["conversation_id"] != info2["conversation_id"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_prefix_matching():
+    """An extended prompt that shares a prefix with a prior turn should route to the same server."""
+    server_list = ["server1", "server2", "server3"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=64,
+                                max_conversations=100)
+    turn1_text = "A" * 200
+    req1 = CompletionRequest(model="TinyLlama", prompt=turn1_text)
+    server1, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+
+    turn2_text = turn1_text + "B" * 100
+    req2 = CompletionRequest(model="TinyLlama", prompt=turn2_text)
+    server2, info2 = await router.get_next_server(req2)
+    await router.finish_request(req2)
+
+    assert info1["conversation_id"] == info2["conversation_id"]
+    assert server1 == server2
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_chat_messages():
+    """ChatCompletionRequest messages should be serialized and matched correctly."""
+    server_list = ["server1", "server2", "server3"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=64,
+                                max_conversations=100)
+    req1 = ChatCompletionRequest(model="TinyLlama",
+                                 messages=[{
+                                     "role": "user",
+                                     "content": "Hello world " * 20
+                                 }])
+    req2 = ChatCompletionRequest(
+        model="TinyLlama",
+        messages=[{
+            "role": "user",
+            "content": "Hello world " * 20
+        }, {
+            "role": "assistant",
+            "content": "Hi there!"
+        }, {
+            "role": "user",
+            "content": "How are you?"
+        }])
+
+    server1, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+    server2, info2 = await router.get_next_server(req2)
+    await router.finish_request(req2)
+
+    assert info1["conversation_id"] is not None
+    assert info1["conversation_id"] == info2["conversation_id"]
+    assert server1 == server2
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_lru_eviction():
+    """Oldest conversation should be evicted when capacity is exceeded."""
+    server_list = ["server1", "server2", "server3"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=32,
+                                max_conversations=2)
+
+    req1 = CompletionRequest(model="TinyLlama",
+                             prompt="First conversation " * 10)
+    req2 = CompletionRequest(model="TinyLlama",
+                             prompt="Second conversation " * 10)
+    req3 = CompletionRequest(model="TinyLlama",
+                             prompt="Third conversation " * 10)
+
+    _, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+    _, info2 = await router.get_next_server(req2)
+    await router.finish_request(req2)
+    # This should evict conversation 1
+    _, info3 = await router.get_next_server(req3)
+    await router.finish_request(req3)
+
+    assert info1["conversation_id"] != info2["conversation_id"]
+    assert info2["conversation_id"] != info3["conversation_id"]
+
+    # Re-submitting req1 should get a new ID since it was evicted
+    req1_again = CompletionRequest(model="TinyLlama",
+                                   prompt="First conversation " * 10)
+    _, info1_again = await router.get_next_server(req1_again)
+    await router.finish_request(req1_again)
+    assert info1_again["conversation_id"] != info1["conversation_id"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_token_ids_returns_none():
+    """Token-ID-only requests should return None conversation_id (cannot hash without tokenizer)."""
+    server_list = ["server1", "server2"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=128,
+                                max_conversations=100)
+    req = CompletionRequest(model="TinyLlama", prompt=[100, 200, 300])
+
+    server, info = await router.get_next_server(req)
+    await router.finish_request(req)
+    assert info["conversation_id"] is None
+    assert server in server_list
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_short_text_returns_none():
+    """Text shorter than chars_per_block produces no full blocks, returns None conversation_id."""
+    server_list = ["server1", "server2"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=128,
+                                max_conversations=100)
+    req = CompletionRequest(model="TinyLlama", prompt="short text")
+
+    server, info = await router.get_next_server(req)
+    await router.finish_request(req)
+    assert info["conversation_id"] is None
+    assert server in server_list
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_server_affinity():
+    """Multi-turn conversations should consistently route to the same server."""
+    server_list = ["server1", "server2", "server3"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=64,
+                                max_conversations=100)
+
+    base_text = "X" * 200
+    req1 = CompletionRequest(model="TinyLlama", prompt=base_text)
+    server1, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+
+    # Multi-turn: each turn extends the prefix
+    for turn in range(5):
+        extended_text = base_text + f" turn{turn} " * 50
+        req = CompletionRequest(model="TinyLlama", prompt=extended_text)
+        server, info = await router.get_next_server(req)
+        await router.finish_request(req)
+        assert server == server1, f"Turn {turn} routed to {server} instead of {server1}"
+        assert info["conversation_id"] == info1["conversation_id"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_load_balanced_fallback():
+    """New (unmatched) conversations should be spread across servers by load."""
+    server_list = ["server1", "server2", "server3"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=32,
+                                max_conversations=1000)
+
+    counts = {s: 0 for s in server_list}
+    requests = []
+    for i in range(9):
+        # Each prompt is unique and long enough for hashing
+        req = CompletionRequest(model="TinyLlama",
+                                prompt=f"Unique conversation {i} " * 10)
+        server, _ = await router.get_next_server(req)
+        counts[server] += 1
+        requests.append(req)
+        # Finish immediately so load stays balanced
+        await router.finish_request(req)
+
+    # With 9 requests and 3 servers, each should get 3
+    for s in server_list:
+        assert counts[s] == 3, f"Server {s} got {counts[s]} requests, expected 3"
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_server_removal():
+    """Removing a server should invalidate its conversation affinities."""
+    server_list = ["server1", "server2"]
+    router = ConversationRouter(servers=server_list,
+                                chars_per_block=32,
+                                max_conversations=100)
+
+    # Establish a conversation on server1
+    req1 = CompletionRequest(model="TinyLlama",
+                             prompt="Conversation on server1 " * 10)
+    server, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+    original_server = server
+    original_conv_id = info1["conversation_id"]
+
+    # Remove the server that handled this conversation
+    await router.remove_server(original_server)
+
+    # Re-submit — should get a new conversation ID on the remaining server
+    req2 = CompletionRequest(model="TinyLlama",
+                             prompt="Conversation on server1 " * 10)
+    server2, info2 = await router.get_next_server(req2)
+    await router.finish_request(req2)
+
+    assert server2 != original_server
+    assert info2["conversation_id"] != original_conv_id
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_create_router():
+    """Verify ConversationRouter can be created via create_router factory."""
+    server_list = ["server1", "server2"]
+    router_config = RouterConfig(
+        type="conversation",
+        args={
+            "chars_per_block": 64,
+            "max_conversations": 500
+        },
+    )
+    router = create_router(router_config, server_list)
+    assert isinstance(router, ConversationRouter)
+    assert router._chars_per_block == 64
+    assert router._max_conversations == 500
