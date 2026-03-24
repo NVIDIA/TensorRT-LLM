@@ -2179,7 +2179,7 @@ public:
     [[nodiscard]] SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const override;
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
-    //! the placeholder block). It should be called after every context chunk is processed.
+    //! the placeholder block). It should be called before every forward step, after adding new tokens.
     void copyLinearAttentionBlock(LlmRequest const& llmRequest);
 
     /// @brief Add new request to the KV cache manager.

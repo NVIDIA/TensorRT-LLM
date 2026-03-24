@@ -1986,15 +1986,9 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         = request.isContextFinished() ? (request.getNumTokens(0)) : request.getContextCurrentPosition();
     TLLM_LOG_DEBUG("%s::copyLinearAttentionBlock - Request %lu, currentPosition %d", mLogPrefix.c_str(), requestId,
         currentPosition);
-    // copy only happens in context phase or the first token of decoding phase (only when promptLen % tokensPerBlock ==
-    // 0)
-    if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() || currentPosition == 0)
-    {
-        return;
-    }
 
     // edge case: promptLen % tokensPerBlock == 0, and this is the first token of decoding phase
-    if (currentPosition == request.getPromptLen())
+    if (currentPosition == request.getPromptLen() + 1 && request.getPromptLen() % mTokensPerBlock == 0)
     {
         if (sequence.getBeamWidth() == 1)
         {
@@ -2014,6 +2008,13 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
                                  // transfer manager to copy the entire block.
                 sequence.getTransferMode(), sequence.getDirectory());
         }
+        return;
+    }
+
+    // copy only happens in context phase or the first token of decoding phase (only when promptLen % tokensPerBlock ==
+    // 0)
+    if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() + 1 || currentPosition == 0)
+    {
         return;
     }
 
@@ -2508,6 +2509,8 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
     auto const requestId = sequence.getRequestId();
+    TLLM_LOG_DEBUG("%s::releaseBlocks - requestId=%lu, llmRequest.id=%s", mLogPrefix.c_str(), requestId,
+        llmRequest.has_value() ? std::to_string(llmRequest->mRequestId).c_str() : "null");
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
     auto node = mAllocatedBlocksPerSeq.extract(requestId);
     TLLM_CHECK(node);
@@ -3292,18 +3295,6 @@ SizeType32 KVCacheManager::copyBlockOffsets(
 
     for (auto const [ws, metadata] : mBlockManager.getWindowSizesMetadata())
     {
-        TLLM_LOG_DEBUG("copyBlockOffsets: ws: %d", ws);
-        // // If windowSize is specified, only copy the blocks for that window size
-        // if (windowSize.has_value() && windowSize.value() != ws)
-        // {
-        //     continue;
-        // }
-        // // If windowSize is unspecified, skip the recurrent states
-        // // This means recurrent states can only be copied when user explicitly requests it
-        // if (!windowSize.has_value() && ws == LinearAttentionMetadata::kRecurrentStates)
-        // {
-        //     continue;
-        // }
         auto const& cacheBlocksTensor = sequence.getCacheBlockIndices(ws);
         auto const* srcPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
         auto const& srcShape = cacheBlocksTensor.getShape();
@@ -3320,7 +3311,6 @@ SizeType32 KVCacheManager::copyBlockOffsets(
                     auto const dstIndex
                         = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
                     std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
-                    TLLM_LOG_DEBUG("copying srcptr: %p, dstptr: %p", srcPtr + srcIndex, dstPtr + dstIndex);
                 }
                 maxBlockCount = std::max<SizeType32>(maxBlockCount, static_cast<SizeType32>(beamBlockCount));
             }
