@@ -17,3 +17,5 @@ transforms:
     enabled: true
   fuse_gemms_mixed_children:
     enabled: true
+  fuse_silu_mul:
+    enabled: true
