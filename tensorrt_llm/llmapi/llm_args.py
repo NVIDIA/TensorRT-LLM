@@ -1,3 +1,4 @@
+"""LLM argument configuration classes and validation logic."""
 import ast
 import functools
 import json
@@ -90,7 +91,6 @@ def Field(default: Any = ...,
     Returns:
         A Pydantic FieldInfo object with the status added to json_schema_extra if provided
     """
-
     if status is not None:
         json_schema_extra = kwargs.get('json_schema_extra', {})
         if isinstance(json_schema_extra, dict):
@@ -104,8 +104,7 @@ def Field(default: Any = ...,
 
 
 class CudaGraphConfig(StrictBaseModel):
-    """
-    Configuration for CUDA graphs.
+    """Configuration for CUDA graphs.
     """
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
@@ -227,8 +226,10 @@ class CudaGraphConfig(StrictBaseModel):
 
 
 class GuidedDecodingConfig(StrictBaseModel):
+    """GuidedDecoding configuration."""
 
     class GuidedDecodingBackend(Enum):
+        """GuidedDecodingBackend container."""
         XGRAMMAR = 0
         LLGUIDANCE = 1
 
@@ -247,8 +248,7 @@ class GuidedDecodingConfig(StrictBaseModel):
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
-    """
-    Configuration for sparse attention.
+    """Configuration for sparse attention.
     """
     algorithm: str
 
@@ -259,18 +259,17 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     )
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the sparse attention algorithm does not support
+        """Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
         return True
 
     def get_indices_block_size(self) -> int:
+        """Get indices block size."""
         return 1
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
+        """Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
         If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
         If False, capture a single unified CUDA graph for all sequences regardless of length.
         The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
@@ -279,8 +278,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for RocketKV sparse attention.
+    """Configuration for RocketKV sparse attention.
     """
     algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
@@ -299,15 +297,16 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     )
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
     def get_indices_block_size(self) -> int:
+        """Get indices block size."""
         return self.page_size
 
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for DeepSeek Sparse Attention.
+    """Configuration for DeepSeek Sparse Attention.
     """
     algorithm: Literal["dsa"] = "dsa"
     index_n_heads: Optional[int] = Field(
@@ -344,11 +343,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     )
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Whether to capture separate CUDA graphs for short and long sequences.
+        """Whether to capture separate CUDA graphs for short and long sequences.
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
         """
         self.seq_len_threshold = self.index_topk
@@ -356,8 +355,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for skip softmax attention.
+    """Configuration for skip softmax attention.
     """
     algorithm: Literal["skip_softmax"] = "skip_softmax"
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
@@ -365,24 +363,26 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description="The threshold scale factor for skip softmax attention.")
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
     @property
     def threshold_scale_factor_prefill(self) -> Optional[float]:
+        """Threshold scale factor for prefill phase."""
         if isinstance(self.threshold_scale_factor, dict):
             return self.threshold_scale_factor.get('prefill', None)
         return self.threshold_scale_factor
 
     @property
     def threshold_scale_factor_decode(self) -> Optional[float]:
+        """Threshold scale factor for decode phase."""
         if isinstance(self.threshold_scale_factor, dict):
             return self.threshold_scale_factor.get('decode', None)
         return self.threshold_scale_factor
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
-    """
-    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
+    """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
 
     This model holds configuration data (`num_slots`, etc.) as well as
     runtime state (`_ep_rank`, `_ep_size`) which must be set via the
@@ -401,8 +401,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
     # --- Methods ---
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
-        """
-        Initializes the runtime state of the configuration.
+        """Initializes the runtime state of the configuration.
         This must be called before accessing properties like `num_local_slots`.
         """
         self._ep_rank = ep_rank
@@ -458,8 +457,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
-        """
-        Retrieves the initial global assignments for a specific layer.
+        """Retrieves the initial global assignments for a specific layer.
         """
         if self.initial_global_assignments is None:
             return None
@@ -484,8 +482,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
 
 class MoeConfig(StrictBaseModel):
-    """
-    Configuration for MoE.
+    """Configuration for MoE.
     """
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
@@ -523,8 +520,7 @@ Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
-    """
-    Configuration for NVFP4 GEMM backend selection.
+    """Configuration for NVFP4 GEMM backend selection.
     """
     allowed_backends: List[Nvfp4Backend] = Field(
         default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
@@ -536,8 +532,7 @@ class Nvfp4GemmConfig(StrictBaseModel):
 
 
 class AttentionDpConfig(StrictBaseModel):
-    """
-    Configuration for attention DP.
+    """Configuration for attention DP.
     """
     enable_balance: bool = Field(default=False,
                                  description="Whether to enable balance.")
@@ -549,6 +544,7 @@ class AttentionDpConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
+        """Validate attention dp config."""
         if self.enable_balance:
             if self.batching_wait_iters < 0:
                 raise ValueError(
@@ -562,8 +558,7 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class CpConfig(StrictBaseModel):
-    """
-    Configuration for context parallelism.
+    """Configuration for context parallelism.
     """
     # TODO: given that multiple fields here are only used with specific cp_types, consider
     # making this a Pydantic discriminated union.
@@ -617,12 +612,14 @@ class _ParallelConfig(StrictBaseModel):
 
     @property
     def devices(self) -> List[int]:
+        """Device list property."""
         if self._devices is None:
             return list(range(self.world_size))
         return self._devices
 
     @devices.setter
     def devices(self, devices: List[int]):
+        """Device list property."""
         if len(devices) != self.world_size:
             raise ValueError(
                 f"devices {devices} should have the same length as world_size {self.world_size}"
@@ -631,16 +628,19 @@ class _ParallelConfig(StrictBaseModel):
 
     @property
     def world_size(self) -> int:
+        """Total world size for distributed execution."""
         return self.tp_size * self.pp_size * self.cp_size
 
     @property
     def world_size_per_node(self) -> int:
+        """Number of GPUs per node."""
         world_size = self.world_size
         total_nodes = math.ceil(world_size / self.gpus_per_node)
         return world_size // total_nodes  #TODO is this right?
 
     @world_size.setter
     def world_size(self, world_size: int):
+        """Total world size for distributed execution."""
         if world_size != self.tp_size * self.pp_size * self.cp_size:
             raise ValueError(
                 f"world_size {world_size} should be equal to tp_size * pp_size * cp_size {self.tp_size * self.pp_size * self.cp_size} "
@@ -648,9 +648,11 @@ class _ParallelConfig(StrictBaseModel):
 
     @property
     def is_multi_gpu(self) -> bool:
+        """Check if multi gpu."""
         return self.world_size > 1
 
     def to_mapping(self) -> Mapping:
+        """Handle to mapping."""
         return Mapping(
             world_size=self.world_size,
             rank=mpi_rank(),
@@ -670,8 +672,7 @@ class _ParallelConfig(StrictBaseModel):
 
 
 class CalibConfig(StrictBaseModel):
-    """
-    Calibration configuration.
+    """Calibration configuration.
     """
     device: Literal['cuda',
                     'cpu'] = Field(default='cuda',
@@ -696,12 +697,14 @@ class CalibConfig(StrictBaseModel):
 
 
 class _ModelFormatKind(Enum):
+    """Enumeration of model format kinds."""
     HF = 0
     TLLM_CKPT = 1
     TLLM_ENGINE = 2
 
 
 class DecodingBaseConfig(StrictBaseModel):
+    """DecodingBase configuration."""
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
 
@@ -825,6 +828,7 @@ class DecodingBaseConfig(StrictBaseModel):
     # 2. If max_concurrency is set, translate it to the corresponding draft_len_schedule.
     def validate_max_concurrency_and_draft_len_schedule_mutually_exclusive(
             self) -> "DecodingBaseConfig":
+        """Validate max concurrency and draft len schedule mutually exclusive."""
         if self.max_concurrency is not None and self.draft_len_schedule is not None:
             # Avoid ValueError during nested re-validation when only max_concurrency is set and draft_len_schedule is translated from max_concurrency
             if self._translated_from_max_concurrency:
@@ -849,8 +853,7 @@ class DecodingBaseConfig(StrictBaseModel):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the speculation algorithm does not support
+        """Override if the speculation algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -860,6 +863,7 @@ class DecodingBaseConfig(StrictBaseModel):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
         # Use an alias for the import here to avoid name collisions with the one for the
         # TRT backend.
+        """Return the speculative decoding mode."""
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.from_string(
@@ -867,6 +871,7 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @functools.cached_property
     def is_linear_tree(self) -> bool:
+        """Check whether the tree structure is linear."""
         return self.max_draft_len == self.max_total_draft_tokens
 
     @property
@@ -875,12 +880,12 @@ class DecodingBaseConfig(StrictBaseModel):
         return 1 + self.max_total_draft_tokens
 
     def num_capture_layers(self) -> int:
+        """Return the number of layers to capture for CUDA graphs."""
         return 0
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
-    """
-    Configuration for the KV Cache Connector.
+    """Configuration for the KV Cache Connector.
     """
     connector_module: str = Field(
         ...,
@@ -894,8 +899,7 @@ class KvCacheConnectorConfig(StrictBaseModel):
 
 
 class LayerwiseBenchmarksConfig(StrictBaseModel):
-    """
-    Configuration for layer-wise benchmarks calibration.
+    """Configuration for layer-wise benchmarks calibration.
     """
     calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
         default="NONE",
@@ -917,6 +921,7 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
+        """Validate calibration file path."""
         if self.calibration_mode == "COLLECT" and not self.calibration_file_path:
             raise ValueError(
                 f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
@@ -925,6 +930,7 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
+    """MedusaDecoding configuration."""
     decoding_type: Literal["Medusa"] = "Medusa"
     medusa_choices: Optional[List[List[int]]] = Field(
         default=None,
@@ -940,14 +946,17 @@ class MedusaDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
+        """Set the maximum total draft tokens."""
         self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only supports linear tree
         return self
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend not in ("pytorch", "_autodeploy")
 
 
 class EagleDecodingConfig(DecodingBaseConfig):
+    """EagleDecoding configuration."""
     decoding_type: Literal["Eagle"] = "Eagle"
     eagle_choices: Optional[List[List[int]]] = Field(
         default=None,
@@ -997,6 +1006,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     @field_validator('eagle_choices', mode='before')
     @classmethod
     def validate_eagle_choices(cls, v):
+        """Validate eagle choices."""
         if v is not None:
             logger.warning(
                 "The eagle_choices/static tree feature is deprecated and will be removed in release 1.4."
@@ -1012,6 +1022,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
+        """Validate eagle config."""
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
         if not self.eagle3_one_model:
@@ -1070,12 +1081,14 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def validate_speculative_model(self) -> 'EagleDecodingConfig':
+        """Validate speculative model."""
         if self.speculative_model is None:
             raise ValueError("Draft model must be provided for EAGLE")
         return self
 
     def check_eagle_choices(self):
         # 1) Check connectivity
+        """Check eagle choices."""
         unique_choices = set(
             tuple(sub_choice)
             for sub_choice in self.eagle_choices)  # remove repeated choices
@@ -1095,6 +1108,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
+        """Return the speculative decoding mode."""
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         if self.eagle3_one_model:
@@ -1103,8 +1117,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
-        """
-        Returns the number of layers to capture of the target model.
+        """Returns the number of layers to capture of the target model.
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
@@ -1114,12 +1127,14 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def is_linear_tree(self) -> bool:
+        """Check whether the tree structure is linear."""
         if self.eagle_choices is None and self.use_dynamic_tree is False:
             return True
         return False
 
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
+    """Eagle3Decoding configuration."""
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
     # Suffix Automaton speculative decoding settings
@@ -1135,6 +1150,7 @@ class Eagle3DecodingConfig(EagleDecodingConfig):
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
+    """SaveHiddenStatesDecoding configuration."""
     decoding_type: Literal["SaveState"] = "SaveState"
     output_directory: str = Field(
         description=
@@ -1174,6 +1190,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     _last_hidden_in_save: bool = PrivateAttr(default=True)
 
     def model_post_init(self, __context):
+        """Run post-initialization logic."""
         self._last_hidden_in_save = True
         if self.eagle3_layers_to_capture is None or -1 not in self.eagle3_layers_to_capture:
             # This variable is queried to determine whether we should write the final hidden state
@@ -1185,14 +1202,14 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
+        """Return the speculative decoding mode."""
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     @functools.cached_property
     def num_capture_layers(self):
-        """
-        Returns the number of layers to save.
+        """Returns the number of layers to save.
         The following hidden states are saved:
         - If eagle3_layers_to_capture is None, save the eagle3 base set plus
         the post norm last hidden state.
@@ -1212,6 +1229,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
+    """UserProvidedDecoding configuration."""
     decoding_type: Literal["User_Provided"] = "User_Provided"
     # Cannot use real type annotations due to circular imports
     drafter: object = Field(
@@ -1228,13 +1246,13 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
+        """Set the maximum total draft tokens."""
         self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only supports linear tree
         return self
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for NGram drafter speculative decoding.
+    """Configuration for NGram drafter speculative decoding.
     """
     decoding_type: Literal["NGram"] = "NGram"
     max_matching_ngram_size: PositiveInt = Field(
@@ -1258,18 +1276,19 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def validate_ngram_config(self):
+        """Validate ngram config."""
         if self.max_draft_len is None or self.max_draft_len <= 0:
             raise ValueError("max_draft_len must be > 0 for NGram")
         self.max_total_draft_tokens = self.max_draft_len  # Current NGram only supports linear tree
         return self
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
 
 class SADecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+    """Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
 
     Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
     the target model forward; supports CUDA graph and overlap scheduler.
@@ -1282,6 +1301,7 @@ class SADecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode='after')
     def validate_sa_config(self):
+        """Validate sa config."""
         if self.max_matching_ngram_size == 0:
             raise ValueError(
                 "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
@@ -1292,15 +1312,18 @@ class SADecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
+    """DraftTargetDecoding configuration."""
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
     _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
+        """Validate draft target config."""
         if self.max_draft_len is None or self.max_draft_len <= 0:
             raise ValueError("max_draft_len must be > 0 for DraftTarget")
         if self.speculative_model is None:
@@ -1310,10 +1333,12 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch" or backend == "_autodeploy"
 
     @functools.cached_property
     def spec_dec_mode(self):
+        """Return the speculative decoding mode."""
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         if self._draft_target_one_model:
@@ -1322,6 +1347,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
+    """MTPDecoding configuration."""
     decoding_type: Literal["MTP"] = "MTP"
     num_nextn_predict_layers: PositiveInt = Field(
         default=1,
@@ -1388,12 +1414,14 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
+        """Set the maximum total draft tokens."""
         self.max_draft_len = self.num_nextn_predict_layers
         self.max_total_draft_tokens = self.num_nextn_predict_layers  # Current MTP only supports linear tree
         return self
 
     @model_validator(mode="after")
     def log_two_model_deprecation_warning(self):
+        """Log deprecation warning for two-model speculative decoding."""
         if not self.mtp_eagle_one_model:
             logger.warning(
                 "2-model style MTP is deprecated and will be removed in release 1.4."
@@ -1401,16 +1429,19 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
+        """Return the number of layers to capture for CUDA graphs."""
         if not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return 1
         return 0
 
     @functools.cached_property
     def spec_dec_mode(self):
+        """Return the speculative decoding mode."""
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
@@ -1456,6 +1487,7 @@ class PARDDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
+        """Set the maximum total draft tokens."""
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
@@ -1465,18 +1497,19 @@ class PARDDecodingConfig(DecodingBaseConfig):
         return 2 * self.max_draft_len
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
     @functools.cached_property
     def spec_dec_mode(self):
+        """Return the speculative decoding mode."""
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.PARD
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for auto speculative decoding.
+    """Configuration for auto speculative decoding.
 
     This config will automatically select a good, draft-model free
     speculation algorithm with some heuristic.
@@ -1488,16 +1521,17 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
+        """Set the maximum total draft tokens."""
         self.max_total_draft_tokens = self.max_draft_len  # Current Auto only supports linear tree
         return self
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend == "pytorch"
 
 
 class RayPlacementConfig(StrictBaseModel):
-    """
-    Configuration for Ray GPU workers placement.
+    """Configuration for Ray GPU workers placement.
     Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
@@ -1527,6 +1561,7 @@ class RayPlacementConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_ray_placement(self) -> 'RayPlacementConfig':
+        """Validate ray placement."""
         has_pgs = self.placement_groups is not None
         has_indices = self.placement_bundle_indices is not None
 
@@ -1563,8 +1598,8 @@ class RayPlacementConfig(StrictBaseModel):
 class ExecutorMemoryType(StrEnum):
     """Types of GPU memory used by executor.
 
-     These are used by the sleep/wakeup feature to target specific type of memory.
-     """
+    These are used by the sleep/wakeup feature to target specific type of memory.
+    """
     SAMPLER = "sampler"
     DRAFTER = "drafter"
     GUIDED_DECODER = "guided_decoder"
@@ -1603,6 +1638,7 @@ class SleepConfig(StrictBaseModel):
     def _normalize_restore_mode(
             value: str | _VirtualMemoryRestoreMode
     ) -> _VirtualMemoryRestoreMode:
+        """Normalize restore mode to canonical form."""
         from tensorrt_llm._torch.virtual_memory import RestoreMode
         if isinstance(value, RestoreMode):
             return value
@@ -1619,6 +1655,7 @@ class SleepConfig(StrictBaseModel):
     @staticmethod
     def _normalize_executor_memory_type(
             key: ExecutorMemoryType | str) -> ExecutorMemoryType:
+        """Normalize executor memory type to canonical form."""
         if isinstance(key, ExecutorMemoryType):
             return key
         if isinstance(key, str):
@@ -1641,6 +1678,7 @@ class SleepConfig(StrictBaseModel):
         *,
         default_mode: Optional[_VirtualMemoryRestoreMode] = None
     ) -> defaultdict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
+        """Create defaulted restore modes."""
         from tensorrt_llm._torch.virtual_memory import RestoreMode
         default_mode: _VirtualMemoryRestoreMode = default_mode or (
             RestoreMode.PINNED if prefer_pinned() else RestoreMode.CPU)
@@ -1657,6 +1695,7 @@ class SleepConfig(StrictBaseModel):
     @field_validator('restore_modes', mode='plain')
     @classmethod
     def _validate_restore_modes(cls, v):
+        """Validate restore modes."""
         if not isinstance(v, dict):
             raise ValueError(
                 f"restore_modes must be dict, got {type(v).__name__}")
@@ -1674,16 +1713,17 @@ class SleepConfig(StrictBaseModel):
 
 
 class PybindMirror(ABC):
-    ''' A class containing the utilities for mirroring Python classes to
+    """A class containing the utilities for mirroring Python classes to
     pybind classes.
-    '''
+    """
 
     @abstractmethod
     def _to_pybind(self):
-        pass
+        """Convert to pybind executor configuration."""
 
     @staticmethod
     def maybe_to_pybind(ins):
+        """Convert to pybind if not None."""
         if isinstance(
                 ins,
                 PybindMirror) or type(ins).__class__ == PybindMirrorEnumMeta:
@@ -1692,8 +1732,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_fields(pybind_class):
-        """
-        Class decorator that ensures Python class fields mirror those of a C++ class.
+        """Class decorator that ensures Python class fields mirror those of a C++ class.
 
         Args:
             pybind_class: The C++ class whose fields should be mirrored
@@ -1703,6 +1742,7 @@ class PybindMirror(ABC):
         """
 
         def decorator(cls):
+            """Wrap the target class with mirrored pybind fields."""
             assert issubclass(cls, StrictBaseModel)
             # Get all non-private fields from the C++ class
             cpp_fields = PybindMirror.get_pybind_variable_fields(pybind_class)
@@ -1722,7 +1762,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_enum_fields(pybind_class):
-        ''' Get all the enum fields from the pybind class. '''
+        """Get all the enum fields from the pybind class."""
         return [
             f for f in pybind_class.__members__.keys()
             if not f.startswith('_') and not callable(getattr(pybind_class, f))
@@ -1730,9 +1770,10 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_enum(pybind_class):
-        ''' Mirror the enum fields from the pybind class to the Python class. '''
+        """Mirror the enum fields from the pybind class to the Python class."""
 
         def decorator(cls):
+            """Wrap the target class with mirrored pybind fields."""
             assert issubclass(cls, Enum)
             cpp_fields = PybindMirror.get_pybind_enum_fields(pybind_class)
             python_fields = set(cls.__members__.keys())
@@ -1748,7 +1789,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_variable_fields(config_cls):
-        ''' Get all the variable fields from the pybind class. '''
+        """Get all the variable fields from the pybind class."""
         return [
             f for f in dir(config_cls)
             if not f.startswith('_') and not callable(getattr(config_cls, f))
@@ -1756,7 +1797,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def pybind_equals(obj0, obj1):
-        ''' Check if two pybind objects are equal. '''
+        """Check if two pybind objects are equal."""
         assert type(obj0) is type(obj1)
         for field in PybindMirror.get_pybind_variable_fields(type(obj0)):
             if getattr(obj0, field) != getattr(obj1, field):
@@ -1821,41 +1862,45 @@ class PybindMirror(ABC):
 
 
 class PybindMirrorMeta(type(PybindMirror)):
-    pass
+    """Metaclass for pybind mirror types."""
 
 
 class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
-    """
-    Combined metaclass for Enum and PybindMirror.  This is crucial.
+    """Combined metaclass for Enum and PybindMirror.  This is crucial.
     """
 
 
 @PybindMirror.mirror_pybind_enum(_BatchingType)
 class BatchingType(StrEnum, metaclass=PybindMirrorEnumMeta):
+    """Enumeration of batchingtype options."""
     STATIC = "STATIC"
     INFLIGHT = "INFLIGHT"
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return getattr(_BatchingType, self.value)
 
 
 @PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
 class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
+    """Enumeration of capacityschedulerpolicy options."""
     MAX_UTILIZATION = "MAX_UTILIZATION"
     GUARANTEED_NO_EVICT = "GUARANTEED_NO_EVICT"
     STATIC_BATCH = "STATIC_BATCH"
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return getattr(_CapacitySchedulerPolicy, self.value)
 
 
 @PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
 class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
-    ''' Context chunking policy. '''
+    """Context chunking policy."""
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return getattr(_ContextChunkingPolicy, self.value)
 
 
@@ -1887,6 +1932,7 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return _DynamicBatchConfig(
             enable_batch_size_tuning=self.enable_batch_size_tuning,
             enable_max_num_tokens_tuning=self.enable_max_num_tokens_tuning,
@@ -1896,6 +1942,7 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
 class SchedulerConfig(StrictBaseModel, PybindMirror):
+    """Scheduler configuration."""
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
         default=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         description="The capacity scheduler policy to use")
@@ -1918,6 +1965,7 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         description="Use pure-Python scheduler instead of C++ scheduler.")
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return _SchedulerConfig(
             capacity_scheduler_policy=self.capacity_scheduler_policy._to_pybind(
             ),
@@ -1929,8 +1977,7 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
 class PeftCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the PEFT cache.
+    """Configuration for the PEFT cache.
     """
     num_host_module_layer: int = Field(
         default=0,
@@ -1982,6 +2029,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return _PeftCacheConfig(
             num_host_module_layer=self.num_host_module_layer,
             num_device_module_layer=self.num_device_module_layer,
@@ -1999,8 +2047,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
 class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
-    """
-    Configuration for lookahead speculative decoding.
+    """Configuration for lookahead speculative decoding.
     """
 
     decoding_type: Literal["Lookahead"] = "Lookahead"
@@ -2018,20 +2065,24 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
+        """Set the maximum total draft tokens."""
         self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only supports linear tree
         return self
 
     def calculate_speculative_resource(self):
+        """Calculate resource requirements for speculative decoding."""
         return _LookaheadDecodingConfig.calculate_speculative_resource_tuple(
             self.max_window_size, self.max_ngram_size,
             self.max_verification_set_size)
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return _LookaheadDecodingConfig(self.max_window_size,
                                         self.max_ngram_size,
                                         self.max_verification_set_size)
 
     def supports_backend(self, backend: str) -> bool:
+        """Check whether this config supports the given backend."""
         return backend not in ("pytorch", "_autodeploy")
 
 
@@ -2065,8 +2116,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the KV cache.
+    """Configuration for the KV cache.
     """
     enable_block_reuse: bool = Field(
         default=True,
@@ -2187,6 +2237,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
             max_tokens=self.max_tokens,
@@ -2218,6 +2269,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @field_validator('dtype')
     @classmethod
     def validate_dtype(cls, v: str):
+        """Validate dtype."""
         v = v.lower()
         if v in ("auto", "fp8",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
@@ -2230,6 +2282,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @field_validator('max_gpu_total_bytes')
     @classmethod
     def validate_max_gpu_total_bytes(cls, v: int):
+        """Validate max gpu total bytes."""
         if v < 0:
             raise ValueError(
                 "kv_cache_config.max_gpu_total_bytes must be non-negative")
@@ -2238,6 +2291,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @field_validator('max_attention_window')
     @classmethod
     def validate_max_attention_window(cls, v: Optional[List[int]]):
+        """Validate max attention window."""
         if v is None:
             return v
 
@@ -2259,6 +2313,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @field_validator('max_util_for_resume')
     @classmethod
     def validate_max_util_for_resume(cls, v: float):
+        """Validate max util for resume."""
         if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
@@ -2267,8 +2322,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
 class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for extended runtime performance knobs.
+    """Configuration for extended runtime performance knobs.
     """
 
     multi_block_mode: bool = Field(
@@ -2288,6 +2342,7 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         res = _ExtendedRuntimePerfKnobConfig(
             multi_block_mode=self.multi_block_mode,
             enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
@@ -2298,8 +2353,7 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the cache transceiver.
+    """Configuration for the cache transceiver.
     """
 
     backend: Optional[Literal[
@@ -2331,6 +2385,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
+        """Convert to pybind executor configuration."""
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
@@ -2341,9 +2396,11 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 
 @dataclass
 class _ModelWrapper:
+    """Wrapper for model path or Hub identifier."""
     model: Union[str, Path]
 
     def __post_init__(self):
+        """Post-initialization validation and setup."""
         if not self.model:
             raise ValueError("model should be provided.")
         assert isinstance(self.model,
@@ -2356,19 +2413,23 @@ class _ModelWrapper:
 
     @property
     def is_hub_model(self) -> bool:
+        """Check if hub model."""
         return not self.is_local_model
 
     @property
     def is_local_model(self) -> bool:
+        """Check if local model."""
         return isinstance(self.model, Path)
 
     @property
     def model_dir(self) -> Path:
+        """Model Dir property."""
         assert self.is_local_model, f"model_dir is only available for local model, {self.model}."
         return self.model
 
     @model_dir.setter
     def model_dir(self, model_dir: Union[str, Path]):
+        """Model Dir property."""
         model_dir = Path(model_dir)
         assert model_dir.exists() and model_dir.is_dir(
         ), f"model_dir is not a valid path, {model_dir}"
@@ -2376,12 +2437,12 @@ class _ModelWrapper:
 
     @property
     def model_name(self) -> Union[str, Path]:
+        """Model Name property."""
         return self.model if isinstance(self.model, str) else None
 
 
 class BaseLlmArgs(StrictBaseModel):
-    """
-    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
+    """Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
     """
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
@@ -2660,18 +2721,22 @@ class BaseLlmArgs(StrictBaseModel):
 
     @property
     def parallel_config(self) -> _ParallelConfig:
+        """Parallel Config property."""
         return self._parallel_config
 
     @property
     def model_format(self) -> _ModelFormatKind:
+        """Model Format property."""
         return self._model_format
 
     @property
     def speculative_model(self) -> Optional[Union[str, Path]]:
+        """Speculative Model property."""
         return self.speculative_config.speculative_model if self.speculative_config is not None else None
 
     @classmethod
     def from_yaml(cls, yaml_path: Union[str, Path]):
+        """Create instance from yaml."""
         with open(yaml_path, "r") as f:
             config_dict = yaml.safe_load(f)
         return cls(**config_dict)
@@ -2679,6 +2744,7 @@ class BaseLlmArgs(StrictBaseModel):
     @field_validator("dtype")
     @classmethod
     def validate_dtype(cls, v, info):
+        """Validate dtype."""
         if torch.cuda.get_device_properties(0).major < 8:
             if v == 'auto':
                 v = 'float16'
@@ -2689,6 +2755,7 @@ class BaseLlmArgs(StrictBaseModel):
     @field_validator("gpus_per_node", mode='before')
     @classmethod
     def validate_gpus_per_node(cls, v, info):
+        """Validate gpus per node."""
         if os.getenv("RAY_LOCAL_WORLD_SIZE") is not None:
             return info.data.get("tensor_parallel_size")
         if v is None:
@@ -2718,6 +2785,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_parallel_config(self):
+        """Validate parallel config."""
         if self.moe_cluster_parallel_size is None:
             self.moe_cluster_parallel_size = -1
 
@@ -2792,6 +2860,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_runtime_args(self):
+        """Validate runtime args."""
         if self.max_batch_size is not None and self.max_num_tokens is not None:
             if self.max_batch_size > self.max_num_tokens:
                 logger.warning(
@@ -2801,6 +2870,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_lora_config_consistency(self):
+        """Validate lora config consistency."""
         if self.lora_config:
             if len(self.lora_config.lora_dir) == 0:
                 # TODO [TRTLLM-5173]
@@ -2830,6 +2900,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_peft_cache_config(self):
+        """Validate peft cache config."""
         if self.peft_cache_config is not None and self.peft_cache_config.lora_prefetch_dir is not None:
             raise ValueError(
                 f"lora_prefetch_dir was set to '{self.peft_cache_config.lora_prefetch_dir}' "
@@ -2837,6 +2908,7 @@ class BaseLlmArgs(StrictBaseModel):
         return self
 
     def get_runtime_sizes(self, ) -> Tuple[int, int, int, int]:
+        """Get runtime sizes."""
         return (
             self.max_beam_width,
             self.max_num_tokens,
@@ -2846,6 +2918,7 @@ class BaseLlmArgs(StrictBaseModel):
 
 
 class TrtLlmArgs(BaseLlmArgs):
+    """TrtLlmArgs container."""
     enable_tqdm: bool = Field(default=False,
                               description="Enable tqdm for progress bar.")
 
@@ -2905,8 +2978,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def init_build_config(self):
-        """
-        Creating a default BuildConfig if none is provided
+        """Creating a default BuildConfig if none is provided
         """
         build_config = getattr(self, "build_config", None)
         if build_config is None:
@@ -2926,6 +2998,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_build_config_remaining(self):
+        """Validate build config remaining."""
         is_trt_llm_args = isinstance(self, TrtLlmArgs)
 
         # TODO: remove the checker when manage weights support all data types
@@ -2949,6 +3022,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
+        """Validate speculative config."""
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
@@ -3011,6 +3085,7 @@ class TrtLlmArgs(BaseLlmArgs):
         return self
 
     def _load_config_from_engine(self, engine_dir: Path):
+        """Load config from engine."""
         engine_config = EngineConfig.from_json_file(engine_dir / "config.json")
         self._pretrained_config = engine_config.pretrained_config
         self.build_config = engine_config.build_config
@@ -3039,6 +3114,7 @@ class TrtLlmArgs(BaseLlmArgs):
             moe_ep_size=mapping.moe_ep_size)
 
     def _load_config_from_ckpt(self, ckpt_dir: Path):
+        """Load config from ckpt."""
         pretrained_config = PretrainedConfig.from_json_file(ckpt_dir /
                                                             "config.json")
         tp_size = pretrained_config.mapping.tp_size
@@ -3072,12 +3148,11 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_model_format_misc(self):
-        '''
-        Load the model format, and do the following:
+        """Load the model format, and do the following:
 
         1. Load the build_config if got an engine.
         2. Load the parallel_config if got a checkpoint.
-        '''
+        """
         model_obj = _ModelWrapper(self.model)
 
         if model_obj.is_local_model and self.backend not in [
@@ -3143,6 +3218,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def setup_embedding_parallel_mode(self):
+        """Set up embedding parallel mode."""
         if self.embedding_parallel_mode == 'NONE':
             self._convert_checkpoint_options['use_parallel_embedding'] = False
         elif self.embedding_parallel_mode == 'SHARDING_ALONG_VOCAB':
@@ -3156,6 +3232,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_enable_build_cache(self):
+        """Validate enable build cache."""
         if not self.enable_build_cache:
             return self
         self.enable_build_cache = BuildCacheConfig() if isinstance(
@@ -3164,11 +3241,13 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_kv_cache_dtype(self):
+        """Validate kv cache dtype."""
         assert self.kv_cache_config.dtype == "auto", "KvCacheConfig.dtype is not supported by the TensorRT backend."
         return self
 
 
 class LoadFormat(Enum):
+    """Enumeration of model loading formats."""
     AUTO = 0
     # Initialize all weights randomly.
     DUMMY = 1
@@ -3184,8 +3263,7 @@ class SamplerType(StrEnum):
 
 
 class TorchCompileConfig(StrictBaseModel):
-    """
-    Configuration for torch.compile.
+    """Configuration for torch.compile.
     """
     enable_fullgraph: bool = Field(
         default=True,
@@ -3207,6 +3285,7 @@ class TorchCompileConfig(StrictBaseModel):
     @field_validator('capture_num_tokens')
     @classmethod
     def validate_capture_num_tokens(cls, v):
+        """Validate capture num tokens."""
         if v is None:
             return v
         return sorted(set(v), reverse=True)
@@ -3223,6 +3302,7 @@ class TorchCompileConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def set_default_capture_num_tokens(self) -> 'TorchCompileConfig':
+        """Set default capture num tokens."""
         if self.enable_piecewise_cuda_graph and self.capture_num_tokens is None:
             self.capture_num_tokens = [2**i for i in range(8)
                                        ] + [i for i in range(256, 3073, 256)]
@@ -3231,6 +3311,7 @@ class TorchCompileConfig(StrictBaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    """TorchLlmArgs container."""
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
@@ -3479,12 +3560,14 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @property
     def quant_config(self) -> QuantConfig:
+        """Quant Config property."""
         if self._quant_config is None:
             self._quant_config = QuantConfig()
         return self._quant_config
 
     @quant_config.setter
     def quant_config(self, value: QuantConfig):
+        """Quant Config property."""
         self._quant_config = value
 
     # TODO: remove backend later
@@ -3497,6 +3580,7 @@ class TorchLlmArgs(BaseLlmArgs):
     @field_validator('load_format', mode='before')
     @classmethod
     def convert_load_format(cls, v):
+        """Convert load format."""
         if isinstance(v, LoadFormat):
             return v
         load_format = v.upper()
@@ -3514,19 +3598,23 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @property
     def extra_resource_managers(self) -> Dict[str, object]:
+        """Extra Resource Managers property."""
         return self._extra_resource_managers
 
     @extra_resource_managers.setter
     def extra_resource_managers(self, value: Dict[str, object]) -> None:
+        """Extra Resource Managers property."""
         self._extra_resource_managers = value
 
     @model_validator(mode="after")
     def set_model_format(self):
+        """Set model format."""
         self._model_format = _ModelFormatKind.HF
         return self
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
+        """Validate speculative config."""
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
@@ -3586,6 +3674,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_checkpoint_format(self):
+        """Validate checkpoint format."""
         if self.checkpoint_format is not None and self.checkpoint_loader is not None:
             logger.warning(
                 "checkpoint_format and checkpoint_loader are both provided, "
@@ -3602,6 +3691,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
+        """Validate load balancer."""
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
                 raise FileNotFoundError(
@@ -3628,6 +3718,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def sync_quant_config_with_kv_cache_config_dtype(self) -> 'TorchLlmArgs':
+        """Synchronize quant config with kv cache config dtype."""
         if self.kv_cache_config is None:
             return self
 
@@ -3685,14 +3776,16 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
+        """Validate ray worker extension cls."""
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
-                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+                "ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
         return self
 
     @model_validator(mode='after')
     def validate_ray_placement_config(self) -> 'TorchLlmArgs':
+        """Validate ray placement config."""
         if self.ray_placement_config is not None and self.orchestrator_type != "ray":
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
@@ -3704,6 +3797,7 @@ class TorchLlmArgs(BaseLlmArgs):
         _hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
     ) -> _ExecutorConfig:
+        """Get executor config."""
         executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
         executor_config.mm_encoder_only = self.mm_encoder_only
         return executor_config
@@ -3713,7 +3807,7 @@ def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
-
+    """Update LLM args with extra configuration."""
     if 'hf_revision' in llm_args_dict:
         llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
 
@@ -3769,6 +3863,7 @@ def update_llm_args_with_extra_dict(
 
 def update_llm_args_with_extra_options(llm_args: Dict,
                                        extra_llm_api_options: str) -> Dict:
+    """Update LLM args with extra configuration."""
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
@@ -3779,7 +3874,7 @@ def update_llm_args_with_extra_options(llm_args: Dict,
 
 def get_model_format(model_dir: str,
                      trust_remote_code: bool = False) -> _ModelFormatKind:
-    ''' Get the format of the model.  '''
+    """Get the format of the model."""
     if not (Path(model_dir) / 'config.json').exists():
         raise ValueError(
             f"Failed to infer model format because no config.json exists in {model_dir}"

@@ -1,3 +1,4 @@
+"""Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -96,6 +97,7 @@ def _compute_slot_mappings(
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    """Apply Hadamard rotation to activation tensor for DSA sparse attention."""
     assert x.dtype == torch.bfloat16
 
     if not HAS_FAST_HADAMARD:
@@ -323,6 +325,8 @@ class IndexerPrefillChunkMetadata:
 
 
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
+    """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
+
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
@@ -345,6 +349,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     use_expanded_buffers_for_mtp: bool = False
 
     def __init__(self, *args, **kwargs):
+        """Initialize DSA metadata with SM count and indexer chunk size."""
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
@@ -353,6 +358,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
 
     def __post_init__(self):
+        """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
 
         self.sparse_mla_topk = self.sparse_attention_config.index_topk
@@ -551,6 +557,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
     def create_expanded_buffers(self, capture_graph=False):
+        """Create expanded KV-length and block-table buffers for speculative decoding."""
         self.kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_sequences * (1 + self.max_draft_tokens), ),
@@ -621,6 +628,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         spec_tree_manager: Optional['SpecTreeManager'] = None,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
+        """Update speculative decoding parameters and create expanded buffers."""
         super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
                                       is_spec_dec_dynamic_tree, max_draft_len,
@@ -636,6 +644,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_dense_topk_indices(self,
                                    kv_lens,
                                    device=False):  # device=False means use CPU
+        """Prepare dense TopK indices for short sequences that skip the indexer."""
 
         @maybe_compile(dynamic=True)
         def _get_dense_topk_indices(seq_lens, kv_lens, num_tokens):
@@ -721,6 +730,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return pool_indices
 
     def prepare(self):
+        """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
 
         # Get kv lengths
@@ -899,6 +909,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         Indexer.prepare(metadata=self)
 
     def on_update_kv_lens(self):
+        """Refresh indexer slot mappings after KV lengths change at runtime."""
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -976,6 +987,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
+        """Reset context/generation counters and refresh slot mappings for speculative decoding."""
         super().update_for_spec_dec()
         # host
         self.max_ctx_kv_len = 0
@@ -989,15 +1001,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 @maybe_compile(dynamic=True)
 def _scale(weights: torch.Tensor, q_scale: torch.Tensor,
            s: float) -> torch.Tensor:
+    """Scale attention weights by quantization scale and constant factor."""
     return weights * q_scale.squeeze(-1) * s
 
 
 @maybe_compile(dynamic=True)
 def _to_float(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Cast hidden states to float32 for TF32 GEMM computation."""
     return hidden_states.float()
 
 
 class Indexer(nn.Module):
+    """DSA sparse attention indexer that selects top-K KV cache entries per token."""
 
     def __init__(self,
                  quant_config: Optional[QuantConfig],
@@ -1008,6 +1023,7 @@ class Indexer(nn.Module):
                  dtype: Optional[torch.dtype],
                  layer_idx: int = 0,
                  aux_stream: Optional[torch.cuda.Stream] = None):
+        """Initialize indexer with projection weights, norms, and TopK configuration."""
         super().__init__()
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
@@ -1448,6 +1464,7 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
+        """Run the indexer TopK kernel for both prefill and decode phases."""
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -1729,6 +1746,7 @@ class Indexer(nn.Module):
 
     def _weight_scale(self, weights: torch.Tensor,
                       q_scale: torch.Tensor) -> torch.Tensor:
+        """Apply quantization scale to indexer attention weights."""
         weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
 
@@ -1756,6 +1774,7 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
+        """Compute indexer TopK indices via fused projection, RoPE, and FP8 scoring."""
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
@@ -1802,6 +1821,8 @@ class Indexer(nn.Module):
 
 
 class DSATrtllmAttention(TrtllmAttention):
+    """TRT-LLM attention layer with DSA sparse indexer for MLA models."""
+
     Metadata = DSAtrtllmAttentionMetadata
 
     def __init__(
@@ -1820,6 +1841,7 @@ class DSATrtllmAttention(TrtllmAttention):
             dtype: Optional[torch.dtype] = None,
             aux_stream: Optional[torch.cuda.Stream] = None,
             **kwargs):
+        """Initialize DSA attention with an Indexer sub-module for sparse TopK selection."""
         if sparse_attention_config is None:
             raise ValueError(
                 "sparse_attention_config is required for DSATrtllmAttention and cannot be None"
@@ -1856,6 +1878,7 @@ class DSATrtllmAttention(TrtllmAttention):
         is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Transform local TopK indices to global paged KV cache indices."""
         # Transform the local topk indices to global topk indices in paged kv cache
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, self.get_local_layer_idx(metadata),
@@ -1874,6 +1897,7 @@ class DSATrtllmAttention(TrtllmAttention):
         qr: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """No-op KV prediction; DSA uses indexer-based selection instead."""
         return None, None
 
     def mla_rope_append_paged_kv_assign_q(
@@ -1884,6 +1908,7 @@ class DSATrtllmAttention(TrtllmAttention):
         is_generation: bool = False,
         **kwargs,
     ) -> None:
+        """Apply RoPE, append latent cache to paged KV, and assign query for MLA."""
         if is_generation:
             cached_token_indptr = metadata.gen_cached_token_indptr
             kv_indptr = metadata.gen_kv_indptr
@@ -1930,6 +1955,7 @@ class DSATrtllmAttention(TrtllmAttention):
 
 
 class DSACacheManager(KVCacheManager):
+    """KV cache manager for DSA with additional indexer K-cache pools."""
 
     def __init__(
         self,
@@ -1954,6 +1980,7 @@ class DSACacheManager(KVCacheManager):
         sparse_attn_config: "SparseAttentionConfig",
         **kwargs,
     ) -> None:
+        """Initialize cache manager with indexer K-cache pool per layer."""
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
 
@@ -1998,6 +2025,7 @@ class DSACacheManager(KVCacheManager):
             self.num_blocks, block_size, 1, per_token_size)
 
     def shutdown(self):
+        """Release indexer K-cache pool references before C++ buffer cleanup."""
         # Clear Python references BEFORE C++ frees the underlying CUDA buffers
         self.indexer_k_cache_pool_per_layer = []
         super().shutdown()
@@ -2005,6 +2033,7 @@ class DSACacheManager(KVCacheManager):
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
                                  **kwargs):
+        """Estimate total cache bytes per token including indexer K-cache overhead."""
         config = model_config.pretrained_config
         sparse_attn_config = model_config.sparse_attention_config
         index_head_dim = sparse_attn_config.index_head_dim
@@ -2033,6 +2062,7 @@ class DSACacheManager(KVCacheManager):
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
+        """Compute actual cache bytes per token from instance configuration."""
         # self.kv_factor for K, others for indexer K cache
         head_dim_factor = (self.index_head_dim + self.index_head_dim //
                            self.quant_block_size * 4) / self.head_dim
