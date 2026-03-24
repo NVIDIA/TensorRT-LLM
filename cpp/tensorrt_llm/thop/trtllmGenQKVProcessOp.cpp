@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
@@ -41,6 +42,8 @@ using tensorrt_llm::kernels::KvCacheDataType;
 using tensorrt_llm::kernels::PositionEmbeddingType;
 using tensorrt_llm::kernels::QKVPreprocessingParams;
 using tensorrt_llm::kernels::RotaryScalingType;
+using tensorrt_llm::kernels::MlaMetaParams;
+using tensorrt_llm::kernels::MlaParams;
 using tensorrt_llm::kernels::cacheTypeFromQuantMode;
 using tensorrt_llm::runtime::TorchUtils;
 
@@ -296,6 +299,209 @@ void qkv_processing(
     }
 }
 
+// ---------------------------------------------------------------------------
+// MLA context operations (mla_rope_context / mla_context_fp8_quantize)
+// ---------------------------------------------------------------------------
+
+void mla_rope_context(
+    // MlaParams tensor fields
+    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_buf, std::optional<torch::Tensor> k_buf,
+    std::optional<torch::Tensor> v_buf, std::optional<torch::Tensor> quant_q_buf,
+    std::optional<torch::Tensor> quant_k_buf, std::optional<torch::Tensor> quant_v_buf,
+    std::optional<torch::Tensor> context_buf, std::optional<torch::Tensor> q_pe,
+    std::optional<torch::Tensor> cos_sin_cache, std::optional<torch::Tensor> workspace,
+    std::optional<torch::Tensor> cache_seq_lens, std::optional<torch::Tensor> seq_q_offset,
+    std::optional<torch::Tensor> fmha_tile_counter, std::optional<torch::Tensor> cu_q_seqlens,
+    std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> block_ids_per_seq,
+    std::optional<torch::Tensor> bmm1_scale, std::optional<torch::Tensor> bmm2_scale,
+    std::optional<torch::Tensor> quant_scale_o, std::optional<torch::Tensor> quant_scale_q,
+    std::optional<torch::Tensor> quant_scale_kv, std::optional<torch::Tensor> dequant_scale_q,
+    std::optional<torch::Tensor> dequant_scale_kv, std::optional<torch::Tensor> quant_scale_qkv,
+    std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
+    // MlaParams scalar fields
+    int64_t batch_size, int64_t acc_q_len, int64_t head_num, int64_t max_input_seq_len, int64_t q_pe_ld,
+    int64_t q_pe_stride, int64_t q_lora_rank, int64_t kv_lora_rank, int64_t qk_nope_head_dim, int64_t qk_rope_head_dim,
+    int64_t v_head_dim, int64_t predicted_tokens_per_seq, int64_t num_layers, double host_bmm1_scale,
+    bool absorption_mode,
+    // KV cache args
+    std::optional<torch::Tensor> kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
+    std::optional<torch::Tensor> host_kv_cache_pool_mapping, int64_t layer_idx, int64_t tokens_per_block,
+    int64_t kv_head_num, int64_t size_per_head, int64_t kv_cache_quant_mode, int64_t cyclic_attention_window_size,
+    int64_t max_attention_window_size, int64_t sink_token_length, int64_t beam_width, int64_t seq_offset)
+{
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(q_buf.has_value(), "q_buf is required for mla_rope_context");
+    auto dtype = TorchUtils::dataType(q_buf->scalar_type());
+
+    auto quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
+    auto kvArrays = buildPagedKvCacheBuffers(kv_cache_block_offsets, host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping, quantMode, layer_idx, batch_size, tokens_per_block, kv_head_num, size_per_head,
+        cyclic_attention_window_size, max_attention_window_size, sink_token_length, beam_width, seq_offset,
+        /*is_mla_enable=*/true, static_cast<size_t>(q_buf->element_size()));
+
+    MlaParams<void> p{};
+    p.latent_cache = latent_cache.has_value() ? latent_cache->data_ptr() : nullptr;
+    p.q_buf = q_buf.has_value() ? q_buf->data_ptr() : nullptr;
+    p.k_buf = k_buf.has_value() ? k_buf->data_ptr() : nullptr;
+    p.v_buf = v_buf.has_value() ? v_buf->data_ptr() : nullptr;
+    p.quant_q_buf = quant_q_buf.has_value() ? quant_q_buf->data_ptr() : nullptr;
+    p.quant_k_buf = quant_k_buf.has_value() ? quant_k_buf->data_ptr() : nullptr;
+    p.quant_v_buf = quant_v_buf.has_value() ? quant_v_buf->data_ptr() : nullptr;
+    p.context_buf = context_buf.has_value() ? context_buf->data_ptr() : nullptr;
+    p.q_pe = q_pe.has_value() ? q_pe->data_ptr() : nullptr;
+    p.cos_sin_cache = optPtr<float2>(cos_sin_cache);
+    p.batch_size = static_cast<int32_t>(batch_size);
+    p.acc_q_len = static_cast<int32_t>(acc_q_len);
+    p.head_num = static_cast<int32_t>(head_num);
+    p.workspace = workspace.has_value() ? workspace->data_ptr() : nullptr;
+    p.cache_seq_lens = optPtr<int32_t>(cache_seq_lens);
+    p.seqQOffset = optPtr<int>(seq_q_offset);
+    p.fmha_tile_counter = optPtr<uint32_t>(fmha_tile_counter);
+    p.max_input_seq_len = static_cast<int32_t>(max_input_seq_len);
+    p.cu_q_seqlens = optPtr<int>(cu_q_seqlens);
+    p.cu_kv_seqlens = optPtr<int>(cu_kv_seqlens);
+    p.q_pe_ld = static_cast<int32_t>(q_pe_ld);
+    p.q_pe_stride = static_cast<int32_t>(q_pe_stride);
+    p.meta.q_lora_rank = static_cast<int32_t>(q_lora_rank);
+    p.meta.kv_lora_rank = static_cast<int32_t>(kv_lora_rank);
+    p.meta.qk_nope_head_dim = static_cast<int32_t>(qk_nope_head_dim);
+    p.meta.qk_rope_head_dim = static_cast<int32_t>(qk_rope_head_dim);
+    p.meta.v_head_dim = static_cast<int32_t>(v_head_dim);
+    p.meta.predicted_tokens_per_seq = static_cast<int32_t>(predicted_tokens_per_seq);
+    p.meta.num_layers = static_cast<int32_t>(num_layers);
+    p.block_ids_per_seq = optPtr<int>(block_ids_per_seq);
+    p.cache_type = cacheTypeFromQuantMode(quantMode);
+    p.bmm1_scale = optPtr<float>(bmm1_scale);
+    p.bmm2_scale = optPtr<float>(bmm2_scale);
+    p.quant_scale_o = optPtr<float>(quant_scale_o);
+    p.quant_scale_q = optPtr<float>(quant_scale_q);
+    p.quant_scale_kv = optPtr<float>(quant_scale_kv);
+    p.dequant_scale_q = optPtr<float>(dequant_scale_q);
+    p.dequant_scale_kv = optPtr<float>(dequant_scale_kv);
+    p.host_bmm1_scale = static_cast<float>(host_bmm1_scale);
+    p.absorption_mode = absorption_mode;
+    p.quant_scale_qkv = optPtr<float>(quant_scale_qkv);
+    p.helix_position_offsets = optPtr<int32_t>(helix_position_offsets);
+    p.helix_is_inactive_rank
+        = helix_is_inactive_rank.has_value() ? static_cast<bool const*>(helix_is_inactive_rank->data_ptr()) : nullptr;
+
+    switch (dtype)
+    {
+    case nvinfer1::DataType::kFLOAT:
+        tensorrt_llm::kernels::invokeMLARopeContext(
+            reinterpret_cast<MlaParams<float>&>(p), kvArrays.kvCacheBuffer, stream);
+        break;
+    case nvinfer1::DataType::kHALF:
+        tensorrt_llm::kernels::invokeMLARopeContext(
+            reinterpret_cast<MlaParams<half>&>(p), kvArrays.kvCacheBuffer, stream);
+        break;
+#ifdef ENABLE_BF16
+    case nvinfer1::DataType::kBF16:
+        tensorrt_llm::kernels::invokeMLARopeContext(
+            reinterpret_cast<MlaParams<__nv_bfloat16>&>(p), kvArrays.kvCacheBuffer, stream);
+        break;
+#endif
+    default: TORCH_CHECK(false, "Unsupported data type for MLA RoPE context.");
+    }
+    sync_check_cuda_error(stream);
+}
+
+void mla_context_fp8_quantize(
+    // MlaParams tensor fields
+    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_buf, std::optional<torch::Tensor> k_buf,
+    std::optional<torch::Tensor> v_buf, std::optional<torch::Tensor> quant_q_buf,
+    std::optional<torch::Tensor> quant_k_buf, std::optional<torch::Tensor> quant_v_buf,
+    std::optional<torch::Tensor> context_buf, std::optional<torch::Tensor> q_pe,
+    std::optional<torch::Tensor> cos_sin_cache, std::optional<torch::Tensor> workspace,
+    std::optional<torch::Tensor> cache_seq_lens, std::optional<torch::Tensor> seq_q_offset,
+    std::optional<torch::Tensor> fmha_tile_counter, std::optional<torch::Tensor> cu_q_seqlens,
+    std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> block_ids_per_seq,
+    std::optional<torch::Tensor> bmm1_scale, std::optional<torch::Tensor> bmm2_scale,
+    std::optional<torch::Tensor> quant_scale_o, std::optional<torch::Tensor> quant_scale_q,
+    std::optional<torch::Tensor> quant_scale_kv, std::optional<torch::Tensor> dequant_scale_q,
+    std::optional<torch::Tensor> dequant_scale_kv, std::optional<torch::Tensor> quant_scale_qkv,
+    std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
+    // MlaParams scalar fields
+    int64_t batch_size, int64_t acc_q_len, int64_t head_num, int64_t max_input_seq_len, int64_t q_pe_ld,
+    int64_t q_pe_stride, int64_t q_lora_rank, int64_t kv_lora_rank, int64_t qk_nope_head_dim, int64_t qk_rope_head_dim,
+    int64_t v_head_dim, int64_t predicted_tokens_per_seq, int64_t num_layers, double host_bmm1_scale,
+    bool absorption_mode,
+    // Extra args
+    int64_t total_kv_len)
+{
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(q_buf.has_value(), "q_buf is required for mla_context_fp8_quantize");
+    auto dtype = TorchUtils::dataType(q_buf->scalar_type());
+
+    MlaParams<void> p{};
+    p.latent_cache = latent_cache.has_value() ? latent_cache->data_ptr() : nullptr;
+    p.q_buf = q_buf.has_value() ? q_buf->data_ptr() : nullptr;
+    p.k_buf = k_buf.has_value() ? k_buf->data_ptr() : nullptr;
+    p.v_buf = v_buf.has_value() ? v_buf->data_ptr() : nullptr;
+    p.quant_q_buf = quant_q_buf.has_value() ? quant_q_buf->data_ptr() : nullptr;
+    p.quant_k_buf = quant_k_buf.has_value() ? quant_k_buf->data_ptr() : nullptr;
+    p.quant_v_buf = quant_v_buf.has_value() ? quant_v_buf->data_ptr() : nullptr;
+    p.context_buf = context_buf.has_value() ? context_buf->data_ptr() : nullptr;
+    p.q_pe = q_pe.has_value() ? q_pe->data_ptr() : nullptr;
+    p.cos_sin_cache = optPtr<float2>(cos_sin_cache);
+    p.batch_size = static_cast<int32_t>(batch_size);
+    p.acc_q_len = static_cast<int32_t>(acc_q_len);
+    p.head_num = static_cast<int32_t>(head_num);
+    p.workspace = workspace.has_value() ? workspace->data_ptr() : nullptr;
+    p.cache_seq_lens = optPtr<int32_t>(cache_seq_lens);
+    p.seqQOffset = optPtr<int>(seq_q_offset);
+    p.fmha_tile_counter = optPtr<uint32_t>(fmha_tile_counter);
+    p.max_input_seq_len = static_cast<int32_t>(max_input_seq_len);
+    p.cu_q_seqlens = optPtr<int>(cu_q_seqlens);
+    p.cu_kv_seqlens = optPtr<int>(cu_kv_seqlens);
+    p.q_pe_ld = static_cast<int32_t>(q_pe_ld);
+    p.q_pe_stride = static_cast<int32_t>(q_pe_stride);
+    p.meta.q_lora_rank = static_cast<int32_t>(q_lora_rank);
+    p.meta.kv_lora_rank = static_cast<int32_t>(kv_lora_rank);
+    p.meta.qk_nope_head_dim = static_cast<int32_t>(qk_nope_head_dim);
+    p.meta.qk_rope_head_dim = static_cast<int32_t>(qk_rope_head_dim);
+    p.meta.v_head_dim = static_cast<int32_t>(v_head_dim);
+    p.meta.predicted_tokens_per_seq = static_cast<int32_t>(predicted_tokens_per_seq);
+    p.meta.num_layers = static_cast<int32_t>(num_layers);
+    p.block_ids_per_seq = optPtr<int>(block_ids_per_seq);
+    p.cache_type = KvCacheDataType::FP8;
+    p.bmm1_scale = optPtr<float>(bmm1_scale);
+    p.bmm2_scale = optPtr<float>(bmm2_scale);
+    p.quant_scale_o = optPtr<float>(quant_scale_o);
+    p.quant_scale_q = optPtr<float>(quant_scale_q);
+    p.quant_scale_kv = optPtr<float>(quant_scale_kv);
+    p.dequant_scale_q = optPtr<float>(dequant_scale_q);
+    p.dequant_scale_kv = optPtr<float>(dequant_scale_kv);
+    p.host_bmm1_scale = static_cast<float>(host_bmm1_scale);
+    p.absorption_mode = absorption_mode;
+    p.quant_scale_qkv = optPtr<float>(quant_scale_qkv);
+    p.helix_position_offsets = optPtr<int32_t>(helix_position_offsets);
+    p.helix_is_inactive_rank
+        = helix_is_inactive_rank.has_value() ? static_cast<bool const*>(helix_is_inactive_rank->data_ptr()) : nullptr;
+
+    switch (dtype)
+    {
+    case nvinfer1::DataType::kFLOAT:
+        tensorrt_llm::kernels::invokeMLAContextFp8Quantize(
+            reinterpret_cast<MlaParams<float>&>(p), static_cast<int>(total_kv_len), stream);
+        break;
+    case nvinfer1::DataType::kHALF:
+        tensorrt_llm::kernels::invokeMLAContextFp8Quantize(
+            reinterpret_cast<MlaParams<half>&>(p), static_cast<int>(total_kv_len), stream);
+        break;
+#ifdef ENABLE_BF16
+    case nvinfer1::DataType::kBF16:
+        tensorrt_llm::kernels::invokeMLAContextFp8Quantize(
+            reinterpret_cast<MlaParams<__nv_bfloat16>&>(p), static_cast<int>(total_kv_len), stream);
+        break;
+#endif
+    default: TORCH_CHECK(false, "Unsupported data type for MLA context FP8 quantize.");
+    }
+    sync_check_cuda_error(stream);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -367,6 +573,52 @@ TRTLLM_NAMESPACE_END
     "int seq_offset=0, "                               \
     "bool is_mla_enable=False"
 
+// Schema string shared by mla_rope_context and mla_context_fp8_quantize.
+// clang-format off
+#define MLA_PARAMS_SCHEMA                              \
+    "Tensor? latent_cache, "                           \
+    "Tensor(a!)? q_buf, "                              \
+    "Tensor(b!)? k_buf, "                              \
+    "Tensor? v_buf, "                                  \
+    "Tensor(c!)? quant_q_buf, "                        \
+    "Tensor(d!)? quant_k_buf, "                        \
+    "Tensor(e!)? quant_v_buf, "                        \
+    "Tensor? context_buf, "                            \
+    "Tensor(f!)? q_pe, "                               \
+    "Tensor? cos_sin_cache, "                          \
+    "Tensor? workspace, "                              \
+    "Tensor? cache_seq_lens, "                         \
+    "Tensor? seq_q_offset, "                           \
+    "Tensor(g!)? fmha_tile_counter, "                  \
+    "Tensor? cu_q_seqlens, "                           \
+    "Tensor? cu_kv_seqlens, "                          \
+    "Tensor? block_ids_per_seq, "                      \
+    "Tensor(h!)? bmm1_scale, "                         \
+    "Tensor(i!)? bmm2_scale, "                         \
+    "Tensor? quant_scale_o, "                          \
+    "Tensor? quant_scale_q, "                          \
+    "Tensor? quant_scale_kv, "                         \
+    "Tensor? dequant_scale_q, "                        \
+    "Tensor? dequant_scale_kv, "                       \
+    "Tensor? quant_scale_qkv, "                        \
+    "Tensor? helix_position_offsets, "                 \
+    "Tensor? helix_is_inactive_rank, "                 \
+    "int batch_size, "                                 \
+    "int acc_q_len, "                                  \
+    "int head_num, "                                   \
+    "int max_input_seq_len, "                          \
+    "int q_pe_ld, "                                    \
+    "int q_pe_stride, "                                \
+    "int q_lora_rank, "                                \
+    "int kv_lora_rank, "                               \
+    "int qk_nope_head_dim, "                           \
+    "int qk_rope_head_dim, "                           \
+    "int v_head_dim, "                                 \
+    "int predicted_tokens_per_seq, "                   \
+    "int num_layers, "                                 \
+    "float host_bmm1_scale, "                          \
+    "bool absorption_mode"
+
 // clang-format on
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -412,6 +664,29 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
     m.def("qkv_preprocessing(" QKV_PROCESSING_SCHEMA ") -> ()");
     m.def("kv_cache_postprocessing(" QKV_PROCESSING_SCHEMA ") -> ()");
+
+    // clang-format off
+    m.def("mla_rope_context(" MLA_PARAMS_SCHEMA ", "
+        "Tensor? kv_cache_block_offsets, "
+        "Tensor? host_kv_cache_pool_pointers, "
+        "Tensor? host_kv_cache_pool_mapping, "
+        "int layer_idx, "
+        "int tokens_per_block, "
+        "int kv_head_num, "
+        "int size_per_head, "
+        "int kv_cache_quant_mode, "
+        "int cyclic_attention_window_size, "
+        "int max_attention_window_size, "
+        "int sink_token_length, "
+        "int beam_width, "
+        "int seq_offset=0"
+        ") -> ()");
+    // clang-format on
+
+    m.def("mla_context_fp8_quantize(" MLA_PARAMS_SCHEMA
+          ", "
+          "int total_kv_len"
+          ") -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -419,4 +694,6 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("build_decoder_info", &tensorrt_llm::torch_ext::build_decoder_info);
     m.impl("qkv_preprocessing", &tensorrt_llm::torch_ext::qkv_processing<true>);
     m.impl("kv_cache_postprocessing", &tensorrt_llm::torch_ext::qkv_processing<false>);
+    m.impl("mla_rope_context", &tensorrt_llm::torch_ext::mla_rope_context);
+    m.impl("mla_context_fp8_quantize", &tensorrt_llm::torch_ext::mla_context_fp8_quantize);
 }
