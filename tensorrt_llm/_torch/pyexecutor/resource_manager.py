@@ -785,9 +785,13 @@ class KVCacheManager(BaseResourceManager):
             if request.py_rewind_len > 0:
                 self.rewind_kv_cache(request, request.py_rewind_len)
 
-        # For context requests, we store the blocks for reuse.
+        # For context requests, store completed context blocks for KV cache reuse.
+        # We wait until context_remaining_length == 0 (all chunks processed) before
+        # storing, so that SWA windows are safe to store — blocks won't go out-of-window
+        # and be evicted while the context is still in-flight.
         for request in scheduled_batch.context_requests:
-            self.impl.store_context_blocks(request)
+            if request.context_remaining_length == 0:
+                self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,

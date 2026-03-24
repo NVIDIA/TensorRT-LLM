@@ -1076,13 +1076,13 @@ cu13 = ["cuda-bindings[all] (==13.*)"]
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.4.3"
+version = "1.4.4"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_pathfinder-1.4.3-py3-none-any.whl", hash = "sha256:4345d8ead1f701c4fb8a99be6bc1843a7348b6ba0ef3b031f5a2d66fb128ae4c"},
+    {file = "cuda_pathfinder-1.4.4-py3-none-any.whl", hash = "sha256:1a9e7feccae0d969ad88545d0462f2ed2750df8e6732309798dc1e1ca603a28b"},
 ]
 
 [[package]]
@@ -1133,49 +1133,45 @@ tileiras = ["nvidia-cuda-nvcc (>=13.2,<13.3)", "nvidia-cuda-tileiras (>=13.2,<13
 
 [[package]]
 name = "cuda-toolkit"
-version = "13.2.0"
+version = "13.0.2"
 description = "CUDA Toolkit meta-package"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "cuda_toolkit-13.2.0-py2.py3-none-any.whl", hash = "sha256:d749077fdf11010881c208978b5fdd3e302290cc2f141ae92ed6e989ea9a65c7"},
+    {file = "cuda_toolkit-13.0.2-py2.py3-none-any.whl", hash = "sha256:b198824cf2f54003f50d64ada3a0f184b42ca0846c1c94192fa269ecd97a66eb"},
 ]
 
 [package.dependencies]
-nvidia-cuda-runtime = {version = "==13.2.51.*", optional = true, markers = "(sys_platform == \"win32\" or sys_platform == \"linux\") and extra == \"cudart\""}
+nvidia-cuda-runtime = {version = "==13.0.96.*", optional = true, markers = "(sys_platform == \"linux\" or sys_platform == \"win32\") and extra == \"cudart\""}
 
 [package.extras]
-all = ["nvidia-cublas (==13.3.0.5.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-cccl (==13.2.27.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-crt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-culibos (==13.2.51.*) ; sys_platform == \"linux\"", "nvidia-cuda-cuobjdump (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-cupti (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-cuxxfilt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-nvcc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-nvdisasm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-nvrtc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-opencl (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-profiler-api (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-runtime (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-sanitizer-api (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-tileiras (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cudla (==13.2.51.*) ; sys_platform == \"linux\"", "nvidia-cufft (==12.2.0.37.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cufile (==1.17.0.44.*) ; sys_platform == \"linux\"", "nvidia-curand (==10.4.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cusolver (==12.1.0.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cusparse (==12.7.9.17.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-npp (==13.1.0.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvfatbin (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvjitlink (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvjpeg (==13.0.4.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvml-dev (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvptxcompiler (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvtx (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvvm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cccl = ["nvidia-cuda-cccl (==13.2.27.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-crt = ["nvidia-cuda-crt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cublas = ["nvidia-cublas (==13.3.0.5.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cudart = ["nvidia-cuda-runtime (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cudla = ["nvidia-cudla (==13.2.51.*) ; sys_platform == \"linux\""]
-cufft = ["nvidia-cufft (==12.2.0.37.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cufile = ["nvidia-cufile (==1.17.0.44.*) ; sys_platform == \"linux\""]
-culibos = ["nvidia-cuda-culibos (==13.2.51.*) ; sys_platform == \"linux\""]
-cuobjdump = ["nvidia-cuda-cuobjdump (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cupti = ["nvidia-cuda-cupti (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-curand = ["nvidia-curand (==10.4.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cusolver = ["nvidia-cusolver (==12.1.0.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cusparse = ["nvidia-cusparse (==12.7.9.17.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-cuxxfilt = ["nvidia-cuda-cuxxfilt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-npp = ["nvidia-npp (==13.1.0.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvcc = ["nvidia-cuda-nvcc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvdisasm = ["nvidia-cuda-nvdisasm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvfatbin = ["nvidia-nvfatbin (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvjitlink = ["nvidia-nvjitlink (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvjpeg = ["nvidia-nvjpeg (==13.0.4.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvml = ["nvidia-nvml-dev (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvptxcompiler = ["nvidia-nvptxcompiler (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvrtc = ["nvidia-cuda-nvrtc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvtx = ["nvidia-nvtx (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-nvvm = ["nvidia-nvvm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-opencl = ["nvidia-cuda-opencl (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-profiler = ["nvidia-cuda-profiler-api (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-sanitizer = ["nvidia-cuda-sanitizer-api (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
-tileiras = ["nvidia-cuda-tileiras (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+all = ["nvidia-cublas (==13.1.0.3.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-cccl (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-crt (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-culibos (==13.0.85.*) ; sys_platform == \"linux\"", "nvidia-cuda-cupti (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-cuxxfilt (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-nvcc (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-nvrtc (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-opencl (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-profiler-api (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-runtime (==13.0.96.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-sanitizer-api (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cufft (==12.0.0.61.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cufile (==1.15.1.6.*) ; sys_platform == \"linux\"", "nvidia-curand (==10.4.0.35.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cusolver (==12.0.4.66.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cusparse (==12.6.3.3.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-npp (==13.0.1.2.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvfatbin (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvjitlink (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvjpeg (==13.0.1.86.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvml-dev (==13.0.87.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvptxcompiler (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvtx (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvvm (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cccl = ["nvidia-cuda-cccl (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+crt = ["nvidia-cuda-crt (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cublas = ["nvidia-cublas (==13.1.0.3.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cudart = ["nvidia-cuda-runtime (==13.0.96.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cufft = ["nvidia-cufft (==12.0.0.61.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cufile = ["nvidia-cufile (==1.15.1.6.*) ; sys_platform == \"linux\""]
+culibos = ["nvidia-cuda-culibos (==13.0.85.*) ; sys_platform == \"linux\""]
+cupti = ["nvidia-cuda-cupti (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+curand = ["nvidia-curand (==10.4.0.35.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cusolver = ["nvidia-cusolver (==12.0.4.66.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cusparse = ["nvidia-cusparse (==12.6.3.3.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+cuxxfilt = ["nvidia-cuda-cuxxfilt (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+npp = ["nvidia-npp (==13.0.1.2.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvcc = ["nvidia-cuda-nvcc (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvfatbin = ["nvidia-nvfatbin (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvjitlink = ["nvidia-nvjitlink (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvjpeg = ["nvidia-nvjpeg (==13.0.1.86.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvml = ["nvidia-nvml-dev (==13.0.87.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvptxcompiler = ["nvidia-nvptxcompiler (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvrtc = ["nvidia-cuda-nvrtc (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvtx = ["nvidia-nvtx (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+nvvm = ["nvidia-nvvm (==13.0.88.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+opencl = ["nvidia-cuda-opencl (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+profiler = ["nvidia-cuda-profiler-api (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+sanitizer = ["nvidia-cuda-sanitizer-api (==13.0.85.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
 
 [[package]]
 name = "cycler"
@@ -3357,16 +3353,16 @@ files = [
 
 [[package]]
 name = "nvidia-cuda-runtime"
-version = "13.2.51"
+version = "13.0.96"
 description = "CUDA Runtime native Libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 markers = "sys_platform == \"win32\" or sys_platform == \"linux\""
 files = [
-    {file = "nvidia_cuda_runtime-13.2.51-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:dfcccf62936b211a86e3cbc5fcc30647af8e601744e987f6a5925ed045b58672"},
-    {file = "nvidia_cuda_runtime-13.2.51-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:9c43b06a52c5b9316e19abc047236932c4d5c729969918a83223c4d2a4132f9a"},
-    {file = "nvidia_cuda_runtime-13.2.51-py3-none-win_amd64.whl", hash = "sha256:2f12e8db61a90a15af531414f387635e1598e44a2702bc34c75eb926fc96fd5e"},
+    {file = "nvidia_cuda_runtime-13.0.96-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ef9bcbe90493a2b9d810e43d249adb3d02e98dd30200d86607d8d02687c43f55"},
+    {file = "nvidia_cuda_runtime-13.0.96-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:7f82250d7782aa23b6cfe765ecc7db554bd3c2870c43f3d1821f1d18aebf0548"},
+    {file = "nvidia_cuda_runtime-13.0.96-py3-none-win_amd64.whl", hash = "sha256:f79298c8a098cec150a597c8eba58ecdab96e3bdc4b9bc4f9983635031740492"},
 ]
 
 [[package]]
@@ -5863,14 +5859,14 @@ files = [
 
 [[package]]
 name = "smg-grpc-proto"
-version = "0.4.3"
+version = "0.4.4"
 description = "SMG gRPC proto definitions for SGLang, vLLM, and TRT-LLM"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "smg_grpc_proto-0.4.3-py3-none-any.whl", hash = "sha256:a42e1ffe5e2700c0ff341ab0c53d0d43435bd6a03a42c4725934873b776a12a9"},
-    {file = "smg_grpc_proto-0.4.3.tar.gz", hash = "sha256:3bd9025678432ca2218ff5fc4411bd00ce44034e592d51748356a157b8296fbe"},
+    {file = "smg_grpc_proto-0.4.4-py3-none-any.whl", hash = "sha256:5aea8ff0bdf725afc377f7553b8234e4d5d7ca62373c2bcf20459273e5e6e3f3"},
+    {file = "smg_grpc_proto-0.4.4.tar.gz", hash = "sha256:617ec15bcffa356c8821936a632b4bf5987f51e9ee4b2d30e7ee0321515b0f28"},
 ]
 
 [package.dependencies]

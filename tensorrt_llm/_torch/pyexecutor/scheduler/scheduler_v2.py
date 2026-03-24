@@ -36,7 +36,7 @@ class BudgetTracker:
 
     Centralizes the budget logic that was previously spread across the main
     scheduling loop.  Designed for future extensibility to multiple memory
-    pools (e.g. Rubin) — callers interact through ``can_fit_tokens`` /
+    pools — callers interact through ``can_fit_tokens`` /
     ``remaining_tokens`` / ``commit`` / ``peft_pages_needed`` without knowing the underlying pool
     topology.
     """
