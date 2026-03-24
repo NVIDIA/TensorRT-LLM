@@ -20,7 +20,10 @@ parser.add_argument("--build-url", required=True, help="Jenkins build URL")
 parser.add_argument("--build-number", required=True, help="Jenkins build number")
 parser.add_argument("--branch", required=True, help="Branch name that passed to the pipeline")
 parser.add_argument(
-    "--report-directory", required=False, help="Directory where the reports located", default="./"
+    "--report-directory",
+    required=False,
+    help="Directory where the reports located",
+    default="./scan_report",
 )
 args = parser.parse_args()
 
