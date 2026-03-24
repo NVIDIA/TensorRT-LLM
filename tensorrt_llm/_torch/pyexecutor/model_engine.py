@@ -712,6 +712,7 @@ class PyTorchModelEngine(ModelEngine):
         # 1-token first to capture the 0→1 transition graph; max-shape next to seed
         # triton autotuning with the largest inputs; 2-token last for the small-ctx path.
         warmup_configs = one_token_configs + max_configs + small_ctx_configs
+        # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
     @with_warmup_flag
@@ -753,7 +754,7 @@ class PyTorchModelEngine(ModelEngine):
             with self.no_cuda_graph():
                 self._general_warmup(resource_manager, warmup_requests_configs)
                 # Clear Cache now as autotuner may use additional memory.
-                # Memory pool will be warmed up latter.
+                # Memory pool will be warmed up later.
                 torch.cuda.empty_cache()
 
         # Autotuner warmup uses context-only requests. Helix CP
