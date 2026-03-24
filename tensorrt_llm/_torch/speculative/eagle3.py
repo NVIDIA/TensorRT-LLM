@@ -335,8 +335,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # Slot IDs for each request; populated in prepare() when spec_resource_manager
     # is present (required for relaxed acceptance, mirrors MTPSpecMetadata.slot_ids).
     slot_ids: Optional[torch.Tensor] = None
-    # MTP Eagle one-model uses the first draft forward token counts for the
-    # first loop iteration and per-sequence counts for subsequent iterations.
+    # One-model speculative decoding uses the first draft forward token counts
+    # for the first loop iteration and per-sequence token counts for
+    # subsequent iterations.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
 
     def __post_init__(self):
@@ -491,6 +492,26 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         ])
         attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
             reorder_block_ids_per_seq, non_blocking=True)
+
+    def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int):
+        return (spec_metadata.all_rank_num_tokens
+                if step_idx == 0 else spec_metadata.subseq_all_rank_num_tokens)
+
+    def _run_draft_forward(self, draft_model, inputs, spec_metadata,
+                           step_idx: int):
+        all_rank_num_tokens = self._get_step_all_rank_num_tokens(
+            spec_metadata, step_idx)
+
+        if self.is_mtp_eagle:
+            hidden_states = draft_model.mtp_layers[0](
+                embed_tokens=draft_model.embed_tokens,
+                all_rank_num_tokens=all_rank_num_tokens,
+                **inputs)
+            return hidden_states, None
+
+        inputs["all_rank_num_tokens"] = all_rank_num_tokens
+        hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+        return hidden_states, hidden_states_to_save
 
     def sample_and_accept_draft_tokens(
         self,
@@ -654,10 +675,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
-        # Eagle3: pass all_rank_num_tokens explicitly so the draft model sets it
-        # on attn_metadata internally, avoiding external mutation of shared state.
-        if not self.is_mtp_eagle:
-            inputs["all_rank_num_tokens"] = spec_metadata.all_rank_num_tokens
         return inputs
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
@@ -728,22 +745,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
-
-                if self.is_mtp_eagle:
-                    # MTP Eagle: repeatedly call the single MTP layer (index 0)
-                    all_rank_num_tokens = (
-                        spec_metadata.all_rank_num_tokens
-                        if i == 0 else spec_metadata.subseq_all_rank_num_tokens)
-                    hidden_states = draft_model.mtp_layers[0](
-                        embed_tokens=draft_model.embed_tokens,
-                        all_rank_num_tokens=all_rank_num_tokens,
-                        **inputs)
-                else:
-                    # Eagle3: forward through the independent EAGLE draft network.
-                    # all_rank_num_tokens is carried inside inputs and applied by
-                    # Eagle3DraftModel.forward() directly on attn_metadata.
-                    hidden_states, hidden_states_to_save = draft_model.model(
-                        **inputs)
+                hidden_states, hidden_states_to_save = self._run_draft_forward(
+                    draft_model, inputs, spec_metadata, i)
+                if not self.is_mtp_eagle:
                     # Disable spec-dec mode for subsequent iterations
                     attn_metadata.use_spec_decoding = False
 
@@ -893,12 +897,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     "attn_metadata": attn_metadata,
                     "spec_metadata": spec_metadata,
                 }
-                # Eagle3: from step 1 onward each sequence has one token, so
-                # switch to the per-sequence token count.
-                if not self.is_mtp_eagle:
-                    inputs[
-                        "all_rank_num_tokens"] = spec_metadata.all_rank_num_seqs
-
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # SA draft token override (common)
