@@ -583,6 +583,9 @@ def submit_job(config, log_dir, dry_run):
         total_mpi_tasks = ctx_num * ctx_world_size + gen_num * gen_world_size
         mpi_num_nodes = len(mpi_nodelist)
         num_ctx_gpus = ctx_num * ctx_world_size
+        worker_env_var = env_config.get('worker_env_var', '')
+        ctx_worker_env_var = env_config.get('ctx_worker_env_var', '')
+        gen_worker_env_var = env_config.get('gen_worker_env_var', '')
         dwdp_ctx_worker_env_var = worker_env_var + \
             (f" {ctx_worker_env_var}" if ctx_worker_env_var else "")
         dwdp_gen_worker_env_var = worker_env_var + \

@@ -958,7 +958,8 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             )
             c_sf_multi_valid = []
             for i in range(num_valid_permuted_tokens):
-                if permuted_idx_to_expanded_idx[i].item() != helper.pad_val:
-                    c_sf_multi_valid.append(c_sf_multi_unswizzled[i])
+                if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+                    continue
+                c_sf_multi_valid.append(c_sf_multi_unswizzled[i])
             c_sf_multi_valid = torch.cat(c_sf_multi_valid)
             check_accuracy(c_sf_multi_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
