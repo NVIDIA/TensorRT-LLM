@@ -139,8 +139,13 @@ class Mamba2Mixer(nn.Module):
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        supported_head_dim_in_flashinfer = [64, 128]
-        self._use_flashinfer = head_dim in supported_head_dim_in_flashinfer
+        # TODO: Update head_dims and head_group_ratios once flashinfer is updated.
+        supported_head_dims = [64, 128]
+        supported_head_group_ratios = [1, 8, 16]
+        head_group_ratio = (self.tp_nheads //
+                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
+        self._use_flashinfer = (head_dim in supported_head_dims and
+                                head_group_ratio in supported_head_group_ratios)
         # Stochastic rounding requires FlashInfer and fp16 cache
         self._use_stochastic_rounding = (
             config.quant_config.mamba_ssm_stochastic_rounding
