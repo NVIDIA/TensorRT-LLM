@@ -32,7 +32,7 @@ def dedup_licenses(contents):
     return seen
 
 
-def diff_vulns(release_path, base_path):
+def diff_vulns(release_path):
     release_data = load_json(release_path)
 
     release_vulns = dedup_vulns(release_data["vulnerabilities"])
@@ -46,11 +46,7 @@ def diff_licenses(release_path, base_path):
     base_data = load_json(base_path)
     preapproved_deps = get_latest_license_preapproved_container_deps()
     map_preapproved_deps = {}
-    index = 0
     for item in preapproved_deps:
-        index += 1
-        if index < 5:
-            continue
         map_preapproved_deps[item["s_package_name"]] = True
 
     release_pkgs = dedup_licenses(release_data["contents"])
@@ -59,7 +55,11 @@ def diff_licenses(release_path, base_path):
     introduced_licenses = [
         v
         for k, v in release_pkgs.items()
-        if k not in base_pkgs and k not in map_preapproved_deps and is_non_permissive(v["licenses"])
+        if (
+            (k not in base_pkgs)
+            and (k not in map_preapproved_deps)
+            and is_non_permissive(v["licenses"])
+        )
     ]
 
     introduced_licenses.sort(key=lambda e: (e["package"], e["version"]))

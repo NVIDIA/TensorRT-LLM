@@ -103,16 +103,17 @@ def get_last_scan_results(report_type: str, branch: str):
     detected_dependencies = {}
     for doc in docs:
         package_name = doc["_source"]["s_package_name"]
-        if package_name not in detected_dependencies:
-            detected_dependencies[package_name] = 1
+        package_version = doc["_source"]["s_package_version"]
+        if (package_name, package_version) not in detected_dependencies:
+            detected_dependencies[(package_name, package_version)] = 1
         else:
-            detected_dependencies[package_name] += 1
+            detected_dependencies[(package_name, package_version)] += 1
     return detected_dependencies
 
 
 def get_latest_license_preapproved_container_deps():
     data = ES_CLIENT.search(
-        index=ES_INDEX_BASE + "-*",
+        index=ES_INDEX_PREAPPROVED_BASE + "-*",
         body={"size": 1, "sort": [{"ts_created": "desc"}], "_source": ["preapproved_deps"]},
     )
     data_source = data["hits"]["hits"][0]["_source"]

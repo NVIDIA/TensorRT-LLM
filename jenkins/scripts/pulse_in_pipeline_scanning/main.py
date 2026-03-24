@@ -10,10 +10,7 @@ from submit_report import (
     submit_source_code_licenses,
     submit_source_code_vulns,
 )
-
-TIMEOUT = 1000
-DOC_TYPE = "_doc"
-SIZE = 10000
+from utils.es import get_last_scan_results
 
 # Slack configuration
 # Required: TRTLLM_PLC_WEBHOOK      — Slack incoming webhook URL
@@ -38,8 +35,6 @@ args = parser.parse_args()
 SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
 ES_HEADERS = {"Content-Type": "application/json"}
 
-NEWLY_REPORTED_DEPENDENCIES = {}
-
 
 def post_slack_msg():
     starttime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -56,18 +51,6 @@ def post_slack_msg():
     dashboard_link = f"{base}?_g={quote(g)}&_a={quote(a)}"
     hasNewDependencyReported = False
     dependencyReport = f"New TRTLLM dependency found from nightly scanning ({args.branch} branch)\n"
-    for key in NEWLY_REPORTED_DEPENDENCIES:
-        count_reported = NEWLY_REPORTED_DEPENDENCIES[key]
-        dependencyReport += "\n- "
-        if count_reported:
-            hasNewDependencyReported = True
-        else:
-            continue
-        match key:
-            case "source_code_vulnerability":
-                dependencyReport += f"{count_reported} new source code vulnerability reported"
-            case "source_code_license":
-                dependencyReport += f"{count_reported} new source code GPL license reported"
     if not hasNewDependencyReported:
         return
     slack_payload = {"report": dependencyReport, "dashboardUrl": dashboard_link}
@@ -84,24 +67,66 @@ SUBMIT_KWARG = {
     "start_datetime": datetime.now(timezone.utc),
 }
 
-resp_source_vulns = submit_source_code_vulns(
-    os.path.join(args.report_directory, "source_code/vulns.json"), **SUBMIT_KWARG
-)
+NEW_RISKY_DEPENDENCIES = []
 
-resp_source_licenses = submit_source_code_licenses(
-    os.path.join(args.report_directory, "source_code/sbom.json"), **SUBMIT_KWARG
+last_source_vulns = get_last_scan_results("source_code_vulnerability", args.branch)
+new_source_vulns = submit_source_code_vulns(
+    os.path.join(args.report_directory, "source_code/vulns.json"), last_source_vulns, **SUBMIT_KWARG
 )
+if len(new_source_vulns) > 0:
+    NEW_RISKY_DEPENDENCIES.append(f"{len(new_source_vulns)} new source code vulnerability")
 
-resp_container_vulns = submit_container_vulns(
+
+last_source_licenses = get_last_scan_results("source_code_license", args.branch)
+new_source_licenses = submit_source_code_licenses(
+    os.path.join(args.report_directory, "source_code/sbom.json"),
+    last_source_licenses,
+    **SUBMIT_KWARG,
+)
+if len(new_source_licenses) > 0:
+    NEW_RISKY_DEPENDENCIES.append(
+        f"{len(new_source_licenses)} new source code unpermissive license"
+    )
+
+last_container_vulns = get_last_scan_results("container_vulnerability", args.branch)
+new_amd64_container_vulns = submit_container_vulns(
     os.path.join(args.report_directory, "release_amd64_amd64/vulns.json"),
     os.path.join(args.report_directory, "base_amd64_amd64/vulns.json"),
     "amd64",
+    last_container_vulns,
     **SUBMIT_KWARG,
 )
+new_arm64_container_vulns = submit_container_vulns(
+    os.path.join(args.report_directory, "release_arm64_arm64/vulns.json"),
+    os.path.join(args.report_directory, "base_arm64_arm64/vulns.json"),
+    "arm64",
+    last_container_vulns,
+    **SUBMIT_KWARG,
+)
+count_container_vulns = len(new_amd64_container_vulns + new_arm64_container_vulns)
+if count_container_vulns > 0:
+    NEW_RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
 
-resp_container_licenses = submit_container_licenses(
+last_container_licneses = get_last_scan_results("container_license", args.branch)
+new_amd64_container_licenses = submit_container_licenses(
     os.path.join(args.report_directory, "release_amd64_amd64/licenses.json"),
     os.path.join(args.report_directory, "base_amd64_amd64/licenses.json"),
     "amd64",
+    last_container_licneses,
     **SUBMIT_KWARG,
 )
+new_arm64_container_licenses = submit_container_licenses(
+    os.path.join(args.report_directory, "release_arm64_arm64/licenses.json"),
+    os.path.join(args.report_directory, "base_arm64_arm64/licenses.json"),
+    "arm64",
+    last_container_licneses,
+    **SUBMIT_KWARG,
+)
+count_container_licenses = len(new_amd64_container_licenses + new_arm64_container_licenses)
+if count_container_licenses > 0:
+    NEW_RISKY_DEPENDENCIES.append(f"{count_container_licenses} new container unpermissive license")
+
+if NEW_RISKY_DEPENDENCIES:
+    print(",".join(NEW_RISKY_DEPENDENCIES))
+else:
+    print("All Good")
