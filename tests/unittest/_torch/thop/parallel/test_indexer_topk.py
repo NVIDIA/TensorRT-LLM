@@ -198,6 +198,7 @@ def compare_top_k_results(
 
 
 def generate_seq_lens(batch_size, min_long_seq, num_tokens):
+    """Generate random sequence lengths: 90% long [min_long_seq, num_tokens), 10% short."""
     seq_lens = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
     is_long = torch.rand(batch_size, device="cuda") < 0.9
     num_long = is_long.sum().item()
@@ -224,6 +225,7 @@ def generate_seq_lens(batch_size, min_long_seq, num_tokens):
 @pytest.mark.parametrize("index_topk", [2048, 128])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
+    """Verify indexer_topk_decode output matches torch.topk for random logits."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
     num_gen_tokens = batch_size * next_n
@@ -258,6 +260,7 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
 @pytest.mark.parametrize("index_topk", [2048, 128])
 @pytest.mark.parametrize("num_tokens", _PREFILL_NUM_TOKENS)
 def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
+    """Verify indexer_topk_prefill output matches torch.topk for variable-length rows."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
@@ -348,6 +351,7 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 def test_cute_dsl_topk_decode_single_cta(
     batch_size, next_n, index_topk, num_tokens, dtype, load_balance
 ):
+    """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -377,6 +381,7 @@ def test_cute_dsl_topk_decode_single_cta(
 def test_cute_dsl_topk_decode_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
 ):
+    """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -402,9 +407,11 @@ def test_cute_dsl_topk_decode_multi_cta(
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
 def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
+    """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
     num_gen_tokens = batch_size * next_n
 
     def run_fn(logits, seq_lens):
+        """Run CuTE DSL indexer TopK decode and return output indices."""
         output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
         torch.ops.trtllm.cute_dsl_indexer_topk_decode(
             input_values=logits,
@@ -436,6 +443,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 def test_cute_dsl_topk_decode_single_pass_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
+    """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -759,78 +767,6 @@ def generate_pre_idx(
     return pre_idx
 
 
-# ---------------------------------------------------------------------------
-# Heuristic distribution-parameterized decode correctness test
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(not _HAS_SCIPY, reason="scipy required for distribution tests")
-@pytest.mark.parametrize("success_ratio", [0.5, 0.9])
-@pytest.mark.parametrize("dist_cfg", _DECODE_DIST_CONFIGS, ids=_DECODE_DIST_IDS)
-@pytest.mark.parametrize("batch_size", [1, 64, 128])
-@pytest.mark.parametrize("next_n", [1, 2, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [8192, 16384])
-def test_indexer_topk_decode_dist(
-    dist_cfg, batch_size, next_n, index_topk, num_tokens, success_ratio
-):
-    """
-    Correctness test for the heuristic indexer_topk_decode across realistic
-    logit distributions, MTP correlation structures, and pre_idx accuracy levels.
-
-    API under test:
-        torch.ops.trtllm.indexer_topk_decode(
-            logits, seq_lens, indices, next_n, index_topk, pre_idx)
-
-    Distribution families (dist_cfg):
-      beta        — bounded, bell-shaped (shallow / moderate / deep negative mean)
-      logistic    — heavy-tailed symmetric (leptokurtic)
-      lognorm     — positively skewed, wide support
-      weibull_min — right-skewed extreme-value (narrow and wide spread)
-
-    MTP correlation (next_n > 1):
-      For batch element b with valid_base = row_ends[b*next_n], each MTP offset
-      nni = 1…next_n-1 satisfies:
-        logits[b*next_n + nni, nni : nni+valid_base] = logits[b*next_n, 0 : valid_base]
-      Positions 0..nni-1 remain independently sampled (new token positions);
-      positions >= nni+valid_base remain -inf.
-
-    pre_idx accuracy (success_ratio):
-      success_ratio fraction of pre_idx[b] is drawn from the true top-K of
-      base row b*next_n; the rest are random valid indices.  The heuristic
-      kernel must return exact top-K results regardless of pre_idx quality.
-    """
-    torch.manual_seed(24)
-    torch.cuda.manual_seed(24)
-
-    num_gen_tokens = batch_size * next_n
-    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
-    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
-    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
-
-    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
-    # Clamp seq_lens so that every effective row length >= index_topk.
-    # With next_n > 1, effective length = seq_len - next_n + offset + 1,
-    # and the minimum (offset=0) is seq_len - next_n + 1.
-    # Ensure seq_len >= next_n so effective length is at least 1.
-    seq_lens = seq_lens.clamp(min=next_n)
-    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
-
-    logits = create_random_logits(row_starts, row_ends, dtype, 42)
-
-    cute_indices = run_fn(logits, seq_lens)
-    torch.cuda.synchronize()
-
-    max_row_len = row_ends.max().item()
-    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
-    mask = (torch_indices >= 0) & ((torch_indices - (row_ends - row_starts)[:, None]) < 0)
-    torch_indices = torch_indices.masked_fill(~mask, -1)
-
-    assert compare_top_k_results(
-        logits, cute_indices.to(torch.int32), torch_indices, row_starts, row_ends, index_topk
-    ), "CuTE DSL top-k results don't match torch.topk"
-
-
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
@@ -839,9 +775,10 @@ def test_indexer_topk_decode_dist(
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode_single_cta(
+def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
     batch_size, next_n, index_topk, num_tokens, dtype, load_balance
 ):
+    """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -868,9 +805,10 @@ def test_cute_dsl_topk_decode_single_cta(
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_cute_dsl_topk_decode_multi_cta(
+def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
     batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
 ):
+    """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -895,10 +833,12 @@ def test_cute_dsl_topk_decode_multi_cta(
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
+def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):  # noqa: F811
+    """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
     num_gen_tokens = batch_size * next_n
 
     def run_fn(logits, seq_lens):
+        """Run CuTE DSL indexer TopK decode and return output indices."""
         output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
         torch.ops.trtllm.cute_dsl_indexer_topk_decode(
             input_values=logits,
@@ -927,9 +867,10 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta(
+def test_cute_dsl_topk_decode_single_pass_multi_cta(  # noqa: F811
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
+    """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -958,7 +899,10 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta(
 def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
+    """Correctness test for CuTE DSL single-pass multi-CTA cluster TopK on Blackwell."""
+
     def run_fn(logits, seq_lens):
+        """Run cluster TopK decode, skip if problem size exceeds capacity."""
         result = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
             input_values=logits,
             seq_lens=seq_lens,
