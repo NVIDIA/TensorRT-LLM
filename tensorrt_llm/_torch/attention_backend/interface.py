@@ -22,8 +22,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
-from ..pyexecutor.mamba_cache_manager import (MambaCacheManager,
-                                              MambaHybridCacheManager)
+from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from ..utils import get_model_extra_attrs
 
@@ -306,11 +305,8 @@ class AttentionMetadata:
             return
 
         if self.mamba_metadata is None:
-            if (self.kv_cache_manager is not None
-                    # TODO: let MambaHybridCacheManager inherit from MambaCacheManager(Base)
-                    and
-                (isinstance(self.kv_cache_manager, MambaCacheManager) or
-                 isinstance(self.kv_cache_manager, MambaHybridCacheManager))):
+            if (self.kv_cache_manager is not None and isinstance(
+                    self.kv_cache_manager, BaseMambaCacheManager)):
                 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
                 self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
                                                      self.mamba_chunk_size)

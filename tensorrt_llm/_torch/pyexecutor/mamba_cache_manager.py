@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import reduce
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
@@ -64,8 +65,51 @@ def use_cpp_mamba_cache_manager() -> bool:
     return os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
 
 
+class BaseMambaCacheManager(ABC):
+    """Abstract interface for accessing mamba/recurrent state caches.
+
+    Implemented by MambaCacheManager (standalone mamba-only models) and
+    LinearHybridCacheManager (hybrid attention+mamba models). Use
+    ``isinstance(mgr, BaseMambaCacheManager)`` to check for mamba capability.
+    """
+
+    @abstractmethod
+    def get_state_indices(self, *args, **kwargs) -> torch.Tensor:
+        ...
+
+    @abstractmethod
+    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        ...
+
+    @abstractmethod
+    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        ...
+
+    @abstractmethod
+    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+        ...
+
+    @abstractmethod
+    def is_speculative(self) -> bool:
+        ...
+
+    @abstractmethod
+    def mamba_layer_cache(self, layer_idx: int):
+        ...
+
+    def reorder_state_indices_when_padding_requests(self, request_size: int,
+                                                    padding_size: int):
+        """Ensure padding slots use distinct state indices. No-op by default;
+        overridden by PythonMambaCacheManager which manages its own index pool."""
+
+
 class CppMambaCacheManager(BaseResourceManager):
-    """C++ backed Mamba cache manager using RnnStateManager bindings."""
+    """Mamba state manager backed by the C++ RnnStateManager bindings.
+
+    Manages only mamba states (conv + SSM). Used when TRTLLM_USE_CPP_MAMBA=1,
+    which is required for disaggregated serving deployments.
+    Does not support speculative decoding.
+    """
 
     def __init__(
         self,
@@ -171,6 +215,11 @@ class CppMambaCacheManager(BaseResourceManager):
 
 
 class PythonMambaCacheManager(BaseResourceManager):
+    """Pure-Python mamba state manager with speculative decoding support.
+
+    Manages only mamba states (conv + SSM) using PyTorch tensors on GPU.
+    Supports caching intermediate states for speculative decoding verification.
+    """
 
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -490,7 +539,13 @@ class PythonMambaCacheManager(BaseResourceManager):
         conv_states[:, state_indices_d, :] = accepted_conv_state
 
 
-class MambaCacheManager(BaseResourceManager):
+class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
+    """Facade for standalone mamba state management (no KV cache).
+
+    Delegates to CppMambaCacheManager (when TRTLLM_USE_CPP_MAMBA=1, required
+    for disaggregated serving) or PythonMambaCacheManager (default, supports
+    speculative decoding).
+    """
 
     def __init__(
         self,
@@ -624,6 +679,12 @@ class MambaCacheManager(BaseResourceManager):
 
 
 class MambaHybridCacheManagerV1(KVCacheManager, MambaCacheManager):
+    """Hybrid cache manager combining separate KVCacheManager and MambaCacheManager.
+
+    Manages KV cache and mamba states in independent pools. Used for
+    speculative decoding or disaggregated serving (via CppMambaCacheManager).
+    Does not support block reuse / prefix caching for mamba states.
+    """
 
     def __init__(
         self,
@@ -744,7 +805,15 @@ def calc_context_stop_positions(prompt_len: int,
     return stop_positions
 
 
-class LinearHybridCacheManager(KVCacheManager):
+class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
+    """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
+
+    Both KV cache blocks and recurrent state blocks are managed by the unified
+    C++ KVCacheManager, enabling block reuse / prefix caching across attention
+    and mamba layers. This is the default hybrid manager.
+
+    Disaggregated serving and speculative decoding are not supported yet.
+    """
 
     def __init__(
         self,
@@ -1142,17 +1211,11 @@ class _MambaHybridCacheManagerMeta(type):
 
 
 class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
-    """Factory class that creates the appropriate hybrid cache manager.
-
-    Delegates to LinearHybridCacheManager (default) or
-    MambaHybridCacheManagerV1 based on configuration.
-    LinearHybridCacheManager is preferred when both are applicable.
+    """Factory that selects the appropriate hybrid cache manager.
 
     Selection logic:
-    - If TRTLLM_USE_CPP_MAMBA=1: MambaHybridCacheManagerV1
-    - If spec_config is not None (speculative decoding):
-      MambaHybridCacheManagerV1
-    - Otherwise: LinearHybridCacheManager (default)
+    - Speculative decoding or TRTLLM_USE_CPP_MAMBA=1 -> MambaHybridCacheManagerV1
+    - Otherwise (default) -> LinearHybridCacheManager
     """
 
     def __new__(
