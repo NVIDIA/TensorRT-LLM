@@ -72,7 +72,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
         return;
     }
 
-    int const preIdxOffset = rowIdx % next_n;
+    // +1 accounts for the temporal shift: prev_topk indices were computed at
+    // seq_len-1, but the current step has one additional KV token appended.
+    int const preIdxOffset = (rowIdx % next_n) + 1;
     heuristicTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
 }
 
