@@ -100,7 +100,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
-| `Lightricks/LTX-Video` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+| `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 
 ## Feature Matrix
 
