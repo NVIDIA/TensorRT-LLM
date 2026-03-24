@@ -676,14 +676,7 @@ class KVCacheManager(BaseResourceManager):
 
     def extend_capacity_for_tokens(self, request: LlmRequest,
                                    num_tokens: int) -> None:
-        """Extend KV cache capacity for *request* by *num_tokens* extra tokens.
-
-        Used after ``pad_draft_tokens_for_cuda_graph`` to ensure the KV cache
-        has enough capacity for the padded draft tokens so that the subsequent
-        rewind does not underflow.
-        """
-        for _ in range(num_tokens):
-            self.impl.add_token(request.py_request_id)
+        """No-op for V1; interface kept consistent with V2."""
 
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
@@ -1782,6 +1775,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
 
+        # Tracks the draft length allocated by try_allocate_generation per
+        # request.  Used by extend_capacity_for_tokens to compute the exact
+        # padding delta instead of blindly extending, which would cause
+        # unbounded capacity growth.
+        self._allocated_draft_lens: dict[int, int] = {}
+
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -1806,7 +1805,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # (num_extra_kv_tokens + max_total_draft_tokens) so the host
         # page-index buffer is large enough for the maximum capacity a single
         # sequence can reach during warmup or normal operation.
-        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self.max_total_draft_tokens
+        # The +1 accounts for the base decode token that
+        # _required_gen_capacity adds on top of draft tokens.
+        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self.max_total_draft_tokens + 1
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block -
                                    1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
@@ -2065,6 +2066,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
+        draft_len = get_draft_token_length(req)
+        self._allocated_draft_lens[req.py_request_id] = draft_len
         return kv_cache.resize(
             self._required_gen_capacity(req, kv_cache.capacity))
 
@@ -2165,21 +2168,33 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def extend_capacity_for_tokens(self, request: LlmRequest,
                                    num_tokens: int) -> None:
-        """Extend KV cache capacity for *request* by *num_tokens* extra tokens.
+        """Extend KV cache capacity for the CUDA-graph padding delta.
 
-        Used after ``pad_draft_tokens_for_cuda_graph`` to ensure the KV cache
-        has enough capacity for the padded draft tokens so that the subsequent
-        rewind does not underflow.
+        ``try_allocate_generation`` allocated capacity for the schedule-reduced
+        draft length.  After padding restores ``py_draft_tokens`` to the static
+        max, we must extend by exactly the difference so that the subsequent
+        rewind (which operates on the padded length) does not underflow.
+
+        The *num_tokens* argument from the caller is the full post-padding
+        draft length minus the pre-padding length.  However, the schedule-
+        reduced length used by ``try_allocate_generation`` may differ from
+        the pre-padding length, so we recompute the delta from the recorded
+        ``_allocated_draft_lens`` to stay consistent.
         """
-        if num_tokens <= 0:
+        allocated = self._allocated_draft_lens.pop(request.py_request_id, None)
+        if allocated is None:
+            return
+        current_draft_len = get_draft_token_length(request)
+        delta = current_draft_len - allocated
+        if delta <= 0:
             return
         kv_cache = self.kv_cache_map[request.py_request_id]
-        new_capacity = kv_cache.capacity + num_tokens
+        new_capacity = kv_cache.capacity + delta
         success = kv_cache.resize(new_capacity)
         if not success:
             raise ValueError(
                 f"Failed to extend capacity of KV cache for request "
-                f"{request.py_request_id} by {num_tokens} tokens "
+                f"{request.py_request_id} by {delta} tokens "
                 f"(target capacity {new_capacity})")
 
     def suspend_request(self, req: LlmRequest) -> None:
@@ -2438,6 +2453,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             return
