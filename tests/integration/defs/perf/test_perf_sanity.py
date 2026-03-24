@@ -767,9 +767,7 @@ class DisaggTestCmds(NamedTuple):
                 raise RuntimeError(
                     f"Timed out waiting for config file {config_path} after {timeout}s"
                 )
-            print_info(
-                f"Waiting for config file {config_path}, elapsed: {elapsed:.0f}s"
-            )
+            print_info(f"Waiting for config file {config_path}, elapsed: {elapsed:.0f}s")
             time.sleep(1)
 
     def run_cmd(self, server_idx: int) -> List[str]:
