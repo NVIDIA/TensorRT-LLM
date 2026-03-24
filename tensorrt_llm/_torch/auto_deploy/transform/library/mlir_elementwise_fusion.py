@@ -140,8 +140,8 @@ class MLIRElementwiseFusion(BaseTransform):
                     sg_hash = KernelCache.hash_subgraph(sg)
                     replace_subgraph_with_fused_op(sg, kernel_fn, sg_hash, converter.metadata)
                     num_replaced += 1
-            except Exception as e:
-                self._log_warning(f"Failed to fuse subgraph: {e}")
+            except (ValueError, NotImplementedError) as e:
+                self._log_warning(f"Skipping subgraph (unsupported pattern): {e}")
 
         self._log_info(
             f"Replaced {num_replaced}/{len(subgraphs)} subgraphs (skipped {num_skipped} low-rank)"

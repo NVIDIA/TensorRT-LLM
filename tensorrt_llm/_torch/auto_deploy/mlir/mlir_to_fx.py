@@ -255,16 +255,23 @@ class MLIRToFXConverter:
 
     def _convert_to_dtype(self, op: AdToDtype, graph: Graph, metadata: dict) -> None:
         """Reconstruct ``aten.to.dtype`` from ``ad.to_dtype``."""
+        from .dialect import TensorType, mlir_to_torch_dtype
+
         input_node = self._resolve(op.input)
-        dtype_int = op.target_dtype.value.data
-        # Convert the stored int back to a torch.dtype
-        _INT_TO_DTYPE = {
-            5: torch.float16,
-            15: torch.bfloat16,
-            6: torch.float32,
-            7: torch.float64,
-        }
-        target_dtype = _INT_TO_DTYPE.get(dtype_int, dtype_int)
+        # Recover target dtype from the MLIR output type for full type coverage
+        # (int, bool, fp8, etc.), falling back to the stored integer for plain floats.
+        result_type = op.output.type
+        if isinstance(result_type, TensorType):
+            target_dtype = mlir_to_torch_dtype(result_type.element_type)
+        else:
+            dtype_int = op.target_dtype.value.data
+            _INT_TO_DTYPE = {
+                5: torch.float16,
+                15: torch.bfloat16,
+                6: torch.float32,
+                7: torch.float64,
+            }
+            target_dtype = _INT_TO_DTYPE.get(dtype_int, dtype_int)
         node = graph.call_function(torch.ops.aten.to.dtype, args=(input_node, target_dtype))
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)

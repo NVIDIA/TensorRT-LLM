@@ -24,13 +24,15 @@ Usage requires ``pip install xdsl``. All imports are gated behind :data:`HAS_XDS
 
 try:
     import xdsl  # noqa: F401
-
-    HAS_XDSL = True
-
+except ImportError:
+    HAS_XDSL = False
+else:
     # Workaround: xDSL's @irdl_op_definition enforces UPPERCASE ClassVar names,
     # but IRDLOperation's own 'assembly_format' and 'custom_directives' are lowercase.
     # This causes failures in pytest when TRT-LLM's C++ bindings are loaded first.
     # Patch the check to allow these known xDSL-internal fields.
+    # Note: patch errors are intentionally not caught so incompatible xDSL versions
+    # surface immediately rather than silently disabling MLIR support.
     import xdsl.utils.classvar as _cv
 
     _KNOWN_XDSL_CLASSVARS = frozenset({"assembly_format", "custom_directives"})
@@ -43,7 +45,6 @@ try:
 
     _cv.is_const_classvar = _patched_is_const_classvar
 
-except ImportError:
-    HAS_XDSL = False
+    HAS_XDSL = True
 
 __all__ = ["HAS_XDSL"]

@@ -387,6 +387,9 @@ class AdSplat(IRDLOperation):
     """Constant splat — creates a tensor filled with a scalar value."""
 
     name = "ad.splat"
+    # TODO(suyogg): FloatAttr only supports floating-point constants. Integer and
+    # boolean literals are currently unrepresentable. Change to AnyAttr() and update
+    # fx_to_mlir.py to build IntegerAttr/BoolAttr based on the Python value type.
     value = attr_def(FloatAttr)
     output = result_def(AnyAttr())
 

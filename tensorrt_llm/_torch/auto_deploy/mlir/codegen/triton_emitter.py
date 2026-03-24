@@ -76,11 +76,39 @@ _TRITON_DTYPE_MAP = {
     "f64": "tl.float64",
 }
 
+# torch dtype string for MLIR element types (used in codegen source strings)
+_TORCH_DTYPE_STR_MAP = {
+    "f16": "torch.float16",
+    "f32": "torch.float32",
+    "bf16": "torch.bfloat16",
+    "f64": "torch.float64",
+}
+
 
 def _mlir_elem_to_triton_str(tensor_type: TensorType) -> str:
     """Return Triton dtype string for a TensorType's element type."""
     elem_str = str(tensor_type.element_type)
     return _TRITON_DTYPE_MAP.get(elem_str, "tl.float32")
+
+
+def _mlir_elem_to_torch_dtype_str(tensor_type: TensorType) -> str:
+    """Return torch dtype string for a TensorType's element type (for codegen source)."""
+    elem_str = str(tensor_type.element_type)
+    return _TORCH_DTYPE_STR_MAP.get(elem_str, "torch.bfloat16")
+
+
+def _validate_reduction_attrs(op) -> None:
+    """Validate that a reduction op targets the last dim (dim=-1) as required by the row kernel.
+
+    The Triton row kernel only supports last-dimension reductions. Any other axis
+    would silently miscompile, so we reject unsupported configurations here.
+    """
+    dim = op.attributes["dim"].value.data
+    if dim != -1:
+        raise NotImplementedError(
+            f"{op.name}: reduction over axis {dim} is not supported "
+            "(only dim=-1 is supported by the row-wise Triton emitter)"
+        )
 
 
 def _get_tensor_rank(val: SSAValue) -> int:
@@ -204,7 +232,8 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
                 val_names[id(r)] = result_name
 
         elif op_name == "ad.reduce_mean":
-            # reduce_mean(input, ncols)
+            # reduce_mean(input, ncols) — row-wise only
+            _validate_reduction_attrs(op)
             input_val = op.operands[0]
             input_name = val_names[id(input_val)]
             result_name = f"t{temp_counter}"
@@ -215,6 +244,8 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
                 val_names[id(r)] = result_name
 
         elif op_name == "ad.reduce_sum":
+            # reduce_sum(input) — row-wise only
+            _validate_reduction_attrs(op)
             input_val = op.operands[0]
             input_name = val_names[id(input_val)]
             result_name = f"t{temp_counter}"
@@ -307,16 +338,21 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     in_tensor_params = [f"input{i}" for i in range(n_inputs)]
     ref = f"input{ref_input_idx}"
     out_alloc_lines = []
-    # Determine output shapes from subgraph output types
+    # Determine output shapes and dtypes from subgraph output MLIR types
     for i, out in enumerate(subgraph.outputs):
         out_rank = _get_tensor_rank(out)
+        out_dtype_str = (
+            _mlir_elem_to_torch_dtype_str(out.type)
+            if isinstance(out.type, TensorType)
+            else f"{ref}.dtype"
+        )
         if out_rank < max_rank:
             out_alloc_lines.append(
                 f"    out{i} = torch.empty("
-                f"{ref}.shape[:-1] + (1,), device={ref}.device, dtype={ref}.dtype)"
+                f"{ref}.shape[:-1] + (1,), device={ref}.device, dtype={out_dtype_str})"
             )
         else:
-            out_alloc_lines.append(f"    out{i} = torch.empty_like({ref})")
+            out_alloc_lines.append(f"    out{i} = torch.empty_like({ref}, dtype={out_dtype_str})")
 
     launch_args = [f"input{i}" for i in range(n_inputs)] + [f"out{i}" for i in range(n_outputs)]
 
@@ -386,8 +422,9 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
                 else:
                     shape_parts.append(str(s))
             shape_expr = "(" + ", ".join(shape_parts) + (",)" if len(shape_parts) == 1 else ")")
+            out_dtype_str = _mlir_elem_to_torch_dtype_str(out.type)
             fake_returns.append(
-                f"torch.empty({shape_expr}, device={ref_input}.device, dtype={ref_input}.dtype)"
+                f"torch.empty({shape_expr}, device={ref_input}.device, dtype={out_dtype_str})"
             )
         else:
             fake_returns.append(f"torch.empty_like({ref_input})")
@@ -405,7 +442,7 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     )
 
     reg_globals = {"torch": torch, "launcher_fn": launcher_fn}
-    exec(reg_src, reg_globals)  # noqa: S102
+    exec(reg_src, reg_globals)  # noqa: S102  # nosec B102
 
     # Build a wrapper that calls via torch.ops
     op_short_name = f"mlir_fused_{sg_hash}"

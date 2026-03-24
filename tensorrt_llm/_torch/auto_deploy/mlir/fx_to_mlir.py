@@ -272,8 +272,14 @@ class FXToMLIRConverter:
         input_val = self._resolve_operand(node.args[0])
         dims = node.args[1]  # list of ints
         keepdim = node.args[2] if len(node.args) > 2 else False
-        # We only support single-dim reduction for now
-        dim = dims[0] if isinstance(dims, (list, tuple)) else dims
+        # Only single-dim reductions are supported; fall back to opaque for multi-axis.
+        if isinstance(dims, (list, tuple)):
+            if len(dims) != 1:
+                self._convert_opaque(node, block)
+                return
+            dim = dims[0]
+        else:
+            dim = dims
         result_type = _result_type_for_node(node)
         op = AdReduceMean.build(
             operands=[input_val],
