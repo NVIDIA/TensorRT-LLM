@@ -51,7 +51,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_me
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.runtime.generation import CUASSERT
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -742,8 +742,11 @@ class TxSession(TxSessionBase):
         params: DisaggregatedParams,
         sender: Sender,
         aux_buffer: Optional[AuxBuffer] = None,
+        timeout_s: Optional[float] = None,
     ):
         super().__init__(sender, SessionArgsBase(params))
+        self._timeout_s = timeout_s
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
         self._aux_buffer = aux_buffer
@@ -799,10 +802,10 @@ class TxSession(TxSessionBase):
         assert self.aux_slot is not None, "No aux_slot set for this session"
         self._aux_buffer.fill_slot(self.aux_slot, request)
 
-    def is_completed(self, need_aux: bool) -> bool:
+    def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?"""
         status = self.status
-        if need_aux:
+        if self._need_aux:
             return status == SessionStatus.FULLY_TRANSFERRED
         return status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED)
 
@@ -810,18 +813,18 @@ class TxSession(TxSessionBase):
         """Non-blocking check: has the transfer failed?"""
         return self.status == SessionStatus.ERROR
 
-    def wait_complete(self, need_aux: bool, timeout: float) -> WaitResult:
+    def wait_complete(self) -> Optional[WaitResult]:
         """Block until KV (and optionally aux) transfer finishes.
 
         Returns WaitResult.COMPLETED, WaitResult.FAILED, or WaitResult.TIMEOUT.
         """
         try:
             for task in self.kv_tasks:
-                kv_status = task.future.result(timeout=timeout)
+                kv_status = task.future.result(timeout=self._timeout_s)
                 if kv_status != AgentResult.SUCCESS:
                     return WaitResult.FAILED
-            if need_aux and self.aux_task is not None:
-                aux_status = self.aux_task.future.result(timeout=timeout)
+            if self._need_aux and self.aux_task is not None:
+                aux_status = self.aux_task.future.result(timeout=self._timeout_s)
                 if aux_status != AgentResult.SUCCESS:
                     return WaitResult.FAILED
             return WaitResult.COMPLETED
@@ -1125,8 +1128,11 @@ class RxSession(RxSessionBase):
         params: DisaggregatedParams,
         receiver: Receiver,
         aux_buffer: Optional[AuxBuffer] = None,
+        timeout_s: Optional[float] = None,
     ):
         super().__init__(receiver, SessionArgsBase(params))
+        self._timeout_s = timeout_s
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
         self._aux_buffer = aux_buffer
@@ -1236,10 +1242,10 @@ class RxSession(RxSessionBase):
         request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
         request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
 
-    def is_completed(self, need_aux: bool) -> bool:
+    def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?"""
         status = self.status
-        if need_aux:
+        if self._need_aux:
             return status == SessionStatus.FULLY_TRANSFERRED
         return status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED)
 
@@ -1247,12 +1253,12 @@ class RxSession(RxSessionBase):
         """Non-blocking check: has the transfer failed?"""
         return self.status == SessionStatus.ERROR
 
-    def wait_complete(self, need_aux: bool, block_for_aux: bool = False) -> Optional[WaitResult]:
-        """Block until KV transfer is done; optionally wait for aux too.
+    def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]:
+        """Block until transfer completes.
 
-        With block_for_aux=False (default): returns None if KV is done but aux
-        is still in flight — caller should re-poll next cycle.
-        With block_for_aux=True: spins until aux also arrives (use for block_all).
+        With blocking=False (default): returns None if KV is done but transfer
+        not fully complete — caller should re-poll next cycle.
+        With blocking=True: spins until fully complete.
         Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error.
         """
         try:
@@ -1260,17 +1266,19 @@ class RxSession(RxSessionBase):
                 kv_status = task.future.result()
                 if kv_status != AgentResult.SUCCESS:
                     return WaitResult.FAILED
-            if need_aux:
+            if self._need_aux:
                 while True:
                     status = self.status
                     if status == SessionStatus.FULLY_TRANSFERRED:
                         return WaitResult.COMPLETED
                     elif status == SessionStatus.ERROR:
                         return WaitResult.FAILED
-                    if not block_for_aux:
+                    if not blocking:
                         return None  # KV done, aux still in flight; re-poll next cycle
                     time.sleep(0.001)
             return WaitResult.COMPLETED
+        except TimeoutError:
+            return WaitResult.FAILED
         except Exception:
             return WaitResult.FAILED
 
@@ -1401,10 +1409,13 @@ class TransferWorkerConfig:
     instance_name: str
     max_concurrent_sessions: int = 0
     max_draft_len: Optional[int] = None
+    tx_timeout_s: Optional[float] = None
+    rx_timeout_s: Optional[float] = None
 
 
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
+        self._config = config
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
             kvm, config.max_concurrent_sessions, config.max_draft_len
@@ -1431,6 +1442,7 @@ class TransferWorker:
             params=params,
             sender=self._sender,
             aux_buffer=self._aux_buffer,
+            timeout_s=self._config.tx_timeout_s,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -1441,6 +1453,7 @@ class TransferWorker:
             params=params,
             receiver=self._receiver,
             aux_buffer=self._aux_buffer,
+            timeout_s=self._config.rx_timeout_s,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:

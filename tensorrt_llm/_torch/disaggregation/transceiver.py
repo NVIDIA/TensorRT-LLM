@@ -6,7 +6,13 @@ from typing import Any, Callable, Dict, List, Optional, cast
 import torch
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, WaitResult, get_unique_rid
+from tensorrt_llm._torch.disaggregation.base.transfer import (
+    KVSlice,
+    RxSessionBase,
+    TxSessionBase,
+    WaitResult,
+    get_unique_rid,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
@@ -62,6 +68,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
                 # large multiplier is cheap.
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
+                tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
+                rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
@@ -69,8 +77,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._init_sync_policy()
         self._exchange_rank_info()
 
-        self._send_sessions = {}
-        self._recv_sessions = {}
+        self._send_sessions: Dict[int, TxSessionBase] = {}
+        self._recv_sessions: Dict[int, RxSessionBase] = {}
         self._send_reqs = {}
         self._recv_reqs = {}
         self._wait_reqs = {}
@@ -190,7 +198,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Scan sessions and return (completed_rids, failed_rids)."""
         completed, failed = [], []
         for rid, session in sessions.items():
-            if session.is_completed(self._need_aux_transfer(reqs[rid])):
+            if session.is_completed():
                 completed.append(rid)
             elif session.has_failed():
                 failed.append(rid)
@@ -287,12 +295,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         completed, timed_out, failed = [], [], []
-        timeout = self._sender_future_timeout_ms / 1000.0
         for rid in to_process:
             session = self._send_sessions[rid]
-            result = session.wait_complete(
-                need_aux=self._need_aux_transfer(self._send_reqs[rid]), timeout=timeout
-            )
+            result = session.wait_complete()
             if result == WaitResult.COMPLETED:
                 completed.append(rid)
             elif result == WaitResult.TIMEOUT:
@@ -328,9 +333,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         completed, failed = [], []
         for rid in to_process:
-            result = self._recv_sessions[rid].wait_complete(
-                need_aux=self._need_aux_transfer(self._recv_reqs[rid]), block_for_aux=block_all
-            )
+            result = self._recv_sessions[rid].wait_complete(blocking=block_all)
             if result == WaitResult.COMPLETED:
                 completed.append(rid)
             elif result == WaitResult.FAILED:
