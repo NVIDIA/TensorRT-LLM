@@ -204,6 +204,9 @@ transforms:
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
+  fuse_silu_mul:
+    stage: post_load_fusion
+    enabled: false
   fuse_swiglu:
     stage: post_load_fusion
     enabled: false
