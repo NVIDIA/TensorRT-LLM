@@ -98,6 +98,10 @@ def create_random_logits(
     torch.manual_seed(seed)
     num_rows = row_starts.shape[0]
     max_len = int(row_ends.max().item())
+    # Pad to multiple of 4 so stride0 satisfies the float4-alignment requirement
+    # of launchHeuristicTopKDecode (matches TRT-LLM runtime where strides are
+    # always multiples of tokens_per_block >= 64).
+    max_len = (max_len + 3) & ~3
 
     logits = torch.rand(num_rows, max_len, dtype=dtype, device="cuda")
 
@@ -567,6 +571,10 @@ def create_distributed_logits(
     rng = np.random.default_rng(seed)
     num_rows = int(row_starts.shape[0])
     max_len = int(row_ends.cpu().max().item())
+    # Pad to multiple of 4 so stride0 satisfies the float4-alignment requirement
+    # of launchHeuristicTopKDecode (matches TRT-LLM runtime where strides are
+    # always multiples of tokens_per_block >= 64).
+    max_len = (max_len + 3) & ~3
     size = (num_rows, max_len)
 
     dist = cfg["dist"]
