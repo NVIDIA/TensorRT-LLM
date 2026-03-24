@@ -506,7 +506,7 @@ class TestKVCacheV2DSv3Lite:
             prompts,
             sampling_params,
             kv_extra=kv_extra,
-            speculative_config=MTPDecodingConfig(num_nextn_predict_layers=2),
+            speculative_config=MTPDecodingConfig(max_draft_len=2),
             tensor_parallel_size=self.TP_SIZE,
             assert_outputs_match=False,
             **llm_kwargs,

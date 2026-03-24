@@ -78,7 +78,7 @@ worker_config:
     num_postprocess_workers: 4
     speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
   ctx:
     max_batch_size: 1
     max_num_tokens: 131104
@@ -99,6 +99,6 @@ worker_config:
       backend: DEFAULT
     speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
     moe_config:
       backend: TRTLLM

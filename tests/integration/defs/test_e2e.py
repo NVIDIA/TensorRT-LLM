@@ -2259,7 +2259,7 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
         },
         "speculative_config": {
             "decoding_type": "MTP",
-            "num_nextn_predict_layers": 1,
+            "max_draft_len": 1,
         },
     }
 

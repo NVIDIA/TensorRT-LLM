@@ -322,7 +322,8 @@ def extract_config_fields(config_data: dict) -> dict:
     gen_config = config_data["worker_config"]["gen"]
     mtp_size = 0
     if "speculative_config" in gen_config:
-        mtp_size = gen_config["speculative_config"].get("num_nextn_predict_layers", 0)
+        spec_config = gen_config["speculative_config"]
+        mtp_size = spec_config.get("max_draft_len", 0)
 
     return {
         "isl": isl,

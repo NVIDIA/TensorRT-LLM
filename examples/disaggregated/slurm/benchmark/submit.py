@@ -422,7 +422,7 @@ def submit_job(config, log_dir, dry_run):
 
     # Get mtp_size from gen config's speculative_config
     mtp_size = worker_config['gen'].get('speculative_config',
-                                        {}).get('num_nextn_predict_layers', 0)
+                                        {}).get('max_draft_len', 0)
 
     # Create base log directory path
     if 'log_dir' in env_config and env_config['log_dir']:
