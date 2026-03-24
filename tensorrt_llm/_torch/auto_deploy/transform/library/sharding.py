@@ -1756,6 +1756,9 @@ def _shard_nvfp4_moe_scale(
     modelopt_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(scale, tuple(weight_shape_elements))
     sharded = _split_tensor_for_tp(modelopt_scale, dim, rank, world_size)
     m, n = sharded.shape
+    # Pad to match CUTLASS FP4 scale swizzle alignment requirements:
+    # 128 rows (4 * 32 tile in M dim) and 4 columns (N dim grouping).
+    # See modelopt_fp4_scale_to_cutlass_fp4_scale in quantization_utils.py.
     pad_m = (128 - m % 128) % 128
     pad_n = (4 - n % 4) % 4
     result_1d = modelopt_fp4_scale_to_cutlass_fp4_scale(sharded)
