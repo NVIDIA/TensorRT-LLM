@@ -343,38 +343,6 @@ def lint(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
-def toposort_single_gm(gm: GraphModule) -> None:
-    """Rebuild one FX graph in dependency order.
-
-    Some graph rewrites leave the FX linked-list order non-topological even though the dataflow is
-    otherwise valid. Rebuilding the graph via recursive ``node_copy`` restores producer-before-
-    consumer order while preserving node metadata.
-    """
-    old_graph = gm.graph
-    new_graph = Graph()
-    new_graph._codegen = old_graph._codegen
-    env: Dict[Node, Node] = {}
-
-    def copy_node(node: Node) -> Node:
-        if node in env:
-            return env[node]
-        for input_node in node.all_input_nodes:
-            copy_node(input_node)
-        new_node = new_graph.node_copy(node, lambda x: env[x])
-        new_node.meta = dict(node.meta)
-        env[node] = new_node
-        return new_node
-
-    for node in old_graph.nodes:
-        if node.op != "output":
-            copy_node(node)
-    for node in old_graph.nodes:
-        if node.op == "output":
-            copy_node(node)
-
-    gm.graph = new_graph
-
-
 def _canonicalize_single_gm(gm: GraphModule) -> None:
     # clean up graph (needs to be done repeatedly until no more dead code)
     eliminate_dead_code(gm, is_impure_node=_is_impure_node)

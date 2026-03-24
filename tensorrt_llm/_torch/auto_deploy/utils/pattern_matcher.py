@@ -35,12 +35,11 @@ from torch._inductor.pattern_matcher import (
     is_match,
     joint_fwd_bwd,
     log_trace_failure,
+    stable_topological_sort,
 )
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-
-from ._graph import toposort_single_gm
 
 
 @contextlib.contextmanager
@@ -125,11 +124,20 @@ class ADReplacementPatternEntry(ReplacementPatternEntry):
             # earliest matched output node. That is usually fine for single-output rewrites, but it
             # can leave multi-output replacements non-topological: some inputs to the later tuple
             # outputs may still appear later in the linked-list order, or the copied tuple producer
-            # and its getitem users can end up reversed. Rebuilding the graph order here keeps the
-            # repair local to the rewrite site instead of paying a global toposort in every later
-            # canonicalization step.
-            assert isinstance(graph.owning_module, GraphModule)
-            toposort_single_gm(graph.owning_module)
+            # and its getitem users can end up reversed. A concrete example is
+            # fuse_allreduce_residual_rmsnorm: the fused tuple op may be inserted relative to the
+            # earlier residual/add output even though a later RMSNorm weight/cast node is still one
+            # of its inputs, or the copied tuple producer may end up after the newly rewritten
+            # operator.getitem users that unpack it. Both shapes are dataflow-correct but violate
+            # FX's producer-before-consumer linked-list invariant and later fail lint/dead-code
+            # elimination with "used before it has been defined". We repair the linked-list order
+            # here, at the rewrite site, so only multi-output replacements pay for a full-graph
+            # stable sort instead of doing a broader canonicalization-time repair for every graph.
+            # TODO: Narrow this to a local reorder over the replacement-affected region instead of
+            # sorting the full graph. A bounded repair should start from the inserted replacement
+            # nodes plus the rewritten multi-output/getitem chain, then expand only as needed to
+            # make that slice dependency-safe before reordering it.
+            stable_topological_sort(graph)
 
 
 def _register_replacement_with_safe_insertion(
