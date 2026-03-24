@@ -1242,10 +1242,10 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
         }
     }
     auto searchRoot = mCachedBlocksRoot;
-    for (auto const& key : blockKeys)
+    for (auto const& blockKey : blockKeys)
     {
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(key, true, true)
+            ? searchRoot->findMatchingBlock(blockKey, true, true)
             : std::make_tuple(false, 0, nullptr);
 
         if (matchingBlock == nullptr)
