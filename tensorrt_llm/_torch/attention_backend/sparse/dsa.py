@@ -1684,15 +1684,7 @@ class Indexer(nn.Module):
         """
         q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(
             qr, hidden_states, position_ids)
-
-        weights, _ = maybe_execute_in_parallel(
-            lambda: weights,
-            lambda: self._update_k_cache(k_fp8, k_scale, metadata),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-
+        self._update_k_cache(k_fp8, k_scale, metadata)
         return q_fp8, k_fp8, k_scale, weights
 
     def pre_indexer_proj(
