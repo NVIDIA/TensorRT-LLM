@@ -2019,7 +2019,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # max_tokens is explicitly set, cap by GPU-only capacity so callers
         # (e.g. CUDA graph warmup) don't exceed the GPU pool.
         if self._gpu_max_tokens is not None:
-            clamped = min(clamped, self._gpu_max_tokens)
+            clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
 
     def get_num_free_blocks(self) -> int:
