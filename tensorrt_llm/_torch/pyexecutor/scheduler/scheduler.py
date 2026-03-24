@@ -724,6 +724,14 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 current_compute_capacity -= actual_model_cost
 
     def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+        """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        Every request is assigned exactly min(context_remaining_length, unit_size) tokens.
+        Requests that would exceed the capacity budget are zeroed out.
+
+        This policy is designed for linear attention state caching, which doesn't support estimating
+        reusable tokens, so we don't subtract them from the budget.
+        """
         total_tokens = 0
         for req in requests:
             req.context_chunk_size = min(req.context_remaining_length, unit_size)
