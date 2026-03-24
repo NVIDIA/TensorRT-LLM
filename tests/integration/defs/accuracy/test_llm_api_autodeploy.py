@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -429,14 +429,17 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nemotron-MOE"
+    MODEL_NAME = "nvidia/Nemotron-3-Nano"
 
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
     MODEL_PATHS = {
-        "bf16": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024",
-        "fp8": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
-        "nvfp4": f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+        "bf16":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
+        "fp8":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"),
+        "nvfp4":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -478,19 +481,19 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
     MODEL_PATHS = {
         "bf16":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"),
         "fp8":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"),
         "nvfp4":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -520,10 +523,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         if model_id == "bf16":
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
-        if enable_attention_dp:
-            kwargs.setdefault("transforms", {})["detect_sharding"] = {
-                "enable_attention_dp": True
-            }
+        kwargs.setdefault("transforms", {}).setdefault(
+            "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
@@ -533,7 +534,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            trust_remote_code=True,
                            **kwargs) as llm:
             _set_quant_config(llm, model_id)
-
+            # the nvfp4 model is mixed precision, should be tested against higher thresholds
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             print_memory_usage("after engine build")
 
             sampling_params = self.get_default_sampling_params()
@@ -881,11 +884,21 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     Config = yaml_extra (merged) + config_overrides.
     Model paths are resolved via hf_id_to_local_model_dir.
     """
+    # Aliases for models that have different names in the registry and the reference accuracy files.
+    MODEL_REFERENCE_ALIASES = {
+        "nvidia/Llama-3.1-8B-Instruct-FP8": "meta-llama/Llama-3.1-8B-Instruct",
+        "nvidia/Llama-3.1-8B-Instruct-NVFP4":
+        "meta-llama/Llama-3.1-8B-Instruct",
+    }
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
         pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
                      id="meta-llama_Llama-3.1-8B-Instruct"),
+        pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
+                     id="nvidia_Llama-3.1-8B-Instruct-FP8"),
+        pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
+                     id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
         pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),
         pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
@@ -939,7 +952,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                               use_beam_search=False)
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.parametrize("accuracy_check", [False])
+    @pytest.mark.parametrize("accuracy_check", [False, True])
     @pytest.mark.parametrize("model_name,config_overrides,tasks",
                              MODEL_REGISTRY_ACCURACY_PARAMS)
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
@@ -958,9 +971,18 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                            yaml_extra=yaml_paths,
                            **config_overrides) as llm:
             if accuracy_check:
+                if "NVFP4" in model_name:
+                    _set_quant_config(llm, "nvfp4")
+                elif "FP8" in model_name:
+                    _set_quant_config(llm, "fp8")
+                reference_model_name = self.MODEL_REFERENCE_ALIASES.get(
+                    model_name, model_name)
                 for task_cls in tasks:
-                    task = task_cls(model_name)
+                    task = task_cls(reference_model_name)
                     try:
-                        task.evaluate(llm, sampling_params=sampling_params)
+                        evaluate_kwargs = {
+                            "sampling_params": sampling_params
+                        } if task_cls is MMLU else {}
+                        task.evaluate(llm, **evaluate_kwargs)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None

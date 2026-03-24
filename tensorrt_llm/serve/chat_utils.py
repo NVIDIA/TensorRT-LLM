@@ -124,67 +124,42 @@ def parse_chat_message_content_part(
 
     if part_type == "image_url":
         str_content = cast(str, content)
-
-        async def load_image_async():
-            try:
-                image_kwargs = (
-                    mm_data_tracker._multimodal_server_config.media_io_kwargs
-                    or {}).get("image", {})
-                return await async_load_image(str_content, **image_kwargs)
-            except Exception as e:
-                logger.error(f"Failed to load image: {str(e)}")
-                return None
-
+        image_kwargs = (
+            mm_data_tracker._multimodal_server_config.media_io_kwargs
+            or {}).get("image", {})
         return MultimodalData(modality="image",
-                              data=load_image_async(),
+                              data=async_load_image(str_content,
+                                                    **image_kwargs),
                               is_embedding=False)
 
     if part_type == "image_embeds":
         str_content = cast(str, content)
 
-        async def decode_image_embeds_async():
-            try:
-                return load_base64_image_embeds(str_content)
-            except Exception as e:
-                logger.error(f"Failed to decode image data: {str(e)}")
-                return None
+        async def decode_image_embeds():
+            return load_base64_image_embeds(str_content)
 
         return MultimodalData(modality="image",
-                              data=decode_image_embeds_async(),
+                              data=decode_image_embeds(),
                               is_embedding=True)
 
     if part_type == "video_url":
         str_content = cast(str, content)
-
-        async def load_video_async():
-            try:
-                video_kwargs = (
-                    mm_data_tracker._multimodal_server_config.media_io_kwargs
-                    or {}).get("video", {})
-                return await async_load_video(str_content, **video_kwargs)
-            except Exception as e:
-                logger.error(f"Failed to load video: {str(e)}")
-                return None
-
+        video_kwargs = (
+            mm_data_tracker._multimodal_server_config.media_io_kwargs
+            or {}).get("video", {})
         return MultimodalData(modality="video",
-                              data=load_video_async(),
+                              data=async_load_video(str_content,
+                                                    **video_kwargs),
                               is_embedding=False)
 
     if part_type == "audio_url":
         str_content = cast(str, content)
-
-        async def load_audio_async():
-            try:
-                audio_kwargs = (
-                    mm_data_tracker._multimodal_server_config.media_io_kwargs
-                    or {}).get("audio", {})
-                return await async_load_audio(str_content, **audio_kwargs)
-            except Exception as e:
-                logger.error(f"Failed to load audio: {str(e)}")
-                return None
-
+        audio_kwargs = (
+            mm_data_tracker._multimodal_server_config.media_io_kwargs
+            or {}).get("audio", {})
         return MultimodalData(modality="audio",
-                              data=load_audio_async(),
+                              data=async_load_audio(str_content,
+                                                    **audio_kwargs),
                               is_embedding=False)
 
     raise NotImplementedError(f"Unknown part type: {part_type}")
