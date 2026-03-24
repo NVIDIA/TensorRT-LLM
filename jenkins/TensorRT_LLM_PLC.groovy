@@ -214,64 +214,13 @@ def pulseScanSourceCode(llmRepo, branchName) {
         }
     }
     container("cpu") {
-        sh "cat nspect_scan_report.json"
-        sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
+        def outputDir = "scan_report/source_code"
+        sh "mkdir -p ${outputDir}"
+        sh "unzip -p sbom.zip *.json > ${outputDir}/sbom.json"
         sh "cat sbom_toupload.json"
-        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
-            def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-scan/posting"
-            def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
-            def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
-            def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
-            def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
-            withEnv([
-                "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
-                "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
-                "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
-                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
-            ]) {
-                sh """
-                    python3 -m venv venv
-                    venv/bin/pip install requests elasticsearch==7.13.4
-                    venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl} --build-number ${env.BUILD_NUMBER} --branch ${params.branchName}
-                """
-            }
-        }
+        sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
     }
 }
-
-def processContainerScanResults(branchName) {
-    container("cpu") {
-        def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc/posting"
-        def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
-        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
-        def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
-        def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
-        def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
-        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
-            withEnv([
-                "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
-                "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
-                "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
-                "TRTLLM_ES_INDEX_PREAPPROVED_BASE=${TRTLLM_ES_INDEX_PREAPPROVED_BASE}",
-                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
-            ]) {
-                sh """
-                    python3 -m venv venv
-                    venv/bin/pip install requests elasticsearch==7.13.4
-                    venv/bin/python ./jenkins/scripts/process_scan_report.py \
-                        --scan-report-dir scan_report \
-                        --output-dir scan_report_diff
-                    venv/bin/python ./jenkins/scripts/submit_container_scan_report.py \
-                        --diff-dir scan_report_diff \
-                        --build-url ${pipelineUrl} \
-                        --build-number ${env.BUILD_NUMBER} \
-                        --branch ${branchName}
-                """
-            }
-        }
-    }
-}
-
 def pulseScanContainer(llmRepo, branchName) {
     // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
     def imageTags = [:]
@@ -332,6 +281,35 @@ def pulseScanContainer(llmRepo, branchName) {
     }
 }
 
+def processScanResults(branchName) {
+    container("cpu") {
+        def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc/posting"
+        def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
+        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
+        def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
+        def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
+        def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
+        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+            withEnv([
+                "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
+                "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
+                "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
+                "TRTLLM_ES_INDEX_PREAPPROVED_BASE=${TRTLLM_ES_INDEX_PREAPPROVED_BASE}",
+                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
+            ]) {
+                sh """
+                    python3 -m venv venv
+                    venv/bin/pip install requests elasticsearch==7.13.4
+                    venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
+                        --build-url ${pipelineUrl} \
+                        --build-number ${env.BUILD_NUMBER} \
+                        --branch ${branchName}
+                """
+            }
+        }
+    }
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig()
@@ -356,7 +334,6 @@ pipeline {
         // Jobs in other folders (e.g. personal/dev pipelines) will have no cron trigger.
         parameterizedCron(env.JOB_NAME.startsWith('LLM/helpers/') ? '''
             H 2 * * * %branchName=main;repoUrlKey=tensorrt_llm_github
-            H 3 * * * %branchName=release/1.2;repoUrlKey=tensorrt_llm_github
         ''' : '')
     }
     stages {
@@ -371,28 +348,28 @@ pipeline {
         }
         stage('Run TRT-LLM PLC Jobs') {
             parallel {
-                stage("Source Code OSS Scanning"){
-                    stages {
-                        stage("Generate Lock Files"){
-                            steps
-                            {
-                                script {
-                                    generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                stage('Parent Scanning') {
+                    parallel{
+                        stage("Source Code OSS Scanning"){
+                            stages {
+                                //stage("Generate Lock Files"){
+                                    //steps
+                                    //{
+                                        //script {
+                                            //generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                                        //}
+                                    //}
+                                //}
+                                stage("Run Pulse Scanning"){
+                                    steps
+                                    {
+                                        script {
+                                            pulseScanSourceCode(env.LLM_REPO, env.BRANCH_NAME)
+                                        }
+                                    }
                                 }
                             }
                         }
-                        stage("Run Pulse Scanning"){
-                            steps
-                            {
-                                script {
-                                    pulseScanSourceCode(env.LLM_REPO, env.BRANCH_NAME)
-                                }
-                            }
-                        }
-                    }
-                }
-                stage("Container OSS Scanning"){
-                    stages {
                         stage("Run Container Scanning"){
                             steps
                             {
@@ -401,12 +378,12 @@ pipeline {
                                 }
                             }
                         }
-                        stage("Process Container Scan Results"){
-                            steps
-                            {
-                                script {
-                                    processContainerScanResults(env.BRANCH_NAME)
-                                }
+                    }
+                    stage("Process Scan Result"){
+                        steps
+                        {
+                            script {
+                                processScanResults(env.BRANCH_NAME)
                             }
                         }
                     }
@@ -418,6 +395,7 @@ pipeline {
                             sonarScan()
                         }
                     }
+                }
                 }
             }
         }
