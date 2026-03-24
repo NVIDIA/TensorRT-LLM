@@ -172,10 +172,7 @@ echo "Server is ready!"
 echo "Starting client commands from ${client_cmds_file}..."
 while read -r cmd <&3; do
     echo "Starting client command: ${cmd}"
-    eval "${cmd}"
-    if [ $? -ne 0 ]; then
-        cleanup_on_failure "Command failed: ${cmd}."
-    fi
+    eval "${cmd}" || cleanup_on_failure "Command failed: ${cmd}."
 done 3< "${client_cmds_file}"
 
 echo "Job completed successfully, total runtime: $SECONDS seconds"

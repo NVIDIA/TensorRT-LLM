@@ -87,7 +87,6 @@ worker_config:
       - 768
       - 1024
       - 2048
-      - 256
     print_iter_log: true
     trust_remote_code: true
     kv_cache_config:

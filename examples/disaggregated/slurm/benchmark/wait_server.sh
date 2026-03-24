@@ -14,7 +14,7 @@ readonly STATUS_UPDATE_INTERVAL=30
 # Wait for server to be healthy
 echo "Waiting for server ${hostname}:${port} to be healthy..."
 start_time=$(date +%s)
-while ! curl -s -o /dev/null -w "%{http_code}" "http://${hostname}:${port}/health" > /dev/null 2>&1; do
+while [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://${hostname}:${port}/health" 2>/dev/null)" != "200" ]]; do
     current_time=$(date +%s)
     elapsed=$((current_time - start_time))
 
