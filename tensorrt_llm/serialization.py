@@ -1,5 +1,5 @@
 import io
-# pickle is not secure, but but this whole file is a wrapper to make it
+# pickle is not secure, but this whole file is a wrapper to make it
 # possible to mitigate the primary risk of code injection via pickle.
 import pickle  # nosec B403
 import re

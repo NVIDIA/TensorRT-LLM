@@ -18,7 +18,7 @@
 This module provides an interface between the high-level runtime and cache management system and
 the low-level functional attention operators. The interface is designed to provide a homogeneous
 object-oriented interface to the high-level runtime via the SequenceInfo dataclass. The SequenceInfo
-is also responsible for functionalizing information about the sequence and pass it on the the
+is also responsible for functionalizing information about the sequence and pass it on the
 various attention interface. The AttentionDescriptor is the main interface to the attention operator
 and operates on a purely functional paradigm that is compatible with the torch custom op system.
 

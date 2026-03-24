@@ -146,7 +146,7 @@ def initialize_dummy_weights(
 
             param.data.copy_(tmp_param.to(dtype))
 
-        # Note: no need to to mess with int32 params, these are probably
+        # Note: no need to mess with int32 params, these are probably
         # constants and not weights.
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
