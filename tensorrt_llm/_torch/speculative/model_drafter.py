@@ -11,8 +11,7 @@ from tensorrt_llm.logger import logger
 from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
-from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
-                                      get_draft_token_length)
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
                                            ResourceManagerType)
 from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
@@ -52,6 +51,8 @@ def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
 
 class ModelDrafter(Drafter):
     """Model-based drafter that uses a draft model to generate draft tokens."""
+
+    _needs_padding_kv_extension = True
 
     def __init__(
         self,
@@ -109,32 +110,6 @@ class ModelDrafter(Drafter):
         self.previous_scheduled_batch: Optional[ScheduledRequests] = None
         # Map from request ID to original request
         self.req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None
-
-    def _extend_kv_cache_for_padding(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: ResourceManager,
-        pre_padding_lens: Dict[int, int],
-    ) -> None:
-        """Extend main-model and draft-model KV cache capacity for padding.
-
-        Two-model mode uses TorchSampler which computes py_rewind_len from
-        the padded len(py_draft_tokens).  Both KV cache managers (main and
-        draft) are rewound by the same py_rewind_len in update_resources,
-        so both must have capacity extended to match the padded length.
-        """
-        kv_mgr = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER)
-        draft_kv_mgr = resource_manager.get_resource_manager(
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        for req in scheduled_requests.generation_requests:
-            extra = get_draft_token_length(req) - pre_padding_lens.get(
-                req.py_request_id, 0)
-            if extra > 0:
-                if kv_mgr is not None:
-                    kv_mgr.extend_capacity_for_tokens(req, extra)
-                if draft_kv_mgr is not None:
-                    draft_kv_mgr.extend_capacity_for_tokens(req, extra)
 
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
