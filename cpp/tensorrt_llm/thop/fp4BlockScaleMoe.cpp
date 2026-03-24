@@ -399,8 +399,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     // allocate or use provided output
     at::Tensor output;
-    at::Tensor out_tensor_unpadded; // original unpadded out_tensor for copy-back
-    bool needs_copy_back = false;
     if (out_tensor.has_value())
     {
         TORCH_CHECK(do_finalize, "out_tensor is only supported when do_finalize=true.");
@@ -411,21 +409,18 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         auto const out_hidden = out_tensor->sizes()[1];
         if (out_hidden < args.hidden_size)
         {
-            // When the output tensor has fewer columns than the padded hidden size (e.g., NVFP4 with
-            // hidden_size not a multiple of the kernel's required alignment), we must allocate a padded
-            // output buffer for the GEMM/finalize kernels and copy back the valid columns afterwards.
-            // Using the unpadded tensor directly as output can cause incorrect GEMM results because
-            // the Gemm2 kernel may require the output dimension to match the padded hidden_size.
-            out_tensor_unpadded = out_tensor.value();
-            needs_copy_back = true;
-            output = at::detail::empty_cuda(
-                {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+            // out_tensor has unpadded hidden dim (e.g., nvfp4 with padding).
+            // Set valid_hidden_size so the finalize kernel writes only the needed columns
+            // directly into out_tensor. Keep output_hidden_size at the full hidden_size so
+            // Gemm2 still computes at the padded width (its cubin config requires it).
+            args.valid_hidden_size = out_hidden;
+            args.output_hidden_size = args.hidden_size;
         }
         else
         {
             TORCH_CHECK(out_hidden == args.hidden_size, "out_tensor hidden dim must match hidden_size.");
-            output = out_tensor.value();
         }
+        output = out_tensor.value();
     }
     else
     {
@@ -484,15 +479,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     if (!do_finalize)
     {
         return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
-    }
-
-    // Copy padded output back to original unpadded out_tensor if needed
-    if (needs_copy_back)
-    {
-        auto const valid_cols = out_tensor_unpadded.sizes()[1];
-        // Copy first valid_cols columns from padded output to original out_tensor
-        out_tensor_unpadded.copy_(output.slice(1, 0, valid_cols));
-        return {out_tensor_unpadded};
     }
 
     return {output};
