@@ -178,6 +178,7 @@ class _KVCache:
         "_avg_history_length",
         "_avg_capacity",
         "_ssm_blocks",
+        "_num_released_prefix_blocks",
         "__rawref__",
     )
 
@@ -244,6 +245,7 @@ class _KVCache:
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
         self._ssm_blocks = None
+        self._num_released_prefix_blocks = 0
         self.__rawref__ = rawref.NULL
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
@@ -929,12 +931,16 @@ class _KVCache:
         for ordinal, block in typed_enumerate(self._blocks):
             is_committed = ordinal < self._num_committed_blocks
             assert is_committed == block.is_committed
+            prefix_released = ordinal < self._num_released_prefix_blocks
             for beam_block in block.pages:
                 assert typed_len(beam_block) == num_life_cycles
                 for lc in typed_range(num_life_cycles):
                     holder = beam_block[lc]
                     if lc == ssm_lc_id:
                         # SSM pages live in _ssm_blocks, not in _blocks
+                        assert holder is None
+                        continue
+                    if prefix_released:
                         assert holder is None
                         continue
                     start, end = stale_ranges[lc]
@@ -1159,6 +1165,7 @@ class _KVCache:
             for indices in beam_indices:
                 for i in range(min(num_blocks, len(indices))):
                     indices[i] = BAD_PAGE_INDEX
+        self._num_released_prefix_blocks = max(self._num_released_prefix_blocks, num_blocks)
 
     @contextmanager
     def _record_event(self) -> Iterator[None]:
