@@ -123,7 +123,8 @@ bool FmhaDispatcher::isSupported()
         // Sparse context attention uses a generation-style kernel with per-token sparse indices.
         if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseAttention = true;
+            tllmRunnerParams.mSparseAttention
+                = mFixedParams.useSparseMLA ? SparseType::SparseMla : SparseType::SparseMqaGqa;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
@@ -236,7 +237,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // The kernel iterates over tokens via numCtasPerSeqQ when maxSeqLenQ > 1.
         if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseAttention = true;
+            tllmRunnerParams.mSparseAttention
+                = mFixedParams.useSparseMLA ? SparseType::SparseMla : SparseType::SparseMqaGqa;
             tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.sparse_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;

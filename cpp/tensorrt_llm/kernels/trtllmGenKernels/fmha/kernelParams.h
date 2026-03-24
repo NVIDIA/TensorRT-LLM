@@ -771,7 +771,7 @@ struct KernelParams
 
         // If sparse attention is enabled, the shape and stride for KV need to be updated for 2D layout
         // (numTokensKvInPagedKv, headDimQk).
-        if (options.mSparseAttention)
+        if (isSparseAttention(options.mSparseAttention))
         {
             shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
             strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
@@ -903,8 +903,8 @@ struct KernelParams
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
         // The SparseTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
-        TLLM_CHECK_WITH_INFO(
-            !options.mSparseAttention || (options.mSparseTopK % 4) == 0, "SparseTopK must be a multiple of 4");
+        TLLM_CHECK_WITH_INFO(!isSparseAttention(options.mSparseAttention) || (options.mSparseTopK % 4) == 0,
+            "SparseTopK must be a multiple of 4");
         params.mNumSparseTopk = options.mSparseTopK;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
         // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).

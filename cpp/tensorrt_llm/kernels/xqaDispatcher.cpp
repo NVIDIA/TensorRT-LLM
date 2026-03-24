@@ -300,7 +300,7 @@ bool XqaDispatcher::isSupported()
         // Sparse MQA/GQA uses trtllm-gen sparse kernel.
         if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseAttention = true;
+            tllmRunnerParams.mSparseAttention = SparseType::SparseMqaGqa;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
@@ -443,7 +443,7 @@ void XqaDispatcher::runImpl(
             // Sparse MQA/GQA attention: use trtllm-gen sparse kernel.
             else if (mFixedParams.useTllmGenSparseAttention)
             {
-                tllmRunnerParams.mSparseAttention = true;
+                tllmRunnerParams.mSparseAttention = SparseType::SparseMqaGqa;
                 tllmRunnerParams.mSparseTopK = params.sparse_params.sparse_topk;
                 tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
                 tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<int const*>(params.sparse_params.sparse_attn_indices);

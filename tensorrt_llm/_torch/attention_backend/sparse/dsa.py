@@ -166,7 +166,7 @@ def transform_local_topk_and_prepare_pool_view(
         block_table,
         topk_indices,
         BLOCK_SIZE=tokens_per_block,
-        NUM_TOPK_TOKENS=topk_indices.shape[1],
+        NUM_TOPK_TOKENS=topk_indices.shape[-1],
         stride_factor=stride_factor,
         layer_id=layer_idx,
     )

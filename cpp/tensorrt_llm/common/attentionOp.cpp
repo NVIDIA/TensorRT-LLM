@@ -1123,7 +1123,7 @@ int AttentionOp::mlaGeneration(
         // Set the following parameters if sparseAttention is used.
         if (useSparseMLA())
         {
-            tllmRunnerParams.mSparseAttention = true;
+            tllmRunnerParams.mSparseAttention = SparseType::SparseMla;
             tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.sparse_topk;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);

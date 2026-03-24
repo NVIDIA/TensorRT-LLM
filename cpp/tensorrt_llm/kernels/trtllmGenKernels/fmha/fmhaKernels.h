@@ -164,7 +164,7 @@ public:
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, bool sparseAttention, bool skipsSoftmax) const
+        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -429,8 +429,8 @@ private:
         {
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
-            // The sparseMla only selects topK tokensKv.
-            if (params.mSparseAttention)
+            // Sparse attention only selects topK tokensKv.
+            if (isSparseAttention(params.mSparseAttention))
             {
                 maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseTopK);
             }
@@ -469,8 +469,9 @@ private:
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
             }
-            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) && !params.mSparseAttention
-                && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
+            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params)
+                && !isSparseAttention(params.mSparseAttention) && selectKernelParams.mTileSizeKv == 128
+                && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
             {
                 // Use smaller tileSizeKv to fully utilize the SMs.
                 selectKernelParams.mTileSizeKv = 64;
@@ -582,7 +583,7 @@ private:
         int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
         // Check the conditions.
-        if (params.mNumHeadsQPerKv <= 32 || (params.mSparseAttention && params.mNumHeadsQPerKv < 128)
+        if (params.mNumHeadsQPerKv <= 32 || (isSparseAttention(params.mSparseAttention) && params.mNumHeadsQPerKv < 128)
             || useSwapsMmaAbMlaGenKernel(params))
         {
             kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
@@ -601,7 +602,7 @@ private:
                 selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
             }
             // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
-            TLLM_CHECK_WITH_INFO(!params.mSparseAttention || params.mNumHeadsQPerKv == 128,
+            TLLM_CHECK_WITH_INFO(!isSparseAttention(params.mSparseAttention) || params.mNumHeadsQPerKv == 128,
                 "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128, got %d",
                 params.mNumHeadsQPerKv);
             // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
@@ -780,7 +781,7 @@ private:
 
         // Sparse MQA/GQA: tileSizeQ only groups heads (not tokens), same as sparse MLA.
         // The kernel iterates over tokens via numCtasPerSeqQ when maxSeqLenQ > 1.
-        if (params.mSparseAttention)
+        if (isSparseAttention(params.mSparseAttention))
         {
             numTokensHeadsQ = params.mNumHeadsQPerKv;
         }
@@ -824,7 +825,7 @@ private:
     void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
         // Sparse attention kernels use a fixed numTokensPerPage = 1.
-        if (params.mSparseAttention)
+        if (isSparseAttention(params.mSparseAttention))
         {
             selectKernelParams.mNumTokensPerPage = 1;
         }
@@ -876,7 +877,7 @@ private:
             + ", numTokensPerPage=" + std::to_string(selectKernelParams.mNumTokensPerPage)
             + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
             + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
-            + ", sparseAttention=" + std::to_string(params.mSparseAttention)
+            + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -887,7 +888,8 @@ private:
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
-                selectKernelParams.mUses2CtaMma, params.mSparseAttention, selectKernelParams.mSkipsSoftmaxWhenPossible),
+                selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
+                selectKernelParams.mSkipsSoftmaxWhenPossible),
             info);
     }
 

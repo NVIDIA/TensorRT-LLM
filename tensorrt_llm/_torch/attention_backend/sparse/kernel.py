@@ -1892,21 +1892,11 @@ def triton_convert_req_index_to_global_index(
     """
     Convert request-local token indices to global KV cache pool indices.
 
-    KV cache pool layout: [max_num_pages, num_layers, kv_factor, num_kv_heads, tokens_per_block, head_dim]
-    block_table: [num_requests, max_pages]
-      - stores memPoolBlockIdx (physical page index, first dim of pool)
-      - same for K and V (K/V share the same physical page)
+    Accepts both 2D and 3D token_indices:
+      - 2D [num_tokens, topk]: MLA path (num_kv_heads=1 implicit)
+      - 3D [num_kv_heads, num_tokens, topk]: MQA/GQA path
 
-    Input shape:  [num_kv_heads, num_tokens, topk] (3D local indices)
-    Output shape: [num_kv_heads, num_tokens, kv_factor, topk] (4D global indices)
-
-    stride_factor = num_layers * kv_factor * num_kv_heads * BLOCK_SIZE
-      (elements per physical page, excluding head_dim)
-    Global index = memPoolBlockIdx * stride_factor
-                   + layer_id * kv_factor * num_kv_heads * BLOCK_SIZE
-                   + kv_factor_idx * num_kv_heads * BLOCK_SIZE
-                   + kv_head_idx * BLOCK_SIZE
-                   + token_in_page
+    Output shape: [num_kv_heads, num_tokens, kv_factor, topk]
 
     Args:
         block_table: [num_requests, max_pages] — physical page indices.
@@ -1920,15 +1910,13 @@ def triton_convert_req_index_to_global_index(
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
-    assert token_indices.ndim == 3, f"Expected 3D [num_kv_heads, num_tokens, topk], got {token_indices.ndim}D"
+    assert token_indices.ndim in (2, 3), \
+        f"Expected 2D [num_tokens, topk] or 3D [num_kv_heads, num_tokens, topk], got {token_indices.ndim}D"
     assert block_table.ndim == 2, f"Expected 2D [batch, max_pages], got {block_table.ndim}D"
-    assert token_indices.shape[0] == num_kv_heads
-    assert token_indices.shape[2] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
         f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
 
     num_tokens = req_id.shape[0]
-    block_table.shape[0]
     max_num_blocks_per_req = block_table.shape[1]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
@@ -1940,7 +1928,12 @@ def triton_convert_req_index_to_global_index(
                       device=token_indices.device)
 
     bt_stride0, bt_stride1 = block_table_c.stride()
-    ti_stride0, ti_stride1, ti_stride2 = token_indices_c.stride()
+    # 2D input: ti_stride0=0 (kv_head_idx is always 0, term vanishes)
+    if token_indices_c.ndim == 2:
+        ti_stride0 = 0
+        ti_stride1, ti_stride2 = token_indices_c.stride()
+    else:
+        ti_stride0, ti_stride1, ti_stride2 = token_indices_c.stride()
     out_stride0, out_stride1, out_stride2, out_stride3 = out.stride()
 
     grid = (num_kv_heads, num_tokens, tiles_per_row)
