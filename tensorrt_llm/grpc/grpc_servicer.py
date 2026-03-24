@@ -106,6 +106,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 if request.HasField("guided_decoding")
                 else None,
                 embedding_bias=list(request.embedding_bias) if request.embedding_bias else None,
+                include_stop_token_in_output=request.include_stop_token_in_output,
             )
 
             # Build LoRA request if present
