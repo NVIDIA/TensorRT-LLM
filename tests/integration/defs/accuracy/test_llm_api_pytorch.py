@@ -6370,6 +6370,11 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM", "CUTLASS"])
     def test_nvfp4_4gpus_static_eplb(self, moe_backend):
 
+        if moe_backend == "TRTLLM":
+            pytest.skip(
+                "TRTLLM + EPLB is not supported yet, see https://nvbugs/5997893."
+            )
+
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             mamba_ssm_cache_dtype="float16",
@@ -6380,7 +6385,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             model_cfg = json.load(f)
         num_experts = model_cfg["n_routed_experts"]
         max_batch_size = 32
-        num_slots = 576  # num_slots should be larger than num_experts and should be divisible by parallel_size.
+        # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
+        # Assign extra 16 expert slots per rank.
+        extra_num_slots = 16 * 4
+        num_slots = num_experts + extra_num_slots
         hybrid_pattern = model_cfg["hybrid_override_pattern"]
         moe_layer_indices = [
             i for i, ch in enumerate(hybrid_pattern) if ch == 'E'
@@ -6419,14 +6427,23 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM", "CUTLASS"])
     def test_nvfp4_4gpus_online_eplb(self, moe_backend):
 
+        if moe_backend == "TRTLLM":
+            pytest.skip(
+                "TRTLLM + EPLB is not supported yet, see https://nvbugs/5997893."
+            )
+
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             mamba_ssm_cache_dtype="float16",
             free_gpu_memory_fraction=0.5,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        num_slots = 576  # num_slots should be larger than num_experts and should be divisible by parallel_size.
         max_batch_size = 32
+        num_experts = 512  # 512 experts per token for Nemotron V3 Super.
+        # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
+        # Assign extra 16 expert slots per rank.
+        extra_num_slots = 16 * 4
+        num_slots = num_experts + extra_num_slots
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
