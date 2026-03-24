@@ -909,13 +909,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Restore attn_metadata
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
-        # Eagle3: restore all_rank_num_tokens to the pre-loop value so the next
-        # target model forward sees the correct per-rank token distribution.
-        # spec_metadata.all_rank_num_tokens holds this value (set before the
-        # worker is called), so no separate save is needed.
-        if not self.is_mtp_eagle and spec_metadata.all_rank_num_tokens is not None:
-            attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_tokens
-
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens, next_draft_tokens,
             spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
