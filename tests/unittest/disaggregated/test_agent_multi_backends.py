@@ -20,13 +20,14 @@ def test_load_agent_missing_module():
 
 
 def test_load_agent_missing_attributes():
-    """_load_agent returns (None, None) and logs a warning when attributes are missing."""
+    """_load_agent returns (None, ImportError) and logs a warning when attributes are missing."""
     from tensorrt_llm._torch.disaggregation.nixl.agent import _load_agent
 
     # 'os' exists but has no NixlTransferAgent attribute
     agent, err = _load_agent("os", ["NixlTransferAgent"])
     assert agent is None
-    assert err is None
+    assert isinstance(err, ImportError), f"Expected ImportError, got {type(err)}: {err}"
+    assert "NixlTransferAgent" in str(err)
 
 
 def test_load_agent_success():

@@ -37,7 +37,7 @@ class NixlTransferStatus(TransferStatus):
         while status in (TransferState.PENDING, TransferState.PROCESSING):
             status = TransferState(self.agent.check_xfer_state(self.handle))
             if status == TransferState.ERROR:
-                logger.error("NIXL transfer entered ERROR state.")
+                logger.error("NIXL transfer entered ERROR state (agent=%s).", self.agent.name)
                 return False
             if timeout is not None and (time.time() - start_time > timeout):
                 logger.warning("NIXL transfer wait timed out after %s ms.", timeout_ms)
@@ -64,7 +64,7 @@ class NixlTransferAgent(BaseTransferAgent):
         )
         self.agent = nixl_agent(name, agent_config)
 
-    def register_memory(self, descs: RegMemoryDescs):
+    def _get_validated_reg_descs(self, descs: RegMemoryDescs):
         if not descs.descs:
             raise ValueError("descs.descs must not be empty")
         if isinstance(descs.descs[0], tuple) and len(descs.descs[0]) != 4:
@@ -76,21 +76,13 @@ class NixlTransferAgent(BaseTransferAgent):
             raise RuntimeError(
                 f"nixl get_reg_descs returned None for type={descs.type}, count={len(descs.descs)}"
             )
-        self.agent.register_memory(reg_descs)
+        return reg_descs
+
+    def register_memory(self, descs: RegMemoryDescs):
+        self.agent.register_memory(self._get_validated_reg_descs(descs))
 
     def deregister_memory(self, descs: RegMemoryDescs):
-        if not descs.descs:
-            raise ValueError("descs.descs must not be empty")
-        if isinstance(descs.descs[0], tuple) and len(descs.descs[0]) != 4:
-            raise ValueError(
-                f"Expected 4 elements per desc, got {len(descs.descs[0])}: {descs.descs[0]}"
-            )
-        reg_descs = self.agent.get_reg_descs(descs.descs, descs.type)
-        if reg_descs is None:
-            raise RuntimeError(
-                f"nixl get_reg_descs returned None for type={descs.type}, count={len(descs.descs)}"
-            )
-        self.agent.deregister_memory(reg_descs)
+        self.agent.deregister_memory(self._get_validated_reg_descs(descs))
 
     def load_remote_agent(self, name: str, agent_desc: bytes):
         self.agent.add_remote_agent(agent_desc)

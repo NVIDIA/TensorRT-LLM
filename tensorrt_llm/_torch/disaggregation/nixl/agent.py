@@ -13,17 +13,20 @@ so trtllm can still function normally even without NIXL dependencies.
 """
 
 
-def _load_agent(module_name, required_attributes):
+def _load_agent(
+    module_name: str, required_attributes: list[str]
+) -> tuple[object, ImportError | None]:
     try:
         module = __import__(module_name, fromlist=required_attributes, level=0)
         if all(hasattr(module, attr) for attr in required_attributes):
             return module, None
         missing = [a for a in required_attributes if not hasattr(module, a)]
-        logger.warning("Module %s missing required attributes: %s", module_name, missing)
+        err = ImportError(f"Module {module_name} is missing required attributes: {missing}")
+        logger.warning("%s", err)
+        return None, err
     except ImportError as e:
         logger.warning("Failed to import module: %s. Error: %s", module_name, str(e))
         return None, e
-    return None, None
 
 
 NixlTransferStatus, NixlTransferAgent = None, None
