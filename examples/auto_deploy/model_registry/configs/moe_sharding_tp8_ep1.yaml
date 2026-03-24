@@ -1,0 +1,3 @@
+transforms:
+  detect_sharding:
+    dist_mapping: {moe_tp: 8, moe_ep: 1}
