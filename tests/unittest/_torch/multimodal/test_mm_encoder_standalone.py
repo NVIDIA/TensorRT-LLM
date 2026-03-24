@@ -1062,8 +1062,10 @@ def test_pd_disagg_multimodal_with_block_reuse():
                 e for e in events
                 if e and e.get("data", {}).get("type") == "stored"
             ]
-            print(f"\n[reuse=True] total events: {len(events)}, "
-                  f"stored events: {len(stored)}", flush=True)
+            print(
+                f"\n[reuse=True] total events: {len(events)}, "
+                f"stored events: {len(stored)}",
+                flush=True)
 
 
 @pytest.mark.parametrize(
@@ -1201,8 +1203,7 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
             events = llm_prefill.get_kv_cache_events(50)
 
     stored_events = [
-        e for e in events
-        if e and e.get("data", {}).get("type") == "stored"
+        e for e in events if e and e.get("data", {}).get("type") == "stored"
     ]
     mm_keys_offsets = []
     for event in stored_events:
@@ -1213,9 +1214,11 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
                     assert "start_offset" in mm_key, "mm_key should have 'start_offset' field"
                     mm_keys_offsets.append(mm_key["start_offset"])
 
-    print(f"\n[reuse=True, E-P-D] total events: {len(events)}, "
-          f"stored events: {len(stored_events)}, "
-          f"mm_keys offsets: {mm_keys_offsets}", flush=True)
+    print(
+        f"\n[reuse=True, E-P-D] total events: {len(events)}, "
+        f"stored events: {len(stored_events)}, "
+        f"mm_keys offsets: {mm_keys_offsets}",
+        flush=True)
 
     assert len(mm_keys_offsets) > 0, (
         "Expected mm_keys in stored events from the E-P-D disagg path")
@@ -1336,17 +1339,19 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
                     request_type="context_only")
                 outputs = llm_prefill.generate(
                     inputs,
-                    sampling_params=SamplingParams(max_tokens=0,
-                                                  temperature=0),
+                    sampling_params=SamplingParams(max_tokens=0, temperature=0),
                     disaggregated_params=prefill_params)
                 assert len(outputs) == 1
 
                 pd_params = outputs[0].disaggregated_params
                 pd_params.request_type = "generation_only"
                 decode_inputs = [{
-                    "prompt": inputs[0]["prompt"],
-                    "multi_modal_data": None,
-                    "prompt_token_ids": outputs[0].prompt_token_ids,
+                    "prompt":
+                    inputs[0]["prompt"],
+                    "multi_modal_data":
+                    None,
+                    "prompt_token_ids":
+                    outputs[0].prompt_token_ids,
                 }]
                 decode_outputs = llm_decode.generate(
                     decode_inputs,
@@ -1363,11 +1368,12 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
             events = llm_prefill.get_kv_cache_events(50)
 
     stored_events = [
-        e for e in events
-        if e and e.get("data", {}).get("type") == "stored"
+        e for e in events if e and e.get("data", {}).get("type") == "stored"
     ]
-    print(f"\n[reuse=False] total events: {len(events)}, "
-          f"stored events: {len(stored_events)}", flush=True)
+    print(
+        f"\n[reuse=False] total events: {len(events)}, "
+        f"stored events: {len(stored_events)}",
+        flush=True)
     assert len(stored_events) == 0, (
         f"Expected 0 stored events with enable_block_reuse=False, "
         f"got {len(stored_events)}")
