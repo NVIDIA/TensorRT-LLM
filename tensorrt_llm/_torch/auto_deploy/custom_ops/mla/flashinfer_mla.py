@@ -992,8 +992,12 @@ class FlashInferMLAAttention(AttentionDescriptor):
         kv_lora_rank = compressed_kv_fake.shape[-1]
         qk_rope_head_dim = kpe_fake.shape[-1]
 
-        # FlashInfer MLA decode currently supports multiple kv_lora_rank values,
-        # but still expects the standard 64-dim RoPE cache component.
+        # FlashInfer MLA decode in the currently supported runtime accepts the standard
+        # DeepSeek-family cache shapes: kv_lora_rank in {256, 512} and qk_rope_head_dim == 64.
+        if kv_lora_rank not in (256, 512):
+            raise ValueError(
+                f"kv_lora_rank must be 256 or 512 for flashinfer_mla, got {kv_lora_rank}"
+            )
         if qk_rope_head_dim != 64:
             raise ValueError("qk_rope_head_dim must be 64 for flashinfer_mla")
 

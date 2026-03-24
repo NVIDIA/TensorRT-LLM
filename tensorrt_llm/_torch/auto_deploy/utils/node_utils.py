@@ -1396,7 +1396,7 @@ def get_layer_after_linear_node(
             # an unknown one-node layer.
             mla_nodes_forward = list(filtered_nodes(forward_subgraph, is_any_mla_op))
             if len(mla_nodes_forward) == 1:
-                lin_nodes_in_subgraph = [lin_nodes_in_subgraph[-1]]
+                lin_nodes_in_subgraph = [max(lin_nodes_in_subgraph, key=linear_nodes.index)]
             else:
                 # it means that probably we went over the boundary of the layer.
                 # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2

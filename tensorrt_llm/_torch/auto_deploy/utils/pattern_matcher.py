@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Utilities for registering and applying Torch-Inductor FX-based pattern matchers.
 
@@ -367,6 +382,7 @@ def register_ad_pattern(
         to be functionally isolated, no intermediate nodes are shared with the rest of the graph.
 
     """
+    dummy_args = tuple(dummy_args)
     argnames = list(inspect.signature(search_fn).parameters.keys())
     specific_gm = trace_fn(search_fn, dummy_args)
     pattern = _fx_to_ad_pattern_with_op_ignore(
@@ -381,7 +397,7 @@ def register_ad_pattern(
     _register_replacement_with_safe_insertion(
         search_fn=search_fn,
         replace_fn=replace_fn,
-        example_inputs=[None],
+        example_inputs=dummy_args,
         trace_fn=trace_fn,
         pass_dicts=patterns,
         search_fn_pattern=pattern,
