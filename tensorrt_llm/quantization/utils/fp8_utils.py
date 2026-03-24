@@ -223,6 +223,89 @@ def check_sf_layout(sf: torch.Tensor,
     return sf
 
 
+def unpack_col_major_tma_aligned_packed_tensor(
+    packed: torch.Tensor,
+    mn: int,
+    k: int,
+) -> torch.Tensor:
+    """Inverse of :func:`get_col_major_tma_aligned_packed_tensor`.
+
+    Recovers a ``(mn, k)`` float32 UE8M0 scale tensor from the packed
+    int32 col-major layout produced by the forward transform.
+
+    Only valid when the original scales were UE8M0 (all power-of-two),
+    which is guaranteed after :func:`resmooth_to_fp8_e8m0`.
+    """
+    assert packed.dtype == torch.int
+
+    remove_dim = False
+    if packed.dim() == 2:
+        packed = packed.unsqueeze(0)
+        remove_dim = True
+    b = packed.shape[0]
+
+    aligned_mn = get_tma_aligned_size(mn, 4)  # int32 element_size = 4
+    aligned_k = align(k, 4)
+
+    # The forward packed 4 UE8M0 exponent bytes into each int32 via
+    # view(dtype=torch.int) in row order: byte0 = bits[0:8], byte1 =
+    # bits[8:16], byte2 = bits[16:24], byte3 = bits[24:32].
+    # Extract them with bit-shifts (works regardless of strides).
+    int_data = packed.clone()  # (b, mn, aligned_k//4)  — may be col-major
+
+    # Pad mn back to aligned_mn (forward sliced [:mn])
+    if mn < aligned_mn:
+        pad = torch.zeros(
+            (b, aligned_mn - mn, int_data.shape[-1]),
+            device=packed.device, dtype=torch.int,
+        )
+        int_data = torch.cat([int_data, pad], dim=-2)
+
+    byte0 = (int_data & 0xFF).to(torch.uint8)
+    byte1 = ((int_data >> 8) & 0xFF).to(torch.uint8)
+    byte2 = ((int_data >> 16) & 0xFF).to(torch.uint8)
+    byte3 = ((int_data >> 24) & 0xFF).to(torch.uint8)
+    # Stack along a new last dim and flatten to recover (b, aligned_mn, aligned_k)
+    unpacked = torch.stack([byte0, byte1, byte2, byte3], dim=-1)
+    unpacked = unpacked.view(b, aligned_mn, aligned_k)
+
+    # Slice away padding
+    ue8m0 = unpacked[:, :mn, :k]
+
+    # Reconstruct float32 from UE8M0 exponent byte:
+    #   forward was: exponent = (float_bits >> 23).to(uint8)
+    #   inverse:     float_bits = exponent.to(int32) << 23
+    float_bits = ue8m0.to(torch.int32) << 23
+    # Reinterpret int32 bits as float32 via a 1-D round-trip (guaranteed contiguous)
+    result = float_bits.reshape(-1).contiguous().view(torch.float32).reshape(b, mn, k)
+
+    return result.squeeze(0) if remove_dim else result
+
+
+def inverse_transform_sf(
+    sf: torch.Tensor,
+    mn: int,
+    k: int,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Recover a ``(nb_m, nb_k)`` float32 block-scale grid from a packed SF.
+
+    This reverses the ``(FP32, 128, 128) → (INT, 1, 128)`` path in
+    :func:`transform_sf_into_required_layout` (the path taken by
+    ``FP8BlockScalesLinearMethod.post_load_weights`` on SM100f / SM120).
+    """
+    nb_k = ceil_div(k, block_size)
+
+    # Step 1: unpack to per-row float32 UE8M0 grid  (mn, nb_k)
+    per_row = unpack_col_major_tma_aligned_packed_tensor(sf, mn, nb_k)
+
+    # Step 2: collapse replicated rows back to (nb_m, nb_k).
+    # Forward did index_select with indices = arange(mn) // block_size,
+    # so rows within a 128-block are identical.  Take one per block.
+    per_block = per_row[::block_size]  # (nb_m, nb_k)
+    return per_block
+
+
 @nvtx_range("[DG] transform_sf_into_required_layout")
 def transform_sf_into_required_layout(sf: torch.Tensor,
                                       mn: int,

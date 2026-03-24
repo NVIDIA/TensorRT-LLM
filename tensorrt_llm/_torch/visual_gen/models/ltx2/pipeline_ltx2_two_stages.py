@@ -213,49 +213,75 @@ def _requantize_fp4_weight(
 
 # -- FP8 block-scale helpers ------------------------------------------------
 
-def _is_fp8_scale_standard(
+def _is_fp8_scale_packed(
     weight_scale: torch.Tensor,
     out_features: int,
     in_features: int,
     block_size: int = 128,
 ) -> bool:
-    """Check if FP8 block scale is in standard 2-D float32 format.
+    """Return True when the FP8 block scale is in the packed int32 layout.
 
-    After ``post_load_weights`` on SM100f / SM120, the scale is
-    resmoothed and transformed into a TMA-aligned int layout that
-    cannot be trivially reversed.  This helper returns *True* only
-    when the scale is still in the original ``(nb_out, nb_in)``
-    float32 format that :func:`_dequantize_fp8_weight` can handle.
+    After ``post_load_weights`` on SM100f / SM120, block scales are
+    resmoothed and packed into a TMA-aligned int32 col-major tensor by
+    ``transform_sf_into_required_layout``.  When that has **not**
+    happened, the scale is a plain ``(nb_out, nb_in)`` float32 grid
+    (the *standard* format).
     """
+    if weight_scale.dtype != torch.int32 or weight_scale.ndim != 2:
+        return False
+
     import math
 
-    if weight_scale.dtype != torch.float32:
-        return False
-    if weight_scale.ndim != 2:
-        return False
-    expected = (math.ceil(out_features / block_size),
-                math.ceil(in_features / block_size))
-    return tuple(weight_scale.shape) == expected
+    from tensorrt_llm.quantization.utils.fp8_utils import (
+        align,
+    )
+
+    nb_in = math.ceil(in_features / block_size)
+    aligned_k = align(nb_in, 4)
+    expected_cols = aligned_k // 4
+    return (weight_scale.shape[0] == out_features
+            and weight_scale.shape[1] == expected_cols)
 
 
 def _dequantize_fp8_weight(
     fp8_weight: torch.Tensor,
     weight_scale: torch.Tensor,
+    packed: bool = False,
     block_size: int = 128,
 ) -> torch.Tensor:
-    """Dequantize FP8 E4M3 weight with per-block scales back to BF16."""
+    """Dequantize FP8 E4M3 weight with per-block scales back to BF16.
+
+    Handles both the standard float32 grid and the packed int32 layout.
+    """
     out_features, in_features = fp8_weight.shape
+
+    if packed:
+        from tensorrt_llm.quantization.utils.fp8_utils import (
+            inverse_transform_sf,
+        )
+        block_scale = inverse_transform_sf(
+            weight_scale, mn=out_features, k=in_features,
+            block_size=block_size,
+        )
+    else:
+        block_scale = weight_scale
+
     bf16 = fp8_weight.to(torch.bfloat16)
-    scale = weight_scale.repeat_interleave(block_size, dim=0)[:out_features]
+    scale = block_scale.repeat_interleave(block_size, dim=0)[:out_features]
     scale = scale.repeat_interleave(block_size, dim=1)[:, :in_features]
     return bf16 * scale.to(bf16.device)
 
 
 def _requantize_fp8_weight(
     bf16_weight: torch.Tensor,
+    repack: bool = False,
     block_size: int = 128,
 ) -> tuple:
     """Quantize BF16 weight to FP8 E4M3 with 128x128 block scales.
+
+    When *repack* is True the returned weight/scale pair is post-processed
+    through ``resmooth_to_fp8_e8m0`` + ``transform_sf_into_required_layout``
+    so they match the packed layout expected by SM100f / SM120 GEMM kernels.
 
     Returns ``(qweight, block_scales)``.
     """
@@ -263,7 +289,19 @@ def _requantize_fp8_weight(
         quantize_fp8_blockwise,
     )
 
-    return quantize_fp8_blockwise(bf16_weight, block_size)
+    qw, scale = quantize_fp8_blockwise(bf16_weight, block_size)
+
+    if repack:
+        from tensorrt_llm.quantization.utils.fp8_utils import (
+            resmooth_to_fp8_e8m0, transform_sf_into_required_layout,
+        )
+        qw, scale = resmooth_to_fp8_e8m0(qw, scale)
+        scale = transform_sf_into_required_layout(
+            scale, mn=qw.shape[0], k=qw.shape[1],
+            recipe=(1, 128, 128), is_sfa=False,
+        )
+
+    return qw, scale
 
 
 def _apply_lora_deltas(
@@ -317,25 +355,21 @@ def _apply_lora_deltas(
                     )
                 ws_param = state[scale_key]
                 out_f, in_f = delta.shape
-
-                if not _is_fp8_scale_standard(ws_param.data, out_f, in_f):
-                    raise RuntimeError(
-                        f"Cannot apply LoRA delta to FP8 param "
-                        f"'{param_name}': weight_scale has been "
-                        f"transformed (shape={list(ws_param.shape)}, "
-                        f"dtype={ws_param.dtype}). This happens on "
-                        f"SM100f/SM120 GPUs after post_load_weights. "
-                        f"Use --linear_type default (BF16) for "
-                        f"two-stage pipeline on this GPU architecture."
-                    )
+                is_packed = _is_fp8_scale_packed(
+                    ws_param.data, out_f, in_f,
+                )
 
                 saved_state[param_name] = param.data.clone()
                 saved_state[scale_key] = ws_param.data.clone()
 
-                bf16 = _dequantize_fp8_weight(param.data, ws_param.data)
+                bf16 = _dequantize_fp8_weight(
+                    param.data, ws_param.data, packed=is_packed,
+                )
                 bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
 
-                qw, new_scale = _requantize_fp8_weight(bf16)
+                qw, new_scale = _requantize_fp8_weight(
+                    bf16, repack=is_packed,
+                )
                 param.data.copy_(qw)
                 ws_param.data.copy_(new_scale)
             else:
