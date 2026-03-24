@@ -104,12 +104,12 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 
 ## Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve |
-|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
+| Model | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve |
+|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes |
+| **FLUX.2** | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.2** | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | No | Yes | Yes | No | No | Yes | Yes |
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
