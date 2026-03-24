@@ -986,6 +986,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 // Generate Pytest command
+                // NOTE: the launcher (trtllm-llmapi-launch) is NOT included in
+                // pytestCommand.  For multi-node, slurm_run.sh wraps run_tests.py
+                // itself with the launcher so that MPI worker nodes stay alive
+                // across all pytest invocations (regular, isolated, rerun).
                 String pytestUtil = ""
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
@@ -999,14 +1003,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     jobWorkspace,
                     "__PLACEHOLDER_TRTLLM_WHL_PATH__",
                     "$jobWorkspace/.coveragerc",
-                    pytestUtil,
-                    [
-                      "--test-list=$testListPathNode",
-                      "--splitting-algorithm least_duration",
-                      "--splits $splits",
-                      "--group $splitId"
-                    ]
+                    "",  // pytestUtil excluded — launcher wraps run_tests.py instead
+                    []  // test-list/splits/group are now handled by run_tests.py
                 ).join(" ")
+                def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
@@ -1120,6 +1120,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    export testListPathNode="$testListPathNode"
+                    export testSplits="$splits"
+                    export testGroup="$splitId"
+                    export failSignaturesList="$failSignaturesList"
+                    export pytestUtil="$pytestUtil"
                     export HF_TOKEN=$HF_TOKEN
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
@@ -2648,9 +2653,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
-        def noRegularTests = false
-        def noIsolateTests = false
-        def rerunFailed = false
         def testDBList = renderTestDB(testList, llmSrc, stageName)
 
         // Download and Merge waives.txt
@@ -2660,9 +2662,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (testFilter[(REUSE_TEST)] != false) {
             reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
         }
-
-        // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -2684,9 +2683,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def containerPortStart = getStartingPortForHost(hostNodeName, stageName)
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
 
-        // Some clusters do not allow dmesg -C so we add || true
-        // Temporarily disable to reduce the log size
-        // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
@@ -2700,11 +2696,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             containerPortStart,
             containerPortNum
         )
-
-        // Only add --test-list if there are regular tests to run
-        if (preprocessedLists.regularCount > 0) {
-            pytestCommand += ["--test-list=${preprocessedLists.regular}"]
-        }
 
         def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
         def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
@@ -2724,62 +2715,37 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
-                try {
-                    if (preprocessedLists.regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
-                    } else {
-                        echo "No regular tests to run for stage ${stageName}"
-                        noRegularTests = true
-                        sh "mkdir -p ${stageName}"
-                        // Create an empty results.xml file for consistency
-                        sh """
-                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                            echo '<testsuites>' >> ${stageName}/results.xml
-                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                            echo '</testsuite>' >> ${stageName}/results.xml
-                            echo '</testsuites>' >> ${stageName}/results.xml
-                        """
-                    }
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
-                    if (isRerunFailed) {
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Regular tests failed after rerun attempt"
-                        }
-                        rerunFailed = true
-                    }
-                }
 
-                // Run the isolated tests if exists
-                if (preprocessedLists.isolateCount > 0) {
-                    stage ("[${stageName}] Run Pytest (Isolated)") {
-                        echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                        rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
-                    }
-                } else {
-                    echo "No isolated tests to run for stage ${stageName}"
-                    noIsolateTests = true
-                }
+                // Build fail signatures list for rerun eligibility
+                def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
-                if (noRegularTests && noIsolateTests) {
-                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
-                }
+                // Use unified run_tests.py for render + regular + isolated + rerun + merge
+                sh """
+                    rm -rf ${stageName}/ && \
+                    cd ${llmSrc}/tests/integration/defs && \
+                    python3 ${llmSrc}/jenkins/scripts/run_tests.py \
+                        --render \
+                        --test-db-list ${testDBList} \
+                        --splits ${splits} \
+                        --group ${splitId} \
+                        ${perfMode ? '--perf-mode' : ''} \
+                        --pytest-base-cmd '${pytestCommand.join(" ")}' \
+                        --stage-name ${stageName} \
+                        --output-dir ${WORKSPACE}/${stageName} \
+                        --working-dir ${llmSrc}/tests/integration/defs \
+                        --fail-signatures '${failSignaturesList}' \
+                        --max-rerun-tests 5
+                """
             }
         }
 
-        // Generate comprehensive rerun report if any reruns occurred
-        stage ("Generate Report") {
-            generateRerunReport(stageName, llmSrc)
-        }
-
-        if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
+        // Upload rerun report if generated by run_tests.py
+        if (fileExists("${WORKSPACE}/${stageName}/rerun_results.html")) {
+            trtllm_utils.uploadArtifacts(
+                "${WORKSPACE}/${stageName}/rerun_results.html",
+                "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+            )
+            echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
         }
 
         if (perfMode) {
