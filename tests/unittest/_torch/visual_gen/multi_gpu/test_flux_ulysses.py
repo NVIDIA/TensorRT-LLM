@@ -138,8 +138,12 @@ _FLUX2_TEST_CONFIG = dict(
 def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
     """Create DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(**pretrained_dict)
-    ws = dist.get_world_size() if dist.is_initialized() else 1
-    rk = dist.get_rank() if dist.is_initialized() else 0
+    if ulysses_size > 1 and dist.is_initialized():
+        ws = dist.get_world_size()
+        rk = dist.get_rank()
+    else:
+        ws = ulysses_size
+        rk = 0
     vgm = VisualGenMapping(world_size=ws, rank=rk, ulysses_size=ulysses_size)
 
     config = DiffusionModelConfig(
