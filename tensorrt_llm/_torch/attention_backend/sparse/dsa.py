@@ -527,17 +527,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            # Zero-initialize so the first decode step's pre_idx (after +1
-            # offset) points to index 1 — a valid but benign candidate.
+            # Zero-initialize so the first decode step's pre_idx (kernel
+            # adds +1 offset) points to index 1 — a valid but benign candidate.
             # Without this, uninitialized memory produces random hint indices.
             self.heuristic_prev_topk.zero_()
-            self.heuristic_pre_idx_staging = self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences, self.sparse_mla_topk),
-                cache_name="heuristic_pre_idx_staging",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
             # Scratch buffer for heuristic TopK kernel output values.
             # Pre-allocated with stable address for CUDA Graph compatibility
             # (replaces cudaMallocAsync/cudaFreeAsync inside the kernel launcher).
@@ -601,17 +594,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-        # Resize heuristic scratch buffer when max_draft_tokens changes.
-        if self.enable_heuristic_topk:
-            max_gen_tokens = self.max_num_sequences * (1 +
-                                                       self.max_draft_tokens)
-            self.heuristic_scratch_values = self.get_empty(
-                self.cuda_graph_buffers,
-                (max_gen_tokens, self.sparse_mla_topk),
-                cache_name="heuristic_scratch_values",
-                dtype=torch.float32,
-                capture_graph=capture_graph,
-            )
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
     # TODO: remove this function once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
@@ -640,6 +622,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             capture_graph = self.is_cuda_graph
             self.create_expanded_buffers(capture_graph=capture_graph)
+            # Resize heuristic scratch buffer for new max_draft_tokens.
+            if self.enable_heuristic_topk:
+                max_gen_tokens = self.max_num_sequences * (
+                    1 + self.max_draft_tokens)
+                self.heuristic_scratch_values = self.get_empty(
+                    self.cuda_graph_buffers,
+                    (max_gen_tokens, self.sparse_mla_topk),
+                    cache_name="heuristic_scratch_values",
+                    dtype=torch.float32,
+                    capture_graph=capture_graph,
+                )
 
     def prepare_dense_topk_indices(self,
                                    kv_lens,
@@ -1671,12 +1664,10 @@ class Indexer(nn.Module):
                 if self._enable_heuristic_topk:
                     local_layer = metadata.kv_cache_manager.layer_offsets[
                         self.layer_idx]
-                    staging = metadata.heuristic_pre_idx_staging
-                    staging[:num_generations].copy_(
-                        metadata.heuristic_prev_topk[
-                            local_layer, :num_generations])
-                    staging[:num_generations] += 1
-                    pre_idx = staging[:num_generations]
+                    # Pass prev_topk directly; the +1 temporal offset is
+                    # handled inside the C++ kernel (preIdxOffset += 1).
+                    pre_idx = metadata.heuristic_prev_topk[
+                        local_layer, :num_generations]
                     heuristic_scratch = \
                         metadata.heuristic_scratch_values[
                             :num_gen_tokens]
