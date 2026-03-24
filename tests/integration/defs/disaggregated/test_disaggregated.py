@@ -643,7 +643,6 @@ def run_disaggregated_test(example_dir,
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
                                        disaggregated_example_root, llm_venv,
                                        llama_model_root):
-    pytest.fail("yiqingy test")
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
@@ -829,6 +828,7 @@ def test_disaggregated_multi_gpu_trt_backend(disaggregated_test_root,
                          indirect=True)
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
                                   disaggregated_example_root, llama_model_root):
+    pytest.fail("yiqingy test")
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
