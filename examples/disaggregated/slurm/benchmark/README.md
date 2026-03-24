@@ -14,8 +14,8 @@ The benchmarking process is orchestrated through a combination of Python scripts
    - `start_server.sh`: Starts the disaggregated serving coordinator
    - `wait_server.sh`: Waits for server readiness before benchmarking
    - `run_benchmark.sh` / `run_benchmark_nv_sa.sh`: Execute benchmark workloads
-   - `accuracy_eval.sh`: Runs accuracy evaluation using lm_eval
-   - `gen_server_config.py`: Generates server configuration from worker settings
+   - `benchmark_utils.sh`: Shared utility functions for benchmark log processing
+   - `get_env.py`: Collects TensorRT-LLM version and commit info into `env_vars.json`
 
 ## Configuration (config.yaml)
 
@@ -37,15 +37,17 @@ slurm:
 ### 2. Benchmark Configuration
 ```yaml
 benchmark:
-  mode: "e2e"  # Options: e2e (end-to-end), gen_only (generation only)
+  mode: "e2e"  # Options: e2e, gen_only, gen_only_no_context
+  enable_benchmark: true  # Set false to skip benchmarking (e.g., accuracy-only runs)
   use_nv_sa_benchmark: false  # Use NVIDIA SA benchmark script
   multi_round: 8  # Number of benchmark rounds
-  benchmark_ratio: 0.8  # Fraction of requests to benchmark
+  benchmark_ratio: 0.8  # Fraction of requests to benchmark (SA benchmark only)
   streaming: true  # Enable streaming mode
   concurrency_list: "16"  # Comma-separated list of concurrency levels to test
   input_length: 1024  # Input sequence length
   output_length: 1024  # Output sequence length
   dataset_file: "<dataset_file>"  # Path to dataset file
+  env_var: {}  # Optional environment variables for benchmark client
 ```
 
 ### 3. Hardware Configuration
@@ -64,10 +66,14 @@ environment:
   model_path: "<model_path>"  # Path to model checkpoint
   trtllm_repo: "<trtllm_repo>"  # Path to TensorRT-LLM repository
   build_wheel: false  # Set true to build TensorRT-LLM from source
+  cuda_architectures: ""  # CUDA architectures to build for (e.g., "90-real;100-real"). Empty = all
   trtllm_wheel_path: ""  # Path to pre-built wheel (if not building from source)
   work_dir: "<full_path_to_work_dir>"  # Working directory for outputs
-  worker_env_var: "TLLM_LOG_LEVEL=INFO ..."  # Environment variables for workers
+  log_dir: ""  # Optional: override the auto-generated log directory path
+  worker_env_var: "TLLM_LOG_LEVEL=INFO ..."  # Environment variables for all workers
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"  # Environment variables for server
+  ctx_worker_env_var: ""  # Additional environment variables for context workers only
+  gen_worker_env_var: ""  # Additional environment variables for generation workers only
 ```
 
 ### 5. Worker Configuration
@@ -126,8 +132,14 @@ Use the `submit.py` script to submit your benchmark job:
 # Submit a single configuration
 python3 submit.py -c my_benchmark.yaml
 
-# Or submit multiple configurations from a directory
+# Submit multiple configurations from a directory
 python3 submit.py -d ./configs/
+
+# Override the log directory
+python3 submit.py -c my_benchmark.yaml --log-dir /path/to/logs
+
+# Dry run (validate config and print sbatch command without submitting)
+python3 submit.py -c my_benchmark.yaml --dry-run
 ```
 
 The submission script will:
@@ -162,15 +174,18 @@ ls <work_dir>/<date>/<isl-osl>/<config>/logs/
 
 Results are automatically organized in the work directory:
 ```
-<work_dir>/
-  └── <YYYYMMDD>/
+<work_dir>/logs/
+  └── <YYYYMMDD-HHMMSS>-<config_name>/
       └── <isl>-<osl>/
-          └── ctx<N>_gen<M>_dep<X>_batch<Y>_eplb<Z>_mtp<W>/
-              ├── logs/
+          └── disagg_ctx<N>_gen<M>_dep<X>_batch<Y>_eplb<Z>_mtp<W>/
               ├── ctx_config.yaml
               ├── gen_config.yaml
-              ├── job_info.txt
-              └── bench.log
+              ├── server_config_base.yaml
+              ├── allocations.json
+              ├── env_vars.json
+              ├── start_server_cmds_base.sh
+              ├── client_cmds_base.sh
+              └── slurm-<job_id>.out
 ```
 
 ### Benchmark Modes
@@ -203,17 +218,24 @@ Metrics are automatically collected from worker iteration logs and stored in the
 
 #### 1. Accuracy Evaluation
 
-Enable accuracy evaluation using the lm_eval framework:
+Enable accuracy evaluation using the lm_eval framework. Tasks are configured as a nested dictionary, allowing per-task settings:
 
 ```yaml
 accuracy:
   enable_accuracy_test: true
-  model: "local-completions"
-  tasks: "gsm8k,hellaswag,mmlu"  # Comma-separated task list
-  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"
+  env_var: {}  # Optional environment variables for accuracy evaluation
+  tasks:
+    gsm8k:
+      model: "local-completions"  # or "local-chat-completions"
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
+      extra_kwargs:
+        trust_remote_code: true
+    hellaswag:
+      model: "local-completions"
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200"
 ```
 
-Accuracy results will be saved in `<log_dir>/accuracy_eval/` after benchmark completion.
+Accuracy results will be saved in `<log_dir>/accuracy_eval_<task>/` after benchmark completion.
 
 #### 2. NVIDIA Nsight Systems Profiling
 
@@ -252,6 +274,7 @@ Build from source:
 environment:
   trtllm_repo: "/path/to/TensorRT-LLM"
   build_wheel: true  # Builds wheel on one node
+  cuda_architectures: "90-real;100-real"  # Optional: limit architectures for faster builds
 ```
 
 Or install from pre-built wheel:

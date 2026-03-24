@@ -177,5 +177,9 @@ done 3< "${client_cmds_file}"
 
 echo "Job completed successfully, total runtime: $SECONDS seconds"
 
+# Wait for nsys to flush traces before killing workers
+echo "Waiting 120s for nsys trace flush..."
+sleep 120
+
 # try to kill the server and workers
 scancel ${SLURM_JOB_ID}
