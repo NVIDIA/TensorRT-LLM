@@ -2613,11 +2613,29 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         return bool(has_invalid_values)
 
+    def __del__(self):
+        import sys
+        if self.kv_cache_map:
+            print(
+                "[KVCacheManagerV2] __del__ called with active kv_caches — shutdown was not called",
+                file=sys.stderr,
+                flush=True)
+            self.shutdown()
+
     def shutdown(self):
+        import sys
+        import traceback as _tb
+        print("[KVCacheManagerV2] shutdown() called explicitly",
+              file=sys.stderr,
+              flush=True)
+        _tb.print_stack(file=sys.stderr)
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
         self.impl.shutdown()
+        print("[KVCacheManagerV2] shutdown() completed",
+              file=sys.stderr,
+              flush=True)
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this

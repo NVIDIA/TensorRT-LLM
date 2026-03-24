@@ -183,11 +183,22 @@ class KVCacheManager:
         self._last_update_num_closed_requests = 0
 
     def __del__(self) -> None:
+        import sys
+
+        print(
+            "[_KVCacheManager] __del__ called — shutdown may not have been invoked explicitly",
+            file=sys.stderr,
+            flush=True,
+        )
         self.shutdown()
 
     def shutdown(self) -> None:
+        import sys
+
+        print("[_KVCacheManager] shutdown() called", file=sys.stderr, flush=True)
         self.clear_reusable_blocks()
         self._storage.destroy()
+        print("[_KVCacheManager] shutdown() completed", file=sys.stderr, flush=True)
 
     def clear_reusable_blocks(self) -> None:
         for ref in self._radix_tree.clear():
