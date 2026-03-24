@@ -366,23 +366,6 @@ std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
 
     // Exact match
     auto exactMatch = mLookupNode->findMatchingNode(blockKey);
-    std::stringstream ss;
-    ss << "findMatchingBlock for blockKey: " << blockKey;
-    ss << " - exactMatch: " << (exactMatch.has_value() ? "true" : "false");
-    if (exactMatch.has_value())
-    {
-        auto block = exactMatch->node->getValue(mWindowSize);
-        if (block.has_value() && *block)
-        {
-            ss << " - matched block: " << (*block)->getBlockId();
-            ss << " - block is full: " << (*block)->isFull();
-        }
-        else
-        {
-            ss << " - matched block: null";
-        }
-    }
-    TLLM_LOG_DEBUG("%s", ss.str().c_str());
     if (exactMatch.has_value())
     {
         auto optBlock = exactMatch->node->getValue(mWindowSize);
