@@ -155,6 +155,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         for group_idx, lg in enumerate(self.page_table.layer_groups):
             if self.is_v2_manager:
+                # V2 path
                 group_id = group_idx
                 block_ids = list(
                     self.kv_cache_manager.kv_cache_map[
@@ -162,6 +163,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                     ].get_aggregated_page_indices(group_id, valid_only=True)
                 )
             else:
+                # V1 path
                 first_global_layer_id = get_global_layer_ids(lg)[0]
                 block_ids = self.kv_cache_manager.get_batch_cache_indices(
                     [req.py_request_id], layer_idx=first_global_layer_id
@@ -309,8 +311,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         chunk_block_offset = 0
         for kv_slice in kv_slices:
             send_session.send(kv_slice, chunk_block_offset=chunk_block_offset)
-            if self.chunk_size_blocks is not None:
-                chunk_block_offset += self.chunk_size_blocks
+            chunk_block_offset += max(
+                (len(ids) for ids in kv_slice.block_ids_per_layer_groups), default=0
+            )
         if self._need_aux_transfer(req):
             send_session.pack_aux(req)
             send_session.send_aux()

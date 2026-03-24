@@ -296,3 +296,62 @@ def test_make_chunk_callback_conditions(is_v2, chunk_size, expected_none):
     """_make_chunk_callback returns None unless both V2 and chunking enabled."""
     result = None if (not is_v2 or chunk_size is None) else "callback"
     assert (result is None) == expected_none
+
+
+def test_chunk_callback_callable_behavior():
+    """When both conditions are met, the callback enqueues cumulative blocks."""
+    release_queue: queue.Queue[Tuple[int, int]] = queue.Queue()
+
+    def _on_chunk_transferred(request_id: int, chunk_block_offset: int, num_blocks: int):
+        cumulative_blocks = chunk_block_offset + num_blocks
+        release_queue.put((request_id, cumulative_blocks))
+
+    _on_chunk_transferred(request_id=1, chunk_block_offset=0, num_blocks=4)
+    _on_chunk_transferred(request_id=1, chunk_block_offset=4, num_blocks=4)
+    _on_chunk_transferred(request_id=1, chunk_block_offset=8, num_blocks=2)
+
+    results = []
+    while not release_queue.empty():
+        results.append(release_queue.get_nowait())
+    assert results == [(1, 4), (1, 8), (1, 10)]
+
+
+# ---------------------------------------------------------------------------
+# Mid-transfer chunk failure tests
+# ---------------------------------------------------------------------------
+
+
+def test_tx_session_mid_chunk_failure():
+    """If one chunk fails mid-transfer, the session reports ERROR."""
+    session = _make_tx_session(4)
+
+    session.kv_tasks[0].future.set_result(AgentResult.SUCCESS)
+    session.kv_tasks[0].status = TaskStatus.TRANSFERRED
+    session.kv_tasks[1].future.set_result(AgentResult.SUCCESS)
+    session.kv_tasks[1].status = TaskStatus.TRANSFERRED
+    session.kv_tasks[2].future.set_exception(RuntimeError("RDMA failed"))
+    session.kv_tasks[2].status = TaskStatus.ERROR
+    session.kv_tasks[3].future.set_result(AgentResult.SUCCESS)
+    session.kv_tasks[3].status = TaskStatus.TRANSFERRED
+
+    assert session.status == SessionStatus.ERROR
+    result = session.wait_complete(need_aux=False, timeout=1.0)
+    assert result == WaitResult.FAILED
+
+
+def test_rx_session_mid_chunk_failure():
+    """If one chunk fails mid-transfer on receiver, the session reports ERROR."""
+    session = _make_rx_session(4)
+
+    session._kv_tasks[0].future.set_result(AgentResult.SUCCESS)
+    session._kv_tasks[0].status = TaskStatus.TRANSFERRED
+    session._kv_tasks[1].future.set_exception(RuntimeError("RDMA failed"))
+    session._kv_tasks[1].status = TaskStatus.ERROR
+    session._kv_tasks[2].future.set_result(AgentResult.SUCCESS)
+    session._kv_tasks[2].status = TaskStatus.TRANSFERRED
+    session._kv_tasks[3].future.set_result(AgentResult.SUCCESS)
+    session._kv_tasks[3].status = TaskStatus.TRANSFERRED
+
+    assert session.status == SessionStatus.ERROR
+    result = session.wait_complete(need_aux=False)
+    assert result == WaitResult.FAILED

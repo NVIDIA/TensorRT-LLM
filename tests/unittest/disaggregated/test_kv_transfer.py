@@ -138,11 +138,6 @@ def test_session_status_enum():
 # ---------------------------------------------------------------------------
 
 
-def _make_block_ids(num_groups: int, blocks_per_group: List[int]) -> List[List[int]]:
-    """Helper: create block ID lists for testing."""
-    return [list(range(n)) for n in blocks_per_group]
-
-
 def test_create_kv_slices_no_chunking():
     """Without chunk_size_blocks, a single slice with all blocks is returned."""
     all_block_ids = [[0, 1, 2, 3, 4, 5, 6, 7]]
@@ -1161,16 +1156,8 @@ def test_transfer_worker_v2_with_window(
             worker.shutdown()
 
 
-def add_and_verify_chunked_request(
-    setup,
-    ctx_request_id,
-    gen_request_id,
-    request_len,
-    chunk_size_blocks,
-):
-    """Chunked transfer variant: sender sends N slices, receiver sends 1."""
-    import math
-
+def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
+    """Shared setup for chunked transfer tests: create requests, allocate KV, get block IDs."""
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
@@ -1211,7 +1198,6 @@ def add_and_verify_chunked_request(
         disagg_request_id=unique_rid,
     )
 
-    # Allocate KV for both sides
     ctx_kv_caches, gen_kv_caches = [], []
     for mgr in ctx_kv_cache_managers:
         if use_v2:
@@ -1231,7 +1217,6 @@ def add_and_verify_chunked_request(
         else:
             mgr.impl.add_sequence(gen_request.py_request_id, request_len, 1, gen_request)
 
-    # Get block IDs
     ctx_block_ids = [
         get_block_ids_per_layer_groups(mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block)
         for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers)
@@ -1241,8 +1226,75 @@ def add_and_verify_chunked_request(
         for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers)
     ]
 
-    # Sender: create chunked slices
-    sender_sessions = [tw.create_tx_session(ctx_request) for tw in ctx_transfer_workers]
+    return {
+        "ctx_request": ctx_request,
+        "gen_request": gen_request,
+        "ctx_kv_caches": ctx_kv_caches,
+        "gen_kv_caches": gen_kv_caches,
+        "ctx_block_ids": ctx_block_ids,
+        "gen_block_ids": gen_block_ids,
+    }
+
+
+def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions):
+    """Shared verification and cleanup for chunked transfer tests."""
+    ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
+    gen_kv_cache_managers = setup["gen_kv_cache_managers"]
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+    use_v2 = setup["use_v2"]
+
+    ctx_block_ids = ctx_info["ctx_block_ids"]
+    gen_block_ids = ctx_info["gen_block_ids"]
+
+    for session in sender_sessions:
+        assert session.status == SessionStatus.KV_TRANSFERRED
+    for session in receiver_sessions:
+        assert session.status == SessionStatus.KV_TRANSFERRED
+
+    num_layer_groups = len(ctx_block_ids[0])
+    for lg_id in range(num_layer_groups):
+        ctx_data = [
+            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["ctx_request"].py_request_id)
+            for mgr, bids in zip(ctx_kv_cache_managers, ctx_block_ids)
+        ]
+        gen_data = [
+            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["gen_request"].py_request_id)
+            for mgr, bids in zip(gen_kv_cache_managers, gen_block_ids)
+        ]
+        for c, g in zip(ctx_data, gen_data):
+            assert c.equal(g), f"Layer group {lg_id}: data mismatch with chunked transfer"
+
+    for tw, s in zip(gen_transfer_workers, receiver_sessions):
+        tw.clear_session(s)
+    for tw, s in zip(ctx_transfer_workers, sender_sessions):
+        tw.clear_session(s)
+    if use_v2:
+        torch.cuda.current_stream().synchronize()
+        for kv in ctx_info["ctx_kv_caches"]:
+            kv.close()
+        for kv in ctx_info["gen_kv_caches"]:
+            kv.close()
+
+
+def add_and_verify_chunked_request(
+    setup,
+    ctx_request_id,
+    gen_request_id,
+    request_len,
+    chunk_size_blocks,
+):
+    """Chunked transfer variant: sender sends N slices, receiver sends 1."""
+    import math
+
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+
+    ctx_info = _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len)
+    ctx_block_ids = ctx_info["ctx_block_ids"]
+    gen_block_ids = ctx_info["gen_block_ids"]
+
+    sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
     send_futures = []
     for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids):
         max_blocks = max(len(ids) for ids in block_ids_per_groups)
@@ -1258,10 +1310,11 @@ def add_and_verify_chunked_request(
                 block_ids_per_layer_groups=chunk_block_ids,
             )
             send_futures.append(sender_session.send(kv_slice, chunk_block_offset=chunk_offset))
-            chunk_offset += chunk_size_blocks
+            chunk_offset += max(len(ids) for ids in chunk_block_ids)
 
-    # Receiver: single monolithic slice
-    receiver_sessions = [tw.create_rx_session(gen_request) for tw in gen_transfer_workers]
+    receiver_sessions = [
+        tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
+    ]
     recv_futures = []
     for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids):
         full_slice = KVSlice(
@@ -1270,42 +1323,12 @@ def add_and_verify_chunked_request(
         )
         recv_futures.append(recv_session.receive(full_slice))
 
-    # Wait for all
     for f in send_futures:
         f.result()
     for f in recv_futures:
         f.result()
 
-    for session in sender_sessions:
-        assert session.status == SessionStatus.KV_TRANSFERRED
-    for session in receiver_sessions:
-        assert session.status == SessionStatus.KV_TRANSFERRED
-
-    # Verify data matches (simplified: compare first layer group)
-    num_layer_groups = len(ctx_block_ids[0])
-    for lg_id in range(num_layer_groups):
-        ctx_data = [
-            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_request.py_request_id)
-            for mgr, bids in zip(ctx_kv_cache_managers, ctx_block_ids)
-        ]
-        gen_data = [
-            get_block_data(mgr, bids[lg_id], lg_id, use_v2, gen_request.py_request_id)
-            for mgr, bids in zip(gen_kv_cache_managers, gen_block_ids)
-        ]
-        for c, g in zip(ctx_data, gen_data):
-            assert c.equal(g), f"Layer group {lg_id}: data mismatch with chunked transfer"
-
-    # Cleanup
-    for tw, s in zip(gen_transfer_workers, receiver_sessions):
-        tw.clear_session(s)
-    for tw, s in zip(ctx_transfer_workers, sender_sessions):
-        tw.clear_session(s)
-    if use_v2:
-        torch.cuda.current_stream().synchronize()
-        for kv in ctx_kv_caches:
-            kv.close()
-        for kv in gen_kv_caches:
-            kv.close()
+    _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions)
 
 
 CHUNKED_TEST_CONFIGS = [
