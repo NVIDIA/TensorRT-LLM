@@ -730,7 +730,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             if capacity is not None and total_tokens + req.context_chunk_size > capacity:
                 req.context_chunk_size = 0
             total_tokens += req.context_chunk_size
-        if total_tokens > capacity:
+        if capacity is not None and total_tokens > capacity:
             logger.warning(
                 f"Total tokens {total_tokens} exceeds capacity {capacity} but FORCE_CHUNK is used"
             )
