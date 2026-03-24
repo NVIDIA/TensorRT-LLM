@@ -48,6 +48,11 @@
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+class FabricMemory;
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
 class BaseEvictionPolicy;
@@ -979,6 +984,8 @@ private:
     bool mOnboardBlocks;
     // Buffer manager
     runtime::BufferManager mBufferManager;
+    // Fabric memory backing for primary pools (MNNVL-capable allocation)
+    std::vector<std::unique_ptr<kv_cache_manager::FabricMemory>> mFabricMemoryPools;
 
     // Used to keep track of number of free blocks during scheduling
     SizeType32 mSchedulingNumFreeBlocks;
