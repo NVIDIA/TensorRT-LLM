@@ -131,6 +131,10 @@ class _TrtllmMLAPlanner:
         self.kv_scale_orig_quant: Optional[torch.Tensor] = None
         self.kv_scale_quant_orig: Optional[torch.Tensor] = None
 
+        # Flash MLA metadata (required on SM90 for FP8 KV cache + MLA decode)
+        self.flash_mla_tile_scheduler_metadata: Optional[torch.Tensor] = None
+        self.flash_mla_num_splits: Optional[torch.Tensor] = None
+
         # Decode-path buffers reused across layers (allocated on first use)
         self.cu_q_decode: Optional[torch.Tensor] = None
         self.cu_kv_decode: Optional[torch.Tensor] = None
@@ -306,6 +310,18 @@ class _TrtllmMLAPlanner:
             max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.fmha_scheduler_counter_decode = torch.zeros(1, dtype=torch.uint32, device=device)
+
+        # Flash MLA: allocate metadata buffers for SM90 + head_dim=576.
+        # The standard FMHA doesn't support FP8 KV cache + MLA on SM90;
+        # Flash MLA provides this capability.
+        if torch.cuda.get_device_capability() == (9, 0):
+            sm_count = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            self.flash_mla_tile_scheduler_metadata = torch.zeros(
+                sm_count * 8, dtype=torch.int32, device=device
+            )
+            self.flash_mla_num_splits = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
 
     def ensure_decode_buffers(
         self,
@@ -509,28 +525,12 @@ def prepare_trtllm_mla_metadata(
     num_seq = num_prefill + num_decode
     block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
-    if not hasattr(_GlobalTrtllmMLAPlanner, "_dbg_bom"):
-        with open("/tmp/mla_block_offsets.log", "w") as f:
-            f.write(f"block_offset_multiplier={block_offset_multiplier}\n")
-            f.write(f"num_seq={num_seq} num_prefill={num_prefill} num_decode={num_decode}\n")
-            f.write(f"cu_num_pages={cu_num_pages.tolist()}\n")
-            f.write(f"cache_loc first 20={cache_loc[:20].tolist()}\n")
-        _GlobalTrtllmMLAPlanner._dbg_bom = True
-
     _GlobalTrtllmMLAPlanner.plan_device(
         num_seq=num_seq,
         block_offset_multiplier=block_offset_multiplier,
         cu_num_pages=cu_num_pages,
         cache_loc=cache_loc,
     )
-
-    if not hasattr(_GlobalTrtllmMLAPlanner, "_dbg_bom2"):
-        bo = _GlobalTrtllmMLAPlanner.block_offsets
-        bi = _GlobalTrtllmMLAPlanner.block_ids_per_seq
-        with open("/tmp/mla_block_offsets.log", "a") as f:
-            f.write(f"block_offsets shape={bo.shape} first_seq={bo[0, 0, :, :4].tolist()}\n")
-            f.write(f"block_ids shape={bi.shape} first_seq={bi[0, :4].tolist()}\n")
-        _GlobalTrtllmMLAPlanner._dbg_bom2 = True
 
     return [_GlobalTrtllmMLAPlanner.block_offsets]
 
@@ -742,28 +742,17 @@ def _handle_prefill_thop(
     kv_cache_block_offsets: torch.Tensor,
     host_kv_cache_pool_pointers: torch.Tensor,
     host_kv_cache_pool_mapping: torch.Tensor,
-    position_embedding_type: int = 2,
-    rotary_embedding_dim: int = 0,
-    rotary_cos_sin: Optional[torch.Tensor] = None,
     layer_idx: int = 0,
 ) -> torch.Tensor:
-    """Batched prefill via thop.attention (SEPARATE_Q_K_V layout).
+    """Batched prefill via TrtllmAttentionWrapper (context wrapper).
 
-    Expands compressed KV via kv_b_proj, assembles full Q/K/V, and passes the
-    entire batch to thop.attention with attention_input_type=context_only.
-    The C++ kernel handles multi-sequence batching internally via
-    host_context_lengths and writes latent_cache to the paged KV cache.
+    Expands compressed KV via kv_b_proj, assembles full Q/K/V, and calls
+    the context wrapper's plan()/run() with attention_input_type=context_only.
+    The wrapper handles RoPE internally via its rotary_cos_sin table (created
+    from RopeParams at wrapper init time).
 
-    RoPE handling depends on ``position_embedding_type``:
-    - 2 (rope_gpt_neox): the C++ kernel's ``invokeMLARopeContext`` applies
-      RoPE to k_pe (from latent_cache) before writing to the KV cache, and
-      to Q's rope portion for FMHA.  Requires a valid ``rotary_cos_sin``
-      table and **un-RoPE'd** q_pe, kpe, and latent_cache.
-    - 0 (disabled): RoPE already applied externally.  Q/K/V carry post-RoPE
-      values and latent_cache is written to the cache as-is.
-
-    Uses q_scaling=1.0 so the C++ kernel computes softmax_scale = 1/sqrt(head_size),
-    matching the standard 1/sqrt(qk_head_dim) model scale.
+    Uses the context wrapper: head_size=qk_head_dim (192), num_kv_heads=num_heads (32),
+    v_head_dim=v_head_dim (128) — matching the PT backend's self.mha wrapper.
     """
     dtype = q_nope_flat.dtype
     device = q_nope_flat.device
@@ -786,12 +775,19 @@ def _handle_prefill_thop(
 
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    # Skip during CUDA graph capture or resize forward (estimation-mode cache too small).
-    if torch.cuda.is_current_stream_capturing() or _GlobalTrtllmMLAPlanner.skip_attention:
+    # Skip during CUDA graph capture, resize forward, or warmup.
+    if (
+        torch.cuda.is_current_stream_capturing()
+        or _GlobalTrtllmMLAPlanner.skip_attention
+        or cuda_graph_state.in_warm_up()
+    ):
         return output
 
-    # Full-batch prefill using raw thop.attention with CONTEXT params:
-    # head_size=192 (qk_head_dim), num_kv_heads=32 (num_heads) — matching PT backend.
+    # BUG: thop.attention context MLA cache write crashes with illegal memory
+    # access. The FMHA attention computation itself works (confirmed with
+    # update_kv_cache=False), but the cache write path is incompatible with
+    # AD's block offset encoding for MLA kv_factor=1 paged cache.
+    # See trtllm_mla_prefill_cache_write_bug.md for full analysis.
     _call_thop_attention_mla(
         q,
         k,
@@ -799,15 +795,15 @@ def _handle_prefill_thop(
         output,
         latent_cache,
         None,
-        False,
+        False,  # is_fused_qkv
         1,  # attention_input_type = context_only
         num_heads,
-        num_heads,  # num_kv_heads = num_heads for context (PT backend pattern)
-        qk_head_dim,  # head_size = 192 (not 576) for context
+        num_kv_heads,  # 1 — matches kv_factor=1 cache layout
+        qk_head_dim,  # head_size = 192
         tokens_per_block,
         max_num_requests,
         max_context_length,
-        1.0,
+        1.0,  # q_scaling
         quant_mode,
         kv_lora_rank,
         qk_nope_head_dim,
@@ -822,9 +818,14 @@ def _handle_prefill_thop(
         kv_cache_block_offsets,
         host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping,
-        position_embedding_type=position_embedding_type,
-        rotary_embedding_dim=rotary_embedding_dim,
-        rotary_cos_sin=rotary_cos_sin,
+        position_embedding_type=2,
+        rotary_embedding_dim=qk_rope_head_dim,
+        rotary_cos_sin=_GlobalTrtllmMLAPlanner.get_or_create_rotary_cos_sin(
+            max_context_length,
+            qk_rope_head_dim,
+            10000.0,
+            q.device,
+        ),
         layer_idx=layer_idx,
     )
 
@@ -975,13 +976,6 @@ def _handle_decode_impl(
     copies q_pe manually and zeros the scheduler counter.
     """
     planner = _GlobalTrtllmMLAPlanner
-
-    # Skip during resize forward (estimation-mode cache too small).
-    if planner.skip_attention:
-        return torch.zeros(
-            num_tokens, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device
-        )
-
     gen_head_size = kv_lora_rank + qk_rope_head_dim
 
     # Cast FP8 weights to compute dtype for BMM (FP8 checkpoints store kv_b_proj in FP8).
@@ -1000,6 +994,42 @@ def _handle_decode_impl(
         w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
         planner._per_layer_pool_ptrs[("w_kn_v_t", ptr)] = (w_kn, w_v_t)
 
+    # Pre-create wrapper during warmup so it exists for CUDA graph capture.
+    # TrtllmAttentionWrapper.__init__ allocates GPU tensors (rotary_cos_sin, etc.)
+    # which is forbidden during capture.
+    wrapper = planner.get_or_create_wrapper(
+        layer_idx,
+        num_heads,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+    )
+
+    # Skip during resize forward (estimation-mode cache too small).
+    if planner.skip_attention:
+        return torch.zeros(
+            num_tokens, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device
+        )
+
+    # Flash MLA metadata (required on SM90 for FP8 KV cache + MLA decode).
+    flash_mla_meta = None
+    flash_mla_splits = None
+    if planner.flash_mla_tile_scheduler_metadata is not None:
+        decode_kv_lens = sequence_length[num_prefill:]
+        flash_mla_splits = planner.flash_mla_num_splits[: num_tokens + 1]
+        thop.compute_flash_mla_metadata(
+            decode_kv_lens,
+            planner.flash_mla_tile_scheduler_metadata,
+            flash_mla_splits,
+            num_tokens,
+            1,  # s_q (1 token per decode request)
+            num_heads,
+            1,  # num_kv_heads
+            kv_lora_rank,
+        )
+        flash_mla_meta = planner.flash_mla_tile_scheduler_metadata
+
     fused_q_flat = planner.fused_q_flat[:num_tokens]
     fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
 
@@ -1010,7 +1040,12 @@ def _handle_decode_impl(
     cu_q = planner.cu_q_decode[: num_tokens + 1]
     cu_kv = planner.cu_kv_decode[: num_tokens + 1]
 
-    if rotary_cos_sin is not None:
+    # Skip mla_rope_generation during warmup (synthetic batch may have invalid
+    # block offsets for cache writes), but still run wrapper plan/run below
+    # so the C++ AttentionOp initializes and allocates workspace.
+    is_warmup = cuda_graph_state.in_warm_up()
+
+    if rotary_cos_sin is not None and not is_warmup:
         torch.ops.trtllm.mla_rope_generation(
             fused_q_view,
             q_pe_flat,
@@ -1057,14 +1092,6 @@ def _handle_decode_impl(
 
     output_latent = planner.output_latent[:num_tokens]
 
-    wrapper = planner.get_or_create_wrapper(
-        layer_idx,
-        num_heads,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-    )
     wrapper.plan(
         layer_idx=layer_idx,
         tokens_per_block=tokens_per_block,
@@ -1082,6 +1109,8 @@ def _handle_decode_impl(
         host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
         block_ids_per_seq=planner.block_ids_per_seq,
+        flash_mla_tile_scheduler_metadata=flash_mla_meta,
+        flash_mla_num_splits=flash_mla_splits,
         latent_cache=latent_cache,
         q_pe=q_pe_flat,
         workspace=planner.workspace,
@@ -1268,24 +1297,11 @@ def _mla_with_cache_impl(
     # -- Prefill helper -------------------------------------------------------
 
     def _prefill_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """Run thop.attention prefill (handles FMHA + cache write).
+        """Run prefill via context wrapper (handles FMHA + cache write).
 
-        The C++ kernel's ``invokeMLARopeContext`` ALWAYS requires
-        ``position_embedding_type=2`` and a valid ``rotary_cos_sin`` table for
-        MLA context — it uses them to apply RoPE to the kpe portion of
-        ``latent_cache`` before writing to the paged KV cache.  Q and K
-        tensors for FMHA carry whatever RoPE state the model already applied.
+        The context wrapper handles RoPE internally via its rotary_cos_sin
+        table (position_embedding_type=yarn set at wrapper creation).
         """
-        if fused_rope:
-            rope_table = rotary_cos_sin
-        else:
-            rope_table = planner.get_or_create_rotary_cos_sin(
-                max_context_length,
-                qk_rope_head_dim,
-                10000.0,
-                q_n.device,
-            )
-
         return _handle_prefill_thop(
             q_n,
             q_p,
@@ -1314,9 +1330,6 @@ def _mla_with_cache_impl(
             kv_cache_block_offsets,
             host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping,
-            position_embedding_type=2,
-            rotary_embedding_dim=qk_rope_head_dim,
-            rotary_cos_sin=rope_table,
             layer_idx=layer_idx,
         )
 
@@ -1324,7 +1337,7 @@ def _mla_with_cache_impl(
 
     def _do_decode(q_n, q_p, lc, n_tok, n_pf):
         """Write cache (non-fused only) and run decode attention."""
-        if not fused_rope:
+        if not fused_rope and not cuda_graph_state.in_warm_up():
             _write_decode_latent_to_cache(
                 lc, kv_cache, n_tok, n_pf, seq_len_with_cache, tokens_per_block
             )
@@ -1635,15 +1648,13 @@ class TrtllmMLAAttention(AttentionDescriptor):
                 f"Use the flashinfer_mla backend for this model instead."
             )
 
-        # For FP8 models, use FP8 KV cache to match the PT backend which
-        # auto-detects FP8 and sets quant_mode=FP8_KV_CACHE.
-        if cache_config.dtype == "auto" and cls._has_fp8_model_weights(source_attn_node):
-            cache_dtype = torch.float8_e4m3fn
-        else:
-            cache_dtype = cls.resolve_cache_dtype(
-                cache_config.dtype,
-                compressed_kv_fake.dtype,
-            )
+        # Use BF16 KV cache by default (matching the PT backend which does NOT
+        # auto-enable FP8 KV cache even for FP8 weight models).  FP8 KV cache
+        # requires Flash MLA and special FMHA kernel support.
+        cache_dtype = cls.resolve_cache_dtype(
+            cache_config.dtype,
+            compressed_kv_fake.dtype,
+        )
 
         return {
             "kv_cache": KVPagedResourceHandler(
