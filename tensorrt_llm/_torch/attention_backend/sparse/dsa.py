@@ -1395,6 +1395,9 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
+        # Update the indexer k cache before prefill chunks gather from it.
+        self._update_k_cache(k_fp8, k_scale, metadata)
+
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -1669,24 +1672,6 @@ class Indexer(nn.Module):
             qk_pe, qk_nope, self.scale_fmt == "ue8m0")
         return fp8_out, scale
 
-    @torch.inference_mode()
-    def pre_indexer(
-        self, qr: torch.Tensor, hidden_states: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata, position_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Token-wise projections, FP8 quantize, weight scaling, and k cache update.
-
-        Runs the full indexer pre-computation including k cache update.
-        Used by the eager path (Indexer.forward) where everything runs
-        outside CUDA graph capture.
-
-        Returns (q_fp8, k_fp8, k_scale, weights).
-        """
-        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(
-            qr, hidden_states, position_ids)
-        self._update_k_cache(k_fp8, k_scale, metadata)
-        return q_fp8, k_fp8, k_scale, weights
-
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
         position_ids: torch.Tensor
@@ -1733,8 +1718,8 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        q_fp8, k_fp8, k_scale, weights = self.pre_indexer(
-            qr, hidden_states, metadata, position_ids)
+        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(
+            qr, hidden_states, position_ids)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
