@@ -19,14 +19,15 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from .config import DiffusionModelConfig, VisualGenArgs
+from .mapping import VisualGenMapping
 from .models import AutoPipeline
 
 if TYPE_CHECKING:
@@ -54,7 +55,6 @@ class PipelineLoader:
         self,
         args: Optional[VisualGenArgs] = None,
         *,
-        mapping: Optional[Mapping] = None,
         device: str = "cuda",
     ):
         """
@@ -62,16 +62,10 @@ class PipelineLoader:
 
         Args:
             args: VisualGenArgs containing all configuration (preferred)
-            mapping: Tensor parallel mapping (fallback if args is None)
             device: Device to load model on (fallback if args is None)
         """
         self.args = args
-        if args is not None:
-            self.mapping = args.to_mapping()
-            self.device = torch.device(args.device)
-        else:
-            self.mapping = mapping or Mapping()
-            self.device = torch.device(device)
+        self.device = torch.device(args.device if args is not None else device)
 
     def _resolve_checkpoint_dir(self, checkpoint_dir: str) -> str:
         """Resolve checkpoint_dir to a local directory path.
@@ -107,6 +101,23 @@ class PipelineLoader:
                 f"HuggingFace Hub model ID: {e}"
             ) from e
         return str(local_dir)
+
+    def _setup_visual_gen_mapping(self, config: DiffusionModelConfig) -> None:
+        ws = dist.get_world_size() if dist.is_initialized() else 1
+        rk = dist.get_rank() if dist.is_initialized() else 0
+        if self.args is not None:
+            vgm = VisualGenMapping(
+                ws,
+                rk,
+                cfg_size=self.args.parallel.dit_cfg_size,
+                tp_size=self.args.parallel.dit_tp_size,
+                ulysses_size=self.args.parallel.dit_ulysses_size,
+                order=self.args.parallel.dit_dim_order,
+            )
+        else:
+            vgm = VisualGenMapping(ws, rk)
+        config.visual_gen_mapping = vgm
+        config.mapping = vgm.to_llm_mapping()
 
     def load(
         self,
@@ -151,13 +162,17 @@ class PipelineLoader:
         config = DiffusionModelConfig.from_pretrained(
             checkpoint_dir,
             args=self.args,
-            mapping=self.mapping,
         )
 
         # Log quantization settings
         if config.quant_config and config.quant_config.quant_algo:
             logger.info(f"Quantization: {config.quant_config.quant_algo.name}")
             logger.info(f"Dynamic weight quant: {config.dynamic_weight_quant}")
+
+        # =====================================================================
+        # STEP 1b: Build VisualGenMapping (must precede model creation)
+        # =====================================================================
+        self._setup_visual_gen_mapping(config)
 
         # =====================================================================
         # STEP 2: Create Pipeline with MetaInit
@@ -206,7 +221,7 @@ class PipelineLoader:
         # =====================================================================
 
         t0 = time.time()
-        if config.parallel.enable_parallel_vae:
+        if config.enable_parallel_vae:
             pipeline.setup_parallel_vae()
 
         if hasattr(pipeline, "post_load_weights"):

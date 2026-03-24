@@ -26,10 +26,10 @@ try:
     from tensorrt_llm._torch.visual_gen.config import (
         AttentionConfig,
         DiffusionModelConfig,
-        ParallelConfig,
         TeaCacheConfig,
         TorchCompileConfig,
     )
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -138,17 +138,21 @@ _FLUX2_TEST_CONFIG = dict(
 def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
     """Create DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(**pretrained_dict)
-    parallel = ParallelConfig(dit_ulysses_size=ulysses_size)
+    ws = dist.get_world_size() if dist.is_initialized() else 1
+    rk = dist.get_rank() if dist.is_initialized() else 0
+    vgm = VisualGenMapping(world_size=ws, rank=rk, ulysses_size=ulysses_size)
 
-    return DiffusionModelConfig(
+    config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
         quant_config=QuantConfig(),
         torch_compile=TorchCompileConfig(enable_torch_compile=False),
         attention=AttentionConfig(backend=backend),
-        parallel=parallel,
+        visual_gen_mapping=vgm,
         teacache=TeaCacheConfig(),
         skip_create_weights_in_init=False,
     )
+    config.mapping = vgm.to_llm_mapping()
+    return config
 
 
 def _stabilize_model_weights(model):

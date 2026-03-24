@@ -32,7 +32,6 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -91,6 +90,7 @@ class LTX2Attention(Attention):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
         config = config or DiffusionModelConfig()
+        vgm = config.visual_gen_mapping
 
         # Store before super().__init__() — _init_qkv_proj needs _context_dim
         self._context_dim = context_dim if context_dim is not None else query_dim
@@ -120,7 +120,7 @@ class LTX2Attention(Attention):
         # plain backend as fallback.  The base class already set self.attn
         # to UlyssesAttention(inner_backend=sharded_backend).
         self._has_dual_attn = False
-        ulysses_size = config.parallel.dit_ulysses_size
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
         if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
@@ -294,10 +294,11 @@ class BasicAVTransformerBlock(nn.Module):
 
         self._use_ulysses = False
         self._audio_is_sharded = False
-        if config is not None and config.parallel.dit_ulysses_size > 1:
+        vgm = config.visual_gen_mapping if config is not None else None
+        if vgm is not None and vgm.ulysses_size > 1:
             self._use_ulysses = True
-            self._ulysses_size = config.parallel.dit_ulysses_size
-            self._ulysses_pg = getattr(config, "ulysses_process_group", None)
+            self._ulysses_size = vgm.ulysses_size
+            self._ulysses_pg = vgm.ulysses_group
 
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
@@ -766,17 +767,20 @@ class LTXModel(nn.Module):
 
         self._init_preprocessors(cross_pe_max_pos)
 
-        # Ulysses sequence parallelism — must run before block/attention init
-        # so that model_config.ulysses_process_group is available.
+        vgm = model_config.visual_gen_mapping
         primary_heads = (
             num_attention_heads if model_type.is_video_enabled() else audio_num_attention_heads
         )
-        (self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank) = (
-            setup_sequence_parallelism(
-                model_config=model_config,
-                num_attention_heads=primary_heads,
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        if ulysses_size > 1 and primary_heads % ulysses_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({primary_heads}) must be divisible by "
+                f"ulysses_size ({ulysses_size})"
             )
-        )
+        self.use_ulysses = ulysses_size > 1
+        self.ulysses_size = ulysses_size
+        self.ulysses_pg = vgm.ulysses_group if vgm else None
+        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
         # Audio is sharded by Ulysses only when its sequence length is
         # divisible by ulysses_size (checked at runtime in forward).
         # Head divisibility is validated here since the attention backend

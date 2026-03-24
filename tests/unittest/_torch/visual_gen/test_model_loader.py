@@ -227,28 +227,20 @@ def test_diffusion_args_to_quant_config():
     assert args.dynamic_weight_quant is True
 
 
-def test_diffusion_args_to_mapping():
-    """Test that VisualGenArgs correctly generates Mapping from ParallelConfig."""
-    from tensorrt_llm._torch.visual_gen import ParallelConfig, VisualGenArgs
+def test_parallel_config_to_visual_gen_mapping():
+    """Test that ParallelConfig correctly generates VisualGenMapping."""
+    from tensorrt_llm._torch.visual_gen import ParallelConfig
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
-    # ParallelConfig validator requires WORLD_SIZE >= total parallel (tp*cp = 4)
-    old_world = os.environ.get("WORLD_SIZE")
-    try:
-        os.environ["WORLD_SIZE"] = "4"
-        args = VisualGenArgs(
-            checkpoint_path="/fake/path",
-            parallel=ParallelConfig(dit_tp_size=2, dit_cp_size=2),
-        )
-        mapping = args.to_mapping()
-        assert mapping.tp_size == 2
-        assert mapping.cp_size == 2
-        # world_size = tp_size * pp_size * cp_size (DP is handled separately)
-        assert mapping.world_size == 4
-    finally:
-        if old_world is not None:
-            os.environ["WORLD_SIZE"] = old_world
-        elif "WORLD_SIZE" in os.environ:
-            del os.environ["WORLD_SIZE"]
+    pc = ParallelConfig(dit_cfg_size=2, dit_tp_size=2, dit_ulysses_size=2)
+    vgm = pc.to_visual_gen_mapping(world_size=8, rank=0)
+    assert isinstance(vgm, VisualGenMapping)
+    assert vgm.cfg_size == 2
+    assert vgm.tp_size == 2
+    assert vgm.ulysses_size == 2
+    assert vgm.ring_size == 1
+    llm_mapping = vgm.to_llm_mapping()
+    assert llm_mapping.tp_size == 2
 
 
 def test_load_without_quant_config_no_fp8(checkpoint_exists):

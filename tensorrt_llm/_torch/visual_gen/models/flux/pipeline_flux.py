@@ -45,7 +45,10 @@ class FluxPipeline(BasePipeline):
     """
 
     def __init__(self, model_config):
-        if model_config.parallel.dit_cfg_size != 1:
+        if (
+            model_config.visual_gen_mapping is not None
+            and model_config.visual_gen_mapping.cfg_size != 1
+        ):
             raise ValueError(
                 "FluxPipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
             )

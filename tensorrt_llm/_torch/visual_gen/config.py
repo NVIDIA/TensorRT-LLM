@@ -64,11 +64,7 @@ class ParallelConfig(StrictBaseModel):
         - dit_ring_size: Ring attention (not implemented)
         - dit_cp_size, dit_dp_size, dit_fsdp_size: Other parallelism types
 
-    Total world_size = dit_cfg_size × dit_ulysses_size
-
-    Parallelism Strategy:
-        - CFG Parallelism: Distributes positive/negative prompts across GPUs
-        - Ulysses Parallelism: Distributes sequence within each CFG group
+    See mapping.py for more details.
 
     Example Configurations:
         1. cfg_size=1, ulysses_size=2 -> 2 GPUs (Ulysses only)
@@ -98,6 +94,13 @@ class ParallelConfig(StrictBaseModel):
     dit_cp_size: int = PydanticField(1, ge=1)
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
+    dit_dim_order: str = PydanticField(
+        "cfg-tp-ring-ulysses",
+        description=(
+            "Outermost-to-innermost ordering of parallelism axes for the "
+            "DeviceMesh. Innermost = most contiguous ranks."
+        ),
+    )
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
@@ -113,39 +116,6 @@ class ParallelConfig(StrictBaseModel):
     @property
     def n_workers(self) -> int:
         return self.dit_cfg_size * self.dit_ulysses_size
-
-    def to_mapping(self) -> Mapping:
-        """Convert to TRT-LLM Mapping."""
-        world_size = self.dit_tp_size * self.dit_cp_size
-        return Mapping(
-            world_size=world_size,
-            tp_size=self.dit_tp_size,
-            pp_size=1,
-            cp_size=self.dit_cp_size,
-        )
-
-    @property
-    def total_parallel_size(self) -> int:
-        """Total parallelism across all DiT dimensions."""
-        return (
-            self.dit_tp_size
-            * self.dit_ulysses_size
-            * self.dit_ring_size
-            * self.dit_cp_size
-            * self.dit_dp_size
-            * self.dit_cfg_size
-        )
-
-    def validate_world_size(self, world_size: int) -> None:
-        """Validate that the parallel config is compatible with the given world size.
-
-        Called at launch time when WORLD_SIZE is known (not at config construction).
-        """
-        if self.total_parallel_size > world_size:
-            raise ValueError(
-                f"Total DiT parallel size ({self.total_parallel_size}) "
-                f"exceeds world_size ({world_size})"
-            )
 
 
 class TeaCacheConfig(StrictBaseModel):
@@ -396,10 +366,6 @@ class VisualGenArgs(StrictBaseModel):
         }
         return data
 
-    def to_mapping(self) -> Mapping:
-        """Derive Mapping from ParallelConfig."""
-        return self.parallel.to_mapping()
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return self.model_dump()
@@ -472,7 +438,8 @@ class DiffusionModelConfig(BaseModel):
     Contains merged/parsed config from:
     - pretrained_config: From checkpoint/config.json
     - quant_config: From checkpoint or user quant config
-    - Sub-configs: From VisualGenArgs (pipeline, attention, parallel, teacache)
+    - Sub-configs: From VisualGenArgs (pipeline, attention, teacache)
+    - visual_gen_mapping: Populated by setup_visual_gen_mapping() from ParallelConfig
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -484,8 +451,12 @@ class DiffusionModelConfig(BaseModel):
     allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.AUTO)
     extra_attrs: Dict = PydanticField(default_factory=dict)
 
-    # Distributed process groups
-    ulysses_process_group: Optional[torch.distributed.ProcessGroup] = None
+    # Unified parallelism mapping (populated by setup_visual_gen_mapping)
+    visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+
+    # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
+    enable_parallel_vae: bool = True
+    parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     dynamic_weight_quant: bool = False
 
@@ -498,7 +469,6 @@ class DiffusionModelConfig(BaseModel):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
-    parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
 
     @property
@@ -840,8 +810,9 @@ class DiffusionModelConfig(BaseModel):
             cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
             attention=attention_cfg,
-            parallel=parallel_cfg,
             teacache=teacache_cfg,
+            enable_parallel_vae=parallel_cfg.enable_parallel_vae,
+            parallel_vae_split_dim=parallel_cfg.parallel_vae_split_dim,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,
