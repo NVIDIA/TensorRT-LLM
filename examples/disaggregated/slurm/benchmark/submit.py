@@ -346,7 +346,7 @@ def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
     print(f"Environment variables saved to {env_file}")
 
 
-def submit_job(config, log_dir, dry_run):
+def submit_job(config, log_dir, dry_run, config_file=None):
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
@@ -436,6 +436,10 @@ def submit_job(config, log_dir, dry_run):
         log_base = os.path.join(script_dir, "logs")
 
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
+        config_name = os.path.splitext(
+            os.path.basename(config_file))[0] if config_file else ""
+        if config_name:
+            date_prefix = f"{date_prefix}-{config_name}"
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
         # Determine directory suffix based on attention_dp
@@ -761,7 +765,7 @@ def main():
         print(f"Processing: {config_file}")
         try:
             config = load_config(config_file)
-            submit_job(config, args.log_dir, args.dry_run)
+            submit_job(config, args.log_dir, args.dry_run, config_file)
             print(f"Successfully submitted job for: {config_file}\n")
         except Exception as e:
             traceback.print_exc()
