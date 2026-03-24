@@ -421,10 +421,6 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
         seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, maxAttentionWindow);
     blockManager.holdSequence(seqNoise.getRequestId());
 
-    TLLM_LOG_DEBUG("==========================================================");
-
-    blockManager.getWindowBlockManager(linearWindowSizeCode).printTree();
-
     auto inputTokens1 = std::make_shared<VecTokens>();
     for (int i = 0; i < numReusedTokens; ++i)
     {

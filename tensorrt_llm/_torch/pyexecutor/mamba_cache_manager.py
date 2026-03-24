@@ -872,14 +872,11 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         # round conv_bytes to 1KB
         self.conv_bytes = ((self.conv_bytes + 1023) // 1024) * 1024
 
-        self.use_fake_pool = os.getenv("USE_FAKE_POOL", "0") == "1"
-
         self.linear_attention_metadata = LinearAttentionMetadata()
         # TODO(xiweny): confirm if this is needed
         # self.linear_attention_metadata.linear_layer_indices = [0, 1]
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
-        self.linear_attention_metadata.all_recurrent_states_bytes = 1 if self.use_fake_pool else (
-            self.ssm_bytes + self.conv_bytes)
+        self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
         self.linear_attention_metadata.input_features_bytes_per_token = 0
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_prefix_cache_step
 
@@ -948,25 +945,7 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                                dtype=torch.int32,
                                                device="cuda")
         self.kv_cache_config = kv_cache_config
-        if self.use_fake_pool:
-            self.fake_state_indices = torch.arange(self.max_batch_size,
-                                                   dtype=torch.int32,
-                                                   device="cuda")
-            block_num = 128
-            self.fake_ssm_states = torch.empty(
-                [self.num_linear_layers, block_num, *self.ssm_state_shape],
-                dtype=self.ssm_state_dtype,
-                device="cuda")
-            self.fake_conv_states = torch.empty(
-                [self.num_linear_layers, block_num, *self.conv_state_shape],
-                dtype=self.conv_state_dtype,
-                device="cuda")
 
-        # Pool layout is layer-first: {numLayers, numBlocks, 1, blockSize}
-        self.pool = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_linear_layers, -1,
-                                 self.ssm_bytes + self.conv_bytes)
-        torch.fill_(self.pool, 0)
         self.ssm_states_mapping = {}
         self.conv_states_mapping = {}
         for layer_id in self.linear_pp_layers:
@@ -1016,10 +995,7 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                               num_extra_decoding_steps,
                                               draft_kv_cache_manager)
         self.requests.extend(requests)
-        if self.use_fake_pool:
-            self._setup_fake_states()
-        else:
-            self._setup_state_indices()
+        self._setup_state_indices()
         return requests
 
     def update_resources(self,
@@ -1036,7 +1012,7 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             scheduled_batch.generation_requests
         for req in self.requests:
             self.impl.copy_linear_attention_block(req)
-        self.impl.sync_transfer_manager_with_buffer_manager()
+        # self.impl.sync_transfer_manager_with_buffer_manager()
         self.impl.refresh_blocks()
         self._setup_state_indices()
 
@@ -1134,8 +1110,6 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
     # [total_block_num, *ssm_state_shape] (one block for one layer)
     def _get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        if self.use_fake_pool:
-            return self.fake_ssm_states[self.linear_layer_offsets[layer_idx]]
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
             torch.uint8).reshape(self.num_linear_layers, -1,
@@ -1161,8 +1135,6 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         return my_ssm_states
 
     def _get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        if self.use_fake_pool:
-            return self.fake_conv_states[self.linear_layer_offsets[layer_idx]]
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
             torch.uint8).reshape(self.num_linear_layers, -1,
