@@ -959,7 +959,9 @@ def mla_dsa_proj(
     """Token-wise projections for DSA MLA (CUDA-graph-capturable).
 
     Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-    indexer.pre_indexer (which updates the indexer k cache).
+    indexer.pre_indexer_proj (FP8 quantize, weight scaling).  Does NOT
+    update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
+    because the scatter kernel accesses batch-specific metadata.
 
     Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
     handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
