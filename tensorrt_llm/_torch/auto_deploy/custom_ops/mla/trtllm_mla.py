@@ -281,14 +281,16 @@ class _TrtllmMLAPlanner:
         # on the first call (matching the PT backend's approach).
         self.workspace = torch.empty(0, dtype=torch.int8, device=device)
         # Shape: (num_layers, 2) — maps each layer to [primary_pool, secondary_pool].
-        # Shape: [num_layers, 2] — maps [layer_idx] to [pool_idx, layer_within_pool].
-        # Pool 0 for all layers. Column 1 = layer index within pool (matches PT backend).
-        num_layers = 30  # accommodates typical DeepSeek layer counts
+        # Shape: [pool_mapping_size, 2] — maps [layer_idx] to [pool_idx, layer_within_pool].
+        # Pool 0 for all layers. Column 1 = layer index within pool.
+        # Sized to 1030+ to accommodate context ops at layer_idx+1000.
+        num_layers = 30
+        pool_mapping_size = num_layers + 1000
         self.host_pool_mapping = torch.zeros(
-            num_layers, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+            pool_mapping_size, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
-        for i in range(num_layers):
-            self.host_pool_mapping[i, 1] = i
+        for i in range(pool_mapping_size):
+            self.host_pool_mapping[i, 1] = i % num_layers
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
