@@ -445,7 +445,9 @@ class BasePipeline(nn.Module):
             self._run_warmup(height, width, num_frames, steps)
             torch.cuda.synchronize()
 
-        self._warmed_up_shapes = set(self.warmup_cache_key(h, w, f) for h, w, f in shapes)
+        self._warmed_up_shapes = set(
+            self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
+        )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 

@@ -184,7 +184,7 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
-        cache_key = self.pipeline.warmup_cache_key(req.height, req.width, req.num_frames)
+        cache_key = self.pipeline.warmup_cache_key(req.height, req.width, num_frames=req.num_frames)
         if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
             logger.warning(
                 f"Requested shape {cache_key} was not warmed up. "
