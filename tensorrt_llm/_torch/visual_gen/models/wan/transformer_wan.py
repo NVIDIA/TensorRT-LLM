@@ -6,7 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
-from transformers.modeling_utils import get_parameter_device
+
+try:
+    from transformers.modeling_utils import get_parameter_device
+except ImportError:
+    # Removed in transformers 5.0
+    def get_parameter_device(parameter):
+        return next(parameter.parameters()).device
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear

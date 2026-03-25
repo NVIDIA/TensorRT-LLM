@@ -7,7 +7,13 @@ from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
-from transformers.modeling_utils import load_sharded_checkpoint
+
+try:
+    from transformers.modeling_utils import load_sharded_checkpoint
+except ImportError:
+    # Moved to transformers.trainer_utils in transformers 5.0
+    from transformers.trainer_utils import load_sharded_checkpoint
+
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,

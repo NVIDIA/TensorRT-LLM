@@ -112,9 +112,11 @@ class LLaMAConfig(PretrainedConfig):
                 from llava.model import LlavaLlamaConfig  # noqa
                 from llava.model import LlavaLlamaModel
                 transformers.AutoConfig.register("llava_llama",
-                                                 LlavaLlamaConfig)
-                transformers.AutoModelForCausalLM.register(
-                    LlavaLlamaConfig, LlavaLlamaModel)
+                                                 LlavaLlamaConfig,
+                                                 exist_ok=True)
+                transformers.AutoModelForCausalLM.register(LlavaLlamaConfig,
+                                                           LlavaLlamaModel,
+                                                           exist_ok=True)
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 hf_config_dir, trust_remote_code=trust_remote_code)
