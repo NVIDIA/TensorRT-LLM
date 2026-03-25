@@ -1435,19 +1435,33 @@ SizeType32 WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType
     TLLM_CHECK(emplaceDone);
 
     auto constexpr beamIdx = 0;
-    auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
-        ? llmRequest.getUniqueTokens(beamIdx)
-        : *(llmRequest.getEncoderUniqueTokens().value());
+    bool const isSelfCache = mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY;
 
-    // Ignore last token because it can't be recovered
-    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
-    // Add empty block if last token is separated
-    if (inputLength % mTokensPerBlock == 1)
+    // For cross KV cache without encoder tokens (e.g., encoder-decoder models with feature inputs like Whisper),
+    // encoder unique tokens are not available. Use empty block keys since block reuse is disabled for cross
+    // KV cache and unique tokens are only needed for radix tree lookup.
+    bool const hasUniqueTokens = isSelfCache
+        || (llmRequest.getEncoderUniqueTokens().has_value() && llmRequest.getEncoderUniqueTokens().value());
+    std::vector<BlockKey> blockKeys;
+    VecUniqueTokens const* uniqueTokensPtr = nullptr;
+
+    if (hasUniqueTokens)
     {
-        blockedUniqueTokens.emplace_back();
-    }
+        auto const& uniqueTokens
+            = isSelfCache ? llmRequest.getUniqueTokens(beamIdx) : *(llmRequest.getEncoderUniqueTokens().value());
+        uniqueTokensPtr = &uniqueTokens;
 
-    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        // Ignore last token because it can't be recovered
+        auto blockedUniqueTokens
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
+        // Add empty block if last token is separated
+        if (inputLength % mTokensPerBlock == 1)
+        {
+            blockedUniqueTokens.emplace_back();
+        }
+
+        blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+    }
 
     auto config = llmRequest.getKvCacheRetentionConfig();
 
@@ -1469,7 +1483,7 @@ SizeType32 WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(
         blockKeys, inputLength, numContextBlocks, sequence, perBlockRetentions, mode, directory, isEnableBlockReuse);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
-    mTotalInputTokens += static_cast<double>(uniqueTokens.size());
+    mTotalInputTokens += static_cast<double>(uniqueTokensPtr ? uniqueTokensPtr->size() : inputLength);
 
     SizeType32 numConnectorMatchedTokens = 0;
 
