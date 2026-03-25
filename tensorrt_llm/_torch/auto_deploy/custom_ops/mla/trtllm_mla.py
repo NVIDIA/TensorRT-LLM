@@ -738,6 +738,7 @@ def _handle_prefill_thop(
     kpe_flat: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
     latent_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
     num_tokens: int,
     num_heads: int,
     num_kv_heads: int,
@@ -799,55 +800,65 @@ def _handle_prefill_thop(
     k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
     q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
-    # Context wrapper: head_size=192, num_kv_heads=32 (matching PT backend's self.mha).
-    # is_fused_qkv=False with separate Q/K/V, q_pe=None.
-    # Uses layer_idx+1000 for a separate C++ AttentionOp from decode.
-    wrapper = planner.get_or_create_wrapper(
-        layer_idx,
-        num_heads,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-        for_context=True,
-    )
-    wrapper.plan(
-        layer_idx=layer_idx + 1000,
-        tokens_per_block=tokens_per_block,
-        max_num_requests=max_num_requests,
-        max_sequence_length=max_context_length,
-        max_context_length=max_context_length,
-        beam_width=1,
-        sequence_length=sequence_length,
-        context_lengths=context_lengths,
-        host_past_key_value_lengths=host_past_kv_lengths,
-        host_total_kv_lens=host_total_kv_lens,
-        host_context_lengths=host_context_lengths,
-        host_request_types=host_request_types,
-        kv_cache_block_offsets=kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-        block_ids_per_seq=planner.block_ids_per_seq,
-        latent_cache=latent_cache,
-        # Use a separate workspace for context (not shared with decode's
-        # CUDA graph workspace, which has a captured address).
-        workspace=planner._ctx_workspace
-        if hasattr(planner, "_ctx_workspace")
-        else planner._init_ctx_workspace(device),
-        use_paged_context_fmha=False,
-        attention_input_type=AttentionInputType.context_only,
-        kv_scale_orig_quant=planner.kv_scale_orig_quant,
-        kv_scale_quant_orig=planner.kv_scale_quant_orig,
-        kv_cache_manager=planner.kv_cache_manager,
-    )
-    wrapper.run(
-        q=q,
-        k=k,
-        v=v,
-        output=output,
-        is_fused_qkv=False,
-        update_kv_cache=True,
-    )
+    # Batched SDPA for attention (C++ FMHA cache write is incompatible with AD
+    # block offsets, and update_kv_cache=False is blocked by global assertion).
+    q_3d = q.view(num_tokens, num_heads, qk_head_dim)
+    k_3d = k.view(num_tokens, num_heads, qk_head_dim)
+    v_3d = v.view(num_tokens, num_heads, v_head_dim)
+    num_prefill = int((host_request_types == 0).sum().item())
+    ctx_lens = host_context_lengths[:num_prefill]
+    max_ctx = int(ctx_lens.max().item()) if num_prefill > 0 else 0
+    all_same_len = num_prefill > 0 and int(ctx_lens.min().item()) == max_ctx
+    if all_same_len and num_prefill > 0:
+        q_4d = q_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, qk_head_dim).transpose(1, 2)
+        k_4d = k_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, qk_head_dim).transpose(1, 2)
+        v_4d = v_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, v_head_dim).transpose(1, 2)
+        o_4d = torch.nn.functional.scaled_dot_product_attention(
+            q_4d,
+            k_4d,
+            v_4d,
+            is_causal=True,
+            scale=1.0 / math.sqrt(qk_head_dim),
+        )
+        output[:num_tokens] = o_4d.transpose(1, 2).reshape(num_tokens, num_heads * v_head_dim)
+    elif num_prefill > 0:
+        ctx_lens_list = ctx_lens.tolist()
+        offset = 0
+        for i in range(num_prefill):
+            sl = ctx_lens_list[i]
+            qi = q_3d[offset : offset + sl].transpose(0, 1).unsqueeze(0)
+            ki = k_3d[offset : offset + sl].transpose(0, 1).unsqueeze(0)
+            vi = v_3d[offset : offset + sl].transpose(0, 1).unsqueeze(0)
+            oi = torch.nn.functional.scaled_dot_product_attention(
+                qi,
+                ki,
+                vi,
+                is_causal=True,
+                scale=1.0 / math.sqrt(qk_head_dim),
+            )
+            output[offset : offset + sl] = (
+                oi.squeeze(0).transpose(0, 1).reshape(sl, num_heads * v_head_dim)
+            )
+            offset += sl
+
+    # Manual cache write: scatter latent_cache tokens into the paged KV cache.
+    num_prefill = int((host_request_types == 0).sum().item())
+    ctx_lens = host_context_lengths[:num_prefill].tolist()
+    kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
+    offset = 0
+    for i in range(num_prefill):
+        seq_len_i = ctx_lens[i]
+        seq_latent = latent_cache[offset : offset + seq_len_i]
+        positions = torch.arange(seq_len_i, device=device)
+        page_ids = planner.block_ids_per_seq[i][(positions // tokens_per_block).long()]
+        flat_idx = page_ids.long() * rpb + positions % tokens_per_block
+        src = (
+            seq_latent
+            if seq_latent.dtype == kv_cache_2d.dtype
+            else seq_latent.to(kv_cache_2d.dtype)
+        )
+        kv_cache_2d.index_copy_(0, flat_idx, src)
+        offset += seq_len_i
 
     return output
 
@@ -1243,12 +1254,12 @@ def _mla_with_cache_impl(
             if not hasattr(w, "_quant_configured") and key[1] is False:  # decode only
                 w.quant_mode = quant_mode
                 w._quant_configured = True
-    # Configure FP8 block scaling on context wrappers (matches PT backend).
+    # Configure FP8 block scaling on ALL wrappers (matches PT backend).
     if kv_b_proj_weight.dtype == torch.float8_e4m3fn:
-        ctx_quant = quant_mode | int(QuantMode.FP8_1x128_128x128)
+        full_quant = quant_mode | int(QuantMode.FP8_1x128_128x128)
         for key, w in planner._attn_wrappers.items():
-            if not hasattr(w, "_quant_configured") and key[1] is True:  # context only
-                w.quant_mode = ctx_quant
+            if not hasattr(w, "_quant_configured"):
+                w.quant_mode = full_quant
                 w._quant_configured = True
         quant_mode = int(QuantMode.FP8_KV_CACHE)
 
@@ -1346,6 +1357,7 @@ def _mla_with_cache_impl(
             kpe_pre,
             kv_b_proj_weight,
             lc,
+            kv_cache,
             n_tok,
             num_heads,
             num_kv_heads,
