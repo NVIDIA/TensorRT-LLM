@@ -6,7 +6,7 @@ Read an exact or nearby checked-in config and the model's deployment guide **bef
 
 | Field | Guidance |
 |---|---|
-| `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. MoE models generally cap lower than dense. |
+| `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. MoE models generally cap lower than dense. The `max_requests` upper bound from the KV cache estimation section below caps reachable batch size. |
 | `max_num_tokens` | Affects throughput and memory. Must exceed ISL plus chat template overhead; sweet spot is ISL to 2× ISL. Tune together with `max_batch_size`. |
 | `enable_attention_dp` | Usually shines only in high-throughput / high-concurrency traffic scenarios; at low concurrency the memory and compute overhead can be prohibitively resource-intensive with little throughput gain. Follow the exact model guide/config. |
 | `kv_cache_config.free_gpu_memory_fraction` | OOM lever. Safe range depends on attention architecture (MLA vs GQA) and whether attention data parallelism (ADP) is enabled. Guides often adjust `max_batch_size` or `max_seq_len` first. |
@@ -17,6 +17,29 @@ Read an exact or nearby checked-in config and the model's deployment guide **bef
 | `attention_dp_config.*` | Preserve when present in source configs. |
 | `cuda_graph_config.max_batch_size` / `batch_sizes` | Align with source config. Not necessarily equal to server `max_batch_size`. |
 | MTP fields (`num_nextn_predict_layers`, `use_relaxed_acceptance_for_thinking`, `relaxed_topk`, `relaxed_delta`) | DeepSeek-R1 MTP only. Copy verbatim from the selected checked-in config; never interpolate. |
+
+## KV Cache Estimation
+
+Use these formulas to sanity-check whether a concurrency target fits in GPU memory. Read the required values from the model's HuggingFace config (`config.json`).
+
+**Per-token KV cache size:**
+
+- **GQA (standard grouped-query attention):**
+  `kv_per_token = 2 × num_hidden_layers × (num_key_value_heads / TP) × head_dim × dtype_bytes`
+- **MLA (multi-latent attention, e.g. DeepSeek-V2/V3):**
+  `kv_per_token = num_hidden_layers × (kv_lora_rank + qk_rope_head_dim) × dtype_bytes`
+
+Where `dtype_bytes` is 2 for BF16/FP16, 1 for FP8/INT8.
+
+**Approximate max concurrent requests (upper bound):**
+
+```
+max_requests ≈ floor((GPU_HBM × 0.90 − model_weights_bytes / TP) / (kv_per_token × (ISL + OSL)))
+```
+
+**HF config fields to read:** `num_hidden_layers`, `num_key_value_heads`, `head_dim` (or `hidden_size / num_attention_heads`), `kv_lora_rank`, `qk_rope_head_dim`.
+
+**Caveats:** This estimate ignores activation memory, CUDA graph workspace, MoE expert workspace, and attention data parallelism (ADP) overhead. Always prefer checked-in config values over formula-derived estimates. Mark any formula-derived number as unverified.
 
 ## Generally Observed Patterns
 
@@ -44,4 +67,4 @@ These come from `tensorrt_llm/bench/` and are benchmark heuristics, not serve ru
 
 ## OOM Triage
 
-Follow the exact model guide/config first. Common levers: lower `max_batch_size`, `max_num_tokens`, `max_seq_len`, or `free_gpu_memory_fraction`. If the deployment guide provides a backend support matrix, use it for `moe_config.backend`.
+Follow the exact model guide/config first. For a quick concurrency feasibility check, use the KV cache estimation formulas above. Common levers: lower `max_batch_size`, `max_num_tokens`, `max_seq_len`, or `free_gpu_memory_fraction`. If the deployment guide provides a backend support matrix, use it for `moe_config.backend`.
