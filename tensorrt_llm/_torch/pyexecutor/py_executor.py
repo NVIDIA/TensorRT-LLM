@@ -1922,9 +1922,10 @@ class PyExecutor:
             True when the total number of generation-ready requests
             reaches ``benchmark_req_queues_size``.
         """
-        assert self.is_benchmark_disagg, (
-            "_is_benchmark_disagg_fill_complete called outside benchmark "
-            "disagg mode")
+        if not self.is_benchmark_disagg:
+            raise RuntimeError(
+                "_is_benchmark_disagg_fill_complete() should not be called outside benchmark "
+                "disagg mode.  This is an unexpected error.")
         local_gen_count = sum(1 for req in scheduled_batch.generation_requests
                               if not req.is_attention_dp_dummy)
         if self.enable_attention_dp:
@@ -1942,7 +1943,7 @@ class PyExecutor:
         return False
 
     def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
-                                     can_forward: bool) -> tuple:
+                                     can_forward: bool) -> tuple[bool, bool]:
         """Gate the forward pass until all benchmark disagg requests are ready.
 
         In benchmark disagg mode the GEN executor must defer the forward
