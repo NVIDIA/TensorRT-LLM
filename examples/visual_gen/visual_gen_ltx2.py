@@ -252,7 +252,9 @@ def main():
     args = parse_args()
 
     if bool(args.spatial_upsampler_path) != bool(args.distilled_lora_path):
-        missing = "--distilled_lora_path" if args.spatial_upsampler_path else "--spatial_upsampler_path"
+        missing = (
+            "--distilled_lora_path" if args.spatial_upsampler_path else "--spatial_upsampler_path"
+        )
         raise ValueError(
             f"Two-stage pipeline requires both --spatial_upsampler_path and "
             f"--distilled_lora_path, but {missing} was not provided."

@@ -16,10 +16,10 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-
 # ---------------------------------------------------------------------------
 # Building blocks
 # ---------------------------------------------------------------------------
+
 
 class PixelShuffleND(torch.nn.Module):
     """N-dimensional pixel shuffle for upsampling."""
@@ -88,8 +88,12 @@ class BlurDownsample(torch.nn.Module):
         c = x2d.shape[1]
         weight = self.kernel.expand(c, 1, self.kernel_size, self.kernel_size)
         return F.conv2d(
-            x2d, weight=weight, bias=None,
-            stride=self.stride, padding=self.kernel_size // 2, groups=c,
+            x2d,
+            weight=weight,
+            bias=None,
+            stride=self.stride,
+            padding=self.kernel_size // 2,
+            groups=c,
         )
 
 
@@ -132,7 +136,9 @@ class SpatialRationalResampler(torch.nn.Module):
         super().__init__()
         self.scale = float(scale)
         self.num, self.den = _rational_for_scale(self.scale)
-        self.conv = torch.nn.Conv2d(mid_channels, (self.num**2) * mid_channels, kernel_size=3, padding=1)
+        self.conv = torch.nn.Conv2d(
+            mid_channels, (self.num**2) * mid_channels, kernel_size=3, padding=1
+        )
         self.pixel_shuffle = PixelShuffleND(2, upscale_factors=(self.num, self.num))
         self.blur_down = BlurDownsample(dims=2, stride=self.den)
 
@@ -148,6 +154,7 @@ class SpatialRationalResampler(torch.nn.Module):
 # ---------------------------------------------------------------------------
 # Main upsampler model
 # ---------------------------------------------------------------------------
+
 
 class LatentUpsampler(torch.nn.Module):
     """Spatially (and optionally temporally) upsample VAE latents.
@@ -194,7 +201,8 @@ class LatentUpsampler(torch.nn.Module):
         elif spatial_upsample:
             if rational_resampler:
                 self.upsampler = SpatialRationalResampler(
-                    mid_channels=mid_channels, scale=self.spatial_scale,
+                    mid_channels=mid_channels,
+                    scale=self.spatial_scale,
                 )
             else:
                 self.upsampler = torch.nn.Sequential(
@@ -255,6 +263,7 @@ class LatentUpsampler(torch.nn.Module):
 # Configurator
 # ---------------------------------------------------------------------------
 
+
 class LatentUpsamplerConfigurator:
     """Create a LatentUpsampler from a config dict."""
 
@@ -275,6 +284,7 @@ class LatentUpsamplerConfigurator:
 # ---------------------------------------------------------------------------
 # Upsampling helper
 # ---------------------------------------------------------------------------
+
 
 def upsample_video(
     latent: torch.Tensor,
