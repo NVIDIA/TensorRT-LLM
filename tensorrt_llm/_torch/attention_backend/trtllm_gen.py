@@ -888,6 +888,8 @@ class FlashInferTrtllmGenAttention:
         self._layout = DEFAULT_KV_LAYOUT
         self._kv_cache_manager = kv_cache_manager
         self._quant_config = quant_config
+        self._kv_pool_cache = {}
+        self._pool_idx_cache = {}
 
     @property
     def layout(self) -> str:
@@ -959,17 +961,18 @@ class FlashInferTrtllmGenAttention:
         if kv_cache_block_offsets is None:
             return None, None
 
-        # Lazy-init: cache kv_pool (and optional scale pool) per layer.
-        # Pool pointers are stable for model lifetime — only created once.
-        if not hasattr(self, "_kv_pool_cache"):
-            self._kv_pool_cache = {}
-            self._pool_idx_cache = {}
-
         if layer_idx not in self._kv_pool_cache:
             kv_factor = 1 if is_mla_enable else 2
-            total_num_blocks = (
-                kv_cache_block_offsets.size(1) * kv_cache_block_offsets.size(-1) * kv_factor
-            )
+            if self._kv_cache_manager is not None:
+                layer_offset = self._kv_cache_manager.layer_offsets[layer_idx]
+                total_num_blocks = (
+                    self._kv_cache_manager.impl.get_primary_pool_data(layer_offset).shape[0]
+                    * kv_factor
+                )
+            else:
+                total_num_blocks = (
+                    kv_cache_block_offsets.size(1) * kv_cache_block_offsets.size(-1) * kv_factor
+                )
             kv_pool, kv_scale_pool = thop.build_kv_cache_buffers(
                 host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping,
@@ -1590,8 +1593,7 @@ def trtllm_gen_attention(
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
     global_layer_idx: Optional[int] = None,
-    backend: Optional["FlashInferTrtllmGenAttention"] = None,
-) -> Optional["FlashInferTrtllmGenAttention"]:
+) -> None:
     """
     TrtLLM-Gen attention using flashinfer backend.
 
@@ -1692,10 +1694,9 @@ def trtllm_gen_attention(
     """
     logger.debug(f"trtllm_gen_attention starts at layer {layer_idx}")
 
-    if backend is None:
-        backend = FlashInferTrtllmGenAttention(
-            kv_cache_manager=kv_cache_manager, quant_config=quant_config
-        )
+    backend = FlashInferTrtllmGenAttention(
+        kv_cache_manager=kv_cache_manager, quant_config=quant_config
+    )
 
     is_fp8_out = output.dtype == torch.float8_e4m3fn
     is_fp4_out = output.dtype == torch.uint8
@@ -1886,4 +1887,3 @@ def trtllm_gen_attention(
         backend.run_generation(gen_params)
 
     logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")
-    return backend
