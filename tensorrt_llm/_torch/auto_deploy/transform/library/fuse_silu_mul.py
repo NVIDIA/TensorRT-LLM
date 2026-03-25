@@ -16,32 +16,48 @@
 """Graph transform for fusing SiLU+Mul activation after GEMM fusion.
 
 After fuse_gemms_mixed_children or fuse_fp8_gemms fuses gate+up projections into a
-single GEMM, the graph contains:
+single GEMM, the graph contains one of two splitting patterns:
+
+Variant 1 (non-quantized, torch.narrow):
 
     fused_out = gemm(x, gate_up_weight)
     gate = narrow(fused_out, -1, 0, intermediate_size)
     up = narrow(fused_out, -1, intermediate_size, intermediate_size)
     hidden = silu(gate) * up
 
-This transform replaces the narrow+silu+mul pattern with a single fused op:
+Variant 2 (quantized, split+getitem):
 
-    fused_out = gemm(x, gate_up_weight)
+    fused_out = quant_gemm(x, fused_weight, ...)
+    parts = split_output(fused_out)
+    gate = getitem(parts, 0)
+    up = getitem(parts, 1)
+    hidden = silu(gate) * up
+
+This transform replaces both patterns with a single fused op:
+
     hidden = silu_and_mul(fused_out)
 
 The fused kernel avoids materializing narrow views and uses FlashInfer's optimized
-silu_and_mul kernel when available.
+silu_and_mul kernel. The transform is a no-op when FlashInfer is not available.
 """
 
+import operator
+from contextlib import nullcontext
 from typing import Optional, Tuple, Type
 
 import torch
+from torch._inductor.pattern_matcher import Match
 from torch.fx import GraphModule, Node
 
-# Import to ensure the custom op is registered
-from ...custom_ops.linear.silu_mul import silu_and_mul  # noqa: F401
+from ...custom_ops.linear.silu_mul import HAS_FUSED_SILU_AND_MUL
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+
+# It is important to import ADPatternMatcherPass from pattern_matcher.py, not from
+# torch._inductor.pattern_matcher
+from ...utils._graph import lift_to_meta, placeholders_on_meta, run_shape_prop
 from ...utils.node_utils import is_op
+from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -50,45 +66,150 @@ from ..interface import (
     TransformRegistry,
 )
 
+# Dummy half-size for tracing the pattern (actual values are ignored via op_ignore_types).
+_HALF_SIZE = 256
 
-def _get_narrow_info(node: Node) -> Optional[Tuple[Node, int, int]]:
-    """Extract (parent, offset, length) from a torch.narrow call on dim=-1.
 
-    Returns None if the node is not a narrow on the last dimension.
+# ---- Variant 1: narrow+silu+mul (pattern matcher) -----------------------------------
+
+
+def _silu_mul_pattern(x: torch.Tensor) -> torch.Tensor:
+    """Search pattern: narrow+silu+mul after non-quantized GEMM fusion.
+
+    Uses explicit aten ops for silu/mul to match the export-level graph, and torch.narrow
+    to match the nodes injected by GEMM fusion.
     """
-    if not is_op(node, torch.narrow):
+    gate = torch.narrow(x, -1, 0, _HALF_SIZE)
+    up = torch.narrow(x, -1, _HALF_SIZE, _HALF_SIZE)
+    return torch.ops.aten.mul.Tensor(torch.ops.aten.silu.default(gate), up)
+
+
+def _silu_mul_replacement(x: torch.Tensor) -> torch.Tensor:
+    """Replacement: fused silu_and_mul custom op."""
+    return torch.ops.auto_deploy.silu_and_mul.default(x)
+
+
+def _symbolic_trace_fn(fn, _args):
+    """Trace preserving torch.narrow (torch_export_to_gm would decompose it to aten.slice)."""
+    return torch.fx.symbolic_trace(fn)
+
+
+def _check_narrow_constraints(match: Match) -> bool:
+    """Verify the two narrow ops form a valid gate/up split on dim -1."""
+    narrow_nodes = [n for n in match.nodes if n.op == "call_function" and n.target == torch.narrow]
+    if len(narrow_nodes) != 2:
+        return False
+
+    for n in narrow_nodes:
+        if n.args[1] != -1:
+            return False
+
+    narrow_nodes.sort(key=lambda n: n.args[2])
+    gate_narrow, up_narrow = narrow_nodes
+
+    gate_offset, gate_length = gate_narrow.args[2], gate_narrow.args[3]
+    up_offset, up_length = up_narrow.args[2], up_narrow.args[3]
+
+    return gate_offset == 0 and up_offset == gate_length and gate_length == up_length
+
+
+# ---- Variant 2: getitem+silu+mul (graph walk) ---------------------------------------
+# The quantized GEMM fusion path splits via an opaque closure (split_output) + getitem.
+# The closure cannot be matched by the pattern matcher, so we use direct graph walking.
+
+
+def _match_getitem_silu_mul(mul_node: Node) -> Optional[Node]:
+    """Match silu(getitem(split, 0)) * getitem(split, 1) and return the split input.
+
+    Returns the fused linear output (pre-split tensor) if the pattern matches, None otherwise.
+    """
+    left, right = mul_node.args[0], mul_node.args[1]
+    if not isinstance(left, Node) or not isinstance(right, Node):
         return None
 
-    # torch.narrow(input, dim, start, length)
-    if len(node.args) < 4:
-        return None
+    for silu_candidate, up_candidate in [(left, right), (right, left)]:
+        if not is_op(silu_candidate, torch.ops.aten.silu.default):
+            continue
 
-    parent = node.args[0]
-    dim = node.args[1]
-    offset = node.args[2]
-    length = node.args[3]
+        silu_input = silu_candidate.args[0]
+        if not isinstance(silu_input, Node):
+            continue
 
-    if not isinstance(parent, Node):
-        return None
-    if dim != -1:
-        return None
-    if not isinstance(offset, int) or not isinstance(length, int):
-        return None
+        # Both silu_input (gate) and up_candidate must be getitem from the same parent
+        if silu_input.op != "call_function" or silu_input.target != operator.getitem:
+            continue
+        if up_candidate.op != "call_function" or up_candidate.target != operator.getitem:
+            continue
 
-    return parent, offset, length
+        gate_parent, gate_idx = silu_input.args[0], silu_input.args[1]
+        up_parent, up_idx = up_candidate.args[0], up_candidate.args[1]
+
+        if gate_parent is not up_parent:
+            continue
+        if not isinstance(gate_parent, Node):
+            continue
+
+        # gate must be index 0, up must be index 1
+        if gate_idx != 0 or up_idx != 1:
+            continue
+
+        # The parent is the split_output call; its first arg is the fused linear output
+        if gate_parent.op != "call_function" or len(gate_parent.args) < 1:
+            continue
+
+        fused_linear_out = gate_parent.args[0]
+        if not isinstance(fused_linear_out, Node):
+            continue
+
+        return fused_linear_out
+
+    return None
+
+
+def _fuse_getitem_silu_mul(gm: GraphModule) -> int:
+    """Fuse getitem+silu+mul patterns from quantized GEMM fusion into silu_and_mul."""
+    graph = gm.graph
+    cnt = 0
+
+    for node in list(graph.nodes):
+        if not is_op(node, torch.ops.aten.mul.Tensor):
+            continue
+
+        fused_linear_out = _match_getitem_silu_mul(node)
+        if fused_linear_out is None:
+            continue
+
+        with graph.inserting_before(node):
+            fused_node = graph.call_function(
+                torch.ops.auto_deploy.silu_and_mul.default,
+                args=(fused_linear_out,),
+            )
+            ref_val = node.meta.get("val")
+            if ref_val is not None:
+                fused_node.meta["val"] = torch.empty(
+                    ref_val.shape, dtype=ref_val.dtype, device="meta"
+                )
+
+        node.replace_all_uses_with(fused_node)
+        cnt += 1
+
+    if cnt > 0:
+        graph.eliminate_dead_code()
+        gm.recompile()
+
+    return cnt
+
+
+# ---- Transform class ----------------------------------------------------------------
 
 
 @TransformRegistry.register("fuse_silu_mul")
 class FuseSiluMul(BaseTransform):
-    """Fuse narrow+silu+mul into a single silu_and_mul op after GEMM fusion.
+    """Fuse silu+mul into a single silu_and_mul op after GEMM fusion.
 
-    Detects the pattern:
-        gate = narrow(x, -1, 0, size)
-        up = narrow(x, -1, size, size)
-        hidden = silu(gate) * up
-
-    And replaces it with:
-        hidden = silu_and_mul(x)
+    Handles two variants:
+    - Variant 1 (narrow split): matched via ADPatternMatcherPass
+    - Variant 2 (getitem split): matched via direct graph walk (opaque split closures)
 
     This runs as a post_load_fusion pass, after GEMM fusion has combined gate+up
     projections.
@@ -107,107 +228,30 @@ class FuseSiluMul(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        if not self.config.enabled:
+        if not self.config.enabled or not HAS_FUSED_SILU_AND_MUL:
             return gm, TransformInfo(skipped=True, num_matches=0)
 
-        graph = gm.graph
-        cnt = 0
+        # Variant 1: narrow+silu+mul (pattern matcher, requires shape metadata)
+        with lift_to_meta(gm) if placeholders_on_meta(gm) else nullcontext():
+            run_shape_prop(gm)
 
-        for node in list(graph.nodes):
-            if not is_op(node, torch.ops.aten.mul.Tensor):
-                continue
-
-            result = self._try_fuse_mul(node)
-            if result is None:
-                continue
-
-            fused_parent, half_size = result
-
-            # Create fused silu_and_mul node
-            with graph.inserting_before(node):
-                fused_node = graph.call_function(
-                    torch.ops.auto_deploy.silu_and_mul.default,
-                    args=(fused_parent,),
-                )
-                # Propagate shape metadata
-                ref_val = node.meta.get("val")
-                if ref_val is not None:
-                    fused_node.meta["val"] = torch.empty(
-                        ref_val.shape, dtype=ref_val.dtype, device="meta"
-                    )
-
-            node.replace_all_uses_with(fused_node)
-            cnt += 1
-
+        patterns = ADPatternMatcherPass()
+        register_ad_pattern(
+            search_fn=_silu_mul_pattern,
+            replace_fn=_silu_mul_replacement,
+            patterns=patterns,
+            dummy_args=[torch.randn(2, _HALF_SIZE * 2, device="meta")],
+            trace_fn=_symbolic_trace_fn,
+            op_ignore_types={torch.narrow: (int,)},
+            extra_check=_check_narrow_constraints,
+        )
+        cnt = patterns.apply(gm.graph)
         if cnt > 0:
-            # Clean up dead code (narrow, silu nodes that are no longer used)
-            gm.graph.eliminate_dead_code()
             gm.recompile()
 
-        info = TransformInfo(
-            skipped=False,
-            num_matches=cnt,
-            is_clean=cnt == 0,
-            has_valid_shapes=cnt == 0,
+        # Variant 2: getitem+silu+mul (direct graph walk for opaque split closures)
+        cnt += _fuse_getitem_silu_mul(gm)
+
+        return gm, TransformInfo(
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=cnt == 0
         )
-        return gm, info
-
-    @staticmethod
-    def _try_fuse_mul(mul_node: Node) -> Optional[Tuple[Node, int]]:
-        """Try to match the narrow+silu+mul pattern on a mul node.
-
-        Returns (fused_parent, half_size) if the pattern matches, None otherwise.
-        """
-        left, right = mul_node.args[0], mul_node.args[1]
-        if not isinstance(left, Node) or not isinstance(right, Node):
-            return None
-
-        # Try both orderings: silu(narrow(x)) * narrow(x)  or  narrow(x) * silu(narrow(x))
-        for silu_candidate, up_candidate in [(left, right), (right, left)]:
-            result = FuseSiluMul._match_silu_narrow_mul(silu_candidate, up_candidate)
-            if result is not None:
-                return result
-
-        return None
-
-    @staticmethod
-    def _match_silu_narrow_mul(
-        silu_candidate: Node, up_candidate: Node
-    ) -> Optional[Tuple[Node, int]]:
-        """Check if silu_candidate = silu(narrow(x, 0, size)) and up_candidate = narrow(x, size, size).
-
-        Returns (x, size) on match, None otherwise.
-        """
-        # silu_candidate must be a silu op
-        if not is_op(silu_candidate, torch.ops.aten.silu.default):
-            return None
-
-        # silu's input must be a narrow
-        silu_input = silu_candidate.args[0]
-        if not isinstance(silu_input, Node):
-            return None
-
-        gate_info = _get_narrow_info(silu_input)
-        if gate_info is None:
-            return None
-        gate_parent, gate_offset, gate_size = gate_info
-
-        # up_candidate must also be a narrow
-        up_info = _get_narrow_info(up_candidate)
-        if up_info is None:
-            return None
-        up_parent, up_offset, up_size = up_info
-
-        # Both narrows must come from the same parent
-        if gate_parent is not up_parent:
-            return None
-
-        # gate must be at offset 0, up must be at offset gate_size, both same size
-        if gate_offset != 0:
-            return None
-        if up_offset != gate_size:
-            return None
-        if gate_size != up_size:
-            return None
-
-        return gate_parent, gate_size

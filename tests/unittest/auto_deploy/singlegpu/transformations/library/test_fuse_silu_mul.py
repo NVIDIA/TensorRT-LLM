@@ -2,10 +2,14 @@ import pytest
 import torch
 from torch.export import Dim
 
-import tensorrt_llm._torch.auto_deploy.custom_ops.linear.silu_mul as _silu_mul  # noqa: F401 — registers custom op
+from tensorrt_llm._torch.auto_deploy.custom_ops.linear.silu_mul import HAS_FUSED_SILU_AND_MUL
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+_requires_fused_silu_mul = pytest.mark.skipif(
+    not HAS_FUSED_SILU_AND_MUL, reason="requires flashinfer for fused silu_and_mul kernel"
+)
 
 
 class SwiGLUMLP(torch.nn.Module):
@@ -81,6 +85,7 @@ def _run_transforms(gm, transform_specs):
     return gm
 
 
+@_requires_fused_silu_mul
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fuse_silu_mul_basic():
     """Test that silu+mul is fused after GEMM fusion merges gate+up projections."""
@@ -121,6 +126,7 @@ def test_fuse_silu_mul_basic():
     torch.testing.assert_close(fused_output, ref_output, atol=1e-2, rtol=1e-2)
 
 
+@_requires_fused_silu_mul
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fuse_silu_mul_multi_layer():
     """Test that silu+mul fusion works across multiple layers."""
@@ -148,6 +154,7 @@ def test_fuse_silu_mul_multi_layer():
     torch.testing.assert_close(fused_output, ref_output, atol=1e-2, rtol=1e-2)
 
 
+@_requires_fused_silu_mul
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fuse_silu_mul_disabled():
     """Test that fusion is skipped when disabled."""

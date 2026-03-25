@@ -17,34 +17,34 @@
 
 Replaces the pattern: silu(narrow(x, 0, half)) * narrow(x, half, half)
 with a single fused kernel that avoids materializing the narrow views.
+
+The custom op is only registered when FlashInfer is available, since without
+the fused kernel the transform provides no benefit over the original ops.
 """
 
 import torch
-import torch.nn.functional as F
 
 try:
     from flashinfer.activation import silu_and_mul as _flashinfer_silu_and_mul
+
+    HAS_FUSED_SILU_AND_MUL = True
 except ImportError:
     _flashinfer_silu_and_mul = None
+    HAS_FUSED_SILU_AND_MUL = False
 
+if HAS_FUSED_SILU_AND_MUL:
 
-@torch.library.custom_op("auto_deploy::silu_and_mul", mutates_args=())
-def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    """Fused SiLU+Mul activation: split x in half, apply silu to first half, multiply.
+    @torch.library.custom_op("auto_deploy::silu_and_mul", mutates_args=())
+    def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+        """Fused SiLU+Mul activation: split x in half, apply silu to first half, multiply.
 
-    Equivalent to: silu(x[..., :half]) * x[..., half:]
-
-    Uses FlashInfer's fused kernel when available, falls back to manual implementation.
-    """
-    if _flashinfer_silu_and_mul is not None:
+        Equivalent to: silu(x[..., :half]) * x[..., half:]
+        """
         return _flashinfer_silu_and_mul(x)
-    gate, up = x.chunk(2, dim=-1)
-    return F.silu(gate) * up
 
-
-@silu_and_mul.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    """Fake implementation for tracing."""
-    half_size = x.shape[-1] // 2
-    output_shape = list(x.shape[:-1]) + [half_size]
-    return x.new_empty(output_shape, dtype=x.dtype)
+    @silu_and_mul.register_fake
+    def _(x: torch.Tensor) -> torch.Tensor:
+        """Fake implementation for tracing."""
+        half_size = x.shape[-1] // 2
+        output_shape = list(x.shape[:-1]) + [half_size]
+        return x.new_empty(output_shape, dtype=x.dtype)
