@@ -28,7 +28,6 @@ Design Goals:
 
 import itertools
 import logging
-import os
 from typing import List, Optional
 
 import pytest
@@ -458,6 +457,7 @@ def test_moe_backend(
     swiglu_alpha: Optional[float],
     swiglu_beta: Optional[float],
     swiglu_limit: Optional[float],
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """
     Test MoE backend with autotune to capture all tactics.
@@ -470,7 +470,7 @@ def test_moe_backend(
     """
     # DENSEGEMM: disable fused fc2_alpha path for backend-level testing.
     if backend_type == MoeBackendType.DENSEGEMM:
-        os.environ["TRTLLM_MOE_FUSED_FC2_ALPHA"] = "0"
+        monkeypatch.setenv("TRTLLM_MOE_FUSED_FC2_ALPHA", "0")
 
     is_gated = is_gated_activation(activation_type)
     swiglu_gptoss_style = False

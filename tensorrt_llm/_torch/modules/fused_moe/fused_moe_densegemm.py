@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import os
 from typing import Dict, List, Optional, Union
 
@@ -13,9 +14,8 @@ from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
-from .fused_moe_cutlass import CutlassFusedMoE
-from .interface import AlltoallMethodType
-from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
+from .interface import MoE, MoEWeightLoadingMode
+from .quantization import NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
 
@@ -80,8 +80,16 @@ def gen_fc2_alpha_fused(
     return fc2_alpha.scatter_(1, token_selected_experts.long(), scaled_values)
 
 
-class DenseGEMMFusedMoE(CutlassFusedMoE):
-    """CuteDSL flow of fused mixture of experts (MoE) Layer.
+class DenseGEMMFusedMoE(MoE):
+    """CuteDSL DenseGEMM flow of fused mixture of experts (MoE) Layer.
+
+    This backend uses CuTe DSL dense GEMM kernels with fused SwiGLU for MoE
+    computation. It supports NVFP4 quantization only and is restricted to
+    SM100/SM103 (Blackwell) architectures.
+
+    Unlike CutlassFusedMoE which uses per-expert scattered GEMM, DenseGEMM
+    packs all experts into a single dense matrix and uses standard GEMM operations,
+    which can be more efficient for small token counts (min-latency scenarios).
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -155,6 +163,8 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
         # DenseGEMM CuTe DSL kernels only support SM100 and SM103.
         from tensorrt_llm._utils import get_sm_version
 
+        from ...utils import ActivationType
+
         sm_version = get_sm_version()
         assert sm_version in self._SUPPORTED_SM_VERSIONS, (
             f"DenseGEMMFusedMoE only supports SM {self._SUPPORTED_SM_VERSIONS} "
@@ -163,8 +173,6 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
 
         # DenseGEMM kernel hardcodes SwiGLU fusion — reject other activation types
         # before calling super().__init__() to fail fast with a clear message.
-        from ...utils import ActivationType
-
         if activation_type is None:
             activation_type = ActivationType.Swiglu
         assert activation_type == ActivationType.Swiglu, (
@@ -184,6 +192,10 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             f"when weight_per_expert is not MMA tile-K aligned."
         )
 
+        # Call MoE base class directly (not CutlassFusedMoE).
+        # Note: `without_comm` and `apply_router_weight_on_input` are accepted
+        # for API compatibility with create_moe_backend() but are not passed to
+        # MoE.__init__() since DenseGEMM does not use alltoall communication.
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -194,10 +206,8 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             model_config=model_config,
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
-            without_comm=without_comm,
             activation_type=activation_type,
         )
 
@@ -214,14 +224,53 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
         if AuxStreamType.MoeFc2Alpha not in self.aux_stream_dict:
             self.aux_stream_dict[AuxStreamType.MoeFc2Alpha] = torch.cuda.Stream()
-        if self.event_dict is None:
-            self.event_dict = {}
+        self.event_dict = {}
         for key in [EventType.Main, EventType.MoeFc2Alpha]:
-            if key not in self.event_dict:
-                self.event_dict[key] = torch.cuda.Event()
+            self.event_dict[key] = torch.cuda.Event()
 
-    def load_weights(self, weights: List[Dict]):
-        super().load_weights(weights)
+        # Weight creation
+        self._weights_created = False
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+
+    def _supports_load_balancer(self) -> bool:
+        """DenseGEMMFusedMoE supports load balancer."""
+        return True
+
+    def _get_quant_method(self):
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True
+        ):
+            if self.quant_config.layer_quant_mode.has_nvfp4():
+                return NVFP4CuteDslFusedMoEMethod()
+            raise ValueError(
+                f"{self.__class__.__name__} only supports NVFP4 quantization, "
+                f"got {self.quant_config.quant_mode}."
+            )
+        raise ValueError(
+            f"{self.__class__.__name__} requires quantization (NVFP4), "
+            f"but no quantization config was provided."
+        )
+
+    def create_weights(self):
+        if self._weights_created:
+            return
+
+        self.quant_method = self._get_quant_method()
+        self.quant_method.create_weights(self)
+
+        self._weights_created = True
+
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
+        assert self._weights_created
+        assert len(weights) == 1
+        weights = weights[0]
+
+        kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(self.quant_method.load_weights).args:
+            kargs["allow_partial_loading"] = allow_partial_loading
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode, **kargs)
+
         # Transpose w2_weight layout: (E, H, ...) -> (H, E, ...) for dense GEMM.
         # NOTE: .contiguous() on the transposed view allocates a full-size temporary,
         # temporarily doubling peak memory.  An in-place multi-dim transpose is not
@@ -240,6 +289,9 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
                     f"{self.__class__.__name__} only supports nvfp4 quantization, "
                     f"got {self.quant_config.quant_mode}."
                 )
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)
 
     def _transform_w2_weight_scale_for_min_latency(self):
         """Transform w2_weight_scale for minimum latency path optimization."""
@@ -277,17 +329,6 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             w2_weight_scale.view(self.w2_weight_scale.dtype).view(self.w2_weight_scale.shape),
             non_blocking=True,
         )
-
-    def select_alltoall_method_type(self) -> AlltoallMethodType:
-        return AlltoallMethodType.NotEnabled
-
-    def _get_quant_method(self):
-        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
-            exclude_kv_cache=True
-        ):
-            if self.quant_config.layer_quant_mode.has_nvfp4():
-                return NVFP4CuteDslFusedMoEMethod()
-        return super()._get_quant_method()
 
     def quantize_input(
         self, x: Union[torch.Tensor, Fp4QuantizedTensor], post_quant_comm: bool = True
@@ -524,3 +565,39 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             enable_alltoall=False,
         )
         return x
+
+    def forward_impl(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert do_finalize, "DenseGEMMFusedMoE does not support do_finalize=False"
+
+        is_first_call = self.repeat_idx == 0
+        is_last_call = self.repeat_idx == self.repeat_count - 1
+
+        outputs = self.forward_chunk(
+            x,
+            router_logits,
+            output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            repeating_info=(is_first_call, is_last_call),
+        )
+        outputs = self.reducescatter_or_allreduce(
+            outputs,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
+
+        if self.use_dp and self.parallel_size > 1:
+            rank = self.parallel_rank
+            outputs = outputs[: all_rank_num_tokens[rank]]
+        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
+        return outputs

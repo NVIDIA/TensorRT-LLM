@@ -606,8 +606,8 @@ class ConfigurableMoE(MoE):
 
             assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
-            # CutlassFusedMoE expects float32, while TRTLLMGenFusedMoE uses bfloat16
-            if isinstance(self.backend, CutlassFusedMoE):
+            # CutlassFusedMoE and DenseGEMMFusedMoE expect float32, while TRTLLMGenFusedMoE uses bfloat16
+            if isinstance(self.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
                 assert token_final_scales.dtype == torch.float32
             assert token_selected_experts.dtype == torch.int32
 
