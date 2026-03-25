@@ -505,17 +505,11 @@ class PoolGroupBase:
         self._destroyed = False
 
     def __del__(self) -> None:
-        import sys
-
-        print("[PoolGroupBase] __del__ called", file=sys.stderr, flush=True)
         self.destroy()
 
     def destroy(self) -> None:
         if self._destroyed:
             return
-        import sys
-
-        print("[PoolGroupBase] destroy() starting (has CUDA sync)", file=sys.stderr, flush=True)
         allocator = self._slot_allocator
         if allocator._capacity != 0:
             allocator._synchronize()
@@ -524,7 +518,6 @@ class PoolGroupBase:
         for pool in self._pools:
             pool.destroy()
         self._destroyed = True
-        print("[PoolGroupBase] destroy() completed", file=sys.stderr, flush=True)
 
     @property
     def num_pools(self) -> PoolIndex:
