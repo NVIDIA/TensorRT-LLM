@@ -239,6 +239,11 @@ class _TrtllmMLAPlanner:
         self._attn_wrappers[key] = w
         return w
 
+    def _init_ctx_workspace(self, device: torch.device) -> torch.Tensor:
+        """Create a separate workspace for context attention (not shared with decode)."""
+        self._ctx_workspace = torch.empty(0, dtype=torch.int8, device=device)
+        return self._ctx_workspace
+
     def get_or_create_rotary_cos_sin(
         self,
         max_positions: int,
@@ -288,7 +293,12 @@ class _TrtllmMLAPlanner:
             pool_mapping_size, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         for i in range(pool_mapping_size):
-            self.host_pool_mapping[i, 1] = i % num_layers
+            # Decode layers [0..29] and context layers [1000..1029] both map
+            # to the same physical pool layers [0..29].
+            if i < num_layers:
+                self.host_pool_mapping[i, 1] = i
+            else:
+                self.host_pool_mapping[i, 1] = i - 1000
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
@@ -817,7 +827,11 @@ def _handle_prefill_thop(
         host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
         block_ids_per_seq=planner.block_ids_per_seq,
         latent_cache=latent_cache,
-        workspace=planner.workspace,
+        # Use a separate workspace for context (not shared with decode's
+        # CUDA graph workspace, which has a captured address).
+        workspace=planner._ctx_workspace
+        if hasattr(planner, "_ctx_workspace")
+        else planner._init_ctx_workspace(device),
         use_paged_context_fmha=False,
         attention_input_type=AttentionInputType.context_only,
         kv_scale_orig_quant=planner.kv_scale_orig_quant,
