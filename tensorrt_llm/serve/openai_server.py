@@ -389,13 +389,13 @@ class OpenAIServer(_VideoRoutesMixin):
         if disable_harmony or self.model_config is None:
             self.use_harmony = False
         else:
-            self.use_harmony = (self.model_config.model_type == "gpt_oss")
+            self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
-            if self.model_config.model_type == "kimi_k2":
+            if type(self.model_config).model_type == "kimi_k2":
                 self.tool_call_id_type = "kimi_k2"
-            elif self.model_config.model_type == "deepseek_v32":
+            elif type(self.model_config).model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
 
         if self.generator.args.return_perf_metrics:
