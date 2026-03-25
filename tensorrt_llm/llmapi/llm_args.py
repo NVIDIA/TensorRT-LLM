@@ -2292,9 +2292,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.enable_unified_memory_optimization:
             if self.host_cache_size and self.host_cache_size > 0:
                 logger.info(
-                    "Unified memory detected: host_cache_size (%d bytes) will "
-                    "be folded into primary GPU pool by the C++ runtime.",
-                    self.host_cache_size)
+                    "Unified memory detected: setting host_cache_size to 0 "
+                    "(secondary pool is meaningless on unified memory)")
+                object.__setattr__(self, "host_cache_size", 0)
         return self
 
 
