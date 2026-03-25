@@ -913,7 +913,9 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
+def get_all_layer_subgraphs(
+    gm: GraphModule, linear_nodes: Optional[List[Node]] = None
+) -> tuple[List[LayerSubgraph], set[Node]]:
     """
     Get subgraphs for all consecutive layers (attention, MLP, SSM, MoE) in the graph.
 
@@ -946,7 +948,8 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
 
     assert gm.graph.nodes, "Graph is empty"
     layer_subgraphs = []
-    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    if linear_nodes is None:
+        linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
 
     # get residual add nodes to correctly identify layer boundaries
     residuals = identify_regions_between_residuals(gm)
