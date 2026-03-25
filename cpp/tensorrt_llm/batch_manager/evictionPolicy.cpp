@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
+#include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 
@@ -38,6 +39,10 @@ namespace
 {
 SizeType32 getCacheLevel(BlockPtr const& block)
 {
+    if (block->isPlaceholder())
+    {
+        return 0;
+    }
     return block->isPrimary() ? 0 : 1;
 }
 
@@ -47,7 +52,7 @@ SizeType32 getPriorityIdx(executor::RetentionPriority priority)
 }
 } // namespace
 
-void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
+void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> blocksPerCacheLevel,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
 {
     SizeType32 startIdx = 0;
@@ -57,20 +62,20 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
     // For each cache level, create a separate list of queues.
     for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
     {
-        mFreeBlockIterators.reserve(mFreeBlockIterators.size() + sizes[cacheLevel]);
+        mFreeBlockIterators.reserve(mFreeBlockIterators.size() + blocksPerCacheLevel[cacheLevel]);
         mFreeQueues.emplace_back(std::vector<FreeBlocksQueue>(kMaxPriority - kMinPriority + 1));
 
         auto& freeQueue = mFreeQueues[cacheLevel][defaultPriorityIdx];
 
-        for (SizeType32 blockId = 0; blockId < sizes[cacheLevel]; blockId++)
+        for (SizeType32 blockId = 0; blockId < blocksPerCacheLevel[cacheLevel]; blockId++)
         {
             // Initialize all blocks to be the default priority level
             mFreeBlockIterators.emplace_back(freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]));
         }
 
-        startIdx += sizes[cacheLevel];
+        startIdx += blocksPerCacheLevel[cacheLevel];
     }
-    mNumFreeBlocksPerLevel = sizes;
+    mNumFreeBlocksPerLevel = blocksPerCacheLevel;
 
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultSecondaryOffloadMinPriority);
 }
@@ -78,7 +83,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
 bool LRUEvictionPolicy::verifyQueueIntegrity()
 {
     bool queueCompromised = false;
-    for (SizeType32 cacheLevel = 0; cacheLevel < 2; cacheLevel++)
+    for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
     {
         for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
         {
@@ -103,8 +108,11 @@ bool LRUEvictionPolicy::verifyQueueIntegrity()
     return !queueCompromised;
 }
 
-std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel)
+std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
+    TLLM_CHECK_WITH_INFO(!wantPlaceholder,
+        "LRUEvictionPolicy does not manage placeholder blocks. Use MaybePlaceholderLRUEvictionPolicy.");
+
     for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
     {
         // Find the first non-empty queue, and return the first block.
@@ -134,20 +142,18 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     TLLM_CHECK_WITH_INFO(
         block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
         "Attempted to release the cached-blocks root into the eviction queue");
-    // Placeholder blocks have no physical GPU memory and must never enter the eviction queue.
-    TLLM_CHECK_WITH_INFO(!block->isPlaceholder(), "Attempted to release a placeholder block into the eviction queue");
     SizeType32 const cacheLevel = getCacheLevel(block);
-    SizeType32 const id = block->getBlockId();
+    SizeType32 const idx = blockIdx(block->getBlockId());
 
     // If there are no children, this is a leaf block. Insert into a queue.
     auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
     if (toFront)
     {
-        mFreeBlockIterators[id] = q.insert(q.begin(), block);
+        mFreeBlockIterators[idx] = q.insert(q.begin(), block);
     }
     else
     {
-        mFreeBlockIterators[id] = q.insert(q.end(), block);
+        mFreeBlockIterators[idx] = q.insert(q.end(), block);
     }
 
     mNumFreeBlocksPerLevel[cacheLevel]++;
@@ -174,16 +180,16 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block)
 void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
     std::optional<std::chrono::milliseconds> durationMs)
 {
-    SizeType32 const id = block->getBlockId();
+    SizeType32 const idx = blockIdx(block->getBlockId());
     SizeType32 const cacheLevel = getCacheLevel(block);
 
-    if (mFreeBlockIterators[id] != std::nullopt)
+    if (mFreeBlockIterators[idx] != std::nullopt)
     {
-        mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
+        mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[idx]);
         mNumFreeBlocksPerLevel[cacheLevel] -= 1;
     }
 
-    mFreeBlockIterators[id] = std::nullopt;
+    mFreeBlockIterators[idx] = std::nullopt;
 
     if (priority.has_value())
     {
@@ -209,20 +215,132 @@ void LRUEvictionPolicy::refresh()
             break;
         }
 
-        auto const id = block->getBlockId();
+        auto const idx = blockIdx(block->getBlockId());
         auto const level = getCacheLevel(block);
 
         mExpiringBlockHeap.erase(mExpiringBlockHeap.begin());
 
-        if (mFreeBlockIterators[id] != std::nullopt)
+        if (mFreeBlockIterators[idx] != std::nullopt)
         {
             // This is already in another queue. Delete it, and bring it down to the default queue
-            mFreeQueues[level][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
+            mFreeQueues[level][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[idx]);
             auto& q = mFreeQueues[level][getPriorityIdx(kDefaultPriority)];
-            mFreeBlockIterators[id] = q.insert(q.end(), block);
+            mFreeBlockIterators[idx] = q.insert(q.end(), block);
         }
         block->setPriority(kDefaultPriority);
     }
+}
+
+// ---- PlaceholderInnerLRUEvictionPolicy ----
+// Manages pre-allocated placeholder blocks (with negative IDs starting at -2) via the standard queue
+// system. Overrides blockIdx() to map negative IDs to 0-based queue indices.
+namespace
+{
+class PlaceholderInnerLRUEvictionPolicy : public LRUEvictionPolicy
+{
+protected:
+    SizeType32 blockIdx(KVCacheBlock::IdType blockId) const override
+    {
+        // blockId is negative: -2 → 0, -3 → 1, ...
+        TLLM_CHECK_WITH_INFO(blockId < -1, "PlaceholderInnerLRUEvictionPolicy expects blockId < -1, got %d", blockId);
+        return -blockId - 2;
+    }
+
+public:
+    bool verifyQueueIntegrity() override
+    {
+        bool queueCompromised = false;
+        for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
+        {
+            for (auto const& block : mFreeQueues[kPrimaryLevel][level])
+            {
+                if (!block->isPlaceholder())
+                {
+                    TLLM_LOG_WARNING("Found non-placeholder block (id %d) in PlaceholderInnerLRUEvictionPolicy",
+                        block->getBlockId());
+                    queueCompromised = true;
+                }
+                if (block->hasRefs())
+                {
+                    TLLM_LOG_WARNING(
+                        "Found placeholder block (id %d) with references in placeholder policy", block->getBlockId());
+                    queueCompromised = true;
+                }
+            }
+        }
+        return !queueCompromised;
+    }
+};
+} // anonymous namespace
+
+// ---- MaybePlaceholderLRUEvictionPolicy ----
+
+void MaybePlaceholderLRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById,
+    SizeType32 numPlaceholderBlocks, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
+{
+    mPlaceholderEvictionPolicy = std::make_shared<PlaceholderInnerLRUEvictionPolicy>();
+
+    // Extract the actual placeholder blocks from allPlaceholderBlocksById[2..numPlaceholderBlocks+1]
+    // so the inner policy's mFreeBlockIterators[i] corresponds to blockId = -(i+2).
+    std::vector<BlockPtr> placeholderBlocks(
+        allPlaceholderBlocksById.begin() + 2, allPlaceholderBlocksById.begin() + numPlaceholderBlocks + 2);
+
+    mPlaceholderEvictionPolicy->initialize(placeholderBlocks, {numPlaceholderBlocks, 0}, secondaryOffloadMinPriority);
+}
+
+std::tuple<BlockPtr, bool> MaybePlaceholderLRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
+{
+    if (wantPlaceholder)
+    {
+        TLLM_CHECK_WITH_INFO(mPlaceholderEvictionPolicy != nullptr,
+            "Placeholder eviction policy not initialized. Call initializePlaceholders() first.");
+        return mPlaceholderEvictionPolicy->getFreeBlock(kPrimaryLevel);
+    }
+    return LRUEvictionPolicy::getFreeBlock(cacheLevel);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
+{
+    if (block->isPlaceholder())
+    {
+        TLLM_CHECK_WITH_INFO(mPlaceholderEvictionPolicy != nullptr,
+            "Placeholder eviction policy not initialized. Call initializePlaceholders() first.");
+        mPlaceholderEvictionPolicy->releaseBlock(block, toFront);
+        return;
+    }
+    LRUEvictionPolicy::releaseBlock(block, toFront);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+    std::optional<std::chrono::milliseconds> durationMs)
+{
+    if (block->isPlaceholder())
+    {
+        TLLM_CHECK_WITH_INFO(mPlaceholderEvictionPolicy != nullptr,
+            "Placeholder eviction policy not initialized. Call initializePlaceholders() first.");
+        mPlaceholderEvictionPolicy->claimBlock(block, priority, durationMs);
+        return;
+    }
+    LRUEvictionPolicy::claimBlock(block, priority, durationMs);
+}
+
+void MaybePlaceholderLRUEvictionPolicy::refresh()
+{
+    LRUEvictionPolicy::refresh();
+    if (mPlaceholderEvictionPolicy)
+    {
+        mPlaceholderEvictionPolicy->refresh();
+    }
+}
+
+bool MaybePlaceholderLRUEvictionPolicy::verifyQueueIntegrity()
+{
+    bool ok = LRUEvictionPolicy::verifyQueueIntegrity();
+    if (mPlaceholderEvictionPolicy)
+    {
+        ok = mPlaceholderEvictionPolicy->verifyQueueIntegrity() && ok;
+    }
+    return ok;
 }
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy

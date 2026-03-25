@@ -111,11 +111,33 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         // Iterate over all pools, partial-copy logic
         for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
         {
+            auto const& pool = pools[poolIdx];
+
+            // For layer-first layout pools, block data is non-contiguous across layers.
+            // Copy each layer's block data separately.
+            if (pool.layerFirstLayout)
+            {
+                auto srcPool = src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
+                auto dstPool = dst->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
+                auto const srcBlockIdx = static_cast<tr::ITensor::DimType64>(src->getMemoryPoolBlockIndex());
+                auto const dstBlockIdx = static_cast<tr::ITensor::DimType64>(dst->getMemoryPoolBlockIndex());
+
+                for (SizeType32 layerIdx = 0; layerIdx < pool.numLayers; ++layerIdx)
+                {
+                    // pool shape: {numLayers, numBlocks, kvFactor, blockSize}
+                    // slice at {layerIdx, blockIdx} gives {1, kvFactor, blockSize}
+                    auto srcBlock = tr::ITensor::slice(srcPool, {layerIdx, srcBlockIdx}, 1);
+                    auto dstBlock = tr::ITensor::slice(dstPool, {layerIdx, dstBlockIdx}, 1);
+                    (isOffload ? mOffloadManager : mOnboardManager).copy(*srcBlock, *dstBlock);
+                }
+                continue;
+            }
+
             auto srcPtr = computeBlockPointer(src, pools, poolIdx);
             auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
 
             // Does it contain block scales?
-            auto containsBlockScales = pools[poolIdx].containsBlockScales;
+            auto containsBlockScales = pool.containsBlockScales;
 
             // If no partial tokens or if the dataType is not supported for partial copy, copy entire block.
             // Note that nvfp4 kv cache SFs use an interleaved layout, so we need to copy the entire block.
@@ -128,7 +150,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             }
             else
             {
-                int const tokensPerBlock = pools[poolIdx].tokensPerBlock;
+                int const tokensPerBlock = pool.tokensPerBlock;
                 if (numTokensToCopy >= tokensPerBlock)
                 {
                     // If requested tokens >= entire block, just do a full copy.
@@ -137,10 +159,10 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 else
                 {
                     auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
-                    int const numLayers = pools[poolIdx].numLayers;
-                    int const kvFactor = pools[poolIdx].kvFactor;
-                    int const numHeads = pools[poolIdx].numKvHeads;
-                    int const sizePerHead = pools[poolIdx].sizePerHead;
+                    int const numLayers = pool.numLayers;
+                    int const kvFactor = pool.kvFactor;
+                    int const numHeads = pool.numKvHeads;
+                    int const sizePerHead = pool.sizePerHead;
                     auto shape = srcPtr->getShape();
 
                     TLLM_CHECK_WITH_INFO(
@@ -161,6 +183,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
+        TLLM_CHECK_WITH_INFO(!pools[poolIdx].layerFirstLayout,
+            "File-based offload/onboard is not supported for layer-first layout pools");
         auto ptr = isOffload ? computeBlockPointer(src, pools, poolIdx) : computeBlockPointer(dst, pools, poolIdx);
         auto block_id = src->getBlockId();
 

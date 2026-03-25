@@ -33,13 +33,14 @@ public:
 
     // TODO(TRTLLM-1564): Don't use a separate `initialize` function. Ensure eviction policies can't be in-between a
     // state of construction and initialization.
-    virtual void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
+    virtual void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> blocksPerCacheLevel,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
         = 0;
 
     /// @brief Get a free block from the specified cache level
     /// @returns The pointer to the free block, along with whether it can be offloaded
-    virtual std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel) = 0;
+    /// @param wantPlaceholder If true, return a placeholder block instead of a normal block
+    virtual std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
     /// @brief Release a block. Prioritize the block for eviction if toFront=true
     virtual void releaseBlock(BlockPtr block) = 0;
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
@@ -70,9 +71,9 @@ struct ExpiringBlockComparator
 class LRUEvictionPolicy : public BaseEvictionPolicy
 {
 public:
-    void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
+    void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> blocksPerCacheLevel,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority) override;
-    std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel) override;
+    std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
 
     void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;
@@ -91,7 +92,15 @@ public:
 
     bool verifyQueueIntegrity() override;
 
-private:
+protected:
+    /// @brief Map a block ID to the index into mFreeBlockIterators.
+    /// Default: identity (block IDs are 0-based non-negative integers).
+    /// Override for policies managing blocks with non-standard IDs (e.g. negative placeholder IDs).
+    virtual SizeType32 blockIdx(KVCacheBlock::IdType blockId) const
+    {
+        return blockId;
+    }
+
     // Queues of available leaf blocks, split by cache level and priority level
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
     // Iterators to block entries in mFreeQueues
@@ -102,6 +111,37 @@ private:
     executor::RetentionPriority mSecondaryOffloadMinPriority;
     // Heap of block times
     std::set<BlockPtr, ExpiringBlockComparator> mExpiringBlockHeap;
+};
+
+/// @brief Extends LRUEvictionPolicy to manage pre-allocated placeholder blocks via a dedicated inner
+/// LRUEvictionPolicy (mPlaceholderEvictionPolicy). Placeholder blocks have negative IDs starting at -2.
+/// Normal block operations are delegated to the base LRUEvictionPolicy; placeholder block operations
+/// are delegated to mPlaceholderEvictionPolicy.
+class MaybePlaceholderLRUEvictionPolicy : public LRUEvictionPolicy
+{
+public:
+    /// @brief Initialize the placeholder eviction policy with pre-allocated placeholder blocks.
+    /// @param allPlaceholderBlocksById Vector of placeholder blocks indexed by abs(blockId).
+    ///        Indices 0 and 1 are unused (nullptr); index abs(blockId) holds the block with that ID.
+    /// @param numPlaceholderBlocks Number of placeholder blocks (determines valid index range [2,
+    /// numPlaceholderBlocks+1]).
+    /// @param secondaryOffloadMinPriority Secondary offload priority threshold (passed to inner policy).
+    void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById, SizeType32 numPlaceholderBlocks,
+        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority);
+
+    std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
+
+    void releaseBlock(BlockPtr block, bool toFront) override;
+
+    void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+        std::optional<std::chrono::milliseconds> durationMs) override;
+
+    void refresh() override;
+
+    bool verifyQueueIntegrity() override;
+
+private:
+    std::shared_ptr<LRUEvictionPolicy> mPlaceholderEvictionPolicy;
 };
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy
