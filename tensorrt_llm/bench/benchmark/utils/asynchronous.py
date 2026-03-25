@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
@@ -63,6 +64,7 @@ class LlmManager:
                                       sampling_params: SamplingParams,
                                       post_proc_params: PostprocParams):
         self.request_seen.set()
+        sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
 
         async with semaphore_guard(self._concurrency_semaphore):
@@ -111,6 +113,7 @@ class LlmManager:
         slot so that the conversation history stays consistent.
         """
         self.request_seen.set()
+        sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
         tokenizer = self.tokenizer
 
