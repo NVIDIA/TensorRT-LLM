@@ -459,6 +459,11 @@ class _TrtllmMLAPlanner:
 _GlobalTrtllmMLAPlanner = _TrtllmMLAPlanner()
 
 
+def set_mla_skip_attention(skip: bool) -> None:
+    """Set/clear the skip_attention flag on the global MLA planner."""
+    _GlobalTrtllmMLAPlanner.skip_attention = skip
+
+
 def set_mla_kv_cache_manager(kv_cache_manager) -> None:
     """Set the KVCacheManager on the global MLA planner.
 
@@ -756,78 +761,114 @@ def _handle_prefill_thop(
     """
     dtype = q_nope_flat.dtype
     device = q_nope_flat.device
+    planner = _GlobalTrtllmMLAPlanner
+    gen_head_size = kv_lora_rank + qk_rope_head_dim  # 576
 
-    q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
-
-    # Cast FP8 weights to compute dtype (FP8 checkpoints store kv_b_proj in FP8).
-    w = (
-        kv_b_proj_weight.to(dtype)
-        if kv_b_proj_weight.dtype == torch.float8_e4m3fn
-        else kv_b_proj_weight
-    )
-    kv = torch.nn.functional.linear(compressed_kv_flat, w)
-    kv = kv.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
-    k_nope = kv[:, :, :qk_nope_head_dim]
-    v = kv[:, :, qk_nope_head_dim:].contiguous().view(num_tokens, num_heads * v_head_dim)
-
-    kpe_expanded = kpe_flat.view(num_tokens, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
-    k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
-
+    # Final output: [num_tokens, num_heads * v_head_dim]
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
     # Skip during CUDA graph capture, resize forward, or warmup.
     if (
         torch.cuda.is_current_stream_capturing()
-        or _GlobalTrtllmMLAPlanner.skip_attention
+        or planner.skip_attention
         or cuda_graph_state.in_warm_up()
     ):
         return output
 
-    # BUG: thop.attention context MLA cache write crashes with illegal memory
-    # access. The FMHA attention computation itself works (confirmed with
-    # update_kv_cache=False), but the cache write path is incompatible with
-    # AD's block offset encoding for MLA kv_factor=1 paged cache.
-    # See trtllm_mla_prefill_cache_write_bug.md for full analysis.
-    _call_thop_attention_mla(
-        q,
-        k,
-        v,
-        output,
-        latent_cache,
-        None,
-        False,  # is_fused_qkv
-        1,  # attention_input_type = context_only
+    # The C++ MLA kernel outputs in latent space: [num_tokens, num_heads * kv_lora_rank].
+    # We project through v_b_proj afterwards to get [num_tokens, num_heads * v_head_dim].
+    attn_out_latent = torch.empty(num_tokens, num_heads * kv_lora_rank, dtype=dtype, device=device)
+
+    # Cast FP8 weights to compute dtype (FP8 checkpoints store kv_b_proj in FP8).
+    ptr = kv_b_proj_weight.data_ptr()
+    cached = planner._per_layer_pool_ptrs.get(("w_kn_ctx", ptr))
+    if cached is not None:
+        w_kn = cached
+    else:
+        w = (
+            kv_b_proj_weight.to(dtype)
+            if kv_b_proj_weight.dtype == torch.float8_e4m3fn
+            else kv_b_proj_weight
+        )
+        weight_reshaped = w.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+        w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
+        planner._per_layer_pool_ptrs[("w_kn_ctx", ptr)] = w_kn
+
+    # Build fused_q = [q_absorbed, 0] with shape [num_tokens, num_heads, 576].
+    # q_pe is passed separately (the C++ kernel applies RoPE to it internally).
+    # Matches PT backend's context path (attention.py lines 2346-2389).
+    q_nope_3d = q_nope_flat.view(num_tokens, num_heads, qk_nope_head_dim)
+    fused_q = torch.empty(num_tokens, num_heads, gen_head_size, dtype=dtype, device=device)
+    q_absorbed = torch.bmm(q_nope_3d.transpose(0, 1), w_kn)  # [num_heads, num_tokens, kv_lora_rank]
+    fused_q[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
+    # q_pe portion left for the C++ kernel to fill via RoPE (position_embedding_type=2)
+    # Leave q_pe portion zeroed — the wrapper's C++ kernel applies RoPE internally
+    # (PositionEmbeddingType.yarn). Embedding pre-RoPE'd q_pe would double-apply.
+    # The kernel reads q_pe from latent_cache's kpe portion instead.
+    fused_q_flat = fused_q.view(num_tokens, num_heads * gen_head_size)
+
+    # MLA context via TrtllmAttentionWrapper: same wrapper as decode (head_size=576,
+    # num_kv_heads=1). The wrapper manages the C++ AttentionOp lifecycle via plan()/run().
+    wrapper = planner.get_or_create_wrapper(
+        layer_idx,
         num_heads,
-        num_kv_heads,  # 1 — matches kv_factor=1 cache layout
-        qk_head_dim,  # head_size = 192
-        tokens_per_block,
-        max_num_requests,
-        max_context_length,
-        1.0,  # q_scaling
-        quant_mode,
         kv_lora_rank,
         qk_nope_head_dim,
         qk_rope_head_dim,
         v_head_dim,
-        sequence_length,
-        context_lengths,
-        host_past_kv_lengths,
-        host_context_lengths,
-        host_request_types,
-        host_total_kv_lens,
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        position_embedding_type=2,
-        rotary_embedding_dim=qk_rope_head_dim,
-        rotary_cos_sin=_GlobalTrtllmMLAPlanner.get_or_create_rotary_cos_sin(
-            max_context_length,
-            qk_rope_head_dim,
-            10000.0,
-            q.device,
-        ),
-        layer_idx=layer_idx,
     )
+    wrapper.plan(
+        layer_idx=layer_idx,
+        tokens_per_block=tokens_per_block,
+        max_num_requests=max_num_requests,
+        max_sequence_length=max_context_length,
+        max_context_length=max_context_length,
+        beam_width=1,
+        sequence_length=sequence_length,
+        context_lengths=context_lengths,
+        host_past_key_value_lengths=host_past_kv_lengths,
+        host_total_kv_lens=host_total_kv_lens,
+        host_context_lengths=host_context_lengths,
+        host_request_types=host_request_types,
+        kv_cache_block_offsets=kv_cache_block_offsets,
+        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+        block_ids_per_seq=planner.block_ids_per_seq,
+        latent_cache=latent_cache,
+        workspace=planner.workspace,
+        use_paged_context_fmha=False,
+        attention_input_type=AttentionInputType.context_only,
+        kv_scale_orig_quant=planner.kv_scale_orig_quant,
+        kv_scale_quant_orig=planner.kv_scale_quant_orig,
+        kv_cache_manager=planner.kv_cache_manager,
+    )
+    wrapper.run(
+        q=fused_q_flat,
+        output=attn_out_latent,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+    )
+
+    # Project from latent space to V space: attn_out_latent @ v_b_proj → output.
+    # v_b_proj = kv_b_proj_weight[num_heads, qk_nope_head_dim:, :] transposed.
+    cached_vt = planner._per_layer_pool_ptrs.get(("w_v_t_ctx", ptr))
+    if cached_vt is not None:
+        w_v_t = cached_vt
+    else:
+        w_full = (
+            kv_b_proj_weight.to(dtype)
+            if kv_b_proj_weight.dtype == torch.float8_e4m3fn
+            else kv_b_proj_weight
+        )
+        w_reshaped = w_full.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+        w_v_t = w_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
+        planner._per_layer_pool_ptrs[("w_v_t_ctx", ptr)] = w_v_t
+
+    # [num_heads, num_tokens, kv_lora_rank] @ [num_heads, kv_lora_rank, v_head_dim]
+    # → [num_heads, num_tokens, v_head_dim]
+    latent_3d = attn_out_latent.view(num_tokens, num_heads, kv_lora_rank).transpose(0, 1)
+    output_3d = output.view(num_tokens, num_heads, v_head_dim).transpose(0, 1)
+    torch.bmm(latent_3d, w_v_t, out=output_3d)
 
     return output
 

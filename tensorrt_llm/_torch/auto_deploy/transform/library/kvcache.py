@@ -283,10 +283,10 @@ class ResizeKVCache(BaseTransform):
         # for the synthetic batch, causing out-of-bounds KV cache writes).
         try:
             from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import (
-                _GlobalTrtllmMLAPlanner,
+                set_mla_skip_attention,
             )
 
-            _GlobalTrtllmMLAPlanner.skip_attention = True
+            set_mla_skip_attention(True)
         except Exception:
             pass
 
@@ -310,7 +310,7 @@ class ResizeKVCache(BaseTransform):
 
         # Re-enable MLA attention after resize forward.
         try:
-            _GlobalTrtllmMLAPlanner.skip_attention = False
+            set_mla_skip_attention(False)
         except Exception:
             pass
 
