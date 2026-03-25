@@ -201,18 +201,20 @@ class _TrtllmMLAPlanner:
         q_lora_rank = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
 
         if for_context:
-            # Context wrapper: standard QKV dimensions (matches PT's self.mha)
+            # Context wrapper: same latent dimensions as decode (head_size=576,
+            # num_kv_heads=1) but with a separate C++ AttentionOp instance so
+            # context_only and generation_only modes don't conflict.
             mla_params = MLAParams(
                 q_lora_rank=q_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
-                v_head_dim=v_head_dim,
+                v_head_dim=kv_lora_rank,
             )
             w = TrtllmAttentionWrapper(
                 num_heads=num_heads,
-                head_size=qk_nope_head_dim + qk_rope_head_dim,
-                num_kv_heads=num_heads,
+                head_size=kv_lora_rank + qk_rope_head_dim,
+                num_kv_heads=1,
                 pos_embd_params=pos_embd_params,
                 q_scaling=1.0,
                 mla_params=mla_params,
@@ -768,11 +770,7 @@ def _handle_prefill_thop(
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
     # Skip during CUDA graph capture, resize forward, or warmup.
-    if (
-        torch.cuda.is_current_stream_capturing()
-        or planner.skip_attention
-        or cuda_graph_state.in_warm_up()
-    ):
+    if torch.cuda.is_current_stream_capturing() or planner.skip_attention:
         return output
 
     # The C++ MLA kernel outputs in latent space: [num_tokens, num_heads * kv_lora_rank].
@@ -801,52 +799,46 @@ def _handle_prefill_thop(
     fused_q = torch.empty(num_tokens, num_heads, gen_head_size, dtype=dtype, device=device)
     q_absorbed = torch.bmm(q_nope_3d.transpose(0, 1), w_kn)  # [num_heads, num_tokens, kv_lora_rank]
     fused_q[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
-    # q_pe portion left for the C++ kernel to fill via RoPE (position_embedding_type=2)
-    # Leave q_pe portion zeroed — the wrapper's C++ kernel applies RoPE internally
-    # (PositionEmbeddingType.yarn). Embedding pre-RoPE'd q_pe would double-apply.
-    # The kernel reads q_pe from latent_cache's kpe portion instead.
+    # q_pe is passed separately via wrapper.plan(q_pe=...), NOT embedded in fused_q.
+    # The C++ kernel's invokeMLARopeGeneration reads q_pe from the separate tensor
+    # and applies RoPE. This matches the PT backend when apply_rotary_emb=False
+    # (fused rope path, attention.py L2385-2386).
     fused_q_flat = fused_q.view(num_tokens, num_heads * gen_head_size)
 
-    # MLA context via TrtllmAttentionWrapper: same wrapper as decode (head_size=576,
-    # num_kv_heads=1). The wrapper manages the C++ AttentionOp lifecycle via plan()/run().
-    wrapper = planner.get_or_create_wrapper(
-        layer_idx,
+    # MLA context via _call_thop_attention_mla with layer_idx+1000 to get a
+    # separate C++ AttentionOp (decode's op is initialized during CUDA graph
+    # capture and can't switch to context_only mode).
+    _call_thop_attention_mla(
+        fused_q_flat,
+        None,  # k
+        None,  # v
+        attn_out_latent,
+        latent_cache,
+        q_pe_flat.view(num_tokens, num_heads * qk_rope_head_dim),
+        True,  # is_fused_qkv
+        1,  # attention_input_type = context_only
         num_heads,
+        num_kv_heads,  # 1
+        gen_head_size,  # 576
+        tokens_per_block,
+        max_num_requests,
+        max_context_length,
+        1.0,
+        quant_mode,
         kv_lora_rank,
         qk_nope_head_dim,
         qk_rope_head_dim,
-        v_head_dim,
-    )
-    wrapper.plan(
-        layer_idx=layer_idx,
-        tokens_per_block=tokens_per_block,
-        max_num_requests=max_num_requests,
-        max_sequence_length=max_context_length,
-        max_context_length=max_context_length,
-        beam_width=1,
-        sequence_length=sequence_length,
-        context_lengths=context_lengths,
-        host_past_key_value_lengths=host_past_kv_lengths,
-        host_total_kv_lens=host_total_kv_lens,
-        host_context_lengths=host_context_lengths,
-        host_request_types=host_request_types,
-        kv_cache_block_offsets=kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-        block_ids_per_seq=planner.block_ids_per_seq,
-        latent_cache=latent_cache,
-        workspace=planner.workspace,
-        use_paged_context_fmha=False,
-        attention_input_type=AttentionInputType.context_only,
-        kv_scale_orig_quant=planner.kv_scale_orig_quant,
-        kv_scale_quant_orig=planner.kv_scale_quant_orig,
-        kv_cache_manager=planner.kv_cache_manager,
-    )
-    wrapper.run(
-        q=fused_q_flat,
-        output=attn_out_latent,
-        is_fused_qkv=True,
-        update_kv_cache=True,
+        kv_lora_rank,  # v_head_dim in latent space
+        sequence_length,
+        context_lengths,
+        host_past_kv_lengths,
+        host_context_lengths,
+        host_request_types,
+        host_total_kv_lens,
+        kv_cache_block_offsets,
+        host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping,
+        layer_idx=layer_idx + 1000,  # separate AttentionOp from decode
     )
 
     # Project from latent space to V space: attn_out_latent @ v_b_proj → output.
