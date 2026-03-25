@@ -2162,6 +2162,8 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     if enable_chunked_prefill:
         llm_args_extra["enable_chunked_prefill"] = True
         llm_args_extra["max_num_tokens"] = 32
+    else:
+        llm_args_extra["enable_chunked_prefill"] = False
 
     if pytorch_backend:
         llm_args_extra.update(
@@ -2310,6 +2312,8 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     if enable_chunked_prefill:
         llm_args_extra["enable_chunked_prefill"] = True
         llm_args_extra["max_num_tokens"] = 32
+    else:
+        llm_args_extra["enable_chunked_prefill"] = False
 
     if pytorch_backend:
         llm_args_extra.update(
