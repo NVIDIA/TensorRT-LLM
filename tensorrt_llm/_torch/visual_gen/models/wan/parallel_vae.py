@@ -2,7 +2,9 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock, WanCausalConv3d
+from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
 from tensorrt_llm._torch.visual_gen.modules.vae import (
     HaloExchangeConv,
@@ -49,18 +51,25 @@ class ParallelVAE_Wan(ParallelVAEBase):
     # encode / decode
     # ------------------------------------------------------------------
 
-    def _encode_impl(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _encode_impl(self, x: torch.Tensor, **kwargs):
+        return_dict = kwargs.pop("return_dict", True)
         x_local, _ = self._split_tensor(x)
-        z_local = self.vae_backend.encode(x_local, **kwargs)
-        if isinstance(z_local, (tuple, list)):
-            z_local = z_local[0]
-        return self._gather_tensor(z_local)
+        posterior_local = self.vae_backend.encode(x_local, return_dict=False, **kwargs)[0]
+        params_gathered = self._gather_tensor(posterior_local.parameters)
+        dist = DiagonalGaussianDistribution(params_gathered)
+        if not return_dict:
+            return (dist,)
+        return AutoencoderKLOutput(latent_dist=dist)
 
-    def _decode_impl(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _decode_impl(self, z: torch.Tensor, **kwargs):
+        return_dict = kwargs.pop("return_dict", True)
         z_local, _ = self._split_tensor(z)
-        out = self.vae_backend.decode(z_local, **kwargs)
-        x_local = out[0] if isinstance(out, (tuple, list)) else out
-        return self._gather_tensor(x_local)
+        sample = self._gather_tensor(
+            self.vae_backend.decode(z_local, return_dict=False, **kwargs)[0]
+        )
+        if not return_dict:
+            return (sample,)
+        return DecoderOutput(sample=sample)
 
     # ------------------------------------------------------------------
     # Module parallelisation
