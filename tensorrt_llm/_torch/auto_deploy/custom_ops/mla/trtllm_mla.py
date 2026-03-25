@@ -779,6 +779,8 @@ def _handle_prefill_thop(
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
     # Skip during CUDA graph capture, resize forward, or warmup.
+    # Skip during CUDA graph capture or resize forward.
+    # During warmup, we still run to initialize the C++ AttentionOp (workspace alloc).
     if torch.cuda.is_current_stream_capturing() or planner.skip_attention:
         return output
 
@@ -1012,9 +1014,18 @@ def _handle_decode_impl(
         w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
         planner._per_layer_pool_ptrs[("w_kn_v_t", ptr)] = (w_kn, w_v_t)
 
-    # Pre-create wrapper during warmup so it exists for CUDA graph capture.
-    # TrtllmAttentionWrapper.__init__ allocates GPU tensors (rotary_cos_sin, etc.)
-    # which is forbidden during capture.
+    # Pre-create BOTH decode and context wrappers during warmup so they exist
+    # for CUDA graph capture. TrtllmAttentionWrapper.__init__ allocates GPU tensors
+    # (rotary_cos_sin, etc.) which is forbidden during capture.
+    planner.get_or_create_wrapper(
+        layer_idx,
+        num_heads,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        for_context=True,
+    )
     wrapper = planner.get_or_create_wrapper(
         layer_idx,
         num_heads,
