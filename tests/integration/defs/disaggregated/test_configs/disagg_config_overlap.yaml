@@ -11,9 +11,8 @@ context_servers:
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
-    enable_block_reuse: false
+    enable_block_reuse: true
     free_gpu_memory_fraction: 0.2
-    enable_partial_reuse: false
   cache_transceiver_config:
     backend: DEFAULT
 generation_servers:
@@ -24,8 +23,7 @@ generation_servers:
   max_num_tokens: 4096
   max_seq_len: 4096
   kv_cache_config:
-    enable_block_reuse: false
+    enable_block_reuse: true
     free_gpu_memory_fraction: 0.2
-    enable_partial_reuse: false
   cache_transceiver_config:
     backend: DEFAULT
