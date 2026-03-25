@@ -350,10 +350,9 @@ class Sender(SenderBase):
         # NOTE: TransferRequest moves (not copies) src/dst MemoryDescs internally.
         # After this call, src_memory_descs and dst_memory_descs are in a moved-from
         # state and must NOT be accessed again.
-        request = TransferRequest(
+        return TransferRequest(
             TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
         )
-        return request
 
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
