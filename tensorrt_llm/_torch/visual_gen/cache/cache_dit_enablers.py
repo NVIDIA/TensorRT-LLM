@@ -229,7 +229,7 @@ def enable_cache_dit_for_flux(
     *,
     is_flux2: bool,
 ) -> CacheDiTEnableResult:
-    """FLUX.1 / FLUX.2: BlockAdapter over joint + single transformer blocks with variant-specific patterns."""
+    """Cache-DiT BlockAdapter for FLUX.1 / FLUX.2."""
     import cache_dit
     from cache_dit import BlockAdapter, ForwardPattern, ParamsModifier
 
@@ -246,22 +246,27 @@ def enable_cache_dit_for_flux(
     else:
         modifier = ParamsModifier(cache_config=db_cfg)
 
-    # FLUX.1: joint + single blocks both Pattern_1; FLUX.2: Pattern_1 on joint, Pattern_2 on single.
     if is_flux2:
-        forward_pattern = [ForwardPattern.Pattern_1, ForwardPattern.Pattern_2]
+        block_lists = [
+            pipeline.transformer.transformer_blocks,
+            pipeline.transformer.single_transformer_blocks,
+        ]
+        forward_pattern = [ForwardPattern.Pattern_1, ForwardPattern.Pattern_3]
         tag = "FLUX.2"
     else:
+        block_lists = [
+            pipeline.transformer.transformer_blocks,
+            pipeline.transformer.single_transformer_blocks,
+        ]
         forward_pattern = [ForwardPattern.Pattern_1, ForwardPattern.Pattern_1]
         tag = "FLUX.1"
 
     adapter = BlockAdapter(
         transformer=pipeline.transformer,
-        blocks=[
-            pipeline.transformer.transformer_blocks,
-            pipeline.transformer.single_transformer_blocks,
-        ],
+        blocks=block_lists,
         forward_pattern=forward_pattern,
         params_modifiers=[modifier],
+        check_forward_pattern=True,
     )
 
     logger.info(
@@ -269,10 +274,10 @@ def enable_cache_dit_for_flux(
         f"W={db_cfg.max_warmup_steps}",
     )
 
-    # Pass BlockAdapter directly to enable_cache (not a length-1 tuple).
     disable_target = cache_dit.enable_cache(
         adapter,
         cache_config=db_cfg,
+        calibrator_config=calibrator,
     )
 
     def refresh_flux(num_inference_steps: int) -> None:
