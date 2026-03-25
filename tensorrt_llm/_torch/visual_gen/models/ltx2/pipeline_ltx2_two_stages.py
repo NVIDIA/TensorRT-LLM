@@ -630,10 +630,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         video_latents = out.video  # (B, C, F_lat, H_lat_s1, W_lat_s1)
         audio_latents = out.audio  # (B, C, F_aud, M) or None
 
-        # Non-primary CFG-parallel workers (rank != 0) receive None from
-        # decode_latents.  Stage-2 operations are local-only (no cross-rank
-        # collectives with ulysses_size=1), so non-primary workers can exit
-        # here safely while rank 0 continues with the real latents.
+        # Non-primary workers (rank != 0) receive None from
+        # decode_latents and exit here.  Rank 0 continues with Stage 2.
         if video_latents is None:
             return MediaOutput(video=None, audio=None)
 
@@ -658,6 +656,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         )
         logger.info(f"Merged distilled LoRA ({n} params) for stage 2")
 
+        # Disable Ulysses for Stage 2: only rank 0 is active, so
+        # cross-rank collectives in the attention backend would hang.
+        self.transformer.set_ulysses_enabled(False)
         try:
             video_latents, audio_latents = self._refinement_denoise(
                 video_latents=video_latents,
@@ -673,6 +674,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 image_cond_strength=image_cond_strength,
             )
         finally:
+            self.transformer.set_ulysses_enabled(True)
             if saved_quant_state:
                 _restore_lora_state(self.transformer, saved_quant_state)
             else:
