@@ -39,6 +39,8 @@ from .softplus import softplus
 })
 @triton.heuristics(
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics(
+    {"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.jit()
 def _incremental_selective_scan_update_kernel(
     # Pointers to matrices
@@ -117,6 +119,7 @@ def _incremental_selective_scan_update_kernel(
     LAUNCH_WITH_PDL: tl.constexpr,
     FAST_FORWARD_REPLAY: tl.constexpr,
     CB_OUTPUT: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -227,86 +230,105 @@ def _incremental_selective_scan_update_kernel(
     # Phase 2: Process new tokens and compute outputs.
     # ===================================================================
     if CB_OUTPUT:
-        # CB formulation: avoid maintaining (M, dstate) state across T iterations.
+        # CB formulation using tl.dot for the C·B^T matrix multiply.
         #
         #   out_t[m] = exp(A * cumdt_t) * (C_t · state_0)[m]
         #            + Σ_{j≤t} CB[t,j] * decay(j→t) * dt_j * x_j[m]
         #
-        # where CB[t,j] = C_t · B_j is a scalar dot product over dstate.
-        #
-        # Pass 1: Load and cache x, dt, B to old_* buffers + process dt values.
-        # Values stay warm in L1 cache for pass 2.
-        cumAdt = 0.0
-        for t in range(T):
-            x_t = tl.load(x_ptr + t * stride_x_T + offs_m * stride_x_dim,
-                          mask=offs_m < dim, other=0.0)
-            tl.store(old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim,
-                     x_t, mask=offs_m < dim)
+        # CB = C_all @ B_all^T computed via tl.dot (single matmul, loads
+        # each of C and B exactly once as 2D tiles).
 
-            dt_raw = tl.load(dt_ptr + t * stride_dt_T)
-            tl.store(old_dt_ptr + t * stride_old_dt_T, dt_raw)
-
-            B_t = tl.load(B_ptr + t * stride_B_T + offs_n * stride_B_dstate,
-                          mask=offs_n < dstate, other=0.0)
-            tl.store(old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate,
-                     B_t, mask=offs_n < dstate)
-
-        # Load D once if needed
         if HAS_D:
             D = tl.load(D_ptr + offs_m * stride_D_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
 
-        # Pass 2: Compute outputs via CB formulation.
-        # Reload B_j/x_j/dt_j from L1 cache (warm from pass 1).
-        cumAdt = 0.0
-        for t in range(T):
-            # Load and process dt_t, accumulate cumulative A*dt
-            dt_raw_t = tl.load(dt_ptr + t * stride_dt_T).to(tl.float32)
-            dt_proc_t = dt_raw_t
-            if HAS_DT_BIAS:
-                dt_proc_t = dt_proc_t + dt_bias
-            if DT_SOFTPLUS:
-                dt_proc_t = softplus(dt_proc_t)
-            cumAdt = cumAdt + A * dt_proc_t
-            cumAdt_t = cumAdt
+        # --- Load C_all and B_all as 2D tiles: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE) ---
+        offs_t = tl.arange(0, BLOCK_SIZE_T)
+        t_mask = offs_t < T
 
-            # Load C_t
-            C_t = tl.load(C_ptr + t * stride_C_T + offs_n * stride_C_dstate,
-                          mask=offs_n < dstate, other=0.0).to(tl.float32)
+        C_all_ptrs = C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate
+        C_all = tl.load(C_all_ptrs, mask=t_mask[:, None] & (offs_n[None, :] < dstate),
+                        other=0.0).to(tl.float32)
 
-            # Initial state contribution: C_t · state_0 * exp(cumAdt_t)
-            out_t = tl.sum(state * C_t[None, :], axis=1) * tl.exp(cumAdt_t)
+        B_all_ptrs = B_ptr + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate
+        B_all = tl.load(B_all_ptrs, mask=t_mask[:, None] & (offs_n[None, :] < dstate),
+                        other=0.0).to(tl.float32)
 
-            # CB contributions from tokens j = 0..t (reload from L1 cache)
-            cumAdt_j = 0.0
-            for j in range(T):
-                if j <= t:
-                    B_j = tl.load(B_ptr + j * stride_B_T + offs_n * stride_B_dstate,
-                                  mask=offs_n < dstate, other=0.0).to(tl.float32)
-                    x_j = tl.load(x_ptr + j * stride_x_T + offs_m * stride_x_dim,
-                                  mask=offs_m < dim, other=0.0).to(tl.float32)
-                    dt_raw_j = tl.load(dt_ptr + j * stride_dt_T).to(tl.float32)
-                    dt_proc_j = dt_raw_j
-                    if HAS_DT_BIAS:
-                        dt_proc_j = dt_proc_j + dt_bias
-                    if DT_SOFTPLUS:
-                        dt_proc_j = softplus(dt_proc_j)
-                    cumAdt_j = cumAdt_j + A * dt_proc_j
-                    CB_tj = tl.sum(C_t * B_j)
-                    decay_jt = tl.exp(cumAdt_t - cumAdt_j)
-                    out_t = out_t + CB_tj * decay_jt * dt_proc_j * x_j
+        # CB = C_all @ B_all^T : (BLOCK_SIZE_T, BLOCK_SIZE_T)
+        # Following ssd_chunk_scan pattern: dot inputs in bf16, accumulate in fp32.
+        CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
 
-            # Apply D and z
-            if HAS_D:
-                x_t = tl.load(x_ptr + t * stride_x_T + offs_m * stride_x_dim,
-                              mask=offs_m < dim, other=0.0).to(tl.float32)
-                out_t = out_t + x_t * D
-            if HAS_Z:
+        # --- Load x_all: (BLOCK_SIZE_T, BLOCK_SIZE_M) ---
+        x_all_ptrs = x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim
+        x_all = tl.load(x_all_ptrs, mask=t_mask[:, None] & (offs_m[None, :] < dim),
+                        other=0.0)
+        # Store x to old_* cache
+        old_x_all_ptrs = old_x_ptr + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim
+        tl.store(old_x_all_ptrs, x_all, mask=t_mask[:, None] & (offs_m[None, :] < dim))
+        x_all = x_all.to(tl.float32)
+
+        # Store B to old_* cache (reuse B_all before it's freed)
+        old_B_all_ptrs = old_B_ptr + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate
+        tl.store(old_B_all_ptrs, B_all.to(old_B_all_ptrs.dtype.element_ty),
+                 mask=t_mask[:, None] & (offs_n[None, :] < dstate))
+
+        # --- Load and process dt, compute cumulative A*dt ---
+        dt_all_ptrs = dt_ptr + offs_t * stride_dt_T
+        dt_raw_all = tl.load(dt_all_ptrs, mask=t_mask, other=0.0)
+        # Store dt to old_* cache
+        old_dt_all_ptrs = old_dt_ptr + offs_t * stride_old_dt_T
+        tl.store(old_dt_all_ptrs, dt_raw_all, mask=t_mask)
+        dt_proc_all = dt_raw_all.to(tl.float32)
+        if HAS_DT_BIAS:
+            dt_proc_all = dt_proc_all + dt_bias
+        if DT_SOFTPLUS:
+            dt_proc_all = softplus(dt_proc_all)
+        # Inclusive prefix sum for decay: cumAdt[t] = A * (dt_0 + ... + dt_t)
+        cumAdt_all = tl.cumsum(A * dt_proc_all, axis=0)
+
+        # --- Scale CB matrix: apply decay and dt, enforce causal mask ---
+        # CB_scaled[t,j] = CB[t,j] * exp(cumAdt[t] - cumAdt[j]) * dt[j]  if j <= t
+        #                   0                                               if j > t
+        causal_mask = offs_t[:, None] >= offs_t[None, :]  # lower-triangular
+        decay_matrix = tl.exp(cumAdt_all[:, None] - cumAdt_all[None, :])  # (T, T)
+        CB_scaled = tl.where(causal_mask, CB * decay_matrix * dt_proc_all[None, :], 0.0)
+
+        # --- Compute all outputs via tl.dot (no per-element extraction) ---
+        # 1) Initial state: init_out = C_all @ state^T * decay
+        #    C_all: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE), state: (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE)
+        #    result: (BLOCK_SIZE_T, BLOCK_SIZE_M)
+        decay_vec = tl.exp(cumAdt_all)  # (BLOCK_SIZE_T,)
+        # All dots use bf16 inputs with fp32 accumulation, matching the
+        # precision convention of ssd_chunk_scan (context-phase Mamba2).
+        # State is truncated to bf16 here — this is the state→output projection,
+        # not the state recurrence, so no drift accumulates.
+        init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
+
+        # 2) CB contribution: cb_out = CB_scaled @ x_all
+        #    CB_scaled: (BLOCK_SIZE_T, BLOCK_SIZE_T), x_all: (BLOCK_SIZE_T, BLOCK_SIZE_M)
+        #    result: (BLOCK_SIZE_T, BLOCK_SIZE_M)
+        cb_out = tl.dot(CB_scaled.to(tl.bfloat16), x_all.to(tl.bfloat16))
+
+        # 3) Combine
+        out_all = init_out + cb_out  # (BLOCK_SIZE_T, BLOCK_SIZE_M)
+
+        # Apply D: out += x * D (element-wise, D broadcast over T)
+        if HAS_D:
+            out_all = out_all + x_all * D[None, :]
+
+        # Apply z and store outputs (z is per-token, need to load per t)
+        if HAS_Z:
+            for t in range(T):
                 z_t = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
                               mask=offs_m < dim, other=0.0).to(tl.float32)
+                # Extract row t from out_all
+                out_t = tl.sum(tl.where((offs_t == t)[:, None], out_all, 0.0), axis=0)
                 out_t = out_t * z_t * tl.sigmoid(z_t)
-
-            tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim,
-                     out_t, mask=offs_m < dim)
+                tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim,
+                         out_t, mask=offs_m < dim)
+        else:
+            # Store all outputs at once (2D store)
+            out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+            tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & (offs_m[None, :] < dim))
     else:
         # Sequential state update: straightforward with serial dependency.
         for t in range(T):
@@ -373,7 +395,7 @@ def incremental_selective_state_update(
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
     _fast_forward_replay: bool = False,
-    _cb_output: bool = False,
+    _cb_output: bool = True,
 ):
     """
     Argument:

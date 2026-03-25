@@ -369,32 +369,54 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         tag = (f"incr_b{batch}_mtp{mtp_len}_k{prev_k}"
                f"_s{state_dtype_name}_a{act_dtype_name}")
 
-        def _run_incr(prev_k=prev_k):
-            incremental_selective_state_update(
-                state_work, interm_work, prev_tokens,
-                x=x, dt=dt, A=A, B=B, C=C,
-                out=out_incr,
-                D=D, dt_bias=dt_bias, dt_softplus=True,
-                state_batch_indices=None,
-                _block_size_m=args.block_size_m,
-                _num_warps=args.num_warps,
-                _fast_forward_replay=args.fast_forward_replay,
-                _cb_output=args.cb_output,
-            )
+        bsm_values = ([int(x) for x in args.block_size_m.split(",")]
+                       if args.block_size_m else [None])
+        nw_values = ([int(x) for x in args.num_warps.split(",")]
+                      if args.num_warps else [None])
+        for bsm in bsm_values:
+            for nw in nw_values:
+                def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw):
+                    incremental_selective_state_update(
+                        state_work, interm_work, prev_tokens,
+                        x=x, dt=dt, A=A, B=B, C=C,
+                        out=out_incr,
+                        D=D, dt_bias=dt_bias, dt_softplus=True,
+                        state_batch_indices=None,
+                        _block_size_m=bsm,
+                        _num_warps=nw,
+                        _fast_forward_replay=args.fast_forward_replay,
+                        _cb_output=args.cb_output,
+                    )
 
-        median_us, p95_us, p99_us = _time_kernel(
-            args, _run_incr, _reset, tag)
+                sweep_tag = (tag + (f"_m{bsm}" if bsm else "")
+                             + (f"_w{nw}" if nw else ""))
+                median_us, p95_us, p99_us = _time_kernel(
+                    args, _run_incr, _reset, sweep_tag)
 
-        _print_row(show_kernel_col, "incremental", batch, mtp_len, prev_k,
-                   state_dtype_name, act_dtype_name, median_us, p95_us, p99_us)
+                sweep_suffix = ""
+                if bsm is not None or nw is not None:
+                    parts = []
+                    if bsm is not None:
+                        parts.append(f"M={bsm}")
+                    if nw is not None:
+                        parts.append(f"W={nw}")
+                    sweep_suffix = " " + ",".join(parts)
+
+                _print_row(show_kernel_col, "incremental",
+                           batch, mtp_len, prev_k,
+                           state_dtype_name, act_dtype_name,
+                           median_us, p95_us, p99_us,
+                           sweep_suffix)
 
 
 def _print_row(show_kernel_col, kernel_name, batch, mtp_len, prev_k,
-               state_dtype_name, act_dtype_name, median_us, p95_us, p99_us):
+               state_dtype_name, act_dtype_name, median_us, p95_us, p99_us,
+               sweep_suffix=""):
     kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
     print(f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(prev_k):>6} | "
           f"{state_dtype_name:>11} | {act_dtype_name:>9} | "
-          f"{median_us:>9.2f} | {p95_us:>7.2f} | {p99_us:>7.2f} |")
+          f"{median_us:>9.2f} | {p95_us:>7.2f} | {p99_us:>7.2f} |"
+          f"{sweep_suffix}")
 
 
 # ---------------------------------------------------------------------------
@@ -502,11 +524,11 @@ def _parse_args() -> argparse.Namespace:
         help="Path to save results (file or directory). "
              "If a directory, writes benchmark_incremental_<timestamp>.txt inside it.")
     parser.add_argument(
-        "--block-size-m", type=int, default=None,
-        help="Override BLOCK_SIZE_M for the incremental kernel (for sweep).")
+        "--block-size-m", type=str, default=None,
+        help="Override BLOCK_SIZE_M: single value or comma-separated sweep (e.g. '4,8,16,32').")
     parser.add_argument(
-        "--num-warps", type=int, default=None,
-        help="Override num_warps for the incremental kernel (for sweep).")
+        "--num-warps", type=str, default=None,
+        help="Override num_warps: single value or comma-separated sweep (e.g. '1,2,4').")
     parser.add_argument(
         "--fast-forward-replay", action=argparse.BooleanOptionalAction,
         default=False,
