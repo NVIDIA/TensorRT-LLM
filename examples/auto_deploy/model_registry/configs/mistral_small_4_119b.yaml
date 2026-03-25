@@ -1,7 +1,7 @@
 # Standalone AutoDeploy config for serving Mistral Small 4 119B.
 runtime: trtllm
 attn_backend: trtllm
-compile_backend: torch-simple
+compile_backend: torch-cudagraph
 model_factory: Mistral3ForConditionalGeneration
 skip_loading_weights: false
 max_seq_len: 512
