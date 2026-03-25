@@ -17,16 +17,18 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 # =============================================================================
+# Type aliases
+# =============================================================================
+
+CacheBackendName = Literal["none", "teacache", "cache_dit"]
+
+# =============================================================================
 # Pipeline component identifiers
 # =============================================================================
 
 
 class PipelineComponent(str, Enum):
-    """Identifiers for pipeline components that can be loaded or skipped.
-
-    Inherits from str so values compare equal to plain strings,
-    e.g. ``PipelineComponent.VAE == "vae"`` is ``True``.
-    """
+    """Component names for loading or skipping (str enum: values match plain strings)."""
 
     TRANSFORMER = "transformer"
     VAE = "vae"
@@ -204,6 +206,68 @@ class TeaCacheConfig(StrictBaseModel):
         return self
 
 
+class CacheDiTConfig(StrictBaseModel):
+    """Configuration for Cache-DiT (DBCache, TaylorSeer, SCM).
+
+    Use when cache_backend is cache_dit; requires the cache-dit package. Fields map
+    to cache_dit DBCacheConfig. Wan/FLUX-specific wiring lives in cache_dit_enablers.
+
+    When enable_separate_cfg is unset, enablers apply a default for batched CFG.
+    """
+
+    Fn_compute_blocks: int = PydanticField(
+        1, ge=0, description="First n blocks always computed (Fn)."
+    )
+    Bn_compute_blocks: int = PydanticField(
+        0, ge=0, description="Last n blocks use residual cache (Bn)."
+    )
+    max_warmup_steps: int = PydanticField(
+        4,
+        ge=0,
+        description="Initial steps that do not use cache (default tuned for few-step runs).",
+    )
+    max_cached_steps: int = PydanticField(
+        -1,
+        description="Cap on cached steps; -1 means no limit.",
+    )
+    max_continuous_cached_steps: int = PydanticField(
+        3,
+        ge=-1,
+        description="Cap on consecutive cached steps (-1 = library unlimited; default 3).",
+    )
+    residual_diff_threshold: float = PydanticField(
+        0.24,
+        ge=0.0,
+        description="L1 diff threshold for DBCache (default pairs with max_continuous_cached_steps).",
+    )
+    enable_separate_cfg: Optional[bool] = PydanticField(
+        None,
+        description=(
+            "If set, forwarded to DBCacheConfig.enable_separate_cfg. "
+            "If None, enablers pick defaults for each pipeline (Wan: batched CFG → False)."
+        ),
+    )
+    enable_taylorseer: bool = False
+    taylorseer_order: int = PydanticField(1, ge=1, le=4)
+
+    scm_steps_mask_policy: Optional[str] = PydanticField(
+        None,
+        description="Policy name for cache_dit.steps_mask (e.g. fast, medium, slow, ultra).",
+    )
+    scm_steps_policy: Literal["dynamic", "static"] = "dynamic"
+
+    force_refresh_step_hint: Optional[int] = PydanticField(
+        None,
+        description="Optional step index hint for forced cache refresh (cache_dit DBCacheConfig).",
+    )
+    force_refresh_step_policy: Literal["once", "repeat"] = PydanticField(
+        "once",
+        description="Policy for force_refresh_step_hint: once or repeat.",
+    )
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
 class TorchCompileConfig(StrictBaseModel):
     """Configuration for torch.compile and autotuning.
 
@@ -365,6 +429,11 @@ class VisualGenArgs(StrictBaseModel):
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
+    cache_backend: CacheBackendName = PydanticField(
+        "none",
+        description="Cache accelerator: none, teacache, or cache_dit.",
+    )
+    cache_dit: CacheDiTConfig = PydanticField(default_factory=CacheDiTConfig)
 
     # Set by model_validator when quant_config is provided as a dict (ModelOpt format)
     dynamic_weight_quant: bool = False
@@ -395,6 +464,21 @@ class VisualGenArgs(StrictBaseModel):
             "force_dynamic_quantization": daq,
         }
         return data
+
+    @model_validator(mode="after")
+    def validate_cache_backend_exclusivity(self) -> "VisualGenArgs":
+        if self.cache_backend == "cache_dit" and self.teacache.enable_teacache:
+            raise ValueError(
+                "teacache.enable_teacache must be False when cache_backend is 'cache_dit'."
+            )
+        if self.cache_backend == "teacache" and not self.teacache.enable_teacache:
+            raise ValueError("cache_backend 'teacache' requires teacache.enable_teacache=True.")
+        if self.cache_backend == "none" and self.teacache.enable_teacache:
+            raise ValueError(
+                "cache_backend is 'none' but teacache.enable_teacache is True. "
+                "Set cache_backend='teacache' to use TeaCache."
+            )
+        return self
 
     def to_mapping(self) -> Mapping:
         """Derive Mapping from ParallelConfig."""
@@ -500,6 +584,8 @@ class DiffusionModelConfig(BaseModel):
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
+    cache_backend: CacheBackendName = "none"
+    cache_dit: CacheDiTConfig = PydanticField(default_factory=CacheDiTConfig)
 
     @property
     def torch_dtype(self) -> "torch.dtype":
@@ -721,7 +807,8 @@ class DiffusionModelConfig(BaseModel):
         Args:
             checkpoint_dir: Path to checkpoint
             args: VisualGenArgs containing user config
-                - (compilation, torch_compile, cuda_graph, pipeline, attention, parallel, teacache)
+                - (compilation, torch_compile, cuda_graph, pipeline, attention, parallel, teacache,
+                   cache_backend, cache_dit)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
@@ -734,6 +821,8 @@ class DiffusionModelConfig(BaseModel):
         attention_cfg = args.attention if args else AttentionConfig()
         parallel_cfg = args.parallel if args else ParallelConfig()
         teacache_cfg = args.teacache if args else TeaCacheConfig()
+        cache_backend_val: CacheBackendName = args.cache_backend if args else "none"
+        cache_dit_cfg = args.cache_dit if args else CacheDiTConfig()
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
@@ -756,7 +845,7 @@ class DiffusionModelConfig(BaseModel):
                 config_dict = json.load(f)
             pretrained_config = SimpleNamespace(**config_dict)
 
-            # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
+            # Ensure _name_or_path is set so TeaCache coefficient matching works.
             if not getattr(pretrained_config, "_name_or_path", None):
                 pretrained_config._name_or_path = str(checkpoint_path)
 
@@ -842,6 +931,8 @@ class DiffusionModelConfig(BaseModel):
             attention=attention_cfg,
             parallel=parallel_cfg,
             teacache=teacache_cfg,
+            cache_backend=cache_backend_val,
+            cache_dit=cache_dit_cfg,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,

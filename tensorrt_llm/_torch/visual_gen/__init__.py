@@ -11,6 +11,7 @@ from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from .checkpoints import WeightLoader
 from .config import (
     AttentionConfig,
+    CacheDiTConfig,
     CudaGraphConfig,
     DiffusionModelConfig,
     ParallelConfig,
@@ -29,6 +30,7 @@ __all__ = [
     "TorchCompileConfig",
     "CudaGraphConfig",
     "VisualGenArgs",
+    "CacheDiTConfig",
     "DiffusionModelConfig",
     "ParallelConfig",
     "PipelineComponent",
