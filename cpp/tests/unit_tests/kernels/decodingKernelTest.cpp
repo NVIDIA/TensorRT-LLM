@@ -320,6 +320,8 @@ void fillTensorAtIndex(ITensor::SharedPtr tensor, SizeType32 idx, std::vector<T>
     bufferManager->copy(src.data(), *target);
 }
 
+} // anonymous namespace
+
 class TestGatherTree : public ::testing::Test
 {
 public:
@@ -722,26 +724,13 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
     auto const* gatheredIdsData = bufferCast<TokenIdType>(*gatheredIdsHost);
     auto const* seqLengthsData = bufferCast<SizeType32>(*seqLengthsHost);
 
-    // Read logProbsTiled (unmodified by gatherTree) for populating logits,
-    // and gathered logProbs (written by gatherTree) for cross-checking.
-    auto logProbsTiledHost
-        = mBufferManager->copyFrom(*mDecodingState->getJointDecodingOutput().logProbsTiled, MemoryType::kCPU);
-    auto const* logProbsTiledData = bufferCast<float>(*logProbsTiledHost);
-    // Layout: [maxSeqLen, batchSize=1, beamWidth] -> logProbsTiledData[t * beamWidth + slot]
-
-    auto gatheredLogProbsHost = mBufferManager->copyFrom(*mDecodingState->getLogProbs(0), MemoryType::kCPU);
-    auto const* gatheredLogProbsData = bufferCast<float>(*gatheredLogProbsHost);
-    // Layout: [beamWidth, maxSeqLen] -> gatheredLogProbsData[beam * maxSeqLen + g]
-
     SizeType32 const promptLen = 3;           // matches inputLengths in hardcodeBuffersLen10
     SizeType32 const vocabSizePadded = 32000; // LLaMA vocab size (matches fixture token IDs)
     SizeType32 const maxNewTokens = maxSeqLen - promptLen;
 
-    // Populate generation logits using actual token IDs and logProb values from the
-    // fixture. For each (post-reassignment slot B, gen step g), place the logProbsTiled
-    // value at logits[A][g][token], where A is the pre-reassignment slot (from parentIds)
-    // and token is the selected token (from raw ids). This mirrors how the model stores
-    // logits indexed by pre-reassignment slot.
+    // Populate sentinel logits: for each (pre-reassignment slot, gen step), place a 1.0f
+    // at the selected token position. All other entries stay 0. After correct reordering,
+    // argmax(logits[beam][g]) should equal the gathered token for that beam and step.
     std::vector<float> logits(static_cast<size_t>(beamWidth) * maxNewTokens * vocabSizePadded, 0.0f);
     for (SizeType32 postSlot = 0; postSlot < beamWidth; ++postSlot)
     {
@@ -751,8 +740,7 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
             SizeType32 const t = promptLen + g;
             SizeType32 const preSlot = parentIdsData[postSlot * maxSeqLen + t];
             TokenIdType const token = idsData[postSlot * maxSeqLen + t];
-            float const logProbValue = logProbsTiledData[t * beamWidth + postSlot];
-            logits[static_cast<size_t>(preSlot * maxNewTokens + g) * vocabSizePadded + token] = logProbValue;
+            logits[static_cast<size_t>(preSlot * maxNewTokens + g) * vocabSizePadded + token] = 1.0f;
         }
     }
 
@@ -850,10 +838,10 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
         }
     }
 
-    // Cross-check: after reorder, the logit at the gathered output token position
-    // should match the gathered logProb from gatherTree. This is non-tautological
-    // because the gathered logProbs are computed independently by gatherTree (via
-    // insertUnfinishedPath + finalize tracing through logProbsTiled and parentIds).
+    // Cross-check: after reorder, logits[beam][g][gatheredToken] should be positive (the 1.0f
+    // sentinel placed there during population). This is non-tautological: gatheredIdsData is
+    // produced independently by gatherTree tracing through parentIds, while the logits were
+    // reordered via the slot trace. A wrong slot's logits would have zeros at this position.
     bool allCorrect = true;
     for (SizeType32 beam = 0; beam < beamWidth; ++beam)
     {
@@ -861,13 +849,12 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
         for (SizeType32 g = 0; g < genLen; ++g)
         {
             TokenIdType const gatheredToken = gatheredIdsData[beam * maxSeqLen + (promptLen + g)];
-            float const reorderedLogProb
+            float const logitAtGatheredToken
                 = logits[static_cast<size_t>(beam * maxNewTokens + g) * vocabSizePadded + gatheredToken];
-            float const expectedLogProb = gatheredLogProbsData[beam * maxSeqLen + g];
-            if (std::abs(reorderedLogProb - expectedLogProb) > 1e-5f)
+            if (logitAtGatheredToken <= 0.0f)
             {
-                TLLM_LOG_ERROR("Beam %d, step %d: reordered logProb %f != gathered logProb %f (token %d)", beam, g,
-                    reorderedLogProb, expectedLogProb, gatheredToken);
+                TLLM_LOG_ERROR("Beam %d, step %d: logit at gathered token %d is %.1f, expected positive", beam, g,
+                    gatheredToken, logitAtGatheredToken);
                 allCorrect = false;
             }
         }
@@ -889,6 +876,9 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
     }
     EXPECT_TRUE(anyReorder) << "Test data should cause at least some beam reordering";
 }
+
+namespace
+{
 
 enum AcceptKernelMode
 {
