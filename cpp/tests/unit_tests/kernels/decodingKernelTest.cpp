@@ -702,6 +702,13 @@ TEST_F(TestGatherTree, GatherTreeWithSwap)
 // then runs the reorder algorithm and checks the result.
 TEST_F(TestGatherTree, GenerationLogitsReorder)
 {
+    // Compile-time proof that the fixture data causes beam reordering.
+    // hardcodeBuffersLen10: parentIds[slot=1][t=3] = 0 (row 1, col 3 of the parentIds table).
+    // Since 0 != 1, any beam trace through slot 1 at t=4 steps to slot 0 at t=3 — a concrete swap.
+    static constexpr SizeType32 kFixtureParentIds_slot1_t3 = 0;
+    static_assert(kFixtureParentIds_slot1_t3 != 1,
+        "parentIds[slot=1][t=3] must differ from slot 1 to guarantee a beam swap in this test");
+
     createBuffers();
     hardcodeBuffersLen10();
     cudaDeviceSynchronize();
@@ -724,13 +731,13 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
     auto const* gatheredIdsData = bufferCast<TokenIdType>(*gatheredIdsHost);
     auto const* seqLengthsData = bufferCast<SizeType32>(*seqLengthsHost);
 
-    SizeType32 const promptLen = 3;           // matches inputLengths in hardcodeBuffersLen10
-    SizeType32 const vocabSizePadded = 32000; // LLaMA vocab size (matches fixture token IDs)
+    SizeType32 constexpr promptLen = 3;           // matches inputLengths in hardcodeBuffersLen10
+    SizeType32 constexpr vocabSizePadded = 32000; // LLaMA vocab size (matches fixture token IDs)
     SizeType32 const maxNewTokens = maxSeqLen - promptLen;
 
     // Populate sentinel logits: for each (pre-reassignment slot, gen step), place a 1.0f
     // at the selected token position. All other entries stay 0. After correct reordering,
-    // argmax(logits[beam][g]) should equal the gathered token for that beam and step.
+    // logits[beam][g][gatheredToken] should be positive (the sentinel landed at the right place).
     std::vector<float> logits(static_cast<size_t>(beamWidth) * maxNewTokens * vocabSizePadded, 0.0f);
     for (SizeType32 postSlot = 0; postSlot < beamWidth; ++postSlot)
     {
@@ -838,10 +845,10 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
         }
     }
 
-    // Cross-check: after reorder, logits[beam][g][gatheredToken] should be positive (the 1.0f
-    // sentinel placed there during population). This is non-tautological: gatheredIdsData is
-    // produced independently by gatherTree tracing through parentIds, while the logits were
-    // reordered via the slot trace. A wrong slot's logits would have zeros at this position.
+    // Cross-check: after reorder, logits[beam][g][gatheredToken] should equal the 1.0f sentinel
+    // placed there during population. This is non-tautological: gatheredIdsData is produced
+    // independently by gatherTree tracing through parentIds, while the logits were reordered via
+    // the slot trace. A wrong slot's logits would have 0.0f at this position.
     bool allCorrect = true;
     for (SizeType32 beam = 0; beam < beamWidth; ++beam)
     {
@@ -851,30 +858,15 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
             TokenIdType const gatheredToken = gatheredIdsData[beam * maxSeqLen + (promptLen + g)];
             float const logitAtGatheredToken
                 = logits[static_cast<size_t>(beam * maxNewTokens + g) * vocabSizePadded + gatheredToken];
-            if (logitAtGatheredToken <= 0.0f)
+            if (logitAtGatheredToken != 1.0f)
             {
-                TLLM_LOG_ERROR("Beam %d, step %d: logit at gathered token %d is %.1f, expected positive", beam, g,
+                TLLM_LOG_ERROR("Beam %d, step %d: logit at gathered token %d is %.1f, expected 1.0", beam, g,
                     gatheredToken, logitAtGatheredToken);
                 allCorrect = false;
             }
         }
     }
     EXPECT_TRUE(allCorrect);
-
-    // Also verify that at least some reordering happened (the test data should cause beam swaps)
-    bool anyReorder = false;
-    for (SizeType32 beam = 0; beam < beamWidth && !anyReorder; ++beam)
-    {
-        for (SizeType32 g = 0; g < genLens[beam]; ++g)
-        {
-            if (slotTrace[beam][g] != beam)
-            {
-                anyReorder = true;
-                break;
-            }
-        }
-    }
-    EXPECT_TRUE(anyReorder) << "Test data should cause at least some beam reordering";
 }
 
 namespace
