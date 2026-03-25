@@ -1050,6 +1050,43 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
         blockOffsets, quantMode.hasFp4KvCache());
 }
 
+std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedKvCacheBuffers(
+    at::Tensor host_kv_cache_pool_pointers, at::Tensor host_kv_cache_pool_mapping, int64_t layer_idx,
+    int64_t num_kv_heads, int64_t tokens_per_block, int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks,
+    int64_t kv_cache_quant_mode, at::ScalarType dtype)
+{
+    int32_t const poolIndex = host_kv_cache_pool_mapping.index({static_cast<int64_t>(layer_idx), 0}).item<int32_t>();
+    int32_t const layerIdxInCachePool
+        = host_kv_cache_pool_mapping.index({static_cast<int64_t>(layer_idx), 1}).item<int32_t>();
+
+    auto const blockSize = tokens_per_block * num_kv_heads * head_dim;
+    auto const bytesPerBlock = blockSize * static_cast<int64_t>(at::elementSize(dtype));
+    auto const intraPoolOffset = layerIdxInCachePool * kv_factor * bytesPerBlock;
+
+    auto quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
+
+    auto poolPointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers, poolIndex, intraPoolOffset, blockSize,
+        layerIdxInCachePool, static_cast<int32_t>(kv_factor), quantMode.hasFp4KvCache());
+
+    // Flat-block KV cache: [total_blocks, num_kv_heads, tokens_per_block, head_dim]
+    // Each dim-0 element = one single K or V block. Raw block offsets from
+    // kv_cache_block_offsets can index directly into dim-0.
+    auto options = at::TensorOptions().dtype(dtype).device(at::kCUDA);
+    auto kv_pool = torch::from_blob(
+        poolPointers.primaryPoolPtr, {total_num_blocks, num_kv_heads, tokens_per_block, head_dim}, options);
+
+    // FP4 block scale pool (same flat-block layout, E4M3 dtype, vector_size=16)
+    std::optional<at::Tensor> kv_scale_pool = std::nullopt;
+    if (quantMode.hasFp4KvCache() && poolPointers.primaryBlockScalePoolPtr != nullptr)
+    {
+        auto sf_options = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(at::kCUDA);
+        kv_scale_pool = torch::from_blob(poolPointers.primaryBlockScalePoolPtr,
+            {total_num_blocks, num_kv_heads, tokens_per_block, head_dim / 16}, sf_options);
+    }
+
+    return {kv_pool, kv_scale_pool};
+}
+
 } // namespace torch_ext
 
 void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits,

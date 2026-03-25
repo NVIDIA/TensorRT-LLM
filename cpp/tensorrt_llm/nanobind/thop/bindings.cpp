@@ -17,6 +17,7 @@
 #include "bindings.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
@@ -82,6 +83,13 @@ void initBindings(nb::module_& m)
         nb::arg("tile_scheduler_metadata"), nb::arg("num_splits"), nb::arg("batch_size"), nb::arg("s_q"),
         nb::arg("num_q_heads"), nb::arg("num_kv_heads"), nb::arg("head_size_v"),
         "Compute FlashMLA tile-scheduler metadata in-place. Call once per forward pass before attention layers.",
+        nb::call_guard<nb::gil_scoped_release>());
+
+    m.def("build_kv_cache_buffers", &torch_ext::buildFlashinferTrtllmGenPagedKvCacheBuffers,
+        nb::arg("host_kv_cache_pool_pointers"), nb::arg("host_kv_cache_pool_mapping"), nb::arg("layer_idx"),
+        nb::arg("num_kv_heads"), nb::arg("tokens_per_block"), nb::arg("head_dim"), nb::arg("kv_factor"),
+        nb::arg("total_num_blocks"), nb::arg("kv_cache_quant_mode"), nb::arg("dtype"),
+        "Build flat-block KV cache tensor from pool pointers. Returns (kv_pool, kv_scale_pool).",
         nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::nanobind::thop

@@ -25,6 +25,7 @@
 #include "tensorrt_llm/thop/attentionOp.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
+#include <tuple>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
