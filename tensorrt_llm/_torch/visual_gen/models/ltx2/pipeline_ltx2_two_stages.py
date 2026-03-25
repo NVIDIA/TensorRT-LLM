@@ -457,21 +457,20 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         checkpoint_dir: str,
         device: torch.device,
         skip_components: Optional[list] = None,
-        *,
-        text_encoder_path: str = "",
-        spatial_upsampler_path: str = "",
-        distilled_lora_path: str = "",
         **kwargs,
     ) -> None:
         super().load_standard_components(
             checkpoint_dir,
             device,
             skip_components,
-            text_encoder_path=text_encoder_path,
             **kwargs,
         )
 
         dtype = self.model_config.torch_dtype
+        spatial_upsampler_path = self.model_config.extra_attrs.get(
+            "spatial_upsampler_path", "")
+        distilled_lora_path = self.model_config.extra_attrs.get(
+            "distilled_lora_path", "")
 
         # --- Spatial upsampler ---
         if spatial_upsampler_path:

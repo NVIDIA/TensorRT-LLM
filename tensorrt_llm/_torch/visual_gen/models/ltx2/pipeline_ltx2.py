@@ -271,6 +271,17 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    @classmethod
+    def resolve_variant(cls, config):
+        if (
+            config.extra_attrs.get("spatial_upsampler_path")
+            and config.extra_attrs.get("distilled_lora_path")
+        ):
+            from .pipeline_ltx2_two_stages import LTX2TwoStagesPipeline
+
+            return LTX2TwoStagesPipeline
+        return cls
+
     @property
     def dtype(self):
         return self.model_config.torch_dtype
