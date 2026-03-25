@@ -64,7 +64,12 @@ class TrtllmGenSupportChecker:
 
     # Supported data types
     SUPPORTED_INPUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
-    SUPPORTED_KV_CACHE_DTYPES = {DataType.HALF, DataType.BF16, DataType.FP8}
+    SUPPORTED_KV_CACHE_DTYPES = {
+        DataType.HALF,
+        DataType.BF16,
+        DataType.FP8,
+        DataType.NVFP4,
+    }
     SUPPORTED_OUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
 
     # Supported Q:KV:O dtype combinations for trtllm-gen kernels
@@ -81,6 +86,10 @@ class TrtllmGenSupportChecker:
         (torch.float8_e4m3fn, DataType.FP8, torch.float16),
         # e4m3:e4m3:bf16
         (torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+        # e4m3:nvfp4:*
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
     }
 
     # Generation phase supported combinations (includes context + additional)
@@ -96,6 +105,10 @@ class TrtllmGenSupportChecker:
         (torch.bfloat16, DataType.FP8, torch.bfloat16),
         # fp16:e4m3:fp16
         (torch.float16, DataType.FP8, torch.float16),
+        # e4m3:nvfp4:*
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
     }
 
     # Unsupported head sizes for context FMHA.
@@ -231,19 +244,12 @@ class TrtllmGenSupportChecker:
         if cross_attention:
             return False, "Cross attention is not supported by trtllm-gen backend."
 
-        has_fp4_kv = (
-            quant_config.layer_quant_mode.has_fp4_kv_cache()
-            if quant_config is not None
-            else kv_cache_dtype == DataType.NVFP4
-        )
-        if has_fp4_kv:
-            return False, "NVFP4 KV cache is not supported by flashinfer trtllm-gen kernels."
         if q_dtype not in cls.SUPPORTED_INPUT_DTYPES:
             return False, f"Input dtype {q_dtype} not supported. Supported: FP16, BF16, FP8 (E4M3)."
         if kv_cache_dtype not in cls.SUPPORTED_KV_CACHE_DTYPES:
             return (
                 False,
-                f"KV cache dtype {kv_cache_dtype} not supported. Supported: FP16, BF16, FP8.",
+                f"KV cache dtype {kv_cache_dtype} not supported. Supported: FP16, BF16, FP8, NVFP4.",
             )
         if out_dtype is not None and out_dtype not in cls.SUPPORTED_OUT_DTYPES:
             return False, f"Output dtype {out_dtype} not supported. Supported: FP16, BF16, FP8."
@@ -655,8 +661,12 @@ class FlashInferTrtllmGenAttention:
         has_sparse_attention = (
             sparse_attention_config is not None and not has_skip_softmax_attention
         )
+        q_dtype = q.dtype
+        if kv_cache_manager.dtype == DataType.NVFP4:
+            q_dtype = torch.float8_e4m3fn
+
         result = self._checker.is_supported(
-            q_dtype=q.dtype,
+            q_dtype=q_dtype,
             kv_cache_dtype=kv_cache_manager.dtype,
             num_heads=self._num_heads,
             num_kv_heads=self._num_kv_heads,
@@ -745,7 +755,13 @@ class FlashInferTrtllmGenAttention:
         fp8_context_fmha = (
             is_fp8_out
             or is_fp4_out
-            or (kv_cache_quant_mode.has_fp8_kv_cache() and use_paged_context_fmha)
+            or (
+                (
+                    kv_cache_quant_mode.has_fp8_kv_cache()
+                    or kv_cache_quant_mode.has_fp4_kv_cache()
+                )
+                and use_paged_context_fmha
+            )
         )
 
         num_tokens = q.size(0)
@@ -975,6 +991,7 @@ class FlashInferTrtllmGenAttention:
             q_processed,
             kv_pool,
             block_tables,
+            kv_scale_pool,
             fmha_workspace,
             cu_q_seqlens,
             cu_kv_seqlens,
@@ -1018,6 +1035,10 @@ class FlashInferTrtllmGenAttention:
 
         # FlashInfer accepts a split K/V tuple; TensorRT-LLM stores both views
         # in one flat paged KV pool, so both tuple entries intentionally alias.
+        kv_block_scales = None
+        if kv_scale_pool is not None:
+            kv_block_scales = (kv_scale_pool, kv_scale_pool)
+
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
@@ -1036,6 +1057,7 @@ class FlashInferTrtllmGenAttention:
             kv_layout=self._layout,
             sinks=params.forward.attention_sinks,
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            kv_block_scales=kv_block_scales,
             enable_pdl=self._enable_pdl,
         )
 
@@ -1082,6 +1104,7 @@ class FlashInferTrtllmGenAttention:
             q_processed,
             kv_pool,
             block_tables,
+            kv_scale_pool,
             fmha_workspace,
             cu_seqlens,
             max_q_len,
@@ -1127,6 +1150,10 @@ class FlashInferTrtllmGenAttention:
         decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
         # FlashInfer accepts a split K/V tuple; TensorRT-LLM stores both views
         # in one flat paged KV pool, so both tuple entries intentionally alias.
+        kv_block_scales = None
+        if kv_scale_pool is not None:
+            kv_block_scales = (kv_scale_pool, kv_scale_pool)
+
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
@@ -1144,6 +1171,7 @@ class FlashInferTrtllmGenAttention:
             max_q_len=decode_max_q_len,
             cum_seq_lens_q=decode_cu_seqlens,
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            kv_block_scales=kv_block_scales,
             enable_pdl=self._enable_pdl,
             backend="trtllm-gen",
         )
@@ -1163,7 +1191,7 @@ class FlashInferTrtllmGenAttention:
         batch_beam = params.num_requests * params.beam_width
         if params.attention_input is None:
             raise RuntimeError("MLA generation requires attention_input.")
-        kv_cache, block_tables = thop.build_trtllm_gen_kv_cache_metadata(
+        kv_cache, block_tables, _ = thop.build_trtllm_gen_kv_cache_metadata(
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
             kv_cache_block_offsets=params.kv_cache_block_offsets,

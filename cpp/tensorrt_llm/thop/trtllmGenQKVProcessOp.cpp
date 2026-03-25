@@ -27,6 +27,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <optional>
 #include <torch/extension.h>
+#include <tuple>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -248,8 +249,8 @@ GenerationWorkspaceRawViews makeGenerationWorkspaceRawViews(
 
 } // anonymous namespace
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor,
-    int64_t, int64_t, int64_t>
+std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor,
+    at::Tensor, at::Tensor, int64_t, int64_t, int64_t>
 trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
     torch::Tensor context_lengths, std::optional<torch::Tensor> kv_cache_block_offsets,
     std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
@@ -413,10 +414,11 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     }
 
     std::optional<at::Tensor> kvPool;
+    std::optional<at::Tensor> kvScalePool;
     std::optional<at::Tensor> blockTables;
     if (need_build_kv_cache_metadata)
     {
-        kvPool = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
+        std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
             host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads, tokens_per_block, head_size, kv_factor,
             total_num_blocks, kv_cache_quant_mode, qkvScalarType);
 
@@ -437,7 +439,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     zeroFlashinferTrtllmGenCounterWorkspaceAsync(views.trtllmGenWorkspace, stream);
 
     auto const windowLeft = computeWindowLeft(cyclic_attention_window_size, max_past_kv_length, attention_chunk_size);
-    return {qProcessed, kvPool, blockTables, views.trtllmGenWorkspace, views.cuQSeqlens, views.cuKvSeqlens,
+    return {qProcessed, kvPool, blockTables, kvScalePool, views.trtllmGenWorkspace, views.cuQSeqlens, views.cuKvSeqlens,
         input_seq_length, max_past_kv_length, windowLeft};
 }
 
@@ -556,8 +558,8 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     }
 }
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor, std::optional<at::Tensor>,
-    int64_t, int64_t, int64_t, bool>
+std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor,
+    std::optional<at::Tensor>, int64_t, int64_t, int64_t, bool>
 trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
     std::optional<torch::Tensor> spec_decoding_generation_lengths,
     std::optional<torch::Tensor> spec_decoding_position_offsets, std::optional<torch::Tensor> kv_cache_block_offsets,
@@ -733,10 +735,11 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     }
 
     std::optional<at::Tensor> kvPool;
+    std::optional<at::Tensor> kvScalePool;
     std::optional<at::Tensor> blockTables;
     if (need_build_kv_cache_metadata)
     {
-        kvPool = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
+        std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
             host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads, tokens_per_block, head_size, kv_factor,
             total_num_blocks, kv_cache_quant_mode, qkvScalarType);
 
@@ -748,8 +751,8 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     zeroFlashinferTrtllmGenCounterWorkspaceAsync(views.trtllmGenWorkspace, stream);
 
     auto const windowLeft = computeWindowLeft(cyclic_attention_window_size, max_past_kv_length, attention_chunk_size);
-    return {qProcessed, kvPool, blockTables, views.trtllmGenWorkspace, cuSeqlens, input_seq_length, max_past_kv_length,
-        windowLeft, isMultiTokenGen};
+    return {qProcessed, kvPool, blockTables, kvScalePool, views.trtllmGenWorkspace, cuSeqlens, input_seq_length,
+        max_past_kv_length, windowLeft, isMultiTokenGen};
 }
 
 } // namespace torch_ext
