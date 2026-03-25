@@ -750,6 +750,7 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
+                    self._sync_kv_cache_for_warmup(resource_manager)
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
@@ -800,6 +801,7 @@ class PyTorchModelEngine(ModelEngine):
                             spec_resource_manager, Eagle3ResourceManager):
                         spec_resource_manager.is_first_draft = True
 
+                    self._sync_kv_cache_for_warmup(resource_manager)
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
@@ -966,6 +968,7 @@ class PyTorchModelEngine(ModelEngine):
                     self._update_draft_inference_state_for_warmup(
                         batch, draft_len > 0, resource_manager)
                     self.runtime_draft_len = draft_len
+                    self._sync_kv_cache_for_warmup(resource_manager)
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
@@ -995,6 +998,7 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run piecewise CUDA graph warmup for num tokens={num_tokens}"
                     )
+                    self._sync_kv_cache_for_warmup(resource_manager)
                     # Run a few times to ensure capture
                     for _ in range(3):
                         self.forward(batch,
@@ -1030,6 +1034,26 @@ class PyTorchModelEngine(ModelEngine):
                 torch.cuda.synchronize()
 
     ### Helper methods promoted from the original warmup method ###
+
+    def _sync_kv_cache_for_warmup(self, resource_manager: ResourceManager):
+        """Synchronize KV cache transfer operations before a warmup forward pass.
+
+        When host cache offloading is enabled (host_cache_size > 0), the C++
+        KV cache manager schedules asynchronous H2D/D2H transfers and tracks
+        block locations via a transfer manager.  In normal inference the
+        ``prepare_resources()`` call performs this synchronization, but during
+        warmup ``prepare_resources()`` is not invoked.  Without explicit
+        synchronization the GPU-side block table may contain stale or invalid
+        pointers, causing CUDA illegal-memory-access errors during the
+        attention kernels.
+        """
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        if (isinstance(kv_cache_manager, KVCacheManager)
+                and getattr(kv_cache_manager, 'blocks_in_secondary_pool', 0)
+                > 0):
+            kv_cache_manager.impl.sync_transfer_manager_with_buffer_manager()
+            kv_cache_manager.impl.refresh_blocks()
 
     @contextlib.contextmanager
     def _release_batch_context(self, batch: Optional[ScheduledRequests],
