@@ -55,16 +55,15 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   endif()
 
   if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
+    set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
-      patch
-      -p1
-      --forward
-      --batch
-      -i
-      "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
+      bash
+      -c
+      "patch -p1 --batch --dry-run -R -i '${_patch_file}' && echo 'Patch already applied, skipping.' || patch -p1 --forward --batch -i '${_patch_file}'"
+    )
   endif()
 
   FetchContent_Declare(${FETCH_ARGS})
