@@ -764,7 +764,6 @@ def _handle_prefill_thop(
     dtype = q_nope_flat.dtype
     device = q_nope_flat.device
     planner = _GlobalTrtllmMLAPlanner
-    gen_head_size = kv_lora_rank + qk_rope_head_dim  # 576
 
     # Final output: [num_tokens, num_heads * v_head_dim]
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
@@ -773,94 +772,69 @@ def _handle_prefill_thop(
     if torch.cuda.is_current_stream_capturing() or planner.skip_attention:
         return output
 
-    # The C++ MLA kernel outputs in latent space: [num_tokens, num_heads * kv_lora_rank].
-    # We project through v_b_proj afterwards to get [num_tokens, num_heads * v_head_dim].
-    attn_out_latent = torch.empty(num_tokens, num_heads * kv_lora_rank, dtype=dtype, device=device)
+    # Expand compressed KV via kv_b_proj to get separate K, V for FMHA.
+    w = (
+        kv_b_proj_weight.to(dtype)
+        if kv_b_proj_weight.dtype == torch.float8_e4m3fn
+        else kv_b_proj_weight
+    )
+    kv = torch.nn.functional.linear(compressed_kv_flat, w)
+    kv = kv.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
+    k_nope = kv[:, :, :qk_nope_head_dim]
+    v = kv[:, :, qk_nope_head_dim:].contiguous().view(num_tokens, num_heads * v_head_dim)
 
-    # Cast FP8 weights to compute dtype (FP8 checkpoints store kv_b_proj in FP8).
-    ptr = kv_b_proj_weight.data_ptr()
-    cached = planner._per_layer_pool_ptrs.get(("w_kn_ctx", ptr))
-    if cached is not None:
-        w_kn = cached
-    else:
-        w = (
-            kv_b_proj_weight.to(dtype)
-            if kv_b_proj_weight.dtype == torch.float8_e4m3fn
-            else kv_b_proj_weight
-        )
-        weight_reshaped = w.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-        w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
-        planner._per_layer_pool_ptrs[("w_kn_ctx", ptr)] = w_kn
+    kpe_expanded = kpe_flat.view(num_tokens, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
+    k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
+    q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
-    # Build fused_q = [q_absorbed, 0] with shape [num_tokens, num_heads, 576].
-    # q_pe is passed separately (the C++ kernel applies RoPE to it internally).
-    # Matches PT backend's context path (attention.py lines 2346-2389).
-    q_nope_3d = q_nope_flat.view(num_tokens, num_heads, qk_nope_head_dim)
-    fused_q = torch.empty(num_tokens, num_heads, gen_head_size, dtype=dtype, device=device)
-    q_absorbed = torch.bmm(q_nope_3d.transpose(0, 1), w_kn)  # [num_heads, num_tokens, kv_lora_rank]
-    fused_q[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
-    # q_pe is passed separately via wrapper.plan(q_pe=...), NOT embedded in fused_q.
-    # The C++ kernel's invokeMLARopeGeneration reads q_pe from the separate tensor
-    # and applies RoPE. This matches the PT backend when apply_rotary_emb=False
-    # (fused rope path, attention.py L2385-2386).
-    fused_q_flat = fused_q.view(num_tokens, num_heads * gen_head_size)
-
-    # MLA context via _call_thop_attention_mla with layer_idx+1000 to get a
-    # separate C++ AttentionOp (decode's op is initialized during CUDA graph
-    # capture and can't switch to context_only mode).
-    _call_thop_attention_mla(
-        fused_q_flat,
-        None,  # k
-        None,  # v
-        attn_out_latent,
-        latent_cache,
-        q_pe_flat.view(num_tokens, num_heads * qk_rope_head_dim),
-        True,  # is_fused_qkv
-        1,  # attention_input_type = context_only
+    # Context wrapper with separate Q/K/V (is_fused_qkv=False).
+    # The wrapper has head_size=576, num_kv_heads=1 (matching PT backend's self.mqa
+    # used for both context and decode). For context, the wrapper internally handles
+    # the Q/K/V head_size (192) vs wrapper head_size (576) mismatch.
+    # Uses layer_idx+1000 for a separate C++ AttentionOp from decode.
+    wrapper = planner.get_or_create_wrapper(
+        layer_idx,
         num_heads,
-        num_kv_heads,  # 1
-        gen_head_size,  # 576
-        tokens_per_block,
-        max_num_requests,
-        max_context_length,
-        1.0,
-        quant_mode,
         kv_lora_rank,
         qk_nope_head_dim,
         qk_rope_head_dim,
-        kv_lora_rank,  # v_head_dim in latent space
-        sequence_length,
-        context_lengths,
-        host_past_kv_lengths,
-        host_context_lengths,
-        host_request_types,
-        host_total_kv_lens,
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        layer_idx=layer_idx + 1000,  # separate AttentionOp from decode
+        v_head_dim,
+        for_context=True,
     )
-
-    # Project from latent space to V space: attn_out_latent @ v_b_proj → output.
-    # v_b_proj = kv_b_proj_weight[num_heads, qk_nope_head_dim:, :] transposed.
-    cached_vt = planner._per_layer_pool_ptrs.get(("w_v_t_ctx", ptr))
-    if cached_vt is not None:
-        w_v_t = cached_vt
-    else:
-        w_full = (
-            kv_b_proj_weight.to(dtype)
-            if kv_b_proj_weight.dtype == torch.float8_e4m3fn
-            else kv_b_proj_weight
-        )
-        w_reshaped = w_full.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-        w_v_t = w_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
-        planner._per_layer_pool_ptrs[("w_v_t_ctx", ptr)] = w_v_t
-
-    # [num_heads, num_tokens, kv_lora_rank] @ [num_heads, kv_lora_rank, v_head_dim]
-    # → [num_heads, num_tokens, v_head_dim]
-    latent_3d = attn_out_latent.view(num_tokens, num_heads, kv_lora_rank).transpose(0, 1)
-    output_3d = output.view(num_tokens, num_heads, v_head_dim).transpose(0, 1)
-    torch.bmm(latent_3d, w_v_t, out=output_3d)
+    wrapper.plan(
+        layer_idx=layer_idx + 1000,
+        tokens_per_block=tokens_per_block,
+        max_num_requests=max_num_requests,
+        max_sequence_length=max_context_length,
+        max_context_length=max_context_length,
+        beam_width=1,
+        sequence_length=sequence_length,
+        context_lengths=context_lengths,
+        host_past_key_value_lengths=host_past_kv_lengths,
+        host_total_kv_lens=host_total_kv_lens,
+        host_context_lengths=host_context_lengths,
+        host_request_types=host_request_types,
+        kv_cache_block_offsets=kv_cache_block_offsets,
+        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+        block_ids_per_seq=planner.block_ids_per_seq,
+        latent_cache=latent_cache,
+        q_pe=q_pe_flat.view(num_tokens, num_heads * qk_rope_head_dim),
+        workspace=planner.workspace,
+        use_paged_context_fmha=False,
+        attention_input_type=AttentionInputType.context_only,
+        kv_scale_orig_quant=planner.kv_scale_orig_quant,
+        kv_scale_quant_orig=planner.kv_scale_quant_orig,
+        kv_cache_manager=planner.kv_cache_manager,
+    )
+    wrapper.run(
+        q=q,
+        k=k,
+        v=v,
+        output=output,
+        is_fused_qkv=False,
+        update_kv_cache=True,
+    )
 
     return output
 
