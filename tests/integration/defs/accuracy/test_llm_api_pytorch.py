@@ -603,7 +603,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_4gpus(self, backend: str, mocker):
-        # Not sure whether fixed or not. Just trigger ci
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         with LLM(self.MODEL_PATH,
                  guided_decoding_backend=backend,
@@ -618,7 +617,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_guided_decoding_with_eagle3(self, backend: str,
                                          eagle3_one_model: bool, mocker):
         if not eagle3_one_model:
-            pytest.skip("KV cache manager v2 only supports one-model eagle3")
+            pytest.skip("v2 does not support two model")
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -1730,9 +1729,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
-        pytest.skip(
-            "KV Cache Manager V2 is not supported for 2-model MTP. GPU: (no CI data)"
-        )
+        pytest.skip("v2 does not support two model")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
@@ -1896,7 +1893,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
     def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler, torch_compile):
-
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -5696,7 +5692,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           mocker):
         if not one_model:
             pytest.skip("v2 does not support two model")
-        pytest.skip("Hang: eagle3 2gpus one_model hangs with v2 KV cache")
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
