@@ -352,7 +352,7 @@ pipeline {
                 stage("Source Code OSS Scanning") {
                     steps {
                         script {
-                            //generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                            generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
                             pulseScanSourceCode(env.LLM_REPO, env.BRANCH_NAME)
                         }
                     }
