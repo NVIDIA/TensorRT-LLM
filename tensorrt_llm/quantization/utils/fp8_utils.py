@@ -247,37 +247,26 @@ def unpack_col_major_tma_aligned_packed_tensor(
     aligned_mn = get_tma_aligned_size(mn, 4)  # int32 element_size = 4
     aligned_k = align(k, 4)
 
-    # The forward packed 4 UE8M0 exponent bytes into each int32 via
-    # view(dtype=torch.int) in row order: byte0 = bits[0:8], byte1 =
-    # bits[8:16], byte2 = bits[16:24], byte3 = bits[24:32].
-    # Extract them with bit-shifts (works regardless of strides).
-    int_data = packed.clone()  # (b, mn, aligned_k//4)  — may be col-major
+    # The packed tensor may have col-major strides from the forward
+    # transform.  Flatten to 1-D via clone() so dtype views always work.
+    n_int32 = packed.shape[-2] * packed.shape[-1]
+    flat_int = packed.reshape(b, -1).clone()  # (b, mn * cols) contiguous
 
     # Pad mn back to aligned_mn (forward sliced [:mn])
     if mn < aligned_mn:
-        pad = torch.zeros(
-            (b, aligned_mn - mn, int_data.shape[-1]),
-            device=packed.device, dtype=torch.int,
-        )
-        int_data = torch.cat([int_data, pad], dim=-2)
+        extra = (aligned_mn - mn) * packed.shape[-1]
+        pad = torch.zeros(b, extra, device=packed.device, dtype=torch.int)
+        flat_int = torch.cat([flat_int, pad], dim=1)
+        n_int32 = aligned_mn * packed.shape[-1]
 
-    byte0 = (int_data & 0xFF).to(torch.uint8)
-    byte1 = ((int_data >> 8) & 0xFF).to(torch.uint8)
-    byte2 = ((int_data >> 16) & 0xFF).to(torch.uint8)
-    byte3 = ((int_data >> 24) & 0xFF).to(torch.uint8)
-    # Stack along a new last dim and flatten to recover (b, aligned_mn, aligned_k)
-    unpacked = torch.stack([byte0, byte1, byte2, byte3], dim=-1)
-    unpacked = unpacked.view(b, aligned_mn, aligned_k)
+    # int32 → uint8: 4 bytes per element
+    flat_bytes = flat_int.view(torch.uint8)  # (b, n_int32 * 4)
+    unpacked = flat_bytes.view(b, aligned_mn, aligned_k)
 
-    # Slice away padding
-    ue8m0 = unpacked[:, :mn, :k]
-
-    # Reconstruct float32 from UE8M0 exponent byte:
-    #   forward was: exponent = (float_bits >> 23).to(uint8)
-    #   inverse:     float_bits = exponent.to(int32) << 23
+    # Slice away padding, reconstruct float32 from UE8M0 exponent byte
+    ue8m0 = unpacked[:, :mn, :k]  # (b, mn, k) uint8
     float_bits = ue8m0.to(torch.int32) << 23
-    # Reinterpret int32 bits as float32 via a 1-D round-trip (guaranteed contiguous)
-    result = float_bits.reshape(-1).contiguous().view(torch.float32).reshape(b, mn, k)
+    result = float_bits.reshape(b, -1).view(torch.float32).reshape(b, mn, k)
 
     return result.squeeze(0) if remove_dim else result
 

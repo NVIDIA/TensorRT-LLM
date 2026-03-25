@@ -1,7 +1,8 @@
-"""Latent upsampler for two-stage LTX-2 inference.
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
-Ported from the reference LTX-2 implementation:
-  ltx_core/model/upsampler/
+"""Latent upsampler for two-stage LTX-2 inference.
 
 The upsampler spatially (and optionally temporally) up-scales VAE latents
 produced by stage 1 denoising so that stage 2 can refine at the full target

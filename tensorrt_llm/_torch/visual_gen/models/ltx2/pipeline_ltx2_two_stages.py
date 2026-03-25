@@ -1,9 +1,6 @@
-# Copyright 2025 Lightricks. All rights reserved.
-#
-# Two-stage LTX-2 pipeline: stage 1 at half spatial resolution,
-# 2x latent upsample via learned upsampler, refinement denoising
-# with distilled LoRA, then decode.
-# Reference: https://github.com/Lightricks/LTX-2
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
 import time
 from typing import Any, Dict, List, Optional, Union
@@ -637,6 +634,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         video_latents = out.video   # (B, C, F_lat, H_lat_s1, W_lat_s1)
         audio_latents = out.audio   # (B, C, F_aud, M) or None
 
+        # Non-primary CFG-parallel workers (rank != 0) receive None from
+        # decode_latents.  Stage-2 operations are local-only (no cross-rank
+        # collectives with ulysses_size=1), so non-primary workers can exit
+        # here safely while rank 0 continues with the real latents.
+        if video_latents is None:
+            return MediaOutput(video=None, audio=None)
+
         # ================================================================
         # Spatial upsample: 2x via learned upsampler
         # ================================================================
@@ -649,7 +653,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 2: refinement denoising with distilled LoRA
         # ================================================================
-        n, saved_fp4 = _apply_lora_deltas(
+        n, saved_quant_state = _apply_lora_deltas(
             self.transformer, self._distilled_lora_deltas, sign=1.0,
         )
         logger.info(f"Merged distilled LoRA ({n} params) for stage 2")
@@ -669,8 +673,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 image_cond_strength=image_cond_strength,
             )
         finally:
-            if saved_fp4:
-                _restore_lora_state(self.transformer, saved_fp4)
+            if saved_quant_state:
+                _restore_lora_state(self.transformer, saved_quant_state)
             else:
                 _apply_lora_deltas(
                     self.transformer, self._distilled_lora_deltas, sign=-1.0,

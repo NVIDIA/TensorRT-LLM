@@ -37,7 +37,6 @@ def parse_args():
     )
     parser.add_argument(
         "--output_path",
-        "--output-path",
         type=str,
         default="output.mp4",
         help="Path to save the output video with audio (supports .mp4, .gif, .png)",
@@ -52,7 +51,6 @@ def parse_args():
     )
     parser.add_argument(
         "--image_cond_strength",
-        "--image-cond-strength",
         type=float,
         default=1.0,
         help="Conditioning strength for the input image (0.0 to 1.0, default: 1.0)",
@@ -69,7 +67,6 @@ def parse_args():
     )
     parser.add_argument(
         "--steps",
-        "--num-inference-steps",
         "--num_inference_steps",
         type=int,
         default=40,
@@ -136,7 +133,6 @@ def parse_args():
     # Two-stage pipeline
     parser.add_argument(
         "--spatial_upsampler_path",
-        "--spatial-upsampler-path",
         type=str,
         default="",
         help=(
@@ -147,7 +143,6 @@ def parse_args():
     )
     parser.add_argument(
         "--distilled_lora_path",
-        "--distilled-lora-path",
         type=str,
         default="",
         help=(
