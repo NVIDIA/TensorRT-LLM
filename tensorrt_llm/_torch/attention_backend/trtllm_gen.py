@@ -992,6 +992,8 @@ class FlashInferTrtllmGenAttention:
             kv_pool,
             block_tables,
             kv_scale_pool,
+            bmm1_scale,
+            bmm2_scale,
             fmha_workspace,
             cu_q_seqlens,
             cu_kv_seqlens,
@@ -1039,6 +1041,18 @@ class FlashInferTrtllmGenAttention:
         if kv_scale_pool is not None:
             kv_block_scales = (kv_scale_pool, kv_scale_pool)
 
+        has_fp4_kv = QuantMode(params.kv_cache_quant_mode).has_fp4_kv_cache()
+        if has_fp4_kv:
+            q_processed = (
+                q_processed.view(torch.uint8)[
+                    : params.num_tokens * params.num_heads * params.head_size
+                ]
+                .view(torch.float8_e4m3fn)
+                .view(params.num_tokens, params.num_heads, params.head_size)
+            )
+        ctx_bmm1_scale = bmm1_scale if has_fp4_kv and bmm1_scale is not None else self._bmm1_scale
+        ctx_bmm2_scale = bmm2_scale if has_fp4_kv and bmm2_scale is not None else 1.0
+
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
@@ -1047,8 +1061,8 @@ class FlashInferTrtllmGenAttention:
             seq_lens=params.sequence_lengths,
             max_q_len=max_q_len,
             max_kv_len=max_kv_len,
-            bmm1_scale=self._bmm1_scale,
-            bmm2_scale=1.0,
+            bmm1_scale=ctx_bmm1_scale,
+            bmm2_scale=ctx_bmm2_scale,
             batch_size=params.batch_size,
             cum_seq_lens_q=cu_q_seqlens,
             cum_seq_lens_kv=cu_kv_seqlens,
@@ -1105,6 +1119,8 @@ class FlashInferTrtllmGenAttention:
             kv_pool,
             block_tables,
             kv_scale_pool,
+            bmm1_scale,
+            bmm2_scale,
             fmha_workspace,
             cu_seqlens,
             max_q_len,
@@ -1154,6 +1170,18 @@ class FlashInferTrtllmGenAttention:
         if kv_scale_pool is not None:
             kv_block_scales = (kv_scale_pool, kv_scale_pool)
 
+        has_fp4_kv = QuantMode(params.kv_cache_quant_mode).has_fp4_kv_cache()
+        if has_fp4_kv:
+            q_processed = (
+                q_processed.view(torch.uint8)[
+                    : params.num_tokens * params.num_heads * params.head_size
+                ]
+                .view(torch.float8_e4m3fn)
+                .view(params.num_tokens, params.num_heads, params.head_size)
+            )
+        gen_bmm1_scale = bmm1_scale if has_fp4_kv else self._bmm1_scale
+        gen_bmm2_scale = bmm2_scale if has_fp4_kv else 1.0
+
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
@@ -1162,8 +1190,8 @@ class FlashInferTrtllmGenAttention:
             seq_lens=params.sequence_lengths,
             max_seq_len=max_kv_len,
             out=params.context_buf,
-            bmm1_scale=self._bmm1_scale,
-            bmm2_scale=1.0,
+            bmm1_scale=gen_bmm1_scale,
+            bmm2_scale=gen_bmm2_scale,
             window_left=window_left,
             kv_layout=self._layout,
             sinks=params.forward.attention_sinks,

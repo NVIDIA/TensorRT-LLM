@@ -27,8 +27,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor,
-    at::Tensor, at::Tensor, int64_t, int64_t, int64_t>
+std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,
+    std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t,
+    int64_t>
 trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
     torch::Tensor context_lengths, std::optional<torch::Tensor> kv_cache_block_offsets,
     std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
@@ -58,7 +59,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     bool is_mla_enable, int64_t attention_chunk_size, int64_t multi_processor_count);
 
 std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor,
-    std::optional<at::Tensor>, int64_t, int64_t, int64_t, bool>
+    at::Tensor, at::Tensor, std::optional<at::Tensor>, int64_t, int64_t, int64_t, bool>
 trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
     std::optional<torch::Tensor> spec_decoding_generation_lengths,
     std::optional<torch::Tensor> spec_decoding_position_offsets, std::optional<torch::Tensor> kv_cache_block_offsets,
