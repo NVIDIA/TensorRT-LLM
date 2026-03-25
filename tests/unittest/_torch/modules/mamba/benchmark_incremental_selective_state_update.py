@@ -233,6 +233,11 @@ def _time_kernel_cuda_graph(
     end_events = [torch.cuda.Event(enable_timing=True, external=True)
                    for _ in range(iters)]
 
+    # Eager warmup before graph capture (triggers Triton autotune if active)
+    reset_fn()
+    run_fn()
+    torch.cuda.synchronize()
+
     reset_fn()
     torch.cuda.synchronize()
 
@@ -371,6 +376,10 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                 out=out_incr,
                 D=D, dt_bias=dt_bias, dt_softplus=True,
                 state_batch_indices=None,
+                _block_size_m=args.block_size_m,
+                _num_warps=args.num_warps,
+                _fast_forward_replay=args.fast_forward_replay,
+                _cb_output=args.cb_output,
             )
 
         median_us, p95_us, p99_us = _time_kernel(
@@ -492,6 +501,20 @@ def _parse_args() -> argparse.Namespace:
         "--output", default=None,
         help="Path to save results (file or directory). "
              "If a directory, writes benchmark_incremental_<timestamp>.txt inside it.")
+    parser.add_argument(
+        "--block-size-m", type=int, default=None,
+        help="Override BLOCK_SIZE_M for the incremental kernel (for sweep).")
+    parser.add_argument(
+        "--num-warps", type=int, default=None,
+        help="Override num_warps for the incremental kernel (for sweep).")
+    parser.add_argument(
+        "--fast-forward-replay", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use fast-forward (parallel) replay vs sequential.")
+    parser.add_argument(
+        "--cb-output", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use CB formulation for output phase vs sequential state update.")
     return parser.parse_args()
 
 

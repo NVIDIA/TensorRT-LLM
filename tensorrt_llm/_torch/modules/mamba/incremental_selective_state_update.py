@@ -115,6 +115,8 @@ def _incremental_selective_scan_update_kernel(
     HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    FAST_FORWARD_REPLAY: tl.constexpr,
+    CB_OUTPUT: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -154,20 +156,51 @@ def _incremental_selective_scan_update_kernel(
     # Phase 1: Replay old tokens to restore true base state.
     # Compile-time bounded loop (T is constexpr) enables unrolling.
     # ===================================================================
-    for t in range(T):
-        if t < prev_num_accepted_tokens:
-            old_x_ptrs = old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim
-            old_B_ptrs = old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate
-            x = tl.load(old_x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-            dt = tl.load(old_dt_ptr + t * stride_old_dt_T).to(tl.float32)
-            if HAS_DT_BIAS:
-                dt += dt_bias
-            if DT_SOFTPLUS:
-                dt = softplus(dt)
-            dA = tl.exp(A * dt)
-            B = tl.load(old_B_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
-            dB = B * dt
-            state = state * dA + dB[None, :] * x[:, None]
+    if FAST_FORWARD_REPLAY:
+        # Fast-forward: single reverse pass with no serial state dependency
+        # and no redundant dt loads.
+        #
+        # Process tokens in reverse order.  Maintain `remaining_decay` which
+        # accumulates the decay for all tokens after the current one:
+        #   state += remaining_decay * dt_t * B_t ⊗ x_t   (add contribution)
+        #   remaining_decay *= exp(A * dt_t)                (decay for earlier tokens)
+        # After the loop, apply remaining_decay to the initial state:
+        #   state *= remaining_decay
+        #
+        # Same ops as sequential (T loads each of dt/x/B, T exp, T outer products,
+        # T+1 state multiplies) but no serial dependency on state between iterations.
+        remaining_decay = 1.0
+        for t_fwd in range(T):
+            t = T - 1 - t_fwd
+            if t < prev_num_accepted_tokens:
+                old_x_ptrs = old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim
+                old_B_ptrs = old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate
+                x = tl.load(old_x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+                dt_val = tl.load(old_dt_ptr + t * stride_old_dt_T).to(tl.float32)
+                if HAS_DT_BIAS:
+                    dt_val += dt_bias
+                if DT_SOFTPLUS:
+                    dt_val = softplus(dt_val)
+                B = tl.load(old_B_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
+                state += remaining_decay * dt_val * B[None, :] * x[:, None]
+                remaining_decay *= tl.exp(A * dt_val)
+        state *= remaining_decay
+    else:
+        # Sequential replay: straightforward state update with serial dependency.
+        for t in range(T):
+            if t < prev_num_accepted_tokens:
+                old_x_ptrs = old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim
+                old_B_ptrs = old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate
+                x = tl.load(old_x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+                dt = tl.load(old_dt_ptr + t * stride_old_dt_T).to(tl.float32)
+                if HAS_DT_BIAS:
+                    dt += dt_bias
+                if DT_SOFTPLUS:
+                    dt = softplus(dt)
+                dA = tl.exp(A * dt)
+                B = tl.load(old_B_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
+                dB = B * dt
+                state = state * dA + dB[None, :] * x[:, None]
 
     # Write post-replay state back (API contract: state after replay only)
     tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
@@ -191,54 +224,133 @@ def _incremental_selective_scan_update_kernel(
         tl.extra.cuda.gdc_wait()
 
     # ===================================================================
-    # Phase 2: Process new tokens — sequential state update with output.
-    # Stores to old_* cache are interleaved to avoid a separate pass.
+    # Phase 2: Process new tokens and compute outputs.
     # ===================================================================
-    for t in range(T):
-        x_ptrs = x_ptr + t * stride_x_T + offs_m * stride_x_dim
-        B_ptrs = B_ptr + t * stride_B_T + offs_n * stride_B_dstate
-        C_ptrs = C_ptr + t * stride_C_T + offs_n * stride_C_dstate
-        out_ptrs = out_ptr + t * stride_out_T + offs_m * stride_out_dim
+    if CB_OUTPUT:
+        # CB formulation: avoid maintaining (M, dstate) state across T iterations.
+        #
+        #   out_t[m] = exp(A * cumdt_t) * (C_t · state_0)[m]
+        #            + Σ_{j≤t} CB[t,j] * decay(j→t) * dt_j * x_j[m]
+        #
+        # where CB[t,j] = C_t · B_j is a scalar dot product over dstate.
+        #
+        # Pass 1: Load and cache x, dt, B to old_* buffers + process dt values.
+        # Values stay warm in L1 cache for pass 2.
+        cumAdt = 0.0
+        for t in range(T):
+            x_t = tl.load(x_ptr + t * stride_x_T + offs_m * stride_x_dim,
+                          mask=offs_m < dim, other=0.0)
+            tl.store(old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim,
+                     x_t, mask=offs_m < dim)
 
-        x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
-        # Store x to old cache
-        tl.store(old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim,
-                 x, mask=offs_m < dim)
-        x = x.to(tl.float32)
+            dt_raw = tl.load(dt_ptr + t * stride_dt_T)
+            tl.store(old_dt_ptr + t * stride_old_dt_T, dt_raw)
 
-        dt = tl.load(dt_ptr + t * stride_dt_T)
-        # Store dt to old cache
-        tl.store(old_dt_ptr + t * stride_old_dt_T, dt)
-        dt = dt.to(tl.float32)
+            B_t = tl.load(B_ptr + t * stride_B_T + offs_n * stride_B_dstate,
+                          mask=offs_n < dstate, other=0.0)
+            tl.store(old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate,
+                     B_t, mask=offs_n < dstate)
 
-        if HAS_DT_BIAS:
-            dt += dt_bias
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        dA = tl.exp(A * dt)
-
-        B = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
-        # Store B to old cache
-        tl.store(old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate,
-                 B, mask=offs_n < dstate)
-        B = B.to(tl.float32)
-
-        C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
+        # Load D once if needed
         if HAS_D:
-            D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-        if HAS_Z:
-            z = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
-                        mask=offs_m < dim, other=0.0).to(tl.float32)
+            D = tl.load(D_ptr + offs_m * stride_D_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
 
-        dB = B * dt
-        state = state * dA + dB[None, :] * x[:, None]
+        # Pass 2: Compute outputs via CB formulation.
+        # Reload B_j/x_j/dt_j from L1 cache (warm from pass 1).
+        cumAdt = 0.0
+        for t in range(T):
+            # Load and process dt_t, accumulate cumulative A*dt
+            dt_raw_t = tl.load(dt_ptr + t * stride_dt_T).to(tl.float32)
+            dt_proc_t = dt_raw_t
+            if HAS_DT_BIAS:
+                dt_proc_t = dt_proc_t + dt_bias
+            if DT_SOFTPLUS:
+                dt_proc_t = softplus(dt_proc_t)
+            cumAdt = cumAdt + A * dt_proc_t
+            cumAdt_t = cumAdt
 
-        out = tl.sum(state * C[None, :], axis=1)
-        if HAS_D:
-            out += x * D
-        if HAS_Z:
-            out *= z * tl.sigmoid(z)
-        tl.store(out_ptrs, out, mask=offs_m < dim)
+            # Load C_t
+            C_t = tl.load(C_ptr + t * stride_C_T + offs_n * stride_C_dstate,
+                          mask=offs_n < dstate, other=0.0).to(tl.float32)
+
+            # Initial state contribution: C_t · state_0 * exp(cumAdt_t)
+            out_t = tl.sum(state * C_t[None, :], axis=1) * tl.exp(cumAdt_t)
+
+            # CB contributions from tokens j = 0..t (reload from L1 cache)
+            cumAdt_j = 0.0
+            for j in range(T):
+                if j <= t:
+                    B_j = tl.load(B_ptr + j * stride_B_T + offs_n * stride_B_dstate,
+                                  mask=offs_n < dstate, other=0.0).to(tl.float32)
+                    x_j = tl.load(x_ptr + j * stride_x_T + offs_m * stride_x_dim,
+                                  mask=offs_m < dim, other=0.0).to(tl.float32)
+                    dt_raw_j = tl.load(dt_ptr + j * stride_dt_T).to(tl.float32)
+                    dt_proc_j = dt_raw_j
+                    if HAS_DT_BIAS:
+                        dt_proc_j = dt_proc_j + dt_bias
+                    if DT_SOFTPLUS:
+                        dt_proc_j = softplus(dt_proc_j)
+                    cumAdt_j = cumAdt_j + A * dt_proc_j
+                    CB_tj = tl.sum(C_t * B_j)
+                    decay_jt = tl.exp(cumAdt_t - cumAdt_j)
+                    out_t = out_t + CB_tj * decay_jt * dt_proc_j * x_j
+
+            # Apply D and z
+            if HAS_D:
+                x_t = tl.load(x_ptr + t * stride_x_T + offs_m * stride_x_dim,
+                              mask=offs_m < dim, other=0.0).to(tl.float32)
+                out_t = out_t + x_t * D
+            if HAS_Z:
+                z_t = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
+                              mask=offs_m < dim, other=0.0).to(tl.float32)
+                out_t = out_t * z_t * tl.sigmoid(z_t)
+
+            tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim,
+                     out_t, mask=offs_m < dim)
+    else:
+        # Sequential state update: straightforward with serial dependency.
+        for t in range(T):
+            x_ptrs = x_ptr + t * stride_x_T + offs_m * stride_x_dim
+            B_ptrs = B_ptr + t * stride_B_T + offs_n * stride_B_dstate
+            C_ptrs = C_ptr + t * stride_C_T + offs_n * stride_C_dstate
+            out_ptrs = out_ptr + t * stride_out_T + offs_m * stride_out_dim
+
+            x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
+            tl.store(old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim,
+                     x, mask=offs_m < dim)
+            x = x.to(tl.float32)
+
+            dt = tl.load(dt_ptr + t * stride_dt_T)
+            tl.store(old_dt_ptr + t * stride_old_dt_T, dt)
+            dt = dt.to(tl.float32)
+
+            if HAS_DT_BIAS:
+                dt += dt_bias
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            dA = tl.exp(A * dt)
+
+            B = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
+            tl.store(old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate,
+                     B, mask=offs_n < dstate)
+            B = B.to(tl.float32)
+
+            C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
+            if HAS_D:
+                D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+            if HAS_Z:
+                z = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
+                            mask=offs_m < dim, other=0.0).to(tl.float32)
+
+            dB = B * dt
+            state = state * dA + dB[None, :] * x[:, None]
+
+            out = tl.sum(state * C[None, :], axis=1)
+            if HAS_D:
+                out += x * D
+            if HAS_Z:
+                out *= z * tl.sigmoid(z)
+            tl.store(out_ptrs, out, mask=offs_m < dim)
 
 
 def incremental_selective_state_update(
@@ -258,6 +370,10 @@ def incremental_selective_state_update(
     state_batch_indices: torch.Tensor | None =None,
     pad_slot_id: int =PAD_SLOT_ID,
     launch_with_pdl=False,
+    _block_size_m: int | None = None,
+    _num_warps: int | None = None,
+    _fast_forward_replay: bool = False,
+    _cb_output: bool = False,
 ):
     """
     Argument:
@@ -365,6 +481,10 @@ def incremental_selective_state_update(
                                ((16, 4) if dstate <= 32 else
                                 ((8, 2) if dstate <= 64 else
                                  ((8, 1) if dstate <= 128 else ((4, 1))))))
+    if _block_size_m is not None:
+        BLOCK_SIZE_M = _block_size_m
+    if _num_warps is not None:
+        num_warps = _num_warps
     tie_hdim = (A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(-1) == 0
                 and (dt_bias is None or dt_bias.stride(-1) == 0))
 
@@ -436,6 +556,8 @@ def incremental_selective_state_update(
             dt_softplus,
             BLOCK_SIZE_M,
             LAUNCH_WITH_PDL=launch_with_pdl,
+            FAST_FORWARD_REPLAY=_fast_forward_replay,
+            CB_OUTPUT=_cb_output,
             num_warps=num_warps,
             launch_pdl=launch_with_pdl,
         )
