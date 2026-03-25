@@ -300,6 +300,7 @@ def processScanResults(branchName) {
                 def reportPath = "${pwd()}/scan_report"
                 sh "ls ${reportPath}"
                 sh """
+                    printenv
                     python3 -m venv venv
                     venv/bin/pip install requests elasticsearch==7.13.4
                     venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \

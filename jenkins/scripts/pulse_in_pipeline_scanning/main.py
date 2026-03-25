@@ -61,7 +61,7 @@ def process_container_result():
     )
     if len(new_source_licenses) > 0:
         NEW_RISKY_DEPENDENCIES.append(
-            f"{len(new_source_licenses)} new source code unpermissive license"
+            f"{len(new_source_licenses)} new source code non-permissive license"
         )
 
     last_container_vulns = get_last_scan_results("container_vulnerability", args.branch)
@@ -101,7 +101,7 @@ def process_container_result():
     count_container_licenses = len(new_amd64_container_licenses + new_arm64_container_licenses)
     if count_container_licenses > 0:
         NEW_RISKY_DEPENDENCIES.append(
-            f"{count_container_licenses} new container unpermissive license"
+            f"{count_container_licenses} new container non-permissive license"
         )
 
     if NEW_RISKY_DEPENDENCIES:

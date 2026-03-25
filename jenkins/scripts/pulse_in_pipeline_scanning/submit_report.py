@@ -97,14 +97,14 @@ def submit_source_code_licenses(
             license_ids = []
             package_name = component.get("name")
             package_version = component.get("version")
-            result_key = (package_name, package_version)
-            is_new = result_key not in last_scan_result
             for lic_entry in component.get("licenses", []):
                 lic = lic_entry.get("license", {})
                 license_ids.append(lic.get("id") or lic.get("name") or "")
             gpl_licenses = [lid for lid in license_ids if lid.startswith(GPL_LICENSE_PREFIXES)]
             if not gpl_licenses:
                 continue
+            result_key = (package_name, package_version)
+            is_new = result_key not in last_scan_result
             purl = component.get("purl", "")
             supplier = component.get("supplier", {}).get("name", "") or ""
             doc = {
@@ -237,6 +237,6 @@ def submit_container_licenses(
                 f"Elasticsearch indexing errors for container licenses ({release_image})."
             )
     else:
-        print(f"No unpermissive licenses in {release_image}.")
+        print(f"No non-permissive licenses in {release_image}.")
 
     return new_items
