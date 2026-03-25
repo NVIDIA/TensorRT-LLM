@@ -223,8 +223,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("SHARED_EXPERT_GATE", tr::LoraModule::ModuleType::kSHARED_EXPERT_GATE)
         .value("MAMBA_IN_PROJ", tr::LoraModule::ModuleType::kMAMBA_IN_PROJ)
         .value("MAMBA_OUT_PROJ", tr::LoraModule::ModuleType::kMAMBA_OUT_PROJ)
-        .value("MOE_LATENT_UP", tr::LoraModule::ModuleType::kMOE_LATENT_UP)
-        .value("MOE_LATENT_DOWN", tr::LoraModule::ModuleType::kMOE_LATENT_DOWN);
+        .value("MOE_LATENT_FC1", tr::LoraModule::ModuleType::kMOE_LATENT_FC1)
+        .value("MOE_LATENT_FC2", tr::LoraModule::ModuleType::kMOE_LATENT_FC2);
 
     nb::class_<tr::LoraModule>(m, "LoraModule")
         .def(nb::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32>(),

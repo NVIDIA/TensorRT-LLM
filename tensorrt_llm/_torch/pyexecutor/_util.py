@@ -1143,6 +1143,8 @@ def create_py_executor_instance(
 
     peft_cache_manager = None
     if lora_config is not None:
+        # TODO: Refactor dimension resolution into a LoraModuleDimensions
+        # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:

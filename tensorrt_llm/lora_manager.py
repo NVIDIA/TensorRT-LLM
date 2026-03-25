@@ -682,8 +682,8 @@ class LoraManager(object):
         "shared_expert_gate": 21,
         "mamba_in_proj": 22,
         "mamba_out_proj": 23,
-        "moe_latent_up": 24,
-        "moe_latent_down": 25,
+        "moe_latent_fc1": 24,
+        "moe_latent_fc2": 25,
     }
 
     def __init__(

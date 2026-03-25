@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/common/assert.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -29,9 +30,10 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
     auto const sharedExpertHidden = sharedExpertHiddenSize > 0 ? sharedExpertHiddenSize * tpSize : mlpHidden;
     auto const moeHidden = moeHiddenSize > 0 ? moeHiddenSize * tpSize : mlpHidden;
     // Mamba dimensions: in_proj outputs d_in_proj, out_proj inputs d_inner
-    // Fall back to mlpHidden if not specified (for backward compatibility)
-    auto const mambaInProj = mambaInProjSize > 0 ? mambaInProjSize * tpSize : mlpHidden;
-    auto const mambaInner = mambaInnerSize > 0 ? mambaInnerSize * tpSize : mlpHidden;
+    TLLM_CHECK_WITH_INFO((mambaInProjSize > 0) == (mambaInnerSize > 0),
+        "mambaInProjSize and mambaInnerSize must both be zero or both be non-zero");
+    auto const mambaInProj = mambaInProjSize * tpSize;
+    auto const mambaInner = mambaInnerSize * tpSize;
     // MoE latent projections are replicated (not TP-sharded), so moeLatentSize
     // is the actual per-GPU dimension and should not be scaled by tpSize.
     auto const moeLatent = moeLatentSize;
@@ -85,8 +87,8 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMAMBA_IN_PROJ: modules.emplace_back(t, hidden, mambaInProj, false, true, -1, 0); break;
         case ModuleType::kMAMBA_OUT_PROJ: modules.emplace_back(t, mambaInner, hidden, false, true, 1, -1); break;
         // MoE latent projections: replicated (not TP-sharded), no TP split dims
-        case ModuleType::kMOE_LATENT_UP: modules.emplace_back(t, hidden, moeLatent, false, true, -1, -1); break;
-        case ModuleType::kMOE_LATENT_DOWN: modules.emplace_back(t, moeLatent, hidden, false, true, -1, -1); break;
+        case ModuleType::kMOE_LATENT_FC1: modules.emplace_back(t, hidden, moeLatent, false, true, -1, -1); break;
+        case ModuleType::kMOE_LATENT_FC2: modules.emplace_back(t, moeLatent, hidden, false, true, -1, -1); break;
         case ModuleType::kINVALID: throw std::runtime_error("Invalid LoRA module " + moduleName);
         }
     }

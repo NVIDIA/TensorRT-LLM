@@ -250,10 +250,10 @@ class NemotronHMOE(nn.Module):
         # These layers should NOT be TP-sharded to ensure MoE receives
         # full latent representation. They are replicated across all GPUs.
         if self.use_latent_moe:
-            # LoRA for fc1_latent_proj (only create when LoRA is configured)
-            self.fc1_latent_lora = (LoraLayer([LoraModuleType.MOE_LATENT_UP], [
-                self.moe_hidden_size
-            ]) if model_config.lora_config is not None else None)
+            self.fc1_latent_lora = None
+            if model_config.lora_config is not None:
+                self.fc1_latent_lora = LoraLayer(
+                    [LoraModuleType.MOE_LATENT_FC1], [self.moe_hidden_size])
             self.fc1_latent_proj = Linear(
                 in_features=self.hidden_size,
                 out_features=self.moe_hidden_size,
@@ -264,10 +264,10 @@ class NemotronHMOE(nn.Module):
                 skip_create_weights_in_init,
                 lora=self.fc1_latent_lora,
             )
-            # LoRA for fc2_latent_proj (only create when LoRA is configured)
-            self.fc2_latent_lora = (
-                LoraLayer([LoraModuleType.MOE_LATENT_DOWN], [self.hidden_size])
-                if model_config.lora_config is not None else None)
+            self.fc2_latent_lora = None
+            if model_config.lora_config is not None:
+                self.fc2_latent_lora = LoraLayer(
+                    [LoraModuleType.MOE_LATENT_FC2], [self.hidden_size])
             self.fc2_latent_proj = Linear(
                 in_features=self.moe_hidden_size,
                 out_features=self.hidden_size,
@@ -407,6 +407,10 @@ class NemotronHLayer(DecoderLayer):
                 f"Supported sizes: {_SUPPORTED_NVFP4_HIDDEN_SIZES}. Using non-fused path.",
                 key=f"disable_nvfp4_rmsnorm_with_{config.hidden_size}",
             )
+            self.is_nvfp4 = False
+        # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
+        # Disable fused RMSNorm+NVFP4 when LoRA is configured.
+        if self.is_nvfp4 and model_config.lora_config is not None:
             self.is_nvfp4 = False
 
         # fuse_allreduce_norm is the model-level flag.  When enabled, ALL
@@ -567,7 +571,9 @@ class NemotronHLayer(DecoderLayer):
         # skip their own AllReduce (it is handled by pre_allreduce /
         # final_allreduce instead).  MLP/Mamba ignore this kwarg; their
         # reduce_output was set at init time.
-        mixer_kwargs = dict(spec_metadata=spec_metadata, lora_params=lora_params, **kwargs)
+        mixer_kwargs = dict(spec_metadata=spec_metadata,
+                            lora_params=lora_params,
+                            **kwargs)
         if self.fuse_allreduce_norm:
             mixer_kwargs['all_reduce_params'] = AllReduceParams(
                 enable_allreduce=False)
@@ -800,8 +806,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 "mamba_out_proj",
                 "shared_expert_h_to_4h",
                 "shared_expert_4h_to_h",
-                "moe_latent_up",
-                "moe_latent_down",
+                "moe_latent_fc1",
+                "moe_latent_fc2",
             ],
             trtllm_modules_to_hf_modules={
                 "attn_q": "q_proj",
@@ -812,8 +818,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 "mamba_out_proj": "out_proj",
                 "shared_expert_h_to_4h": "shared_experts.up_proj",
                 "shared_expert_4h_to_h": "shared_experts.down_proj",
-                "moe_latent_up": "fc1_latent_proj",
-                "moe_latent_down": "fc2_latent_proj",
+                "moe_latent_fc1": "fc1_latent_proj",
+                "moe_latent_fc2": "fc2_latent_proj",
             },
         )
 

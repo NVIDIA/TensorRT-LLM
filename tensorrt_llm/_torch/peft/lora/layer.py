@@ -81,8 +81,8 @@ class LoraModuleType(IntEnum):
     MAMBA_IN_PROJ = 22  # Mamba input projection
     MAMBA_OUT_PROJ = 23  # Mamba output projection
 
-    MOE_LATENT_UP = 24  # MoE latent up projection (fc1_latent_proj)
-    MOE_LATENT_DOWN = 25  # MoE latent down projection (fc2_latent_proj)
+    MOE_LATENT_FC1 = 24  # MoE latent fc1 projection (fc1_latent_proj)
+    MOE_LATENT_FC2 = 25  # MoE latent fc2 projection (fc2_latent_proj)
 
     def __str__(self):
         """Return the name of the enum value."""
@@ -129,7 +129,7 @@ class LoraModuleType(IntEnum):
         """Check if this is a Mixture of Experts (MoE) module type."""
         return self in {
             self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER,
-            self.MOE_LATENT_UP, self.MOE_LATENT_DOWN
+            self.MOE_LATENT_FC1, self.MOE_LATENT_FC2
         }
 
     @property

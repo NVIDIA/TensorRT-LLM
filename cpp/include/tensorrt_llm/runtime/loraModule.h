@@ -55,8 +55,8 @@ public:
         kSHARED_EXPERT_GATE = 21,
         kMAMBA_IN_PROJ = 22,
         kMAMBA_OUT_PROJ = 23,
-        kMOE_LATENT_UP = 24,
-        kMOE_LATENT_DOWN = 25,
+        kMOE_LATENT_FC1 = 24,
+        kMOE_LATENT_FC2 = 25,
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
@@ -253,10 +253,10 @@ public:
             return ModuleType::kMAMBA_IN_PROJ;
         else if (name == "mamba_out_proj")
             return ModuleType::kMAMBA_OUT_PROJ;
-        else if (name == "moe_latent_up")
-            return ModuleType::kMOE_LATENT_UP;
-        else if (name == "moe_latent_down")
-            return ModuleType::kMOE_LATENT_DOWN;
+        else if (name == "moe_latent_fc1")
+            return ModuleType::kMOE_LATENT_FC1;
+        else if (name == "moe_latent_fc2")
+            return ModuleType::kMOE_LATENT_FC2;
         else
             return ModuleType::kINVALID;
     }
@@ -289,8 +289,8 @@ public:
         case ModuleType::kSHARED_EXPERT_GATE: return "shared_expert_gate";
         case ModuleType::kMAMBA_IN_PROJ: return "mamba_in_proj";
         case ModuleType::kMAMBA_OUT_PROJ: return "mamba_out_proj";
-        case ModuleType::kMOE_LATENT_UP: return "moe_latent_up";
-        case ModuleType::kMOE_LATENT_DOWN: return "moe_latent_down";
+        case ModuleType::kMOE_LATENT_FC1: return "moe_latent_fc1";
+        case ModuleType::kMOE_LATENT_FC2: return "moe_latent_fc2";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";

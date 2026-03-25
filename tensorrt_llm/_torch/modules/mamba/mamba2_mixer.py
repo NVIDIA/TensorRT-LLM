@@ -112,9 +112,10 @@ class Mamba2Mixer(nn.Module):
         self.slot_mapping = None
         self.is_paged_state = False
 
-        self.in_proj_lora = (LoraLayer([LoraModuleType.MAMBA_IN_PROJ],
-                                       [d_in_proj // tp_size])
-                             if config.lora_config is not None else None)
+        self.in_proj_lora = None
+        if config.lora_config is not None:
+            self.in_proj_lora = LoraLayer([LoraModuleType.MAMBA_IN_PROJ],
+                                          [d_in_proj // tp_size])
 
         # in_proj
         self.in_proj = Linear(
@@ -191,8 +192,10 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
-        # Determine if NVFP4 quantization is enabled
-        self.is_nvfp4 = (config.quant_config is not None
+        # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
+        # Disable fused RMSNorm+NVFP4 when LoRA is configured.
+        self.is_nvfp4 = (config.lora_config is None
+                         and config.quant_config is not None
                          and config.quant_config.quant_mode is not None
                          and config.quant_config.quant_mode.has_nvfp4())
 
@@ -208,9 +211,10 @@ class Mamba2Mixer(nn.Module):
             is_nvfp4=self.is_nvfp4,
         )
 
-        self.out_proj_lora = (LoraLayer([LoraModuleType.MAMBA_OUT_PROJ],
-                                        [d_model])
-                              if config.lora_config is not None else None)
+        self.out_proj_lora = None
+        if config.lora_config is not None:
+            self.out_proj_lora = LoraLayer([LoraModuleType.MAMBA_OUT_PROJ],
+                                           [d_model])
 
         # out_proj
         self.out_proj = Linear(
@@ -234,15 +238,7 @@ class Mamba2Mixer(nn.Module):
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
-        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant.
-
-        Called from post_load_weights (weights don't exist during __init__).
-        """
-        # Don't use fused NVFP4 output if LoRA is enabled on out_proj.
-        # LoRA computation requires a regular tensor, not Fp4QuantizedTensor.
-        if getattr(self.out_proj, 'lora', None) is not None:
-            self.norm.is_nvfp4 = False
-            return
+        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
 
         if getattr(self.out_proj, 'input_scale', None) is not None:
             self.norm.nvfp4_scale = self.out_proj.input_scale

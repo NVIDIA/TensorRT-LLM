@@ -238,7 +238,7 @@ def test_moe_latent_lora_modules_use_correct_dimensions():
     """Test for correct dimensions of MoE latent projection layers."""
     hidden, mlp_hidden, moe_latent, tp = 6144, 3072, 1024, 2
     up, down = _tb.LoraModule.create_lora_modules(
-        lora_module_names=["moe_latent_up", "moe_latent_down"],
+        lora_module_names=["moe_latent_fc1", "moe_latent_fc2"],
         hidden_size=hidden,
         mlp_hidden_size=mlp_hidden,
         num_attention_heads=32,
