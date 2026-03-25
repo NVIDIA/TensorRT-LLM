@@ -747,23 +747,22 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        recurrent_state = ssm_states[cache_indices]
-
-        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+        core_attn_out, _ = chunk_gated_delta_rule(
             q=query,
             k=key,
             v=value,
             g=g,
             beta=beta,
-            initial_state=recurrent_state,
-            output_final_state=True,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices,
+            # This path writes recurrent state directly back into the shared
+            # pool; callers **must** ensure cache_indices do not alias live slots.
+            inplace_indexed_state_update=True,
+            output_final_state=False,
             cu_seqlens=query_start_loc_long,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
-        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype,
-                                                       copy=False)
-        ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
