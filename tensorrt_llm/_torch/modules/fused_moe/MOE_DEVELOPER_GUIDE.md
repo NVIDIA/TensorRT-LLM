@@ -4,7 +4,7 @@
 
 ### MoE Layer in Model
 
-```
+```text
 Input Hidden States
        │
        ├──────────────────────┐
@@ -35,7 +35,7 @@ Input Hidden States
 
 ConfigurableMoE composes independent components via composition (not inheritance):
 
-```
+```text
 ConfigurableMoE
 ├── Backend (pure computation): routing → quantize → FC1 → activation → FC2
 ├── Communication (distributed): dispatch tokens → compute → combine results
@@ -45,7 +45,7 @@ ConfigurableMoE
 
 Execution flow within ConfigurableMoE (`_forward_chunk_impl`):
 
-```
+```text
 routing() → [EPLB] → quantize/dispatch (adaptive order) → backend.run_moe() → combine()
                               │                                                    │
                        Communication                                        Communication
