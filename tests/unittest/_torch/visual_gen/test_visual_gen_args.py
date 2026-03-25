@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
+    CacheDiTConfig,
     CompilationConfig,
     CudaGraphConfig,
     ParallelConfig,
@@ -72,6 +73,41 @@ class TestVisualGenArgsStrictValidation:
             )
 
 
+class TestVisualGenArgsCacheBackend:
+    def test_cache_dit_conflicts_with_teacache_enabled(self):
+        with pytest.raises(ValidationError, match="cache_dit"):
+            VisualGenArgs(
+                checkpoint_path="/tmp/model",
+                cache_backend="cache_dit",
+                teacache=TeaCacheConfig(enable_teacache=True),
+            )
+
+    def test_teacache_backend_requires_enable_teacache(self):
+        with pytest.raises(ValidationError, match="teacache"):
+            VisualGenArgs(
+                checkpoint_path="/tmp/model",
+                cache_backend="teacache",
+                teacache=TeaCacheConfig(enable_teacache=False),
+            )
+
+    def test_none_backend_rejects_teacache_enabled(self):
+        with pytest.raises(ValidationError, match="cache_backend"):
+            VisualGenArgs(
+                checkpoint_path="/tmp/model",
+                cache_backend="none",
+                teacache=TeaCacheConfig(enable_teacache=True),
+            )
+
+    def test_cache_dit_nested_config(self):
+        args = VisualGenArgs(
+            checkpoint_path="/tmp/model",
+            cache_backend="cache_dit",
+            cache_dit=CacheDiTConfig(Fn_compute_blocks=2, max_warmup_steps=4),
+        )
+        assert args.cache_dit.Fn_compute_blocks == 2
+        assert args.cache_dit.max_warmup_steps == 4
+
+
 class TestVisualGenArgsFromDict:
     """from_dict now enforces strict validation (no silent drops)."""
 
@@ -99,6 +135,7 @@ class TestVisualGenArgsFromDict:
             {
                 "checkpoint_path": "/tmp/model",
                 "attention": {"backend": "TRTLLM"},
+                "cache_backend": "teacache",
                 "teacache": {"enable_teacache": True, "teacache_thresh": 0.3},
             }
         )
