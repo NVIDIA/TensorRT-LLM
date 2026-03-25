@@ -254,14 +254,14 @@ files = [
 
 [[package]]
 name = "anyio"
-version = "4.12.1"
+version = "4.13.0"
 description = "High-level concurrency and networking framework on top of asyncio or Trio"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "anyio-4.12.1-py3-none-any.whl", hash = "sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c"},
-    {file = "anyio-4.12.1.tar.gz", hash = "sha256:41cfcc3a4c85d3f05c932da7c26d0201ac36f72abd4435ba90d0464a3ffed703"},
+    {file = "anyio-4.13.0-py3-none-any.whl", hash = "sha256:08b310f9e24a9594186fd75b4f73f4a4152069e3853f1ed8bfbf58369f4ad708"},
+    {file = "anyio-4.13.0.tar.gz", hash = "sha256:334b70e641fd2221c1505b3890c69882fe4a2df910cba14d97019b90b24439dc"},
 ]
 
 [package.dependencies]
@@ -270,7 +270,7 @@ idna = ">=2.8"
 typing_extensions = {version = ">=4.5", markers = "python_version < \"3.13\""}
 
 [package.extras]
-trio = ["trio (>=0.31.0) ; python_version < \"3.10\"", "trio (>=0.32.0) ; python_version >= \"3.10\""]
+trio = ["trio (>=0.32.0)"]
 
 [[package]]
 name = "apache-tvm-ffi"
@@ -504,14 +504,14 @@ urllib3 = ">=2"
 
 [[package]]
 name = "build"
-version = "1.4.0"
+version = "1.4.1"
 description = "A simple, correct Python build frontend"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "build-1.4.0-py3-none-any.whl", hash = "sha256:6a07c1b8eb6f2b311b96fcbdbce5dab5fe637ffda0fd83c9cac622e927501596"},
-    {file = "build-1.4.0.tar.gz", hash = "sha256:f1b91b925aa322be454f8330c6fb48b465da993d1e7e7e6fa35027ec49f3c936"},
+    {file = "build-1.4.1-py3-none-any.whl", hash = "sha256:21c81f7a0fa423f0da229335c5c2a605967fbfc9af3c4b6ecd368265ed59c6bc"},
+    {file = "build-1.4.1.tar.gz", hash = "sha256:30adeb28821e573a49b556030d8c84186d112f6a38b12fa5476092c4544ae55a"},
 ]
 
 [package.dependencies]
@@ -1076,13 +1076,13 @@ cu13 = ["cuda-bindings[all] (==13.*)"]
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.4.4"
+version = "1.5.0"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_pathfinder-1.4.4-py3-none-any.whl", hash = "sha256:1a9e7feccae0d969ad88545d0462f2ed2750df8e6732309798dc1e1ca603a28b"},
+    {file = "cuda_pathfinder-1.5.0-py3-none-any.whl", hash = "sha256:498f90a9e9de36044a7924742aecce11c50c49f735f1bc53e05aa46de9ea4110"},
 ]
 
 [[package]]
@@ -3088,14 +3088,14 @@ dill = ">=0.3.8"
 
 [[package]]
 name = "narwhals"
-version = "2.18.0"
+version = "2.18.1"
 description = "Extremely lightweight compatibility layer between dataframe libraries"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "narwhals-2.18.0-py3-none-any.whl", hash = "sha256:68378155ee706ac9c5b25868ef62ecddd62947b6df7801a0a156bc0a615d2d0d"},
-    {file = "narwhals-2.18.0.tar.gz", hash = "sha256:1de5cee338bc17c338c6278df2c38c0dd4290499fcf70d75e0a51d5f22a6e960"},
+    {file = "narwhals-2.18.1-py3-none-any.whl", hash = "sha256:a0a8bb80205323851338888ba3a12b4f65d352362c8a94be591244faf36504ad"},
+    {file = "narwhals-2.18.1.tar.gz", hash = "sha256:652a1fcc9d432bbf114846688884c215f17eb118aa640b7419295d2f910d2a8b"},
 ]
 
 [package.extras]
@@ -5859,14 +5859,14 @@ files = [
 
 [[package]]
 name = "smg-grpc-proto"
-version = "0.4.4"
+version = "0.4.5"
 description = "SMG gRPC proto definitions for SGLang, vLLM, and TRT-LLM"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "smg_grpc_proto-0.4.4-py3-none-any.whl", hash = "sha256:5aea8ff0bdf725afc377f7553b8234e4d5d7ca62373c2bcf20459273e5e6e3f3"},
-    {file = "smg_grpc_proto-0.4.4.tar.gz", hash = "sha256:617ec15bcffa356c8821936a632b4bf5987f51e9ee4b2d30e7ee0321515b0f28"},
+    {file = "smg_grpc_proto-0.4.5-py3-none-any.whl", hash = "sha256:0a1a0fa1a9184b872181753cfacbd9b1829b852f39ea56c60561d756d2005dc2"},
+    {file = "smg_grpc_proto-0.4.5.tar.gz", hash = "sha256:55dfac50373a83f22b63512d6b4fcf8280d97454071147c300d60ae58d14ca36"},
 ]
 
 [package.dependencies]
@@ -6943,4 +6943,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "609a6801df396037ee4bf3aa60b630ca78f5d0e8454978259a2b0793e2c3b4fa"
+content-hash = "7b36b116970d1441b1bff46f0de5b5002e706677da2260613925195af204aacb"
