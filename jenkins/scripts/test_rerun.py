@@ -51,11 +51,8 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
     return ran_tests
 
 
-def generate_rerun_tests_list(outdir,
-                              xml_filename,
-                              failSignaturesList,
-                              test_list_filename,
-                              unfinished_test_filename):
+def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
+                              test_list_filename, unfinished_test_filename):
     # Generate rerun test lists:
     # Part 1. Tests that are failed or errored in the test results xml file:
     #    - If test duration <= 5 min: add to rerun_2.txt (will rerun 2 times)
@@ -63,7 +60,7 @@ def generate_rerun_tests_list(outdir,
     #    - If test duration > 10 min but contains fail signatures in error message: add to rerun_1.txt
     #    - If test duration > 10 min and no known failure signatures: add to rerun_0.txt (will not rerun)
     # Part 2. Tests that are unfinished:
-    #    add to rerun_1.txt (will rerun 1 time)
+    #    add to rerun_0.txt (will not rerun)
     # Part 3. Tests that are not run
     #    add to rerun_1.txt (will rerun 1 time)
     print(failSignaturesList)
@@ -86,19 +83,16 @@ def generate_rerun_tests_list(outdir,
                 tests.append(test_name)
                 test_to_line[test_name] = line
 
-    # Map test name to test line in unfinished_test_filename.
-    # e.g. unfinished_test_to_line: {"test_name": "A10-PyTorch-1/test_name"}
+    # Get tests that terminated unexpectedly from unfinished_test_filename.
     unfinished_tests = []
-    unfinished_test_to_line = {}
     if unfinished_test_filename and os.path.exists(unfinished_test_filename):
         with open(unfinished_test_filename, 'r') as f:
             for raw in f:
                 line = raw.strip()
                 if not line:
                     continue
-                test_name = line.split('/')[-1]
+                test_name = line.split('/', 1)[1] if '/' in line else line
                 unfinished_tests.append(test_name)
-                unfinished_test_to_line[test_name] = line
 
     with open(rerun_0_filename, 'w') as rerun_0_file, \
          open(rerun_1_filename, 'w') as rerun_1_file, \
@@ -111,22 +105,12 @@ def generate_rerun_tests_list(outdir,
         for test in tests:
             # Part 2: process unfinished tests
             if test in unfinished_tests:
-                rerun_1_file.write(test_to_line[test] + '\n')
-                print(test + " will rerun 1 time, because it is unfinished")
-                unfinished_test_to_line.pop(test)
+                rerun_0_file.write(test_to_line[test] + '\n')
+                print(test + " will not rerun because it terminated unexpectedly.")
             # Part 3: process tests that did not run
             elif test not in ran_tests:
                 rerun_1_file.write(test_to_line[test] + '\n')
                 print(test + " will rerun 1 time, because it did not run")
-
-    # Rewrite unfinished_test_file from entries still in unfinished_test_to_line
-    # (matched unfinished tests were popped inside the loop above).
-    if unfinished_test_filename:
-        remaining_lines = list(unfinished_test_to_line.values())
-        print(f"Remaining unfinished tests: {remaining_lines}")
-        with open(unfinished_test_filename, 'w') as f:
-            if remaining_lines:
-                f.write('\n'.join(remaining_lines) + '\n')
 
     # Remove empty files
     for filename in [rerun_0_filename, rerun_1_filename, rerun_2_filename]:
