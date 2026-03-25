@@ -243,5 +243,4 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_VLModel):
         weights = weight_mapper.preprocess_weights(weights)
         if not _is_disagg():
             self.mm_encoder.load_weights(weights)
-        print(self.llm.config)
         self.llm.load_weights(weights, weight_mapper)
