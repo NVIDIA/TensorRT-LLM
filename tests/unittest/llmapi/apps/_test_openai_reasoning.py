@@ -9,29 +9,47 @@ from .openai_server import RemoteOpenAIServer
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-# yapf: disable
-@pytest.fixture(scope="module",
-                params=["DeepSeek-R1-Distill-Qwen-1.5B",
-                        "Qwen3/Qwen3-0.6B"])
-def model_name(request) -> str:
-    return request.param
-# yapf: enable
-
-
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
-def backend(request):
+# Note: Qwen3 model is not supported with TRT backend.
+# TRT backend with enabled beam search can run test cases with and without beam search.
+@pytest.fixture(
+    scope="module",
+    params=[
+        ("DeepSeek-R1-Distill-Qwen-1.5B", "trt", True),
+        ("DeepSeek-R1-Distill-Qwen-1.5B", "pytorch", False),
+        ("DeepSeek-R1-Distill-Qwen-1.5B", "pytorch", True),
+        ("Qwen3/Qwen3-0.6B", "pytorch", False),
+        ("Qwen3/Qwen3-0.6B", "pytorch", True),
+    ],
+    ids=lambda p: f"{p[0]}-{p[1]}-{'with' if p[2] else 'no'}_beam_search")
+def model_name_and_backend_and_beam_search(request):
     return request.param
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str):
-    # Skip specific model/backend combinations
-    if model_name == "Qwen3/Qwen3-0.6B" and backend == "trt":
-        pytest.skip("Qwen3 model not supported with trt backend")
+def model_name(model_name_and_backend_and_beam_search) -> str:
+    return model_name_and_backend_and_beam_search[0]
 
+
+@pytest.fixture(scope="module")
+def backend(model_name_and_backend_and_beam_search) -> str:
+    return model_name_and_backend_and_beam_search[1]
+
+
+@pytest.fixture(scope="module")
+def enable_beam_search(model_name_and_backend_and_beam_search) -> bool:
+    return model_name_and_backend_and_beam_search[2]
+
+
+@pytest.fixture(scope="module")
+def max_beam_width(enable_beam_search):
+    return 2 if enable_beam_search else 1
+
+
+@pytest.fixture(scope="module")
+def server(model_name: str, backend: str, enable_beam_search: bool,
+           max_beam_width: int):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
-    max_beam_width = 1 if backend == "pytorch" else 2
     args.extend(["--max_beam_width", str(max_beam_width)])
     args.extend(["--max_batch_size", "2", "--max_seq_len", "1024"])
     if model_name.startswith("Qwen3"):
@@ -47,12 +65,20 @@ def client(server: RemoteOpenAIServer) -> openai.OpenAI:
     return server.get_client()
 
 
-def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str):
+@pytest.mark.parametrize("use_beam_search", [False, True])
+def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str,
+                          enable_beam_search: bool, max_beam_width: int,
+                          use_beam_search: bool):
+    if backend == "pytorch" and use_beam_search != enable_beam_search:
+        pytest.skip("PyTorch backend fixes beam width on startup.")
+    if backend == "trt" and not use_beam_search:
+        pytest.skip("Reduce test cases.")
+
     messages = [{"role": "user", "content": "hi"}]
-    if backend == "pytorch":
+    if not use_beam_search:
         n, extra_body = 1, None
     else:
-        n, extra_body = 2, dict(use_beam_search=True)
+        n, extra_body = max_beam_width, dict(use_beam_search=True)
     resp = client.chat.completions.create(
         model=model_name,
         messages=messages,
@@ -92,7 +118,12 @@ async def process_stream(
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_reasoning_parser_streaming(async_client: openai.AsyncOpenAI,
-                                          model_name: str):
+                                          model_name: str, backend: str,
+                                          enable_beam_search: bool):
+    # Note: TRT backend with enabled beam search can run this test case without using beam search.
+    if backend == "pytorch" and enable_beam_search:
+        pytest.skip("Beam search is not supported in this test case.")
+
     messages = [{"role": "user", "content": "hi"}]
     stream = await async_client.chat.completions.create(
         model=model_name,
