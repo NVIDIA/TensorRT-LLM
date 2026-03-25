@@ -516,7 +516,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Indexed by [local_layer_idx, generation_position, :].
         # The graph captures reads/writes on these stable-address buffers;
         # each replay's write becomes the next replay's read (feedback loop).
-        self.enable_heuristic_topk = self.sparse_attention_config.enable_heuristic_topk
+        self.enable_heuristic_topk = (
+            self.sparse_attention_config.enable_heuristic_topk
+            and get_sm_version() >= 100)
         if self.enable_heuristic_topk:
             num_local_layers = self.kv_cache_manager.num_local_layers
             self.heuristic_prev_topk = self.get_empty(
@@ -1073,7 +1075,9 @@ class Indexer(nn.Module):
                                   and IS_CUTLASS_DSL_AVAILABLE)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
-        self._enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+        self._enable_heuristic_topk = (
+            sparse_attention_config.enable_heuristic_topk
+            and get_sm_version() >= 100)
 
         if self.use_cute_dsl_topk and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops

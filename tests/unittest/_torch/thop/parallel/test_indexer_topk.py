@@ -938,6 +938,7 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
 # ============================================================================
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not _HAS_SCIPY, reason="scipy required for distribution tests")
 @pytest.mark.parametrize("success_ratio", [0.5, 0.9])
 @pytest.mark.parametrize("dist_cfg", _DECODE_DIST_CONFIGS, ids=_DECODE_DIST_IDS)
