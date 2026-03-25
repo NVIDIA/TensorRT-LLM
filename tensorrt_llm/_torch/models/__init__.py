@@ -11,6 +11,7 @@ from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
+from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
@@ -54,6 +55,7 @@ __all__ = [
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
+    "Exaone4_5_ForConditionalGeneration",
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",

@@ -80,6 +80,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         self.temporal_patch_size = getattr(self.config.vision_config,
                                            'temporal_patch_size', 1)
 
+    def get_vocab_size(self) -> int:
+        """Return the vocab size of the model."""
+        return self.config.text_config.vocab_size
+
     @property
     def config(self) -> PretrainedConfig:
         return self._config
@@ -521,8 +525,9 @@ class Qwen2_5_VLVisionAttention(Attention):
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
-            max_position_embeddings=model_config.pretrained_config.text_config.
+            num_key_value_heads=config.num_key_value_heads
+            if config.num_key_value_heads is not None else config.num_heads,
+            max_position_embeddings=model_config.pretrained_config.
             max_position_embeddings,
             bias=True,
             pos_embd_params=None,
@@ -536,6 +541,32 @@ class Qwen2_5_VLVisionAttention(Attention):
             # sub-config onto the top-level pretrained_config.
             head_dim=config.hidden_size // config.num_heads,
         )
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor],
+                   position_embeddings: Tuple[torch.Tensor, torch.Tensor]):
+        seq_len, _ = q.size()
+        q = q.view(seq_len, -1, self.head_dim)
+        k = k.view(seq_len, -1, self.head_dim)
+        v = v.view(seq_len, -1, self.head_dim)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q, k, v = q.reshape(seq_len, -1), k.reshape(seq_len,
+                                                    -1), v.reshape(seq_len, -1)
+        return q, k, v
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor],
+                   position_embeddings: Tuple[torch.Tensor, torch.Tensor]):
+        seq_len, _ = q.size()
+        q = q.view(seq_len, -1, self.head_dim)
+        k = k.view(seq_len, -1, self.head_dim)
+        v = v.view(seq_len, -1, self.head_dim)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q, k, v = q.reshape(seq_len, -1), k.reshape(seq_len,
+                                                    -1), v.reshape(seq_len, -1)
+        return q, k, v
 
     def forward(
         self,
@@ -552,16 +583,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv, None, None
         q, k, v = self.split_qkv(q, k, v)
-        seq_length = hidden_states.shape[0]
-        q, k, v = (qkv.reshape(seq_length, 3, self.num_heads,
-                               -1).permute(1, 0, 2, 3).unbind(0))
 
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-        q, k, v = q.reshape(seq_length,
-                            -1), k.reshape(seq_length,
-                                           -1), v.reshape(seq_length, -1)
+        q, k, v = self.apply_rope(q, k, v, position_embeddings)
         q, k, v = self.convert_qkv(q, k, v)
+
         output = self.forward_impl(q=q,
                                    k=k,
                                    v=v,
