@@ -309,9 +309,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                   **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        masks = (input_ids == self.config.image_token_id) | (
-            input_ids == self.config.vision_token_id) | (
-                input_ids == self.config.video_token_id)
+        masks = torch.zeros_like(input_ids, dtype=torch.bool)
+        for attr in ("image_token_id", "vision_token_id", "video_token_id"):
+            token_id = getattr(self.config, attr, None)
+            if token_id is not None:
+                masks |= input_ids == token_id
         input_ids[masks] = self.tllm_multimodal_token_id
         return input_ids
 

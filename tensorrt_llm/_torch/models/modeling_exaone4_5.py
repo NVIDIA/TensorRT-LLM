@@ -15,10 +15,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
-from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
@@ -46,6 +46,27 @@ from .modeling_qwen2vl import (
     Qwen2VLModelBase,
 )
 from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
+
+
+class Exaone4_5Config(PretrainedConfig):
+    """VLM config: nested ``text_config`` / ``vision_config`` from JSON become real sub-configs."""
+
+    model_type = "exaone4_5"
+
+    def __init__(
+        self,
+        text_config: Optional[Union[PretrainedConfig, dict]] = None,
+        vision_config: Optional[Union[PretrainedConfig, dict]] = None,
+        **kwargs,
+    ):
+        if isinstance(text_config, dict):
+            text_config = PretrainedConfig.from_dict(copy.deepcopy(text_config))
+        if isinstance(vision_config, dict):
+            vision_config = PretrainedConfig.from_dict(copy.deepcopy(vision_config))
+        super().__init__(text_config=text_config, vision_config=vision_config, **kwargs)
+
+
+AutoConfig.register(Exaone4_5Config.model_type, Exaone4_5Config)
 
 
 class Exaone4_5InputProcessor(Qwen2VLInputProcessorBase):
@@ -118,7 +139,6 @@ class Exaone4_5_VLModel(Qwen2VLModelBase):
     ) -> None:
         self.original_arch = model_config.pretrained_config.architectures[0]
 
-        # model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
 
         self._supports_sdpa = True
@@ -131,8 +151,8 @@ class Exaone4_5_VLModel(Qwen2VLModelBase):
             raise ValueError("Exaone4.5 only supports TRTLLM backend")
 
         llm_model_config = copy.deepcopy(model_config)
-        # llm_model_config.pretrained_config.architectures = ["Exaone4ForCausalLM"]
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.text_config
+        llm_model_config.pretrained_config.tie_word_embeddings = False
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         if not _is_disagg():
@@ -223,4 +243,5 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_VLModel):
         weights = weight_mapper.preprocess_weights(weights)
         if not _is_disagg():
             self.mm_encoder.load_weights(weights)
+        print(self.llm.config)
         self.llm.load_weights(weights, weight_mapper)
