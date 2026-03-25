@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -256,6 +256,18 @@ public:
         return num_sm_parts;
     }
 
+    static int getFlashMlaNumSmPartsStatic(int s_q, int num_heads, int num_kv_heads, int head_size_v)
+    {
+        static constexpr int block_size_m = 64;
+        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
+        int device;
+        cudaGetDevice(&device);
+        int sm_cnt;
+        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, device);
+        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+        return num_sm_parts;
+    }
+
     template <typename T>
     int getKvCacheElemSizeInBits() const
     {
@@ -274,18 +286,6 @@ public:
         }
         return dTypeSize * 8;
     }
-
-    struct KvCacheBuffers
-    {
-        kernels::KVBlockArray kvCacheBuffer;
-        kernels::KVBlockArray kvScaleCacheBuffer;
-    };
-
-    static KvCacheBuffers buildKvCacheBlockArrays(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock,
-        int32_t sizePerToken, int32_t cyclicAttentionWindowSize, int32_t maxCyclicAttentionWindowSize,
-        int32_t sinkTokenLen, bool canUseOneMoreBlock, void* primaryPoolPtr, void* secondaryPoolPtr,
-        void* primaryBlockScalePoolPtr, void* secondaryBlockScalePoolPtr, kernels::KVBlockArray::DataType* blockOffsets,
-        bool hasFp4KvCache);
 
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
@@ -576,6 +576,20 @@ private:
 
     UniqPtrWNullCopy<int32_t[], Deleter> mMultiBlockSemaphores = {};
 };
+
+template <typename KVCacheBuffer>
+struct KvCacheBuffers
+{
+    KVCacheBuffer kvCacheBuffer;
+    KVCacheBuffer kvScaleCacheBuffer;
+};
+
+template <typename KVCacheBuffer>
+KvCacheBuffers<KVCacheBuffer> buildKvCacheBuffers(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock,
+    int32_t sizePerToken, int32_t cyclicAttentionWindowSize, int32_t maxCyclicAttentionWindowSize, int32_t sinkTokenLen,
+    bool canUseOneMoreBlock, void* primaryPoolPtr, void* secondaryPoolPtr, void* primaryBlockScalePoolPtr,
+    void* secondaryBlockScalePoolPtr, kernels::KVBlockArray::DataType* blockOffsets, bool hasFp4KvCache,
+    int32_t maxAttentionWindowSize = 0, void* keyValueCache = nullptr);
 
 } // namespace common::op
 

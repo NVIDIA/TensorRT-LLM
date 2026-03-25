@@ -93,6 +93,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-8B-Instruct-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
+- name: nvidia/Llama-3.1-8B-Instruct-NVFP4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base
@@ -213,9 +215,9 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Qwen3.5 MoE (Feb 2026) ---
 - name: Qwen/Qwen3.5-35B-A3B
-  yaml_extra: ['qwen3.5_moe_35b.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml']
 - name: Qwen/Qwen3.5-397B-A17B
-  yaml_extra: ['qwen3.5_moe_400b.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml']
 # --- GLM-5 (Feb 2026) ---
 - name: zai-org/GLM-5
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']

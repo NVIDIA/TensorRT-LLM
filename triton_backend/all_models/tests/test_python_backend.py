@@ -845,7 +845,7 @@ def test_get_executor_config_minimal():
     config = TritonPythonModel().get_executor_config({"parameters": {}})
     assert config.max_beam_width == 1
     assert config.enable_chunked_context == False
-    assert config.normalize_log_probs == True
+    assert config.normalize_log_probs == False
     assert config.batching_type == trtllm.BatchingType.INFLIGHT
     assert config.decoding_config.decoding_mode is None
     assert config.decoding_config.medusa_choices is None

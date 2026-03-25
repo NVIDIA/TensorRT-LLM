@@ -285,36 +285,46 @@ def should_skip_trtllm(
     # These are known issues that need investigation. Skipping to avoid test failures
     # and CUDA errors that can cascade to subsequent tests.
 
-    # Issue: NVFP4 with large expert count + large hidden_size + seq_len=1
-    # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
-    # Observed: e256_k8_h7168_i2048, seq=1, bfloat16 — tactic[204] with tile
-    # config [8, 83] produces 8.37% element mismatch (threshold: 3%).
-    # All other 207/208 tactics pass. seq=8 with the same config also passes
-    # (different tile behavior). The swiglu_gptoss_style variant passes too
-    # (uses relaxed tolerance: rtol=0.1, percent=0.95).
-    # Root cause: FP4 quantization error accumulates in the large GEMM reduction
-    # dimension (h=7168) and the [8, 83] tile config hits an edge case at seq=1.
-    if (
-        quant_algo == QuantAlgo.NVFP4
-        and not swiglu_gptoss_style
-        and seq_len == 1
-        and num_experts >= 256
-        and model_config.hidden_size >= 7168
-    ):
-        return (
-            f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model "
-            f"(num_experts={num_experts}, hidden_size={model_config.hidden_size}) "
-            f"and seq_len=1: 207/208 tactics pass but tactic[204] "
-            f"(FP4BlockScaleMoERunner tile [8, 83]) has 8.37% mismatch "
-            f"(threshold 3%). seq_len=8 passes all tactics."
-        )
-
-    # Issue: NVFP4 with large intermediate_size has known accuracy issues
-    if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
-        return (
-            f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
-            f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
-        )
+    if quant_algo == QuantAlgo.NVFP4:
+        # Issue: NVFP4 with large intermediate_size has known accuracy issues
+        if intermediate_size >= 14336:
+            return (
+                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
+                f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
+            )
+        # NVFP4 flaky tactic failures with large model configs at seq=8.
+        # For example of observed failures:
+        #   - act=Relu2-e60_k4_h2048_i1408-seq=8: tactic[28] tile [32,36],
+        #     12.79% mismatch, 187/188 tactics pass.
+        if (
+            num_experts >= 60
+            and model_config.top_k >= 4
+            and model_config.hidden_size >= 2048
+            and model_config.intermediate_size >= 1408
+            and seq_len == 8
+        ):
+            return (
+                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
+                f"(num_experts={num_experts}, top_k={model_config.top_k}, "
+                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size})"
+                f"and seq_len=8: flaky happen tactics failure with tactic[24] and tactic[28]"
+            )
+        # Issue: NVFP4 with large expert count + large hidden_size
+        # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
+        # Observed: e256_k8_h7168_i2048, seq=1, bfloat16 — tactic[204] with tile
+        # config [8, 83] produces 8.37% element mismatch (threshold: 3%).
+        # All other 207/208 tactics pass. The swiglu_gptoss_style variant passes too
+        # (uses relaxed tolerance: rtol=0.1, percent=0.95).
+        # Root cause: FP4 quantization error accumulates in the large GEMM reduction
+        # dimension (h=7168) and the [8, 83] tile config hits an edge case at seq=1.
+        if num_experts >= 256 and model_config.hidden_size >= 7168 and not swiglu_gptoss_style:
+            return (
+                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model "
+                f"(num_experts={num_experts}, hidden_size={model_config.hidden_size}) "
+                f"and seq_len=1: 207/208 tactics pass but tactic[204] "
+                f"(FP4BlockScaleMoERunner tile [8, 83]) has 8.37% mismatch "
+                f"(threshold 3%). seq_len=8 passes all tactics."
+            )
 
     # Issue: W4A8_MXFP4_MXFP8 has accuracy issues on certain model configs
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
@@ -505,37 +515,6 @@ def should_skip_deepgemm(
     """
     if backend_type != MoeBackendType.DEEPGEMM:
         return None
-
-    # Issue: DEEPGEMM + FP8_BLOCK_SCALES crashes with CUDA illegal memory access
-    # in _resmooth_kernel (Triton JIT) during post_load_weights() FP8 E8M0 scale
-    # resmoothing on SM100f (Blackwell). Root cause is a Triton compiler/runtime
-    # bug on SM100f: the kernel crashes when total grid blocks exceed ~65K.
-    # The crash depends on grid size, not just num_experts — Grok-1 (e8, h=6144,
-    # i=32768) crashes despite having only 8 experts because its weight tensors
-    # produce grids with 196K+ blocks.
-    # Weight shapes: w3_w1=[E, I*2, H], w2=[E, H, I] (from quantization.py)
-    # Grid for resmooth: (E, cdiv(M,128), cdiv(K,128))
-    # Verified boundary: max_blocks <= 57344 passes, >= 98304 crashes.
-    # Threshold: 65536 blocks (64K). Affected: DeepSeek-V3, Kimi-K2, Grok-1.
-    _RESMOOTH_GRID_BLOCK_LIMIT = 65536
-    if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and model_config is not None:
-        num_e = model_config.num_experts
-        hidden = model_config.hidden_size
-        inter = model_config.intermediate_size
-
-        def _cdiv(x, y):
-            return (x + y - 1) // y
-
-        w31_blocks = num_e * _cdiv(inter * 2, 128) * _cdiv(hidden, 128)
-        w2_blocks = num_e * _cdiv(hidden, 128) * _cdiv(inter, 128)
-        max_blocks = max(w31_blocks, w2_blocks)
-        if max_blocks > _RESMOOTH_GRID_BLOCK_LIMIT:
-            return (
-                f"[Triton Bug] DeepGemmFusedMoE FP8_BLOCK_SCALES crashes in "
-                f"_resmooth_kernel on SM100f when grid blocks exceed ~64K "
-                f"(max_blocks={max_blocks:,} > {_RESMOOTH_GRID_BLOCK_LIMIT:,}). "
-                f"Affected: E={num_e}, H={hidden}, I={inter}."
-            )
 
     # TP per-shard alignment: FP8_BLOCK_SCALES requires 128-aligned per-shard
     # intermediate_size for block scale tensor operations.

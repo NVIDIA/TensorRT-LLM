@@ -60,8 +60,8 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
-from .resource_manager import (ResourceManager, ResourceManagerType,
-                               request_context)
+from .resource_manager import (KVCacheManagerV2, ResourceManager,
+                               ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -374,6 +374,13 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        # V2 scheduler calls suspend_request() during scheduling, which
+        # offloads GPU pages while preserving the radix tree.  The executor
+        # does not need to call _terminate_requests (GPU resources are already
+        # freed by suspend) or _pause_requests (V2's prepare_context handles
+        # resume internally, so resetting to CONTEXT_INIT is unnecessary).
+        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
+                                                        KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
@@ -1790,6 +1797,36 @@ class PyExecutor:
                 )
                 self._check_disagg_ctx_cache_transfer_status(1)
 
+            # In gen-only benchmark mode, all requests must fit in KV cache
+            # simultaneously. If some requests are stuck in INIT state and the
+            # scheduler could not allocate KV for any of them, the benchmark
+            # will hang forever because in-progress generation requests won't
+            # release their KV cache.
+            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
+                    and not fitting_disagg_gen_init_requests):
+                stuck_init_requests = [
+                    req for req in self.active_requests
+                    if req.is_disagg_generation_init_state
+                ]
+                # Only fail once all benchmark requests have been fetched
+                # so that _handle_errors covers every request and every
+                # client receives an error response.
+                if (stuck_init_requests and self.num_fetch_requests
+                        >= self.benchmark_req_queues_size):
+                    error_msg = (
+                        f"Insufficient KV cache for gen-only benchmark mode: "
+                        f"{len(stuck_init_requests)} request(s) are waiting for "
+                        f"KV cache allocation but the scheduler could not fit "
+                        f"any of them. Increase free_gpu_memory_fraction or "
+                        f"reduce TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                        f"{self.benchmark_req_queues_size}).")
+                    logger.error(error_msg)
+                    # Fail all active and waiting requests so every
+                    # client receives an error instead of hanging.
+                    self._handle_errors(error_msg,
+                                        requests=self.active_requests)
+                    return None, None
+
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
@@ -1836,8 +1873,9 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
-                self._terminate_requests(scheduled_batch.paused_requests)
-                self._pause_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
 
@@ -2092,7 +2130,8 @@ class PyExecutor:
                         else:
                             can_forward = True
 
-                self._terminate_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -2203,7 +2242,8 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                self._pause_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
                     guided_decoder_failed_requests = None
@@ -3246,7 +3286,12 @@ class PyExecutor:
             self._terminate_request(request)
 
     def _terminate_request(self, request: LlmRequest):
-        if self._disagg_pp_termination_handler is not None:
+        # Dummy requests don't participate in disagg KV cache transfers,
+        # so they must bypass the PP termination handler to avoid stale
+        # sequences in the KV cache manager (the handler delays removal,
+        # but the dummy ID is reused every iteration).
+        if (self._disagg_pp_termination_handler is not None
+                and not request.is_dummy_request):
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request)

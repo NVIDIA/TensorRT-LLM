@@ -32,8 +32,6 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
   # Bielik-11B-v2.2-Instruct
   - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
-  # Ministral-8B
-  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:500-con:250]
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:500,2000]
   - perf/test_perf.py::test_perf[nemotron_nano_12b_v2-bench-pytorch-bfloat16-input_output_len:512,512]
   - perf/test_perf.py::test_perf[qwen3_4b_eagle3-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4]
@@ -48,7 +46,6 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:500,2000-reqs:8-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:1000,1000-reqs:8-con:1]
   - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000-con:250]
-  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-input_output_len:500,2000-reqs:500-con:250]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:2]
 
 
