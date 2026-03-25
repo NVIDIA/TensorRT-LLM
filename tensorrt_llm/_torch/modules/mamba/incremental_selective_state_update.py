@@ -41,7 +41,7 @@ from .softplus import softplus
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.jit()
 def _incremental_selective_scan_update_kernel(
-    # Ponters to matrices
+    # Pointers to matrices
     state_ptr,
     old_x_ptr,
     old_dt_ptr,
@@ -120,23 +120,20 @@ def _incremental_selective_scan_update_kernel(
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
 
-    # If HAS_CACHE_BATCH_INDICES is true, then the ssm state's and old_* batch
-    # coordinate is taken from the state_batch_indices_ptr Otherwise, the state
-    # coordinate is the same as the batch id.
+    # Resolve batch index for cache (state & old_* tensors)
     if HAS_CACHE_BATCH_INDICES:
         state_batch_indices_ptr += pid_b
         cache_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
-        if (cache_batch_idx == pad_slot_id):
+        if cache_batch_idx == pad_slot_id:
             return
     else:
         cache_batch_idx = pid_b
+
+    # Base pointers for cache-indexed tensors
     state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
     old_x_ptr += cache_batch_idx * stride_old_x_batch + pid_h * stride_old_x_head
-    orig_old_x_ptr = old_x_ptr
     old_dt_ptr += cache_batch_idx * stride_old_dt_batch + pid_h * stride_old_dt_head
-    orig_old_dt_ptr = old_dt_ptr
-    old_B_ptr +=  cache_batch_idx * stride_old_B_batch + (pid_h // nheads_ngroups_ratio) * stride_old_B_group
-    orig_old_B_ptr = old_B_ptr
+    old_B_ptr += cache_batch_idx * stride_old_B_batch + (pid_h // nheads_ngroups_ratio) * stride_old_B_group
     prev_num_accepted_tokens_ptr += cache_batch_idx
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -151,32 +148,31 @@ def _incremental_selective_scan_update_kernel(
         dt_bias_ptr += pid_h * stride_dt_bias_head
         dt_bias = tl.load(dt_bias_ptr).to(tl.float32)
     A_ptr += pid_h * stride_A_head
-    A= tl.load(A_ptr).to(tl.float32)
+    A = tl.load(A_ptr).to(tl.float32)
 
-    for _ in range(prev_num_accepted_tokens):
-        old_x_ptrs = old_x_ptr + offs_m * stride_old_x_dim
-        old_B_ptrs = old_B_ptr + offs_n * stride_old_B_dstate
-        x = tl.load(old_x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-        dt = tl.load(old_dt_ptr).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += dt_bias
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        dA = tl.exp(A * dt)  # scalar, not a matrix
-        B = tl.load(old_B_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
-        dB = B * dt
-        state = state * dA + dB * x[:, None]
-        old_x_ptr += stride_old_x_T
-        old_dt_ptr += stride_old_dt_T
-        old_B_ptr += stride_old_B_T
-    # Write state back in-place
+    # ===================================================================
+    # Phase 1: Replay old tokens to restore true base state.
+    # Compile-time bounded loop (T is constexpr) enables unrolling.
+    # ===================================================================
+    for t in range(T):
+        if t < prev_num_accepted_tokens:
+            old_x_ptrs = old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim
+            old_B_ptrs = old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate
+            x = tl.load(old_x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+            dt = tl.load(old_dt_ptr + t * stride_old_dt_T).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += dt_bias
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            dA = tl.exp(A * dt)
+            B = tl.load(old_B_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
+            dB = B * dt
+            state = state * dA + dB[None, :] * x[:, None]
+
+    # Write post-replay state back (API contract: state after replay only)
     tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
-    # Reset the old_* ptrs so we can write the new values backed
-    old_x_ptr = orig_old_x_ptr
-    old_dt_ptr = orig_old_dt_ptr
-    old_B_ptr = orig_old_B_ptr
 
-    # Set up the new input ptrs
+    # Set up new input pointers
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
     dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
     B_ptr += pid_b * stride_B_batch + (pid_h //
@@ -194,42 +190,48 @@ def _incremental_selective_scan_update_kernel(
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
 
-    for _ in range(T):
-        x_ptrs = x_ptr + offs_m * stride_x_dim
-        B_ptrs = B_ptr + offs_n * stride_B_dstate
-        C_ptrs = C_ptr + offs_n * stride_C_dstate
-        if HAS_Z:
-            z_ptrs = z_ptr + offs_m * stride_z_dim
-        out_ptrs = out_ptr + offs_m * stride_out_dim
+    # ===================================================================
+    # Phase 2: Process new tokens — sequential state update with output.
+    # Stores to old_* cache are interleaved to avoid a separate pass.
+    # ===================================================================
+    for t in range(T):
+        x_ptrs = x_ptr + t * stride_x_T + offs_m * stride_x_dim
+        B_ptrs = B_ptr + t * stride_B_T + offs_n * stride_B_dstate
+        C_ptrs = C_ptr + t * stride_C_T + offs_n * stride_C_dstate
+        out_ptrs = out_ptr + t * stride_out_T + offs_m * stride_out_dim
 
         x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
-        old_x_ptrs = old_x_ptr + offs_m * stride_old_x_dim
-        tl.store(old_x_ptrs, x, mask=offs_m < dim)
+        # Store x to old cache
+        tl.store(old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim,
+                 x, mask=offs_m < dim)
         x = x.to(tl.float32)
 
-        dt = tl.load(dt_ptr)
-        tl.store(old_dt_ptr, dt)
+        dt = tl.load(dt_ptr + t * stride_dt_T)
+        # Store dt to old cache
+        tl.store(old_dt_ptr + t * stride_old_dt_T, dt)
         dt = dt.to(tl.float32)
 
         if HAS_DT_BIAS:
             dt += dt_bias
         if DT_SOFTPLUS:
             dt = softplus(dt)
-        dA = tl.exp(A * dt)  # scalar, not a matrix
+        dA = tl.exp(A * dt)
 
         B = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
-        old_B_ptrs = old_B_ptr + offs_n * stride_old_B_dstate
-        tl.store(old_B_ptrs, B, mask=offs_n< dstate)
+        # Store B to old cache
+        tl.store(old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate,
+                 B, mask=offs_n < dstate)
         B = B.to(tl.float32)
 
         C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
         if HAS_D:
             D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         if HAS_Z:
-            z = tl.load(z_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+            z = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
+                        mask=offs_m < dim, other=0.0).to(tl.float32)
 
         dB = B * dt
-        state = state * dA + dB * x[:, None]
+        state = state * dA + dB[None, :] * x[:, None]
 
         out = tl.sum(state * C[None, :], axis=1)
         if HAS_D:
@@ -237,17 +239,6 @@ def _incremental_selective_scan_update_kernel(
         if HAS_Z:
             out *= z * tl.sigmoid(z)
         tl.store(out_ptrs, out, mask=offs_m < dim)
-
-        x_ptr += stride_x_T
-        old_x_ptr += stride_old_x_T
-        dt_ptr += stride_dt_T
-        old_dt_ptr += stride_old_dt_T
-        B_ptr += stride_B_T
-        old_B_ptr += stride_old_B_T
-        C_ptr += stride_C_T
-        out_ptr += stride_out_T
-        if HAS_Z:
-            z_ptr += stride_z_T
 
 
 def incremental_selective_state_update(
@@ -366,12 +357,14 @@ def incremental_selective_state_update(
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = ((z.stride(0), z.stride(1), z.stride(2),
                   z.stride(3)) if z is not None else (0, 0, 0, 0))
-    # We don't want autotune since it will overwrite the state
-    # We instead tune by hand.
+    # We don't want autotune since it will overwrite the state.
+    # Tuned by hand. For large dstate, fewer warps is critical: the (M, dstate)
+    # state matrix lives in registers, and fewer warps means more registers per
+    # thread, avoiding costly spills to local memory.
     BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
                                ((16, 4) if dstate <= 32 else
-                                ((8, 4) if dstate <= 64 else
-                                 ((4, 4) if dstate <= 128 else ((4, 8))))))
+                                ((8, 2) if dstate <= 64 else
+                                 ((8, 1) if dstate <= 128 else ((4, 1))))))
     tie_hdim = (A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(-1) == 0
                 and (dt_bias is None or dt_bias.stride(-1) == 0))
 

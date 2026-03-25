@@ -150,11 +150,11 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
     for k in range(T + 1):
         torch.manual_seed(k + 100)
 
-        x2 = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=dtype)
-        dt2_base = torch.randn(batch, 1, nheads, device=device, dtype=dtype)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt2_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
         dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
-        B2 = torch.randn(batch, 1, ngroups, d_state, device=device, dtype=dtype)
-        C2 = torch.randn(batch, 1, ngroups, d_state, device=device, dtype=dtype)
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
 
         slots = state_batch_indices if paged_cache else slice(None)
 
@@ -165,7 +165,7 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         if k > 0:
             ref_state_f32[slots] = states_buffer_f32[slots, k - 1]
 
-        ref_out = torch.zeros(batch, 1, nheads, head_dim, device=device, dtype=dtype)
+        ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         selective_state_update(
             ref_state_f32,   # float32 starting state
             x2, dt2, A, B2, C2,
@@ -179,7 +179,7 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         # Incremental kernel
         test_state = state0.clone()
         prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
-        test_out = torch.zeros(batch, 1, nheads, head_dim, device=device, dtype=dtype)
+        test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         incremental_selective_state_update(
             test_state,
             intermediate_update_inputs.clone(),
