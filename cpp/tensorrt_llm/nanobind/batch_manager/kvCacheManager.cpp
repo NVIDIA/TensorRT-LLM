@@ -162,9 +162,9 @@ public:
     }
 
     SizeType32 copyBlockOffsets(tensorrt_llm::runtime::ITensor& output, SizeType32 outputSlotOffset,
-        tb::LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const override
+        tb::LlmRequest::RequestIdType requestId) const override
     {
-        NB_OVERRIDE_PURE(copyBlockOffsets, output, outputSlotOffset, requestId, windowSize);
+        NB_OVERRIDE_PURE(copyBlockOffsets, output, outputSlotOffset, requestId);
     }
 
     bool isEnableBlockReuse() const override
@@ -320,13 +320,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("linear_layer_indices", &tbk::LinearAttentionMetadata::linearLayerIndices)
         .def_rw("cache_type", &tbk::LinearAttentionMetadata::cacheType)
         .def_rw("all_recurrent_states_bytes", &tbk::LinearAttentionMetadata::allRecurrentStatesBytes)
-        .def_rw("input_features_bytes_per_token", &tbk::LinearAttentionMetadata::inputFeaturesBytesPerToken)
         .def_rw("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval)
         .def_rw("save_last_snapshot", &tbk::LinearAttentionMetadata::saveLastSnapshot);
 
     nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
-        .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates)
-        .value("INPUT_FEATURES", tbk::LinearAttentionMetadata::LinearCacheType::kInputFeatures);
+        .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
 
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
         .def(nb::init<>())
@@ -508,21 +506,6 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 }
             },
             nb::call_guard<nb::gil_scoped_release>())
-        //  .def(
-        //      "copy_linear_batch_block_offsets",
-        //      [](tbk::BaseKVCacheManager& self, at::Tensor output,
-        //          std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 const beamWidth,
-        //          SizeType32 const offset)
-        //      {
-        //          auto _output = from_torch(output);
-        //          TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
-        //          for (size_t i = 0; i < requestIds.size(); ++i)
-        //          {
-        //              self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i],
-        //              LinearAttentionMetadata::kRecurrentStates);
-        //          }
-        //      },
-        //      nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_latest_events",
             [](tbk::BaseKVCacheManager& self, std::optional<double> timeout_ms = std::nullopt)

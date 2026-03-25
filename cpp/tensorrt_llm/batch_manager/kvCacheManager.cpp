@@ -613,7 +613,6 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     mIsVariableGQA = std::unordered_set(numKvHeadsPerLayer.begin(), numKvHeadsPerLayer.end()).size() > 1;
 
     mLayerToWindowSize.resize(mNumLayers);
-    mUniqueWindowSizes.reserve(numUniqueWindowSizes);
     for (auto const& [windowSize, layersWithWindowSize] : uniqueWindowSizeToLayers)
     {
         if (windowSize > maxSequenceLength)
@@ -621,7 +620,6 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             TLLM_LOG_WARNING("[kv cache manager] window size %d is greater than max sequence length %d", windowSize,
                 maxSequenceLength);
         }
-        mUniqueWindowSizes.push_back(windowSize);
         for (auto& layerIdx : layersWithWindowSize)
         {
             mLayerToWindowSize.at(layerIdx) = windowSize;
@@ -665,9 +663,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     mAbsolutePoolToWindowSize.reserve(numAllPools);
     mAbsolutePoolToRelativePoolIndex.reserve(numAllPools);
     auto absolutePoolsOffset = SizeType32{0};
-    for (auto const& windowSize : mUniqueWindowSizes)
+    for (auto const& [windowSize, manager] : mWindowBlockManagers)
     {
-        auto const& manager = mWindowBlockManagers.at(windowSize);
         auto const numPools = manager.getNumPools();
         for (auto i = 0; i < numPools; ++i)
         {
@@ -788,8 +785,10 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         {
             TLLM_CHECK(numLayersPerPool.size() == 1);
             auto bytesPerElement = common::getDTypeSize(mDataType);
-            mPools.emplace_back(
-                numLayers, mLinearAttentionMetadata->allRecurrentStatesBytes / bytesPerElement, tokensPerBlock);
+            KVCacheBlockPool pool(numLayers, /*kvFactor=*/1, /*numKvHeads=*/-1,
+                /*sizePerHead=*/-1, tokensPerBlock);
+            pool.blockSize = mLinearAttentionMetadata->allRecurrentStatesBytes / bytesPerElement;
+            mPools.push_back(std::move(pool));
         }
         else
         {
@@ -930,25 +929,14 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
         TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %d unique tokens", llmRequest.mRequestId,
             windowSize, uniqueTokens.size());
+        // only store the tokens that have been completed
         size_t const completedTokens = llmRequest.getContextCurrentPosition();
-        TLLM_CHECK(completedTokens <= static_cast<size_t>(llmRequest.getPromptLen()) + 1);
-        TLLM_CHECK_WITH_INFO(llmRequest.getNumTokens(0) <= llmRequest.getPromptLen() + 1,
-            "llmRequest.getNumTokens(0) = %d, llmRequest.getPromptLen() = %d", llmRequest.getNumTokens(0),
-            llmRequest.getPromptLen());
         auto usableSize = std::min(completedTokens, uniqueTokens.size() - 1);
-        TLLM_CHECK(usableSize <= static_cast<size_t>(llmRequest.getPromptLen()));
 
         auto blockedUniqueTokens
             = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, getTokensPerBlock(), false);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        if (blockKeys.size() > static_cast<size_t>(llmRequest.getPromptLen()) / getTokensPerBlock())
-        {
-            TLLM_LOG_ERROR(
-                "BlockManager::storeContextBlocks - blockKeys.size() < llmRequest->getPromptLen()/getTokensPerBlock(), "
-                "blockKeys.size()=%zu, llmRequest->getPromptLen()=%d, getTokensPerBlock()=%d, usableSize=%zu",
-                blockKeys.size(), llmRequest.getPromptLen(), getTokensPerBlock(), usableSize);
-        }
-        (void) manager.storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], llmRequest);
+        (void) manager.storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
     }
 }
 
@@ -1029,17 +1017,10 @@ void WindowBlockManager::allocatePools(bool useUvm)
             poolDtype = nvinfer1::DataType::kUINT8;
         }
 
-        nvinfer1::Dims cacheShape;
-        if (isRecurrentState())
-        {
-            // Layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}
-            cacheShape = ITensor::makeShape({pool.numLayers, mNumPrimaryBlocks, mKVFactor, blockSize});
-            pool.layerFirstLayout = true;
-        }
-        else
-        {
-            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
-        }
+        nvinfer1::Dims cacheShape = isRecurrentState()
+            ? ITensor::makeShape({pool.numLayers, mNumPrimaryBlocks, mKVFactor, blockSize})
+            : ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
+        pool.layerFirstLayout = isRecurrentState();
 
         TLLM_LOG_INFO(
             "[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads, shape={%d, %d, %d, %d}%s",
@@ -1052,15 +1033,9 @@ void WindowBlockManager::allocatePools(bool useUvm)
             pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
         if (mNumSecondaryBlocks > 0)
         {
-            nvinfer1::Dims cacheShapeOffload;
-            if (isRecurrentState())
-            {
-                cacheShapeOffload = ITensor::makeShape({pool.numLayers, mNumSecondaryBlocks, mKVFactor, blockSize});
-            }
-            else
-            {
-                cacheShapeOffload = ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
-            }
+            nvinfer1::Dims cacheShapeOffload = isRecurrentState()
+                ? ITensor::makeShape({pool.numLayers, mNumSecondaryBlocks, mKVFactor, blockSize})
+                : ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
             TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
                 mLogPrefix.c_str(), mNumSecondaryBlocks, pool.numLayers, pool.numKvHeads);
             pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
@@ -1238,15 +1213,6 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
                 return tk::KVCacheIndex{common::flat_index3(
                     block->getMemoryPoolBlockIndex(), layerIdx, fieldIdx, pool.numLayers, mKVFactor)};
             }();
-            if ((!block->isPlaceholder()) && block->getMemoryPoolBlockIndex() >= mNumPrimaryBlocks)
-            {
-                TLLM_LOG_ERROR(
-                    "memorypool block index of block id=%d is out of range, getMemoryPoolBlockIndex() = %d, "
-                    "mNumPrimaryBlocks = %d",
-                    block->getBlockId(), block->getMemoryPoolBlockIndex(), mNumPrimaryBlocks);
-                TLLM_LOG_ERROR("block->isPrimary(): %d", block->isPrimary());
-                TLLM_LOG_ERROR("mAllBlocksById.size(): %lu", mAllBlocksById.size());
-            }
             offsetsPtr[offsetIndex] = blockIndex;
         }
     }
@@ -1455,7 +1421,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
     SizeType32 numSharedContextBlocks = shareLastContextBlockAmongBeams ? numContextBlocks : numContextBlocks - 1;
 
     auto blockItr = blockKeys.begin();
-    // std::vector<std::tuple<BlockPtr, std::string>> allBlockStats;
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
         auto [partialMatch, numMatched, matchingBlock] = (searchRoot != nullptr && blockItr != blockKeys.end())
@@ -1490,7 +1455,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     auto newBlock = getFreeBlock(
                         sequence, matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
                     mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
-                    // allBlockStats.emplace_back(newBlock,
                     // TODO: (optional) Send out event
                     matchingBlock = newBlock;
                     if (blockItr != blockKeys.end())
@@ -1519,10 +1483,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 // Recover block and reuse
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-                // allBlockStats.emplace_back(matchingBlock, "M");
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks for request %lu - Matched full block %d", mLogPrefix.c_str(),
                     sequence.getRequestId(), matchingBlockId);
-                searchRoot = matchingBlock;
             }
             onboardBlock(sequence, matchingBlock, mode, directory);
             addBlockToAllBeams(matchingBlock, sequence);
@@ -1596,7 +1558,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             freeBlock->setHash();
             TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Beam %d. Allocated non-shared block %d for bi %d",
                 mLogPrefix.c_str(), beamIdx, freeBlock->getBlockId(), bi);
-            // allBlockStats.emplace_back(freeBlock, "B");
         }
         ++mMissedBlocks;
         if (blockItr != blockKeys.end())
@@ -1607,6 +1568,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
 
     if (isRecurrentState())
     {
+        // purge tailing placeholder blocks
         numMatchedTokens = (latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
     }
     sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
@@ -1692,16 +1654,10 @@ SizeType32 WindowBlockManager::addSequence(
 
     TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
 
-    bool shareLastContextBlockAmongBeams = true;
+    bool shareLastContextBlockAmongBeams = sequence.getBeamWidth() == 1;
     if (isRecurrentState())
     {
-        shareLastContextBlockAmongBeams = inputLength % mTokensPerBlock == 0;
-    }
-    else if (sequence.getBeamWidth() > 1)
-    {
-        // The last context block cannot be shared among beams because each
-        // beam will write different generated tokens into it.
-        shareLastContextBlockAmongBeams = false;
+        shareLastContextBlockAmongBeams &= inputLength % mTokensPerBlock == 0;
     }
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, llmRequest,
         perBlockRetentions, shareLastContextBlockAmongBeams, mode, directory);
@@ -1733,7 +1689,6 @@ void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
     }
 }
 
-// TODO (xiweny): change this
 void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
 {
     auto const minTokensForBlockDetach = mWindowSize + mTokensPerBlock;
@@ -1957,12 +1912,6 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
             addBlockToBeam(block, sequence, beamIdx);
         }
     }
-
-    for (auto const& block : mAllocatedBlocksPerSeq.at(sequence.getRequestId()))
-    {
-        TLLM_LOG_DEBUG("%s::allocateBlock - block %d for sequence %lu", mLogPrefix.c_str(), block->getBlockId(),
-            sequence.getRequestId());
-    }
 }
 
 void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& request)
@@ -1990,7 +1939,7 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
     // edge case: promptLen % tokensPerBlock == 0, and this is the first token of decoding phase
     if (currentPosition == request.getPromptLen() + 1 && request.getPromptLen() % mTokensPerBlock == 0)
     {
-        if (sequence.getBeamWidth() == 1)
+        if (TLLM_LIKELY(sequence.getBeamWidth() == 1))
         {
             // the block of beam0 is inherited from context phase, no need to copy
             return;
@@ -2011,9 +1960,8 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         return;
     }
 
-    // copy only happens in context phase or the first token of decoding phase (only when promptLen % tokensPerBlock ==
-    // 0)
-    if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() + 1 || currentPosition == 0)
+    // copy only happens in context phase or the corner case above
+    if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() || currentPosition == 0)
     {
         return;
     }
@@ -2027,7 +1975,7 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         auto prevBlock = getBlockById(prevBlockId);
         if (prevBlock->isPlaceholder())
         {
-            TLLM_LOG_WARNING(
+            TLLM_LOG_INFO(
                 "%s::copyLinearAttentionBlock - Previous block %d is a placeholder, skip. This usually happens when "
                 "chunked context is enabled but reusing is disabled.",
                 mLogPrefix.c_str(), prevBlockId);
@@ -2062,23 +2010,8 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
-    std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-    OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
+    std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks)
 {
-    if (isRecurrentState() && !llmRequest.has_value())
-    {
-        TLLM_LOG_ERROR("%s::storeBlocks - storeBlocks of recurrent state can only be called from StoreContextBlocks",
-            mLogPrefix.c_str());
-        return std::make_pair(0, std::vector<KVCacheBlock::IdType>{});
-    }
-    if (isRecurrentState() && blockKeys.size() > static_cast<size_t>(llmRequest->getPromptLen()) / getTokensPerBlock())
-    {
-        TLLM_LOG_ERROR(
-            "%s::storeBlocks - blockKeys.size() < llmRequest->getPromptLen()/getTokensPerBlock(), "
-            "blockKeys.size()=%zu, llmRequest->getPromptLen()=%d, getTokensPerBlock()=%d",
-            mLogPrefix.c_str(), blockKeys.size(), llmRequest->getPromptLen(), getTokensPerBlock());
-        TLLM_THROW("called from wrong function");
-    }
     SizeType32 numBlocksStoredForReuse = 0;
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     TLLM_LOG_DEBUG(
@@ -2096,7 +2029,6 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
     }
     std::vector<BlockPtr> storedBlocks;
     std::vector<KVCacheBlock::IdType> pinnedBlockIds;
-    std::vector<BlockPtr> matchedBlocks;
     for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
     {
         try
@@ -2123,7 +2055,6 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 TLLM_LOG_DEBUG("%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(),
                     matchedBlock->getBlockId());
                 searchRoot = matchedBlock;
-                matchedBlocks.push_back(matchedBlock);
                 // TODO possible optimization: if bid != matchedBlock->getBlockId(),
                 // block can be freed and inserted at mFreePrimaryBlocks.begin()
             }
@@ -2144,63 +2075,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 searchRoot->addNextBlock(blockKey, block);
 
                 // Sanity check. The list of stored blocks should be connected.
-                if (!(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back()))
-                {
-                    // TODO: remove me
-                    std::stringstream dbgStream;
-                    dbgStream << mLogPrefix << "::storeBlocks sanity check failed: stored blocks list not connected.\n";
-                    dbgStream << "llmRequest: id=" << llmRequest->mRequestId
-                              << " numTokens=" << llmRequest->getNumTokens(0)
-                              << " promptLen=" << llmRequest->getPromptLen()
-                              << " contextCurrentPosition=" << llmRequest->getContextCurrentPosition() << "\n";
-                    dbgStream << "parameters: blockKeys.size()=" << blockKeys.size()
-                              << " blockIds.size()=" << blockIds.size() << " pinBlocks=" << pinBlocks
-                              << " numBlocks=" << numBlocks << " blockCnt=" << blockCnt
-                              << "searchRoot=" << searchRoot->getBlockId() << "\n";
-                    dbgStream << "blockIds:";
-                    for (std::size_t i = 0; i < blockIds.size(); ++i)
-                    {
-                        dbgStream << " [" << i << "]=" << blockIds.at(i);
-                    }
-                    dbgStream << "\nstoredBlocks: size=" << storedBlocks.size();
-                    for (std::size_t i = 0; i < storedBlocks.size(); ++i)
-                    {
-                        dbgStream << " [" << i << "]=" << (storedBlocks[i] ? storedBlocks[i]->getBlockId() : -1);
-                    }
-                    dbgStream << "\nmatchedBlocks: size=" << matchedBlocks.size();
-                    for (std::size_t i = 0; i < matchedBlocks.size(); ++i)
-                    {
-                        dbgStream << " [" << i << "]=" << (matchedBlocks[i] ? matchedBlocks[i]->getBlockId() : -1);
-                    }
-                    dbgStream << "\nblock: bid=" << bid << " blockId=" << (block ? block->getBlockId() : -1)
-                              << " prevBlockId="
-                              << ((block && block->getPrevBlock()) ? block->getPrevBlock()->getBlockId() : -1);
-                    if (!storedBlocks.empty() && storedBlocks.back())
-                    {
-                        dbgStream << " storedBlocks.back()=" << storedBlocks.back()->getBlockId();
-                    }
-                    auto nextBlocks = searchRoot->getNextBlocks();
-                    auto searchRootNext = nextBlocks.find(blockKey);
-                    if (searchRootNext != nextBlocks.end())
-                    {
-                        dbgStream << " searchRootNext=" << searchRootNext->second->getBlockId();
-                        if (searchRootNext->second->getBlockKey() == blockKey)
-                        {
-                            dbgStream << " (same block key)";
-                        }
-                        else
-                        {
-                            dbgStream << " (different block key)";
-                        }
-                    }
-                    else
-                    {
-                        dbgStream << " searchRootNext=nil";
-                    }
-                    dbgStream << "\nneedMatch: " << needMatch;
-                    TLLM_LOG_ERROR("%s", dbgStream.str().c_str());
-                }
-                matchedBlocks.push_back(block);
+                TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
                 storedBlocks.push_back(block);
                 TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
                     || block->getPrevBlockInSeq()->getHash() == searchRoot->getHash());
@@ -2352,7 +2227,8 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     for (auto& [_, manager] : mWindowBlockManagers)
     {
         if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1
-            || !isAllWindowSizesValidForStoreForReuse || mLinearAttentionMetadata.has_value())
+            || !isAllWindowSizesValidForStoreForReuse || mLinearAttentionMetadata.has_value()
+            /* Hybrid model we only store context blocks for reuse*/)
         {
             lastStoredId = manager.releaseBlocks(sequence, std::nullopt);
         }
@@ -2437,7 +2313,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
     auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
 
-    if (uniqueTokens.size() == 0 || isRecurrentState())
+    if (uniqueTokens.size() == 0)
     {
         return;
     }
@@ -2456,7 +2332,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     {
         // store all blocks
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], llmRequest);
+        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
         return;
     }
 
@@ -2467,7 +2343,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     if (prevBlock->getPrevBlock() == nullptr)
     {
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], llmRequest);
+        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
         return;
     }
 
@@ -2478,7 +2354,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
         return;
     }
     TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
-    (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], llmRequest);
+    (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
 }
 
 std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
@@ -2493,14 +2369,14 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     auto usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
     if (isRecurrentState())
     {
-        usableSize = llmRequest->getPromptLen() - 1;
+        usableSize = std::min(llmRequest->getPromptLen() - 1, usableSize); // TODO: enable store for completed sequences
     }
     TLLM_LOG_INFO("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
         mLogPrefix.c_str(), llmRequest->mRequestId, mWindowSize, uniqueTokens.size(), usableSize);
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
-    auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], llmRequest, pinBlocks);
+    auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], pinBlocks);
 
     return pinnedBlockIds;
 }
@@ -2515,7 +2391,7 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     auto node = mAllocatedBlocksPerSeq.extract(requestId);
     TLLM_CHECK(node);
     auto& allocatedBlocks = node.mapped();
-    if (llmRequest.has_value() && !isRecurrentState())
+    if (llmRequest.has_value() && !isRecurrentState()) // only store context blocks for recurrent states
     {
         // If llmRequest is provided, block store for reuse is enabled.
         if (!isSequenceValidForStoreForReuse(requestId))
@@ -2543,8 +2419,7 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
             std::transform(allocatedBlocks.begin(), allocatedBlocks.end(), cacheBlockIds.begin(),
                 [](BlockPtr const& block) { return block->getBlockId(); });
 
-            auto [numBlocksStoredForReuse, pinnedBlockIds]
-                = storeBlocks(std::move(blockKeys), cacheBlockIds, llmRequest);
+            auto [numBlocksStoredForReuse, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds);
             TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
                 sequence.getRequestId(), numBlocksStoredForReuse);
         }
@@ -3072,7 +2947,7 @@ void KVCacheManager::addSequence(
     auto kvCacheRetentionConfig = llmRequest
         ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
         : executor::KvCacheRetentionConfig();
-    TLLM_LOG_DEBUG("addSequence for request %lu, inputLength = %d, beamWidth = %d", requestId, inputLength, beamWidth);
+
     auto const [seqIt, emplaceDone] = [&]
     {
         auto lck = std::scoped_lock(mSequencesMtx);
@@ -3107,7 +2982,7 @@ void KVCacheManager::addSequence(
     for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
     {
         // NOTE: Caller to KVCacheManager::addSequence should deal with the chunking
-        auto const maxTokenNum = metadata.maxTokenNum; // >= llm_args.max_seq_len
+        auto const maxTokenNum = metadata.maxTokenNum;
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
         // Consider the temporaryAttentionWindow when allocating blocks.
@@ -3223,8 +3098,6 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     }
     TLLM_CHECK(!mBlockManager.isSequenceHeld(requestId));
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG(
-        "Removed request %lu, last stored id = %lu", requestId, lastStoredId.has_value() ? lastStoredId.value() : -1);
     return lastStoredId;
 }
 
@@ -3275,11 +3148,8 @@ tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType
     }
 }
 
-SizeType32 KVCacheManager::copyBlockOffsets(
-    ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId, std::optional<SizeType32> windowSize) const
+SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
 {
-    TLLM_LOG_DEBUG("copyBlockOffsets for request %lu and windowSize: %d", requestId,
-        windowSize.has_value() ? windowSize.value() : -999);
     auto const& sequence = getSequence(requestId);
     auto const beamWidth = sequence.getBeamWidth();
 
@@ -3341,15 +3211,6 @@ std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::groupLayersByW
         length of numLayers yet. So, we need to rotate the window sizes per layer with modulo.
         */
         auto const windowSize = maxAttentionWindowVec.at(layerIdx % numNonUniqueWindowSizes);
-        if (LinearAttentionMetadata::hasLinearCache(windowSize))
-        {
-            auto const split = LinearAttentionMetadata::splitCombinedCacheTypes(windowSize);
-            for (auto const& linearCacheType : split)
-            {
-                uniqueWindowSizeToLayers[linearCacheType].push_back(layerIdx);
-            }
-            continue;
-        }
         uniqueWindowSizeToLayers[windowSize].push_back(layerIdx);
     }
     return uniqueWindowSizeToLayers;
@@ -3462,58 +3323,42 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     {
         TLLM_LOG_DEBUG("windowSizeShare: %lf, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
         auto memoryBudget = static_cast<uint64_t>(allottedPrimaryMemBytes * windowSizeShare);
-        SizeType32 blocksInPrimaryPool = -1;
-        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
         {
             TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
                 "Linear attention metadata must be provided when linear attention is used.");
-            blocksInPrimaryPool = linearAttentionMetadata->calcMaxMemoryBlocks(
+            return linearAttentionMetadata->calcMaxMemoryBlocks(
                 windowSize, tokensPerBlock, memoryBudget, windowSizeToLayers.at(windowSize).size());
         }
-        else
-        {
-            auto maxTokens = static_cast<uint64_t>(memoryBudget / cacheSizeBytesPerToken);
+        auto maxTokens = static_cast<uint64_t>(memoryBudget / cacheSizeBytesPerToken);
 
-            // kv_cache_config.max_tokens is not effective in VSWA scheme
-            if (config.getMaxTokens().has_value() && !isVSWA)
+        // kv_cache_config.max_tokens is not effective in VSWA scheme
+        if (config.getMaxTokens().has_value() && !isVSWA)
+        {
+            auto const maxTokensFromConfig = static_cast<uint64_t>(config.getMaxTokens().value());
+            if (maxTokensFromConfig < maxTokens)
             {
-                auto const maxTokensFromConfig = static_cast<uint64_t>(config.getMaxTokens().value());
-                if (maxTokensFromConfig < maxTokens)
-                {
-                    TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
-                    maxTokens = std::min(maxTokensFromConfig, maxTokens);
-                }
+                TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
+                maxTokens = std::min(maxTokensFromConfig, maxTokens);
             }
-            TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
-            blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
         }
-        TLLM_LOG_DEBUG(
-            "Number of blocks in KV cache primary pool for windowSize %d: %d", windowSize, blocksInPrimaryPool);
-        return blocksInPrimaryPool;
+        TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
+        return static_cast<SizeType32>(tc::ceilDiv(maxTokens, tokensPerBlock));
     };
 
     auto const calculateSecondaryBlocks
         = [&](SizeType32 windowSize, double windowSizeShare, SizeType32 cacheSizeBytesPerToken)
     {
         auto memoryBudget = static_cast<uint64_t>(allottedSecondaryMemBytes * windowSizeShare);
-        SizeType32 blocksInSecondaryPool = -1;
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
         {
             TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
                 "Linear attention metadata must be provided when linear attention is used.");
-            blocksInSecondaryPool = linearAttentionMetadata->calcMaxMemoryBlocks(
+            return linearAttentionMetadata->calcMaxMemoryBlocks(
                 windowSize, tokensPerBlock, memoryBudget, windowSizeToLayers.at(windowSize).size());
         }
-        else
-        {
-            auto maxTokensSecondary = static_cast<SizeType32>(memoryBudget / cacheSizeBytesPerToken);
-            blocksInSecondaryPool = std::max(0, maxTokensSecondary / tokensPerBlock);
-        }
-        TLLM_LOG_DEBUG(
-            "Number of blocks in KV cache secondary pool for windowSize %d: %d, onboard blocks to primary memory "
-            "before reuse: %s",
-            windowSize, blocksInSecondaryPool, config.getOnboardBlocks() ? "true" : "false");
-        return blocksInSecondaryPool;
+        auto maxTokensSecondary = static_cast<SizeType32>(memoryBudget / cacheSizeBytesPerToken);
+        return std::max(0, maxTokensSecondary / tokensPerBlock);
     };
 
     std::map<SizeType32, float> windowSizeToShare;
@@ -3575,8 +3420,14 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto const cacheSizeBytesPerToken = cacheSizeBytesPerTokenPerWindow.at(windowSize);
         auto const windowSizeShare = windowSizeToShare.at(windowSize);
         auto const blocksInPrimaryPool = calculatePrimaryBlocks(windowSize, windowSizeShare, cacheSizeBytesPerToken);
+        TLLM_LOG_DEBUG(
+            "Number of blocks in KV cache primary pool for windowSize %d: %d", windowSize, blocksInPrimaryPool);
         auto const blocksInSecondaryPool
             = calculateSecondaryBlocks(windowSize, windowSizeShare, cacheSizeBytesPerToken);
+        TLLM_LOG_DEBUG(
+            "Number of blocks in KV cache secondary pool for windowSize %d: %d, onboard blocks to primary memory "
+            "before reuse: %s",
+            windowSize, blocksInSecondaryPool, config.getOnboardBlocks() ? "true" : "false");
         blocksPrimary.push_back(blocksInPrimaryPool);
         blocksSecondary.push_back(blocksInSecondaryPool);
     }
@@ -3671,20 +3522,12 @@ void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLen
 GenerationRequest const& KVCacheManager::getSequence(RequestIdType requestId) const
 {
     auto lck = std::scoped_lock(mSequencesMtx);
-    if (mSequences.find(requestId) == mSequences.end())
-    {
-        TLLM_LOG_ERROR("Sequence for request %lu not found", requestId);
-    }
     return mSequences.at(requestId);
 }
 
 GenerationRequest& KVCacheManager::getSequence(RequestIdType requestId)
 {
     auto lck = std::scoped_lock(mSequencesMtx);
-    if (mSequences.find(requestId) == mSequences.end())
-    {
-        TLLM_LOG_ERROR("Sequence for request %lu not found", requestId);
-    }
     return mSequences.at(requestId);
 }
 

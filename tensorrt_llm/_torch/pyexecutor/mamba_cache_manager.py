@@ -873,11 +873,8 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.conv_bytes = ((self.conv_bytes + 1023) // 1024) * 1024
 
         self.linear_attention_metadata = LinearAttentionMetadata()
-        # TODO(xiweny): confirm if this is needed
-        # self.linear_attention_metadata.linear_layer_indices = [0, 1]
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
-        self.linear_attention_metadata.input_features_bytes_per_token = 0
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_prefix_cache_step
 
         if kv_cache_config.enable_partial_reuse:

@@ -119,16 +119,13 @@ struct LinearAttentionMetadata
     enum LinearCacheType : WindowSizeType
     {
         kRecurrentStates = static_cast<WindowSizeType>(0x80000001),
-        kInputFeatures = static_cast<WindowSizeType>(0x80000002),
     };
 
     std::vector<SizeType32> linearLayerIndices;
     WindowSizeType cacheType;
     SizeType32 allRecurrentStatesBytes; // Sum of all states like ssm_state and conv_state (1 layer)
-    SizeType32 inputFeaturesBytesPerToken;
-
-    SizeType32 statesSnapshotInterval; // Only used for SSM_CONV_STATE
-    bool saveLastSnapshot;             // Take additional snapshot of recurrent states at the end of the input sequence
+    SizeType32 statesSnapshotInterval;  // Only used for kRecurrentStates
+    bool saveLastSnapshot;              // Take additional snapshot of recurrent states at the end of the input sequence
 
     // Optional: explicit number of placeholder blocks for this kRecurrentStates manager.
     // If set, overrides the automatic computation (fullAttention.primaryBlocks - this.primaryBlocks).
@@ -164,24 +161,9 @@ struct LinearAttentionMetadata
         return false;
     }
 
-    [[nodiscard]] bool hasLinearCache() const
-    {
-        return hasLinearCache(cacheType);
-    }
-
     [[nodiscard]] bool hasRecurrentStatesCache() const
     {
         return hasRecurrentStatesCache(cacheType);
-    }
-
-    [[nodiscard]] bool hasInputFeaturesCache() const
-    {
-        return hasInputFeaturesCache(cacheType);
-    }
-
-    static constexpr bool hasLinearCache(WindowSizeType encodedWindowSize)
-    {
-        return encodedWindowSize < 0;
     }
 
     static constexpr bool hasRecurrentStatesCache(WindowSizeType encodedWindowSize)
@@ -190,24 +172,9 @@ struct LinearAttentionMetadata
             == static_cast<uint32_t>(LinearCacheType::kRecurrentStates);
     }
 
-    static constexpr bool hasInputFeaturesCache(WindowSizeType encodedWindowSize)
+    static constexpr bool hasLinearCache(WindowSizeType encodedWindowSize)
     {
-        return (static_cast<uint32_t>(encodedWindowSize) & static_cast<uint32_t>(LinearCacheType::kInputFeatures))
-            == static_cast<uint32_t>(LinearCacheType::kInputFeatures);
-    }
-
-    static std::vector<WindowSizeType> splitCombinedCacheTypes(WindowSizeType encodedWindowSize)
-    {
-        std::vector<WindowSizeType> result;
-        if (hasRecurrentStatesCache(encodedWindowSize))
-        {
-            result.push_back(LinearCacheType::kRecurrentStates);
-        }
-        if (hasInputFeaturesCache(encodedWindowSize))
-        {
-            result.push_back(LinearCacheType::kInputFeatures);
-        }
-        return result;
+        return hasRecurrentStatesCache(encodedWindowSize);
     }
 
     [[nodiscard]] SizeType32 calcMaxLookupBlocks(
@@ -234,12 +201,6 @@ struct LinearAttentionMetadata
             auto perBlockBytes = allRecurrentStatesBytes * numLayers;
             auto numDynamicBlocks = (memoryBudget / perBlockBytes);
             return static_cast<SizeType32>(numDynamicBlocks);
-        }
-        if (hasInputFeaturesCache(encodedWindowSize))
-        {
-            TLLM_CHECK_WITH_INFO(
-                encodedWindowSize == kInputFeatures, "each pool must only serve on type of linear cache");
-            return static_cast<SizeType32>(memoryBudget / (inputFeaturesBytesPerToken * numLayers) / tokensPerBlock);
         }
         TLLM_THROW("Unknown linear cache type");
     }
@@ -499,14 +460,6 @@ private:
     size_t mHash;
 };
 
-class KVCacheBlockSet
-{
-public:
-private:
-    std::vector<BlockPtr> mPositiveIdMap;
-    std::vector<BlockPtr> mNegativeIdMap;
-};
-
 class GenerationRequest
 {
 public:
@@ -714,22 +667,6 @@ public:
         , secondaryPtr(std::move(secondaryPtr))
         , containsBlockScales(containsBlockScales)
         , containsIndexerKCache(containsIndexerKCache)
-        , layerFirstLayout(false)
-    {
-    }
-
-    KVCacheBlockPool(SizeType32 numLayers, SizeType32 blockSize, SizeType32 tokensPerBlock,
-        runtime::ITensor::SharedPtr primaryPtr = nullptr, runtime::ITensor::SharedPtr secondaryPtr = nullptr)
-        : numLayers(numLayers)
-        , kvFactor(1)
-        , numKvHeads(-1)
-        , sizePerHead(-1)
-        , tokensPerBlock(tokensPerBlock)
-        , blockSize(blockSize)
-        , primaryPtr(std::move(primaryPtr))
-        , secondaryPtr(std::move(secondaryPtr))
-        , containsBlockScales(false)
-        , containsIndexerKCache(false)
         , layerFirstLayout(false)
     {
     }
@@ -1036,7 +973,7 @@ public:
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
+        bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity();
 
@@ -1366,7 +1303,7 @@ public:
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize, bool pinBlocks = false)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, std::nullopt, pinBlocks);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
@@ -1711,7 +1648,6 @@ private:
     // Stored before mWindowBlockManagers so it is constructed first and its address
     // is stable when passed to each WindowBlockManager constructor.
     radix_block_tree::UnifiedBlockTree mLookupTree;
-    std::vector<SizeType32> mUniqueWindowSizes;
     std::map<SizeType32, WindowBlockManager> mWindowBlockManagers;
     std::map<SizeType32, WindowSizeMetadata> mWindowSizeToMetadata;
     std::vector<SizeType32> mLayerToWindowSize;
@@ -1824,8 +1760,8 @@ public:
         = 0;
 
     //! @return maxBlockCount of all beams
-    virtual SizeType32 copyBlockOffsets(runtime::ITensor& output, SizeType32 outputSlotOffset,
-        LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const
+    virtual SizeType32 copyBlockOffsets(
+        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const
         = 0;
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
@@ -1912,16 +1848,7 @@ public:
         {
             nkvh.push_back(numKvHeadsPerLayer.at(layer));
         }
-        std::stringstream ss;
-        for (auto const& n : nkvh)
-        {
-            ss << n << " ";
-        }
-        TLLM_LOG_DEBUG("[calculateCacheSizePerTokenForSingleWindowSize] nkvh: %s", ss.str().c_str());
         auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
-        TLLM_LOG_DEBUG(
-            "[calculateCacheSizePerTokenForSingleWindowSize] sumLocalHeads: %d, kvFactor: %d, sizePerHead: %d",
-            sumLocalHeads, kvFactor, sizePerHead);
         // NOTE: We expect the caller to have already taken the tp size into account for numKvHeadsPerLayer
         // consider only local layers for the calculation
         return sumLocalHeads * kvFactor * sizePerHead;
@@ -2108,12 +2035,7 @@ public:
 
     [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
     {
-        auto src = mBlockManager.getNumFreeBlocksPerWindowSize();
-        std::map<SizeType32, SizeType32> dst;
-        std::transform(src.cbegin(), src.cend(), std::inserter(dst, dst.end()),
-            [](std::pair<SizeType32 const, SizeType32> const& pair)
-            { return std::make_pair(static_cast<SizeType32>(pair.first), pair.second); });
-        return dst;
+        return mBlockManager.getNumFreeBlocksPerWindowSize();
     }
 
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
@@ -2216,8 +2138,8 @@ public:
         SizeType32 beamWidth) const override;
 
     //! @return maxBlockCount of all beams
-    SizeType32 copyBlockOffsets(runtime::ITensor& output, SizeType32 outputSlotOffset,
-        LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const override;
+    SizeType32 copyBlockOffsets(
+        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const override;
 
     [[nodiscard]] bool isEnableBlockReuse() const override
     {
