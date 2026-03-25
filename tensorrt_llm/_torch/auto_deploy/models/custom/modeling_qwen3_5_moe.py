@@ -2591,7 +2591,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        # If lm_head was grafted into the exported graph, the language_model
+        # already produces logits — skip the redundant application.
+        if getattr(self.model.language_model, "_lm_head_grafted", False):
+            logits = hidden_states
+        else:
+            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
         return Qwen3_5MoeConditionalOutput(logits=logits)
 
 
@@ -2605,7 +2610,15 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
 
     Dim 0 is always 3 (temporal, height, width) and is static; dims 1 and 2
     (batch, sequence) are dynamic.
+
+    When ``lm_head`` is supplied, it is grafted onto the exported graph so that
+    sharding and other graph-level transforms (e.g. ``gather_logits_before_lm_head``)
+    can see and optimize it.
     """
+
+    def __init__(self, submodule_name: str, lm_head: nn.Module | None = None):
+        super().__init__(submodule_name)
+        self._lm_head = lm_head
 
     def _init_dynamic_shape_lookup(self):
         base = super()._init_dynamic_shape_lookup()
@@ -2613,6 +2626,76 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
         seq_len_dyn = Dim.DYNAMIC
         base["position_ids"] = {1: batch_size_dyn, 2: seq_len_dyn}
         return base
+
+    def post_process(self, sub_mod: nn.Module, sub_gm):
+        """Extend parent post_process to graft lm_head into the exported graph.
+
+        After grafting, the graph outputs logits directly.  We also set a flag
+        on the top-level model so that its ``forward()`` knows to skip the
+        redundant ``self.lm_head(...)`` call.
+        """
+        super().post_process(sub_mod, sub_gm)
+
+        if self._lm_head is None:
+            return
+
+        # 1. Attach lm_head as a submodule of the graph module
+        sub_gm.lm_head = self._lm_head
+
+        # 2. Graft lm_head into the computation graph:
+        #    old: output(hidden_states) -> new: output(lm_head(hidden_states).float())
+        graph = sub_gm.graph
+        output_node = next(n for n in graph.nodes if n.op == "output")
+        hidden_states = output_node.args[0]
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states = hidden_states[0]
+
+        with graph.inserting_before(output_node):
+            # lm_head linear using auto_deploy.torch_linear_simple so that
+            # the sharding transform and gather_logits_before_lm_head recognize
+            # it as a linear node.
+            lm_head_weight = graph.get_attr("lm_head.weight")
+            lm_head_weight.name = "lm_head_weight"
+            logits = graph.call_function(
+                torch.ops.auto_deploy.torch_linear_simple,
+                args=(hidden_states, lm_head_weight, None),
+            )
+            logits.name = "lm_head_torch_linear_simple"
+
+            # Cast to float32 using aten.to.dtype (not .float() which produces
+            # a call_method node that get_lm_head_node cannot see through).
+            logits_f32 = graph.call_function(
+                torch.ops.aten.to.dtype, args=(logits, torch.float32)
+            )
+
+        output_node.replace_input_with(hidden_states, logits_f32)
+        graph.lint()
+        sub_gm.recompile()
+
+        # 3. Mark that lm_head is now inside the graph so the parent forward
+        #    (Qwen3_5MoeForConditionalGeneration.forward) skips the redundant
+        #    lm_head application.
+        sub_gm._lm_head_grafted = True
+
+    @classmethod
+    def from_autoinferred(cls, model: nn.Module) -> "Qwen3_5MoeTextExportInfo":
+        """Auto-infer the text submodule and capture lm_head from the parent model."""
+        text_config_cls = type(model.config.text_config)
+
+        submodule_key = None
+        for name, submodule in model.named_modules():
+            if isinstance(getattr(submodule, "config", None), text_config_cls):
+                submodule_key = name
+                break
+
+        if submodule_key is None:
+            raise ValueError(
+                "Could not find text submodule in model. Expected text submodule to have a config "
+                f"object of type {text_config_cls}."
+            )
+
+        lm_head = getattr(model, "lm_head", None)
+        return cls(submodule_key, lm_head=lm_head)
 
 
 class Qwen3_5MoeADInputProcessor:
