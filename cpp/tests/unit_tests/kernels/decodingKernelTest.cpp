@@ -711,7 +711,7 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
     ASSERT_TRUE(checkResult());
 
     // Now test the generation logits reordering algorithm.
-    // Copy ids, parentIds, and gatheredIds to host.
+    // Copy ids, parentIds, gatheredIds, and seqLengths to host.
     auto idsHost = mBufferManager->copyFrom(*mDecodingState->getIds(0), MemoryType::kCPU);
     auto parentIdsHost = mBufferManager->copyFrom(*ITensor::at(mDecodingState->getParentIds(), {0}), MemoryType::kCPU);
     auto gatheredIdsHost = mBufferManager->copyFrom(*mDecodingState->getGatheredIds(0), MemoryType::kCPU);
@@ -722,30 +722,41 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
     auto const* gatheredIdsData = bufferCast<TokenIdType>(*gatheredIdsHost);
     auto const* seqLengthsData = bufferCast<SizeType32>(*seqLengthsHost);
 
-    SizeType32 const promptLen = 3; // matches inputLengths in hardcodeBuffersLen10
+    // Read logProbsTiled (unmodified by gatherTree) for populating logits,
+    // and gathered logProbs (written by gatherTree) for cross-checking.
+    auto logProbsTiledHost
+        = mBufferManager->copyFrom(*mDecodingState->getJointDecodingOutput().logProbsTiled, MemoryType::kCPU);
+    auto const* logProbsTiledData = bufferCast<float>(*logProbsTiledHost);
+    // Layout: [maxSeqLen, batchSize=1, beamWidth] -> logProbsTiledData[t * beamWidth + slot]
 
-    // Create sentinel generation logits: logits[slot][g][v] = slot for all v.
-    // This lets us verify which slot's logits end up at each beam position after reorder.
-    SizeType32 const vocabSizePadded = 8; // small for testing
+    auto gatheredLogProbsHost = mBufferManager->copyFrom(*mDecodingState->getLogProbs(0), MemoryType::kCPU);
+    auto const* gatheredLogProbsData = bufferCast<float>(*gatheredLogProbsHost);
+    // Layout: [beamWidth, maxSeqLen] -> gatheredLogProbsData[beam * maxSeqLen + g]
+
+    SizeType32 const promptLen = 3;           // matches inputLengths in hardcodeBuffersLen10
+    SizeType32 const vocabSizePadded = 32000; // LLaMA vocab size (matches fixture token IDs)
     SizeType32 const maxNewTokens = maxSeqLen - promptLen;
-    // Shape: [beamWidth, maxNewTokens, vocabSizePadded]
-    std::vector<float> logits(beamWidth * maxNewTokens * vocabSizePadded, 0.0f);
-    for (SizeType32 slot = 0; slot < beamWidth; ++slot)
+
+    // Populate generation logits using actual token IDs and logProb values from the
+    // fixture. For each (post-reassignment slot B, gen step g), place the logProbsTiled
+    // value at logits[A][g][token], where A is the pre-reassignment slot (from parentIds)
+    // and token is the selected token (from raw ids). This mirrors how the model stores
+    // logits indexed by pre-reassignment slot.
+    std::vector<float> logits(static_cast<size_t>(beamWidth) * maxNewTokens * vocabSizePadded, 0.0f);
+    for (SizeType32 postSlot = 0; postSlot < beamWidth; ++postSlot)
     {
-        for (SizeType32 g = 0; g < maxNewTokens; ++g)
+        auto const genLen = seqLengthsData[postSlot] - promptLen;
+        for (SizeType32 g = 0; g < genLen; ++g)
         {
-            for (SizeType32 v = 0; v < vocabSizePadded; ++v)
-            {
-                logits[(slot * maxNewTokens + g) * vocabSizePadded + v] = static_cast<float>(slot);
-            }
+            SizeType32 const t = promptLen + g;
+            SizeType32 const preSlot = parentIdsData[postSlot * maxSeqLen + t];
+            TokenIdType const token = idsData[postSlot * maxSeqLen + t];
+            float const logProbValue = logProbsTiledData[t * beamWidth + postSlot];
+            logits[static_cast<size_t>(preSlot * maxNewTokens + g) * vocabSizePadded + token] = logProbValue;
         }
     }
 
-    // Run the same algorithm as reorderGenerationLogitsForBeamSearch:
-    // 1. Build slot trace (post-reassignment)
-    // 2. Convert to pre-reassignment via parentIds
-    // 3. Reorder logits
-
+    // Build slot trace and reorder (same algorithm as reorderGenerationLogitsForBeamSearch)
     std::vector<std::vector<SizeType32>> slotTrace(beamWidth, std::vector<SizeType32>(maxNewTokens, 0));
 
     for (SizeType32 beam = 0; beam < beamWidth; ++beam)
@@ -783,19 +794,12 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
         }
         ASSERT_GE(startSlot, 0) << "Could not find starting slot for beam " << beam;
 
-        // Build post-reassignment slot trace
+        // Build pre-reassignment slot trace in a single pass
         SizeType32 slot = startSlot;
-        slotTrace[beam][genLen - 1] = slot;
-        for (SizeType32 t = seqLen - 1; t > promptLen; --t)
+        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
         {
             slot = parentIdsData[slot * maxSeqLen + t];
-            slotTrace[beam][t - 1 - promptLen] = slot;
-        }
-
-        // Convert to pre-reassignment slot
-        for (SizeType32 g = 0; g < genLen; ++g)
-        {
-            slotTrace[beam][g] = parentIdsData[slotTrace[beam][g] * maxSeqLen + (promptLen + g)];
+            slotTrace[beam][t - promptLen] = slot;
         }
     }
 
@@ -846,21 +850,24 @@ TEST_F(TestGatherTree, GenerationLogitsReorder)
         }
     }
 
-    // Verify: after reorder, logits[beam][g][0] should equal the pre-reassignment slot
-    // that the model computed logits from for that beam at that step.
-    // Since our sentinel set logits[slot][g][v] = slot, the reordered value tells us
-    // which slot's logits were assigned to each beam.
+    // Cross-check: after reorder, the logit at the gathered output token position
+    // should match the gathered logProb from gatherTree. This is non-tautological
+    // because the gathered logProbs are computed independently by gatherTree (via
+    // insertUnfinishedPath + finalize tracing through logProbsTiled and parentIds).
     bool allCorrect = true;
     for (SizeType32 beam = 0; beam < beamWidth; ++beam)
     {
         auto const genLen = genLens[beam];
         for (SizeType32 g = 0; g < genLen; ++g)
         {
-            auto const reorderedSlot = static_cast<SizeType32>(logits[(beam * maxNewTokens + g) * vocabSizePadded]);
-            auto const expectedSlot = slotTrace[beam][g];
-            if (reorderedSlot != expectedSlot)
+            TokenIdType const gatheredToken = gatheredIdsData[beam * maxSeqLen + (promptLen + g)];
+            float const reorderedLogProb
+                = logits[static_cast<size_t>(beam * maxNewTokens + g) * vocabSizePadded + gatheredToken];
+            float const expectedLogProb = gatheredLogProbsData[beam * maxSeqLen + g];
+            if (std::abs(reorderedLogProb - expectedLogProb) > 1e-5f)
             {
-                TLLM_LOG_ERROR("Beam %d, step %d: expected slot %d, got slot %d", beam, g, expectedSlot, reorderedSlot);
+                TLLM_LOG_ERROR("Beam %d, step %d: reordered logProb %f != gathered logProb %f (token %d)", beam, g,
+                    reorderedLogProb, expectedLogProb, gatheredToken);
                 allCorrect = false;
             }
         }
