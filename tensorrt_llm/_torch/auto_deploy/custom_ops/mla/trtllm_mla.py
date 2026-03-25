@@ -198,23 +198,21 @@ class _TrtllmMLAPlanner:
             rope=rope_params,
             is_neox=False,
         )
-        q_lora_rank = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-
         if for_context:
-            # Context wrapper: same latent dimensions as decode (head_size=576,
-            # num_kv_heads=1) but with a separate C++ AttentionOp instance so
-            # context_only and generation_only modes don't conflict.
+            # Context wrapper: matches PT backend's self.mha (attention.py L1304-1323)
+            # head_size=qk_head_dim (192), num_kv_heads=num_heads (32), v_head_dim=128
+            # q_lora_rank=0: DeepSeek-V3-Lite has no Q compression (q_lora_rank=None)
             mla_params = MLAParams(
-                q_lora_rank=q_lora_rank,
+                q_lora_rank=0,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
-                v_head_dim=kv_lora_rank,
+                v_head_dim=v_head_dim,
             )
             w = TrtllmAttentionWrapper(
                 num_heads=num_heads,
-                head_size=kv_lora_rank + qk_rope_head_dim,
-                num_kv_heads=1,
+                head_size=qk_nope_head_dim + qk_rope_head_dim,
+                num_kv_heads=num_heads,
                 pos_embd_params=pos_embd_params,
                 q_scaling=1.0,
                 mla_params=mla_params,
@@ -222,7 +220,7 @@ class _TrtllmMLAPlanner:
         else:
             # Decode wrapper: latent dimensions (matches PT's self.mqa)
             mla_params = MLAParams(
-                q_lora_rank=q_lora_rank,
+                q_lora_rank=0,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
@@ -789,10 +787,8 @@ def _handle_prefill_thop(
     k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
     q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
-    # Context wrapper with separate Q/K/V (is_fused_qkv=False).
-    # The wrapper has head_size=576, num_kv_heads=1 (matching PT backend's self.mqa
-    # used for both context and decode). For context, the wrapper internally handles
-    # the Q/K/V head_size (192) vs wrapper head_size (576) mismatch.
+    # Context wrapper: head_size=192, num_kv_heads=32 (matching PT backend's self.mha).
+    # is_fused_qkv=False with separate Q/K/V, q_pe=None.
     # Uses layer_idx+1000 for a separate C++ AttentionOp from decode.
     wrapper = planner.get_or_create_wrapper(
         layer_idx,
@@ -821,7 +817,6 @@ def _handle_prefill_thop(
         host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
         block_ids_per_seq=planner.block_ids_per_seq,
         latent_cache=latent_cache,
-        q_pe=q_pe_flat.view(num_tokens, num_heads * qk_rope_head_dim),
         workspace=planner.workspace,
         use_paged_context_fmha=False,
         attention_input_type=AttentionInputType.context_only,
@@ -1217,10 +1212,18 @@ def _mla_with_cache_impl(
             planner.kv_scale_quant_orig = torch.tensor(
                 [1.0], dtype=torch.float32, device=q_nope.device
             )
-        # Configure wrapper quant_mode for FP8 KV cache (once per layer).
-        for w in planner._attn_wrappers.values():
-            if not hasattr(w, "_quant_configured"):
+    # Configure FP8 KV cache quant_mode on decode wrappers only.
+    if quant_mode != 0:
+        for key, w in planner._attn_wrappers.items():
+            if not hasattr(w, "_quant_configured") and key[1] is False:  # decode only
                 w.quant_mode = quant_mode
+                w._quant_configured = True
+    # Configure FP8 block scaling on context wrappers (matches PT backend).
+    if kv_b_proj_weight.dtype == torch.float8_e4m3fn:
+        ctx_quant = quant_mode | int(QuantMode.FP8_1x128_128x128)
+        for key, w in planner._attn_wrappers.items():
+            if not hasattr(w, "_quant_configured") and key[1] is True:  # context only
+                w.quant_mode = ctx_quant
                 w._quant_configured = True
         quant_mode = int(QuantMode.FP8_KV_CACHE)
 
