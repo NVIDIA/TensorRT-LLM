@@ -247,6 +247,7 @@ def test_insert_cached_attention_trtllm_materializes_out_scale_reciprocal():
     cm = CachedSequenceInterface(
         max_seq_len=64,
         max_batch_size=4,
+        max_num_tokens=256,
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -295,6 +296,7 @@ def test_insert_cached_attention_trtllm_fallback_without_fp8_contract():
     cm = CachedSequenceInterface(
         max_seq_len=64,
         max_batch_size=4,
+        max_num_tokens=256,
         device="cuda",
         kv_cache_config=kv_cache_config,
     )

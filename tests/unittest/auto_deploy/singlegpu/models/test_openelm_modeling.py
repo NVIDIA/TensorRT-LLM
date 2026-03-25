@@ -82,6 +82,7 @@ def _create_small_config():
         share_input_output_layers=True,
         rope_freq_constant=10000,
         rope_max_length=256,
+        initializer_range=0.02,
     )
 
 

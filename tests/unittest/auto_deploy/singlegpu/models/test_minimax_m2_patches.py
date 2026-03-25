@@ -64,15 +64,7 @@ def _load_minimax_m2_moe_layer(model_name_or_path):
         return None
 
 
-@pytest.mark.parametrize(
-    "model_name",
-    [
-        pytest.param(
-            hf_id_to_local_model_dir("MiniMaxAI/MiniMax-M2"),
-        ),
-    ],
-)
-def test_minimax_m2_moe_patch(model_name):
+def test_minimax_m2_moe_patch():
     """Test that the patched MiniMaxM2SparseMoeBlock forward matches HF implementation.
 
     The patch rewrites the forward to use torch.ops.auto_deploy.torch_moe
@@ -81,6 +73,12 @@ def test_minimax_m2_moe_patch(model_name):
     Since importing minimax_m2.py auto-patches module instances, we use the
     CLASS method (type(module).forward) as the original HF reference.
     """
+    # Resolve model path at test time (not collection time) to avoid ValueError
+    try:
+        model_name = hf_id_to_local_model_dir("MiniMaxAI/MiniMax-M2")
+    except (ValueError, FileNotFoundError):
+        pytest.skip("MiniMax-M2 model not available locally")
+
     # Set seed for reproducibility
     torch.manual_seed(42)
 

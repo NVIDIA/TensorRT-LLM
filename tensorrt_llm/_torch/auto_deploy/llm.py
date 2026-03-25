@@ -46,13 +46,15 @@ class ADInputProcessor(DefaultInputProcessor):
             # multi_modal_data should not be present in the messages field
             assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
 
-            # Normalize message content to list-of-dicts format for multimodal
+            # Normalize message content to list-of-dicts format only for multimodal
             # processors (e.g., Llama4) that expect {"type": "text", "text": "..."}
-            # instead of plain strings when tokenize=True.
+            # instead of plain strings when tokenize=True. Text-only models' Jinja2
+            # chat templates expect content as a plain string.
             messages = inputs["messages"]
-            for msg in messages:
-                if isinstance(msg.get("content"), str):
-                    msg["content"] = [{"type": "text", "text": msg["content"]}]
+            if hasattr(self.processor, "image_processor"):
+                for msg in messages:
+                    if isinstance(msg.get("content"), str):
+                        msg["content"] = [{"type": "text", "text": msg["content"]}]
 
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.

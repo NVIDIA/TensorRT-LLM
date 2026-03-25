@@ -502,6 +502,9 @@ def test_granite_moe_hybrid_mamba_decoder_layer_equivalence(B, S, dtype):
 
     # Layer 0 is a mamba layer
     hf_layer = HFDecoderLayer(config, layer_idx=0)
+    # HF ParallelExperts uses torch.empty() — reinitialize all weights to avoid NaN
+    for name, p in hf_layer.named_parameters():
+        torch.nn.init.normal_(p, std=0.02)
     hf_layer.to(device=device, dtype=dtype)
     hf_layer.eval()
 
@@ -536,6 +539,9 @@ def test_granite_moe_hybrid_attention_decoder_layer_nope_equivalence(B, S, dtype
 
     # Layer 3 is an attention layer
     hf_layer = HFDecoderLayer(config, layer_idx=3)
+    # HF ParallelExperts uses torch.empty() — reinitialize all weights to avoid NaN
+    for name, p in hf_layer.named_parameters():
+        torch.nn.init.normal_(p, std=0.02)
     hf_layer.to(device=device, dtype=dtype)
     hf_layer.eval()
 
@@ -614,6 +620,9 @@ def test_granite_moe_hybrid_full_model_hybrid_equivalence(B, S, dtype):
     config = _create_small_hybrid_config()
 
     hf_model = HFModel(config)
+    # HF ParallelExperts uses torch.empty() — reinitialize all weights to avoid NaN
+    for name, p in hf_model.named_parameters():
+        torch.nn.init.normal_(p, std=0.02)
     hf_model.to(device=device, dtype=dtype)
     hf_model.eval()
 

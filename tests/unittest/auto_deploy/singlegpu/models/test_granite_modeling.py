@@ -42,6 +42,13 @@ from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
 
 
+def _create_causal_mask(B: int, S: int, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """Create the additive causal mask expected by HF eager attention."""
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    return causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, S, S)
+
+
 @pytest.fixture(scope="function", autouse=True)
 def set_seed():
     torch.manual_seed(42)
@@ -238,11 +245,15 @@ def test_granite_attention_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
+    # HF eager attention is non-causal when attention_mask=None, but the
+    # AutoDeploy custom attention models prefill-only causal attention.
+    causal_mask = _create_causal_mask(B, S, device, dtype)
+
     # Run HF attention
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=(hf_cos, hf_sin),
-        attention_mask=None,
+        attention_mask=causal_mask,
     )
 
     # Run custom attention
@@ -294,10 +305,13 @@ def test_granite_decoder_layer_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
+    # Match the custom decoder layer's causal prefill behavior.
+    causal_mask = _create_causal_mask(B, S, device, dtype)
+
     # Run HF decoder layer
     hf_out = hf_layer(
         hidden_states=x,
-        attention_mask=None,
+        attention_mask=causal_mask,
         position_ids=position_ids,
         position_embeddings=(hf_cos, hf_sin),
     )

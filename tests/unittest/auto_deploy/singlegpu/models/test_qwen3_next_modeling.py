@@ -46,7 +46,7 @@ def _create_small_config():
     """Create a small Qwen3Next config for testing (4 layers: 3 linear + 1 full)."""
     HFConfig = _get_hf_config_class()
     if HFConfig is not None:
-        return HFConfig(
+        config = HFConfig(
             vocab_size=1000,
             hidden_size=64,
             intermediate_size=128,
@@ -84,6 +84,9 @@ def _create_small_config():
                 "full_attention",
             ],
         )
+        # Required by HF's attention implementation dispatch (avoids KeyError: None)
+        config._attn_implementation = "eager"
+        return config
     pytest.skip("transformers doesn't have qwen3_next")
 
 
@@ -576,11 +579,17 @@ def test_qwen3_next_attention_numerical_equivalence(B, S, dtype):
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
     position_embeddings = hf_rope(x, position_ids)  # (cos, sin), each (B, S, rotary_dim)
 
+    # HF eager attention is non-causal when attention_mask=None, but the
+    # AutoDeploy custom attention uses is_causal=True.
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, S, S)
+
     # HF attention forward: returns (attn_output, attn_weights)
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=position_embeddings,
-        attention_mask=None,
+        attention_mask=causal_mask,
     )
 
     # Custom attention also gets pre-sliced position embeddings (slicing done at model level)
@@ -685,7 +694,12 @@ def test_qwen3_next_full_attention_decoder_layer_equivalence(B, S, dtype):
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
     position_embeddings = hf_rope(x, position_ids)
 
-    hf_out = hf_layer(x, position_embeddings=position_embeddings)
+    # HF eager attention needs an explicit causal mask to match custom model's is_causal=True
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, S, S)
+
+    hf_out = hf_layer(x, position_embeddings=position_embeddings, attention_mask=causal_mask)
     if isinstance(hf_out, tuple):
         hf_out = hf_out[0]
 

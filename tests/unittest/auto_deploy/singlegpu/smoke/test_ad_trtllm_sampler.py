@@ -32,7 +32,7 @@ def test_ad_trtllm_sampler_smoke():
 
     # Setup simple prompt
     experiment_config["prompt"]["batch_size"] = 1
-    experiment_config["prompt"]["queries"] = {"prompt": "What is the capital of France?"}
+    experiment_config["prompt"]["queries"] = "What is the capital of France?"
     experiment_config["prompt"]["sp_kwargs"] = {
         "max_tokens": 10,
         "temperature": 1.0,

@@ -632,6 +632,10 @@ def test_glm_moe_dsa_decoder_layer_numerical_equivalence(B, S, dtype, layer_idx)
     config = _create_small_config()
 
     hf_layer = _HFRefDecoderLayer(config, layer_idx=layer_idx)
+    # Initialize any uninitialized weights (e.g., router gate uses torch.empty)
+    for module in hf_layer.modules():
+        if isinstance(module, _HFRefTopkRouter):
+            module.weight = nn.Parameter(torch.randn_like(module.weight))
     hf_layer.to(device=device, dtype=dtype)
     hf_layer.eval()
 
