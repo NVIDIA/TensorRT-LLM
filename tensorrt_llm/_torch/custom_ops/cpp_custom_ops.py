@@ -1,5 +1,3 @@
-"""Fake implementations of C++ custom ops for torch.compile shape inference."""
-
 from typing import List, Optional, Tuple
 
 import torch
