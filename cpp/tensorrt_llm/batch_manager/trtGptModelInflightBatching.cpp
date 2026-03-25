@@ -1956,7 +1956,7 @@ void TrtGptModelInflightBatching::postProcessRequest(
     // store the generated tokens into the mTokensGathered buffer
     llmReq.setGeneratedTokens(generatedTokens);
 
-    if (llmReq.getReturnGenerationLogits())
+    if (llmReq.getReturnGenerationLogits() && mWorldConfig.isLastPipelineParallelRank())
     {
         reorderGenerationLogitsForBeamSearch(
             llmReq, seqSlot, reqBeamWidth, maxSeqLength, outputIdsHostData, sequenceLengthsHostData);
