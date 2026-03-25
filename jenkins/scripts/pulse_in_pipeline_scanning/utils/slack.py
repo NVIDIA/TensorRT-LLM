@@ -6,7 +6,6 @@ import requests
 
 
 def post_slack_msg(build_number, branch, risk_detail):
-    print(risk_detail)
     SLACK_WEBHOOK_URL = os.environ.get("TRTLLM_PLC_WEBHOOK")
     if not SLACK_WEBHOOK_URL:
         raise EnvironmentError("Error: Environment variable 'SLACK_WEBHOOK_URL' is not set!")

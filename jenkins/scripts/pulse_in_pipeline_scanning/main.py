@@ -105,7 +105,10 @@ def process_container_result():
         )
 
     if NEW_RISKY_DEPENDENCIES:
+        print(", ".join(NEW_RISKY_DEPENDENCIES))
         post_slack_msg(args.build_number, args.branch, ", ".join(NEW_RISKY_DEPENDENCIES))
+    else:
+        print("No new risk involved")
 
 
 if __name__ == "__main__":
