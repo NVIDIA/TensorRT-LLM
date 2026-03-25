@@ -33,6 +33,7 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 # LoRA helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_lora_deltas(
     lora_path: str,
     transformer: torch.nn.Module,
@@ -101,7 +102,7 @@ def _load_lora_deltas(
         if base_name not in up_keys:
             continue
         A = down_keys[base_name]  # (rank, in_features)
-        B = up_keys[base_name]    # (out_features, rank)
+        B = up_keys[base_name]  # (out_features, rank)
         rank = A.shape[0]
         alpha = alpha_dict.get(base_name, float(rank))
         scale = strength * alpha / rank
@@ -109,30 +110,23 @@ def _load_lora_deltas(
         param_name = base_name
         for prefix in strip_prefixes:
             if param_name.startswith(prefix):
-                param_name = param_name[len(prefix):]
+                param_name = param_name[len(prefix) :]
                 break
 
         # Apply the same key remapping as LTXModel.load_weights() so
         # that LoRA delta keys match TRT-LLM parameter names.
         for ff_prefix in (".ff.", ".audio_ff."):
             if ff_prefix + "net.0.proj" in param_name:
-                param_name = param_name.replace(
-                    ff_prefix + "net.0.proj", ff_prefix + "up_proj"
-                )
+                param_name = param_name.replace(ff_prefix + "net.0.proj", ff_prefix + "up_proj")
             elif ff_prefix + "net.2" in param_name:
-                param_name = param_name.replace(
-                    ff_prefix + "net.2", ff_prefix + "down_proj"
-                )
+                param_name = param_name.replace(ff_prefix + "net.2", ff_prefix + "down_proj")
         param_name = param_name.replace(".q_norm.", ".norm_q.")
         param_name = param_name.replace(".k_norm.", ".norm_k.")
 
         delta = (B.float() @ A.float()) * scale
         deltas[param_name] = delta
 
-    logger.info(
-        f"Loaded {len(deltas)} LoRA deltas from {lora_path} "
-        f"(strength={strength})"
-    )
+    logger.info(f"Loaded {len(deltas)} LoRA deltas from {lora_path} (strength={strength})")
     return deltas
 
 
@@ -166,9 +160,7 @@ def _dequantize_fp4_weight(
     )
 
     scale_fp32 = (
-        linear_scale[:out_features, :scale_cols]
-        .view(torch.float8_e4m3fn)
-        .to(torch.float32)
+        linear_scale[:out_features, :scale_cols].view(torch.float8_e4m3fn).to(torch.float32)
     )
 
     device = packed_weight.device
@@ -181,9 +173,7 @@ def _dequantize_fp4_weight(
     e2m1_table = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=device)
     vals = e2m1_table[idx]
 
-    scale_real = (scale_fp32 * weight_scale_2.float()).view(
-        out_features, scale_cols, 1
-    )
+    scale_real = (scale_fp32 * weight_scale_2.float()).view(out_features, scale_cols, 1)
     vals = vals.view(out_features, scale_cols, block_size) * scale_real
     return vals.view(out_features, in_features).to(torch.bfloat16)
 
@@ -198,17 +188,14 @@ def _requantize_fp4_weight(
     """
     from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_nvfp4
 
-    qweight, linear_scale, weight_scale_2 = quantize_nvfp4(
-        bf16_weight, block_size
-    )
+    qweight, linear_scale, weight_scale_2 = quantize_nvfp4(bf16_weight, block_size)
     # block_scale_interleave expects uint8; quantize_nvfp4 returns float8_e4m3fn
-    interleaved_scale = torch.ops.trtllm.block_scale_interleave(
-        linear_scale.view(torch.uint8)
-    )
+    interleaved_scale = torch.ops.trtllm.block_scale_interleave(linear_scale.view(torch.uint8))
     return qweight, interleaved_scale, weight_scale_2
 
 
 # -- FP8 block-scale helpers ------------------------------------------------
+
 
 def _is_fp8_scale_packed(
     weight_scale: torch.Tensor,
@@ -229,15 +216,12 @@ def _is_fp8_scale_packed(
 
     import math
 
-    from tensorrt_llm.quantization.utils.fp8_utils import (
-        align,
-    )
+    from tensorrt_llm.quantization.utils.fp8_utils import align
 
     nb_in = math.ceil(in_features / block_size)
     aligned_k = align(nb_in, 4)
     expected_cols = aligned_k // 4
-    return (weight_scale.shape[0] == out_features
-            and weight_scale.shape[1] == expected_cols)
+    return weight_scale.shape[0] == out_features and weight_scale.shape[1] == expected_cols
 
 
 def _dequantize_fp8_weight(
@@ -253,11 +237,12 @@ def _dequantize_fp8_weight(
     out_features, in_features = fp8_weight.shape
 
     if packed:
-        from tensorrt_llm.quantization.utils.fp8_utils import (
-            inverse_transform_sf,
-        )
+        from tensorrt_llm.quantization.utils.fp8_utils import inverse_transform_sf
+
         block_scale = inverse_transform_sf(
-            weight_scale, mn=out_features, k=in_features,
+            weight_scale,
+            mn=out_features,
+            k=in_features,
             block_size=block_size,
         )
     else:
@@ -282,20 +267,23 @@ def _requantize_fp8_weight(
 
     Returns ``(qweight, block_scales)``.
     """
-    from tensorrt_llm._torch.visual_gen.quantization.ops import (
-        quantize_fp8_blockwise,
-    )
+    from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise
 
     qw, scale = quantize_fp8_blockwise(bf16_weight, block_size)
 
     if repack:
         from tensorrt_llm.quantization.utils.fp8_utils import (
-            resmooth_to_fp8_e8m0, transform_sf_into_required_layout,
+            resmooth_to_fp8_e8m0,
+            transform_sf_into_required_layout,
         )
+
         qw, scale = resmooth_to_fp8_e8m0(qw, scale)
         scale = transform_sf_into_required_layout(
-            scale, mn=qw.shape[0], k=qw.shape[1],
-            recipe=(1, 128, 128), is_sfa=False,
+            scale,
+            mn=qw.shape[0],
+            k=qw.shape[1],
+            recipe=(1, 128, 128),
+            is_sfa=False,
         )
 
     return qw, scale
@@ -347,32 +335,37 @@ def _apply_lora_deltas(
                 scale_key = f"{base}.weight_scale"
                 if scale_key not in state:
                     raise RuntimeError(
-                        f"Cannot apply LoRA delta to FP8 param "
-                        f"'{param_name}': missing {scale_key}."
+                        f"Cannot apply LoRA delta to FP8 param '{param_name}': missing {scale_key}."
                     )
                 ws_param = state[scale_key]
                 out_f, in_f = delta.shape
                 is_packed = _is_fp8_scale_packed(
-                    ws_param.data, out_f, in_f,
+                    ws_param.data,
+                    out_f,
+                    in_f,
                 )
 
                 saved_state[param_name] = param.data.clone()
                 saved_state[scale_key] = ws_param.data.clone()
 
                 bf16 = _dequantize_fp8_weight(
-                    param.data, ws_param.data, packed=is_packed,
+                    param.data,
+                    ws_param.data,
+                    packed=is_packed,
                 )
                 bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
 
                 qw, new_scale = _requantize_fp8_weight(
-                    bf16, repack=is_packed,
+                    bf16,
+                    repack=is_packed,
                 )
                 param.data.copy_(qw)
                 ws_param.data.copy_(new_scale)
             else:
                 # BF16/FP16/FP32 — direct in-place addition
                 param.data.add_(
-                    delta.to(param.device, param.dtype), alpha=sign,
+                    delta.to(param.device, param.dtype),
+                    alpha=sign,
                 )
             applied += 1
 
@@ -400,8 +393,11 @@ def _apply_lora_deltas(
             saved_state[scale2_key] = ws2_param.data.clone()
 
             bf16 = _dequantize_fp4_weight(
-                param.data, ws_param.data, ws2_param.data,
-                out_features, in_features,
+                param.data,
+                ws_param.data,
+                ws2_param.data,
+                out_features,
+                in_features,
             )
             bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
 
@@ -437,6 +433,7 @@ def _restore_lora_state(
 # Pipeline
 # ---------------------------------------------------------------------------
 
+
 @register_pipeline("LTX2TwoStagesPipeline")
 class LTX2TwoStagesPipeline(LTX2Pipeline):
     """Two-stage text-to-video with audio.
@@ -467,7 +464,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         **kwargs,
     ) -> None:
         super().load_standard_components(
-            checkpoint_dir, device, skip_components,
+            checkpoint_dir,
+            device,
+            skip_components,
             text_encoder_path=text_encoder_path,
             **kwargs,
         )
@@ -479,9 +478,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             logger.info(f"Loading spatial upsampler from {spatial_upsampler_path}...")
             sft_paths = _find_safetensors_files(spatial_upsampler_path)
             if not sft_paths:
-                raise ValueError(
-                    f"No safetensors files found at {spatial_upsampler_path}"
-                )
+                raise ValueError(f"No safetensors files found at {spatial_upsampler_path}")
 
             config: Dict[str, Any] = {}
             try:
@@ -489,6 +486,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     meta = f.metadata()
                     if meta and "config" in meta:
                         import json
+
                         config = json.loads(meta["config"])
             except Exception:
                 pass
@@ -502,7 +500,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                         state_dict[key] = f.get_tensor(key)
 
             missing, unexpected = self.spatial_upsampler.load_state_dict(
-                state_dict, strict=False,
+                state_dict,
+                strict=False,
             )
             if missing:
                 logger.warning(f"Upsampler missing keys ({len(missing)}): {missing[:5]}")
@@ -600,10 +599,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         pipeline_start = time.time()
         height_s1 = height // 2
         width_s1 = width // 2
-        logger.info(
-            f"LTX2 two-stage: stage1 at {height_s1}x{width_s1}, "
-            f"final {height}x{width}"
-        )
+        logger.info(f"LTX2 two-stage: stage1 at {height_s1}x{width_s1}, final {height}x{width}")
 
         # ================================================================
         # Stage 1: denoise at half resolution
@@ -631,8 +627,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             enhance_prompt=enhance_prompt,
         )
 
-        video_latents = out.video   # (B, C, F_lat, H_lat_s1, W_lat_s1)
-        audio_latents = out.audio   # (B, C, F_aud, M) or None
+        video_latents = out.video  # (B, C, F_lat, H_lat_s1, W_lat_s1)
+        audio_latents = out.audio  # (B, C, F_aud, M) or None
 
         # Non-primary CFG-parallel workers (rank != 0) receive None from
         # decode_latents.  Stage-2 operations are local-only (no cross-rank
@@ -646,7 +642,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         per_ch_stats = self._get_per_channel_statistics()
         video_latents = upsample_video(
-            video_latents[:1], per_ch_stats, self.spatial_upsampler,
+            video_latents[:1],
+            per_ch_stats,
+            self.spatial_upsampler,
         )
         logger.info("Upsampled video latents via learned upsampler")
 
@@ -654,7 +652,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # Stage 2: refinement denoising with distilled LoRA
         # ================================================================
         n, saved_quant_state = _apply_lora_deltas(
-            self.transformer, self._distilled_lora_deltas, sign=1.0,
+            self.transformer,
+            self._distilled_lora_deltas,
+            sign=1.0,
         )
         logger.info(f"Merged distilled LoRA ({n} params) for stage 2")
 
@@ -677,7 +677,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 _restore_lora_state(self.transformer, saved_quant_state)
             else:
                 _apply_lora_deltas(
-                    self.transformer, self._distilled_lora_deltas, sign=-1.0,
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                    sign=-1.0,
                 )
             logger.info("Un-merged distilled LoRA after stage 2")
 
@@ -686,9 +688,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         if output_type == "latent":
             if self.rank == 0:
-                logger.info(
-                    f"Two-stage total time: {time.time() - pipeline_start:.2f}s"
-                )
+                logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
             return MediaOutput(video=video_latents, audio=audio_latents)
 
         logger.info("Decoding upsampled video (tiled)...")
@@ -696,7 +696,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         tiling_config = TilingConfig.default()
         chunks = list(
             self.video_decoder.tiled_decode(
-                video_latents, tiling_config, generator=None,
+                video_latents,
+                tiling_config,
+                generator=None,
             )
         )
         video = torch.cat(chunks, dim=2)
@@ -708,9 +710,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
 
         if self.rank == 0:
-            logger.info(
-                f"Two-stage total time: {time.time() - pipeline_start:.2f}s"
-            )
+            logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
         return MediaOutput(video=video, audio=audio_out)
 
     # ------------------------------------------------------------------
@@ -758,25 +758,32 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         # --- Text conditioning (positive only, no CFG) ---
         prompt_embeds, prompt_attention_mask = self._encode_prompt(
-            prompt, num_videos_per_prompt=1,
+            prompt,
+            num_videos_per_prompt=1,
             max_sequence_length=max_sequence_length,
         )
         video_embeds, audio_embeds, connector_mask = self._process_connectors(
-            prompt_embeds, prompt_attention_mask,
+            prompt_embeds,
+            prompt_attention_mask,
         )
 
         # --- Shapes at full resolution ---
         pixel_shape = VideoPixelShape(
-            batch=1, frames=num_frames, height=height, width=width,
+            batch=1,
+            frames=num_frames,
+            height=height,
+            width=width,
             fps=frame_rate,
         )
         video_shape = VideoLatentShape.from_pixel_shape(
-            pixel_shape, latent_channels=self.transformer_in_channels,
+            pixel_shape,
+            latent_channels=self.transformer_in_channels,
         )
         audio_shape = AudioLatentShape.from_video_pixel_shape(
             pixel_shape,
             channels=getattr(self.audio_decoder, "z_channels", 8)
-            if hasattr(self, "audio_decoder") else 8,
+            if hasattr(self, "audio_decoder")
+            else 8,
             mel_bins=getattr(self, "audio_mel_bins", 64) // 4,
             sample_rate=getattr(self, "audio_sampling_rate", 16000),
             hop_length=getattr(self, "audio_hop_length", 160),
@@ -786,10 +793,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # --- Video: patchify, positions ---
         v_latents = self.video_patchifier.patchify(video_latents)
         video_positions = self.video_patchifier.get_patch_grid_bounds(
-            video_shape, device=self.device,
+            video_shape,
+            device=self.device,
         )
         video_positions = get_pixel_coords(
-            video_positions.float(), VIDEO_SCALE_FACTORS, causal_fix=True,
+            video_positions.float(),
+            VIDEO_SCALE_FACTORS,
+            causal_fix=True,
         )
         video_positions[:, 0, ...] /= frame_rate
         video_positions = video_positions.to(self.dtype)
@@ -807,15 +817,21 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             full_clean[:, :, :1, :, :] = encoded_image
 
             denoise_mask = self._build_denoise_mask(
-                video_shape, num_cond_latent_frames=1,
+                video_shape,
+                num_cond_latent_frames=1,
                 strength=image_cond_strength,
             )
             clean_latent = self.video_patchifier.patchify(full_clean)
 
             noise_5d = torch.randn_like(video_latents)
             mask_5d = torch.ones(
-                1, 1, video_shape.frames, video_shape.height, video_shape.width,
-                device=self.device, dtype=torch.float32,
+                1,
+                1,
+                video_shape.frames,
+                video_shape.height,
+                video_shape.width,
+                device=self.device,
+                dtype=torch.float32,
             )
             mask_5d[:, :, :1, :, :] = 1.0 - image_cond_strength
             blended = noise_5d * mask_5d + video_latents * (1.0 - mask_5d)
@@ -825,7 +841,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         if audio_latents is not None:
             a_latents = self.audio_patchifier.patchify(audio_latents)
             audio_positions = self.audio_patchifier.get_patch_grid_bounds(
-                audio_shape, device=self.device,
+                audio_shape,
+                device=self.device,
             )
         else:
             a_latents = None
@@ -834,7 +851,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # --- Distilled sigma schedule ---
         sigmas = torch.tensor(
             STAGE_2_DISTILLED_SIGMA_VALUES,
-            device=self.device, dtype=torch.float32,
+            device=self.device,
+            dtype=torch.float32,
         )
 
         # Add noise at the first sigma level using flow-matching interpolation:
@@ -880,7 +898,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 )
 
             vel_v, vel_a = self.transformer(
-                video=video_mod, audio=audio_mod,
+                video=video_mod,
+                audio=audio_mod,
             )
 
             # Video: velocity → x0 → post-process → Euler step

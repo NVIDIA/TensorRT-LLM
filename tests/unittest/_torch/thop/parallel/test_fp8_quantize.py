@@ -379,6 +379,7 @@ def test_triton_fp8_quantize_1x128_large_m(dtype, use_ue8m0):
 # Round-trip tests for inverse_transform_sf / unpack_col_major_tma_aligned_packed_tensor
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("mn,k", [
     (256, 256),
     (384, 512),
@@ -390,8 +391,7 @@ def test_unpack_col_major_tma_aligned_round_trip(mn, k):
     """Pack then unpack should recover the original float32 UE8M0 tensor."""
     from tensorrt_llm.quantization.utils.fp8_utils import (
         get_col_major_tma_aligned_packed_tensor,
-        unpack_col_major_tma_aligned_packed_tensor,
-    )
+        unpack_col_major_tma_aligned_packed_tensor)
 
     # Build a random UE8M0 scale tensor: 2^exp where exp in [-10, 10].
     exponents = torch.randint(-10, 11, (mn, k), device='cuda')
@@ -400,9 +400,11 @@ def test_unpack_col_major_tma_aligned_round_trip(mn, k):
     packed = get_col_major_tma_aligned_packed_tensor(original)
     recovered = unpack_col_major_tma_aligned_packed_tensor(packed, mn, k)
 
-    torch.testing.assert_close(
-        recovered, original, atol=0.0, rtol=0.0,
-        msg=f"Round-trip failed for ({mn}, {k})")
+    torch.testing.assert_close(recovered,
+                               original,
+                               atol=0.0,
+                               rtol=0.0,
+                               msg=f"Round-trip failed for ({mn}, {k})")
 
 
 @pytest.mark.parametrize("out_features,in_features", [
@@ -415,8 +417,7 @@ def test_unpack_col_major_tma_aligned_round_trip(mn, k):
 def test_inverse_transform_sf_round_trip(out_features, in_features):
     """transform_sf → inverse_transform_sf should recover block-scale grid."""
     from tensorrt_llm.quantization.utils.fp8_utils import (
-        inverse_transform_sf, transform_sf_into_required_layout,
-    )
+        inverse_transform_sf, transform_sf_into_required_layout)
 
     block_size = 128
     nb_m = math.ceil(out_features / block_size)
@@ -427,14 +428,22 @@ def test_inverse_transform_sf_round_trip(out_features, in_features):
 
     packed = transform_sf_into_required_layout(
         original_scale.clone(),
-        mn=out_features, k=in_features,
-        recipe=(1, 128, 128), is_sfa=False,
+        mn=out_features,
+        k=in_features,
+        recipe=(1, 128, 128),
+        is_sfa=False,
     )
 
     recovered = inverse_transform_sf(
-        packed, mn=out_features, k=in_features, block_size=block_size,
+        packed,
+        mn=out_features,
+        k=in_features,
+        block_size=block_size,
     )
 
     torch.testing.assert_close(
-        recovered, original_scale, atol=0.0, rtol=0.0,
+        recovered,
+        original_scale,
+        atol=0.0,
+        rtol=0.0,
         msg=f"inverse_transform_sf failed for ({out_features}, {in_features})")

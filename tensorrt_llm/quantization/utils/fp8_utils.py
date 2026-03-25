@@ -249,7 +249,7 @@ def unpack_col_major_tma_aligned_packed_tensor(
 
     # The packed tensor may have col-major strides from the forward
     # transform.  Flatten to 1-D via clone() so dtype views always work.
-    n_int32 = packed.shape[-2] * packed.shape[-1]
+    packed.shape[-2] * packed.shape[-1]
     flat_int = packed.reshape(b, -1).clone()  # (b, mn * cols) contiguous
 
     # Pad mn back to aligned_mn (forward sliced [:mn])
@@ -257,7 +257,7 @@ def unpack_col_major_tma_aligned_packed_tensor(
         extra = (aligned_mn - mn) * packed.shape[-1]
         pad = torch.zeros(b, extra, device=packed.device, dtype=torch.int)
         flat_int = torch.cat([flat_int, pad], dim=1)
-        n_int32 = aligned_mn * packed.shape[-1]
+        aligned_mn * packed.shape[-1]
 
     # int32 → uint8: 4 bytes per element
     flat_bytes = flat_int.view(torch.uint8)  # (b, n_int32 * 4)
