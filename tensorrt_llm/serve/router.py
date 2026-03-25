@@ -144,6 +144,54 @@ class KvCacheAwareServerState(ServerState):
         return self._num_active_requests
 
 
+class LoadBalancingMixin:
+    """Mixin providing common server state and request tracking for
+    load-balancing routers.
+
+    Subclasses should set _server_state_class and call
+    _init_load_balancing() in __init__.
+    """
+
+    _server_state_class: type = ServerState
+
+    def _init_load_balancing(self, servers: Optional[List[str]],
+                             use_tokens: bool = False):
+        self._use_tokens = use_tokens
+        self._server_state: dict[str, ServerState] = {}
+        self._req_routing_table: dict[int, str] = {}
+        for server in servers or []:
+            self._server_state[server] = self._create_server_state(server)
+
+    def _create_server_state(self, server: str) -> ServerState:
+        return self._server_state_class(server, self._use_tokens)
+
+    def _get_server_load(self, server: str) -> int:
+        state = self._server_state[server]
+        return state._num_active_tokens if self._use_tokens \
+            else state._num_active_requests
+
+    def _validate_servers_available(self):
+        if not self._servers:
+            if self._metadata_server:
+                raise ValueError(
+                    f"No {self._server_role} servers available in metadata service"
+                )
+            else:
+                raise ValueError(
+                    f"No {self._server_role} servers available")
+
+    async def _register_request(self, server: str, request: OpenAIRequest):
+        await self._server_state[server].increment_load(request)
+        self._req_routing_table[id(request)] = server
+
+    async def _unregister_request(self, request: OpenAIRequest,
+                                  **kwargs) -> str:
+        server = self._req_routing_table.pop(id(request))
+        if server in self._server_state:
+            await self._server_state[server].decrement_load(request, **kwargs)
+        return server
+
+
 class Router(ABC):
 
     def __init__(
@@ -496,7 +544,7 @@ class RoundRobinRouter(Router):
         pass
 
 
-class LoadBalancingRouter(Router):
+class LoadBalancingRouter(LoadBalancingMixin, Router):
 
     def __init__(self,
                  server_role: ServerRole,
@@ -507,14 +555,8 @@ class LoadBalancingRouter(Router):
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        # Load map between servers and their number of tokens processed
-        self._server_state = {}
+        self._init_load_balancing(servers, use_tokens)
         self._server_load_heap = []
-
-        # Routing table to map requests to servers
-        self._req_routing_table = {}
-
-        self._use_tokens = use_tokens
         self._init_heap()
 
     def _on_servers_updated(self, old_servers, new_servers):
@@ -527,7 +569,7 @@ class LoadBalancingRouter(Router):
                 current_state[server] = self._server_state[server]
             else:
                 # Initialize new server state
-                current_state[server] = ServerState(server, self._use_tokens)
+                current_state[server] = self._create_server_state(server)
 
         # Update state and rebuild heap
         self._server_state = current_state
@@ -538,7 +580,6 @@ class LoadBalancingRouter(Router):
 
     def _init_heap(self):
         for server in self._servers:
-            self._server_state[server] = ServerState(server, self._use_tokens)
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
@@ -546,13 +587,7 @@ class LoadBalancingRouter(Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        if not self._servers:
-            if self._metadata_server:
-                raise ValueError(
-                    f"No {self._server_role} servers available in metadata service"
-                )
-            else:
-                raise ValueError(f"No {self._server_role} servers available")
+        self._validate_servers_available()
 
         async with self._lock:
             if exclude_server:
@@ -564,7 +599,7 @@ class LoadBalancingRouter(Router):
                 server_load_heap = self._server_load_heap
 
             server = heapq.heappop(server_load_heap)[1]
-            await self._server_state[server].increment_load(request)
+            await self._register_request(server, request)
             # maintain the member heap
             if exclude_server:
                 self._server_load_heap = server_load_heap
@@ -575,21 +610,13 @@ class LoadBalancingRouter(Router):
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
-            self._req_routing_table[id(request)] = server
-
         return server, {"server_info": self._server_info.get(server, {})}
-
-    def _get_server_load(self, server):
-        return self._server_state[server]._num_active_tokens if self._use_tokens \
-            else self._server_state[server]._num_active_requests
 
     async def finish_request(self, request: OpenAIRequest):
         async with self._lock:
-            server = self._req_routing_table[id(request)]
-            await self._server_state[server].decrement_load(request)
+            server = await self._unregister_request(request)
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
-            del self._req_routing_table[id(request)]
 
 
 def block_key_hasher(token_ids: list[int],
@@ -599,7 +626,9 @@ def block_key_hasher(token_ids: list[int],
                                0 if parent_hash is None else parent_hash)
 
 
-class KvCacheAwareRouter(Router):
+class KvCacheAwareRouter(LoadBalancingMixin, Router):
+
+    _server_state_class = KvCacheAwareServerState
 
     def __init__(self,
                  server_role: ServerRole = None,
@@ -612,17 +641,7 @@ class KvCacheAwareRouter(Router):
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._lock = asyncio.Lock()
-        self._use_tokens = use_tokens
-
-        # Load map between servers and their number of tokens processed
-        self._server_state: dict[str, KvCacheAwareServerState] = {
-            server: KvCacheAwareServerState(server, use_tokens)
-            for server in servers or []
-        }
-
-        # Routing table to map requests to servers
-        self._req_routing_table: dict[int, OpenAIRequest] = {}
+        self._init_load_balancing(servers, use_tokens)
 
         self._tokenizers = {}
         # TODO: use max_num_tokens? per server?
@@ -717,8 +736,7 @@ class KvCacheAwareRouter(Router):
             scores.append(score)
         server = servers[scores.index(max(scores))]
         async with self._lock:
-            await self._server_state[server].increment_load(request)
-            self._req_routing_table[id(request)] = server
+            await self._register_request(server, request)
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
             "token_lists": token_lists,  # list[list[int]]
@@ -730,16 +748,12 @@ class KvCacheAwareRouter(Router):
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None):
         async with self._lock:
-            server = self._req_routing_table[id(request)]
-            del self._req_routing_table[id(request)]
-            if server in self._server_state:
-                await self._server_state[server].decrement_load(request,
-                                                                session=session)
+            await self._unregister_request(request, session=session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         for new_server in new_servers:
-            self._server_state[new_server] = KvCacheAwareServerState(
-                new_server, self._use_tokens)
+            self._server_state[new_server] = self._create_server_state(
+                new_server)
         for old_server in old_servers:
             self._server_state.pop(old_server, None)
 
