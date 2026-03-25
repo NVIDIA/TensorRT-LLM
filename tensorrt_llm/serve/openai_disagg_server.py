@@ -41,7 +41,8 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (UCompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
+                                                UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -92,8 +93,8 @@ class OpenAIDisaggServer:
         self._metrics_interval_secs = metrics_interval_secs
 
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
-        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock)
-        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock)
+        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
+        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
@@ -157,6 +158,34 @@ class OpenAIDisaggServer:
         if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
             self._disagg_cluster_storage.add_routes(self.app)
 
+    @staticmethod
+    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
+        """Populate conversation_id from the X-Correlation-ID header when not
+        already set in the request body.
+
+        aiperf sends multi-turn session IDs via the ``X-Correlation-ID``
+        header (see aiperf ``base_transports.build_headers``).  We mirror
+        that convention so the ConversationRouter can provide session
+        affinity without requiring clients to set the body field.
+
+        When ``disaggregated_params`` is ``None`` (standard OpenAI
+        requests without disagg fields), a minimal instance is created
+        to carry the conversation_id.  The service layer replaces it
+        later for ctx/gen routing but extracts conversation_id first."""
+        header_conv_id = raw_req.headers.get("x-correlation-id")
+        if header_conv_id is None:
+            return
+        if req.disaggregated_params is None:
+            # Use "context_only" (not "") so that token-based routers
+            # (use_tokens=True) can call get_request_num_tokens without
+            # hitting "Unsupported request type".
+            req.disaggregated_params = DisaggregatedParams(
+                request_type="context_only",
+                conversation_id=header_conv_id,
+            )
+        elif req.disaggregated_params.conversation_id is None:
+            req.disaggregated_params.conversation_id = header_conv_id
+
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
             try:
@@ -165,6 +194,7 @@ class OpenAIDisaggServer:
                     self._perf_metrics_collector.stream_requests.inc()
                 else:
                     self._perf_metrics_collector.nonstream_requests.inc()
+                self._extract_conversation_id(req, raw_req)
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
