@@ -120,6 +120,21 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
     return ""
 
 
+def _strip_model_prefix(name: str) -> str:
+    """Strip common VLM model prefixes so exclude patterns match bare GraphModule paths.
+
+    Quant config exclude patterns may use the full checkpoint path (e.g.,
+    ``model.language_model.layers.0.linear_attn*``) while the exported GraphModule
+    uses bare paths (e.g., ``layers.0.linear_attn.in_proj_qkv``).  We normalize
+    both the pattern and the module name by stripping known prefixes.
+    """
+    prefixes = ("model.language_model.", "model.")
+    for p in prefixes:
+        if name.startswith(p):
+            return name[len(p):]
+    return name
+
+
 def _pattern_matches(modname: str, pattern: str) -> bool:
     """Check if an exclude pattern matches the module name.
 
@@ -127,7 +142,10 @@ def _pattern_matches(modname: str, pattern: str) -> bool:
     This preserves exact module-path excludes (for example:
     ``model.layers.0.self_attn.q_a_proj``) and wildcard entries.
     """
-    return fnmatch(modname, pattern)
+    if fnmatch(modname, pattern):
+        return True
+    # Retry with VLM prefix stripped from both sides
+    return fnmatch(_strip_model_prefix(modname), _strip_model_prefix(pattern))
 
 
 def should_skip_quantization(
