@@ -65,7 +65,7 @@ class TrtllmGenSupportChecker:
 
     # Supported data types
     SUPPORTED_INPUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
-    SUPPORTED_KV_CACHE_DTYPES = {DataType.HALF, DataType.BF16, DataType.FP8}
+    SUPPORTED_KV_CACHE_DTYPES = {DataType.HALF, DataType.BF16, DataType.FP8, DataType.NVFP4}
     SUPPORTED_OUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
 
     # Supported Q:KV:O dtype combinations for trtllm-gen kernels
@@ -82,6 +82,10 @@ class TrtllmGenSupportChecker:
         (torch.float8_e4m3fn, DataType.FP8, torch.float16),
         # e4m3:e4m3:bf16
         (torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+        # NVFP4 KV cache (requires FP8 query)
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
     }
 
     # Generation phase supported combinations (includes context + additional)
@@ -97,6 +101,10 @@ class TrtllmGenSupportChecker:
         (torch.bfloat16, DataType.FP8, torch.bfloat16),
         # fp16:e4m3:fp16
         (torch.float16, DataType.FP8, torch.float16),
+        # NVFP4 KV cache (requires FP8 query)
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+        (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
     }
 
     # Unsupported head sizes for context FMHA
@@ -169,13 +177,6 @@ class TrtllmGenSupportChecker:
         if cross_attention:
             return False, "Cross attention is not supported by trtllm-gen backend."
 
-        has_fp4_kv = (
-            quant_config.layer_quant_mode.has_fp4_kv_cache()
-            if quant_config is not None
-            else kv_cache_dtype == DataType.NVFP4
-        )
-        if has_fp4_kv:
-            return False, "NVFP4 KV cache is not supported by flashinfer trtllm-gen kernels."
         if q_dtype not in cls.SUPPORTED_INPUT_DTYPES:
             return False, f"Input dtype {q_dtype} not supported. Supported: FP16, BF16, FP8 (E4M3)."
         if kv_cache_dtype not in cls.SUPPORTED_KV_CACHE_DTYPES:
@@ -959,7 +960,7 @@ class FlashInferTrtllmGenAttention:
         computed fresh each forward pass since batch composition changes.
         """
         if kv_cache_block_offsets is None:
-            return None, None
+            return None, None, None
 
         if layer_idx not in self._kv_pool_cache:
             kv_factor = 1 if is_mla_enable else 2
@@ -994,10 +995,14 @@ class FlashInferTrtllmGenAttention:
         # block_tables: pure Python slice, no C++ op, no division
         block_tables = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size]
 
-        return (kv_pool, kv_pool), block_tables
+        kv_block_scales = None
+        if kv_scale_pool is not None:
+            kv_block_scales = (kv_scale_pool, kv_scale_pool)
+
+        return (kv_pool, kv_pool), block_tables, kv_block_scales
 
     def run_context(self, params: EnqueueContextParams):
-        kv_cache, block_tables = self._get_kv_cache_and_block_tables(
+        kv_cache, block_tables, kv_block_scales = self._get_kv_cache_and_block_tables(
             kv_cache_block_offsets=params.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
@@ -1147,12 +1152,27 @@ class FlashInferTrtllmGenAttention:
         #   kernel handles correctly via qStrideTokens / qStrideHeads.
         #   This matches thop's context-phase behavior where FMHA reads Q
         #   directly from the packed QKV buffer (fmhaParams.qkvPtr).
+        has_fp4_kv = QuantMode(params.kv_cache_quant_mode).has_fp4_kv_cache()
         if separate_q_kv_output:
-            q_processed = ctx_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
+            if has_fp4_kv:
+                q_processed = (
+                    ctx_ws.q_buf.view(torch.uint8)[
+                        : params.num_tokens * params.num_heads * params.head_size
+                    ]
+                    .view(torch.float8_e4m3fn)
+                    .view(params.num_tokens, params.num_heads, params.head_size)
+                )
+            else:
+                q_processed = ctx_ws.q_buf.view(
+                    params.num_tokens, params.num_heads, params.head_size
+                )
         else:
             q_size = params.num_heads * params.head_size
             q_processed = params.qkv_input[:, :q_size].view(-1, params.num_heads, params.head_size)
         ctx_ws.trtllm_gen_workspace.zero_()
+
+        ctx_bmm1 = ctx_ws.fmha_bmm1_scale if has_fp4_kv else params.bmm1_scale
+        ctx_bmm2 = ctx_ws.fmha_bmm2_scale if has_fp4_kv else params.bmm2_scale
 
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
@@ -1162,8 +1182,8 @@ class FlashInferTrtllmGenAttention:
             seq_lens=params.sequence_lengths,
             max_q_len=params.input_seq_length,
             max_kv_len=params.max_past_kv_length,
-            bmm1_scale=params.bmm1_scale,
-            bmm2_scale=params.bmm2_scale,
+            bmm1_scale=ctx_bmm1,
+            bmm2_scale=ctx_bmm2,
             batch_size=params.batch_size,
             cum_seq_lens_q=ctx_ws.cu_q_seqlens,
             cum_seq_lens_kv=ctx_ws.cu_kv_seqlens,
@@ -1172,13 +1192,14 @@ class FlashInferTrtllmGenAttention:
             kv_layout=self._layout,
             sinks=params.attention_sinks,
             uses_shared_paged_kv_idx=False,
+            kv_block_scales=kv_block_scales,
         )
 
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
 
     def run_generation(self, params: EnqueueGenerationParams):
         batch_beam = params.num_requests * params.beam_width
-        kv_cache, block_tables = self._get_kv_cache_and_block_tables(
+        kv_cache, block_tables, kv_block_scales = self._get_kv_cache_and_block_tables(
             kv_cache_block_offsets=params.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
@@ -1327,7 +1348,17 @@ class FlashInferTrtllmGenAttention:
             is_mla_enable=params.is_mla_enable,
         )
 
-        q_processed = gen_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
+        has_fp4_kv = QuantMode(params.kv_cache_quant_mode).has_fp4_kv_cache()
+        if has_fp4_kv:
+            q_processed = (
+                gen_ws.q_buf.view(torch.uint8)[
+                    : params.num_tokens * params.num_heads * params.head_size
+                ]
+                .view(torch.float8_e4m3fn)
+                .view(params.num_tokens, params.num_heads, params.head_size)
+            )
+        else:
+            q_processed = gen_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
         gen_ws.trtllm_gen_workspace.zero_()
 
         # FlashInfer's trtllm-gen decode kernel needs to know the actual
@@ -1355,6 +1386,9 @@ class FlashInferTrtllmGenAttention:
         #   - else (uniform lengths): use q_len_per_req = input_seq_length.
         #     This covers both normal single-token decode (input_seq_length=1)
         #     and uniform multi-token decode (input_seq_length>1).
+        gen_bmm1 = gen_ws.bmm1_scale if has_fp4_kv else params.bmm1_scale
+        gen_bmm2 = gen_ws.bmm2_scale if has_fp4_kv else params.bmm2_scale
+
         if is_multi_token_gen:
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q_processed,
@@ -1364,8 +1398,8 @@ class FlashInferTrtllmGenAttention:
                 seq_lens=params.sequence_lengths,
                 max_seq_len=params.max_past_kv_length,
                 out=params.context_buf,
-                bmm1_scale=params.bmm1_scale,
-                bmm2_scale=params.bmm2_scale,
+                bmm1_scale=gen_bmm1,
+                bmm2_scale=gen_bmm2,
                 window_left=window_left,
                 kv_layout=self._layout,
                 sinks=params.attention_sinks,
@@ -1373,6 +1407,7 @@ class FlashInferTrtllmGenAttention:
                 max_q_len=params.input_seq_length,
                 cum_seq_lens_q=cu_seqlens,
                 uses_shared_paged_kv_idx=False,
+                kv_block_scales=kv_block_scales,
             )
         else:
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1383,13 +1418,14 @@ class FlashInferTrtllmGenAttention:
                 seq_lens=params.sequence_lengths,
                 max_seq_len=params.max_past_kv_length,
                 out=params.context_buf,
-                bmm1_scale=params.bmm1_scale,
-                bmm2_scale=params.bmm2_scale,
+                bmm1_scale=gen_bmm1,
+                bmm2_scale=gen_bmm2,
                 window_left=window_left,
                 kv_layout=self._layout,
                 sinks=params.attention_sinks,
                 q_len_per_req=params.input_seq_length,
                 uses_shared_paged_kv_idx=False,
+                kv_block_scales=kv_block_scales,
             )
 
 
@@ -1480,11 +1516,15 @@ def is_supported(
     if kv_cache_manager is not None:
         kv_cache_dtype = kv_cache_manager.dtype
 
+    q_dtype = q.dtype
+    if kv_cache_dtype == DataType.NVFP4:
+        q_dtype = torch.float8_e4m3fn
+
     return FlashInferTrtllmGenAttention(
         kv_cache_manager=kv_cache_manager, quant_config=quant_config
     ).is_supported(
         phase=phase,
-        q_dtype=q.dtype,
+        q_dtype=q_dtype,
         kv_cache_dtype=kv_cache_dtype,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -1808,7 +1848,10 @@ def trtllm_gen_attention(
         attention_chunk_size=attention_chunk_size if attention_chunk_size is not None else 0,
         fp8_context_fmha=is_fp8_out
         or is_fp4_out
-        or (kv_cache_quant_mode.has_fp8_kv_cache() and use_paged_context_fmha),
+        or (
+            (kv_cache_quant_mode.has_fp8_kv_cache() or kv_cache_quant_mode.has_fp4_kv_cache())
+            and use_paged_context_fmha
+        ),
         remove_padding=True,
         cross_attention=False,
         position_shift_enabled=False,
