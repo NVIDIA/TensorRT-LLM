@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import List, Optional
 from unittest.mock import MagicMock
 
@@ -17,7 +18,11 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import Stages, TransformConfig
-from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import InitializeCache, ResizeKVCache
+from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
+    InitializeCache,
+    InsertCachedMLAAttention,
+    ResizeKVCache,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
@@ -550,3 +555,43 @@ def test_insert_cached_attention_passes_kv_cache_config():
     for name, handler in cm._resource_lookup.items():
         if hasattr(handler, "dtype"):
             assert handler.dtype == torch.bfloat16
+
+
+def _make_fake_mla_node(kv_lora_rank: int, qk_rope_head_dim: int):
+    return SimpleNamespace(
+        args=[
+            None,
+            None,
+            SimpleNamespace(meta={"val": torch.empty(1, 1, kv_lora_rank)}),
+            SimpleNamespace(meta={"val": torch.empty(1, 1, 1, qk_rope_head_dim)}),
+        ]
+    )
+
+
+def test_insert_cached_mla_attention_keeps_supported_flashinfer_backend(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (9, 0))
+
+    attn_node = _make_fake_mla_node(kv_lora_rank=512, qk_rope_head_dim=64)
+    backend = InsertCachedMLAAttention.resolve_backend_for_node("flashinfer_mla", attn_node)
+
+    assert backend == "flashinfer_mla"
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0)])
+def test_insert_cached_mla_attention_falls_back_for_rank256(monkeypatch, capability):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+
+    attn_node = _make_fake_mla_node(kv_lora_rank=256, qk_rope_head_dim=64)
+    backend = InsertCachedMLAAttention.resolve_backend_for_node("flashinfer_mla", attn_node)
+
+    expected = "flashinfer_trtllm_mla" if capability >= (10, 0) else "torch_mla"
+    assert backend == expected
+
+
+def test_insert_cached_mla_attention_preserves_non_flashinfer_backend():
+    attn_node = _make_fake_mla_node(kv_lora_rank=256, qk_rope_head_dim=64)
+    backend = InsertCachedMLAAttention.resolve_backend_for_node("torch_mla", attn_node)
+
+    assert backend == "torch_mla"
