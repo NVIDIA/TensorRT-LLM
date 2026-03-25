@@ -74,7 +74,7 @@ def main():
     )
     parser.add_argument(
         "--csv",
-        default="/home/yuanjingx/works/scripts/nspect_container_license_delta/pre_approved.csv",
+        default="./pre_approved.csv",
         help="Path to pre_approved.csv (default: %(default)s)",
     )
     args = parser.parse_args()

@@ -8,7 +8,7 @@ import requests
 def post_slack_msg(build_number, branch, risk_detail):
     SLACK_WEBHOOK_URL = os.environ.get("TRTLLM_PLC_WEBHOOK")
     if not SLACK_WEBHOOK_URL:
-        raise EnvironmentError("Error: Environment variable 'SLACK_WEBHOOK_URL' is not set!")
+        raise EnvironmentError("Error: Environment variable 'TRTLLM_PLC_WEBHOOK' is not set!")
     starttime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     base = (
         "https://gpuwa.nvidia.com/kibana/s/tensorrt/app/dashboards"

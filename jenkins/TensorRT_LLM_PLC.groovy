@@ -226,8 +226,7 @@ def pulseScanContainer(llmRepo, branchName) {
     def imageTags = [:]
     container("cpu") {
         def output = sh(
-            //script: "./jenkins/scripts/get_image_key_to_tag.sh ${params.branchName}",
-            script: "./jenkins/scripts/get_image_key_to_tag.sh main",
+            script: "./jenkins/scripts/get_image_key_to_tag.sh ${params.branchName}",
             returnStdout: true
         ).trim()
         def containerTagMap = new JsonSlurper().parseText(output)

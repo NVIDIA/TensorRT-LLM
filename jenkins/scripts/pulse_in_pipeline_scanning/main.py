@@ -83,19 +83,19 @@ def process_container_result():
     if count_container_vulns > 0:
         NEW_RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
 
-    last_container_licneses = get_last_scan_results("container_license", args.branch)
+    last_container_licenses = get_last_scan_results("container_license", args.branch)
     new_amd64_container_licenses = submit_container_licenses(
         os.path.join(args.report_directory, "release_amd64/licenses.json"),
         os.path.join(args.report_directory, "base_amd64/licenses.json"),
         "amd64",
-        last_container_licneses,
+        last_container_licenses,
         **SUBMIT_KWARG,
     )
     new_arm64_container_licenses = submit_container_licenses(
         os.path.join(args.report_directory, "release_arm64/licenses.json"),
         os.path.join(args.report_directory, "base_arm64/licenses.json"),
         "arm64",
-        last_container_licneses,
+        last_container_licenses,
         **SUBMIT_KWARG,
     )
     count_container_licenses = len(new_amd64_container_licenses + new_arm64_container_licenses)
