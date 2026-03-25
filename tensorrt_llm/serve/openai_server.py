@@ -1729,7 +1729,7 @@ class OpenAIServer:
             # Save all generated videos (batch-aware)
             saved_paths = MediaStorage.save_videos(
                 videos=output.video,
-                output_path_prefix=str(self.media_storage_path / video_id),
+                output_paths=str(self.media_storage_path / video_id),
                 audios=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,
@@ -1914,7 +1914,7 @@ class OpenAIServer:
             # Save all generated videos (batch-aware)
             saved_paths = MediaStorage.save_videos(
                 videos=output.video,
-                output_path_prefix=str(self.media_storage_path / video_id),
+                output_paths=str(self.media_storage_path / video_id),
                 audios=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,

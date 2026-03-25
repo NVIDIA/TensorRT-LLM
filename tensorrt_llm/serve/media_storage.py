@@ -13,7 +13,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from PIL import Image
@@ -603,7 +603,7 @@ class MediaStorage:
     @staticmethod
     def save_images(
         images: Any,
-        output_path_prefix: str,
+        output_paths: Union[str, List[str]],
         format: Optional[str] = None,
         quality: int = 95,
     ) -> List[str]:
@@ -615,13 +615,22 @@ class MediaStorage:
         Args:
             images: torch.Tensor with shape ``(B, H, W, C)`` or ``(H, W, C)``,
                 dtype uint8.
-            output_path_prefix: Path prefix for output files.  Each image is
-                saved as ``{prefix}_{index}.{ext}``.
+            output_paths: Either a path prefix string or a list of per-image
+                output paths.  When a **string** is provided, each image is
+                saved as ``{prefix}_{index}.{ext}``.  When a **list** is
+                provided, each element is used as the output path for the
+                corresponding image (both absolute and relative paths are
+                accepted).  If a list entry has no file extension, the
+                format-derived extension is appended automatically.
             format: Image format (png, jpg, webp).  If *None*, defaults to PNG.
             quality: Quality for lossy formats (1-100, higher is better).
 
         Returns:
             List of paths where images were saved.
+
+        Raises:
+            ValueError: If *output_paths* is a list whose length does not
+                match the batch size.
         """
         ext = MediaStorage._image_ext_for_format(format)
 
@@ -629,11 +638,27 @@ class MediaStorage:
         if hasattr(images, "dim") and images.dim() == 3:
             images = images.unsqueeze(0)
 
+        batch_size = images.shape[0]
+
+        # Build per-image output paths
+        if isinstance(output_paths, list):
+            if len(output_paths) != batch_size:
+                raise ValueError(
+                    f"Length of output_paths ({len(output_paths)}) does not "
+                    f"match batch size ({batch_size})"
+                )
+            resolved = []
+            for p in output_paths:
+                if not os.path.splitext(p)[1]:
+                    p = p + ext
+                resolved.append(p)
+        else:
+            resolved = [f"{output_paths}_{i}{ext}" for i in range(batch_size)]
+
         paths: List[str] = []
-        for i in range(images.shape[0]):
-            path = f"{output_path_prefix}_{i}{ext}"
-            MediaStorage.save_image(images[i], path, format, quality)
-            paths.append(path)
+        for i in range(batch_size):
+            MediaStorage.save_image(images[i], resolved[i], format, quality)
+            paths.append(resolved[i])
         return paths
 
     @staticmethod
@@ -762,7 +787,7 @@ class MediaStorage:
     @staticmethod
     def save_videos(
         videos: Any,
-        output_path_prefix: str,
+        output_paths: Union[str, List[str]],
         audios: Optional[Any] = None,
         frame_rate: float = 24.0,
         format: Optional[str] = None,
@@ -775,8 +800,13 @@ class MediaStorage:
         Args:
             videos: torch.Tensor with shape ``(B, T, H, W, C)`` or
                 ``(T, H, W, C)``, dtype uint8.
-            output_path_prefix: Path prefix for output files.  Each video is
-                saved as ``{prefix}_{index}.{ext}``.
+            output_paths: Either a path prefix string or a list of per-video
+                output paths.  When a **string** is provided, each video is
+                saved as ``{prefix}_{index}.{ext}``.  When a **list** is
+                provided, each element is used as the output path for the
+                corresponding video (both absolute and relative paths are
+                accepted).  If a list entry has no file extension, the
+                format-derived extension is appended automatically.
             audios: Optional batched audio tensor.  When provided and the
                 tensor has a batch dimension matching *videos*, each audio
                 slice is paired with the corresponding video.  If the audio
@@ -788,6 +818,10 @@ class MediaStorage:
 
         Returns:
             List of paths where videos were saved.
+
+        Raises:
+            ValueError: If *output_paths* is a list whose length does not
+                match the batch size.
         """
         ext = f".{format}" if format else ".mp4"
 
@@ -796,9 +830,24 @@ class MediaStorage:
             videos = videos.unsqueeze(0)
 
         batch_size = videos.shape[0]
+
+        # Build per-video output paths
+        if isinstance(output_paths, list):
+            if len(output_paths) != batch_size:
+                raise ValueError(
+                    f"Length of output_paths ({len(output_paths)}) does not "
+                    f"match batch size ({batch_size})"
+                )
+            resolved = []
+            for p in output_paths:
+                if not os.path.splitext(p)[1]:
+                    p = p + ext
+                resolved.append(p)
+        else:
+            resolved = [f"{output_paths}_{i}{ext}" for i in range(batch_size)]
+
         paths: List[str] = []
         for i in range(batch_size):
-            path = f"{output_path_prefix}_{i}{ext}"
             audio_i = None
             if audios is not None:
                 if hasattr(audios, "dim") and audios.dim() >= 2 and audios.shape[0] == batch_size:
@@ -806,7 +855,9 @@ class MediaStorage:
                 elif i == 0:
                     # Single audio shared across batch – attach to first video only
                     audio_i = audios
-            actual_path = MediaStorage.save_video(videos[i], path, audio_i, frame_rate, format)
+            actual_path = MediaStorage.save_video(
+                videos[i], resolved[i], audio_i, frame_rate, format
+            )
             paths.append(actual_path)
         return paths
 
