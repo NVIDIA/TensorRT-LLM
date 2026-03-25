@@ -37,7 +37,7 @@ class MemoryDescs:
 
     __slots__ = ("type", "descs")
 
-    def __init__(self, type: str, descs: List[tuple]):
+    def __init__(self, type: str, descs: List[tuple[int, int, int]]):
         self.type = type
         self.descs = descs
 
