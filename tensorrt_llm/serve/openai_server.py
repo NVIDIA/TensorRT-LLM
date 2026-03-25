@@ -467,8 +467,8 @@ class OpenAIServer:
                                methods=["POST"])
         control_queue = self.generator._executor.control_queue
         if control_queue is not None:
-            from .control_plane import ControlPlaneServer
-            self.control_plane = ControlPlaneServer(
+            from .control_plane import KVCacheControlPlane
+            self.kv_cache_control_plane = KVCacheControlPlane(
                 control_queue=control_queue,
                 tokenizer=self.tokenizer,
                 model_config=self.model_config,
@@ -476,19 +476,19 @@ class OpenAIServer:
                 harmony_adapter_factory=get_harmony_adapter
                 if self.use_harmony else None,
             )
-            self.control_plane.register_routes(self.app)
+            self.kv_cache_control_plane.register_routes(self.app)
         else:
-            # Control plane is unavailable — the executor does not expose a
-            # control_queue.  This is expected in RPC orchestrator mode
-            # (GenerationExecutorRpcProxy) and for non-PyExecutor backends.
-            # The /_control/* endpoints will not be registered; clients that
-            # attempt to call them will receive 404.
+            # KV-cache control plane is unavailable — the executor does not
+            # expose a control_queue.  This is expected in RPC orchestrator
+            # mode (GenerationExecutorRpcProxy) and for non-PyExecutor
+            # backends.  The /_control/* endpoints will not be registered;
+            # clients that attempt to call them will receive 404.
             logger.warning(
-                "Control plane is disabled: the executor backend does not "
-                "provide a control_queue (e.g. RPC orchestrator mode). "
-                "Endpoints under /_control/ (KV cache truncation, etc.) "
-                "will not be available.")
-            self.control_plane = None
+                "KV-cache control plane is disabled: the executor backend "
+                "does not provide a control_queue (e.g. RPC orchestrator "
+                "mode). Endpoints under /_control/ (KV cache truncation, "
+                "etc.) will not be available.")
+            self.kv_cache_control_plane = None
 
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,

@@ -187,6 +187,8 @@ def worker_main(
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
+    control_queue: Optional[IpcQueue] = None
+    has_kv_cache_control_queue = worker_queues.control_queue_addr is not None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
@@ -310,6 +312,12 @@ def worker_main(
 
     with worker:
         try:
+            # All ranks must enter the KV-cache control-plane broadcast path,
+            # even though only the leader rank owns the IPC queue.
+            if has_kv_cache_control_queue and hasattr(
+                    worker.engine, 'enable_kv_cache_control_plane'):
+                worker.engine.enable_kv_cache_control_plane()
+
             worker.block_subordinates()
 
             if is_leader:
@@ -325,7 +333,7 @@ def worker_main(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
                 if control_queue is not None:
-                    worker.engine.set_control_ipc_queue(control_queue)
+                    worker.engine.set_kv_cache_control_queue(control_queue)
 
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):

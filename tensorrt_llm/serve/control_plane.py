@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Control-plane server for non-inference runtime operations.
+"""KV-cache control plane for non-inference runtime operations.
 
-Handles KV cache management and other executor-level control operations,
-separated from the OpenAI-compatible inference server. Communicates with
-PyExecutor via a dedicated IPC queue, bypassing the LLM/Proxy/Worker chain.
+Handles KV cache management operations (e.g. truncation), separated from the
+OpenAI-compatible inference server.  Communicates with PyExecutor via a
+dedicated control queue, bypassing the LLM/Proxy/Worker chain.
 """
 
 import traceback
@@ -32,11 +32,11 @@ from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
 
 
-class ControlPlaneServer:
-    """Server for executor-level control operations.
+class KVCacheControlPlane:
+    """KV cache control plane for runtime cache management operations.
 
-    This class owns a direct IPC channel to the PyExecutor's control queue,
-    allowing control requests (e.g. KV cache truncation) to reach the executor
+    Owns a direct channel to the PyExecutor's KV cache control queue,
+    allowing cache-management requests (e.g. truncation) to reach the executor
     without passing through the LLM API, Proxy, or Worker dispatch chain.
     """
 

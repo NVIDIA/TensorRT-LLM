@@ -14,6 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    CONTROL_REQUEST_ID,
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
@@ -29,6 +30,7 @@ class MockPyExecutor:
 
     def __init__(self, dist):
         self.dist = dist
+        self.active_requests = []
         self.canceled_req_ids = []
         self.control_requests = []
         self.request_accumulated = []
@@ -36,6 +38,9 @@ class MockPyExecutor:
         self.expected_num_active_requests = 0
         self.new_active_requests_queue_latency_ms = 0.0
         self.waiting_queue = FCFSWaitingQueue()
+        self.executor_request_queue = Mock()
+        self.control_request_barrier = Mock()
+        self.control_action_done = Mock()
 
     def _handle_special_queue_items(self, new_requests):
         """Handle special signals.
@@ -58,6 +63,19 @@ class MockPyExecutor:
                 accepted_new_requests.append(req_item)
 
         return accepted_new_requests
+
+    def _handle_control_request(self):
+        """Mirror PyExecutor._handle_control_request."""
+        if (
+            len(self.active_requests) == 0
+            and len(self.waiting_queue) == 0
+            and len(self.control_requests) > 0
+        ):
+            assert len(self.control_requests) == 1
+            self.control_requests.pop(0)
+            self.control_request_barrier.set()
+            self.control_action_done.wait()
+            self.control_action_done.clear()
 
     def update_waiting_queue(self):
         """Update waiting queue to remove canceled requests.
@@ -178,3 +196,14 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert mock_executor.get_waiting_queue_size() == 1
+
+
+def test_handle_thread_control_request(mock_executor):
+    """Test thread-driven control requests still use the barrier path."""
+    mock_executor.control_requests.append(RequestQueueItem(CONTROL_REQUEST_ID))
+
+    mock_executor._handle_control_request()
+
+    mock_executor.control_request_barrier.set.assert_called_once_with()
+    mock_executor.control_action_done.wait.assert_called_once_with()
+    mock_executor.control_action_done.clear.assert_called_once_with()
