@@ -127,6 +127,7 @@ def _selective_scan_update_kernel(
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -183,6 +184,9 @@ def _selective_scan_update_kernel(
             cache_idx = state_batch_idx
         else:
             cache_idx = pid_b
+
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
 
     current_step_idx = 0
     for _ in range(T):
@@ -298,6 +302,7 @@ def selective_state_update(
     cache_steps=None,
     retrieve_parent_token=None,
     intermediate_state_indices=None,
+    launch_with_pdl=False,
 ):
     """
     Argument:
@@ -324,6 +329,9 @@ def selective_state_update(
         retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
         intermediate_state_indices: (batch,) tensor of indices for intermediate_states_buffer operations.
             If provided, uses these indices instead of state_batch_indices for the buffer.
+        launch_with_pdl: If True, launch with Programmatic Dependent Launch.
+            Requires all inputs other than x, B, and C to already be available.
+            Allows addressing math and state loading to overlap with the prior kernel.
     """
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -460,5 +468,7 @@ def selective_state_update(
             tie_hdim,
             BLOCK_SIZE_M,
             DISABLE_STATE_UPDATE=disable_state_update,
+            LAUNCH_WITH_PDL=launch_with_pdl,
             num_warps=num_warps,
+            launch_pdl=launch_with_pdl,
         )

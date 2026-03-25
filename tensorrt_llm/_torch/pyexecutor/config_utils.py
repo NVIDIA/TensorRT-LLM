@@ -28,11 +28,15 @@ def is_qwen3_next(config):
 
 
 def is_qwen3_5(config):
-    """True when config was loaded for a Qwen3.5 text checkpoint."""
+    """True when config was loaded for a Qwen3.5 text checkpoint (MoE or dense)."""
+    _QWEN3_5_ARCHS = {
+        'Qwen3_5MoeForCausalLM',
+        'Qwen3_5ForCausalLM',
+    }
     return hasattr(
         config, 'architectures'
     ) and config.architectures is not None and config.architectures[
-        0] == 'Qwen3_5MoeForCausalLM'
+        0] in _QWEN3_5_ARCHS
 
 
 def is_qwen3_hybrid(config):
@@ -105,15 +109,32 @@ class _Qwen35ConfigCompat:
         text_config = _Qwen35ConfigCompat._inherit_quantization_config(
             config_dict, text_config)
         text_config = _Qwen35ConfigCompat._flatten_rope(text_config)
-        text_config["architectures"] = ["Qwen3_5MoeForCausalLM"]
+
+        # Detect dense vs MoE and set architecture + MoE defaults accordingly
+        is_moe = "num_experts" in text_config and text_config["num_experts"] > 0
+        if is_moe:
+            text_config["architectures"] = ["Qwen3_5MoeForCausalLM"]
+        else:
+            text_config["architectures"] = ["Qwen3_5ForCausalLM"]
+            # Ensure MoE fields are zeroed so Qwen3NextConfig defaults don't
+            # accidentally enable MoE for the dense model.
+            text_config.setdefault("num_experts", 0)
+            text_config.setdefault("num_experts_per_tok", 0)
+            text_config.setdefault("moe_intermediate_size", 0)
+            text_config.setdefault("shared_expert_intermediate_size", 0)
         return text_config
+
+    _VLM_ARCHITECTURES = {
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+    }
 
     @staticmethod
     def _extract_text_config(config_dict: dict) -> dict:
         """Pull nested text_config from VLM checkpoints, or use dict as-is."""
         architectures = config_dict.get("architectures") or []
         if architectures and architectures[
-                0] == "Qwen3_5MoeForConditionalGeneration":
+                0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
             text_config = dict(config_dict.get("text_config") or {})
         else:
             text_config = dict(config_dict)
@@ -243,11 +264,14 @@ def load_pretrained_config(model_name_or_path: str,
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
-    elif model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or (
-            architectures and architectures[0] in (
-                "Qwen3_5MoeForCausalLM",
-                "Qwen3_5MoeForConditionalGeneration",
-            )):
+    elif model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe",
+                        "qwen3_5_moe_text") or (
+                            architectures and architectures[0] in (
+                                "Qwen3_5MoeForCausalLM",
+                                "Qwen3_5MoeForConditionalGeneration",
+                                "Qwen3_5ForCausalLM",
+                                "Qwen3_5ForConditionalGeneration",
+                            )):
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
     elif checkpoint_format in ("mistral", "mistral_large_3"):
