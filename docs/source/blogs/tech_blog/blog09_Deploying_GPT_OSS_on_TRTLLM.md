@@ -19,7 +19,7 @@ We have a forthcoming guide for getting great performance on H100, however this 
 
 ## Launching the TensorRT LLM docker container
 
-The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev`
+The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc1`
 
 Run the follow docker command to start the TensorRT LLM container in interactive mode:
 
@@ -171,7 +171,7 @@ Currently, the best throughput **19.5k tps/gpu** is achieved with DP4EP4 using 4
 
 ## Launch the TensorRT-LLM Server
 
-We can use `trtllm-serve` to serve the model by translating the benchmark commands above. For low-latency configuration, run:
+We can use `trtllm-serve` to serve the model by translating the benchmark commands above. For low-latency configuration, run:  
 **Note:** You can also point to a local path containing the model weights instead of the HF repo (e.g., `${local_model_path}`).
 
 ```bash
@@ -357,7 +357,7 @@ moe_config:
 
 ## Troubleshooting Tips
 
-- If you encounter CUDA out-of-memory errors, try reducing `--max_batch_size`, `--max_num_tokens`, or `--kv_cache_free_gpu_memory_fraction`. See the [doc](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md) for the explanation of these parameters.
+- If you encounter CUDA out-of-memory errors, try reducing `--max_batch_size`, `--max_num_tokens`, or `--kv_cache_free_gpu_memory_fraction`. See the [doc](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md) for the explanation of these parameters.
 - Add `print_iter_log: true` to extra LLM API options YAML file to inspect the per-iteration log.
 - Check GPU utilization with `nvidia-smi` while the server is running to inspect GPU status and memory usage.
 - If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed
