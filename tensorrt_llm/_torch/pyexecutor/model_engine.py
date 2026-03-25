@@ -755,6 +755,7 @@ class PyTorchModelEngine(ModelEngine):
                 self._general_warmup(resource_manager, warmup_requests_configs)
                 # Clear Cache now as autotuner may use additional memory.
                 # Memory pool will be warmed up later.
+                gc.collect()
                 torch.cuda.empty_cache()
 
         # Autotuner warmup uses context-only requests. Helix CP
