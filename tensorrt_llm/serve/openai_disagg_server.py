@@ -157,6 +157,26 @@ class OpenAIDisaggServer:
         if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
             self._disagg_cluster_storage.add_routes(self.app)
 
+    @staticmethod
+    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
+        """Populate conversation_id from the X-Correlation-ID header when not
+        already set in the request body.
+
+        aiperf sends multi-turn session IDs via the ``X-Correlation-ID``
+        header (see aiperf ``base_transports.build_headers``).  We mirror
+        that convention so the ConversationRouter can provide session
+        affinity without requiring clients to set the body field.
+
+        The header value is stored directly on the request as
+        ``_conversation_id`` so it survives even when
+        ``disaggregated_params`` is later replaced by the service layer."""
+        header_conv_id = raw_req.headers.get("x-correlation-id")
+        if header_conv_id is None:
+            return
+        if req.disaggregated_params is not None:
+            if req.disaggregated_params.conversation_id is None:
+                req.disaggregated_params.conversation_id = header_conv_id
+
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
             try:
@@ -165,6 +185,7 @@ class OpenAIDisaggServer:
                     self._perf_metrics_collector.stream_requests.inc()
                 else:
                     self._perf_metrics_collector.nonstream_requests.inc()
+                self._extract_conversation_id(req, raw_req)
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()

@@ -8,8 +8,9 @@ from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (KvCacheAwareRouter, LoadBalancingRouter,
-                                       RoundRobinRouter, create_router)
+from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
+                                       LoadBalancingRouter, RoundRobinRouter,
+                                       create_router)
 
 
 # Mock class for metadata server
@@ -622,3 +623,157 @@ async def test_get_next_server_exclude_server_insufficient(router_class):
         await router.get_next_server(CompletionRequest(model="TinyLlama",
                                                        prompt=[[10] * 10]),
                                      exclude_server=servers[0])
+
+
+# ── ConversationRouter tests ──
+
+
+def _make_request(conversation_id=None, prompt="the " * 100):
+    params = DisaggregatedParams(request_type="context_only",
+                                 conversation_id=conversation_id)
+    return CompletionRequest(model="TinyLlama",
+                             prompt=[prompt],
+                             disaggregated_params=params)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_session_affinity_and_fallbacks():
+    """Session affinity, exclude-server override, and server-removal reroute."""
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None, servers=servers)
+
+    # Affinity: same conversation_id → same server
+    req = _make_request(conversation_id="sess-A")
+    first, _ = await router.get_next_server(req)
+    await router.finish_request(req)
+    for _ in range(3):
+        req = _make_request(conversation_id="sess-A")
+        s, _ = await router.get_next_server(req)
+        assert s == first
+        await router.finish_request(req)
+
+    # Exclude: affinity overridden when mapped server is excluded
+    req = _make_request(conversation_id="sess-A")
+    s, _ = await router.get_next_server(req, exclude_server=first)
+    assert s != first
+    await router.finish_request(req)
+
+    # Server removal: session re-routes to surviving server
+    req = _make_request(conversation_id="sess-B")
+    orig, _ = await router.get_next_server(req)
+    await router.finish_request(req)
+    await router.remove_server(orig)
+    req = _make_request(conversation_id="sess-B")
+    s, _ = await router.get_next_server(req)
+    assert s != orig and s in router.servers
+    await router.finish_request(req)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_load_balancing():
+    """New sessions with distinct prompts are load-balanced across servers."""
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None, servers=servers)
+
+    assigned, reqs = [], []
+    for i in range(3):
+        req = _make_request(prompt=f"unique topic {i} " * 50)
+        s, _ = await router.get_next_server(req)
+        assigned.append(s)
+        reqs.append(req)
+    assert sorted(assigned) == sorted(servers)
+    for req in reqs:
+        await router.finish_request(req)
+
+    # Session affinity survives interleaved non-session requests
+    req_x = _make_request(conversation_id="sess-X", prompt="topic X")
+    sx, _ = await router.get_next_server(req_x)
+    await router.finish_request(req_x)
+    req_x2 = _make_request(conversation_id="sess-X", prompt="topic X turn 2")
+    s, _ = await router.get_next_server(req_x2)
+    assert s == sx
+    await router.finish_request(req_x2)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_prefix_and_token_id_paths():
+    """Implicit prefix matching (text and token-ID paths) and hash_skip_count."""
+    servers = ["server1", "server2", "server3"]
+    base = "x" * 2000
+
+    # Text prefix matching: multi-turn without conversation_id
+    router = ConversationRouter(server_role=None, servers=servers)
+    req1 = _make_request(prompt=base)
+    s1, _ = await router.get_next_server(req1)
+    await router.finish_request(req1)
+    for ext in ["y" * 50, "y" * 50 + "z" * 50]:
+        req = _make_request(prompt=base + ext)
+        s, _ = await router.get_next_server(req)
+        assert s == s1, "Extended prompt should prefix-match turn 1"
+        await router.finish_request(req)
+
+    # Token-ID path: CompletionRequest with list[list[int]]
+    router2 = ConversationRouter(server_role=None, servers=servers)
+    base_ids = [1000] * 2000
+    dp = DisaggregatedParams(request_type="context_only")
+    req_t1 = CompletionRequest(model="TinyLlama",
+                               prompt=[base_ids + [0]],
+                               disaggregated_params=dp)
+    st1, _ = await router2.get_next_server(req_t1)
+    await router2.finish_request(req_t1)
+
+    req_t2 = CompletionRequest(model="TinyLlama",
+                               prompt=[base_ids + [2000] * 50 + [0]],
+                               disaggregated_params=dp)
+    st2, _ = await router2.get_next_server(req_t2)
+    assert st2 == st1, "Token-ID prefix should match"
+    await router2.finish_request(req_t2)
+
+    # ChatCompletionRequest with prompt_token_ids
+    req_t3 = ChatCompletionRequest(model="TinyLlama",
+                                   messages=[{
+                                       "role": "user",
+                                       "content": "dummy"
+                                   }],
+                                   prompt_token_ids=base_ids + [2000] * 50 +
+                                   [3000] * 50 + [0],
+                                   disaggregated_params=dp)
+    st3, _ = await router2.get_next_server(req_t3)
+    assert st3 == st1, "ChatCompletion token-ID path should match"
+    await router2.finish_request(req_t3)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_hash_skip_count():
+    """hash_skip_count strips shared system-prompt prefix."""
+    servers = ["server1", "server2", "server3"]
+    sys_prompt = "S" * 500
+
+    # Without skip: shared prefix causes false match
+    r1 = ConversationRouter(server_role=None, servers=servers)
+    req_a = _make_request(prompt=sys_prompt + "A" * 2000)
+    sa, _ = await r1.get_next_server(req_a)
+    await r1.finish_request(req_a)
+    req_b = _make_request(prompt=sys_prompt + "B" * 2000)
+    sb, _ = await r1.get_next_server(req_b)
+    await r1.finish_request(req_b)
+    assert sb == sa, "Without skip, shared prefix causes false match"
+
+    # With skip: different content after prefix → no match
+    r2 = ConversationRouter(server_role=None,
+                            servers=servers,
+                            hash_skip_count=125)
+    req_a2 = _make_request(prompt=sys_prompt + "A" * 2000)
+    sa2, _ = await r2.get_next_server(req_a2)
+    # Keep in-flight so LB prefers a different server
+    req_b2 = _make_request(prompt=sys_prompt + "B" * 2000)
+    sb2, _ = await r2.get_next_server(req_b2)
+    await r2.finish_request(req_a2)
+    await r2.finish_request(req_b2)
+    assert sb2 != sa2, "With skip, different content should not match"
+
+
+def test_create_router_conversation():
+    router = create_router(RouterConfig(type="conversation"),
+                           ["server1", "server2"])
+    assert isinstance(router, ConversationRouter)

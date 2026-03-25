@@ -157,13 +157,21 @@ class OpenAIDisaggregatedService(OpenAIService):
             return False
         return True
 
+    @staticmethod
+    def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
+        if request.disaggregated_params is not None:
+            return request.disaggregated_params.conversation_id
+        return None
+
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
-                    request_type="context_only", disagg_request_id=disagg_request_id
+                    request_type="context_only",
+                    disagg_request_id=disagg_request_id,
+                    conversation_id=self._get_conversation_id(request),
                 ),
                 "stream": False,
                 "stream_options": None,
@@ -179,9 +187,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id: Optional[int],
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
+        conversation_id = self._get_conversation_id(request)
         if ctx_response:
             request.disaggregated_params = ctx_response.choices[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
+            request.disaggregated_params.conversation_id = conversation_id
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
@@ -194,6 +204,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_request_id=disagg_request_id,
                 disagg_request_id=disagg_request_id,
                 schedule_style=self._schedule_style,
+                conversation_id=conversation_id,
             )
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
