@@ -637,7 +637,8 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         world_size: int,
         min_local_shape: int = 1,
     ) -> None:
-        scale_key = weight_name + "_scale_inv"
+        # Prepend prefix for VLM models where gm is a submodule
+        scale_key = prefix + weight_name + "_scale_inv"
         if scale_key in state_dict:
             scale = state_dict[scale_key]
             state_dict[scale_key] = self._split_scale(scale, dim, rank, world_size)
@@ -720,7 +721,8 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         world_size: int,
         min_local_shape: int = 1,
     ) -> None:
-        key = weight_name + "_scale"
+        # Prepend prefix for VLM models where gm is a submodule
+        key = prefix + weight_name + "_scale"
         if key in state_dict:
             state_dict[key] = _shard_fp4_weight_scale(
                 state_dict[key],
@@ -1297,6 +1299,11 @@ def _load_hook(
         return
     p_to_load = state_dict[key]
     did_split = param_shape != p_to_load.shape
+    if did_split and ("layers_0" in key or "layers.0." in key or "shared_expert_gate" in key):
+        ad_logger.info(
+            f"[LOAD_DEBUG] key={key}, checkpoint_shape={list(p_to_load.shape)}, "
+            f"expected_shape={list(param_shape)}, will_split={did_split}"
+        )
     p_to_load = p_to_load if not did_split else f_split(p_to_load)
     state_dict[key] = p_to_load
 
@@ -1555,6 +1562,16 @@ def shard_weight_tensor(
 
     sharded_weight = f_split(weight_tensor)
     sharded_shape = sharded_weight.shape
+
+    # DEBUG: trace every parameter shard operation
+    if rank == 0:
+        ad_logger.info(
+            f"[SHARD_DEBUG] param_key={param_key}, "
+            f"original_shape={list(weight_tensor.shape)}, "
+            f"sharded_shape={list(sharded_shape)}, "
+            f"dim={dim}, world_size={world_size}, "
+            f"fused_weight_dims={fused_weight_dims}"
+        )
 
     # Update the parameter in the module
     modname, _, param_name = param_key.rpartition(".")
