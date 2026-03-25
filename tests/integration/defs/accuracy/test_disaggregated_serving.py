@@ -1506,7 +1506,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         max_batch_size = 32
 
         kv_cache_config = {
-            "enable_block_reuse": True if ctx_pp == 1 else False,
+            "enable_block_reuse": True,
         }
 
         ctx_server_config = {
