@@ -185,9 +185,7 @@ def test_getter_methods(mock_executor):
 # ---------------------------------------------------------------------------
 
 
-def _make_ctx_request(num_tokens,
-                      estimated_reusable_tokens=0,
-                      is_first_context_chunk=True):
+def _make_ctx_request(num_tokens, estimated_reusable_tokens=0, is_first_context_chunk=True):
     """Helper to create a mock context request."""
     req = Mock()
     req.get_tokens = Mock(return_value=list(range(num_tokens)))
@@ -196,14 +194,12 @@ def _make_ctx_request(num_tokens,
     return req
 
 
-
 class MockPyExecutorForWaiting:
     """Mock for testing _waiting_requests."""
 
-    def __init__(self,
-                 max_num_tokens=1000,
-                 batch_wait_max_tokens_ratio=0.5,
-                 batch_wait_timeout_iters=3):
+    def __init__(
+        self, max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5, batch_wait_timeout_iters=3
+    ):
         self.max_num_tokens = max_num_tokens
         self.batch_wait_max_tokens_ratio = batch_wait_max_tokens_ratio
         self.batch_wait_timeout_iters = batch_wait_timeout_iters
@@ -216,11 +212,15 @@ class MockPyExecutorForWaiting:
             req_tokens = len(ctx_req.get_tokens(0))
             reusable = ctx_req.estimated_reusable_tokens if ctx_req.is_first_context_chunk else 0
             num_scheduled_ctx_tokens += max(1, req_tokens - reusable)
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
+        num_scheduled_gen_tokens = sum(
+            1 + gen_req.num_draft_tokens for gen_req in generation_requests
+        )
         num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
 
-        should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
+        should_waiting = (
+            self.batch_wait_iters_count < self.batch_wait_timeout_iters
+            and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
+        )
         if should_waiting:
             self.batch_wait_iters_count += 1
             return []
@@ -230,11 +230,9 @@ class MockPyExecutorForWaiting:
 
 
 class TestWaitingRequests:
-
     def test_no_reuse_counts_all_tokens(self):
         """Without KV cache reuse, all context tokens are counted."""
-        executor = MockPyExecutorForWaiting(
-            max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
+        executor = MockPyExecutorForWaiting(max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
         # 100 tokens < 500 threshold => should wait
         ctx_reqs = [_make_ctx_request(100, estimated_reusable_tokens=0)]
         result = executor._waiting_requests(ctx_reqs, [])
@@ -242,39 +240,30 @@ class TestWaitingRequests:
 
     def test_reuse_reduces_token_count(self):
         """With KV cache reuse, only compute tokens are counted."""
-        executor = MockPyExecutorForWaiting(
-            max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
+        executor = MockPyExecutorForWaiting(max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
         # 600 total tokens, 500 reusable => 100 compute tokens < 500 threshold
         ctx_reqs = [
-            _make_ctx_request(600,
-                              estimated_reusable_tokens=500,
-                              is_first_context_chunk=True)
+            _make_ctx_request(600, estimated_reusable_tokens=500, is_first_context_chunk=True)
         ]
         result = executor._waiting_requests(ctx_reqs, [])
         assert result == []  # waiting because compute tokens = 100
 
     def test_reuse_not_applied_for_non_first_chunk(self):
         """Reusable tokens are ignored for non-first context chunks."""
-        executor = MockPyExecutorForWaiting(
-            max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
+        executor = MockPyExecutorForWaiting(max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
         # 600 tokens, reusable=500 but is_first_context_chunk=False => counts all 600
         ctx_reqs = [
-            _make_ctx_request(600,
-                              estimated_reusable_tokens=500,
-                              is_first_context_chunk=False)
+            _make_ctx_request(600, estimated_reusable_tokens=500, is_first_context_chunk=False)
         ]
         result = executor._waiting_requests(ctx_reqs, [])
         assert result == ctx_reqs  # not waiting, 600 >= 500
 
     def test_compute_tokens_at_least_one(self):
         """Each request contributes at least 1 compute token."""
-        executor = MockPyExecutorForWaiting(
-            max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
+        executor = MockPyExecutorForWaiting(max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5)
         # 100 tokens, 100 reusable => max(1, 0) = 1 compute token
         ctx_reqs = [
-            _make_ctx_request(100,
-                              estimated_reusable_tokens=100,
-                              is_first_context_chunk=True)
+            _make_ctx_request(100, estimated_reusable_tokens=100, is_first_context_chunk=True)
         ]
         result = executor._waiting_requests(ctx_reqs, [])
         assert result == []  # 1 token < 500, should wait
