@@ -621,7 +621,11 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
 ):
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -975,9 +979,9 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    launch_dependent_kernels: bool = False,
 ):
-    """
-    x: (batch, dim) or (batch, dim, seqlen)
+    """x: (batch, dim) or (batch, dim, seqlen)
         [shape=2: single token prediction]
         [shape=3: single or multiple tokens prediction]
     conv_state: (..., dim, state_len), where state_len >= width - 1
@@ -999,6 +1003,10 @@ def causal_conv1d_update(
             in this case, the kernel will not process entries at
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
+    launch_dependent_kernels: If true, launch dependent kernels at kernel start.
+        This kernel is typically followed by selective state update,
+        which can profitably start fetching already available inputs
+        like the state before needing the output of this kernel.
     """
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
@@ -1159,6 +1167,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels,
     )
     if unsqueeze:
         out = out.squeeze(-1)
