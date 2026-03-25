@@ -476,8 +476,8 @@ void KVCacheBlock::detachPreviousPlaceholdersFromLookupTree() const
         {
             return;
         }
-        auto slibings = current->getNextBlocks();
-        for (auto const& [key, block] : slibings)
+        auto siblings = current->getNextBlocks();
+        for (auto const& [key, block] : siblings)
         {
             if (!block->isPlaceholder() && block.get() != this)
             {
@@ -641,11 +641,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             else
             {
                 auto const [fullPrimaryBlocks, unusedSecondaryBlocks] = blocksPerWindow.at(maxSequenceLength);
-                numPlaceholderBlocks = fullPrimaryBlocks - allottedPrimaryBlocks;
-                numPlaceholderBlocks = std::max(numPlaceholderBlocks, fullPrimaryBlocks);
-                TLLM_CHECK_WITH_INFO(numPlaceholderBlocks >= 0,
-                    "Full-attention primary blocks (%d) must be >= linear-attention primary blocks (%d)",
-                    fullPrimaryBlocks, allottedPrimaryBlocks);
+                numPlaceholderBlocks
+                    = fullPrimaryBlocks; // The full attention runs out of blocks before we use all placeholders.
             }
         }
 
