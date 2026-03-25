@@ -7,7 +7,8 @@ Read an exact or nearby checked-in config and the model's deployment guide **bef
 | Field | Guidance |
 |---|---|
 | `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. MoE models generally cap lower than dense. The `max_requests` upper bound from the KV cache estimation section below caps reachable batch size. |
-| `max_num_tokens` | Affects throughput and memory. Must exceed ISL plus chat template overhead; sweet spot is ISL to 2× ISL. Tune together with `max_batch_size`. |
+| `max_num_tokens` | Scheduler token budget. When chunked prefill is **disabled** (default): must exceed ISL plus chat template overhead; sweet spot is ISL to 2× ISL. When chunked prefill is **enabled**: acts as the chunk size — see `enable_chunked_prefill` section below. General default is 8192. Tune together with `max_batch_size`. |
+| `enable_chunked_prefill` | Disabled by default. Splits long prefills into chunks so decode batches are not starved. See the dedicated section below for MLA-specific guidance and trade-offs. |
 | `enable_attention_dp` | Usually shines only in high-throughput / high-concurrency traffic scenarios; at low concurrency the memory and compute overhead can be prohibitively resource-intensive with little throughput gain. Follow the exact model guide/config. |
 | `kv_cache_config.free_gpu_memory_fraction` | OOM lever. Safe range depends on attention architecture (MLA vs GQA) and whether attention data parallelism (ADP) is enabled. Guides often adjust `max_batch_size` or `max_seq_len` first. |
 | `moe_expert_parallel_size` | MoE only. Copy from checked-in source; do not assume it equals TP. |
@@ -51,9 +52,27 @@ These patterns are generally observed across benchmark data. A checked-in config
 
 - **`kv_cache_config.free_gpu_memory_fraction`** — Safe range depends on attention architecture. MLA models tolerate higher fractions (compressed KV footprint). GQA models need more headroom (larger per-token KV). Lower the fraction when ADP is enabled to account for replicated attention weight overhead. Large MoE models with ADP may need notably conservative fractions to avoid MoE GEMM autotuner workspace failures.
 
-- **`max_num_tokens`** — Must exceed ISL plus chat template overhead or requests get rejected. Sweet spot is generally ISL to 2× ISL. Setting it far above ISL wastes activation buffer memory and can counterintuitively shrink KV cache capacity. Higher values help scheduler packing at high concurrency but with diminishing returns.
+- **`max_num_tokens`** (when chunked prefill is **disabled**, the default) — Must exceed ISL plus chat template overhead or requests get rejected. Sweet spot is generally ISL to 2× ISL. Setting it far above ISL wastes activation buffer memory and can counterintuitively shrink KV cache capacity. Higher values help scheduler packing at high concurrency but with diminishing returns. The general default (8192) is a reasonable starting point for most non-max-throughput workloads.
 
 - **`max_batch_size`** — MoE models generally cap lower than dense models due to per-expert memory scaling. Reachable batch size is bounded by KV cache capacity, which depends on sequence length, GPU memory, and ADP state.
+
+## Chunked Prefill
+
+Chunked prefill (`enable_chunked_prefill: true`) splits long prefill sequences into chunks so that decode batches sharing the same iteration are not starved. It is **disabled by default** and should be treated as an advanced latency optimization, not a default recommendation.
+
+**When chunked prefill is disabled (default):** `max_num_tokens` acts as the scheduler token budget. The heuristics in the "Generally Observed Patterns" section above apply. The general default of 8192 is a reasonable starting point for most non-max-throughput workloads.
+
+**When chunked prefill is enabled:** `max_num_tokens` becomes the **chunk size**. Smaller values reduce TPOT (time per output token) but decrease overall throughput. The ISL-based sizing heuristics above do not apply — instead, tune the chunk size to balance latency and throughput for the target workload.
+
+**MLA models (DeepSeek-V2/V3/R1, Kimi-K2):**
+- Chunked prefill IS supported for MLA — dedicated CUDA kernels exist (`mlaChunkedPrefill.cu`) with multi-round attention and softmax merging.
+- **Hardware constraint:** only available on SM90 (Hopper) and SM100/SM103/SM120 (Blackwell+). The runtime automatically disables it with a warning on older GPUs (`py_executor_creator.py`).
+- **Trade-off:** the DeepSeek-R1 best-practices blog documents this explicitly — *"primarily designed to reduce TPOT [...] will also decrease overall throughput."*
+- **Recommendation:** do not enable by default for MLA models. Consider it only for latency-sensitive workloads on Hopper or Blackwell GPUs where TPOT reduction outweighs the throughput cost.
+
+**Non-MLA models (GQA):** chunked prefill is more broadly supported across GPU generations. Still disabled by default; enable when long prefill sequences cause decode latency spikes.
+
+**Source:** `py_executor_creator.py:535-542`, `_torch/modules/attention.py` (chunked prefill MLA path), `docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md:419-423`.
 
 ## Bench-Derived Hints (fallback only)
 
