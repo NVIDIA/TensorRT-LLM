@@ -50,7 +50,18 @@ slurm_install_setup() {
         if [ "${INSTALL_MODE:-source}" = "wheel" ]; then
             # Wheel installation mode
             echo "Installing from wheel..."
-            WHEEL_FILE=$(find "$llmSrcNode/build" -name "tensorrt_llm-*.whl" -type f 2>/dev/null | head -1)
+            WHEEL_FILE=""
+
+            # If WHEEL_PATH is provided, try to use it directly
+            if [ -n "${WHEEL_PATH:-}" ] && [ -f "${WHEEL_PATH}" ]; then
+                echo "Using WHEEL_PATH: $WHEEL_PATH"
+                WHEEL_FILE="$WHEEL_PATH"
+            else
+                if [ -n "${WHEEL_PATH:-}" ]; then
+                    echo "WARNING: WHEEL_PATH='$WHEEL_PATH' not found, searching $llmSrcNode/build..."
+                fi
+                WHEEL_FILE=$(find "$llmSrcNode/build" -name "tensorrt_llm-*.whl" -type f 2>/dev/null | head -1)
+            fi
 
             if [ -n "$WHEEL_FILE" ]; then
                 echo "Found wheel: $WHEEL_FILE"

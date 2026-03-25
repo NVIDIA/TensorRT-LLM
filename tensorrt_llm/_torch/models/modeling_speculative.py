@@ -786,7 +786,7 @@ class MTPForCausalLM(nn.Module):
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
-            case "deepseek_v3" | "deepseek_v32":
+            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
                 from .modeling_deepseekv3 import DeepseekV3MTP
                 mtp_layer = DeepseekV3MTP
             case "exaone_moe":
@@ -830,7 +830,7 @@ class MTPDraftModel(nn.Module):
                                 layer_idx,
                                 aux_stream_dict,
                                 is_separate_draft_engine=True)
-        elif model_type in ["deepseek_v3", "deepseek_v32"]:
+        elif model_type in ["deepseek_v3", "deepseek_v32", "glm_moe_dsa"]:
             from .modeling_deepseekv3 import DeepseekV3MTP
             mtp_layer = DeepseekV3MTP(model_config,
                                       layer_idx,
@@ -915,7 +915,7 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
             case "glm4_moe":
                 from .modeling_glm import Glm4WeightLoader
                 weight_loader = Glm4WeightLoader(self, is_draft_model=True)
-            case "deepseek_v3" | "deepseek_v32":
+            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
                 from .modeling_deepseekv3 import DeepseekV3WeightLoader
                 weight_loader = DeepseekV3WeightLoader(self,
                                                        is_draft_model=True)
@@ -1024,7 +1024,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
-                        self.draft_config.extra_attrs = model_config.extra_attrs
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
@@ -1041,6 +1040,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         )
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                     model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
@@ -1054,6 +1054,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.extra_attrs = model_config.extra_attrs
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
@@ -1066,15 +1067,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if spec_config.spec_dec_mode.is_pard(
                 ) and self.draft_model is not None:
                     self.draft_model.logits_processor = self.logits_processor
-
-            # EAGLE3-specific logic: merge extra_attrs from draft model for Llama3
-            if (self.draft_config is not None and model_config.spec_config.
-                    spec_dec_mode.is_eagle3_one_model()
-                    and model_config.spec_config.eagle3_model_arch == "llama3"):
-                for key, value in self.draft_config.extra_attrs.items():
-                    assert key in ('attn_layers', 'mla_layers')
-                    assert key in model_config.extra_attrs
-                    model_config.extra_attrs[key].update(value)
 
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(

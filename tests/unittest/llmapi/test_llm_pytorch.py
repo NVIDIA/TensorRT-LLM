@@ -28,6 +28,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness, llm_test_harness,
                        prompts, run_llm_abort_request,
+                       sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, similarity_score,
@@ -106,14 +107,19 @@ def test_llm_capture_request_error():
 
 @force_ampere
 @pytest.mark.mpi_ray_parity
-@pytest.mark.parametrize(
-    "sampling_params",
-    [
-        SamplingParams()  # pytorch only supports n=1
-    ])
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
 @pytest.mark.part0
 def test_llm_abort_request(sampling_params):
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    llm_kwargs = {}
+    if sampling_params.use_beam_search:
+        if sampling_params.best_of is None:
+            llm_kwargs["max_beam_width"] = sampling_params.n
+        else:
+            llm_kwargs["max_beam_width"] = sampling_params.best_of
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              **llm_kwargs)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
@@ -1074,6 +1080,44 @@ def test_min_tokens(use_speculative: bool):
 
     assert len(res.outputs) == 1
     assert len(res.outputs[0].token_ids) == output_len
+
+
+@pytest.mark.part0
+def test_min_tokens_long_prompt():
+    """Check min_tokens is respected when prompt is longer than min_tokens.
+
+    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    total token count (prompt + generated) against the raw min_tokens value
+    instead of comparing generated token count only.  When prompt_len >=
+    min_tokens the EOS suppression was never activated, allowing early
+    termination.
+    """
+    min_tok = 50
+    max_tok = 100
+    # Prompt long enough so that prompt_len > min_tok.  "Hello " tokenises
+    # to ~1-2 tokens with most tokenizers, so 200 repetitions ≈ 200-400
+    # tokens >> min_tok.
+    long_prompt = "Hello " * 200
+
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=2,
+        kv_cache_config=global_kvcache_config,
+        max_num_tokens=2048,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tok,
+        min_tokens=min_tok,
+        temperature=1,
+    )
+    res = llm.generate(long_prompt, sampling_params=sampling_params)
+
+    assert len(res.outputs) == 1
+    generated_len = len(res.outputs[0].token_ids)
+    assert generated_len >= min_tok, (
+        f"Generated only {generated_len} tokens with min_tokens={min_tok} "
+        f"and a long prompt.  Bug 5823135 regression.")
 
 
 @skip_ray

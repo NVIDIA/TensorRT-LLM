@@ -78,6 +78,7 @@ class CUDAGraphRunnerConfig:
     mapping: Optional[Mapping]
     dist: Optional[Distributed]
     kv_cache_manager_key: Any
+    dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
 
@@ -108,7 +109,8 @@ class CUDAGraphRunner:
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self.padding_dummy_request: Optional["Request"] = None
+        self.padding_dummy_requests: Dict[int, "Request"] = {}
+        self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
@@ -209,7 +211,7 @@ class CUDAGraphRunner:
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
                    short_seq_len_mode)
         else:
-            # With dynamic spec decode, the draft length maybe zero even when enable_spec_decode is True,
+            # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
             draft_len_list = []
             for request in batch.generation_requests:
@@ -423,18 +425,30 @@ class CUDAGraphRunner:
                 or new_batch_size > self.max_supported_batch_size):
             return 0
 
-        padded_batch_size = self._round_up_batch_size(new_batch_size)
+        # When dynamic draft length is enabled (one-model path), we treat the determined runtime draft length
+        # as the source of truth and pad the batch size up to the nearest existing graph
+        # for that draft length.
+        if (self.spec_config and self.spec_config.draft_len_schedule
+                and self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
+            padded_batch_size = self._round_up_batch_size_with_draft_len(
+                new_batch_size, runtime_draft_len)
+        else:
+            padded_batch_size = self._round_up_batch_size(new_batch_size)
+
         if batch_size == padded_batch_size:
             return 0
 
         padding_size = padded_batch_size - batch_size
+        if padding_size <= 0:
+            return 0
         if padding_size + batch.batch_size > self.config.batch_size:
             return 0
 
         # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
-        if self.padding_dummy_request is None:
+        # Use per-draft-len dummy requests for dynamic draft length support.
+        if runtime_draft_len not in self.padding_dummy_requests:
 
             # Get draft KV cache manager only for one-model speculative decoding.
             # In two-model mode, each model has its own KV cache manager, so
@@ -442,32 +456,35 @@ class CUDAGraphRunner:
             draft_kv_cache_manager = get_draft_kv_cache_manager(
                 self.spec_config, resource_manager)
 
-            self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
-                [CUDA_GRAPH_DUMMY_REQUEST_ID],
+            # Use unique dummy request ID per draft length
+            dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
+            dummy_request = kv_cache_manager.add_dummy_requests(
+                [dummy_request_id],
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width,
                 draft_kv_cache_manager=draft_kv_cache_manager)
 
-            if self.padding_dummy_request is None:
+            if dummy_request is None:
                 return 0
             else:
-                self.padding_dummy_request = self.padding_dummy_request[0]
-            self.padding_dummy_request.is_cuda_graph_dummy = True
+                dummy_request = dummy_request[0]
+            dummy_request.is_cuda_graph_dummy = True
+
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_res_mgr:
-                spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+                spec_res_mgr.add_dummy_requests([dummy_request_id])
+            self.padding_dummy_requests[runtime_draft_len] = dummy_request
 
         if (isinstance(kv_cache_manager, MambaCacheManager)
                 and not use_cpp_mamba_cache_manager()):
             kv_cache_manager.reorder_state_indices_when_padding_requests(
                 batch_size, padding_size)
 
-        self.padding_dummy_request.py_draft_tokens = [0] * runtime_draft_len
-        batch.generation_requests.extend([self.padding_dummy_request] *
-                                         padding_size)
+        padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
+        batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
 
     def _round_up_batch_size(self, batch_size: int) -> int:
@@ -478,6 +495,26 @@ class CUDAGraphRunner:
         if idx == len(self.supported_batch_sizes):
             return 0
         return self.supported_batch_sizes[idx]
+
+    def _round_up_batch_size_with_draft_len(self, batch_size: int,
+                                            draft_len: int) -> int:
+        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len."""
+        if not self.dynamic_draft_len_mapping:
+            # Fallback to regular round up if no mapping
+            return self._round_up_batch_size(batch_size)
+
+        start_idx = bisect.bisect_left(self.supported_batch_sizes, batch_size)
+        # Negate the list to make it non-decreasing for bisect
+        # (draft_len decreases as batch_size increases in the schedule)
+        draft_lens = [
+            self.dynamic_draft_len_mapping.get(self.supported_batch_sizes[i], 0)
+            for i in range(start_idx, len(self.supported_batch_sizes))
+        ]
+        idx = bisect.bisect_left(draft_lens, -draft_len, key=lambda x: -x)
+        if idx < len(draft_lens) and draft_lens[idx] == draft_len:
+            return self.supported_batch_sizes[start_idx + idx]
+        # No suitable graph found
+        return 0
 
     @contextlib.contextmanager
     def pad_batch(self,
@@ -502,7 +539,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
-        self.padding_dummy_request = None
+        self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -42,6 +43,8 @@ namespace trtllm::attention
 using tensorrt_llm::kernels::KVBlockArray;
 using tensorrt_llm::kernels::MlaParams;
 using tensorrt_llm::kernels::SparseAttentionParams;
+using tensorrt_llm::torch_ext::KvCachePoolPointers;
+using tensorrt_llm::torch_ext::buildKvCachePoolPointers;
 
 enum class AttentionInputType : int8_t
 {
@@ -91,7 +94,8 @@ public:
         int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const
+        std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> flash_mla_num_splits) const
         = 0;
 };
 
@@ -151,7 +155,8 @@ public:
         int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const override
+        std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> flash_mla_num_splits) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -315,47 +320,13 @@ public:
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
-        // Prepare block pool pointers for NVFP4 KV cache.
-        void* host_primary_pool_pointer{nullptr};
-        void* host_secondary_pool_pointer{nullptr};
-        void* host_primary_block_scale_pool_pointer{nullptr};
-        void* host_secondary_block_scale_pool_pointer{nullptr};
-
-        // Whether NVFP4 KV cache is used.
+        // Build KV cache pool pointers from the host tensor.
         bool const use_kv_cache = op.useKVCache() && host_kv_cache_pool_pointers.has_value();
-        bool const use_nvfp4_kv_cache = use_kv_cache && op.mKVCacheQuantMode.hasFp4KvCache();
-        if (use_nvfp4_kv_cache)
+        KvCachePoolPointers pool_pointers;
+        if (use_kv_cache)
         {
-            // For NVFP4 KV cache, extra block scales are stored in separate pools.
-            // The layout of host_kv_cache_pool_pointers is [num_pools, 2 (primary and secondary), 2 (data and scale)].
-            TORCH_CHECK(host_kv_cache_pool_pointers.value().dim() == 3);
-            host_primary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0, 0}).item<int64_t>())
-                + intra_pool_offset);
-            host_secondary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1, 0}).item<int64_t>())
-                + intra_pool_offset);
-            // Calculate the intra-pool offset for scaling factors.
-            // Note that NVFP4 block scaling use a fixed vector size of 16.
-            auto constexpr vector_size = 16;
-            auto const bytes_per_block_sf = block_size / vector_size * 1 /*bytes per E4M3 sf*/;
-            auto const intra_pool_offset_sf = layer_idx_in_cache_pool * kv_factor * bytes_per_block_sf;
-            host_primary_block_scale_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0, 1}).item<int64_t>())
-                + intra_pool_offset_sf);
-            host_secondary_block_scale_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1, 1}).item<int64_t>())
-                + intra_pool_offset_sf);
-        }
-        else if (use_kv_cache)
-        {
-            TORCH_CHECK(host_kv_cache_pool_pointers.value().dim() == 2);
-            host_primary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
-                + intra_pool_offset);
-            host_secondary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
-                + intra_pool_offset);
+            pool_pointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), pool_index, intra_pool_offset,
+                block_size, layer_idx_in_cache_pool, kv_factor, op.mKVCacheQuantMode.hasFp4KvCache());
         }
 
         float const* kv_scale_orig_quant_ptr = nullptr;
@@ -428,10 +399,10 @@ public:
         common_enqueue_params.context_buf = context_buf;
         common_enqueue_params.context_buf_sf = context_buf_sf;
         common_enqueue_params.block_offsets = block_offsets;
-        common_enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
-        common_enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
-        common_enqueue_params.host_primary_block_scale_pool_pointer = host_primary_block_scale_pool_pointer;
-        common_enqueue_params.host_secondary_block_scale_pool_pointer = host_secondary_block_scale_pool_pointer;
+        common_enqueue_params.host_primary_pool_pointer = pool_pointers.primaryPoolPtr;
+        common_enqueue_params.host_secondary_pool_pointer = pool_pointers.secondaryPoolPtr;
+        common_enqueue_params.host_primary_block_scale_pool_pointer = pool_pointers.primaryBlockScalePoolPtr;
+        common_enqueue_params.host_secondary_block_scale_pool_pointer = pool_pointers.secondaryBlockScalePoolPtr;
         common_enqueue_params.num_tokens = num_tokens;
         common_enqueue_params.total_kv_len = total_kv_len;
         common_enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
@@ -578,6 +549,15 @@ public:
                     TORCH_CHECK(block_ids_per_seq.has_value());
                     int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
                     mla_params.block_ids_per_seq = block_ids_per_seq_ptr;
+                    // Use pre-computed metadata if provided.
+                    if (flash_mla_tile_scheduler_metadata.has_value())
+                    {
+                        TORCH_CHECK(flash_mla_num_splits.has_value(),
+                            "flash_mla_num_splits must be provided when flash_mla_tile_scheduler_metadata is set.");
+                        mla_params.flash_mla_tile_scheduler_metadata
+                            = flash_mla_tile_scheduler_metadata->data_ptr<int>();
+                        mla_params.flash_mla_num_splits = flash_mla_num_splits->data_ptr<int>();
+                    }
                 }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
                 op.mlaGeneration<T>(mla_params, enqueue_params, stream);
@@ -649,7 +629,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer)
+    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+    std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -913,7 +894,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
-            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -931,7 +913,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
-            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -986,7 +969,107 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     return op->supportsNvFp4Output();
 }
 
+KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
+    int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache)
+{
+    KvCachePoolPointers pointers;
+    if (isFp4KvCache)
+    {
+        // For NVFP4 KV cache, extra block scales are stored in separate pools.
+        // The layout of host_kv_cache_pool_pointers is [num_pools, 2 (primary and secondary), 2 (data and scale)].
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 3);
+        pointers.primaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 0}).item<int64_t>())
+            + intraPoolOffset);
+        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 0}).item<int64_t>())
+            + intraPoolOffset);
+        // NVFP4 block scaling uses a fixed vector size of 16.
+        auto constexpr vectorSize = 16;
+        auto const bytesPerBlockSf = blockSize / vectorSize * 1 /*bytes per E4M3 sf*/;
+        auto const intraPoolOffsetSf = layerIdxInCachePool * kvFactor * bytesPerBlockSf;
+        pointers.primaryBlockScalePoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 1}).item<int64_t>())
+            + intraPoolOffsetSf);
+        pointers.secondaryBlockScalePoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 1}).item<int64_t>())
+            + intraPoolOffsetSf);
+    }
+    else
+    {
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
+        pointers.primaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0}).item<int64_t>()) + intraPoolOffset);
+        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1}).item<int64_t>()) + intraPoolOffset);
+    }
+    return pointers;
+}
+
+common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
+    std::optional<torch::Tensor> const& kv_cache_block_offsets,
+    std::optional<torch::Tensor> const& host_kv_cache_pool_pointers,
+    std::optional<torch::Tensor> const& host_kv_cache_pool_mapping, common::QuantMode quantMode, int64_t layer_idx,
+    int64_t batch_size, int64_t tokens_per_block, int64_t kv_head_num, int64_t size_per_head,
+    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t sink_token_length,
+    int64_t beam_width, int64_t seq_offset, bool is_mla_enable, size_t elem_size)
+{
+    using kernels::KVBlockArray;
+
+    bool const useKvCache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
+        && host_kv_cache_pool_mapping.has_value();
+    if (!useKvCache)
+    {
+        return {};
+    }
+
+    int32_t const poolIndex = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 0}).item<int32_t>();
+    int32_t const layerIdxInCachePool
+        = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 1}).item<int32_t>();
+    auto* blockOffsets = static_cast<KVBlockArray::DataType*>(
+        kv_cache_block_offsets->index({poolIndex, static_cast<int64_t>(seq_offset)}).data_ptr());
+
+    int cacheElemBits = common::op::AttentionOp::getKvCacheElemSizeInBits(quantMode, elem_size);
+
+    auto const blockSize = tokens_per_block * kv_head_num * size_per_head;
+    auto const bytesPerBlock = blockSize * cacheElemBits / CHAR_BIT;
+    int32_t const kvFactor = is_mla_enable ? 1 : 2;
+    auto const intraPoolOffset = layerIdxInCachePool * kvFactor * bytesPerBlock;
+    auto const sizePerToken = static_cast<int32_t>(kv_head_num * size_per_head * cacheElemBits / 8);
+
+    auto poolPointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), poolIndex, intraPoolOffset,
+        blockSize, layerIdxInCachePool, kvFactor, quantMode.hasFp4KvCache());
+
+    int32_t const maxBlocksPerSequence = static_cast<int32_t>(kv_cache_block_offsets->size(-1));
+    return common::op::buildKvCacheBuffers<kernels::KVBlockArray>(static_cast<int32_t>(batch_size),
+        maxBlocksPerSequence, static_cast<int32_t>(tokens_per_block), sizePerToken,
+        static_cast<int32_t>(cyclic_attention_window_size),
+        static_cast<int32_t>(std::max(cyclic_attention_window_size, max_attention_window_size)),
+        static_cast<int32_t>(sink_token_length), beam_width > 1, poolPointers.primaryPoolPtr,
+        poolPointers.secondaryPoolPtr, poolPointers.primaryBlockScalePoolPtr, poolPointers.secondaryBlockScalePoolPtr,
+        blockOffsets, quantMode.hasFp4KvCache());
+}
+
 } // namespace torch_ext
+
+void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits,
+    int64_t batch_size, int64_t s_q, int64_t num_q_heads, int64_t num_kv_heads, int64_t head_size_v)
+{
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static constexpr int block_size_n = 64;
+    static constexpr int fixed_overhead_num_blocks = 5;
+    int const num_sm_parts = tensorrt_llm::common::op::AttentionOp::getFlashMlaNumSmPartsStatic(static_cast<int>(s_q),
+        static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads), static_cast<int>(head_size_v));
+    Mla_metadata_params params = {};
+    params.seqlens_k_ptr = seqlens_k.data_ptr<int>();
+    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+    params.num_splits_ptr = num_splits.data_ptr<int>();
+    params.batch_size = static_cast<int>(batch_size);
+    params.block_size_n = block_size_n;
+    params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
+    params.num_sm_parts = num_sm_parts;
+    get_mla_metadata_func(params, stream);
+}
 
 TRTLLM_NAMESPACE_END
 
