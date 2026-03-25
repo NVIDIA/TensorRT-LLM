@@ -2723,8 +2723,11 @@ class PyExecutor:
         - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
         """
 
-        num_scheduled_ctx_tokens = sum(
-            len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
+        num_scheduled_ctx_tokens = 0
+        for ctx_req in context_requests:
+            req_tokens = len(ctx_req.get_tokens(0))
+            reusable = ctx_req.estimated_reusable_tokens if ctx_req.is_first_context_chunk else 0
+            num_scheduled_ctx_tokens += max(1, req_tokens - reusable)
         num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
                                        for gen_req in generation_requests)
         num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
