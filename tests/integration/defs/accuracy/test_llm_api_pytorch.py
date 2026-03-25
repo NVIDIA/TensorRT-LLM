@@ -5857,11 +5857,15 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
     )
 
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
-    def test_bf16(self, moe_backend):
+    @pytest.mark.parametrize(
+        "tp_size",
+        [1, pytest.param(2, marks=pytest.mark.skip_less_device(2))],
+        ids=["tp1", "tp2"],
+    )
+    def test_bf16(self, moe_backend, tp_size):
         if moe_backend == "TRTLLM" and get_sm_version() not in (100, 103):
             pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
 
-        world_size = 1
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(
@@ -5869,8 +5873,8 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         moe_config = MoeConfig(backend=moe_backend)
 
         with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=world_size,
-                 moe_expert_parallel_size=world_size,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=1,
                  max_seq_len=4096,
                  max_num_tokens=4096,
                  max_batch_size=128,
@@ -5882,20 +5886,24 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_fp8(self):
+    @pytest.mark.parametrize(
+        "tp_size",
+        [1, pytest.param(2, marks=pytest.mark.skip_less_device(2))],
+        ids=["tp1", "tp2"],
+    )
+    def test_fp8(self, tp_size):
         model_dir = f"{self.MODEL_PATH}-FP8"
         # Model is being added to CI. Skip at the moment.
         if not os.path.exists(model_dir):
             pytest.skip(f"Model directory {model_dir} does not exist")
 
-        world_size = 1
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         moe_config = MoeConfig(backend='DEEPGEMM')
 
         with LLM(model_dir,
-                 tensor_parallel_size=world_size,
-                 moe_expert_parallel_size=world_size,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=1,
                  max_seq_len=4096,
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
