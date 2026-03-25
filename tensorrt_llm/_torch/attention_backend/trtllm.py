@@ -299,6 +299,7 @@ class TrtllmAttentionWrapper:
         """
         self.layer_idx = layer_idx
         self.global_layer_idx = layer_idx
+        self._trtllm_gen_backend = None
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
@@ -559,7 +560,7 @@ class TrtllmAttentionWrapper:
                 skip_softmax_threshold_scale_factor_decode=self.
                 skip_softmax_threshold_scale_factor_decode,
         )[0]:
-            trtllm_gen_attention(
+            self._trtllm_gen_backend = trtllm_gen_attention(
                 q,
                 k,
                 v,
@@ -643,6 +644,7 @@ class TrtllmAttentionWrapper:
                 num_contexts,
                 num_ctx_tokens,
                 global_layer_idx=self.global_layer_idx,
+                backend=self._trtllm_gen_backend,
             )
         else:
             thop.attention(
