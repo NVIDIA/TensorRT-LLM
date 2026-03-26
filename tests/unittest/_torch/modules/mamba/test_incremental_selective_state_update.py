@@ -115,14 +115,14 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
     # Build cache tensors for the incremental kernel.
     # old_x: (cache, T, nheads, dim) bf16 — single-buffered
     # old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered
-    # old_dt_proc: (cache, 2, T, nheads) fp32 — double-buffered
-    # old_cumAdt: (cache, 2, T, nheads) fp32 — double-buffered
+    # old_dt_proc: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
+    # old_cumAdt: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
     # cache_buf_idx: random 0s and 1s to verify indexing correctness
     # -------------------------------------------------------------------
     old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(cache_size, 2, T, nheads, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(cache_size, 2, T, nheads, device=device, dtype=torch.float32)
+    old_dt_proc = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
 
     # Fill each slot's READ buffer (indexed by cache_buf_idx) with step 1's data.
@@ -142,8 +142,8 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         buf = cache_buf_idx[slot].item()
         batch_idx = i  # maps slot back to the batch index
         old_B[slot, buf] = B1[batch_idx]
-        old_dt_proc[slot, buf] = dt1_proc[batch_idx]
-        old_cumAdt[slot, buf] = cumAdt1[batch_idx]
+        old_dt_proc[slot, buf] = dt1_proc[batch_idx].T  # (T, nheads) → (nheads, T)
+        old_cumAdt[slot, buf] = cumAdt1[batch_idx].T    # (T, nheads) → (nheads, T)
 
     # -------------------------------------------------------------------
     # Main loop: test each k (number of old tokens replayed)

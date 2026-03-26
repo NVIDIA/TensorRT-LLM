@@ -67,11 +67,11 @@ def _precompute_cb_scaled_kernel(
     # decay_vec strides
     stride_dv_batch, stride_dv_head, stride_dv_t,
     # old_B strides: (cache, 2, T, ngroups, dstate)
-    stride_oB_cache, stride_oB_buf, stride_oB_T, stride_oB_group, stride_oB_dstate,
-    # old_dt_proc strides: (cache, 2, T, nheads)
-    stride_odp_cache, stride_odp_buf, stride_odp_T, stride_odp_head,
-    # old_cumAdt strides: (cache, 2, T, nheads)
-    stride_oca_cache, stride_oca_buf, stride_oca_T, stride_oca_head,
+    stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T, stride_old_B_group, stride_old_B_dstate,
+    # old_dt_proc strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_dt_proc_cache, stride_old_dt_proc_dbuf, stride_old_dt_proc_head, stride_old_dt_proc_T,
+    # old_cumAdt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_cumAdt_cache, stride_old_cumAdt_dbuf, stride_old_cumAdt_head, stride_old_cumAdt_T,
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
@@ -121,11 +121,11 @@ def _precompute_cb_scaled_kernel(
     decay_vec = tl.exp(cumAdt)
 
     # --- Store dt_proc, cumAdt to WRITE buffer ---
-    odp_base = old_dt_proc_ptr + cache_batch_idx * stride_odp_cache + buf_write * stride_odp_buf + pid_h * stride_odp_head
-    tl.store(odp_base + offs_t * stride_odp_T, dt_proc, mask=t_mask)
+    odp_base = old_dt_proc_ptr + cache_batch_idx * stride_old_dt_proc_cache + buf_write * stride_old_dt_proc_dbuf + pid_h * stride_old_dt_proc_head
+    tl.store(odp_base + offs_t * stride_old_dt_proc_T, dt_proc, mask=t_mask)
 
-    oca_base = old_cumAdt_ptr + cache_batch_idx * stride_oca_cache + buf_write * stride_oca_buf + pid_h * stride_oca_head
-    tl.store(oca_base + offs_t * stride_oca_T, cumAdt, mask=t_mask)
+    oca_base = old_cumAdt_ptr + cache_batch_idx * stride_old_cumAdt_cache + buf_write * stride_old_cumAdt_dbuf + pid_h * stride_old_cumAdt_head
+    tl.store(oca_base + offs_t * stride_old_cumAdt_T, cumAdt, mask=t_mask)
 
     # --- Store decay_vec ---
     dv_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
@@ -155,11 +155,12 @@ def _precompute_cb_scaled_kernel(
              CB_scaled,
              mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T))
 
-    # --- Store B to WRITE buffer of old_B cache ---
-    oB_base = (old_B_ptr + cache_batch_idx * stride_oB_cache
-               + buf_write * stride_oB_buf + group_idx * stride_oB_group)
-    tl.store(oB_base + offs_t[:, None] * stride_oB_T + offs_n[None, :] * stride_oB_dstate,
-             B_all.to(tl.bfloat16), mask=t_mask[:, None] & n_mask[None, :])
+    # --- Store B to WRITE buffer of old_B cache (once per group, not per head) ---
+    if pid_h % nheads_ngroups_ratio == 0:
+        oB_base = (old_B_ptr + cache_batch_idx * stride_old_B_cache
+                   + buf_write * stride_old_B_dbuf + group_idx * stride_old_B_group)
+        tl.store(oB_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
+                 B_all.to(tl.bfloat16), mask=t_mask[:, None] & n_mask[None, :])
 
 
 # ============================================================================
@@ -198,13 +199,13 @@ def _incremental_selective_scan_update_kernel(
     # state strides
     stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
     # old_x strides: (cache, T, nheads, dim) — single-buffered
-    stride_ox_cache, stride_ox_T, stride_ox_head, stride_ox_dim,
+    stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
     # old_B strides: (cache, 2, T, ngroups, dstate)
-    stride_oB_cache, stride_oB_buf, stride_oB_T, stride_oB_group, stride_oB_dstate,
-    # old_dt_proc strides: (cache, 2, T, nheads)
-    stride_odp_cache, stride_odp_buf, stride_odp_T, stride_odp_head,
-    # old_cumAdt strides: (cache, 2, T, nheads)
-    stride_oca_cache, stride_oca_buf, stride_oca_T, stride_oca_head,
+    stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T, stride_old_B_group, stride_old_B_dstate,
+    # old_dt_proc strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_dt_proc_cache, stride_old_dt_proc_dbuf, stride_old_dt_proc_head, stride_old_dt_proc_T,
+    # old_cumAdt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_cumAdt_cache, stride_old_cumAdt_dbuf, stride_old_cumAdt_head, stride_old_cumAdt_T,
     # x strides
     stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
     # C strides
@@ -261,33 +262,33 @@ def _incremental_selective_scan_update_kernel(
     group_idx = pid_h // nheads_ngroups_ratio
 
     # Load precomputed dt_proc and cumAdt from READ buffer
-    odp_base = (old_dt_proc_ptr + cache_batch_idx * stride_odp_cache
-                + buf_read * stride_odp_buf + pid_h * stride_odp_head)
-    old_dt_proc_all = tl.load(odp_base + offs_t * stride_odp_T,
+    odp_base = (old_dt_proc_ptr + cache_batch_idx * stride_old_dt_proc_cache
+                + buf_read * stride_old_dt_proc_dbuf + pid_h * stride_old_dt_proc_head)
+    old_dt_proc_all = tl.load(odp_base + offs_t * stride_old_dt_proc_T,
                               mask=t_mask, other=0.0).to(tl.float32)
 
-    oca_base = (old_cumAdt_ptr + cache_batch_idx * stride_oca_cache
-                + buf_read * stride_oca_buf + pid_h * stride_oca_head)
-    old_cumAdt_all = tl.load(oca_base + offs_t * stride_oca_T,
+    oca_base = (old_cumAdt_ptr + cache_batch_idx * stride_old_cumAdt_cache
+                + buf_read * stride_old_cumAdt_dbuf + pid_h * stride_old_cumAdt_head)
+    old_cumAdt_all = tl.load(oca_base + offs_t * stride_old_cumAdt_T,
                              mask=t_mask, other=0.0).to(tl.float32)
 
     # Load cumAdt at prev_k-1 directly via pointer math (avoids masked reduction)
     prev_k_idx = tl.maximum(prev_num_accepted_tokens - 1, 0)
-    total_cumAdt = tl.load(oca_base + prev_k_idx * stride_oca_T).to(tl.float32)
+    total_cumAdt = tl.load(oca_base + prev_k_idx * stride_old_cumAdt_T).to(tl.float32)
 
     # Compute per-token coefficients
     coeff = tl.exp(total_cumAdt - old_cumAdt_all) * old_dt_proc_all
     coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
 
     # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
-    ox_base = old_x_ptr + cache_batch_idx * stride_ox_cache + pid_h * stride_ox_head
-    old_x_all = tl.load(ox_base + offs_t[:, None] * stride_ox_T + offs_m[None, :] * stride_ox_dim,
+    ox_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
+    old_x_all = tl.load(ox_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
                         mask=t_mask[:, None] & m_mask[None, :], other=0.0).to(tl.float32)
 
     # Load old_B from READ buffer: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE)
-    oB_base = (old_B_ptr + cache_batch_idx * stride_oB_cache
-               + buf_read * stride_oB_buf + group_idx * stride_oB_group)
-    old_B_all = tl.load(oB_base + offs_t[:, None] * stride_oB_T + offs_n[None, :] * stride_oB_dstate,
+    oB_base = (old_B_ptr + cache_batch_idx * stride_old_B_cache
+               + buf_read * stride_old_B_dbuf + group_idx * stride_old_B_group)
+    old_B_all = tl.load(oB_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
                         mask=t_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
 
     # Scale B by coefficients
@@ -323,7 +324,7 @@ def _incremental_selective_scan_update_kernel(
     # Load x_all and store to old_x (single-buffered, replay already read it)
     x_all = tl.load(x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
                     mask=t_mask[:, None] & m_mask[None, :], other=0.0)
-    tl.store(ox_base + offs_t[:, None] * stride_ox_T + offs_m[None, :] * stride_ox_dim,
+    tl.store(ox_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
              x_all, mask=t_mask[:, None] & m_mask[None, :])
     x_all = x_all.to(tl.float32)
 
@@ -388,7 +389,7 @@ def incremental_selective_state_update(
     dt_softplus: bool = False,
     state_batch_indices: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
-    launch_with_pdl=False,
+    use_internal_pdl=True,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
     _num_stages: int | None = None,
@@ -467,8 +468,8 @@ def incremental_selective_state_update(
     assert C.shape == B.shape
     assert old_x.shape == (cache_size, T, nheads, dim)
     assert old_B.shape == (cache_size, 2, T, ngroups, dstate)
-    assert old_dt_proc.shape == (cache_size, 2, T, nheads)
-    assert old_cumAdt.shape == (cache_size, 2, T, nheads)
+    assert old_dt_proc.shape == (cache_size, 2, nheads, T)
+    assert old_cumAdt.shape == (cache_size, 2, nheads, T)
     assert cache_buf_idx.shape == (cache_size,)
     assert prev_num_accepted_tokens.shape == (cache_size,)
 
@@ -488,10 +489,22 @@ def incremental_selective_state_update(
     z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
                  if z is not None else (0, 0, 0, 0))
 
-    BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
-                               ((16, 4) if dstate <= 32 else
-                                ((8, 2) if dstate <= 64 else
-                                 ((8, 1) if dstate <= 128 else ((4, 1))))))
+    # Main kernel tuning: BLOCK_SIZE_M and num_warps.
+    # Sweeping M=4..64, W=1..4 across batch=1..512, MTP=5..20 on B200
+    # with nheads=16, head_dim=64, dstate=128:
+    #   batch=1:    M=4/W=4  (8.2 µs — W=4 uniquely best, 20% over W=1)
+    #   batch=2-4:  M=4/W=2  (10.2 µs — W=2 needed for large MTP)
+    #   batch=8-16: M=16/W=1 (12-16 µs — larger M, single warp)
+    #   batch>=32:  M=32/W=2 (18-233 µs — sweet spot for saturated GPU)
+    # Max gap vs per-config optimal: 2.7% (at batch=512/MTP=20).
+    if batch <= 1:
+        BLOCK_SIZE_M, num_warps = 4, 4
+    elif batch <= 4:
+        BLOCK_SIZE_M, num_warps = 4, 2
+    elif batch <= 16:
+        BLOCK_SIZE_M, num_warps = 16, 1
+    else:
+        BLOCK_SIZE_M, num_warps = 32, 2
     if _block_size_m is not None:
         BLOCK_SIZE_M = _block_size_m
     if _num_warps is not None:
@@ -570,8 +583,8 @@ def incremental_selective_state_update(
             # decay_vec strides
             decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
             BLOCK_SIZE_M,
-            LAUNCH_WITH_PDL=launch_with_pdl,
+            LAUNCH_WITH_PDL=use_internal_pdl,
             num_warps=num_warps,
             **({'num_stages': _num_stages} if _num_stages else {}),
-            launch_pdl=launch_with_pdl,
+            launch_pdl=use_internal_pdl,
         )

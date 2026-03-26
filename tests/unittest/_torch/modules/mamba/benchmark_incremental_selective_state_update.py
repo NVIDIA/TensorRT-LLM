@@ -168,11 +168,11 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
     # old_B: double-buffered (cache, 2, T, ngroups, dstate)
     old_B = torch.randn(batch, 2, mtp_len, ngroups, d_state,
                         device=device, dtype=act_dtype)
-    # old_dt_proc: double-buffered (cache, 2, T, nheads) fp32
-    old_dt_proc = torch.randn(batch, 2, mtp_len, nheads,
+    # old_dt_proc: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
+    old_dt_proc = torch.randn(batch, 2, nheads, mtp_len,
                                device=device, dtype=torch.float32)
-    # old_cumAdt: double-buffered (cache, 2, T, nheads) fp32
-    old_cumAdt = torch.randn(batch, 2, mtp_len, nheads,
+    # old_cumAdt: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
+    old_cumAdt = torch.randn(batch, 2, nheads, mtp_len,
                               device=device, dtype=torch.float32)
     # cache_buf_idx: which buffer to read (0 or 1)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
@@ -417,7 +417,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                             out=out_incr,
                             D=D, dt_bias=dt_bias, dt_softplus=True,
                             state_batch_indices=None,
-                            launch_with_pdl=args.pdl,
+                            use_internal_pdl=args.internal_pdl,
                             _block_size_m=bsm,
                             _num_warps=nw,
                             _num_stages=ns,
@@ -573,8 +573,8 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Use CB formulation for output phase vs sequential state update.")
     parser.add_argument(
-        "--pdl", action="store_true", default=False,
-        help="Enable Programmatic Dependent Launch between precompute and main kernels.")
+        "--internal-pdl", action=argparse.BooleanOptionalAction, default=True,
+        help="Internal PDL between precompute and main kernels (default: on).")
     parser.add_argument(
         "--num-stages", type=str, default=None,
         help="Override num_stages for the main kernel (comma-separated sweep).")
