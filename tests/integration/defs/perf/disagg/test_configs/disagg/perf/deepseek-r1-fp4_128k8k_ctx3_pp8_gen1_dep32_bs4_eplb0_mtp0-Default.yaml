@@ -17,7 +17,7 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: true
-  multi_round: 1
+  multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
   concurrency_list: '4'
@@ -35,8 +35,7 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
-    TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 MIMALLOC_PURGE_DELAY=0 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false

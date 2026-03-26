@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -13,7 +13,9 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+add_gtest(radixTreeTest radixTreeTest.cpp)
 add_gtest(blockKeyTest blockKeyTest.cpp)
+add_gtest(radixBlockTreeTest radixBlockTreeTest.cpp)
 add_gtest(cacheTransBufferTest cacheTransBufferTest.cpp)
 add_gtest(capacitySchedulerTest capacitySchedulerTest.cpp)
 add_gtest(contextProgressTest contextProgressTest.cu)
@@ -24,3 +26,4 @@ add_gtest(llmRequestTest llmRequestTest.cpp)
 add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)
 add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
 add_gtest(staticThreadPoolTest staticThreadPoolTest.cpp)
+add_gtest(rnnCacheFormatterTest rnnCacheFormatterTest.cpp)

@@ -90,7 +90,7 @@ Different types of runtime are provided for whisper models. Following an order o
 - (NEW) Python binding of C++ runtime w/ Paged KV Cache and Inflight Batching (IFB)
 - Python runtime w/ Static Batching
 
-Please refer to the documentation for the details of [paged kv cache](../../../../docs/source/advanced/gpt-attention.md#paged-kv-cache) and [inflight batching](../../../../docs/source/advanced/gpt-attention.md#inflight-batching).
+Please refer to the documentation for the details of [paged kv cache](../../../../docs/source/legacy/advanced/gpt-attention.md#paged-kv-cache) and [inflight batching](../../../../docs/source/legacy/advanced/gpt-attention.md#inflight-batching).
 
 #### Run C++ runtime
 **Note: to use inflight batching and paged kv cache features in C++ runtime, please make sure you have set `--paged_kv_cache enable` and `--remove_input_padding enable` (which is by default enabled) in the `trtllm-build` command. Meanwhile, if using Python runtime, it is recommended to disable these flag by `--paged_kv_cache disable` and `--remove_input_padding disable` to avoid any unnecessary overhead.**

@@ -23,19 +23,20 @@ TensorRT LLM delivers breakthrough performance on the latest NVIDIA GPUs:
 
 ### 🎯 **Comprehensive Model Support**
 
-TensorRT LLM supports the latest and most popular LLM [architectures](https://nvidia.github.io/TensorRT-LLM/models/supported-models.html).
+TensorRT LLM supports the latest and most popular LLM and DiT architectures. See [complete list](./models/supported-models.md).
 
 - **Language Models**: GPT-OSS, Deepseek-R1/V3, Llama 3/4, Qwen2/3, Gemma 3, Phi 4...
 - **Multi-modal Models**: LLaVA-NeXT, Qwen2-VL, VILA, Llama 3.2 Vision...
+- **[Visual Generation](./models/visual-generation.md) Models**: FLUX, Wan2.1/2.2 for image and video generation.
 
 TensorRT LLM strives to support the most popular models on **Day 0**.
 
 ### FP4 Support
-[NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/) , when used with TensorRT LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
+[NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/), when used with TensorRT LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
 
 ### FP8 Support
 
-TensorRT LLM strives to support the most popular models on **Day 0**.
+On NVIDIA H100 and later GPUs, TensorRT LLM supports [FP8 quantization](./features/quantization.md), which can double performance and halve memory consumption compared to 16-bit floating point, with minimal impact on model accuracy.
 
 ### 🚀 **Advanced Optimization & Production Features**
 - **[In-Flight Batching & Paged Attention](./features/paged-attention-ifb-scheduler.md)**: In-flight batching eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
@@ -53,4 +54,4 @@ TensorRT LLM strives to support the most popular models on **Day 0**.
 
 ## What Can You Do With TensorRT LLM?
 
-Whether you're building the next generation of AI applications, optimizing existing LLM deployments, or exploring the frontiers of large language model technology, TensorRT LLM provides the tools, performance, and flexibility you need to succeed in the era of generative AI.To get started, refer to the {ref}`quick-start-guide`.
+Whether you're building the next generation of AI applications, optimizing existing LLM deployments, or exploring the frontiers of large language model technology, TensorRT LLM provides the tools, performance, and flexibility you need to succeed in the era of generative AI. To get started, refer to the {ref}`quick-start-guide`.

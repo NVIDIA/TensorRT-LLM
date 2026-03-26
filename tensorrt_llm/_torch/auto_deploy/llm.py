@@ -69,6 +69,7 @@ class ADInputProcessor(DefaultInputProcessor):
         # for example, this might be the case when invoking AD via trtllm-serve
         elif "multi_modal_data" in inputs:
             images = inputs["multi_modal_data"]["image"]
+            do_rescale = True
             if images is not None and isinstance(images[0], torch.Tensor):
                 # The default multimodal input loader will normalize images to [0, 1] when the requested
                 # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
@@ -127,7 +128,11 @@ class LLM(_TorchLLM):
         pass
 
     def _create_input_processor(self) -> ADInputProcessor:
-        return ADInputProcessor(self.tokenizer, self.factory.init_processor())
+        processor = self.factory.init_processor()
+        base = ADInputProcessor(self.tokenizer, processor)
+        if hasattr(self.factory, "init_input_processor"):
+            return self.factory.init_input_processor(base)
+        return base
 
     def _prefetch_model(self):
         """Prefetch the model for the LLM."""
@@ -159,7 +164,7 @@ class DemoLLM(LLM):
     """
 
     def __init__(self, **kwargs):
-        self.args: LlmArgs = LlmArgs.from_kwargs(**kwargs)
+        self.args: LlmArgs = LlmArgs(**kwargs)
 
         self.mpi_session = None
         self.runtime_context = None

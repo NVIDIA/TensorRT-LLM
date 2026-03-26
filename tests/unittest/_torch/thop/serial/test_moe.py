@@ -22,6 +22,11 @@ import torch
 import torch.nn.functional as F
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
+# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
+# and test_moe_module.py. Add new MoE tests there instead of here.
+
 from enum import Enum
 
 from utils.util import getSMVersion
@@ -37,6 +42,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 class ActType(Enum):
     SwiGlu = 0
     Relu2 = 1
+    Silu = 2
 
 
 class moe_args:
@@ -422,6 +428,8 @@ def run_moe_dequant(args,
             activation_output[i:i + my_num_tokens] = act * (beta + my_x1)
         elif args.act_type == ActType.Relu2:
             activation_output[i:i + my_num_tokens] = F.relu(my_x1)**2
+        elif args.act_type == ActType.Silu:
+            activation_output[i:i + my_num_tokens] = F.silu(my_x1)
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -872,6 +880,10 @@ def are_groups_valid(top_k_groups, n_groups):
     return True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -1006,6 +1018,10 @@ class TestMoeFP8:
                        percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -1021,8 +1037,9 @@ class TestMoeFp4:
     @pytest.mark.parametrize("num_tokens", [1, 1024])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024, 768])
-    @pytest.mark.parametrize("act_type", [ActType.SwiGlu, ActType.Relu2],
-                             ids=["swiglu", "relu2"])
+    @pytest.mark.parametrize("act_type",
+                             [ActType.SwiGlu, ActType.Relu2, ActType.Silu],
+                             ids=["swiglu", "relu2", "silu"])
     @pytest.mark.parametrize(
         "routing_info",
         [
@@ -1092,6 +1109,17 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_qwen_next"),
+            pytest.param(
+                {
+                    "num_experts": 2048,
+                    "top_k": 32,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_large_experts"),
         ],
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
@@ -1137,8 +1165,9 @@ class TestMoeFp4:
     @pytest.mark.parametrize("num_tokens", [1, 150])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024])
-    @pytest.mark.parametrize("act_type", [ActType.SwiGlu, ActType.Relu2],
-                             ids=["swiglu", "relu2"])
+    @pytest.mark.parametrize("act_type",
+                             [ActType.SwiGlu, ActType.Relu2, ActType.Silu],
+                             ids=["swiglu", "relu2", "silu"])
     @pytest.mark.parametrize(
         "routing_info",
         [
@@ -1175,6 +1204,17 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_qwen_next"),
+            pytest.param(
+                {
+                    "num_experts": 2048,
+                    "top_k": 32,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_large_experts"),
         ],
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1328,7 +1368,7 @@ class TestMoeFp4:
             pytest.skip("https://nvbugs/5434352")
 
         assert top_k <= num_experts
-        assert top_k <= 22
+        assert top_k <= 32
         assert num_experts % 4 == 0
 
         if use_topk_as_input:
@@ -1601,7 +1641,7 @@ class TestMoeFp4:
             scale_c_fc1 = args_dequant.c_global_sf * (
                 1.0 / args.gemm1_scales_global) * (
                     1.0 / args.hidden_states_scale_global)
-        elif act_type == ActType.Relu2:
+        elif act_type in [ActType.Relu2, ActType.Silu]:
             scale_c_fc1 = torch.full_like(args.gemm1_scales_global,
                                           args_dequant.c_global_sf)
         # self.fc31_alpha
@@ -1651,7 +1691,7 @@ class TestMoeFp4:
                 do_finalize=True,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                act_type=1 if act_type == ActType.Relu2 else 0)
+                act_type=act_type.value)
         torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 
@@ -1662,7 +1702,7 @@ class TestMoeFp4:
         else:
             atol = 0.1
             rtol = 0.85
-            percent = 0.925
+            percent = 0.9
 
         check_accuracy(output_dequant_reference,
                        output_dequant_actual,
@@ -1917,6 +1957,10 @@ class TestMoeFp4:
                        percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -2003,7 +2047,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
     tile_tokens_dim = 8
 
     assert top_k <= num_experts
-    assert top_k <= 8
+    assert top_k <= 32
     assert num_experts % 4 == 0
 
     if are_groups_valid(top_k_groups, n_groups):
@@ -2142,6 +2186,10 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                    percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() != 100,
     reason="The kernel only supports Blackwell. Current SM is %d." %

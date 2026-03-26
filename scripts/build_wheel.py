@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +37,19 @@ except (ImportError, ModuleNotFoundError):
     from pip._vendor.packaging.requirements import Requirement
 
 build_run = partial(run, shell=True, check=True)
+
+
+def get_available_cpu_count() -> int:
+    """Return the number of CPUs available to this process.
+
+    Respects the process CPU affinity mask (Linux) so that builds launched
+    inside a cgroup or taskset-constrained environment don't over-subscribe.
+    Falls back to the total CPU count on platforms that don't expose affinity.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return cpu_count() or 1
 
 
 @contextmanager
@@ -491,7 +504,8 @@ def main(*,
          generate_fmha: bool = False,
          no_venv: bool = False,
          nvrtc_dynamic_linking: bool = False,
-         mypyc: bool = False):
+         mypyc: bool = False,
+         require_dynamic_attributions: bool = False):
 
     if clean:
         clean_wheel = True
@@ -553,7 +567,7 @@ def main(*,
         cmake_generator = "-G" + generator
 
     if job_count is None:
-        job_count = cpu_count()
+        job_count = get_available_cpu_count()
 
     if len(extra_cmake_vars):
         # Backwards compatibility, we also support semicolon expansion for each value.
@@ -671,9 +685,11 @@ def main(*,
             print(cmake_configure_command)
             build_run(cmake_configure_command)
 
+        maybe_keep_depfile = " -- -d keepdepfile" if generator == "Ninja" else ""
         cmake_build_command = (
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target build_wheel_targets {" ".join(extra_make_targets)}')
+            f'--target build_wheel_targets {" ".join(extra_make_targets)}{maybe_keep_depfile}'
+        )
         print("CMake Build command: ")
         print(cmake_build_command)
         build_run(cmake_build_command)
@@ -690,6 +706,10 @@ def main(*,
         clear_folder(lib_dir)
     if include_dir.exists():
         clear_folder(include_dir)
+    # Remove auto-generated attributions file from previous builds
+    auto_attr_file = project_dir / "ATTRIBUTIONS.md"
+    if auto_attr_file.exists():
+        os.remove(auto_attr_file)
 
     cache_dir = os.getenv("TRTLLM_DG_CACHE_DIR")
     if cache_dir is not None:
@@ -968,6 +988,38 @@ def main(*,
             clear_folder(dist_dir)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
+
+        # Attempt to generate attributions using the dependency database
+        # Skip if output already exists and the build system hasn't changed
+        auto_attr = build_dir / "attribution" / "ATTRIBUTIONS.md"
+        if auto_attr.exists() and not (clean or first_build or configure_cmake):
+            print(f"Using cached attributions from {auto_attr}")
+        else:
+            try:
+                # Activate venv so that 'trtllm-sbom' CLI can be found after pip installs it
+                venv_bin = venv_python.parent
+                build_run(
+                    f'. "{venv_bin / "activate"}" && python {project_dir}/scripts/attribute.py --build-dir "{build_dir}" -j {job_count}'
+                )
+            except Exception as e:
+                if require_dynamic_attributions:
+                    raise RuntimeError(
+                        f"Attribution generation failed and --require_dynamic_attributions was set: {e}"
+                    ) from e
+                print(
+                    f"Warning: Attribution generation step failed with error: {e}",
+                    file=sys.stderr)
+                print(
+                    "You can run the dependency scanner manually and then use 'trtllm-sbom generate' as described in scripts/attribution/sbom/README.md.",
+                    file=sys.stderr)
+
+        # Copy auto-generated ATTRIBUTIONS.md to project root for wheel packaging
+        if auto_attr.exists():
+            install_file(auto_attr, project_dir / "ATTRIBUTIONS.md")
+            print(
+                f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
+            )
+
         build_run(
             f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
         )
@@ -1035,10 +1087,10 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument(
         "--job_count",
         "-j",
-        const=cpu_count(),
+        const=get_available_cpu_count(),
         nargs="?",
         help=
-        "Number of parallel jobs for compilation (default: number of CPU cores)"
+        "Number of parallel jobs for compilation (default: number of CPUs available to this process, respecting affinity)"
     )
     parser.add_argument(
         "--cpp_only",
@@ -1125,6 +1177,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--mypyc",
                         action="store_true",
                         help="Compile kv_cache_manager_v2 with mypyc")
+    parser.add_argument("--require_dynamic_attributions",
+                        action="store_true",
+                        help="Fail the build if attribution generation fails")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -67,6 +68,18 @@ enum class KvCacheDataType
     FP8,
     NVFP4
 };
+
+inline KvCacheDataType cacheTypeFromQuantMode(common::QuantMode quantMode)
+{
+    if (quantMode.hasInt8KvCache())
+        return KvCacheDataType::INT8;
+    else if (quantMode.hasFp8KvCache())
+        return KvCacheDataType::FP8;
+    else if (quantMode.hasFp4KvCache())
+        return KvCacheDataType::NVFP4;
+    else
+        return KvCacheDataType::BASE;
+}
 
 enum class RotaryPositionEmbeddingType
 {
@@ -163,6 +176,9 @@ struct QKVPreprocessingParams
 
     float2 const* mrope_rotary_cos_sin{nullptr};
     int32_t const* mrope_position_deltas{nullptr};
+    // Helix parallelism params.
+    int32_t const* helix_position_offsets{nullptr};
+    bool const* helix_is_inactive_rank{nullptr};
 
     // Scalars.
     int batch_size{0};

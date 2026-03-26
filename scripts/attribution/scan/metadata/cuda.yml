@@ -1,0 +1,13 @@
+dependencies:
+- name: cuda
+  description: CUDA Runtime API libraries, headers, and device code linking
+  source: container
+  basename_matches:
+  - libcudart_static.a
+  - libcudadevrt.a
+  directory_matches:
+  - cuda-*
+  - cuda
+  - cooperative_groups
+  - cub
+  - thrust

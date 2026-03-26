@@ -26,6 +26,7 @@ from typing import Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -63,7 +64,6 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
-    end_ids: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -135,7 +135,7 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
 
 
 def top_k_sampling_batch(
-    logits,
+    logits: torch.Tensor,
     *,
     top_k: int,
     temperature: float,
@@ -260,7 +260,7 @@ def top_k_top_p_sampling_batch(
 
 
 def greedy_search_sampling_batch(
-    logits,
+    logits: torch.Tensor,
     *,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -439,9 +439,9 @@ def get_rejected_indices(
     # NB: torch.arange is needed to enable "advanced indexing",
     #   cf. https://numpy.org/devdocs/user/basics.indexing.html#integer-array-indexing
     token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(draft_tokens, dtype=torch.int32, pin_memory=True).to(
-        device=generator.device, non_blocking=True
-    )
+    draft_tokens_cuda = torch.tensor(
+        draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
+    ).to(device=generator.device, non_blocking=True)
     p = draft_probs[token_idx, draft_tokens_cuda]
     q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
     accept_probs = torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p)
@@ -476,33 +476,35 @@ def sample(
     group_metadata: StrategyMetadata | None = None,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+    softmax: torch.Tensor | None
+    # 'cast' needed b/c of https://github.com/python/mypy/issues/19081
     match strategy:
         case ("top_k", top_k, temperature):
             tokens, softmax = top_k_sampling_batch(
                 logits,
-                top_k=top_k,
-                temperature=temperature,
+                top_k=cast(int, top_k),
+                temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("top_p", top_p, temperature):
             tokens, softmax = top_p_sampling_batch(
                 logits,
-                top_p=top_p,
+                top_p=cast(float, top_p),
                 generator=generator,
-                temperature=temperature,
+                temperature=cast(float, temperature),
             )
         case ("top_k_top_p", top_k, top_p, temperature):
             tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
+                top_k=cast(int, top_k),
+                top_p=cast(float, top_p),
+                temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("temperature", temperature):
             tokens, softmax = temperature_sampling_batch(
                 logits,
-                temperature=temperature,
+                temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("greedy", None):
@@ -514,13 +516,13 @@ def sample(
             )
             tokens, softmax = beam_search_sampling_batch(
                 logits,
-                beam_width_in=beam_width_in,
-                beam_width_out=beam_width_out,
+                beam_width_in=cast(int, beam_width_in),
+                beam_width_out=cast(int, beam_width_out),
                 beam_search_args=group_metadata,
-                temperature=temperature,
+                temperature=cast(float, temperature),
                 return_probs=return_probs,
             )
-    return tokens, softmax, temperature
+    return tokens, softmax, cast(float, temperature)
 
 
 GenericStrategyKeyType = TypeVar("GenericStrategyKeyType", bound=Hashable)
@@ -699,3 +701,74 @@ def torch_multi_arange(
     seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
     seq = seq.cumsum(0, dtype=ends.dtype)
     return seq
+
+
+class _Fusions:
+    @staticmethod
+    @torch.compile(dynamic=None, fullgraph=True)
+    def _gather_scatter_impl(
+        dst_cuda: torch.Tensor,
+        dst_index_cuda: torch.Tensor,
+        src_cuda: torch.Tensor,
+        src_index_cuda: torch.Tensor,
+    ) -> None:
+        # NB: helper function for TorchSampler._sample_batched_by_strategy, torch.compile is expected to avoid a copy
+        dst_cuda[dst_index_cuda] = src_cuda[src_index_cuda]
+
+    @staticmethod
+    def gather_scatter(
+        dst_cuda: torch.Tensor,
+        dst_index_cuda: torch.Tensor,
+        src_cuda: torch.Tensor,
+        src_index_cuda: torch.Tensor,
+    ) -> None:
+        torch._dynamo.mark_dynamic(dst_cuda, 0)
+        torch._dynamo.mark_dynamic(dst_index_cuda, 0)
+        torch._dynamo.mark_dynamic(src_cuda, 0)
+        torch._dynamo.mark_dynamic(src_index_cuda, 0)
+        _Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
+
+    @staticmethod
+    @torch.compile(dynamic=None, fullgraph=True)
+    def _determine_sampled_rank_impl(
+        group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
+    ) -> torch.Tensor:
+        sampled_rank_cuda = (
+            group_logprobs_cuda.greater(sampled_logprobs_cuda).count_nonzero(dim=-1).to(torch.int32)
+        )
+        return sampled_rank_cuda
+
+    @staticmethod
+    def determine_sampled_rank(
+        group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
+    ) -> torch.Tensor:
+        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
+        #     memory passes
+        torch._dynamo.mark_dynamic(group_logprobs_cuda, 0)
+        torch._dynamo.mark_dynamic(sampled_logprobs_cuda, 0)
+        return _Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
+
+    @staticmethod
+    @torch.compile(
+        dynamic=None,
+        fullgraph=True,
+        options=dict(
+            online_softmax=True,
+            split_reductions=False,  # https://github.com/pytorch/pytorch/issues/153241
+        ),
+    )
+    def _gather_log_softmax_impl(
+        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor
+    ) -> torch.Tensor:
+        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
+        #     materializing the index select
+        return torch.nn.functional.log_softmax(
+            inputs_cuda[indices_cuda],
+            dim=-1,
+        )
+
+    @staticmethod
+    def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
+        torch._dynamo.mark_dynamic(inputs_cuda, 0)
+        torch._dynamo.mark_dynamic(indices_cuda, 0)
+        return _Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)

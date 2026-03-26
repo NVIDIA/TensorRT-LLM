@@ -91,7 +91,7 @@ class TensorParallelMode(str, enum.Enum):
         return 1 if mode == cls.ROW else 0
 
     # Helper to shard the corresponding per-channel activation scales
-    # Which shard along the dimension orthogonal to the weights
+    # which are sharded along the dimension orthogonal to the weights
     @classmethod
     def flip(cls, mode):
         return cls.ROW if mode == cls.COLUMN else cls.COLUMN
@@ -190,7 +190,7 @@ def load_weights_vanilla_helper(module: Linear,
 
     if weight is not None:
         if module.has_weight_only_quant:
-            # NOTE: without the preprocess during the runtime, the gemm output nan's. in order to use the preprocess_weights_for_mixed_gemm
+            # NOTE: without the preprocess during the runtime, the gemm outputs NaNs. In order to use the preprocess_weights_for_mixed_gemm
             # we need to cast the weight to int8 first.
             activation_dtype = torch.float8_e4m3fn if module.has_w4a8_awq else torch.float16
             weight_dtype, _ = get_weight_dtype_and_id(module)
@@ -449,6 +449,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         weight_shape = (out_features, in_features)
         module.weight = Parameter(torch.empty(weight_shape, dtype=dtype),
                                   requires_grad=False)
+        if (module.quant_config is not None
+                and module.quant_config.layer_quant_mode.has_fp4_kv_cache()
+                and module.weights_loading_config.weight_mode
+                == WeightMode.FUSED_QKV_LINEAR):
+            # KV-only FP4 cache override can run with unquantized fused QKV weights.
+            # Attention still expects KV cache scales in this mode.
+            module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+            module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                             requires_grad=False)
 
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
@@ -497,6 +507,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     copy_weight_shard(module.weight, weight, shard_offset,
                                       shard_size)
 
+        if hasattr(module, "kv_scales") and os.environ.get(
+                "TRTLLM_LOAD_KV_SCALES", "1") == "1":
+            k_scales = [
+                w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w
+            ]
+            v_scales = [
+                w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w
+            ]
+            if k_scales:
+                assert v_scales, "k_scale and v_scale must be loaded together"
+                copy_weight(
+                    module.kv_scales,
+                    torch.tensor(
+                        [1.0, max(k_scales).item(),
+                         max(v_scales).item()],
+                        dtype=torch.float32))
+                module.inv_kv_scales.data = 1.0 / module.kv_scales
+
     def load_weights_fused_gate_up_linear(
             self,
             module: Linear,
@@ -543,7 +571,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         # K, V scales for NVFP4 KV cache
         module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                      requires_grad=False)
-        # K, V scales for NVFP4 KV cache
+        # Inverse K, V scales for NVFP4 KV cache
         module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                          requires_grad=False)
         if bias:
@@ -726,9 +754,16 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             # Compute max and replace input_scale with a new parameter
             max_input_scale = module.tmp_input_scales.max()
             module.input_scale.data.copy_(max_input_scale)
+            # Also update inv_input_scale for static quantization
+            if hasattr(
+                    module,
+                    "inv_input_scale") and module.inv_input_scale is not None:
+                module.inv_input_scale.data.copy_(1.0 / max_input_scale)
             delattr(module, "has_static_input_scale")
         else:
             module.input_scale = None
+            if hasattr(module, "inv_input_scale"):
+                module.inv_input_scale = None
 
         # Compute max weight_scale
         max_weight_scale = module.tmp_weight_scales.max()
@@ -884,7 +919,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         return output
 
     def _get_scale_name(self, weights: List[Dict]):
-        # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
+        # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
         # Actually they hold identical values of data_amax / 448.
         scale_name = "weight_scale_inv"
         if scale_name not in weights[0]:
@@ -1030,7 +1065,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         return output
 
     def _get_scale_name(self, weights: List[Dict]):
-        # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
+        # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
         # Actually they hold identical values of data_amax / 448.
         for w in weights:
             if "weight_scale_inv" in w:
@@ -1187,10 +1222,15 @@ class NVFP4LinearMethod(LinearMethodBase):
         module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                  requires_grad=False)
 
+        # Global weight scale: amax_weight / (448*6)
+        # Used for dynamic activation quantization to compute alpha at runtime
+        module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
+                                          requires_grad=False)
+
         # K, V scales for NVFP4 KV cache
         module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                      requires_grad=False)
-        # K, V scales for NVFP4 KV cache
+        # Inverse K, V scales for NVFP4 KV cache
         module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                          requires_grad=False)
 
@@ -1205,15 +1245,23 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.register_parameter("bias", None)
 
     def _input_prepare(self, module: Linear, input: torch.Tensor):
+        """Quantize input tensor to FP4 format.
+
+        Args:
+            module: Linear module with quantization parameters
+            input: Input tensor (may be pre-quantized Fp4QuantizedTensor, tuple, or regular tensor)
+
+        Returns:
+            Tuple of (act_fp4, act_sf, alpha) - quantized activation, per-block scales, and alpha
+        """
         if isinstance(input, Fp4QuantizedTensor):
             # Input is already quantized - this should not happen if pre_quant_scale exists
-            # because we disable FP4 output for attention output when pre_quant_scale is present
             if module.pre_quant_scale is not None:
                 raise RuntimeError(
                     "Received FP4 quantized input but pre_quant_scale exists. "
                     "This indicates FP4 output was not properly disabled for the previous layer."
                 )
-            act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
+            return input.fp4_tensor, input.scaling_factor, module.alpha
         elif isinstance(input, tuple):
             # Input is a tuple of (fp4_tensor, scaling_factor)
             if module.pre_quant_scale is not None:
@@ -1221,16 +1269,29 @@ class NVFP4LinearMethod(LinearMethodBase):
                     "Received FP4 quantized tuple input but pre_quant_scale exists. "
                     "This indicates FP4 output was not properly disabled for the previous layer."
                 )
-            act_fp4, act_sf = input
+            return input[0], input[1], module.alpha
         else:
-            # Input is a regular tensor () - apply pre_quant_scale if it exists (for NVFP4_AWQ)
+            # Input is a regular tensor - apply pre_quant_scale if it exists (for NVFP4_AWQ)
             if module.pre_quant_scale is not None:
                 assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
                 input = input * module.pre_quant_scale
 
+            # Dynamic vs static quantization
+            if module.input_scale is None or module.force_dynamic_quantization:
+                # Dynamic mode: compute input_scale and alpha from current input
+                FP8_MAX, E2M1_MAX = 448.0, 6.0
+                amax_input = torch.amax(torch.abs(input)).float()
+                input_scale = FP8_MAX * E2M1_MAX / amax_input
+                alpha = (amax_input /
+                         (FP8_MAX * E2M1_MAX)) * module.weight_scale_2
+            else:
+                # Static mode: use pre-computed values
+                input_scale = module.input_scale
+                alpha = module.alpha
+
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                input, module.input_scale, module.scaling_vector_size, False)
-        return act_fp4, act_sf
+                input, input_scale, module.scaling_vector_size, False)
+            return act_fp4, act_sf, alpha
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
@@ -1243,7 +1304,8 @@ class NVFP4LinearMethod(LinearMethodBase):
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
 
-        act_fp4, act_sf = self._input_prepare(module, input)
+        act_fp4, act_sf, alpha = self._input_prepare(module, input)
+
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
@@ -1252,7 +1314,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.weight,
             act_sf,
             module.weight_scale,
-            module.alpha,
+            alpha,
             module.dtype,
             to_userbuffers=False,
             allowed_backends=allowed_backends_str)
@@ -1270,10 +1332,12 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
                                tp_group: List[int]):
-        act_fp4, act_sf = self._input_prepare(module, input)
-        output = torch.ops.trtllm.nvfp4_gemm_allreduce(
-            act_fp4, module.weight, act_sf, module.weight_scale, module.alpha,
-            module.dtype, tp_rank, tp_group)
+        act_fp4, act_sf, alpha = self._input_prepare(module, input)
+        output = torch.ops.trtllm.nvfp4_gemm_allreduce(act_fp4, module.weight,
+                                                       act_sf,
+                                                       module.weight_scale,
+                                                       alpha, module.dtype,
+                                                       tp_rank, tp_group)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -1326,17 +1390,23 @@ class NVFP4LinearMethod(LinearMethodBase):
                         ...], "The weight_scale_2 should be same for all the weights"
 
         # Compute scaling factor and alpha required by GEMM kernels
-        # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
-        alpha = input_scale.float() * weight_scale_2.float()
-        # modelopt ckpt stores amax/(448*6), convert to (448*6)/amax
-        input_scale = 1.0 / input_scale
+        # For dynamic activation quantization, input_scale may be None (computed at runtime)
+        if input_scale is not None:
+            # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
+            alpha = input_scale.float() * weight_scale_2.float()
+            # modelopt ckpt stores amax/(448*6), convert to (448*6)/amax
+            input_scale = 1.0 / input_scale
+        else:
+            # Dynamic mode: input_scale and alpha computed at runtime
+            alpha = None
 
-        return input_scale, weight_scale, alpha
+        return input_scale, weight_scale, weight_scale_2.float(
+        ) if weight_scale_2 is not None else None, alpha
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
 
-        input_scale, weight_scale, alpha = self.load_weight_scales(
+        input_scale, weight_scale, weight_scale_2, alpha = self.load_weight_scales(
             weights,
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
@@ -1344,15 +1414,20 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         assert len(weights) == 1
         weight_scale = weight_scale[0]
-        # Swizzle weight scale
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
 
-        copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
-        E2M1_MAX = 6.0
-        module.inv_input_scale.data = module.input_scale / E2M1_MAX
-        copy_weight(module.alpha, alpha)
-        module.scalar_alpha = alpha.item()
+
+        # For dynamic activation quantization, input_scale and alpha are computed at runtime
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+            E2M1_MAX = 6.0
+            module.inv_input_scale.data = module.input_scale / E2M1_MAX
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+            module.scalar_alpha = alpha.item()
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
 
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         if "pre_quant_scale" in weights[0]:
@@ -1377,18 +1452,25 @@ class NVFP4LinearMethod(LinearMethodBase):
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
 
-        input_scale, weight_scales, alpha = self.load_weight_scales(
+        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
             weights,
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
             tp_mode=module.tp_mode)
-        # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
-        copy_weight(module.input_scale, input_scale)
+
         copy_weight(module.weight_scale, weight_scale)
-        copy_weight(module.alpha, alpha)
-        module.scalar_alpha = alpha.item()
+
+        # For dynamic activation quantization, input_scale and alpha are computed at runtime
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+            module.scalar_alpha = alpha.item()
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
+
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
         copy_weight(module.weight, fused_weight)
 
@@ -1410,18 +1492,24 @@ class NVFP4LinearMethod(LinearMethodBase):
         fused_weight = torch.cat((gate_weight, up_weight))
         copy_weight(module.weight, fused_weight)
 
-        input_scale, weight_scales, alpha = self.load_weight_scales(
+        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
             weights,
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
             tp_mode=module.tp_mode)
-        # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
-        copy_weight(module.input_scale, input_scale)
+
         copy_weight(module.weight_scale, weight_scale)
-        copy_weight(module.alpha, alpha)
-        module.scalar_alpha = alpha.item()
+
+        # For dynamic activation quantization, input_scale and alpha are computed at runtime
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+            module.scalar_alpha = alpha.item()
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
 
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         # NOTE: pre_quant_scale is the same for gate and up since modelopt checks which layer shared the same input
@@ -1443,14 +1531,8 @@ class NVFP4LinearMethod(LinearMethodBase):
             copy_weight(module.pre_quant_scale, pre_quant_scale)
 
     def post_load_weights(self, module: Linear):
+        """Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements."""
         super().post_load_weights(module)
-        """
-        Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements.
-
-        Args:
-            row_alignment: Required row alignment (default: 32)
-            col_alignment: Required column alignment (default: 16)
-        """
         row_alignment, col_alignment = 32, 16
         row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
         col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
@@ -1594,7 +1676,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                     weight_scale_2 = w["weight_scale_2"][...]
                 else:
                     assert weight_scale_2 == w["weight_scale_2"][...], (
-                        f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
+                        f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}"
                     )
 
         # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
@@ -1825,6 +1907,9 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
         output = torch.ops.trtllm.weight_only_quant_gemm(
             input, module.weight, weight_dtype, module.weight_scale,
             module.dtype)
+
+        if bias is not None:
+            output = output + bias
 
         return output
 
@@ -2107,7 +2192,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
          1. multiply pre_quant_scale to input
          2. quantize input to fp8 using input_scale
          3. unpack_weights and multiply by weight_scales (int4 -> fp16)
-         4. divied by weight_scale_2 (fp16 -> fp8 to allow gemm in fp8).
+         4. divided by weight_scale_2 (fp16 -> fp8 to allow gemm in fp8).
          5. apply gemm in fp8.
          6. rescale using alpha which is input_scale * weight_scale_2
         """
@@ -2344,7 +2429,10 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
-        return NVFP4LinearMethod()
+        if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
+            return NVFP4ARCLinearMethod()
+        else:
+            return NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
         return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
@@ -2440,6 +2528,7 @@ class Linear(nn.Module):
                 f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
             )
             local_out_features = out_features // self.tp_size
+            reduce_output = False if self.mapping.enable_attention_dp else reduce_output
         else:
             assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
 
@@ -2643,7 +2732,7 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert allow_partial_loading is False, "allow_partial_loading is only supported for non-unquantized linear methods now"
+            assert allow_partial_loading is False, "allow_partial_loading is only supported for unquantized linear methods now"
         self.quant_method.load_weights(
             self,
             weights,
@@ -2661,3 +2750,42 @@ class Linear(nn.Module):
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
         self.quant_method.pre_reload_weights(self)
+
+
+class NVFP4ARCLinearMethod(NVFP4LinearMethod):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        module.residual_dim = in_features
+        module.in_features_with_residual = in_features + module.residual_dim
+        module.reorder_index = Parameter(torch.arange(in_features,
+                                                      dtype=torch.int16),
+                                         requires_grad=False)
+        super().create_weights(module, module.in_features_with_residual,
+                               out_features, bias, dtype)
+
+    def _input_prepare(self, module: Linear, input: torch.Tensor):
+        if isinstance(input, Fp4QuantizedTensor) or isinstance(input, tuple):
+            raise RuntimeError(
+                "No quantization fusion for TwoFP4 now. Please run with TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0"
+            )
+        else:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
+                input,
+                module.input_scale,
+                module.reorder_index,
+                module.residual_dim,
+                is_act=True)
+        return act_fp4, act_sf, module.alpha
+
+    def load_weights(self,
+                     module: Linear,
+                     weights: List[Dict],
+                     weight_mode: WeightMode,
+                     allow_partial_loading: bool = False):
+        """
+        Load weights from the checkpoint.
+        """
+        super().load_weights(module, weights, weight_mode,
+                             allow_partial_loading)
+        module.reorder_index.data = weights[0]['reorder_index']

@@ -1733,7 +1733,7 @@ def test_executor_config():
     assert isinstance(config.scheduler_config, trtllm.SchedulerConfig)
     assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
     assert config.enable_chunked_context == False
-    assert config.normalize_log_probs == True
+    assert config.normalize_log_probs == False
     assert config.iter_stats_max_iterations == 1000
     assert config.batching_type == trtllm.BatchingType.INFLIGHT
     assert config.parallel_config is None

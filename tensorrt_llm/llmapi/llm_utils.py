@@ -92,7 +92,7 @@ class _ModelRuntimeContext:
 
     @property
     def model_arch(self) -> str:
-        # "LlaMACausalForLM" or "OPTForCausalLM" and so on
+        # "LlamaForCausalLM" or "OPTForCausalLM" and so on
         return self.engine.config.pretrained_config['architecture']
 
 
@@ -325,6 +325,11 @@ class ModelLoader:
             prequantized (bool): Whether the checkpoint is pre-quantized.
         """
         quant_config = self.llm_args.quant_config
+        kv_cache_dtype = self.llm_args.kv_cache_config.dtype
+        explicit_kv_cache_quant_algo = {
+            "fp8": QuantAlgo.FP8,
+            "nvfp4": QuantAlgo.NVFP4,
+        }.get(kv_cache_dtype)
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -344,7 +349,7 @@ class ModelLoader:
                     hf_quant_algo = QuantAlgo(hf_quant_algo)
                 if quant_config.quant_algo is None:
                     logger.info(
-                        f"Setting quant_algo={hf_quant_algo} form HF quant config."
+                        f"Setting quant_algo={hf_quant_algo} from HF quant config."
                     )
                     quant_config.quant_algo = hf_quant_algo
                 elif quant_config.quant_algo != hf_quant_algo:
@@ -359,9 +364,15 @@ class ModelLoader:
                 "kv_cache_quant_algo", None)
             if hf_kv_cache_quant_algo is not None:
                 hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
-                if quant_config.kv_cache_quant_algo is None:
+                if explicit_kv_cache_quant_algo is not None:
+                    if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                        logger.warning(
+                            f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
+                        )
+                    quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
+                elif quant_config.kv_cache_quant_algo is None:
                     logger.info(
-                        f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} form HF quant config."
+                        f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
                     )
                     quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
                 elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
@@ -376,7 +387,17 @@ class ModelLoader:
                         f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                     )
 
+            # quantized_layers is handled separately (e.g. via LayerQuantConfig
+            # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
+            hf_quant_config.pop("quantized_layers", None)
+
+            quant_config_fields = set(quant_config.model_fields.keys())
             for key, value in hf_quant_config.items():
+                if key not in quant_config_fields:
+                    logger.warning(
+                        f"Ignoring unknown field '{key}' from HF quant config (not a QuantConfig field)."
+                    )
+                    continue
                 logger.info(
                     f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
                 )
@@ -511,7 +532,7 @@ class ModelLoader:
                     dtype=self.llm_args.dtype,
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
-                    **self.llm_args.calib_config.to_dict(),
+                    **self.llm_args.calib_config.model_dump(),
                     trust_remote_code=self.llm_args.trust_remote_code,
                 )
             if self.llm_args.parallel_config.is_multi_gpu:
@@ -525,7 +546,7 @@ class ModelLoader:
                 mapping=self.mapping,
                 quant_config=self.llm_args.quant_config,
                 load_model_on_cpu=
-                True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
+                True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and choose best location
                 trust_remote_code=self.llm_args.trust_remote_code,
                 speculative_model_dir=self._speculative_model_dir,
                 speculative_config=self.llm_args.speculative_config
@@ -579,7 +600,7 @@ class ModelLoader:
         copied_build_config = self.build_config.model_copy(deep=True)
 
         copied_build_config.update_kv_cache_type(self._model_info.architecture)
-        assert self.model is not None, "model is loaded yet."
+        assert self.model is not None, "model has not been loaded yet."
 
         self._engine = build(self.model, copied_build_config)
         self.mapping = self.model.config.mapping
@@ -625,7 +646,7 @@ class ModelLoader:
                 model_dir, **kwargs)
         except Exception as e:
             logger.warning(
-                f"Failed to load hf generation config from {model_dir}, encounter error: {e}"
+                f"Failed to load hf generation config from {model_dir}, encountered error: {e}"
             )
             return None
 
@@ -639,14 +660,14 @@ class ModelLoader:
                 model_dir, trust_remote_code=trust_remote_code, **kwargs)
         except Exception as e:
             logger.warning(
-                f"Failed to load hf model config from {model_dir}, encounter error: {e}"
+                f"Failed to load hf model config from {model_dir}, encountered error: {e}"
             )
             return None
 
 
 class CachedModelLoader:
     '''
-    The CacheModelLoader is used to build the model in both single or multi-gpu, with cache might be enabled.
+    The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
     '''
 
     def __init__(
@@ -730,7 +751,7 @@ class CachedModelLoader:
 
             if self.llm_args.quant_config.quant_algo is not None:
                 logger.warning(
-                    "QuantConfig for pytorch backend is ignored. You can load"
+                    "QuantConfig for pytorch backend is ignored. You can load "
                     "quantized model with hf_quant_config.json directly.")
             # Currently, this is to make updated quant_config visible by llm.args.quant_config
             # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py

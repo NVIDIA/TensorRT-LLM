@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,11 +24,12 @@ import tensorrt_llm.bindings
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -107,6 +108,7 @@ class CppMambaCacheManager(BaseResourceManager):
             dtype=dtype_binding,
             ssm_cache_dtype=ssm_cache_dtype_binding,
             pp_layers=pp_layers,
+            num_layers=num_layers,
         )
         self._max_num_sequences = max_num_sequences
 
@@ -117,6 +119,10 @@ class CppMambaCacheManager(BaseResourceManager):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # For Mamba cache manager, we always need one slot per request.
         return 1
+
+    def is_speculative(self) -> bool:
+        # C++ MambaCacheManager does not support speculative decoding
+        return False
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -200,7 +206,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.spec_state_size = spec_state_size
 
         # get tp size
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -337,7 +343,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.state_indices[:len(self.state_indices_list)].copy_(
             torch.tensor(self.state_indices_list,
                          dtype=torch.int32,
-                         pin_memory=True),
+                         pin_memory=prefer_pinned()),
             non_blocking=True)
 
     # When there exists padded requests, the state indices should not be repeated.
@@ -354,7 +360,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                padding_size] = torch.tensor(
                                    self.mamba_cache_free_blocks[:padding_size],
                                    dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
+                                   pin_memory=prefer_pinned()).to(
                                        self.state_indices.device,
                                        non_blocking=True)
         # But just finished requests won't free their used resources immediately
@@ -368,7 +374,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                padding_size] = torch.tensor(
                                    free_indices[:padding_size],
                                    dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
+                                   pin_memory=prefer_pinned()).to(
                                        self.state_indices.device,
                                        non_blocking=True)
 
@@ -525,7 +531,7 @@ class MambaCacheManager(BaseResourceManager):
                 n_groups=n_groups,
                 head_dim=head_dim,
                 num_layers=num_layers,
-                max_batch_size=max_batch_size,
+                max_batch_size=max_num_sequences,
                 spec_state_size=spec_state_size,
                 mapping=mapping,
                 dtype=dtype,
@@ -593,9 +599,6 @@ class MambaCacheManager(BaseResourceManager):
         return self._impl.get_intermediate_conv_states(layer_idx)
 
     def is_speculative(self) -> bool:
-        if self._use_cpp:
-            # CppMambaCacheManager does not support speculative decoding for now.
-            return False
         return self._impl.is_speculative()
 
     def mamba_layer_cache(
@@ -610,7 +613,7 @@ class MambaCacheManager(BaseResourceManager):
 
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
-        assert self._use_cpp, "update_mamba_states is not supported in PythonMambaCacheManager"
+        assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 

@@ -1,5 +1,5 @@
 version: 0.0.1
-l0_dgx_b200_perf_sanity:
+l0_b200_multi_gpus_perf_sanity:
 - condition:
     ranges:
       system_gpu_count:
@@ -38,6 +38,9 @@ l0_dgx_b200_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tp2_mtp0_1k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tp1_mtp0_1k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tp1_mtp0_8k1k]
+  # llama-3.3-70b-instruct-fp4
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-llama_v3_3_70b_instruct_fp4_blackwell-llama70b_fp4_tp4_512_32]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-llama_v3_3_70b_instruct_fp4_blackwell-llama70b_fp4_tp4_1000_1000]
   # ctx_only tests (disagg config)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-b200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-b200_deepseek-r1-fp4_1k1k_con2048_ctx1_dep4_gen1_dep8_eplb0_mtp1_ccb-UCX] TIMEOUT (120)

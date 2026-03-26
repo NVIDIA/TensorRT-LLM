@@ -22,8 +22,14 @@ Before running these examples, ensure you have:
 
    ```bash
    pip install git+https://github.com/huggingface/diffusers.git
-   pip install av
    ```
+
+   **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
+   ```bash
+   # Ubuntu/Debian
+   apt-get install ffmpeg
+   ```
+   If ffmpeg is not available, the server will use a pure Python encoder that outputs MJPEG/AVI format. See [FFmpeg download page](https://ffmpeg.org/download.html) for installation instructions on other platforms.
 
 2. **Server Running**: The TensorRT-LLM visual generation server must be running
    ```bash
@@ -34,6 +40,9 @@ Before running these examples, ensure you have:
 
    ```bash
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
+   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml > /tmp/serve.log 2>&1 &
@@ -42,30 +51,37 @@ Before running these examples, ensure you have:
    tail -f /tmp/serve.log
 
    ```
+   For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
 
 ## Examples
 
 Current supported & tested models:
 
 1. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
+2. FLUX.1 for image generation (t2i)
+3. FLUX.2 for image generation (t2i)
+4. LTX-2 for video generation with audio (t2v, ti2v)
 
-### 1. Synchronous Image Generation (`sync_t2i.py`)
+### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
-Demonstrates synchronous text-to-image generation using the OpenAI SDK.
+Demonstrates synchronous text-to-image generation using the OpenAI SDK. Supports FLUX.1 and FLUX.2.
 
 **Features:**
 - Generates images from text prompts
-- Supports configurable image size and quality
+- Supports configurable model, image size, and quality
 - Returns base64-encoded images or URLs
 - Saves generated images to disk
 
 **Usage:**
 ```bash
-# Use default localhost server
+# FLUX.2 (default)
 python sync_image_gen.py
 
-# Specify custom server URL
-python sync_image_gen.py http://your-server:8000/v1
+# FLUX.1
+python sync_image_gen.py --model flux1
+
+# Custom server and prompt
+python sync_image_gen.py --base-url http://your-server:8000/v1 --prompt "A sunset"
 ```
 
 **API Endpoint:** `POST /v1/images/generations`
@@ -105,6 +121,19 @@ python sync_video_gen.py --mode t2v \
     --prompt "A serene sunset over the ocean" \
     --duration 5.0 --fps 30 --size 512x512 \
     --output my_video.mp4
+
+# LTX-2: Text-to-Video (generates video with audio)
+python sync_video_gen.py --mode t2v \
+    --model ltx2 \
+    --prompt "A cute cat playing with a ball in the park" \
+    --duration 5.0 --fps 24 --size 1280x720
+
+# LTX-2: Image-to-Video
+python sync_video_gen.py --mode ti2v \
+    --model ltx2 \
+    --prompt "She turns around and smiles, then slowly walks out of the frame" \
+    --image ./media/woman_skyline_original_720p.jpeg \
+    --duration 5.0 --fps 24 --size 1280x720
 ```
 
 **Command-Line Arguments:**
@@ -112,7 +141,7 @@ python sync_video_gen.py --mode t2v \
 - `--prompt` - Text prompt for video generation (required)
 - `--image` - Path to reference image (required for ti2v mode)
 - `--base-url` - API server URL (default: http://localhost:8000/v1)
-- `--model` - Model name (default: wan)
+- `--model` - Model name (default: wan). Use `ltx2` for LTX-2.
 - `--duration` - Video duration in seconds (default: 4.0)
 - `--fps` - Frames per second (default: 24)
 - `--size` - Video resolution in WxH format (default: 256x256)
@@ -158,6 +187,19 @@ python async_video_gen.py --mode t2v \
     --prompt "A serene sunset over the ocean" \
     --duration 5.0 --fps 30 --size 512x512 \
     --output my_video.mp4
+
+# LTX-2: Async Text-to-Video (generates video with audio)
+python async_video_gen.py --mode t2v \
+    --model ltx2 \
+    --prompt "A cool cat on a motorcycle in the night" \
+    --duration 5.0 --fps 24 --size 1280x720
+
+# LTX-2: Async Image-to-Video
+python async_video_gen.py --mode ti2v \
+    --model ltx2 \
+    --prompt "She turns around and smiles, then slowly walks out of the frame" \
+    --image ./media/woman_skyline_original_720p.jpeg \
+    --duration 5.0 --fps 24 --size 1280x720
 ```
 
 **Command-Line Arguments:**
@@ -165,7 +207,7 @@ python async_video_gen.py --mode t2v \
 - `--prompt` - Text prompt for video generation (required)
 - `--image` - Path to reference image (required for ti2v mode)
 - `--base-url` - API server URL (default: http://localhost:8000/v1)
-- `--model` - Model name (default: wan)
+- `--model` - Model name (default: wan). Use `ltx2` for LTX-2.
 - `--duration` - Video duration in seconds (default: 4.0)
 - `--fps` - Frames per second (default: 24)
 - `--size` - Video resolution in WxH format (default: 256x256)
@@ -228,7 +270,7 @@ You can customize these by:
 ## Common Parameters
 
 ### Image Generation
-- `model`: Model identifier (e.g., "wan")
+- `model`: Model identifier (e.g., "flux1", "flux2")
 - `prompt`: Text description
 - `n`: Number of images to generate
 - `size`: Image dimensions (e.g., "512x512", "1024x1024")
@@ -236,12 +278,15 @@ You can customize these by:
 - `response_format`: "b64_json" or "url"
 
 ### Video Generation
-- `model`: Model identifier (e.g., "wan")
+- `model`: Model identifier (e.g., "wan", "ltx2")
 - `prompt`: Text description
-- `size`: Video resolution (e.g., "256x256", "512x512")
+- `size`: Video resolution (e.g., "256x256", "512x512", "1280x720")
 - `seconds`: Duration in seconds
 - `fps`: Frames per second
 - `input_reference`: Reference image file (for TI2V mode)
+
+> **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
+> `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
 
 ## Quick Reference - curl Examples
 
@@ -254,6 +299,19 @@ curl -X POST "http://localhost:8000/v1/videos" \
     "seconds": 4.0,
     "fps": 24,
     "size": "256x256"
+  }'
+```
+
+### Text-to-Video with LTX-2 (JSON, generates video with audio)
+```bash
+curl -X POST "http://localhost:8000/v1/videos" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ltx2",
+    "prompt": "A cool cat on a motorcycle",
+    "seconds": 5.0,
+    "fps": 24,
+    "size": "1280x720"
   }'
 ```
 
@@ -275,7 +333,12 @@ curl -X GET "http://localhost:8000/v1/videos/{video_id}"
 
 ### Download Video
 ```bash
+# The server returns either MP4 (with ffmpeg) or AVI (without ffmpeg)
+# Check the Content-Type header to determine the format
 curl -X GET "http://localhost:8000/v1/videos/{video_id}/content" -o output.mp4
+
+# Or use -J -O to let curl use the server-provided filename
+curl -X GET "http://localhost:8000/v1/videos/{video_id}/content" -J -O
 ```
 
 ### Delete Video
@@ -315,8 +378,18 @@ Errors are displayed with full stack traces for debugging.
 Generated files are saved to the current working directory:
 
 - `output_generation.png` - Synchronous image generation (`sync_image_gen.py`)
-- `output_sync.mp4` - Synchronous video generation (`sync_video_gen.py`)
-- `output_async.mp4` - Asynchronous video generation (`async_video_gen.py`)
-- `output_multipart.mp4` - Multipart example output (`multipart_example.py`)
+- `output_sync.mp4` or `output_sync.avi` - Synchronous video generation (`sync_video_gen.py`)
+- `output_async.mp4` or `output_async.avi` - Asynchronous video generation (`async_video_gen.py`)
 
 **Note:** You can customize output filenames using the `--output` parameter in all scripts.
+
+## Video Encoding
+
+The server supports two video encoding modes:
+
+| Encoder | Format | Requirements | Features |
+|---------|--------|--------------|----------|
+| **FFmpeg (H.264)** | MP4 | ffmpeg installed | Better compression, audio support |
+| **Pure Python (MJPEG)** | AVI | None (built-in) | No external dependencies |
+
+The server automatically selects the best available encoder. The example scripts detect the actual format from the server response and adjust the output filename extension accordingly.

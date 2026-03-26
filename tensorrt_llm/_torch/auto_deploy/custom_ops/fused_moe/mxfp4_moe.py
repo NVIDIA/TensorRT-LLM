@@ -19,9 +19,17 @@ from typing import Callable, Tuple
 
 import torch
 import torch.nn.functional as F
-from triton_kernels.matmul_ogs import FlexCtx, FnSpecs, FusedActivation, PrecisionConfig, matmul_ogs
+from triton_kernels.matmul_ogs import (
+    FlexCtx,
+    FnSpecs,
+    FusedActivation,
+    GatherIndx,
+    PrecisionConfig,
+    RoutingData,
+    ScatterIndx,
+    matmul_ogs,
+)
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import RoutingData, routing
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
@@ -38,7 +46,7 @@ def _swizzle_mxfp4(w, w_scale):
     return w, w_scale
 
 
-RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, torch.Tensor, torch.Tensor]]
+RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, GatherIndx, ScatterIndx]]
 
 
 def _prepare_weights_scales(
@@ -116,7 +124,8 @@ def _run_mxfp4_mlp_core(
     )
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (float(alpha), float(limit)), 2
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+        (float(alpha), float(limit)),
     )
 
     # gate_up (with SWiGLU fused)
@@ -165,7 +174,9 @@ def triton_mxfp4_moe(
     down_scales: torch.Tensor,  # [E, H, I//32] in uint8
 ) -> torch.Tensor:
     def _global_route_fn(logits: torch.Tensor):
-        return routing(logits, top_k)
+        # routing() removed in triton_kernels 3.6.0
+        # TritonEPRouter(ep=1) is equivalent
+        return TritonEPRouter()(logits, top_k)
 
     return _run_mxfp4_mlp_core(
         hidden_states,
