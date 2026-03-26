@@ -95,7 +95,14 @@ class MLIRToFXConverter:
 
         # Walk MLIR ops in order (they are in topological order within the block)
         for mlir_op in mlir_module.body.block.ops:
-            self._convert_op(mlir_op, graph, metadata)
+            try:
+                self._convert_op(mlir_op, graph, metadata)
+            except ValueError as e:
+                op_name = mlir_op.name if hasattr(mlir_op, "name") else type(mlir_op).__name__
+                node_key = ""
+                if isinstance(mlir_op, AdOpaque):
+                    node_key = f" node_key='{mlir_op.node_key.data}'"
+                raise ValueError(f"Error converting MLIR op '{op_name}'{node_key}: {e}") from e
 
         # Build _node_name_map for ALL nodes by scanning value_map.
         # This ensures opaque arg reconstruction can find nodes by their
@@ -418,8 +425,11 @@ class MLIRToFXConverter:
         """Look up the FX Node for an MLIR SSAValue."""
         node = self._value_map.get(ssa_val)
         if node is None:
+            producer = ssa_val.owner
+            producer_name = producer.name if hasattr(producer, "name") else type(producer).__name__
             raise ValueError(
-                "FX node not found for MLIR value. "
+                f"FX node not found for MLIR value produced by '{producer_name}' "
+                f"({type(producer).__name__}). "
                 "This may indicate an unsupported op or ordering issue."
             )
         return node

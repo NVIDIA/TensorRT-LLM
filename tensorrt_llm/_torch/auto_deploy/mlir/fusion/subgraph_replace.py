@@ -89,9 +89,30 @@ def replace_subgraph_with_fused_op(
         result_types=[result_types],
     )
 
-    # Insert fused op before the first subgraph op
+    # Insert fused op at a position where all its inputs are available.
+    # This must be AFTER all external input producers, not just before the
+    # first subgraph op — the subgraph may span across non-fusible ops
+    # (e.g. all_reduce in multi-GPU) that produce inputs consumed by later
+    # subgraph ops.
     block = subgraph.ops[0].parent
-    block.insert_op_before(fused_op, subgraph.ops[0])
+    block_ops_order = {op: i for i, op in enumerate(block.ops)}
+    first_sg_pos = block_ops_order[subgraph.ops[0]]
+
+    # Find the latest input producer position in the block.
+    latest_input_pos = -1
+    for inp in subgraph.inputs:
+        producer = inp.owner
+        if producer in block_ops_order:
+            latest_input_pos = max(latest_input_pos, block_ops_order[producer])
+
+    if latest_input_pos >= first_sg_pos:
+        # An external input is produced AFTER the first subgraph op.
+        # Insert the fused op just after that input producer.
+        anchor_op = list(block.ops)[latest_input_pos]
+        block.insert_op_after(fused_op, anchor_op)
+    else:
+        # Normal case: all inputs are available before the subgraph.
+        block.insert_op_before(fused_op, subgraph.ops[0])
 
     # Replace each subgraph output's uses with the corresponding fused op output
     for i, out_val in enumerate(subgraph.outputs):
