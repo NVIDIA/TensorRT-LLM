@@ -16,9 +16,11 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
@@ -26,6 +28,8 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3DraftOutput,
     EagleConfig,
     EagleDrafterForCausalLM,
+    EagleWrapper,
+    EagleWrapperConfig,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
@@ -124,6 +128,73 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
         return model
 
 
+class _DummyTargetModel(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.embedding = nn.Embedding(32, hidden_size)
+        self.output = nn.Linear(hidden_size, 32, bias=False)
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def get_output_embeddings(self):
+        return self.output
+
+
+class _DummyDraftModel(nn.Module):
+    def __init__(self, hidden_size: int, num_capture_layers: int, dtype: torch.dtype):
+        super().__init__()
+        self.config = SimpleNamespace(
+            hidden_size=hidden_size,
+            num_capture_layers=num_capture_layers,
+        )
+        self.model = SimpleNamespace(dtype=dtype, fc=None, d2t=None)
+
+
+class _FakeCSI:
+    def __init__(
+        self,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        hidden_size: int,
+        num_capture_layers: int,
+        ids_dtype: torch.dtype = torch.int64,
+        hidden_states_dtype: torch.dtype = torch.float16,
+        device: torch.device = torch.device("cpu"),
+    ):
+        self.info = SimpleNamespace(
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            device=device,
+        )
+        self.named_args = {
+            "input_ids": torch.zeros(max_num_tokens, dtype=ids_dtype, device=device),
+        }
+        for layer_idx in range(num_capture_layers):
+            self.named_args[f"r{layer_idx}_hidden_states_cache"] = torch.zeros(
+                max_num_tokens,
+                hidden_size,
+                dtype=hidden_states_dtype,
+                device=device,
+            )
+
+    def get_arg(self, name: str):
+        return self.named_args[name]
+
+
+def _build_test_wrapper(hidden_size: int = 8, num_capture_layers: int = 2) -> EagleWrapper:
+    return EagleWrapper(
+        EagleWrapperConfig(
+            max_draft_len=3,
+            load_embedding_from_target=True,
+            load_lm_head_from_target=True,
+        ),
+        target_model=_DummyTargetModel(hidden_size),
+        draft_model=_DummyDraftModel(hidden_size, num_capture_layers, torch.float16),
+    )
+
+
 @pytest.fixture
 def register_mock_eagle_factory():
     """Register MockEagleDrafterFactory for the test and clean up afterwards.
@@ -143,11 +214,13 @@ def test_build_ad_eagle(register_mock_eagle_factory):
     This test uses the MockEagleDrafterFactory which builds MockEagle3ModelForCausalLM,
     a mock model that generates random hidden states for standalone Eagle testing.
     """
+    # Eagle one-model speculative decoding is only supported with TRTLLM attention.
+    attn_backend = "trtllm"
     llm_extra_args = {
         "model_factory": "MockEagleDrafter",
         "transforms": {
-            "insert_cached_attention": {"backend": "flashinfer"},
-            "compile_model": {"backend": "torch-compile"},
+            "insert_cached_attention": {"backend": attn_backend},
+            "compile_model": {"backend": "torch-simple"},
         },
     }
     experiment_config = get_small_model_config(EAGLE_MODEL_HUB_ID, **llm_extra_args)
@@ -161,6 +234,84 @@ def test_build_ad_eagle(register_mock_eagle_factory):
     experiment_config = ExperimentConfig(**experiment_config)
 
     main(experiment_config)
+
+
+def test_eagle_wrapper_ensure_buffers_lazy_init():
+    wrapper = _build_test_wrapper()
+    csi = _FakeCSI(max_batch_size=4, max_num_tokens=12, hidden_size=8, num_capture_layers=2)
+
+    wrapper._ensure_buffers(csi)
+
+    assert wrapper._buffers_initialized is True
+    assert wrapper._buf_new_tokens_2d is not None
+    assert wrapper._buf_next_new_tokens is not None
+    assert wrapper._buf_new_tokens_lens is not None
+    assert wrapper._buf_c_offset_ones is not None
+    assert wrapper._buf_hidden_states is not None
+    assert wrapper._buf_new_tokens_2d.shape == (4, 4)
+    assert wrapper._buf_next_new_tokens.shape == (4, 4)
+    assert wrapper._buf_new_tokens_lens.shape == (4,)
+    assert wrapper._buf_c_offset_ones.shape == (4,)
+    assert wrapper._buf_hidden_states.shape == (12, 16)
+
+    buffer_ptrs = {
+        "new_tokens_2d": wrapper._buf_new_tokens_2d.data_ptr(),
+        "next_new_tokens": wrapper._buf_next_new_tokens.data_ptr(),
+        "new_tokens_lens": wrapper._buf_new_tokens_lens.data_ptr(),
+        "c_offset_ones": wrapper._buf_c_offset_ones.data_ptr(),
+        "hidden_states": wrapper._buf_hidden_states.data_ptr(),
+    }
+
+    wrapper._ensure_buffers(csi)
+
+    assert buffer_ptrs["new_tokens_2d"] == wrapper._buf_new_tokens_2d.data_ptr()
+    assert buffer_ptrs["next_new_tokens"] == wrapper._buf_next_new_tokens.data_ptr()
+    assert buffer_ptrs["new_tokens_lens"] == wrapper._buf_new_tokens_lens.data_ptr()
+    assert buffer_ptrs["c_offset_ones"] == wrapper._buf_c_offset_ones.data_ptr()
+    assert buffer_ptrs["hidden_states"] == wrapper._buf_hidden_states.data_ptr()
+
+
+def test_eagle_wrapper_collect_hidden_states_reuses_preallocated_buffer():
+    wrapper = _build_test_wrapper()
+    csi = _FakeCSI(max_batch_size=4, max_num_tokens=12, hidden_size=8, num_capture_layers=2)
+    wrapper._ensure_buffers(csi)
+
+    first_buffers = {
+        "r0_hidden_states_cache": torch.arange(96, dtype=torch.float16).view(12, 8),
+        "r1_hidden_states_cache": torch.arange(96, 192, dtype=torch.float16).view(12, 8),
+    }
+    first_hidden_states = wrapper._collect_hidden_states(first_buffers, num_tokens=3)
+
+    assert wrapper._buf_hidden_states is not None
+    assert first_hidden_states.data_ptr() == wrapper._buf_hidden_states.data_ptr()
+    assert torch.equal(
+        first_hidden_states,
+        torch.cat(
+            [
+                first_buffers["r0_hidden_states_cache"][:3],
+                first_buffers["r1_hidden_states_cache"][:3],
+            ],
+            dim=1,
+        ),
+    )
+
+    second_buffers = {
+        "r0_hidden_states_cache": torch.full((12, 8), 7, dtype=torch.float16),
+        "r1_hidden_states_cache": torch.full((12, 8), 11, dtype=torch.float16),
+    }
+    second_hidden_states = wrapper._collect_hidden_states(second_buffers, num_tokens=2)
+
+    assert second_hidden_states.data_ptr() == wrapper._buf_hidden_states.data_ptr()
+    assert torch.equal(
+        second_hidden_states,
+        torch.cat(
+            [
+                second_buffers["r0_hidden_states_cache"][:2],
+                second_buffers["r1_hidden_states_cache"][:2],
+            ],
+            dim=1,
+        ),
+    )
 
 
 def test_eagle_model_torch_export():

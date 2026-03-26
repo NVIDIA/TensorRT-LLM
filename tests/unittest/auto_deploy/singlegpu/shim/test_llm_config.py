@@ -4,6 +4,7 @@ import pydantic
 import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 
 def test_custom_values():
@@ -281,6 +282,23 @@ class TestCudaGraphBatchSizesHeuristic:
         assert args.cuda_graph_batch_sizes == sorted(args.cuda_graph_batch_sizes, reverse=True), (
             f"Expected descending order, got {args.cuda_graph_batch_sizes}"
         )
+
+    def test_speculative_flashinfer_forces_torch_simple(self):
+        """Speculative FlashInfer should avoid cudagraph-backed compile modes for now."""
+        args = LlmArgs(
+            model="test-model",
+            attn_backend="flashinfer",
+            compile_backend="torch-cudagraph",
+            speculative_config=Eagle3DecodingConfig(
+                max_draft_len=3,
+                speculative_model="draft-model",
+                eagle3_one_model=True,
+                eagle3_layers_to_capture={1},
+            ),
+        )
+
+        assert args.compile_backend == "torch-simple"
+        assert args.transforms["compile_model"]["backend"] == "torch-simple"
 
 
 class TestSequenceInfoExampleBatchSize:

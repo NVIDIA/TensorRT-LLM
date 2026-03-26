@@ -110,10 +110,12 @@ class CapturedGraph(nn.Module):
         self,
         model: nn.Module,
         num_batched_inputs: Optional[int] = None,  # number of batched, dynamic inputs...
+        spec_mode: bool = False,
     ):
         super().__init__()
         self.model = model
         self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
+        self.spec_mode = spec_mode
         self.cudagraphs: Dict[Tuple[int, ...], CUDAGraph] = {}
         self._input_buffers: List[torch.Tensor] = [
             torch.empty(0, 1) for _ in range(self.num_batched_inputs)
@@ -129,19 +131,86 @@ class CapturedGraph(nn.Module):
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         return tuple(hash(a) for a in flat_args)
 
-    def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
+    def _get_batched_extent(self, input_tensor: torch.Tensor) -> int:
+        if self.spec_mode:
+            if input_tensor.ndim < 2:
+                raise ValueError(
+                    "CapturedGraph spec_mode expects batched inputs with at least 2 dims, "
+                    f"got shape {tuple(input_tensor.shape)}"
+                )
+            return input_tensor.shape[1]
+
+        return input_tensor.shape[0]
+
+    def _copy_batched_input(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        if self.spec_mode:
+            if src.ndim < 2 or dst.ndim < 2:
+                raise ValueError(
+                    "CapturedGraph spec_mode expects source and destination buffers with at least "
+                    f"2 dims, got src={tuple(src.shape)}, dst={tuple(dst.shape)}"
+                )
+            dst[:, : src.shape[1]].copy_(src, non_blocking=True)
+            return
+
+        dst[: src.shape[0]].copy_(src, non_blocking=True)
+
+    def _truncate_input_buffer(self, in_buffer: torch.Tensor, extent: int) -> torch.Tensor:
+        if self.spec_mode:
+            if in_buffer.ndim < 2:
+                raise ValueError(
+                    "CapturedGraph spec_mode expects input buffers with at least 2 dims, "
+                    f"got shape {tuple(in_buffer.shape)}"
+                )
+            return in_buffer[:, :extent]
+
+        return in_buffer[:extent]
+
+    def _get_runtime_output_batch_size(self, args_batched: List[torch.Tensor], kwargs: Dict) -> int:
+        if self.spec_mode:
+            csi = kwargs.get("cache_seq_interface")
+            if csi is None or not hasattr(csi, "info"):
+                raise ValueError(
+                    "CapturedGraph spec_mode requires cache_seq_interface with .info available "
+                    "to determine runtime sequence count"
+                )
+
+            batch_info = getattr(csi.info, "batch_info", None)
+            if batch_info is None or not hasattr(batch_info, "get_num_sequences"):
+                raise ValueError(
+                    "CapturedGraph spec_mode requires cache_seq_interface.info.batch_info "
+                    "with get_num_sequences() available"
+                )
+
+            return sum(batch_info.get_num_sequences())
+
+        return args_batched[0].shape[0]
+
+    def _capture_one_graph(
+        self,
+        *args,
+        refresh_inputs_fn: Optional[Callable[[], Tuple[Tuple[Any, ...], Dict[str, Any]]]] = None,
+        **kwargs,
+    ) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
         # warm-up and invoke autotuner
         with CudaGraphWarmUpPhase(), autotune():
             for _ in range(3):
-                self.model(*args, **kwargs)
+                warmup_args, warmup_kwargs = (
+                    refresh_inputs_fn() if refresh_inputs_fn is not None else (args, kwargs)
+                )
+                self.model(*warmup_args, **warmup_kwargs)
 
         # capture graph now
+        if refresh_inputs_fn is not None:
+            with CudaGraphWarmUpPhase():
+                capture_args, capture_kwargs = refresh_inputs_fn()
+        else:
+            capture_args, capture_kwargs = args, kwargs
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
             # compute output
-            out = self.model(*args, **kwargs)
+            out = self.model(*capture_args, **capture_kwargs)
             # write out into output buffer up to out batch size
             out_flat = tree_flatten_spec(out, self._out_spec)
             for o_buffer, o in zip(self._out_buffer_flat, out_flat):
@@ -158,7 +227,8 @@ class CapturedGraph(nn.Module):
         batch_sizes = sorted(batch_sizes, reverse=True)
 
         # get args, kwargs for the first time for the largest batch size
-        args, kwargs = get_args_kwargs(batch_sizes[0])
+        with CudaGraphWarmUpPhase():
+            args, kwargs = get_args_kwargs(batch_sizes[0])
 
         # flatten args, kwargs for the first time and record in_spec
         all_args_flat, self._in_spec = _args_kwargs_flatten(*args, **kwargs)
@@ -188,7 +258,8 @@ class CapturedGraph(nn.Module):
             ad_logger.info(f"Capturing graph for batch size: {bs}")
 
             # get new args, kwargs for the current batch size
-            args, kwargs = get_args_kwargs(bs)
+            with CudaGraphWarmUpPhase():
+                args, kwargs = get_args_kwargs(bs)
             all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
             args_batched = all_args_flat[: self.num_batched_inputs]
             args_static = all_args_flat[self.num_batched_inputs :]
@@ -200,17 +271,49 @@ class CapturedGraph(nn.Module):
 
             # copy new inputs to input buffers
             for i, input_tensor in enumerate(args_batched):
-                self._input_buffers[i][: input_tensor.shape[0]].copy_(
-                    input_tensor, non_blocking=True
-                )
+                self._copy_batched_input(self._input_buffers[i], input_tensor)
 
             # setup args, kwargs
-            inputs_truncated = [in_buffer[:bs] for in_buffer in self._input_buffers]
+            inputs_truncated = [
+                self._truncate_input_buffer(in_buffer, self._get_batched_extent(input_tensor))
+                for in_buffer, input_tensor in zip(self._input_buffers, args_batched)
+            ]
             args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
+
+            refresh_inputs_fn = None
+            if "cache_seq_interface" in kwargs:
+
+                def _refresh_inputs_for_capture():
+                    # Warmup forwards are allowed to mutate CSI-managed metadata in-place
+                    # (for example Eagle switches the batch to generate mode during the draft
+                    # loop). Re-run the compile input generator so each warmup/capture forward
+                    # starts from the intended synthetic CSI state again.
+                    refreshed_args, refreshed_kwargs = get_args_kwargs(bs)
+                    refreshed_flat = _args_kwargs_flatten_spec(
+                        self._in_spec, *refreshed_args, **refreshed_kwargs
+                    )
+                    refreshed_batched = refreshed_flat[: self.num_batched_inputs]
+                    refreshed_static = refreshed_flat[self.num_batched_inputs :]
+                    assert self._args_hash == self._get_hash(refreshed_static), (
+                        "Static args mismatch during warmup refresh"
+                    )
+                    for i, input_tensor in enumerate(refreshed_batched):
+                        self._copy_batched_input(self._input_buffers[i], input_tensor)
+                    refreshed_inputs = [
+                        self._truncate_input_buffer(
+                            in_buffer, self._get_batched_extent(input_tensor)
+                        )
+                        for in_buffer, input_tensor in zip(self._input_buffers, refreshed_batched)
+                    ]
+                    return self._in_spec.unflatten(refreshed_inputs + refreshed_static)
+
+                refresh_inputs_fn = _refresh_inputs_for_capture
 
             # capture graph for truncated inputs
             combined_shape = sum((tuple(input.shape) for input in inputs_truncated), start=())
-            self.cudagraphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
+            self.cudagraphs[combined_shape] = self._capture_one_graph(
+                *args, refresh_inputs_fn=refresh_inputs_fn, **kwargs
+            )
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
@@ -234,13 +337,13 @@ class CapturedGraph(nn.Module):
 
         # copy inputs to input buffers
         for i, input_tensor in enumerate(args_batched):
-            self._input_buffers[i][: input_tensor.shape[0]].copy_(input_tensor, non_blocking=True)
+            self._copy_batched_input(self._input_buffers[i], input_tensor)
 
         # run forward pass via graph
         self.cudagraphs[combined_shape].replay()
 
         # retrieve output from buffer, cut to batch size, and unflatten
-        bs = args_batched[0].shape[0]
+        bs = self._get_runtime_output_batch_size(args_batched, kwargs)
         out_flat = [o_b[:bs] for o_b in self._out_buffer_flat]
         return self._out_spec.unflatten(out_flat)
 
@@ -702,6 +805,7 @@ class TorchCudagraphCompiler(CompilerBackend):
         cuda_graph_batch_sizes: Optional[List[int]] = None,
         num_batched_inputs: int = 1,
         get_args_kwargs_for_compile: GetArgsKwargsForBatchSize = None,
+        spec_mode: bool = False,
         piecewise_enabled: bool = False,
         piecewise_num_tokens: Optional[List[int]] = None,
         piecewise_seq_info: Any = None,
@@ -712,6 +816,7 @@ class TorchCudagraphCompiler(CompilerBackend):
         self.num_batched_inputs = num_batched_inputs
         self.cuda_graph_batch_sizes = cuda_graph_batch_sizes or []
         self.get_args_kwargs_for_compile = get_args_kwargs_for_compile
+        self.spec_mode = spec_mode
         self.piecewise_enabled = piecewise_enabled
         self.piecewise_num_tokens = piecewise_num_tokens or []
         self.piecewise_seq_info = piecewise_seq_info
@@ -723,15 +828,12 @@ class TorchCudagraphCompiler(CompilerBackend):
             "get_args_kwargs_for_compile must be provided"
         )
 
-        # wrap get_args_kwargs_for_compile with CudaGraphWarmUpPhase. Note that host-side prepare
-        # functions may be called as part of get_args_kwargs. We want to let these functions know it's
-        # a warm-up phase.
-        def get_args_kwargs_warmup(batch_size: int):
-            with CudaGraphWarmUpPhase():
-                return self.get_args_kwargs_for_compile(batch_size)
-
-        monolithic = CapturedGraph(self.model, num_batched_inputs=self.num_batched_inputs)
-        monolithic.capture_graph(get_args_kwargs_warmup, self.cuda_graph_batch_sizes)
+        monolithic = CapturedGraph(
+            self.model,
+            num_batched_inputs=self.num_batched_inputs,
+            spec_mode=self.spec_mode,
+        )
+        monolithic.capture_graph(self.get_args_kwargs_for_compile, self.cuda_graph_batch_sizes)
 
         piecewise = None
         if self.piecewise_enabled:

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -122,12 +122,22 @@ class _InsertCachedOperator(BaseTransform):
         if prep_meta_host_op is None:
             return
 
-        # Register the host-side prepare metadata function with SequenceInfo.
-        # Arg availability is validated by require_copy() inside register_host_prepare.
         sig = inspect.signature(prep_meta_host_op)
-        cm.info.register_host_prepare_for_attention_forward(
-            prep_meta_host_op, list(sig.parameters.keys())
-        )
+        params = list(sig.parameters.keys())
+
+        # If the host-prepare function accepts spec_config (e.g., TRTLLM attention
+        # uses it to initialize spec-dec tensors), capture it via closure from CSI.
+        if "spec_config" in params:
+            spec_config = cm._spec_config
+            original_fn = prep_meta_host_op
+
+            def host_fn_with_spec(**kwargs):
+                original_fn(spec_config=spec_config, **kwargs)
+
+            seq_info_args = [k for k in params if k != "spec_config"]
+            cm.info.register_host_prepare_for_attention_forward(host_fn_with_spec, seq_info_args)
+        else:
+            cm.info.register_host_prepare_for_attention_forward(prep_meta_host_op, params)
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
@@ -274,9 +284,8 @@ class ResizeKVCache(BaseTransform):
         # Run a forward pass to get the extra memory usage
         cm.info.set_max_num_tokens_sample()
         try:
-            # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
-            if getattr(mod, "_requires_csi", False):
-                mod(cache_seq_interface=cm)
+            if cm._spec_config is not None:
+                mod(**cm.named_args, cache_seq_interface=cm)
             else:
                 mod(**cm.named_args)
         except torch.OutOfMemoryError as e:

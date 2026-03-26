@@ -26,9 +26,10 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention import (
     _GlobalTrtllmPlanner,
+    prepare_trtllm_metadata,
     prepare_trtllm_metadata_host,
 )
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo, SequenceInfo
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,6 +39,81 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import Batch
 def _reset_trtllm_planner():
     """Force a full reset of the global TRT-LLM planner so buffers are re-allocated."""
     _GlobalTrtllmPlanner.__init__()
+
+
+class _DummySpecConfig:
+    def __init__(self, max_draft_len: int):
+        self.max_draft_len = max_draft_len
+
+
+def _create_sequence_info(
+    max_batch_size: int = 4,
+    max_seq_len: int = 2048,
+    max_num_tokens: int = 2048,
+    tokens_per_block: int = 32,
+) -> SequenceInfo:
+    _reset_trtllm_planner()
+    info = SequenceInfo(
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        max_num_tokens=max_num_tokens,
+        tokens_per_block=tokens_per_block,
+    )
+    info.update_cache_information(
+        num_blocks=info.max_batch_size * info.max_blocks_per_seq,
+        block_offset_multiplier=2,
+    )
+    info.to(torch.device("cuda"))
+    return info
+
+
+def _nest_prefill(info: SequenceInfo, context_length: int, num_sequences: int = 1):
+    input_ids = torch.ones(num_sequences, context_length, dtype=torch.int)
+    info.set_example_sequence(input_ids)
+
+
+def _prepare_from_sequence_info(info: SequenceInfo, spec_config: _DummySpecConfig | None = None):
+    kwargs = {
+        "batch_info_host": info.get_arg("batch_info_host"),
+        "seq_len_with_cache_host": info.get_arg("seq_len_with_cache_host", truncate=True),
+        "input_pos_host": info.get_arg("input_pos_host", truncate=True),
+        "seq_len_host": info.get_arg("seq_len_host", truncate=True),
+    }
+    try:
+        kwargs["prompt_lens_host"] = info.get_arg("prompt_lens_host", truncate=True)
+    except Exception:
+        pass
+    if spec_config is not None:
+        kwargs["spec_config"] = spec_config
+    prepare_trtllm_metadata_host(**kwargs)
+
+
+def _prepare_block_offsets_from_sequence_info(info: SequenceInfo):
+    prepare_trtllm_metadata(
+        info.get_arg("batch_info_host"),
+        info.get_arg("cu_num_pages", truncate=True),
+        info.get_arg("cache_loc", truncate=True),
+    )
+
+
+def _snap_metadata(num_seq: int) -> dict:
+    planner = _GlobalTrtllmPlanner
+    result = {
+        "host_past_kv_lengths": planner.host_past_kv_lengths[:num_seq].clone().tolist(),
+        "host_context_lengths": planner.host_context_lengths[:num_seq].clone().tolist(),
+        "host_request_types": planner.host_request_types[:num_seq].clone().tolist(),
+        "host_total_kv_lens": planner.host_total_kv_lens.clone().tolist(),
+        "predicted_tokens_per_seq": planner.predicted_tokens_per_seq,
+    }
+    if planner.context_lengths_gpu is not None:
+        result["context_lengths_gpu"] = planner.context_lengths_gpu[:num_seq].clone().tolist()
+    if planner.host_pool_mapping is not None:
+        result["host_pool_mapping"] = planner.host_pool_mapping.clone().tolist()
+    return result
+
+
+def _snap_block_offsets(num_seq: int, num_pages: int) -> torch.Tensor:
+    return _GlobalTrtllmPlanner.block_offsets[0, :num_seq, :, :num_pages].clone().cpu()
 
 
 def _prepare_and_run(
@@ -665,3 +741,220 @@ def test_block_offsets_computation(num_sequences, pages_per_seq_list, block_offs
         for pg in range(n_pages, max_blocks_per_seq):
             assert bo[seq_id, 0, pg].item() == 0, f"K padding non-zero at seq={seq_id} pg={pg}"
             assert bo[seq_id, 1, pg].item() == 1, f"V padding not 1 at seq={seq_id} pg={pg}"
+
+
+# ---------------------------------------------------------------------------
+# Metadata equivalence checks
+#
+# These tests were originally developed as a standalone metadata-focused suite.
+# They exercise the AD TRTLLM attention metadata path directly by creating a
+# SequenceInfo, simulating Eagle3 phase transitions
+# (nest_sequences -> prepare_host -> switch_to_generate_ ->
+# update_host_request_types -> offset_pos_and_cache_), and checking that the
+# resulting _GlobalTrtllmPlanner state matches the PyTorch backend's TRTLLM
+# attention reference values for the same phase.
+# ---------------------------------------------------------------------------
+
+
+class TestTrtllmAttentionMetadata:
+    """Check AD TRTLLM planner metadata against the PyTorch TRTLLM attention reference.
+
+    These assertions are intentionally stronger than a minimal end-to-end correctness check.
+    Not every field asserted here is necessarily required for the overall computation to
+    produce correct tokens, but each asserted invariant is meant to guard AD-vs-PyTorch
+    equivalence for the TRTLLM attention metadata path.
+
+    PyTorch backend field mapping to thop.attention args:
+        kv_lens_runtime -> host_past_key_value_lengths
+        prompt_lens_cpu_runtime -> host_context_lengths
+        host_request_types_runtime -> host_request_types
+        host_total_kv_lens -> host_total_kv_lens
+        kv_lens_cuda_runtime -> sequence_length / context_lengths_gpu
+
+    Key invariants from the PyTorch backend:
+        - prompt/context lengths stay at the original context length
+        - kv lengths and total kv lengths are stale within an iteration
+        - host request type is the field actively updated mid-forward
+    """
+
+    @pytest.mark.parametrize("context_length", [8, 300, 1001])
+    def test_prefill_phase_matches_reference(self, context_length: int):
+        info = _create_sequence_info()
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info)
+
+        metadata = _snap_metadata(1)
+
+        assert metadata["host_past_kv_lengths"] == [context_length]
+        assert metadata["host_context_lengths"] == [context_length]
+        assert metadata["host_request_types"] == [0]
+        assert metadata["host_total_kv_lens"] == [context_length, 0]
+        if "context_lengths_gpu" in metadata:
+            assert metadata["context_lengths_gpu"] == [context_length]
+        assert metadata["predicted_tokens_per_seq"] == 1
+        assert metadata["host_pool_mapping"] == [[0, 0]]
+
+    def test_long_prefill_block_offsets_match_managed_paged_layout(self):
+        context_length = 2001
+        info = _create_sequence_info(max_seq_len=2048, max_num_tokens=2048)
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info)
+        _prepare_block_offsets_from_sequence_info(info)
+
+        num_pages = (context_length + info.tokens_per_block - 1) // info.tokens_per_block
+        offsets = _snap_block_offsets(1, num_pages)
+        expected_k = torch.arange(num_pages, dtype=torch.int32) * 2
+        expected_v = expected_k + 1
+
+        assert list(_GlobalTrtllmPlanner.block_offsets.shape) == [1, info.max_batch_size, 2, 64]
+        torch.testing.assert_close(offsets[0, 0], expected_k)
+        torch.testing.assert_close(offsets[0, 1], expected_v)
+
+    def test_eagle_prefill_initializes_spec_decoding_metadata(self):
+        context_length = 2001
+        info = _create_sequence_info(max_seq_len=2048, max_num_tokens=2048)
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info, spec_config=_DummySpecConfig(max_draft_len=3))
+        _prepare_block_offsets_from_sequence_info(info)
+
+        metadata = _snap_metadata(1)
+
+        assert metadata["host_past_kv_lengths"] == [context_length]
+        assert metadata["host_context_lengths"] == [context_length]
+        assert metadata["host_request_types"] == [0]
+        assert metadata["host_total_kv_lens"] == [context_length, 0]
+        assert metadata["predicted_tokens_per_seq"] == 1
+        assert metadata["host_pool_mapping"] == [[0, 0]]
+        assert _GlobalTrtllmPlanner.is_spec_decoding_enabled
+        assert _GlobalTrtllmPlanner.spec_decoding_generation_lengths[:2].tolist() == [4, 4]
+        assert _GlobalTrtllmPlanner.spec_decoding_position_offsets[:2, :4].tolist() == [
+            [0, 1, 2, 3],
+            [0, 1, 2, 3],
+        ]
+        assert _GlobalTrtllmPlanner.spec_decoding_packed_mask[:2, :4, :1].tolist() == [
+            [[1], [3], [7], [15]],
+            [[1], [3], [7], [15]],
+        ]
+
+    @pytest.mark.parametrize("context_length", [8, 300, 1001])
+    def test_draft_loop_keeps_stale_prefill_metadata_except_request_type(self, context_length: int):
+        info = _create_sequence_info()
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info)
+
+        info.switch_to_generate_()
+        batch_info = BatchInfo(info.get_arg("batch_info_host"))
+        _GlobalTrtllmPlanner.update_host_request_types(batch_info)
+
+        metadata = _snap_metadata(1)
+
+        assert metadata["host_past_kv_lengths"] == [context_length]
+        assert metadata["host_context_lengths"] == [context_length]
+        assert metadata["host_request_types"] == [1]
+        assert metadata["host_total_kv_lens"] == [context_length, 0]
+
+    def test_eagle_target_to_draft_transition_only_flips_request_type(self):
+        context_length = 2001
+        info = _create_sequence_info(max_seq_len=2048, max_num_tokens=2048)
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info, spec_config=_DummySpecConfig(max_draft_len=3))
+
+        prefill = _snap_metadata(1)
+        info.switch_to_generate_()
+        batch_info = BatchInfo(info.get_arg("batch_info_host"))
+        _GlobalTrtllmPlanner.update_host_request_types(batch_info)
+        draft = _snap_metadata(1)
+
+        assert prefill["host_request_types"] == [0]
+        assert draft["host_request_types"] == [1]
+        assert draft["host_past_kv_lengths"] == prefill["host_past_kv_lengths"] == [context_length]
+        assert draft["host_context_lengths"] == prefill["host_context_lengths"] == [context_length]
+        assert draft["host_total_kv_lens"] == prefill["host_total_kv_lens"] == [context_length, 0]
+        assert draft["predicted_tokens_per_seq"] == 1
+
+    @pytest.mark.parametrize("context_length", [8, 300, 1001])
+    def test_context_lengths_gpu_stays_constant_across_generate_transition(
+        self, context_length: int
+    ):
+        info = _create_sequence_info()
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info)
+
+        info.switch_to_generate_()
+        metadata = _snap_metadata(1)
+
+        assert "context_lengths_gpu" in metadata
+        assert metadata["context_lengths_gpu"] == [context_length]
+
+    @pytest.mark.parametrize("context_length", [8, 300, 1001])
+    def test_offset_pos_and_cache_keeps_metadata_stale(self, context_length: int):
+        info = _create_sequence_info()
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info)
+
+        info.switch_to_generate_()
+        info.offset_pos_and_cache_(torch.ones(1, dtype=torch.int32, device="cuda"))
+        metadata = _snap_metadata(1)
+
+        assert metadata["host_past_kv_lengths"] == [context_length]
+        assert metadata["host_context_lengths"] == [context_length]
+        if "context_lengths_gpu" in metadata:
+            assert metadata["context_lengths_gpu"] == [context_length]
+
+    @pytest.mark.parametrize("context_length", [8, 300, 1001])
+    def test_extend_iteration_preserves_original_prompt_length(self, context_length: int):
+        info = _create_sequence_info()
+
+        _nest_prefill(info, context_length)
+        _prepare_from_sequence_info(info)
+
+        extend_len = 4
+        accepted = 2
+        input_pos = context_length + accepted
+        input_ids = torch.ones(1, extend_len, dtype=torch.int)
+        cu_seqlen = torch.tensor([0, extend_len], dtype=torch.int)
+        num_pages = (input_pos + extend_len) // info.tokens_per_block + 1
+        batch_info = [0, 0, 1, extend_len, 0, 0]
+        info.nest_sequences(
+            input_ids.flatten(),
+            cu_seqlen=cu_seqlen,
+            input_pos=input_pos,
+            batch_info=batch_info,
+            cache_loc=torch.arange(num_pages),
+            cu_num_pages=torch.tensor([0, num_pages], dtype=torch.int),
+            slot_idx=torch.arange(1),
+            prompt_lens=[context_length],
+        )
+        _prepare_from_sequence_info(info)
+
+        metadata = _snap_metadata(1)
+
+        assert metadata["host_context_lengths"] == [context_length]
+        if "context_lengths_gpu" in metadata:
+            assert metadata["context_lengths_gpu"] == [context_length]
+        assert metadata["host_past_kv_lengths"] == [input_pos + extend_len]
+        assert metadata["host_request_types"] == [1]
+
+    def test_metadata_handles_two_sequences_with_different_lengths(self):
+        info = _create_sequence_info(max_batch_size=4)
+
+        input_ids = torch.ones(1, 300, dtype=torch.int)
+        cu_seqlen = torch.tensor([0, 100, 300], dtype=torch.int)
+        info.nest_sequences(
+            input_ids.flatten(),
+            cu_seqlen=cu_seqlen,
+            input_pos=0,
+            cache_loc=torch.arange(300 // info.tokens_per_block + 2),
+            cu_num_pages=torch.tensor([0, 4, 10], dtype=torch.int),
+            slot_idx=torch.arange(2),
+        )
+        _prepare_from_sequence_info(info)
+
+        metadata = _snap_metadata(2)
+
+        assert metadata["host_past_kv_lengths"] == [100, 200]
+        assert metadata["host_context_lengths"] == [100, 200]
+        assert metadata["host_request_types"] == [0, 0]
+        assert metadata["host_total_kv_lens"][0] == 300
+        if "context_lengths_gpu" in metadata:
+            assert metadata["context_lengths_gpu"] == [100, 200]

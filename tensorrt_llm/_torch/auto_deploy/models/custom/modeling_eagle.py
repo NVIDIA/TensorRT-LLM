@@ -724,6 +724,7 @@ class EagleWrapperConfig:
     load_embedding_from_target: bool
     load_lm_head_from_target: bool
     normalize_target_hidden_state: bool = False
+    sync_before_hidden_state_capture: bool = False
 
 
 class EagleWrapper(nn.Module):
@@ -732,7 +733,8 @@ class EagleWrapper(nn.Module):
     Dual-purpose:
     1. Prefill-only mode (export time): runs both models without KV cache for graph capture.
     2. KV-cache mode (inference): runs graph-captured models with cached attention and
-       in-place metadata updates. Hidden states flow through hidden_states_cache_* kwargs.
+       in-place metadata updates. Hidden states flow through layer-prefixed
+       `*_hidden_states_cache` kwargs.
     """
 
     _requires_csi: bool = True
@@ -745,6 +747,15 @@ class EagleWrapper(nn.Module):
         self.load_embedding_from_target = config.load_embedding_from_target
         self.load_lm_head_from_target = config.load_lm_head_from_target
         self.normalize_target_hidden_state = config.normalize_target_hidden_state
+        self.sync_before_hidden_state_capture = config.sync_before_hidden_state_capture
+        self._draft_hidden_size = draft_model.config.hidden_size
+        self._draft_num_capture_layers = getattr(draft_model.config, "num_capture_layers", 1)
+        self._buffers_initialized = False
+        self._buf_new_tokens_2d: Optional[torch.Tensor] = None
+        self._buf_next_new_tokens: Optional[torch.Tensor] = None
+        self._buf_new_tokens_lens: Optional[torch.Tensor] = None
+        self._buf_c_offset_ones: Optional[torch.Tensor] = None
+        self._buf_hidden_states: Optional[torch.Tensor] = None
 
     @property
     def _draft_inner_model(self):
@@ -890,15 +901,55 @@ class EagleWrapper(nn.Module):
         expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
         return {k: v for k, v in kwargs.items() if k in expected_names}
 
-    @staticmethod
-    def _collect_hidden_states(kwargs: dict, num_tokens: int) -> torch.Tensor:
-        """Read hidden_states_cache_* buffers from kwargs, concatenate, and slice.
+    def _ensure_buffers(self, csi: CachedSequenceInterface) -> None:
+        """Lazily initialize stable output buffers for the KV-cache forward path."""
+        if self._buffers_initialized:
+            return
+
+        max_batch_size = csi.info.max_batch_size
+        max_num_tokens = csi.info.max_num_tokens
+        device = csi.info.device
+        ids_dtype = csi.get_arg("input_ids").dtype
+
+        hidden_state_buffers = [
+            tensor
+            for name, tensor in csi.named_args.items()
+            if name.endswith("hidden_states_cache")
+        ]
+        hidden_states_dtype = (
+            hidden_state_buffers[0].dtype if hidden_state_buffers else self._draft_dtype
+        )
+        hidden_states_width = self._draft_hidden_size * self._draft_num_capture_layers
+
+        self._buf_new_tokens_2d = torch.empty(
+            max_batch_size,
+            self.max_draft_len + 1,
+            dtype=ids_dtype,
+            device=device,
+        )
+        self._buf_next_new_tokens = torch.empty(
+            max_batch_size,
+            self.max_draft_len + 1,
+            dtype=ids_dtype,
+            device=device,
+        )
+        self._buf_new_tokens_lens = torch.ones(max_batch_size, dtype=torch.int32, device=device)
+        self._buf_c_offset_ones = torch.ones(max_batch_size, dtype=torch.int32, device=device)
+        self._buf_hidden_states = torch.empty(
+            max_num_tokens,
+            hidden_states_width,
+            dtype=hidden_states_dtype,
+            device=device,
+        )
+        self._buffers_initialized = True
+
+    def _collect_hidden_states(self, kwargs: dict, num_tokens: int) -> torch.Tensor:
+        """Read layer-prefixed ``*_hidden_states_cache`` buffers into a pre-allocated concat buffer.
 
         Returns:
             Tensor of shape [num_tokens, hidden_size * num_capture_layers].
         """
-        # TODO: we should eventually use the resource manager to have them be concatenated before
-        # and we just write into a view and hence can just take the whole tensor here.
+        assert self._buf_hidden_states is not None, "_ensure_buffers must run before collecting."
         buffers = sorted(
             [
                 (name, tensor)
@@ -908,9 +959,13 @@ class EagleWrapper(nn.Module):
             key=lambda x: x[0],
         )
         if not buffers:
-            raise ValueError("No hidden_states_cache_* buffers found in kwargs.")
-        hidden_states = torch.cat([buf[:num_tokens] for _, buf in buffers], dim=1)
-        return hidden_states
+            raise ValueError("No *_hidden_states_cache buffers found in kwargs.")
+        offset = 0
+        for _, buf in buffers:
+            width = buf.shape[1]
+            self._buf_hidden_states[:num_tokens, offset : offset + width].copy_(buf[:num_tokens])
+            offset += width
+        return self._buf_hidden_states[:num_tokens, :offset]
 
     def _forward_with_kv_cache(self, csi: CachedSequenceInterface):
         """Forward pass with KV cache (inference after graph transforms).
@@ -921,6 +976,12 @@ class EagleWrapper(nn.Module):
         Expected kwargs that are accessed directly are described in the required_kwargs property.
         Additional kwargs are forwarded to target/draft submodules (kv caches, etc.).
         """
+        self._ensure_buffers(csi)
+        assert self._buf_new_tokens_2d is not None
+        assert self._buf_next_new_tokens is not None
+        assert self._buf_new_tokens_lens is not None
+        assert self._buf_c_offset_ones is not None
+
         # ---- Phase 0: Check batch information ----
         # determine batch information from batch_info_host
         batch_info = csi.info.batch_info
@@ -942,16 +1003,14 @@ class EagleWrapper(nn.Module):
         # NOTE: we assume gather_context_logits is False so that gathering here works!
         target_logits = csi.info.maybe_gather_and_squeeze(out.logits)
 
-        # ---- Phase 2: Collect hidden states ----
-        # TODO: investigate root cause — without this sync the hidden_states_cache buffers
-        # read by _collect_hidden_states can contain stale data, dropping the spec-dec
-        # acceptance rate from ~31% to ~7%.
-        torch.cuda.synchronize()
-
-        # TODO: For MTP, a cleaner approach would return hidden states as a second output
-        # from the target model (final_norm_hidden_states). However, this causes NCCL hangs
-        # at TP>1 because the export/sharding pipeline doesn't handle multiple graph outputs.
-        # For now, both MTP and Eagle3 use the detect_hidden_states_for_capture graph transform.
+        # ---- Phase 2: Collect hidden states from cache buffers ----
+        if self.sync_before_hidden_state_capture:
+            # FlashInfer speculative decoding still relies on the target-written
+            # hidden_states_cache buffers being visible before we concatenate them
+            # for verification. TRTLLM attention does not require this sync, and
+            # speculative FlashInfer is currently kept on torch-simple rather than
+            # cudagraph replay.
+            torch.cuda.synchronize()
         hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
         if self.normalize_target_hidden_state:
             # MTP: hidden states are captured at the residual add (pre-normalization).
@@ -967,7 +1026,6 @@ class EagleWrapper(nn.Module):
 
         # ---- Phase 3: Sample ----
         # check dtype/device
-        device = csi.info.device
         ids_dtype = csi.get_arg("input_ids").dtype
 
         # sample tokens from gathered logits
@@ -978,14 +1036,12 @@ class EagleWrapper(nn.Module):
         # 1. idx=0: golden/bonus token for prefill+extend sequences --> guaranteed new token
         # 2. idx>1: target-sampled+accepted/declined tokens from previous draft iteration
         new_tokens_2d_extend = sampled_tokens[num_prefill:].view(num_extend, 1 + self.max_draft_len)
+        new_tokens_2d = self._buf_new_tokens_2d[:num_sequences]
         if num_prefill > 0:
-            new_tokens_2d = torch.zeros(
-                num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
-            )
+            new_tokens_2d.zero_()
             new_tokens_2d[:num_prefill, 0] = sampled_tokens[:num_prefill]
+        if num_extend > 0:
             new_tokens_2d[num_prefill:] = new_tokens_2d_extend
-        else:
-            new_tokens_2d = new_tokens_2d_extend
 
         # ---- Phase 4: Verify ----
         # get original input ids
@@ -1014,7 +1070,8 @@ class EagleWrapper(nn.Module):
         if num_prefill == 0:
             new_tokens_lens = new_tokens_lens_extend
         else:
-            new_tokens_lens = torch.ones(num_sequences, dtype=torch.int32, device=device)
+            new_tokens_lens = self._buf_new_tokens_lens[:num_sequences]
+            new_tokens_lens.fill_(1)
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
@@ -1051,7 +1108,6 @@ class EagleWrapper(nn.Module):
         csi.info.copy_("token_gather_indices", last_accepted_tokens, strict=False)
 
         # ---- Phase 4: Prepare for draft loop and next_new_tokens tensor ----
-        device = csi.info.device
         ids_dtype = output_ids_target.dtype
 
         # store current collected output ids asinput ids for the first iteration of the draft loop
@@ -1060,9 +1116,7 @@ class EagleWrapper(nn.Module):
         # a 2D grid of latest verified + new draft tokens for each sequence. This includes:
         # 1. idx=0: latest verified token or bonus token for prefill+extend sequences
         # 2. idx>1: new draft tokens that will be drafted below
-        next_new_tokens = torch.empty(
-            num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
-        )
+        next_new_tokens = self._buf_next_new_tokens[:num_sequences]
 
         # we can already fill in next_new_tokens for idx=0 which corresponds to last accepted tokens
         # which we already stored in the input_ids for the first draft iteration.
@@ -1091,7 +1145,7 @@ class EagleWrapper(nn.Module):
             # for idx=0 --> we use pre-computed c_offset from the verification step
             # for idx>1 --> we offset uniformly by 1
             if draft_idx == 1:
-                c_offset = torch.ones(num_sequences, dtype=torch.int32, device=device)
+                c_offset = self._buf_c_offset_ones[:num_sequences]
 
             # switch to generate (if not done already), store new tokens, and offset cache
             # can be skipped for last iteration since after we return metadata will be reset

@@ -741,6 +741,7 @@ class ADEngine(ModelEngine):
         flat_gather_indices: List[int] = [] if has_new_tokens else None
         mask_scatter_indices: List[int] = [] if has_new_tokens else None
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        prompt_lens: List[int] = []
         dummy_token = -1
 
         # look at context requests first
@@ -756,6 +757,7 @@ class ADEngine(ModelEngine):
             input_ids.extend(prompt_tokens)
             cu_seqlen.append(len(input_ids))
             input_pos.append(begin_compute)
+            prompt_lens.append(request.orig_prompt_len)
 
             # store extra arguments
             if request.py_multimodal_data is not None:
@@ -797,6 +799,7 @@ class ADEngine(ModelEngine):
 
             cu_seqlen.append(len(input_ids))
             input_pos.append(num_tokens_seen)
+            prompt_lens.append(request.orig_prompt_len)
 
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
@@ -856,6 +859,7 @@ class ADEngine(ModelEngine):
             cu_num_pages=cu_num_pages,
             extra_page_per_seq=extra_page_per_seq,
             slot_idx=state_slot_idx,
+            prompt_lens=prompt_lens,
             gather_context_logits=gather_context_logits,
             _gather_idx=flat_gather_indices,
             _mask_scatter_indices=mask_scatter_indices,
@@ -881,11 +885,11 @@ class ADEngine(ModelEngine):
     @nvtx_range("ad_run_forward")
     def _run_forward(self) -> Dict[str, Optional[torch.Tensor]]:
         """Run model forward and return outputs."""
-        # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
-        if getattr(self.model, "_requires_csi", False):
-            model_output = self.model(cache_seq_interface=self.cache_seq_interface)
+        csi = self.cache_seq_interface
+        if self.spec_config is not None:
+            model_output = self.model(**csi.named_args, cache_seq_interface=csi)
         else:
-            model_output = self.model(**self.cache_seq_interface.named_args)
+            model_output = self.model(**csi.named_args)
 
         # construct output dictionary
         if isinstance(model_output, abc.Mapping):

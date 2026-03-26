@@ -267,8 +267,33 @@ class CachedSequenceInterface:
                 continue
             if kv_ref is None:
                 kv_ref = handler
-            if handler == kv_ref:
+            if handler.is_management_compatible(kv_ref):
                 kv_managed[name] = handler
+                if handler != kv_ref:
+                    ad_logger.warning(
+                        "Managing KV resource %s with a reference handler that is only layout-compatible "
+                        "(reference dtype=%s, candidate dtype=%s, itemsize=%d). This is a debug-oriented "
+                        "compatibility path and not exact handler equality.",
+                        name,
+                        kv_ref.dtype,
+                        handler.dtype,
+                        handler.dtype.itemsize,
+                    )
+            else:
+                ad_logger.warning(
+                    "KV resource %s is not compatible with the managed KV reference and will stay "
+                    "unmanaged (reference: head_dim=%d, dtype=%s, kv_factor=%d, kv_layout=%s; "
+                    "candidate: head_dim=%d, dtype=%s, kv_factor=%d, kv_layout=%s).",
+                    name,
+                    kv_ref.head_dim,
+                    kv_ref.dtype,
+                    kv_ref.kv_factor,
+                    kv_ref.kv_layout,
+                    handler.head_dim,
+                    handler.dtype,
+                    handler.kv_factor,
+                    handler.kv_layout,
+                )
 
         return kv_ref, kv_managed
 

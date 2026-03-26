@@ -22,6 +22,7 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
     _generate_default_piecewise_num_tokens,
+    _get_eagle_extend_capture_draft_len,
 )
 
 
@@ -37,6 +38,77 @@ class ModelWithMultipleInputs(torch.nn.Module):
         if x2 is not None:
             out = out + self.base_model(x2)
         return out
+
+
+class ModelWithOpaqueKwarg(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, x, cache_seq_interface=None):
+        self.forward_calls += 1
+        return x + 1
+
+
+class _DummyBatchInfo:
+    def __init__(self, num_sequences: int):
+        self._num_sequences = num_sequences
+
+    def set_num_sequences(self, num_sequences: int):
+        self._num_sequences = num_sequences
+
+    def get_num_sequences(self):
+        return (self._num_sequences,)
+
+
+class _DummySequenceInfo:
+    def __init__(self, num_sequences: int):
+        self.num_sequences = num_sequences
+        self.batch_info = _DummyBatchInfo(num_sequences)
+
+    def set_num_sequences(self, num_sequences: int):
+        self.num_sequences = num_sequences
+        self.batch_info.set_num_sequences(num_sequences)
+
+
+class _DummyCacheSeqInterface:
+    def __init__(self, num_sequences: int):
+        self.info = _DummySequenceInfo(num_sequences)
+
+
+class ModelWithTokenCountOutputs(torch.nn.Module):
+    def __init__(self, max_num_sequences: int):
+        super().__init__()
+        self.forward_calls = 0
+        self.register_buffer(
+            "template",
+            torch.arange(max_num_sequences * 2, dtype=torch.float32, device="cuda").view(
+                max_num_sequences, 2
+            ),
+        )
+
+    def forward(self, input_ids, position_ids=None, cache_seq_interface=None):
+        self.forward_calls += 1
+        # Tie the output to the captured CUDA graph inputs without changing its shape.
+        return self.template + input_ids.sum() * 0
+
+
+class _DummySpecDecMode:
+    def __init__(self, *, eagle3_one_model: bool = False, mtp_eagle_one_model: bool = False):
+        self._eagle3_one_model = eagle3_one_model
+        self._mtp_eagle_one_model = mtp_eagle_one_model
+
+    def is_eagle3_one_model(self):
+        return self._eagle3_one_model
+
+    def is_mtp_eagle_one_model(self):
+        return self._mtp_eagle_one_model
+
+
+class _DummySpecConfig:
+    def __init__(self, mode: _DummySpecDecMode, max_draft_len):
+        self.spec_dec_mode = mode
+        self.max_draft_len = max_draft_len
 
 
 # Using pytest.mark.parametrize to test multiple cases
@@ -170,6 +242,67 @@ def test_cudagraph_capture_replay(
         assert torch.allclose(original_output, replay_output, atol=atol), (
             "CUDAGraph replay output mismatch"
         )
+
+
+def test_cudagraph_static_opaque_kwarg_falls_back_on_hash_mismatch():
+    """Same opaque kwarg replays; a different object forces eager fallback."""
+    model = ModelWithOpaqueKwarg().to("cuda").eval()
+    compiled_model = CapturedGraph(model, num_batched_inputs=1)
+    batch_size = 4
+    input_data = torch.randn(batch_size, 8, device="cuda")
+    captured_csi = object()
+
+    def get_args_kwargs(bs):
+        return (input_data[:bs],), {"cache_seq_interface": captured_csi}
+
+    with torch.inference_mode():
+        compiled_model.capture_graph(get_args_kwargs, [batch_size])
+
+        calls_after_capture = model.forward_calls
+        replay_output = compiled_model(input_data, cache_seq_interface=captured_csi)
+
+        assert model.forward_calls == calls_after_capture
+        assert torch.allclose(replay_output, input_data + 1)
+
+        eager_output = compiled_model(input_data, cache_seq_interface=object())
+
+        assert model.forward_calls == calls_after_capture + 1
+        assert torch.allclose(eager_output, input_data + 1)
+
+
+def test_cudagraph_spec_mode_replays_and_slices_by_num_sequences():
+    """Spec mode should replay without eager fallback and slice outputs by runtime batch."""
+    model = ModelWithTokenCountOutputs(max_num_sequences=4).eval()
+    compiled_model = CapturedGraph(model, num_batched_inputs=2, spec_mode=True)
+    token_per_seq = 5
+    max_bs = 4
+    max_tokens = max_bs * token_per_seq
+    input_ids = torch.randn(1, max_tokens, device="cuda")
+    position_ids = torch.arange(max_tokens, device="cuda").view(1, max_tokens)
+    captured_csi = _DummyCacheSeqInterface(num_sequences=max_bs)
+
+    def get_args_kwargs(bs):
+        nt = bs * token_per_seq
+        captured_csi.info.set_num_sequences(bs)
+        return (
+            input_ids[:, :nt],
+            position_ids[:, :nt],
+        ), {"cache_seq_interface": captured_csi}
+
+    with torch.inference_mode():
+        compiled_model.capture_graph(get_args_kwargs, [max_bs, 2])
+
+        calls_after_capture = model.forward_calls
+        captured_csi.info.set_num_sequences(2)
+        replay_output = compiled_model(
+            input_ids[:, : 2 * token_per_seq],
+            position_ids[:, : 2 * token_per_seq],
+            cache_seq_interface=captured_csi,
+        )
+
+        assert model.forward_calls == calls_after_capture
+        assert replay_output.shape == (2, 2)
+        torch.testing.assert_close(replay_output, model.template[:2])
 
 
 # ============================================================================
@@ -422,3 +555,36 @@ class TestGenerateDefaultPiecewiseNumTokens:
         result = _generate_default_piecewise_num_tokens(4096)
         # 4096 is already a power of 2, should not be duplicated
         assert result.count(4096) == 1
+
+
+class TestEagleExtendCaptureSelection:
+    """Tests for Eagle-specific extend warmup selection."""
+
+    def test_returns_none_without_spec_config(self):
+        assert _get_eagle_extend_capture_draft_len(None) is None
+
+    def test_returns_draft_len_for_any_spec_config(self):
+        spec_config = _DummySpecConfig(_DummySpecDecMode(), max_draft_len=4)
+        assert _get_eagle_extend_capture_draft_len(spec_config) == 4
+
+    def test_returns_draft_len_for_eagle3_one_model(self):
+        spec_config = _DummySpecConfig(
+            _DummySpecDecMode(eagle3_one_model=True),
+            max_draft_len=4,
+        )
+        assert _get_eagle_extend_capture_draft_len(spec_config) == 4
+
+    def test_returns_draft_len_for_mtp_eagle_one_model(self):
+        spec_config = _DummySpecConfig(
+            _DummySpecDecMode(mtp_eagle_one_model=True),
+            max_draft_len=5,
+        )
+        assert _get_eagle_extend_capture_draft_len(spec_config) == 5
+
+    def test_requires_draft_len_for_selected_modes(self):
+        spec_config = _DummySpecConfig(
+            _DummySpecDecMode(eagle3_one_model=True),
+            max_draft_len=None,
+        )
+        with pytest.raises(ValueError, match="max_draft_len"):
+            _get_eagle_extend_capture_draft_len(spec_config)

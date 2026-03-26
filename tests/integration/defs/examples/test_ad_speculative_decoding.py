@@ -291,12 +291,16 @@ def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: 
 
     Runs Eagle3 one-model speculative decoding with streaming and verifies
     that the acceptance rate is above a minimum threshold.
-    Parameterized over overlap scheduler enabled/disabled.
+    Parameterized over overlap scheduler enabled/disabled using the TRTLLM
+    attention backend.
     """
+    # Eagle one-model speculative decoding is only supported with TRTLLM attention.
+    attn_backend = "trtllm"
     print("\n" + "=" * 80)
     print(
         f"Testing AutoDeploy Eagle3 One-Model Acceptance Rate "
-        f"(overlap={'disabled' if disable_overlap_scheduler else 'enabled'})"
+        f"(overlap={'disabled' if disable_overlap_scheduler else 'enabled'}, "
+        f"attn_backend={attn_backend})"
     )
     print("=" * 80)
 
@@ -321,8 +325,10 @@ def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: 
         world_size=1,
         speculative_config=speculative_config,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        compile_backend="torch-simple",
+        compile_backend="torch-cudagraph",
+        attn_backend=attn_backend,
         max_num_tokens=512,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
     ) as llm:
         _run_acceptance_rate_check(llm, max_draft_len)
 
