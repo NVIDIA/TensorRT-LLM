@@ -216,7 +216,7 @@ transforms:
   mlir_elementwise_fusion:
     stage: post_load_fusion
     enabled: true
-    run_shape_prop: true
+    run_shape_prop: false
     bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion

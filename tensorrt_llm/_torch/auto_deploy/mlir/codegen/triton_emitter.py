@@ -124,12 +124,29 @@ def _is_broadcast_input(val: SSAValue, max_rank: int) -> bool:
 
 
 def _get_ncols(inputs: List[SSAValue]) -> int:
-    """Return the last-dim size from the highest-rank input."""
+    """Return the maximum last-dim size across all highest-rank inputs.
+
+    This determines ``N_COLS`` for the generated Triton kernel.  We take the
+    *maximum* last-dim among all inputs at the highest rank, because some
+    subgraphs mix narrow (e.g. ``(-1, 1)`` gating scalars) and wide
+    (e.g. ``(-1, 2048)`` hidden-state) tensors.  The kernel must process
+    the full row width.
+    """
+    max_rank = 0
+    for inp in inputs:
+        if isinstance(inp.type, TensorType):
+            max_rank = max(max_rank, len(inp.type.get_shape()))
+
+    ncols = 0
     for inp in inputs:
         if isinstance(inp.type, TensorType):
             shape = inp.type.get_shape()
-            if len(shape) >= 2:
-                return shape[-1]
+            if len(shape) == max_rank:
+                ncols = max(ncols, shape[-1])
+
+    if ncols > 0:
+        return ncols
+
     # Fallback: use the last dim of any input
     for inp in inputs:
         if isinstance(inp.type, TensorType):
@@ -179,8 +196,18 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     for i, inp in enumerate(subgraph.inputs):
         val_names[id(inp)] = f"v{i}"
 
-    # Track which inputs are broadcast (1D weights)
+    # Track which inputs are broadcast (lower rank) or narrow (same rank but
+    # last dim < N_COLS, e.g. a gating scalar of shape (-1, 1) in a subgraph
+    # whose row width is 2048).  Both categories need a load pattern that
+    # avoids reading past the end of the actual data.
     broadcast_flags = [_is_broadcast_input(inp, max_rank) for inp in subgraph.inputs]
+    narrow_flags = []
+    for inp in subgraph.inputs:
+        if isinstance(inp.type, TensorType):
+            inp_last_dim = inp.type.get_shape()[-1] if inp.type.get_shape() else 0
+            narrow_flags.append(not _is_broadcast_input(inp, max_rank) and 0 < inp_last_dim < ncols)
+        else:
+            narrow_flags.append(False)
 
     # Build kernel body lines.
     # All computation is done in f32 for numerical stability (matching hand-written
@@ -190,8 +217,19 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     # Load all subgraph inputs and upcast to f32
     for i, inp in enumerate(subgraph.inputs):
         if broadcast_flags[i]:
+            # Lower-rank input (e.g. 1D weight): load with offs only.
             body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask).to(tl.float32)")
+        elif narrow_flags[i]:
+            # Same-rank but narrow last dim (e.g. (-1, 1) gating scalar):
+            # load as a scalar so Triton broadcasts it when used with
+            # full-width (N_COLS) tensors.  This avoids mixing block
+            # sizes within a single kernel program.
+            inp_last_dim = inp.type.get_shape()[-1]
+            body_lines.append(
+                f"    v{i} = tl.load(in{i}_ptr + pid * {inp_last_dim}).to(tl.float32)"
+            )
         else:
+            # Full-row input: load N_COLS elements.
             body_lines.append(
                 f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask).to(tl.float32)"
             )
@@ -280,7 +318,10 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         else:
             raise ValueError(f"Unsupported op for Triton codegen: {op_name}")
 
-    # Store all subgraph outputs, downcasting from f32 to the original dtype
+    # Store all subgraph outputs, downcasting from f32 to the original dtype.
+    # Outputs are always contiguous (allocated via torch.empty_like), so use
+    # ``out_row_off`` (= pid * N_COLS) rather than ``row_off`` (= pid * row_stride).
+    # These differ when inputs are non-contiguous (e.g. from aten.chunk).
     for i, out in enumerate(subgraph.outputs):
         out_name = val_names[id(out)]
         out_rank = _get_tensor_rank(out)
@@ -294,7 +335,7 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             body_lines.append(f"    tl.store(out{i}_ptr + pid, {out_name}{cast})")
         else:
             body_lines.append(
-                f"    tl.store(out{i}_ptr + row_off + offs, {out_name}{cast}, mask=mask)"
+                f"    tl.store(out{i}_ptr + out_row_off + offs, {out_name}{cast}, mask=mask)"
             )
 
     # Build parameter lists
@@ -312,7 +353,8 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     pid = tl.program_id(0)
     offs = tl.arange(0, BLOCK_N)
     mask = offs < N_COLS
-    row_off = pid * row_stride""")
+    row_off = pid * row_stride
+    out_row_off = pid * N_COLS""")
 
     preamble_lines = ["    " + line for line in preamble.splitlines()]
 
@@ -323,15 +365,23 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         f"):\n" + "\n".join(preamble_lines) + "\n" + "\n".join(body_lines) + "\n"
     )
 
-    # Find the highest-rank input index for shape reference in launcher + fake impl.
-    # This avoids using a 1D weight as the shape reference when the activation
-    # tensor (higher rank) should be used.
+    # Find the reference input for shape in launcher + fake impl.
+    # Among highest-rank inputs, pick the one with the largest last dimension.
+    # This ensures we use a full-row activation tensor (e.g. shape (-1, 2048)),
+    # not a narrow gating scalar (e.g. shape (-1, 1)).
     ref_input_idx = 0
     ref_input_rank = 0
+    ref_input_ncols = 0
     for i_inp, inp in enumerate(subgraph.inputs):
         rank = _get_tensor_rank(inp)
-        if rank > ref_input_rank:
+        inp_ncols = (
+            inp.type.get_shape()[-1]
+            if isinstance(inp.type, TensorType) and inp.type.get_shape()
+            else 0
+        )
+        if rank > ref_input_rank or (rank == ref_input_rank and inp_ncols > ref_input_ncols):
             ref_input_rank = rank
+            ref_input_ncols = inp_ncols
             ref_input_idx = i_inp
 
     # Build launcher function
