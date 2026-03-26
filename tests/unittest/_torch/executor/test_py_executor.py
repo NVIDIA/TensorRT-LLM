@@ -210,8 +210,7 @@ class MockPyExecutorForWaiting:
         self.batch_wait_iters_count = 0
 
     def _waiting_requests(self, context_requests, generation_requests):
-        return PyExecutor._waiting_requests(self, context_requests,
-                                            generation_requests)
+        return PyExecutor._waiting_requests(self, context_requests, generation_requests)
 
 
 class TestWaitingRequests:
