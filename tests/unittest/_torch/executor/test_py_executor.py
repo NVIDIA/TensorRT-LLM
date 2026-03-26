@@ -17,6 +17,9 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    _compute_scheduled_tokens,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
 
@@ -195,7 +198,10 @@ def _make_ctx_request(num_tokens, estimated_reusable_tokens=0, is_first_context_
 
 
 class MockPyExecutorForWaiting:
-    """Mock for testing _waiting_requests."""
+    """Mock for testing _waiting_requests.
+
+    Uses _compute_scheduled_tokens from py_executor to avoid mirroring logic.
+    """
 
     def __init__(
         self, max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5, batch_wait_timeout_iters=3
@@ -206,16 +212,8 @@ class MockPyExecutorForWaiting:
         self.batch_wait_iters_count = 0
 
     def _waiting_requests(self, context_requests, generation_requests):
-        """Mirror of PyExecutor._waiting_requests."""
-        num_scheduled_ctx_tokens = 0
-        for ctx_req in context_requests:
-            req_tokens = len(ctx_req.get_tokens(0))
-            reusable = ctx_req.estimated_reusable_tokens if ctx_req.is_first_context_chunk else 0
-            num_scheduled_ctx_tokens += max(1, req_tokens - reusable)
-        num_scheduled_gen_tokens = sum(
-            1 + gen_req.num_draft_tokens for gen_req in generation_requests
-        )
-        num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+        num_scheduled_tokens = _compute_scheduled_tokens(
+            context_requests, generation_requests)
 
         should_waiting = (
             self.batch_wait_iters_count < self.batch_wait_timeout_iters
