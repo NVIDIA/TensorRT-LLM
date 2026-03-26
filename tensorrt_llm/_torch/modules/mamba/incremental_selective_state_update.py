@@ -29,8 +29,138 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from .softplus import softplus
 
 
+# ============================================================================
+# Precompute kernel: CB_scaled, decay_vec.  Writes new cache (old_B,
+# old_dt_proc, old_cumAdt) to the WRITE buffer slot for next step's replay.
+# Grid: (batch, nheads).
+# ============================================================================
+
 @triton.heuristics(
     {"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
+@triton.heuristics(
+    {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics(
+    {"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.jit()
+def _precompute_cb_scaled_kernel(
+    # Input pointers
+    dt_ptr, dt_bias_ptr, A_ptr, B_ptr, C_ptr,
+    # Output pointers
+    cb_scaled_ptr, decay_vec_ptr,
+    # Cache WRITE pointers (write-buffer for next step)
+    old_B_ptr, old_dt_proc_ptr, old_cumAdt_ptr,
+    # Double-buffer index (per cache slot)
+    cache_buf_idx_ptr,
+    state_batch_indices_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr, dstate: tl.constexpr, nheads_ngroups_ratio: tl.constexpr,
+    # dt strides
+    stride_dt_batch, stride_dt_T, stride_dt_head,
+    stride_dt_bias_head, stride_A_head,
+    # B strides
+    stride_B_batch, stride_B_T, stride_B_group, stride_B_dstate,
+    # C strides
+    stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
+    # cb_scaled strides
+    stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch, stride_dv_head, stride_dv_t,
+    # old_B strides: (cache, 2, T, ngroups, dstate)
+    stride_oB_cache, stride_oB_buf, stride_oB_T, stride_oB_group, stride_oB_dstate,
+    # old_dt_proc strides: (cache, 2, T, nheads)
+    stride_odp_cache, stride_odp_buf, stride_odp_T, stride_odp_head,
+    # old_cumAdt strides: (cache, 2, T, nheads)
+    stride_oca_cache, stride_oca_buf, stride_oca_T, stride_oca_head,
+    # Meta-parameters
+    DT_SOFTPLUS: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid_b = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=1)
+
+    # Resolve cache index for writes
+    if HAS_CACHE_BATCH_INDICES:
+        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+        if cache_batch_idx == pad_slot_id:
+            return
+    else:
+        cache_batch_idx = pid_b
+
+    # Read buffer index: replay reads from buf_read.  We WRITE to 1 - buf_read.
+    buf_read = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
+    buf_write = 1 - buf_read
+
+    offs_t = tl.arange(0, BLOCK_SIZE_T)
+    offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
+    t_mask = offs_t < T
+    n_mask = offs_n < dstate
+
+    # --- Load and process dt ---
+    dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
+    dt_all = tl.load(dt_ptr + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
+    dt_proc = dt_all
+    if HAS_DT_BIAS:
+        dt_bias = tl.load(dt_bias_ptr + pid_h * stride_dt_bias_head).to(tl.float32)
+        dt_proc = dt_proc + dt_bias
+    if DT_SOFTPLUS:
+        dt_proc = softplus(dt_proc)
+
+    # --- Compute cumAdt and decay_vec ---
+    A = tl.load(A_ptr + pid_h * stride_A_head).to(tl.float32)
+    cumAdt = tl.cumsum(A * dt_proc, axis=0)
+    decay_vec = tl.exp(cumAdt)
+
+    # --- Store dt_proc, cumAdt to WRITE buffer ---
+    odp_base = old_dt_proc_ptr + cache_batch_idx * stride_odp_cache + buf_write * stride_odp_buf + pid_h * stride_odp_head
+    tl.store(odp_base + offs_t * stride_odp_T, dt_proc, mask=t_mask)
+
+    oca_base = old_cumAdt_ptr + cache_batch_idx * stride_oca_cache + buf_write * stride_oca_buf + pid_h * stride_oca_head
+    tl.store(oca_base + offs_t * stride_oca_T, cumAdt, mask=t_mask)
+
+    # --- Store decay_vec ---
+    dv_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
+    tl.store(dv_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
+
+    # --- Load C and B, compute CB = C @ B^T ---
+    group_idx = pid_h // nheads_ngroups_ratio
+    C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
+    B_ptr += pid_b * stride_B_batch + group_idx * stride_B_group
+
+    C_all = tl.load(C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
+                    mask=t_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
+    B_all = tl.load(B_ptr + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
+                    mask=t_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
+
+    CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
+
+    # --- Scale CB: decay * dt * causal_mask ---
+    causal_mask = offs_t[:, None] >= offs_t[None, :]
+    decay_matrix = tl.exp(cumAdt[:, None] - cumAdt[None, :])
+    CB_scaled = tl.where(causal_mask & t_mask[:, None] & t_mask[None, :],
+                         CB * decay_matrix * dt_proc[None, :], 0.0)
+
+    # --- Store CB_scaled ---
+    cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
+    tl.store(cb_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
+             CB_scaled,
+             mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T))
+
+    # --- Store B to WRITE buffer of old_B cache ---
+    oB_base = (old_B_ptr + cache_batch_idx * stride_oB_cache
+               + buf_write * stride_oB_buf + group_idx * stride_oB_group)
+    tl.store(oB_base + offs_t[:, None] * stride_oB_T + offs_n[None, :] * stride_oB_dstate,
+             B_all.to(tl.bfloat16), mask=t_mask[:, None] & n_mask[None, :])
+
+
+# ============================================================================
+# Main kernel: tl.dot replay + precomputed CB output.
+# Grid: (cdiv(dim, M), batch, nheads).
+# ============================================================================
+
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
 @triton.heuristics({
@@ -43,341 +173,197 @@ from .softplus import softplus
     {"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.jit()
 def _incremental_selective_scan_update_kernel(
-    # Pointers to matrices
+    # Pointers
     state_ptr,
-    old_x_ptr,
-    old_dt_ptr,
-    old_B_ptr,
+    # Cache READ pointers (read-buffer from previous step)
+    old_x_ptr, old_B_ptr, old_dt_proc_ptr, old_cumAdt_ptr,
+    # Cache WRITE pointer (write-buffer for old_x only; B/dt/cumAdt written by precompute)
     prev_num_accepted_tokens_ptr,
-    x_ptr,
-    dt_ptr,
-    dt_bias_ptr,
-    A_ptr,
-    B_ptr,
-    C_ptr,
-    D_ptr,
-    z_ptr,
-    out_ptr,
+    cache_buf_idx_ptr,
+    # New input pointers
+    x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
+    # Precomputed pointers
+    cb_scaled_ptr, decay_vec_ptr,
     state_batch_indices_ptr,
     pad_slot_id,
-    # Matrix dimensions
-    T: tl.constexpr,
-    dim: tl.constexpr,
-    dstate: tl.constexpr,
+    # Dimensions
+    T: tl.constexpr, dim: tl.constexpr, dstate: tl.constexpr,
     nheads_ngroups_ratio: tl.constexpr,
-    # Strides
-    stride_state_batch,
-    stride_state_head,
-    stride_state_dim,
-    stride_state_dstate,
-    stride_old_x_batch,
-    stride_old_x_T,
-    stride_old_x_head,
-    stride_old_x_dim,
-    stride_old_dt_batch,
-    stride_old_dt_T,
-    stride_old_dt_head,
-    stride_old_B_batch,
-    stride_old_B_T,
-    stride_old_B_group,
-    stride_old_B_dstate,
-    stride_x_batch,
-    stride_x_T,
-    stride_x_head,
-    stride_x_dim,
-    stride_dt_batch,
-    stride_dt_T,
-    stride_dt_head,
-    stride_dt_bias_head,
-    stride_A_head,
-    stride_B_batch,
-    stride_B_T,
-    stride_B_group,
-    stride_B_dstate,
-    stride_C_batch,
-    stride_C_T,
-    stride_C_group,
-    stride_C_dstate,
-    stride_D_head,
-    stride_D_dim,
-    stride_z_batch,
-    stride_z_T,
-    stride_z_head,
-    stride_z_dim,
-    stride_out_batch,
-    stride_out_T,
-    stride_out_head,
-    stride_out_dim,
-    # Meta-parameters
-    DT_SOFTPLUS: tl.constexpr,
+    # state strides
+    stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
+    # old_x strides: (cache, T, nheads, dim) — single-buffered
+    stride_ox_cache, stride_ox_T, stride_ox_head, stride_ox_dim,
+    # old_B strides: (cache, 2, T, ngroups, dstate)
+    stride_oB_cache, stride_oB_buf, stride_oB_T, stride_oB_group, stride_oB_dstate,
+    # old_dt_proc strides: (cache, 2, T, nheads)
+    stride_odp_cache, stride_odp_buf, stride_odp_T, stride_odp_head,
+    # old_cumAdt strides: (cache, 2, T, nheads)
+    stride_oca_cache, stride_oca_buf, stride_oca_T, stride_oca_head,
+    # x strides
+    stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
+    # C strides
+    stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
+    # D strides
+    stride_D_head, stride_D_dim,
+    # z strides
+    stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
+    # out strides
+    stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
+    # cb_scaled strides
+    stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch, stride_dv_head, stride_dv_t,
+    # Meta
     BLOCK_SIZE_M: tl.constexpr,
-    HAS_DT_BIAS: tl.constexpr,
-    HAS_D: tl.constexpr,
-    HAS_Z: tl.constexpr,
+    HAS_D: tl.constexpr, HAS_Z: tl.constexpr,
     HAS_CACHE_BATCH_INDICES: tl.constexpr,
-    BLOCK_SIZE_DSTATE: tl.constexpr,
-    LAUNCH_WITH_PDL: tl.constexpr,
-    FAST_FORWARD_REPLAY: tl.constexpr,
-    CB_OUTPUT: tl.constexpr,
-    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr, BLOCK_SIZE_T: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
 
-    # Resolve batch index for cache (state & old_* tensors)
     if HAS_CACHE_BATCH_INDICES:
-        state_batch_indices_ptr += pid_b
-        cache_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
+        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
         if cache_batch_idx == pad_slot_id:
             return
     else:
         cache_batch_idx = pid_b
 
-    # Base pointers for cache-indexed tensors
-    state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
-    old_x_ptr += cache_batch_idx * stride_old_x_batch + pid_h * stride_old_x_head
-    old_dt_ptr += cache_batch_idx * stride_old_dt_batch + pid_h * stride_old_dt_head
-    old_B_ptr += cache_batch_idx * stride_old_B_batch + (pid_h // nheads_ngroups_ratio) * stride_old_B_group
-    prev_num_accepted_tokens_ptr += cache_batch_idx
+    # Double-buffer: read from buf_read, write old_x to buf_write
+    buf_read = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
+    buf_write = 1 - buf_read
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
-    state_ptrs = state_ptr + (offs_m[:, None] * stride_state_dim +
-                              offs_n[None, :] * stride_state_dstate)
-    state_mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
+    offs_t = tl.arange(0, BLOCK_SIZE_T)
+    m_mask = offs_m < dim
+    n_mask = offs_n < dstate
+    t_mask = offs_t < T
+
+    # Load state
+    state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+    state_ptrs = state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+    state_mask = m_mask[:, None] & n_mask[None, :]
     state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
-    prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr)
-
-    if HAS_DT_BIAS:
-        dt_bias_ptr += pid_h * stride_dt_bias_head
-        dt_bias = tl.load(dt_bias_ptr).to(tl.float32)
-    A_ptr += pid_h * stride_A_head
-    A = tl.load(A_ptr).to(tl.float32)
+    prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
 
     # ===================================================================
-    # Phase 1: Replay old tokens to restore true base state.
-    # Compile-time bounded loop (T is constexpr) enables unrolling.
+    # Phase 1: Replay via tl.dot fast-forward (reads from READ buffer)
     # ===================================================================
-    if FAST_FORWARD_REPLAY:
-        # Fast-forward: single reverse pass with no serial state dependency
-        # and no redundant dt loads.
-        #
-        # Process tokens in reverse order.  Maintain `remaining_decay` which
-        # accumulates the decay for all tokens after the current one:
-        #   state += remaining_decay * dt_t * B_t ⊗ x_t   (add contribution)
-        #   remaining_decay *= exp(A * dt_t)                (decay for earlier tokens)
-        # After the loop, apply remaining_decay to the initial state:
-        #   state *= remaining_decay
-        #
-        # Same ops as sequential (T loads each of dt/x/B, T exp, T outer products,
-        # T+1 state multiplies) but no serial dependency on state between iterations.
-        remaining_decay = 1.0
-        for t_fwd in range(T):
-            t = T - 1 - t_fwd
-            if t < prev_num_accepted_tokens:
-                old_x_ptrs = old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim
-                old_B_ptrs = old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate
-                x = tl.load(old_x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-                dt_val = tl.load(old_dt_ptr + t * stride_old_dt_T).to(tl.float32)
-                if HAS_DT_BIAS:
-                    dt_val += dt_bias
-                if DT_SOFTPLUS:
-                    dt_val = softplus(dt_val)
-                B = tl.load(old_B_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
-                state += remaining_decay * dt_val * B[None, :] * x[:, None]
-                remaining_decay *= tl.exp(A * dt_val)
-        state *= remaining_decay
-    else:
-        # Sequential replay: straightforward state update with serial dependency.
-        for t in range(T):
-            if t < prev_num_accepted_tokens:
-                old_x_ptrs = old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim
-                old_B_ptrs = old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate
-                x = tl.load(old_x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-                dt = tl.load(old_dt_ptr + t * stride_old_dt_T).to(tl.float32)
-                if HAS_DT_BIAS:
-                    dt += dt_bias
-                if DT_SOFTPLUS:
-                    dt = softplus(dt)
-                dA = tl.exp(A * dt)
-                B = tl.load(old_B_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
-                dB = B * dt
-                state = state * dA + dB[None, :] * x[:, None]
+    group_idx = pid_h // nheads_ngroups_ratio
 
-    # Write post-replay state back (API contract: state after replay only)
+    # Load precomputed dt_proc and cumAdt from READ buffer
+    odp_base = (old_dt_proc_ptr + cache_batch_idx * stride_odp_cache
+                + buf_read * stride_odp_buf + pid_h * stride_odp_head)
+    old_dt_proc_all = tl.load(odp_base + offs_t * stride_odp_T,
+                              mask=t_mask, other=0.0).to(tl.float32)
+
+    oca_base = (old_cumAdt_ptr + cache_batch_idx * stride_oca_cache
+                + buf_read * stride_oca_buf + pid_h * stride_oca_head)
+    old_cumAdt_all = tl.load(oca_base + offs_t * stride_oca_T,
+                             mask=t_mask, other=0.0).to(tl.float32)
+
+    # Extract cumAdt at prev_k-1 for total decay
+    prev_k_idx = tl.maximum(prev_num_accepted_tokens - 1, 0)
+    total_cumAdt = tl.sum(tl.where(offs_t == prev_k_idx, old_cumAdt_all, 0.0))
+
+    # Compute per-token coefficients
+    coeff = tl.exp(total_cumAdt - old_cumAdt_all) * old_dt_proc_all
+    coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
+
+    # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
+    ox_base = old_x_ptr + cache_batch_idx * stride_ox_cache + pid_h * stride_ox_head
+    old_x_all = tl.load(ox_base + offs_t[:, None] * stride_ox_T + offs_m[None, :] * stride_ox_dim,
+                        mask=t_mask[:, None] & m_mask[None, :], other=0.0).to(tl.float32)
+
+    # Load old_B from READ buffer: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE)
+    oB_base = (old_B_ptr + cache_batch_idx * stride_oB_cache
+               + buf_read * stride_oB_buf + group_idx * stride_oB_group)
+    old_B_all = tl.load(oB_base + offs_t[:, None] * stride_oB_T + offs_n[None, :] * stride_oB_dstate,
+                        mask=t_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
+
+    # Scale B by coefficients
+    dB_scaled = coeff[:, None] * old_B_all
+
+    # Apply total decay to initial state FIRST, then add contributions
+    total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_cumAdt), 1.0)
+    state *= total_decay
+
+    # tl.dot fast-forward: old_x^T @ dB_scaled → (M, dstate)
+    state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
+
+    # Write post-replay state
     tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
 
-    # Set up new input pointers
+    # ===================================================================
+    # Phase 2: Output using precomputed CB_scaled and decay_vec
+    # ===================================================================
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
-    dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
-    B_ptr += pid_b * stride_B_batch + (pid_h //
-                                       nheads_ngroups_ratio) * stride_B_group
-    C_ptr += pid_b * stride_C_batch + (pid_h //
-                                       nheads_ngroups_ratio) * stride_C_group
+    C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
     if HAS_Z:
         z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
 
     if HAS_D:
-        D_ptr += pid_h * stride_D_head
-        D_ptrs = D_ptr + offs_m * stride_D_dim
+        D = tl.load(D_ptr + pid_h * stride_D_head + offs_m * stride_D_dim,
+                    mask=m_mask, other=0.0).to(tl.float32)
 
-    if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_wait()
+    # Load C_all
+    C_all = tl.load(C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
+                    mask=t_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
 
-    # ===================================================================
-    # Phase 2: Process new tokens and compute outputs.
-    # ===================================================================
-    if CB_OUTPUT:
-        # CB formulation using tl.dot for the C·B^T matrix multiply.
-        #
-        #   out_t[m] = exp(A * cumdt_t) * (C_t · state_0)[m]
-        #            + Σ_{j≤t} CB[t,j] * decay(j→t) * dt_j * x_j[m]
-        #
-        # CB = C_all @ B_all^T computed via tl.dot (single matmul, loads
-        # each of C and B exactly once as 2D tiles).
+    # Load x_all and store to old_x (single-buffered, replay already read it)
+    x_all = tl.load(x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
+                    mask=t_mask[:, None] & m_mask[None, :], other=0.0)
+    tl.store(ox_base + offs_t[:, None] * stride_ox_T + offs_m[None, :] * stride_ox_dim,
+             x_all, mask=t_mask[:, None] & m_mask[None, :])
+    x_all = x_all.to(tl.float32)
 
-        if HAS_D:
-            D = tl.load(D_ptr + offs_m * stride_D_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
-
-        # --- Load C_all and B_all as 2D tiles: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE) ---
-        offs_t = tl.arange(0, BLOCK_SIZE_T)
-        t_mask = offs_t < T
-
-        C_all_ptrs = C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate
-        C_all = tl.load(C_all_ptrs, mask=t_mask[:, None] & (offs_n[None, :] < dstate),
+    # Load precomputed CB_scaled and decay_vec
+    cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
+    CB_scaled = tl.load(cb_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
+                        mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
                         other=0.0).to(tl.float32)
 
-        B_all_ptrs = B_ptr + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate
-        B_all = tl.load(B_all_ptrs, mask=t_mask[:, None] & (offs_n[None, :] < dstate),
-                        other=0.0).to(tl.float32)
+    dv_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
+    decay_vec = tl.load(dv_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(tl.float32)
 
-        # CB = C_all @ B_all^T : (BLOCK_SIZE_T, BLOCK_SIZE_T)
-        # Following ssd_chunk_scan pattern: dot inputs in bf16, accumulate in fp32.
-        CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
+    # init_out = C_all @ state^T * decay_vec
+    init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
 
-        # --- Load x_all: (BLOCK_SIZE_T, BLOCK_SIZE_M) ---
-        x_all_ptrs = x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim
-        x_all = tl.load(x_all_ptrs, mask=t_mask[:, None] & (offs_m[None, :] < dim),
-                        other=0.0)
-        # Store x to old_* cache
-        old_x_all_ptrs = old_x_ptr + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim
-        tl.store(old_x_all_ptrs, x_all, mask=t_mask[:, None] & (offs_m[None, :] < dim))
-        x_all = x_all.to(tl.float32)
+    # cb_out = CB_scaled @ x_all
+    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), x_all.to(tl.bfloat16))
 
-        # Store B to old_* cache (reuse B_all before it's freed)
-        old_B_all_ptrs = old_B_ptr + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate
-        tl.store(old_B_all_ptrs, B_all.to(old_B_all_ptrs.dtype.element_ty),
-                 mask=t_mask[:, None] & (offs_n[None, :] < dstate))
+    out_all = init_out + cb_out
 
-        # --- Load and process dt, compute cumulative A*dt ---
-        dt_all_ptrs = dt_ptr + offs_t * stride_dt_T
-        dt_raw_all = tl.load(dt_all_ptrs, mask=t_mask, other=0.0)
-        # Store dt to old_* cache
-        old_dt_all_ptrs = old_dt_ptr + offs_t * stride_old_dt_T
-        tl.store(old_dt_all_ptrs, dt_raw_all, mask=t_mask)
-        dt_proc_all = dt_raw_all.to(tl.float32)
-        if HAS_DT_BIAS:
-            dt_proc_all = dt_proc_all + dt_bias
-        if DT_SOFTPLUS:
-            dt_proc_all = softplus(dt_proc_all)
-        # Inclusive prefix sum for decay: cumAdt[t] = A * (dt_0 + ... + dt_t)
-        cumAdt_all = tl.cumsum(A * dt_proc_all, axis=0)
+    if HAS_D:
+        out_all = out_all + x_all * D[None, :]
 
-        # --- Scale CB matrix: apply decay and dt, enforce causal mask ---
-        # CB_scaled[t,j] = CB[t,j] * exp(cumAdt[t] - cumAdt[j]) * dt[j]  if j <= t
-        #                   0                                               if j > t
-        causal_mask = offs_t[:, None] >= offs_t[None, :]  # lower-triangular
-        decay_matrix = tl.exp(cumAdt_all[:, None] - cumAdt_all[None, :])  # (T, T)
-        CB_scaled = tl.where(causal_mask, CB * decay_matrix * dt_proc_all[None, :], 0.0)
-
-        # --- Compute all outputs via tl.dot (no per-element extraction) ---
-        # 1) Initial state: init_out = C_all @ state^T * decay
-        #    C_all: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE), state: (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE)
-        #    result: (BLOCK_SIZE_T, BLOCK_SIZE_M)
-        decay_vec = tl.exp(cumAdt_all)  # (BLOCK_SIZE_T,)
-        # All dots use bf16 inputs with fp32 accumulation, matching the
-        # precision convention of ssd_chunk_scan (context-phase Mamba2).
-        # State is truncated to bf16 here — this is the state→output projection,
-        # not the state recurrence, so no drift accumulates.
-        init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
-
-        # 2) CB contribution: cb_out = CB_scaled @ x_all
-        #    CB_scaled: (BLOCK_SIZE_T, BLOCK_SIZE_T), x_all: (BLOCK_SIZE_T, BLOCK_SIZE_M)
-        #    result: (BLOCK_SIZE_T, BLOCK_SIZE_M)
-        cb_out = tl.dot(CB_scaled.to(tl.bfloat16), x_all.to(tl.bfloat16))
-
-        # 3) Combine
-        out_all = init_out + cb_out  # (BLOCK_SIZE_T, BLOCK_SIZE_M)
-
-        # Apply D: out += x * D (element-wise, D broadcast over T)
-        if HAS_D:
-            out_all = out_all + x_all * D[None, :]
-
-        # Apply z and store outputs (z is per-token, need to load per t)
-        if HAS_Z:
-            for t in range(T):
-                z_t = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
-                              mask=offs_m < dim, other=0.0).to(tl.float32)
-                # Extract row t from out_all
-                out_t = tl.sum(tl.where((offs_t == t)[:, None], out_all, 0.0), axis=0)
-                out_t = out_t * z_t * tl.sigmoid(z_t)
-                tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim,
-                         out_t, mask=offs_m < dim)
-        else:
-            # Store all outputs at once (2D store)
-            out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
-            tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & (offs_m[None, :] < dim))
-    else:
-        # Sequential state update: straightforward with serial dependency.
+    if HAS_Z:
         for t in range(T):
-            x_ptrs = x_ptr + t * stride_x_T + offs_m * stride_x_dim
-            B_ptrs = B_ptr + t * stride_B_T + offs_n * stride_B_dstate
-            C_ptrs = C_ptr + t * stride_C_T + offs_n * stride_C_dstate
-            out_ptrs = out_ptr + t * stride_out_T + offs_m * stride_out_dim
+            z_t = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
+                          mask=m_mask, other=0.0).to(tl.float32)
+            out_t = tl.sum(tl.where((offs_t == t)[:, None], out_all, 0.0), axis=0)
+            out_t = out_t * z_t * tl.sigmoid(z_t)
+            tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim,
+                     out_t, mask=m_mask)
+    else:
+        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
 
-            x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
-            tl.store(old_x_ptr + t * stride_old_x_T + offs_m * stride_old_x_dim,
-                     x, mask=offs_m < dim)
-            x = x.to(tl.float32)
 
-            dt = tl.load(dt_ptr + t * stride_dt_T)
-            tl.store(old_dt_ptr + t * stride_old_dt_T, dt)
-            dt = dt.to(tl.float32)
-
-            if HAS_DT_BIAS:
-                dt += dt_bias
-            if DT_SOFTPLUS:
-                dt = softplus(dt)
-            dA = tl.exp(A * dt)
-
-            B = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
-            tl.store(old_B_ptr + t * stride_old_B_T + offs_n * stride_old_B_dstate,
-                     B, mask=offs_n < dstate)
-            B = B.to(tl.float32)
-
-            C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
-            if HAS_D:
-                D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-            if HAS_Z:
-                z = tl.load(z_ptr + t * stride_z_T + offs_m * stride_z_dim,
-                            mask=offs_m < dim, other=0.0).to(tl.float32)
-
-            dB = B * dt
-            state = state * dA + dB[None, :] * x[:, None]
-
-            out = tl.sum(state * C[None, :], axis=1)
-            if HAS_D:
-                out += x * D
-            if HAS_Z:
-                out *= z * tl.sigmoid(z)
-            tl.store(out_ptrs, out, mask=offs_m < dim)
-
+# ============================================================================
+# Python wrapper
+# ============================================================================
 
 def incremental_selective_state_update(
     state: torch.Tensor,
-    intermediate_update_inputs: torch.Tensor,
+    old_x: torch.Tensor,
+    old_B: torch.Tensor,
+    old_dt_proc: torch.Tensor,
+    old_cumAdt: torch.Tensor,
+    cache_buf_idx: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -385,48 +371,42 @@ def incremental_selective_state_update(
     B: torch.Tensor,
     C: torch.Tensor,
     out: torch.Tensor,
-    D: torch.Tensor | None =None,
-    z: torch.Tensor | None =None,
-    dt_bias: torch.Tensor | None =None,
-    dt_softplus: bool =False,
-    state_batch_indices: torch.Tensor | None =None,
-    pad_slot_id: int =PAD_SLOT_ID,
+    D: torch.Tensor | None = None,
+    z: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    dt_softplus: bool = False,
+    state_batch_indices: torch.Tensor | None = None,
+    pad_slot_id: int = PAD_SLOT_ID,
     launch_with_pdl=False,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
-    _fast_forward_replay: bool = False,
-    _cb_output: bool = True,
 ):
     """
-    Argument:
-        state: (batch/cache, nheads, dim, dstate), in-place.
-            After the call, contains the state after replaying prev_num_accepted_tokens
-            old tokens (i.e. the "true" base state for this step), NOT after the new tokens.
-        intermediate_update_inputs: (batch/cache, old_T, nheads*dim + nheads + ngroups*dstate)
-            Packed [old_x | old_dt_base | old_B] from the previous step, in-place.
-            On return, the first T slots are overwritten with the new step's x, dt, B.
-        prev_num_accepted_tokens: (batch/cache,) number of old tokens to replay per slot.
-        x: (batch, T, nheads, dim) new token inputs
-        dt: (batch, T, nheads, dim) with stride(-1)==0 (tie_hdim)
-        A: (nheads, dim, dstate) with stride(-1)==0, stride(-2)==0 (tie_hdim)
-        B: (batch, T, ngroups, dstate)
-        C: (batch, T, ngroups, dstate)
-        out: (batch, T, nheads, dim) preallocated output tensor, in-place updated.
-        D: (nheads, dim) optional skip connection
-        z: (nheads, dim) optional gating tensor
-        dt_bias: (nheads, dim) with stride(-1)==0 (tie_hdim)
-        dt_softplus: if True, apply softplus to dt
-        state_batch_indices: (batch,) optional indices mapping each batch element to a
-            cache slot. If None, batch element i maps to slot i.
-            If state_batch_indices is passed, lets the kernel identify padded
-            entries that will not be processed,
-            for example: state_batch_indices = [pad_slot_id, 1, 20, pad_slot_id]
-            in this case, the kernel will not process entries at indices 0 and 3.
-        pad_slot_id: int sentinel value in state_batch_indices marking padding entries.
-        launch_with_pdl: If True, launch with Programmatic Dependent Launch.
-            Requires all inputs other than x, B, and C to already be available.
-            Allows addressing math and state loading to overlap with the prior kernel.
+    Incremental SSM state update with precomputed CB and tl.dot replay.
+
+    Uses double-buffered cache tensors.  cache_buf_idx[slot] indicates which
+    buffer (0 or 1) to READ from for replay.  The WRITE buffer is 1 - read.
+    Caller must flip cache_buf_idx[slot] after each call.
+
+    Arguments:
+        state: (cache, nheads, dim, dstate) in-place.  After the call, contains
+            the state after replaying prev_num_accepted_tokens old tokens.
+        old_x: (cache, T, nheads, dim) bf16 — old x cache (single-buffered).
+        old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
+        old_dt_proc: (cache, 2, T, nheads) fp32 — double-buffered processed dt.
+        old_cumAdt: (cache, 2, T, nheads) fp32 — double-buffered cumulative A*dt.
+        cache_buf_idx: (cache,) int32 — which buffer to read (0 or 1).
+        prev_num_accepted_tokens: (cache,) int32.
+        x: (batch, T, nheads, dim) new token inputs.
+        dt: (batch, T, nheads, dim) with stride(-1)==0 (tie_hdim).
+        A: (nheads, dim, dstate) with stride(-1)==0, stride(-2)==0 (tie_hdim).
+        B: (batch, T, ngroups, dstate).
+        C: (batch, T, ngroups, dstate).
+        out: (batch, T, nheads, dim) preallocated output.
+        D, z, dt_bias: optional, same as before.
+        state_batch_indices: (batch,) optional cache slot mapping.
     """
+    # --- Unsqueeze inputs to canonical shapes ---
     if state.dim() == 3:
         state = state.unsqueeze(1)
     if x.dim() == 2:
@@ -463,42 +443,37 @@ def incremental_selective_state_update(
 
     cache_size, nheads, dim, dstate = state.shape
     batch, T, _, _ = x.shape
+    ngroups = B.shape[2]
+    assert nheads % ngroups == 0
 
     assert x.shape == (batch, T, nheads, dim)
     assert dt.shape == x.shape
     assert A.shape == (nheads, dim, dstate)
-    ngroups = B.shape[2]
-    assert nheads % ngroups == 0, "nheads must be divisible by ngroups"
     assert B.shape == (batch, T, ngroups, dstate)
     assert C.shape == B.shape
-    if D is not None:
-        assert D.shape == (nheads, dim)
-    if z is not None:
-        assert z.shape == x.shape
-    if dt_bias is not None:
-        assert dt_bias.shape == (nheads, dim)
-    if state_batch_indices is not None:
-        assert state_batch_indices.shape == (batch, )
-    assert out.shape == x.shape
+    assert old_x.shape == (cache_size, T, nheads, dim)
+    assert old_B.shape == (cache_size, 2, T, ngroups, dstate)
+    assert old_dt_proc.shape == (cache_size, 2, T, nheads)
+    assert old_cumAdt.shape == (cache_size, 2, T, nheads)
+    assert cache_buf_idx.shape == (cache_size,)
+    assert prev_num_accepted_tokens.shape == (cache_size,)
 
-    assert intermediate_update_inputs.dim() == 3
-    old_T = intermediate_update_inputs.shape[1]
-    assert old_T == T
-    assert intermediate_update_inputs.shape == (cache_size, old_T, nheads * (dim + 1) + ngroups * dstate)
-    old_x, old_dt, old_B = torch.split(intermediate_update_inputs, [nheads*dim, nheads, ngroups*dstate], dim=-1)
-    old_x = rearrange(old_x, "b t (h p) -> b t h p", h = nheads)
-    old_B = rearrange(old_B, "b t (g n) -> b t g n", g = ngroups)
+    tie_hdim = (A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(-1) == 0
+                and (dt_bias is None or dt_bias.stride(-1) == 0))
+    assert tie_hdim
 
-    assert prev_num_accepted_tokens.shape == (cache_size, )
-    assert prev_num_accepted_tokens.stride(0) == 1
+    device = x.device
+    BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
 
-    grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
-    z_strides = ((z.stride(0), z.stride(1), z.stride(2),
-                  z.stride(3)) if z is not None else (0, 0, 0, 0))
-    # We don't want autotune since it will overwrite the state.
-    # Tuned by hand. For large dstate, fewer warps is critical: the (M, dstate)
-    # state matrix lives in registers, and fewer warps means more registers per
-    # thread, avoiding costly spills to local memory.
+    # Allocate precomputed intermediates (per-call, not cached)
+    cb_scaled = torch.empty(batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_T,
+                            device=device, dtype=torch.float32)
+    decay_vec = torch.empty(batch, nheads, BLOCK_SIZE_T,
+                            device=device, dtype=torch.float32)
+
+    z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
+                 if z is not None else (0, 0, 0, 0))
+
     BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
                                ((16, 4) if dstate <= 32 else
                                 ((8, 2) if dstate <= 64 else
@@ -507,79 +482,78 @@ def incremental_selective_state_update(
         BLOCK_SIZE_M = _block_size_m
     if _num_warps is not None:
         num_warps = _num_warps
-    tie_hdim = (A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(-1) == 0
-                and (dt_bias is None or dt_bias.stride(-1) == 0))
 
-    assert tie_hdim
+    HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
 
-    with torch.cuda.device(x.device.index):
-        _incremental_selective_scan_update_kernel[grid](
-            state,
-            old_x,
-            old_dt,
-            old_B,
-            prev_num_accepted_tokens,
-            x,
-            dt,
-            dt_bias,
-            A,
-            B,
-            C,
-            D,
-            z,
-            out,
+    with torch.cuda.device(device.index):
+        # --- Precompute kernel ---
+        _precompute_cb_scaled_kernel[(batch, nheads)](
+            dt, dt_bias, A, B, C,
+            cb_scaled, decay_vec,
+            old_B, old_dt_proc, old_cumAdt,
+            cache_buf_idx,
             state_batch_indices,
             pad_slot_id,
-            T,
-            dim,
-            dstate,
-            nheads // ngroups,
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            old_x.stride(0),
-            old_x.stride(1),
-            old_x.stride(2),
-            old_x.stride(3),
-            old_dt.stride(0),
-            old_dt.stride(1),
-            old_dt.stride(2),
-            old_B.stride(0),
-            old_B.stride(1),
-            old_B.stride(2),
-            old_B.stride(3),
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            x.stride(3),
-            dt.stride(0),
-            dt.stride(1),
-            dt.stride(2),
+            T, dstate, nheads // ngroups,
+            # dt strides
+            dt.stride(0), dt.stride(1), dt.stride(2),
             dt_bias.stride(0) if dt_bias is not None else 0,
             A.stride(0),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            B.stride(3),
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            C.stride(3),
-            *(D.stride(0), D.stride(1)) if D is not None else (0,0),
-            z_strides[0],
-            z_strides[1],
-            z_strides[2],
-            z_strides[3],
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
+            # B strides
+            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+            # C strides
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            # cb_scaled strides
+            cb_scaled.stride(0), cb_scaled.stride(1), cb_scaled.stride(2), cb_scaled.stride(3),
+            # decay_vec strides
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            # old_B strides
+            old_B.stride(0), old_B.stride(1), old_B.stride(2), old_B.stride(3), old_B.stride(4),
+            # old_dt_proc strides
+            old_dt_proc.stride(0), old_dt_proc.stride(1), old_dt_proc.stride(2), old_dt_proc.stride(3),
+            # old_cumAdt strides
+            old_cumAdt.stride(0), old_cumAdt.stride(1), old_cumAdt.stride(2), old_cumAdt.stride(3),
             dt_softplus,
+            HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
+            num_warps=1,
+        )
+
+        # --- Main kernel ---
+        grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
+        _incremental_selective_scan_update_kernel[grid](
+            state,
+            old_x, old_B, old_dt_proc, old_cumAdt,
+            prev_num_accepted_tokens,
+            cache_buf_idx,
+            x, C, D, z, out,
+            cb_scaled, decay_vec,
+            state_batch_indices,
+            pad_slot_id,
+            T, dim, dstate, nheads // ngroups,
+            # state strides
+            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
+            # old_x strides (single-buffered: cache, T, nheads, dim)
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            # old_B strides
+            old_B.stride(0), old_B.stride(1), old_B.stride(2), old_B.stride(3), old_B.stride(4),
+            # old_dt_proc strides
+            old_dt_proc.stride(0), old_dt_proc.stride(1), old_dt_proc.stride(2), old_dt_proc.stride(3),
+            # old_cumAdt strides
+            old_cumAdt.stride(0), old_cumAdt.stride(1), old_cumAdt.stride(2), old_cumAdt.stride(3),
+            # x strides
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            # C strides
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            # D strides
+            *(D.stride(0), D.stride(1)) if D is not None else (0, 0),
+            # z strides
+            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
+            # out strides
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            # cb_scaled strides
+            cb_scaled.stride(0), cb_scaled.stride(1), cb_scaled.stride(2), cb_scaled.stride(3),
+            # decay_vec strides
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
             BLOCK_SIZE_M,
-            LAUNCH_WITH_PDL=launch_with_pdl,
-            FAST_FORWARD_REPLAY=_fast_forward_replay,
-            CB_OUTPUT=_cb_output,
             num_warps=num_warps,
-            launch_pdl=launch_with_pdl,
         )

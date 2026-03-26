@@ -161,17 +161,25 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
     state0 = torch.randn(batch, nheads, head_dim, d_state,
                          device=device, dtype=state_dtype)
 
-    # --- Old inputs for packing into intermediate_update_inputs ---
+    # --- Cache tensors for incremental kernel ---
+    # old_x: single-buffered (cache, T, nheads, dim)
     old_x = torch.randn(batch, mtp_len, nheads, head_dim,
                         device=device, dtype=act_dtype)
-    old_dt_base = torch.randn(batch, mtp_len, nheads,
-                               device=device, dtype=act_dtype)
-    old_B = torch.randn(batch, mtp_len, ngroups, d_state,
+    # old_B: double-buffered (cache, 2, T, ngroups, dstate)
+    old_B = torch.randn(batch, 2, mtp_len, ngroups, d_state,
                         device=device, dtype=act_dtype)
-
-    # intermediate_update_inputs: packed layout for incremental kernel
+    # old_dt_proc: double-buffered (cache, 2, T, nheads) fp32
+    old_dt_proc = torch.randn(batch, 2, mtp_len, nheads,
+                               device=device, dtype=torch.float32)
+    # old_cumAdt: double-buffered (cache, 2, T, nheads) fp32
+    old_cumAdt = torch.randn(batch, 2, mtp_len, nheads,
+                              device=device, dtype=torch.float32)
+    # cache_buf_idx: which buffer to read (0 or 1)
+    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+    # Legacy packed tensor (kept for baseline kernel only)
     old_x_flat = old_x.reshape(batch, mtp_len, nheads * head_dim)
-    old_B_flat = old_B.reshape(batch, mtp_len, ngroups * d_state)
+    old_dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=act_dtype)
+    old_B_flat = old_B[:, 0].reshape(batch, mtp_len, ngroups * d_state)
     intermediate_update_inputs = torch.cat(
         [old_x_flat, old_dt_base, old_B_flat], dim=-1
     ).contiguous()
@@ -197,6 +205,7 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
         device=device, dtype=state_dtype)
 
     return (state0, intermediate_update_inputs,
+            old_x, old_B, old_dt_proc, old_cumAdt, cache_buf_idx,
             x, dt, B, C,
             A, dt_bias, D, prev_tokens,
             out_incr, out_base, intermediate_states_buffer)
@@ -328,6 +337,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     act_dtype_name = str(act_dtype).split(".")[-1]
 
     (state0, intermediate_update_inputs,
+     old_x0, old_B0, old_dt_proc0, old_cumAdt0, cache_buf_idx0,
      x, dt, B, C,
      A, dt_bias, D, prev_tokens,
      out_incr, out_base, intermediate_states_buffer,
@@ -335,10 +345,20 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
 
     state_work = state0.clone()
     interm_work = intermediate_update_inputs.clone()
+    old_x_work = old_x0.clone()
+    old_B_work = old_B0.clone()
+    old_dt_proc_work = old_dt_proc0.clone()
+    old_cumAdt_work = old_cumAdt0.clone()
+    cache_buf_idx_work = cache_buf_idx0.clone()
 
     def _reset():
         state_work.copy_(state0)
         interm_work.copy_(intermediate_update_inputs)
+        old_x_work.copy_(old_x0)
+        old_B_work.copy_(old_B0)
+        old_dt_proc_work.copy_(old_dt_proc0)
+        old_cumAdt_work.copy_(old_cumAdt0)
+        cache_buf_idx_work.copy_(cache_buf_idx0)
 
     show_kernel_col = baseline_fn is not None
 
@@ -377,15 +397,17 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
             for nw in nw_values:
                 def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw):
                     incremental_selective_state_update(
-                        state_work, interm_work, prev_tokens,
+                        state_work,
+                        old_x_work, old_B_work,
+                        old_dt_proc_work, old_cumAdt_work,
+                        cache_buf_idx_work,
+                        prev_tokens,
                         x=x, dt=dt, A=A, B=B, C=C,
                         out=out_incr,
                         D=D, dt_bias=dt_bias, dt_softplus=True,
                         state_batch_indices=None,
                         _block_size_m=bsm,
                         _num_warps=nw,
-                        _fast_forward_replay=args.fast_forward_replay,
-                        _cb_output=args.cb_output,
                     )
 
                 sweep_tag = (tag + (f"_m{bsm}" if bsm else "")

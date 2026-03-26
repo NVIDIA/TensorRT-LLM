@@ -23,6 +23,7 @@ from tensorrt_llm._torch.modules.mamba.incremental_selective_state_update import
     incremental_selective_state_update
 from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
+from tensorrt_llm._torch.modules.mamba.softplus import softplus as softplus_fn
 
 # ---------------------------------------------------------------------------
 # Configs derived from NVIDIA-Nemotron-3-Super-120B-A12B Mamba2 parameters
@@ -45,19 +46,10 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
                                             state_dtype, paged_cache):
     """
     Verify that:
-      incremental_selective_state_update(state0, old_inputs, k, new_x, ...)
+      incremental_selective_state_update(state0, old_caches, k, new_x, ...)
     produces the same output as:
       selective_state_update(state_after_k_old_tokens, new_x, ...)
     and writes state_after_k_old_tokens back to the state tensor.
-
-    Precision note: the incremental kernel accumulates old-token replays in fp32
-    registers before storing back to bf16 memory, and continues using that fp32
-    register value for the new-token output — it does NOT reload from bf16.
-    Therefore the reference intermediate states are captured in float32 to match.
-
-    Parametrized over:
-      - paged_cache=False: state_batch_indices is None (batch == cache slots)
-      - paged_cache=True:  batch=2 scattered into a 4-slot cache (slots 1 and 3)
     """
     T = 6      # number of tokens in each step, draft length + 1
     batch = 2
@@ -83,8 +75,7 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
     dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
     dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
 
-    # D: (nheads, head_dim) — pass to avoid a pre-existing bug in
-    # selective_state_update when D=None (TypeError on `*(strides) if D is not None else 0`)
+    # D: (nheads, head_dim)
     D_base = torch.randn(nheads, device=device, dtype=dtype)
     D = repeat(D_base, "h -> h p", p=head_dim)
 
@@ -101,12 +92,6 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
 
     # -------------------------------------------------------------------
     # Capture intermediate SSM states using selective_state_update.
-    # Precision: Even for bf16 ssm state, use float32 buffer so the captured
-    # states match the fp32 register accumulation inside the incremental
-    # kernel.  (The kernel loads bf16 state0, accumulates in fp32, stores back
-    # to bf16.  A float32 buffer avoids an extra bf16 rounding that would cause
-    # output mismatches.)  Caching requires state_batch_indices
-    # (HAS_STATE_BATCH_INDICES gate).
     # -------------------------------------------------------------------
     states_buffer_f32 = torch.zeros(cache_size, T, nheads, head_dim, d_state,
                                     device=device, dtype=torch.float32)
@@ -125,24 +110,40 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         out=out1,
         disable_state_update=True,
     )
-    # states_buffer_f32[slot, k] = SSM state (fp32) after applying x1[..., k] to state0[slot]
 
     # -------------------------------------------------------------------
-    # Build intermediate_update_inputs:
-    # layout (cache_size, T, nheads*head_dim + nheads + ngroups*d_state)
+    # Build cache tensors for the incremental kernel.
+    # old_x: (cache, T, nheads, dim) bf16 — single-buffered
+    # old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered
+    # old_dt_proc: (cache, 2, T, nheads) fp32 — double-buffered
+    # old_cumAdt: (cache, 2, T, nheads) fp32 — double-buffered
+    # cache_buf_idx: random 0s and 1s to verify indexing correctness
     # -------------------------------------------------------------------
-    old_x_flat = rearrange(x1, "b t h p -> b t (h p)")
-    old_B_flat = rearrange(B1, "b t g n -> b t (g n)")
-    interm_batch = torch.cat([old_x_flat, dt1_base, old_B_flat],
-                             dim=-1).contiguous()
-    if paged_cache:
-        intermediate_update_inputs = torch.zeros(
-            cache_size, T,
-            nheads * head_dim + nheads + ngroups * d_state,
-            device=device, dtype=dtype)
-        intermediate_update_inputs[state_batch_indices] = interm_batch
-    else:
-        intermediate_update_inputs = interm_batch
+    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt_proc = torch.randn(cache_size, 2, T, nheads, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(cache_size, 2, T, nheads, device=device, dtype=torch.float32)
+    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
+
+    # Fill each slot's READ buffer (indexed by cache_buf_idx) with step 1's data.
+    # The OTHER buffer has random garbage to catch indexing bugs.
+    slots = state_batch_indices if paged_cache else slice(None)
+    old_x[slots] = x1
+
+    # Compute processed dt and cumAdt for step 1
+    dt1_proc = dt1_base.float() + dt_bias_base.float()[None, None, :]
+    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
+    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    # Write to each slot's read buffer based on its cache_buf_idx
+    slot_indices = (state_batch_indices.tolist() if paged_cache
+                    else list(range(cache_size)))
+    for i, slot in enumerate(slot_indices):
+        buf = cache_buf_idx[slot].item()
+        batch_idx = i  # maps slot back to the batch index
+        old_B[slot, buf] = B1[batch_idx]
+        old_dt_proc[slot, buf] = dt1_proc[batch_idx]
+        old_cumAdt[slot, buf] = cumAdt1[batch_idx]
 
     # -------------------------------------------------------------------
     # Main loop: test each k (number of old tokens replayed)
@@ -156,18 +157,14 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
         C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
 
-        slots = state_batch_indices if paged_cache else slice(None)
-
-        # Reference state in float32 (matches incremental kernel's fp32 register path)
-        # For k=0: state0 loaded as fp32 (bf16→fp32 is lossless for bf16 values)
-        # For k>0: fp32 state captured after k old tokens
+        # Reference
         ref_state_f32 = state0.float().clone()
         if k > 0:
             ref_state_f32[slots] = states_buffer_f32[slots, k - 1]
 
         ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         selective_state_update(
-            ref_state_f32,   # float32 starting state
+            ref_state_f32,
             x2, dt2, A, B2, C2,
             D=D,
             dt_bias=dt_bias,
@@ -180,9 +177,15 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         test_state = state0.clone()
         prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        # cache_buf_idx stays at its random values — each slot reads from its own buffer
+
         incremental_selective_state_update(
             test_state,
-            intermediate_update_inputs.clone(),
+            old_x.clone(),
+            old_B.clone(),
+            old_dt_proc.clone(),
+            old_cumAdt.clone(),
+            cache_buf_idx.clone(),
             prev_tokens,
             x=x2, dt=dt2, A=A, B=B2, C=C2,
             out=test_out,
@@ -192,16 +195,13 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
             state_batch_indices=state_batch_indices,
         )
 
-        # Output must match.  The incremental kernel uses bf16 tl.dot for the
-        # output phase (C·state and CB·x), matching ssd_chunk_scan convention.
-        # The reference uses scalar fp32 ops, so we allow bf16-level tolerance.
+        # Output: bf16 tl.dot precision (matching ssd_chunk_scan convention)
         torch.testing.assert_close(test_out, ref_out, rtol=2e-2, atol=5e-1,
                                    msg=f"Output mismatch at k={k}")
 
-        # State in memory: incremental kernel stores (state after k old tokens) cast to
-        # state_dtype.  Compare against the float32 reference cast to the same dtype.
+        # State: replay uses tl.dot with bf16 inputs, so allow bf16-level tolerance
         expected_state = (state0[slots] if k == 0
                           else states_buffer_f32[slots, k - 1].to(state_dtype))
         torch.testing.assert_close(test_state[slots], expected_state,
-                                   rtol=1e-2, atol=1e-2,
+                                   rtol=2e-2, atol=5e-1,
                                    msg=f"State mismatch at k={k}")
