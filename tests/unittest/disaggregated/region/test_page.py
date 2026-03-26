@@ -1,69 +1,101 @@
 import numpy as np
-import pytest
 
-from tensorrt_llm._torch.disaggregation.native.region.page import BUFFER_ENTRY_DTYPE, PoolDescriptor
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    BUFFER_ENTRY_DTYPE,
+    KVCachePageTable,
+    LayerGroup,
+    LocalLayer,
+    PhysicalPool,
+    PhysicalPoolGroup,
+    PoolView,
+)
 
 
-def _make_pool_descriptor(base_address=0x10000, slot_bytes=256, num_slots=4):
-    entries = np.array(
+def _make_buffer_entries():
+    return np.array(
         [
-            (0, 0, 0, 128),  # layer_id=0, role=0(KEY), offset=0, size=128
-            (0, 1, 128, 128),  # layer_id=0, role=1(VALUE), offset=128, size=128
+            (0, 0, 0, 128),  # local_layer_id=0, role=0(KEY), offset=0, size=128
+            (0, 1, 128, 128),  # local_layer_id=0, role=1(VALUE), offset=128, size=128
         ],
         dtype=BUFFER_ENTRY_DTYPE,
     )
-    return PoolDescriptor(
-        base_address=base_address,
-        slot_bytes=slot_bytes,
-        num_slots=num_slots,
-        buffer_entries=entries,
+
+
+def test_physical_pool_construction():
+    pool = PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)
+    assert pool.base_address == 0x10000
+    assert pool.slot_bytes == 256
+    assert pool.num_slots == 4
+
+
+def test_physical_pool_roundtrip():
+    pool = PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)
+    d = pool.to_dict()
+    restored = PhysicalPool.from_dict(d)
+    assert restored.base_address == pool.base_address
+    assert restored.slot_bytes == pool.slot_bytes
+    assert restored.num_slots == pool.num_slots
+
+
+def test_pool_view_roundtrip():
+    entries = _make_buffer_entries()
+    pv = PoolView(pool_idx=0, buffer_entries=entries)
+    d = pv.to_dict()
+    restored = PoolView.from_dict(d)
+    assert restored.pool_idx == 0
+    assert len(restored.buffer_entries) == 2
+    assert restored.buffer_entries[0]["offset"] == 0
+    assert restored.buffer_entries[1]["offset"] == 128
+
+
+def test_local_layer_roundtrip():
+    ll = LocalLayer(local_layer_id=0, global_layer_id=5)
+    d = ll.to_dict()
+    restored = LocalLayer.from_dict(d)
+    assert restored.local_layer_id == 0
+    assert restored.global_layer_id == 5
+
+
+def test_layer_group_roundtrip():
+    entries = _make_buffer_entries()
+    lg = LayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=8,
+        sliding_window_size=None,
+        local_layers=[LocalLayer(0, 5), LocalLayer(1, 6)],
+        pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
     )
+    d = lg.to_dict()
+    restored = LayerGroup.from_dict(d)
+    assert restored.pool_group_idx == 0
+    assert restored.kv_head_num_per_rank == 8
+    assert restored.sliding_window_size is None
+    assert len(restored.local_layers) == 2
+    assert len(restored.pool_views) == 1
 
 
-def test_pool_descriptor_construction():
-    pd = _make_pool_descriptor()
-    assert pd.base_address == 0x10000
-    assert pd.slot_bytes == 256
-    assert pd.num_slots == 4
-    assert len(pd.buffer_entries) == 2
-
-
-def test_pool_descriptor_pool_bytes():
-    pd = _make_pool_descriptor(slot_bytes=256, num_slots=4)
-    assert pd.pool_bytes == 1024
-
-    pd2 = _make_pool_descriptor(slot_bytes=512, num_slots=8)
-    assert pd2.pool_bytes == 4096
-
-
-def test_pool_descriptor_get_slot_address():
-    pd = _make_pool_descriptor(base_address=0x10000, slot_bytes=256, num_slots=4)
-    assert pd.get_slot_address(0) == 0x10000
-    assert pd.get_slot_address(1) == 0x10000 + 256
-    assert pd.get_slot_address(3) == 0x10000 + 768
-
-
-def test_pool_descriptor_slot_overflow_raises():
-    pd = _make_pool_descriptor(num_slots=4)
-    with pytest.raises(ValueError, match="slot_id .* >= num_slots"):
-        pd.get_slot_address(4)
-    with pytest.raises(ValueError, match="slot_id .* >= num_slots"):
-        pd.get_slot_address(100)
-
-
-def test_pool_descriptor_get_device_pointer():
-    pd = _make_pool_descriptor(base_address=0x10000, slot_bytes=256, num_slots=4)
-    # slot 0, layer 0, role 0 (KEY) → base + 0*256 + offset(0) = 0x10000
-    assert pd.get_device_pointer(0, layer_id=0, role_enum=0) == 0x10000
-    # slot 0, layer 0, role 1 (VALUE) → base + 0*256 + offset(128) = 0x10080
-    assert pd.get_device_pointer(0, layer_id=0, role_enum=1) == 0x10000 + 128
-    # slot 2, layer 0, role 0 (KEY) → base + 2*256 + offset(0)
-    assert pd.get_device_pointer(2, layer_id=0, role_enum=0) == 0x10000 + 512
-
-
-def test_pool_descriptor_get_device_pointer_not_found():
-    pd = _make_pool_descriptor()
-    with pytest.raises(ValueError, match="Buffer not found"):
-        pd.get_device_pointer(0, layer_id=99, role_enum=0)
-    with pytest.raises(ValueError, match="Buffer not found"):
-        pd.get_device_pointer(0, layer_id=0, role_enum=99)
+def test_kv_cache_page_table_roundtrip():
+    entries = _make_buffer_entries()
+    page_table = KVCachePageTable(
+        tokens_per_block=64,
+        layer_groups=[
+            LayerGroup(
+                pool_group_idx=0,
+                kv_head_num_per_rank=8,
+                sliding_window_size=None,
+                local_layers=[LocalLayer(0, 5)],
+                pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
+            )
+        ],
+        pool_groups=[
+            PhysicalPoolGroup(
+                pools=[PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)]
+            )
+        ],
+    )
+    d = page_table.to_dict()
+    restored = KVCachePageTable.from_dict(d)
+    assert restored.tokens_per_block == 64
+    assert len(restored.layer_groups) == 1
+    assert len(restored.pool_groups) == 1
+    assert restored.pool_groups[0].pools[0].base_address == 0x10000
