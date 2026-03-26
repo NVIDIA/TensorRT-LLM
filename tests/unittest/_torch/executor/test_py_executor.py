@@ -196,7 +196,10 @@ def _make_ctx_request(num_tokens, estimated_reusable_tokens=0, is_first_context_
 
 
 class MockPyExecutorForWaiting:
-    """Mock for testing _waiting_requests."""
+    """Mock for testing _waiting_requests.
+
+    Calls PyExecutor._waiting_requests directly to avoid mirroring logic.
+    """
 
     def __init__(
         self, max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5, batch_wait_timeout_iters=3
@@ -207,20 +210,8 @@ class MockPyExecutorForWaiting:
         self.batch_wait_iters_count = 0
 
     def _waiting_requests(self, context_requests, generation_requests):
-        num_scheduled_tokens = PyExecutor._compute_scheduled_tokens(
-            context_requests, generation_requests
-        )
-
-        should_waiting = (
-            self.batch_wait_iters_count < self.batch_wait_timeout_iters
-            and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
-        )
-        if should_waiting:
-            self.batch_wait_iters_count += 1
-            return []
-
-        self.batch_wait_iters_count = 0
-        return context_requests
+        return PyExecutor._waiting_requests(self, context_requests,
+                                            generation_requests)
 
 
 class TestWaitingRequests:
