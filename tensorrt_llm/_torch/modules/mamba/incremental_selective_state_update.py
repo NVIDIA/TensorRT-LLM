@@ -271,9 +271,9 @@ def _incremental_selective_scan_update_kernel(
     old_cumAdt_all = tl.load(oca_base + offs_t * stride_oca_T,
                              mask=t_mask, other=0.0).to(tl.float32)
 
-    # Extract cumAdt at prev_k-1 for total decay
+    # Load cumAdt at prev_k-1 directly via pointer math (avoids masked reduction)
     prev_k_idx = tl.maximum(prev_num_accepted_tokens - 1, 0)
-    total_cumAdt = tl.sum(tl.where(offs_t == prev_k_idx, old_cumAdt_all, 0.0))
+    total_cumAdt = tl.load(oca_base + prev_k_idx * stride_oca_T).to(tl.float32)
 
     # Compute per-token coefficients
     coeff = tl.exp(total_cumAdt - old_cumAdt_all) * old_dt_proc_all
