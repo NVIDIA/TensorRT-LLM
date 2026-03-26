@@ -304,6 +304,16 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
         has_pp_layer = len(pp_layer_list) > 0
         for layer_idx, layer in enumerate(self.layers):
+            if layer_idx >= num_hidden_layers:
+                # Extra layers (e.g., MTP speculative layers) appended beyond
+                # the base model. Skip their forward on all ranks so they are
+                # no-ops in the main decoder loop, but preserve weights on the
+                # last PP rank where the MTP draft worker needs them.
+                if hasattr(layer, 'skip_forward'):
+                    layer.forward = layer.skip_forward
+                if not mapping.is_last_pp_rank():
+                    remove_weights(layer)
+                continue
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion
