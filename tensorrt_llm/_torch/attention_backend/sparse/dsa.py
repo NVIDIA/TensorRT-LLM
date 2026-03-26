@@ -82,7 +82,7 @@ def _compute_slot_mappings(
 
     # on_update_kv_lens() calls this during CUDA graph capture;
     # .all()/.item() would trigger host-device sync and invalidate capture.
-    if not torch.cuda.is_current_stream_capturing():
+    if not block_indices_in_seq.is_cuda:
         max_blocks = block_offsets.shape[1]
         assert (block_indices_in_seq < max_blocks).all(), \
             f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
