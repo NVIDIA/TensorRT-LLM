@@ -249,6 +249,10 @@ transforms:
   insert_cached_residual_add:
     stage: cache_init
     backend: cached_residual_add
+  initialize_mrope_delta_cache:
+    stage: cache_init
+    run_per_gm: false
+    enabled: false
   initialize_cache:
     stage: cache_init
     expect_mem_change: true

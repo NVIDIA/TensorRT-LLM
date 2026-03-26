@@ -36,6 +36,7 @@ from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.hardware_info import HardwareInfo
 from cutlass.utils.smem_allocator import SmemAllocator
 
+from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel, st_release_gpu
 
 
@@ -374,6 +375,8 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
         num_groups = grid_size // ctas_per_group
         num_rows = input_data.shape[0]
 
+        griddepcontrol_wait()
+
         # ---- Shared memory allocation ----
         smem = SmemAllocator()
 
@@ -557,6 +560,8 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
                 if tidx == 0:
                     st_release_gpu(output_counter_ptr, cutlass.Int32(0))
 
+        griddepcontrol_launch_dependents()
+
     # ------------------------------------------------------------------
     # Host-side launcher (override: adds cluster= launch parameter)
     # ------------------------------------------------------------------
@@ -586,4 +591,5 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
             block=(self.num_threads, 1, 1),
             cluster=(ctas_per_group, 1, 1) if cutlass.const_expr(ctas_per_group > 1) else None,
             stream=stream,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
