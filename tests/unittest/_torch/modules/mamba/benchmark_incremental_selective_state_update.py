@@ -389,46 +389,59 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         tag = (f"incr_b{batch}_mtp{mtp_len}_k{prev_k}"
                f"_s{state_dtype_name}_a{act_dtype_name}")
 
-        bsm_values = ([int(x) for x in args.block_size_m.split(",")]
-                       if args.block_size_m else [None])
-        nw_values = ([int(x) for x in args.num_warps.split(",")]
-                      if args.num_warps else [None])
+        def _parse_sweep(val):
+            if val is None:
+                return [None]
+            return [int(x) for x in val.split(",")]
+
+        bsm_values = _parse_sweep(args.block_size_m)
+        nw_values = _parse_sweep(args.num_warps)
+        ns_values = _parse_sweep(args.num_stages)
+        pnw_values = _parse_sweep(args.precompute_num_warps)
+        pns_values = _parse_sweep(args.precompute_num_stages)
+
         for bsm in bsm_values:
-            for nw in nw_values:
-                def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw):
-                    incremental_selective_state_update(
-                        state_work,
-                        old_x_work, old_B_work,
-                        old_dt_proc_work, old_cumAdt_work,
-                        cache_buf_idx_work,
-                        prev_tokens,
-                        x=x, dt=dt, A=A, B=B, C=C,
-                        out=out_incr,
-                        D=D, dt_bias=dt_bias, dt_softplus=True,
-                        state_batch_indices=None,
-                        _block_size_m=bsm,
-                        _num_warps=nw,
-                    )
+          for nw in nw_values:
+            for ns in ns_values:
+              for pnw in pnw_values:
+                for pns in pns_values:
+                    def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw, ns=ns,
+                                  pnw=pnw, pns=pns):
+                        incremental_selective_state_update(
+                            state_work,
+                            old_x_work, old_B_work,
+                            old_dt_proc_work, old_cumAdt_work,
+                            cache_buf_idx_work,
+                            prev_tokens,
+                            x=x, dt=dt, A=A, B=B, C=C,
+                            out=out_incr,
+                            D=D, dt_bias=dt_bias, dt_softplus=True,
+                            state_batch_indices=None,
+                            launch_with_pdl=args.pdl,
+                            _block_size_m=bsm,
+                            _num_warps=nw,
+                            _num_stages=ns,
+                            _precompute_num_warps=pnw,
+                            _precompute_num_stages=pns,
+                        )
 
-                sweep_tag = (tag + (f"_m{bsm}" if bsm else "")
-                             + (f"_w{nw}" if nw else ""))
-                median_us, p95_us, p99_us = _time_kernel(
-                    args, _run_incr, _reset, sweep_tag)
-
-                sweep_suffix = ""
-                if bsm is not None or nw is not None:
                     parts = []
-                    if bsm is not None:
-                        parts.append(f"M={bsm}")
-                    if nw is not None:
-                        parts.append(f"W={nw}")
-                    sweep_suffix = " " + ",".join(parts)
+                    if bsm is not None: parts.append(f"M={bsm}")
+                    if nw is not None: parts.append(f"W={nw}")
+                    if ns is not None: parts.append(f"S={ns}")
+                    if pnw is not None: parts.append(f"pW={pnw}")
+                    if pns is not None: parts.append(f"pS={pns}")
+                    sweep_suffix = (" " + ",".join(parts)) if parts else ""
+                    sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
-                _print_row(show_kernel_col, "incremental",
-                           batch, mtp_len, prev_k,
-                           state_dtype_name, act_dtype_name,
-                           median_us, p95_us, p99_us,
-                           sweep_suffix)
+                    median_us, p95_us, p99_us = _time_kernel(
+                        args, _run_incr, _reset, sweep_tag)
+
+                    _print_row(show_kernel_col, "incremental",
+                               batch, mtp_len, prev_k,
+                               state_dtype_name, act_dtype_name,
+                               median_us, p95_us, p99_us,
+                               sweep_suffix)
 
 
 def _print_row(show_kernel_col, kernel_name, batch, mtp_len, prev_k,
@@ -559,6 +572,18 @@ def _parse_args() -> argparse.Namespace:
         "--cb-output", action=argparse.BooleanOptionalAction,
         default=False,
         help="Use CB formulation for output phase vs sequential state update.")
+    parser.add_argument(
+        "--pdl", action="store_true", default=False,
+        help="Enable Programmatic Dependent Launch between precompute and main kernels.")
+    parser.add_argument(
+        "--num-stages", type=str, default=None,
+        help="Override num_stages for the main kernel (comma-separated sweep).")
+    parser.add_argument(
+        "--precompute-num-warps", type=str, default=None,
+        help="Override num_warps for precompute kernel (comma-separated sweep).")
+    parser.add_argument(
+        "--precompute-num-stages", type=str, default=None,
+        help="Override num_stages for precompute kernel (comma-separated sweep).")
     return parser.parse_args()
 
 

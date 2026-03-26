@@ -90,6 +90,12 @@ def _precompute_cb_scaled_kernel(
     else:
         cache_batch_idx = pid_b
 
+    # Launch dependent kernels immediately — the main kernel's replay phase
+    # reads from the READ buffer (written by the PREVIOUS step), not from
+    # anything this kernel produces.  The main kernel's gdc_wait() gates
+    # only the output phase which reads cb_scaled/decay_vec.
+    tl.extra.cuda.gdc_launch_dependents()
+
     # Read buffer index: replay reads from buf_read.  We WRITE to 1 - buf_read.
     buf_read = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     buf_write = 1 - buf_read
@@ -218,6 +224,7 @@ def _incremental_selective_scan_update_kernel(
     HAS_D: tl.constexpr, HAS_Z: tl.constexpr,
     HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr, BLOCK_SIZE_T: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -320,6 +327,10 @@ def _incremental_selective_scan_update_kernel(
              x_all, mask=t_mask[:, None] & m_mask[None, :])
     x_all = x_all.to(tl.float32)
 
+    # Wait for precompute kernel (PDL) before reading its outputs
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
+
     # Load precomputed CB_scaled and decay_vec
     cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
     CB_scaled = tl.load(cb_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
@@ -380,6 +391,9 @@ def incremental_selective_state_update(
     launch_with_pdl=False,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
+    _num_stages: int | None = None,
+    _precompute_num_warps: int | None = None,
+    _precompute_num_stages: int | None = None,
 ):
     """
     Incremental SSM state update with precomputed CB and tl.dot replay.
@@ -515,7 +529,8 @@ def incremental_selective_state_update(
             old_cumAdt.stride(0), old_cumAdt.stride(1), old_cumAdt.stride(2), old_cumAdt.stride(3),
             dt_softplus,
             HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
-            num_warps=1,
+            num_warps=_precompute_num_warps or 1,
+            **({'num_stages': _precompute_num_stages} if _precompute_num_stages else {}),
         )
 
         # --- Main kernel ---
@@ -555,5 +570,8 @@ def incremental_selective_state_update(
             # decay_vec strides
             decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
             BLOCK_SIZE_M,
+            LAUNCH_WITH_PDL=launch_with_pdl,
             num_warps=num_warps,
+            **({'num_stages': _num_stages} if _num_stages else {}),
+            launch_pdl=launch_with_pdl,
         )
