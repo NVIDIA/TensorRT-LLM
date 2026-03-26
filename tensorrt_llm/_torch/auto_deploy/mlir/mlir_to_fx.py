@@ -31,6 +31,7 @@ from xdsl.ir import Operation, SSAValue
 from .dialect import (
     AdAdd,
     AdCast,
+    AdExp,
     AdGelu,
     AdGraphInput,
     AdGraphOutput,
@@ -43,7 +44,9 @@ from .dialect import (
     AdRelu,
     AdRMSNorm,
     AdRsqrt,
+    AdSigmoid,
     AdSilu,
+    AdSoftplus,
     AdSplat,
     AdSqrt,
     AdSub,
@@ -132,6 +135,14 @@ class MLIRToFXConverter:
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.relu.default)
         elif isinstance(mlir_op, AdTanh):
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.tanh.default)
+        elif isinstance(mlir_op, AdSigmoid):
+            self._convert_unary_elementwise(
+                mlir_op, graph, metadata, torch.ops.aten.sigmoid.default
+            )
+        elif isinstance(mlir_op, AdExp):
+            self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.exp.default)
+        elif isinstance(mlir_op, AdSoftplus):
+            self._convert_softplus(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdRsqrt):
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.rsqrt.default)
         elif isinstance(mlir_op, AdSqrt):
@@ -224,6 +235,13 @@ class MLIRToFXConverter:
         else:
             target_dtype = op.target_dtype.value.data
         node = graph.call_function(torch.ops.aten.to.dtype, args=(input_node, target_dtype))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_softplus(self, op, graph: Graph, metadata: dict) -> None:
+        """Reconstruct softplus from ``ad.softplus`` (beta=1, threshold=20)."""
+        input_node = self._resolve(op.input)
+        node = graph.call_function(torch.ops.aten.softplus.default, args=(input_node,))
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)
 

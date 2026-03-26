@@ -39,6 +39,7 @@ from xdsl.ir import Block, Region, SSAValue
 from ..utils.node_utils import is_op
 from .dialect import (
     AdAdd,
+    AdExp,
     AdGelu,
     AdGraphInput,
     AdGraphOutput,
@@ -50,7 +51,9 @@ from .dialect import (
     AdRelu,
     AdRMSNorm,
     AdRsqrt,
+    AdSigmoid,
     AdSilu,
+    AdSoftplus,
     AdSplat,
     AdSqrt,
     AdSub,
@@ -209,6 +212,12 @@ class FXToMLIRConverter:
             self._convert_unary_elementwise(node, block, AdRelu)
         elif is_op(node, [torch.ops.aten.tanh, torch.ops.aten.tanh.default]):
             self._convert_unary_elementwise(node, block, AdTanh)
+        elif is_op(node, [torch.ops.aten.sigmoid, torch.ops.aten.sigmoid.default]):
+            self._convert_unary_elementwise(node, block, AdSigmoid)
+        elif is_op(node, [torch.ops.aten.exp, torch.ops.aten.exp.default]):
+            self._convert_unary_elementwise(node, block, AdExp)
+        elif is_op(node, [torch.ops.aten.softplus, torch.ops.aten.softplus.default]):
+            self._convert_unary_elementwise(node, block, AdSoftplus)
         elif is_op(node, [torch.ops.aten.rsqrt, torch.ops.aten.rsqrt.default]):
             self._convert_unary_elementwise(node, block, AdRsqrt)
         elif is_op(node, [torch.ops.aten.sqrt, torch.ops.aten.sqrt.default]):
