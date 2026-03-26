@@ -252,23 +252,6 @@ class AsyncTransferManager:
         return len(self._requests_in_transfer) > 0
 
 
-def _compute_scheduled_tokens(context_requests, generation_requests):
-    """Compute the total number of scheduled tokens for batch waiting decisions.
-
-    For context requests, KV cache reusable tokens are subtracted (only for
-    the first context chunk), with a minimum of 1 compute token per request.
-    For generation requests, each contributes 1 + num_draft_tokens.
-    """
-    num_scheduled_ctx_tokens = 0
-    for ctx_req in context_requests:
-        req_tokens = len(ctx_req.get_tokens(0))
-        reusable = ctx_req.estimated_reusable_tokens if ctx_req.is_first_context_chunk else 0
-        num_scheduled_ctx_tokens += max(1, req_tokens - reusable)
-    num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                   for gen_req in generation_requests)
-    return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
-
-
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -2731,6 +2714,23 @@ class PyExecutor:
                     balanced_context_requests = context_requests
         return balanced_context_requests
 
+    @staticmethod
+    def _compute_scheduled_tokens(context_requests, generation_requests):
+        """Compute the total number of scheduled tokens for batch waiting decisions.
+
+        For context requests, KV cache reusable tokens are subtracted (only for
+        the first context chunk), with a minimum of 1 compute token per request.
+        For generation requests, each contributes 1 + num_draft_tokens.
+        """
+        num_scheduled_ctx_tokens = 0
+        for ctx_req in context_requests:
+            req_tokens = len(ctx_req.get_tokens(0))
+            reusable = ctx_req.estimated_reusable_tokens if ctx_req.is_first_context_chunk else 0
+            num_scheduled_ctx_tokens += max(1, req_tokens - reusable)
+        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
+                                       for gen_req in generation_requests)
+        return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
         """
@@ -2740,7 +2740,7 @@ class PyExecutor:
         - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
         """
 
-        num_scheduled_tokens = _compute_scheduled_tokens(
+        num_scheduled_tokens = self._compute_scheduled_tokens(
             context_requests, generation_requests)
 
         should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
