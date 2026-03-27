@@ -102,6 +102,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _init_sync_policy(self):
         m = self._mapping
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
+        self._ctx_need_pp_sync = m.pp_size > 1
         self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
         pp_allgather: Callable = getattr(self._dist, "pp_allgather")
         self._gen_allgather: Callable = (
@@ -183,9 +184,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
     def _ctx_consensus(self, local_ids: list) -> list:
+        # TP consensus: ensure all TP ranks have peer info
         sync_size = self._dist.tp_size if self._ctx_need_tp_sync else 1
         all_ranks = self._dist.tp_allgather(local_ids) if self._ctx_need_tp_sync else [local_ids]
-        return _find_consensus_request_ids(all_ranks, sync_size)
+        ready_ids = _find_consensus_request_ids(all_ranks, sync_size)
+
+        # PP consensus: ensure all PP ranks have peer info before promoting.
+        # In PP, the first PP rank schedules and propagates to others. If a
+        # request is promoted on the first rank but peer info hasn't arrived
+        # on other ranks, respond_and_send_async on those ranks would fail
+        # to dispatch the KV transfer (gen-first skips listener dispatch).
+        # TODO: This is a workaround for functionality: pp_allgather impacts
+        # the pp loop performance. One possible solution is to let pp rank0
+        # decide the ready request ids, the other pp ranks treat the unready
+        # request as ctx-first requests.
+        if self._ctx_need_pp_sync:
+            pp_all_ranks = getattr(self._dist, "pp_allgather")(ready_ids)
+            ready_ids = _find_consensus_request_ids(pp_all_ranks, self._mapping.pp_size)
+
+        return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
         sync_size = (
@@ -372,15 +389,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
-        # use tp_allgather consensus to promote ready requests to CONTEXT_INIT.
+        # use allgather consensus to promote ready requests to CONTEXT_INIT.
         for req in requests:
             rid = get_unique_rid(req)
             if rid not in self._send_sessions:
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
 
-        # Check which waiting requests have peer info locally, then tp_allgather
-        # consensus so all TP ranks agree before promoting.
+        # Check which waiting requests have peer info locally, then allgather
+        # consensus so all TP/PP ranks agree before promoting.
         # Without consensus, background peer info arriving at different times on
         # different ranks causes scheduling mismatches → hang.
         local_ready = [

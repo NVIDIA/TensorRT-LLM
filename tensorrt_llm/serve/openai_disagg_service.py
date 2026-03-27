@@ -83,9 +83,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             case "generation_first":
                 self._send_disagg_request = self._send_disagg_request_gen_first
                 self._schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+                logger.info(
+                    f"Using generation first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
             case _:
                 self._send_disagg_request = self._send_disagg_request_ctx_first
                 self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+                logger.info(
+                    f"Using context first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
 
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -163,11 +169,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
-                    request_type="context_only", disagg_request_id=disagg_request_id
+                    request_type="context_only",
+                    disagg_request_id=disagg_request_id,
+                    schedule_style=self._schedule_style,
                 ),
                 "stream": False,
                 "stream_options": None,
-                "schedule_style": self._schedule_style,
             }
         )
         return ctx_request
@@ -182,6 +189,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         if ctx_response:
             request.disaggregated_params = ctx_response.choices[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
+            request.disaggregated_params.schedule_style = self._schedule_style
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
@@ -363,27 +371,87 @@ class OpenAIDisaggregatedService(OpenAIService):
         need_ctx = not (await self._check_gen_only_disagg(request))
         ctx_server, gen_server = None, None
         ctx_server_info = None
-        tasks = []
         ctx_req, gen_req = None, None
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
         if need_ctx:
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
-            tasks.append(
-                asyncio.create_task(
-                    self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
-                )
-            )
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,
             disagg_request_id=disagg_request_id,
             ctx_server_info=ctx_server_info,
         )
-        tasks.append(
-            asyncio.create_task(
-                self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+
+        if request.stream and need_ctx:
+            # For streaming gen_first requests, the gen client returns a lazy
+            # async generator whose HTTP POST only fires when iterated. The ctx
+            # server blocks waiting for the gen server's rx session (gen_first
+            # protocol). Using asyncio.gather would deadlock: ctx waits for gen
+            # server, but gen POST is deferred until the generator is consumed,
+            # and the generator isn't consumed until gather returns.
+            #
+            # Fix: eagerly start consuming the gen generator in a background
+            # task so the HTTP POST fires, then pipe chunks through a queue.
+            gen_response = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks
             )
-        )
-        responses = await asyncio.gather(*tasks)
-        return responses[-1]
+
+            queue: asyncio.Queue = asyncio.Queue()
+
+            async def _consume_gen():
+                try:
+                    async for chunk in gen_response:
+                        await queue.put(chunk)
+                except Exception as e:
+                    await queue.put(e)
+                await queue.put(None)  # sentinel
+
+            consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
+
+            # Now send ctx request — gen server has received its request
+            try:
+                await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+            except Exception:
+                consume_task.cancel()
+                try:
+                    await consume_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
+
+            async def _yield_from_queue():
+                try:
+                    while True:
+                        item = await queue.get()
+                        if item is None:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        yield item
+                finally:
+                    if not consume_task.done():
+                        consume_task.cancel()
+                    try:
+                        await consume_task
+                    except asyncio.CancelledError:
+                        pass
+
+            return _yield_from_queue()
+        else:
+            # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
+            # through generator consumption, so asyncio.gather works fine.
+            tasks = []
+            if need_ctx:
+                tasks.append(
+                    asyncio.create_task(
+                        self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                    )
+                )
+            tasks.append(
+                asyncio.create_task(
+                    self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+                )
+            )
+            responses = await asyncio.gather(*tasks)
+            return responses[-1]
