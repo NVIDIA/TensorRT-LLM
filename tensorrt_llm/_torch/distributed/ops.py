@@ -1173,7 +1173,7 @@ class MiniMaxAllReduceRMS(nn.Module):
                                                       self.workspace,
                                                       self.mapping.tp_rank,
                                                       self.mapping.tp_size, eps,
-                                                      False)
+                                                      True)
 
     def forward_qk(self, q: torch.Tensor, k: torch.Tensor,
                    rms_weights_q: torch.Tensor, rms_weights_k: torch.Tensor,
@@ -1188,6 +1188,6 @@ class MiniMaxAllReduceRMS(nn.Module):
             self.mapping.tp_rank,
             self.mapping.tp_size,
             eps,
-            False,
+            True,
         )
         return (out_list[0], out_list[1])

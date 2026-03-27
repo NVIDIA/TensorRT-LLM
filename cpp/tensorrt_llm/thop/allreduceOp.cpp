@@ -1844,6 +1844,7 @@ torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor co
 
     torch::Tensor rms_norm_out = torch::empty_like(input);
     allreduce_params.rms_norm_out = rms_norm_out.mutable_data_ptr();
+    allreduce_params.trigger_completion_at_end = trigger_completion_at_end_;
 
     tensorrt_llm::kernels::minimax_ar::minimax_reduce_rms_op(allreduce_params);
 

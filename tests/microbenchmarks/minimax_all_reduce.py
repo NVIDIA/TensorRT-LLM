@@ -29,78 +29,59 @@ except ImportError:
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.distributed import MiniMaxAllReduceRMS
-from tensorrt_llm._utils import local_mpi_rank, local_mpi_size, nvtx_range
-from tensorrt_llm.bindings.internal.runtime import delay_kernel
+from tensorrt_llm._utils import local_mpi_rank, local_mpi_size, mpi_barrier
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 # MiniMax all-reduce only uses D (hidden_size) 128 and 1536 in practice.
-ALLOWED_HIDDEN_SIZES = (128, 1536)
+ALLOWED_HIDDEN_SIZES = (256, 1536)
 
 # Q+K fused API benchmark dimensions
 QK_Q_DIM = 1536
-QK_K_DIM = 128
+QK_K_DIM = 256
 
 
 def profile_minimax_allreduce_rms(
     mapping: Mapping,
     op: MiniMaxAllReduceRMS,
-    enable_cudagraph: bool = False,
-    inner_loop: int = 200,
-    outer_loop: int = 10,
+    warmup: int = 10,
+    iters: int = 100,
+    inner_loop: int = 8,
     input_tensor=None,
     norm_weight=None,
     eps: float = 1e-5,
 ):
-    def func(loop_num=inner_loop):
-        out = None
-        for _ in range(loop_num):
-            out = op(input_tensor, norm_weight, eps)
-        return out
+    def func():
+        for _ in range(inner_loop):
+            op(input_tensor, norm_weight, eps)
 
-    start = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
-    stop = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
-    graph = torch.cuda.CUDAGraph()
-
-    stream = torch.cuda.Stream()
-    with (
-        torch.cuda.stream(stream),
-        nvtx_range(f"minimax_allreduce_rms: shape={input_tensor.size(0)}x{input_tensor.size(1)}"),
-    ):
-        func(loop_num=1)
-
-        if enable_cudagraph:
-            for i in range(2):
-                func(loop_num=1)
-            with torch.cuda.graph(graph, stream=stream):
-                _ = func()
-
-        delay_kernel(20000, stream)
-
-        torch.cuda.synchronize()
-        torch.cuda.profiler.start()
-
-        for i in range(outer_loop):
-            start[i].record(stream)
-            if enable_cudagraph:
-                graph.replay()
-            else:
-                _ = func()
-            stop[i].record(stream)
-
+    for _ in range(warmup):
+        for i in range(inner_loop):
+            op(input_tensor, norm_weight, eps)
     torch.cuda.synchronize()
-    torch.cuda.profiler.stop()
-    runtimes = [start[i].elapsed_time(stop[i]) for i in range(outer_loop)]
-    median_ms = sorted(runtimes)[len(runtimes) // 2] / inner_loop
-    return median_ms
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        func()
+
+    graph.replay()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    graph.replay()
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1000.0 / (iters * inner_loop)
 
 
 def profile_minimax_allreduce_rms_qk(
     mapping: Mapping,
     op: MiniMaxAllReduceRMS,
-    enable_cudagraph: bool = False,
-    inner_loop: int = 200,
-    outer_loop: int = 10,
+    warmup: int = 10,
+    iters: int = 100,
+    inner_loop: int = 8,
     q_tensor=None,
     k_tensor=None,
     norm_weight_q=None,
@@ -109,56 +90,37 @@ def profile_minimax_allreduce_rms_qk(
 ):
     """Profile the fused Q+K minimax allreduce RMS API (forward_qk)."""
 
-    def func(loop_num=inner_loop):
-        out_q, out_k = None, None
-        for _ in range(loop_num):
-            out_q, out_k = op.forward_qk(q_tensor, k_tensor, norm_weight_q, norm_weight_k, eps)
-        return (out_q, out_k)
+    def func():
+        for _ in range(inner_loop):
+            op.forward_qk(q_tensor, k_tensor, norm_weight_q, norm_weight_k, eps)
 
-    start = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
-    stop = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
-    graph = torch.cuda.CUDAGraph()
-
-    stream = torch.cuda.Stream()
-    n_tok, q_d, k_d = q_tensor.size(0), q_tensor.size(1), k_tensor.size(1)
-    with (
-        torch.cuda.stream(stream),
-        nvtx_range(f"minimax_allreduce_rms_qk: shape={n_tok}x{q_d}+{n_tok}x{k_d}"),
-    ):
-        func(loop_num=1)
-
-        if enable_cudagraph:
-            for i in range(2):
-                func(loop_num=1)
-            with torch.cuda.graph(graph, stream=stream):
-                _ = func()
-
-        delay_kernel(20000, stream)
-
-        torch.cuda.synchronize()
-        torch.cuda.profiler.start()
-
-        for i in range(outer_loop):
-            start[i].record(stream)
-            if enable_cudagraph:
-                graph.replay()
-            else:
-                _ = func()
-            stop[i].record(stream)
-
+    for _ in range(warmup):
+        func()
     torch.cuda.synchronize()
-    torch.cuda.profiler.stop()
-    runtimes = [start[i].elapsed_time(stop[i]) for i in range(outer_loop)]
-    median_ms = sorted(runtimes)[len(runtimes) // 2] / inner_loop
-    return median_ms
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        func()
+
+    graph.replay()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    graph.replay()
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1000.0 / (iters * inner_loop)
 
 
 def minimax_allreduce_benchmark(
     dtype: str = "bfloat16",
     test_range: str = "256,256000000,10",
-    enable_cudagraph: bool = False,
     explore_2d: bool = False,
     save_csv: str = None,
+    warmup: int = 10,
+    iters: int = 100,
 ):
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -176,8 +138,7 @@ def minimax_allreduce_benchmark(
 
     torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
 
-    inner_loop = 200
-    outer_loop = 10
+    inner_loop = 8
     eps = 1e-5
 
     shape_list = []
@@ -213,12 +174,13 @@ def minimax_allreduce_benchmark(
         input_tensor = torch.ones((num_tokens, hidden_size), dtype=torch_dtype, device="cuda")
         norm_weight = torch.randn((hidden_size,), dtype=torch_dtype, device="cuda")
 
-        median_ms = profile_minimax_allreduce_rms(
+        mpi_barrier()
+        median_us = profile_minimax_allreduce_rms(
             mapping=mapping,
             op=op,
-            enable_cudagraph=enable_cudagraph,
+            warmup=warmup,
+            iters=iters,
             inner_loop=inner_loop,
-            outer_loop=outer_loop,
             input_tensor=input_tensor,
             norm_weight=norm_weight,
             eps=eps,
@@ -238,15 +200,12 @@ def minimax_allreduce_benchmark(
                             "hidden_size": [hidden_size],
                             "q_dim": [pd.NA],
                             "k_dim": [pd.NA],
-                            "time (us)": [median_ms * 1000],
+                            "time (us)": [median_us],
                         }
                     ),
                 ]
             )
-            print(
-                f"num_tokens: {num_tokens}, hidden_size: {hidden_size}, "
-                f"time (us): {median_ms * 1000}"
-            )
+            print(f"num_tokens: {num_tokens}, hidden_size: {hidden_size}, time (us): {median_us}")
 
     # Q+K fused API benchmark: q_dim=1536, k_dim=128
     num_tokens_qk = sorted({n for n, _ in shape_list})
@@ -261,12 +220,13 @@ def minimax_allreduce_benchmark(
         if message_size_bytes_qk > max_workspace:
             continue
 
-        median_ms_qk = profile_minimax_allreduce_rms_qk(
+        mpi_barrier()
+        median_us_qk = profile_minimax_allreduce_rms_qk(
             mapping=mapping,
             op=op,
-            enable_cudagraph=enable_cudagraph,
+            warmup=warmup,
+            iters=iters,
             inner_loop=inner_loop,
-            outer_loop=outer_loop,
             q_tensor=q_tensor,
             k_tensor=k_tensor,
             norm_weight_q=norm_weight_q,
@@ -288,14 +248,14 @@ def minimax_allreduce_benchmark(
                             "hidden_size": [pd.NA],
                             "q_dim": [QK_Q_DIM],
                             "k_dim": [QK_K_DIM],
-                            "time (us)": [median_ms_qk * 1000],
+                            "time (us)": [median_us_qk],
                         }
                     ),
                 ]
             )
             print(
                 f"qk: num_tokens: {num_tokens}, q_dim: {QK_Q_DIM}, k_dim: {QK_K_DIM}, "
-                f"time (us): {median_ms_qk * 1000}"
+                f"time (us): {median_us_qk}"
             )
 
     if mapping.rank == 0:
@@ -321,15 +281,17 @@ if __name__ == "__main__":
         help="min_size,max_size,multiplicative_ratio",
     )
     parser.add_argument("--explore_2d", action="store_true", default=False)
-    parser.add_argument("--enable_cudagraph", action="store_true")
     parser.add_argument("--save_csv", type=str, default=None)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=100)
 
     args = parser.parse_args()
 
     minimax_allreduce_benchmark(
         args.dtype,
         args.range,
-        args.enable_cudagraph,
         args.explore_2d,
         args.save_csv,
+        args.warmup,
+        args.iters,
     )
