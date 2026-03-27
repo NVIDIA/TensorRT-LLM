@@ -184,15 +184,12 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
-        if (
-            self.pipeline._warmed_up_shapes
-            and (req.height, req.width, req.num_frames) not in self.pipeline._warmed_up_shapes
-        ):
+        cache_key = self.pipeline.warmup_cache_key(req.height, req.width, num_frames=req.num_frames)
+        if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
             logger.warning(
-                f"Requested shape (height={req.height}, width={req.width}, "
-                f"num_frames={req.num_frames}) "
-                f"was not warmed up. First request with this shape will be slower due to "
-                f"torch.compile recompilation or CUDA graph capture."
+                f"Requested shape {cache_key} was not warmed up. "
+                f"First request with this shape will be slower due to "
+                f"torch.compile recompilation or CUDA graph capture. "
                 f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
             )
         try:

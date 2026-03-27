@@ -216,7 +216,7 @@ def _register_fake():
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
-        return torch.empty_like(input).to(torch.float8_e4m3fn), scale
+        return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale.clone()
 
     @torch.library.register_fake("trtllm::fp4_quantize")
     def _(
