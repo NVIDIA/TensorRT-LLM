@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .flux_kontext_pipeline import ditFluxKontextPipeline
 from .wan_pipeline import ditWanImageToVideoPipeline, ditWanPipeline
 
-__all__ = ["ditWanPipeline", "ditWanImageToVideoPipeline"]
+__all__ = [
+    "ditWanPipeline",
+    "ditWanImageToVideoPipeline",
+    "ditFluxKontextPipeline",
+]
