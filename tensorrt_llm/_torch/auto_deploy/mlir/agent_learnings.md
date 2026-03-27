@@ -340,3 +340,51 @@ value 0 places an op at the front incorrectly.
 (`_topo_sort_subgraph`) that builds a proper topological sort from the
 subgraph's internal dependency edges. Ties are broken by block position for
 determinism.
+
+______________________________________________________________________
+
+## 13. Unsupported dtype crashes FX-to-MLIR conversion
+
+**Symptom:** `ValueError: Unsupported torch dtype for MLIR conversion: torch.complex64` on Llama-4-Scout during `FXToMLIRConverter.convert()`.
+
+**Root cause:** The FX graph contains tensors with `complex64` dtype (from
+rotary position embeddings). `torch_dtype_to_mlir()` in `dialect.py` has no
+mapping for complex types. Since the MLIR pass is enabled by default, any
+model with unsupported dtypes in its FX graph would crash.
+
+**Fix:** Wrapped the `converter.convert()` call in
+`mlir_elementwise_fusion.py` with a `try/except ValueError` that logs a
+warning and returns the original graph unchanged (`skipped=True`). The model
+runs correctly without MLIR fusion.
+
+**Lesson:** The MLIR pass must be fail-safe — unsupported ops or dtypes
+should cause a graceful skip, not a crash. Any new dtype encountered in the
+wild should be added to `_TORCH_TO_MLIR_DTYPE` if MLIR/Triton can handle it,
+or left to trigger the graceful skip.
+
+______________________________________________________________________
+
+## 14. MLIR-to-FX back-conversion drops GraphModule methods
+
+**Symptom:** `AttributeError: 'GraphModule' object has no attribute 'get_input_embeddings'` on Mistral-Small-3.1 (multimodal model) during
+CUDA graph capture, after MLIR fusion succeeds.
+
+**Root cause:** `MLIRToFXConverter.convert()` created a fresh
+`GraphModule(original_gm, graph)`. The `GraphModule` constructor copies
+submodules and parameters but does NOT copy class methods defined on the
+original model (e.g. `get_input_embeddings`). Downstream code
+(`modeling_mistral3.py`) calls `self.language_model.get_input_embeddings()`
+on the returned GM, which no longer has that method.
+
+**Fix:** After constructing the new `GraphModule`, iterate over the original
+GM's public callable attributes and copy any that are missing on the new GM
+via `setattr`. This preserves methods like `get_input_embeddings` without
+modifying the graph structure.
+
+Note: an in-place approach (`original_gm.graph = graph; recompile()`) was
+tried first but broke DeepSeek-V3 due to lost shape/export metadata.
+
+**Lesson:** When round-tripping through an IR (FX → MLIR → FX), the
+reconstructed `GraphModule` must preserve not just the graph and parameters
+but also any callable methods that downstream code relies on. Test with
+multimodal models that have extra methods on their graph modules.
