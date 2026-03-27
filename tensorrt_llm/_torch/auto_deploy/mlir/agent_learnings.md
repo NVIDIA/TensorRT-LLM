@@ -7,6 +7,38 @@ similar issues.
 
 ______________________________________________________________________
 
+## E2E Testing
+
+The MLIR elementwise fusion pass is enabled by default in
+`tensorrt_llm/_torch/auto_deploy/config/default.yaml`. To test it end-to-end,
+run AutoDeploy's `build_and_run_ad.py` script with any supported model:
+
+```bash
+# General pattern (uses default.yaml which has mlir_elementwise_fusion enabled)
+python examples/auto_deploy/build_and_run_ad.py \
+    --args.model=<HF_MODEL_PATH_OR_NAME>
+
+# Example with a specific config overlay (e.g. for Nano/Mamba models)
+python examples/auto_deploy/build_and_run_ad.py \
+    --args.model=$MODEL \
+    --args.yaml-extra=examples/auto_deploy/nano_v3.yaml
+```
+
+**What to verify in the logs:**
+
+- `[APPLY] Decomposed N high-level ops into primitives` — FX ops lowered to MLIR
+- `[APPLY] Discovered N fusible subgraphs (total ops: M)` — subgraph discovery succeeded
+- No `RuntimeError` or `KeyError` during kernel generation
+- Successful model inference output at the end
+
+**Models available on this cluster** (under `$LLM_MODELS_ROOT`):
+
+- `Qwen2.5-3B-Instruct` — small, fast sanity check
+- `Qwen3/Qwen3-0.6B` — smallest Qwen3 model
+- `DeepSeek-R1/DeepSeek-R1` — full 671B MoE (requires multi-GPU)
+
+______________________________________________________________________
+
 ## 1. Missing FX↔MLIR converter handlers for new ops
 
 **Symptom:** `ValueError: FX node not found for MLIR value` during
@@ -198,3 +230,113 @@ intermediates in registers) outweighs any standalone kernel speed advantage.
 **Lesson:** Always benchmark e2e under CUDA graphs, not standalone kernel
 speed. Fusion scope (fewer kernels, fewer memory round-trips) matters more
 than individual kernel optimization.
+
+______________________________________________________________________
+
+## 9. PyTorch 64-argument limit for custom op schemas
+
+**Symptom:** `RuntimeError: The function schema has 257 arguments but this PyTorch build only supports 64` on DeepSeek-R1-Distill-Qwen-32B (64 layers)
+during AutoDeploy benchmark on H100.
+
+**Root cause:** The greedy subgraph discovery merges all connected fusible ops
+into maximal subgraphs. For models with many layers, shared weights (e.g. a
+single rmsnorm weight used across layers) connect elementwise ops from all
+layers into one subgraph. DeepSeek-R1-Distill-Qwen-32B had 4 subgraphs with
+1035 total ops, one subgraph having 257 external inputs. Since each input
+becomes a positional `torch.Tensor` argument in the `torch.library.custom_op`
+registration, this exceeded PyTorch's hard limit of 64 schema arguments.
+
+**Fix:** Added a post-discovery splitting step in `subgraph_discovery.py`.
+After building maximal subgraphs, any subgraph with more than 64 inputs is
+split into smaller partitions via a placement-aware greedy walk. Each
+partition respects two constraints: (1) external input count ≤ 64, and
+(2) valid block placement — the latest input producer must come before the
+earliest output consumer in the MLIR block. Values produced in one partition
+and consumed in another become cross-partition I/O automatically.
+
+**Lesson:** `torch.library.custom_op` has a 64-argument schema limit.
+Subgraph discovery must enforce this as a hard constraint. Models with many
+layers and shared weights are particularly prone to creating oversized
+subgraphs.
+
+______________________________________________________________________
+
+## 10. Stale subgraph inputs after sequential replacement
+
+**Symptom:** `KeyError` in `triton_emitter.py` (`val_names` missing an
+operand) when the second or later subgraph is processed. Diagnostic shows
+`producer=ad.opaque, producer_in_subgraph=False, operand_in_inputs=False`.
+
+**Root cause:** Subgraphs are discovered in one pass but replaced
+sequentially. When subgraph A is replaced with a fused `ad.opaque`,
+`SSAValue.replace_by()` redirects downstream operands to the fused op's
+outputs. Subgraph B, discovered before the replacement, still holds OLD
+SSAValues in its `inputs` list. The ops' operands now point to NEW
+SSAValues (from the fused op), but `subgraph.inputs` was never updated.
+The triton emitter seeds `val_names` from the stale inputs, so the ops'
+actual operands don't match.
+
+**Fix:** Added `FusibleSubgraph.refresh_inputs()` which recomputes external
+inputs from the ops' current operands. Called in
+`mlir_elementwise_fusion.py` before `generate_kernel_from_subgraph()`.
+
+**Lesson:** When subgraphs are discovered ahead-of-time but replaced
+iteratively, earlier replacements invalidate later subgraphs' metadata.
+Always refresh I/O from the current IR state before operating on a subgraph.
+
+______________________________________________________________________
+
+## 11. Fused op placement violation from cross-layer partitions
+
+**Symptom:** `ValueError: FX node not found for MLIR value produced by 'ad.opaque'` during MLIR-to-FX back-conversion. The fused op producing the
+needed value was never converted — diagnostic shows
+`any_producer_result_mapped=False`.
+
+**Root cause:** Subgraph splitting (issue #9) only considered the input
+count limit, not block placement. When a subgraph spans the entire model
+(e.g. rmsnorm ops from all 36 layers of Qwen2.5-3B), a partition could
+contain ops from many layers. The partition's output consumers (SwiGLU ops)
+are interspersed with its input producers (attention ops) throughout the
+block:
+
+```
+attn_0 → rmsnorm_0 → swiglu_0 → attn_1 → rmsnorm_1 → swiglu_1 → ...
+```
+
+The fused op must be placed after ALL input producers (e.g. `attn_35`) but
+also before ALL output consumers (e.g. `swiglu_0`). When `attn_35` appears
+after `swiglu_0` in the block, no valid position exists. The replacement
+inserted the fused op after the latest input — i.e. after `attn_35` — which
+is after most SwiGLU consumers. The MLIR-to-FX converter walks the block in
+order, encounters the SwiGLU before the fused op, and fails.
+
+**Fix:** Made `_split_subgraph` placement-aware. For each candidate
+partition it tracks both `max_input_pos` (latest input producer in the
+block) and `min_consumer_pos` (earliest output consumer). When adding an op
+would make `max_input_pos >= min_consumer_pos`, the partition is flushed and
+a new one started. This ensures every partition can be placed at a valid
+block position.
+
+**Lesson:** Subgraph splitting must respect block topology, not just input
+count. A partition is only viable if all its input producers precede all its
+output consumers in the MLIR block. For models where fusible ops are
+interleaved with non-fusible consumers (the common transformer pattern),
+this naturally produces per-layer partitions.
+
+______________________________________________________________________
+
+## 12. Topological ordering of ops within subgraphs
+
+**Symptom:** Intermittent `KeyError` in `triton_emitter.py` where an op's
+operand (produced by another op in the same subgraph) hasn't been added to
+`val_names` yet.
+
+**Root cause:** The original code sorted subgraph ops using block-level
+position (`topo_order.get(o, 0)`) which can produce incorrect ordering when
+group merging changes the ops' relative positions, or when the fallback
+value 0 places an op at the front incorrectly.
+
+**Fix:** Replaced `sort(key=topo_order.get(o,0))` with Kahn's algorithm
+(`_topo_sort_subgraph`) that builds a proper topological sort from the
+subgraph's internal dependency edges. Ties are broken by block position for
+determinism.

@@ -285,6 +285,6 @@ transforms:
     expect_mem_change: true
     run_per_gm: false
     cuda_graph_batch_sizes: null
-    backend: torch-compile
+    backend: torch-cudagraph
     piecewise_enabled: false
     piecewise_num_tokens: null

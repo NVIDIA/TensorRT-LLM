@@ -135,6 +135,10 @@ class MLIRElementwiseFusion(BaseTransform):
                 num_skipped += 1
                 continue
             try:
+                # Refresh inputs: earlier subgraph replacements may have
+                # redirected operands via SSAValue.replace_by(), making the
+                # inputs list computed at discovery time stale.
+                sg.refresh_inputs()
                 kernel_fn = generate_kernel_from_subgraph(sg)
                 if kernel_fn is not None:
                     sg_hash = KernelCache.hash_subgraph(sg)
