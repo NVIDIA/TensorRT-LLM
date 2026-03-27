@@ -30,7 +30,7 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
-from ..modules.linear import Linear
+from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -132,13 +132,15 @@ class MiniMaxRMSNorm(nn.Module):
 
         self.minimax_all_reduce_rms = MiniMaxAllReduceRMS(mapping=self.mapping)
 
-    # TODO: add load weights method
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
-        slice_width = self.hidden_size
-        slice_start = self.mapping.tp_rank * slice_width
-        slice_end = slice_start + slice_width
-        self.weight.copy_(weights[0]["weight"][slice_start:slice_end].to(self.weight.dtype))
+        weight = load_weight_shard(
+            weights[0]["weight"],
+            tensor_parallel_size=self.mapping.tp_size,
+            tensor_parallel_rank=self.mapping.tp_rank,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+        )
+        copy_weight(self.weight, weight)
 
     def forward(self, hidden_states: torch.Tensor):
         """
