@@ -144,6 +144,10 @@ class TRTLLMGenFusedMoE(MoE):
             )
 
         if quant_algo is None:
+            if swiglu_gptoss_style:
+                return _warn_and_return(
+                    "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
+                )
             if not cls._is_flashinfer_fused_moe_available():
                 return _warn_and_return(
                     "TRTLLMGenFusedMoE unquantized BF16 path requires FlashInfer fused MoE "
