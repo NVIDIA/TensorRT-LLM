@@ -109,8 +109,18 @@ class MLIRToFXConverter:
         # original FX names (including precisely-lowered ops like add/rmsnorm).
         self._build_node_name_map_from_graph(graph)
 
-        # Build the new GraphModule reusing the original module's parameters
+        # Build the new GraphModule reusing the original module's parameters.
+        # Copy callable attributes (e.g. get_input_embeddings) from the
+        # original GM that aren't present on the new one, so downstream code
+        # that calls these methods still works.
         new_gm = GraphModule(self._original_gm, graph)
+        for attr_name in dir(self._original_gm):
+            if (
+                not attr_name.startswith("_")
+                and callable(getattr(self._original_gm, attr_name, None))
+                and not hasattr(new_gm, attr_name)
+            ):
+                setattr(new_gm, attr_name, getattr(self._original_gm, attr_name))
         return new_gm
 
     # ------------------------------------------------------------------

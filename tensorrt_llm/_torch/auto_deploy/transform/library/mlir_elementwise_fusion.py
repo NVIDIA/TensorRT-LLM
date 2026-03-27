@@ -92,7 +92,13 @@ class MLIRElementwiseFusion(BaseTransform):
 
         # Step 1: FX -> MLIR
         converter = FXToMLIRConverter(gm)
-        mlir_module = converter.convert()
+        try:
+            mlir_module = converter.convert()
+        except ValueError as e:
+            # Gracefully skip if the graph contains unsupported dtypes (e.g.
+            # complex64 in rotary embeddings) or other FX→MLIR conversion issues.
+            self._log_warning(f"Skipping MLIR fusion (FX→MLIR conversion failed): {e}")
+            return gm, TransformInfo(skipped=True)
 
         # Step 2: Decompose high-level ops into primitives
         num_decomposed = run_decomposition(mlir_module)
