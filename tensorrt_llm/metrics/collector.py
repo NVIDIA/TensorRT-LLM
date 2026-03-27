@@ -40,10 +40,19 @@ class MetricsCollector:
         trtllm_request_queue_time_seconds
         trtllm_kv_cache_hit_rate
         trtllm_kv_cache_utilization
+        trtllm_num_requests_waiting
+        trtllm_num_requests_running
+        trtllm_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
 
     def __init__(self, labels: Dict[str, str]) -> None:
+        """Initialize Prometheus metrics with the given labels.
+
+        Args:
+            labels: Key-value pairs added as metadata to all metrics
+                (e.g. ``{"model_name": "llama", "engine_type": "trtllm"}``).
+        """
         from prometheus_client import Counter, Gauge, Histogram
         self.last_log_time = time.time()
         self.labels = labels
@@ -108,6 +117,28 @@ class MetricsCollector:
                                           "kv_cache_utilization",
                                           documentation="KV cache utilization",
                                           labelnames=self.labels.keys())
+
+        self.num_requests_waiting = Gauge(
+            name=self.metric_prefix + "num_requests_waiting",
+            documentation=
+            "Current number of requests waiting in the queue.",
+            labelnames=self.labels.keys())
+        self.num_requests_running = Gauge(
+            name=self.metric_prefix + "num_requests_running",
+            documentation=
+            "Current number of requests actively being processed.",
+            labelnames=self.labels.keys())
+
+        self.cache_config_info = Gauge(
+            name=self.metric_prefix + "cache_config_info",
+            documentation=
+            "Information about the KV cache configuration.",
+            labelnames=[*self.labels.keys(), "block_size", "num_gpu_blocks"])
+
+        # Initialize gauges so they appear in /prometheus/metrics at startup
+        self._log_gauge(self.num_requests_waiting, 0)
+        self._log_gauge(self.num_requests_running, 0)
+        self._log_gauge(self.kv_cache_utilization, 0)
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
@@ -182,16 +213,22 @@ class MetricsCollector:
         This method updates Prometheus metrics including:
         - kv_cache_hit_rate
         - kv_cache_utilization
+        - num_requests_waiting
+        - num_requests_running
+        - cache_config_info
 
         Args:
             iteration_stats: A JSON dict returned from `BaseLLM.get_stats()` containing iteration-level statistics
                 with the following expected structure:
+                - "numQueuedRequests" (int): Number of requests waiting in the queue.
+                - "numActiveRequests" (int): Number of requests actively being processed.
                 - "kvCacheStats" (dict): KV cache statistics containing:
                     - "cacheHitRate" (float): Cache hit rate (0.0 to 1.0). If present (including zero),
                       the kv_cache_hit_rate gauge is updated.
                     - "usedNumBlocks" (int): Number of KV cache blocks currently in use.
                     - "maxNumBlocks" (int): Maximum number of KV cache blocks available. Should always be
                       non-zero.
+                    - "tokensPerBlock" (int): Number of tokens per KV cache block.
 
         Returns:
             None: Metrics are logged to Prometheus; nothing is returned.
@@ -201,12 +238,30 @@ class MetricsCollector:
             - KV cache utilization is only calculated and logged when both "usedNumBlocks" and
               "maxNumBlocks" are present in kvCacheStats and "maxNumBlocks" is non-zero.
         """
+        num_queued = iteration_stats.get("numQueuedRequests")
+        if num_queued is not None:
+            self._log_gauge(self.num_requests_waiting, num_queued)
+
+        num_active = iteration_stats.get("numActiveRequests")
+        if num_active is not None:
+            self._log_gauge(self.num_requests_running, num_active)
+
         if kv_stats := iteration_stats.get("kvCacheStats"):
             cache_hit_rate = kv_stats.get("cacheHitRate")
             if cache_hit_rate is not None:
                 self._log_gauge(self.kv_cache_hit_rate, cache_hit_rate)
-            if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
-                max_num_blocks = kv_stats["maxNumBlocks"]
+
+            max_num_blocks = kv_stats.get("maxNumBlocks")
+            if "usedNumBlocks" in kv_stats and max_num_blocks is not None:
                 if max_num_blocks:
                     utilization = kv_stats["usedNumBlocks"] / max_num_blocks
                     self._log_gauge(self.kv_cache_utilization, utilization)
+
+            tokens_per_block = kv_stats.get("tokensPerBlock")
+            if tokens_per_block is not None and max_num_blocks is not None:
+                cache_config_labels = {
+                    **self.labels,
+                    "block_size": str(tokens_per_block),
+                    "num_gpu_blocks": str(max_num_blocks),
+                }
+                self.cache_config_info.labels(**cache_config_labels).set(1)
