@@ -204,12 +204,37 @@ def discover_fusible_subgraphs(mlir_module: ModuleOp) -> List[FusibleSubgraph]:
         ops = _topo_sort_subgraph(ops, topo_order)
         sg = _build_subgraph(ops)
 
-        if len(sg.inputs) > MAX_CUSTOM_OP_INPUTS:
+        if len(sg.inputs) > MAX_CUSTOM_OP_INPUTS or _has_placement_conflict(sg, topo_order):
             partitions = _split_subgraph(sg, topo_order)
             result.extend(partitions)
         else:
             result.append(sg)
     return result
+
+
+def _has_placement_conflict(sg: FusibleSubgraph, topo_order: dict[Operation, int]) -> bool:
+    """Return True if the subgraph cannot be replaced by a single fused op.
+
+    A fused op must be placed after all its input producers and before all its
+    output consumers.  If the latest input producer appears at or after the
+    earliest output consumer in the block, no valid insertion point exists.
+    """
+    op_set = set(sg.ops)
+
+    max_input_pos = -1
+    for inp in sg.inputs:
+        producer = inp.owner
+        if producer in topo_order:
+            max_input_pos = max(max_input_pos, topo_order[producer])
+
+    min_consumer_pos = len(topo_order) + 1
+    for out in sg.outputs:
+        for use in out.uses:
+            consumer = use.operation
+            if consumer not in op_set and consumer in topo_order:
+                min_consumer_pos = min(min_consumer_pos, topo_order[consumer])
+
+    return max_input_pos >= min_consumer_pos
 
 
 def _topo_sort_subgraph(ops: List[Operation], topo_order: dict[Operation, int]) -> List[Operation]:
