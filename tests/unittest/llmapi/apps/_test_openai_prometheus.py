@@ -65,6 +65,34 @@ def server(model_name: str,
         logger.info("Tests completed, shutting down server")
 
 
+def test_cache_config_available_before_first_request(
+        server: RemoteOpenAIServer):
+    """Verify that trtllm_cache_config_info is available at startup, before
+    any inference request.  External scrapers (e.g. the Kubernetes Inference
+    Gateway EPP) rely on this metric for routing decisions."""
+    metric_prefix = "trtllm_"
+    max_wait_time = 10.0
+    poll_interval = 0.5
+    start_time = time.time()
+    cache_config_found = False
+
+    while time.time() - start_time < max_wait_time:
+        response = urlopen(f'{server.url_root}/prometheus/metrics')
+        assert response.status == 200
+        data = response.read().decode("utf-8")
+        if metric_prefix + "cache_config_info" in data:
+            cache_config_found = True
+            # Verify the label values are populated and sensible
+            assert 'block_size="' in data
+            assert 'num_gpu_blocks="' in data
+            break
+        time.sleep(poll_interval)
+
+    assert cache_config_found, \
+        (f"{metric_prefix}cache_config_info not found in /prometheus/metrics "
+         f"after {max_wait_time}s — it should be available before any request")
+
+
 def test_metrics_endpoint(server: RemoteOpenAIServer):
     metric_prefix = "trtllm_"
 
