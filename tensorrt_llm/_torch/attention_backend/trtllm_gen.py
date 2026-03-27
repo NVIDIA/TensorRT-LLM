@@ -927,6 +927,7 @@ class FlashInferTrtllmGenAttention:
         host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping,
         layer_idx: int,
+        global_layer_idx: int,
         num_kv_heads: int,
         tokens_per_block: int,
         head_dim: int,
@@ -964,7 +965,9 @@ class FlashInferTrtllmGenAttention:
         if layer_idx not in self._kv_pool_cache:
             kv_factor = 1 if is_mla_enable else 2
             if self._kv_cache_manager is not None:
-                layer_offset = self._kv_cache_manager.layer_offsets[layer_idx]
+                # layer_offsets keys are global layer indices (pp_layers); layer_idx here
+                # is the local index used for host_kv_cache_pool_mapping / build_kv_cache_buffers.
+                layer_offset = self._kv_cache_manager.layer_offsets[global_layer_idx]
                 total_num_blocks = (
                     self._kv_cache_manager.impl.get_primary_pool_data(layer_offset).shape[0]
                     * kv_factor
@@ -1002,6 +1005,7 @@ class FlashInferTrtllmGenAttention:
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
             layer_idx=params.layer_idx,
+            global_layer_idx=params.global_layer_idx,
             num_kv_heads=params.num_kv_heads,
             tokens_per_block=params.tokens_per_block,
             head_dim=params.head_size,
@@ -1183,6 +1187,7 @@ class FlashInferTrtllmGenAttention:
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
             layer_idx=params.layer_idx,
+            global_layer_idx=params.global_layer_idx,
             num_kv_heads=params.num_kv_heads,
             tokens_per_block=params.tokens_per_block,
             head_dim=params.head_size,
