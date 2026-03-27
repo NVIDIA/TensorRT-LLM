@@ -173,10 +173,13 @@ class PythonMambaCacheManager(BaseResourceManager):
         # Represents last state, or "two back" if prev_num_accepted_tokens is > 0
         temporal: torch.Tensor
 
+        # Fields that are shared across layers (not indexed by layer)
+        _SHARED_FIELDS = {"prev_num_accepted_tokens", "cache_buf_idx"}
+
         def at_layer_idx(self, layer: int):
             kwargs = {}
             for k, v in vars(self).items():
-                if k == "prev_num_accepted_tokens":
+                if k in self._SHARED_FIELDS:
                     kwargs[k] = v
                 else:
                     kwargs[k] = v[layer]
@@ -187,8 +190,13 @@ class PythonMambaCacheManager(BaseResourceManager):
         """Speculative state with intermediate states for draft tokens."""
         # This is # of accepted tokens, not just draft, so is always at least 1 if drafting.
         # 0 means that the temporal saved state is actually the last state, not two back.
-        prev_num_accepted_tokens: torch.Tensor
-        intermediate_ssm_update_inputs: torch.Tensor
+        prev_num_accepted_tokens: torch.Tensor  # (cache,) int — shared across layers
+        cache_buf_idx: torch.Tensor             # (cache,) int32 — double-buffer index, shared across layers
+        # SSM replay cache (separate tensors for coalesced access + double-buffering)
+        old_x: torch.Tensor                     # (layers, cache, T, nheads, dim) bf16 — single-buffered
+        old_B: torch.Tensor                     # (layers, cache, 2, T, ngroups, dstate) bf16 — double-buffered
+        old_dt_proc: torch.Tensor               # (layers, cache, 2, nheads, T) fp32 — double-buffered
+        old_cumAdt: torch.Tensor                # (layers, cache, 2, nheads, T) fp32 — double-buffered
         intermediate_conv_window: torch.Tensor
 
     def __init__(
@@ -276,34 +284,58 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         # create state container
         if speculative_num_draft_tokens is not None:
+            T = speculative_num_draft_tokens + 1
+
             prev_num_accepted_tokens = torch.zeros(
-                size = (max_batch_size,),
-                dtype = int,
+                size=(max_batch_size,),
+                dtype=int,
                 device=device,
             )
 
-            # what do we need to go to state_{i-2} to state_{i-1}?
-            # Just x (d_inner), dt (nheads), B (n_groups * dstate).
-            intermediate_ssm_update_inputs = torch.zeros(
-                size=(num_local_layers, max_batch_size,
-                      speculative_num_draft_tokens + 1, d_inner + nheads + n_groups * d_state),
-                dtype=dtype,
-                device=device,
+            cache_buf_idx = torch.zeros(
+                max_batch_size, dtype=torch.int32, device=device,
             )
 
-            # Cache intermediate conv windows per draft token(include new sampled token) during target model verification phase
+            # SSM replay cache: separate tensors for coalesced access + double-buffering.
+            # old_x is single-buffered (written by main kernel after replay reads it).
+            # old_B, old_dt_proc, old_cumAdt are double-buffered (written by precompute
+            # kernel which runs concurrently with main kernel's replay via PDL).
+            old_x = torch.zeros(
+                num_local_layers, max_batch_size, T, nheads, head_dim,
+                dtype=dtype, device=device,
+            )
+            old_B = torch.zeros(
+                num_local_layers, max_batch_size, 2, T, n_groups, d_state,
+                dtype=dtype, device=device,
+            )
+            old_dt_proc = torch.zeros(
+                num_local_layers, max_batch_size, 2, nheads, T,
+                dtype=torch.float32, device=device,
+            )
+            old_cumAdt = torch.zeros(
+                num_local_layers, max_batch_size, 2, nheads, T,
+                dtype=torch.float32, device=device,
+            )
+
+            # Cache intermediate conv windows per draft token (include new sampled token)
             intermediate_conv_window_cache = torch.zeros(
                 size=(num_local_layers, self.spec_state_size,
-                      speculative_num_draft_tokens + 1) + conv_state_shape,
+                      T) + conv_state_shape,
                 dtype=dtype,
                 device=device,
             )
+
+            ssm_cache_tensors = [old_x, old_B, old_dt_proc, old_cumAdt]
 
             self.mamba_cache = self.SpeculativeState(
                 conv=conv_states,
                 temporal=ssm_states,
-                prev_num_accepted_tokens = prev_num_accepted_tokens,
-                intermediate_ssm_update_inputs = intermediate_ssm_update_inputs,
+                prev_num_accepted_tokens=prev_num_accepted_tokens,
+                cache_buf_idx=cache_buf_idx,
+                old_x=old_x,
+                old_B=old_B,
+                old_dt_proc=old_dt_proc,
+                old_cumAdt=old_cumAdt,
                 intermediate_conv_window=intermediate_conv_window_cache,
             )
 
@@ -312,8 +344,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 f"max_mamba_cache_size: {max_batch_size}, "
                 f"conv_state size: {get_tensor_size_bytes(conv_states) / GB:.2f}GB, "
                 f"ssm_state size: {get_tensor_size_bytes(ssm_states) / GB:.2f}GB, "
-                f"prev_num_accepted_tokens_inputs size: {get_tensor_size_bytes(prev_num_accepted_tokens) / GB:.2f}GB, "
-                f"intermediate_ssm_update_inputs size: {get_tensor_size_bytes(intermediate_ssm_update_inputs) / GB:.2f}GB, "
+                f"ssm_replay_cache size: {get_tensor_size_bytes(ssm_cache_tensors) / GB:.2f}GB, "
                 f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB"
             )
         else:
@@ -479,8 +510,12 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache = self.SpeculativeState(
                 conv=torch.tensor([]),
                 temporal=torch.tensor([]),
-                intermediate_ssm_update_inputs=([]),
-                prev_num_accepted_tokens=([]),
+                prev_num_accepted_tokens=torch.tensor([]),
+                cache_buf_idx=torch.tensor([]),
+                old_x=torch.tensor([]),
+                old_B=torch.tensor([]),
+                old_dt_proc=torch.tensor([]),
+                old_cumAdt=torch.tensor([]),
                 intermediate_conv_window=torch.tensor([]),
             )
         else:
@@ -501,9 +536,13 @@ class PythonMambaCacheManager(BaseResourceManager):
             num_contexts:num_contexts + num_gens] - 1
         state_indices_d = self.state_indices[num_contexts:num_contexts +
                                              num_gens]
-        # State is handled incrementally.
+        # SSM state is handled incrementally by the kernel.  Update the number
+        # of accepted tokens and flip the double-buffer index so the next step's
+        # replay reads from the buffer that was just written by the precompute kernel.
         self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = num_accepted_tokens[
             num_contexts:num_contexts + num_gens]
+        self.mamba_cache.cache_buf_idx[state_indices_d] = \
+            1 - self.mamba_cache.cache_buf_idx[state_indices_d]
 
         # Conv we saved all the options, so carry them over.
         conv_states = self.mamba_cache.conv

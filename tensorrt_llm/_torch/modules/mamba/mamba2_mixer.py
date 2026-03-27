@@ -431,22 +431,22 @@ class Mamba2Mixer(nn.Module):
                         activation="silu",
                         conv_state_indices=state_indices_d)
 
-            # For flashinfer state update, dt dtype has to match dt_bias and D.
-            def convert_dt():
-                return dt_d.to(dtype=torch.float32)
+            if is_target_verify:
+                # MTP path: our incremental kernel handles bf16 dt natively
+                # (applies bias + softplus internally).  No dt conversion needed.
+                xbc_d = conv1d()
+            else:
+                # Non-MTP path: flashinfer needs fp32 dt.  Run conv1d and dt
+                # conversion in parallel on separate streams.
+                def convert_dt():
+                    return dt_d.to(dtype=torch.float32)
 
-            # If we're in a cuda graph and using PDL on conv1d, the next kernel
-            # if PDL'd will launch when convert_dt is done and conv1d triggers
-            # dependent kernels.  If these don't happen in parallel, then
-            # convert will go second and we lose PDL, but we're using cuda
-            # graphs for low latency so that seems ok.
-            # If any of the contiguous calls below actually fire, that also breaks PDL.
-            xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
-                                                    convert_dt,
-                                                    self.events[0],
-                                                    self.events[1],
-                                                    self.aux_steram,
-                                                    disable_on_compile=True)
+                xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
+                                                        convert_dt,
+                                                        self.events[0],
+                                                        self.events[1],
+                                                        self.aux_steram,
+                                                        disable_on_compile=True)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
@@ -475,8 +475,12 @@ class Mamba2Mixer(nn.Module):
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
                 incremental_update_func_mtp(
-                    ssm_states, # in place
-                    layer_cache.intermediate_ssm_update_inputs, # in place
+                    ssm_states,
+                    layer_cache.old_x,
+                    layer_cache.old_B,
+                    layer_cache.old_dt_proc,
+                    layer_cache.old_cumAdt,
+                    layer_cache.cache_buf_idx,
                     layer_cache.prev_num_accepted_tokens,
                     x_d.view(
                         num_decodes,
@@ -500,7 +504,7 @@ class Mamba2Mixer(nn.Module):
                         self.head_dim,
                     ),
                     D=D,
-                    dt_bias = dt_bias,
+                    dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
                     state_batch_indices=state_indices_d[:num_decodes],
                 )
