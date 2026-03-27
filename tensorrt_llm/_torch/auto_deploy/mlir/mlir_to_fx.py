@@ -32,6 +32,7 @@ from .dialect import (
     AdAdd,
     AdCast,
     AdExp,
+    AdGatedRMSNorm,
     AdGelu,
     AdGraphInput,
     AdGraphOutput,
@@ -176,6 +177,8 @@ class MLIRToFXConverter:
             self._convert_pow(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdRMSNorm):
             self._convert_rmsnorm(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdGatedRMSNorm):
+            self._convert_gated_rmsnorm(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdToDtype):
             self._convert_to_dtype(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdGraphOutput):
@@ -284,6 +287,24 @@ class MLIRToFXConverter:
         node = graph.call_function(
             torch.ops.auto_deploy.flashinfer_rms_norm,
             args=(input_node, weight_node, eps),
+        )
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_gated_rmsnorm(self, op: AdGatedRMSNorm, graph: Graph, metadata: dict) -> None:
+        """Reconstruct gated rmsnorm call from ``ad.gated_rmsnorm``.
+
+        Maps back to ``triton_rmsnorm_gated`` for unfused instances.
+        """
+        input_node = self._resolve(op.input)
+        weight_node = self._resolve(op.weight)
+        gate_node = self._resolve(op.gate)
+        eps = op.eps.value.data
+        group_size = op.group_size.value.data
+        norm_before_gate = bool(op.norm_before_gate.value.data)
+        node = graph.call_function(
+            torch.ops.auto_deploy.triton_rmsnorm_gated,
+            args=(input_node, weight_node, gate_node, eps, group_size, norm_before_gate),
         )
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)

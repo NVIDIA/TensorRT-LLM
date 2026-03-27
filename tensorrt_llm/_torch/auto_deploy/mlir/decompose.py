@@ -66,7 +66,13 @@ class _DecompPattern(RewritePattern):
         if rule is None:
             return
 
-        new_ops, result_val = rule(op)
+        result = rule(op)
+
+        # A decomposition may return None to skip (e.g. unsupported group_size).
+        if result is None:
+            return
+
+        new_ops, result_val = result
 
         # Insert all new ops before the original
         for new_op in new_ops:

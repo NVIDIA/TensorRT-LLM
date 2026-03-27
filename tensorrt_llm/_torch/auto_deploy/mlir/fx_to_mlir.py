@@ -40,6 +40,7 @@ from ..utils.node_utils import is_op
 from .dialect import (
     AdAdd,
     AdExp,
+    AdGatedRMSNorm,
     AdGelu,
     AdGraphInput,
     AdGraphOutput,
@@ -86,6 +87,30 @@ def _is_rmsnorm(node: Node) -> bool:
     """Return True if *node* calls any registered rmsnorm variant."""
     _init_rmsnorm_targets()
     return is_op(node, _RMSNORM_TARGETS) if _RMSNORM_TARGETS else False
+
+
+# All gated rmsnorm FX targets
+_GATED_RMSNORM_TARGETS = []
+
+
+def _init_gated_rmsnorm_targets():
+    """Lazily collect gated rmsnorm op targets."""
+    global _GATED_RMSNORM_TARGETS
+    if _GATED_RMSNORM_TARGETS:
+        return
+    for attr_name in [
+        "triton_rmsnorm_gated",
+        "torch_rmsnorm_gated",
+    ]:
+        op = getattr(torch.ops.auto_deploy, attr_name, None)
+        if op is not None:
+            _GATED_RMSNORM_TARGETS.append(op)
+
+
+def _is_gated_rmsnorm(node: Node) -> bool:
+    """Return True if *node* calls any registered gated rmsnorm variant."""
+    _init_gated_rmsnorm_targets()
+    return is_op(node, _GATED_RMSNORM_TARGETS) if _GATED_RMSNORM_TARGETS else False
 
 
 def _get_fake_tensor(node: Node) -> Optional[torch.Tensor]:
@@ -228,6 +253,8 @@ class FXToMLIRConverter:
             self._convert_mean(node, block)
         elif _is_rmsnorm(node):
             self._convert_rmsnorm(node, block)
+        elif _is_gated_rmsnorm(node):
+            self._convert_gated_rmsnorm(node, block)
         elif is_op(node, torch.ops.aten.to.dtype):
             self._convert_to_dtype(node, block)
         elif node.target is op_module.getitem:
@@ -295,6 +322,7 @@ class FXToMLIRConverter:
             attributes={
                 "dim": IntegerAttr(dim, IntegerType(64)),
                 "keepdim": IntegerAttr(1 if keepdim else 0, IntegerType(1)),
+                "group_size": IntegerAttr(0, IntegerType(64)),
             },
             result_types=[result_type],
         )
@@ -327,6 +355,34 @@ class FXToMLIRConverter:
         op = AdRMSNorm.build(
             operands=[input_val, weight_val],
             attributes={"eps": eps_attr},
+            result_types=[result_type],
+        )
+        block.add_op(op)
+        self._value_map[node.name] = op.output
+        self._store_meta(node)
+
+    def _convert_gated_rmsnorm(self, node: Node, block: Block) -> None:
+        """Gated rmsnorm variant → ``ad.gated_rmsnorm``.
+
+        FX signature: ``(x, weight, gate, eps, group_size, norm_before_gate)``
+        """
+        input_val = self._resolve_operand(node.args[0])
+        weight_val = self._resolve_operand(node.args[1])
+        gate_val = self._resolve_operand(node.args[2])
+        eps_val = float(node.args[3]) if len(node.args) > 3 else 1e-5
+        group_size = int(node.args[4]) if len(node.args) > 4 else 0
+        norm_before_gate = bool(node.args[5]) if len(node.args) > 5 else False
+        eps_attr = FloatAttr(eps_val, Float64Type())
+        result_type = _result_type_for_node(node)
+        if result_type.get_shape() == (-1,) and isinstance(input_val.type, TensorType):
+            result_type = input_val.type
+        op = AdGatedRMSNorm.build(
+            operands=[input_val, weight_val, gate_val],
+            attributes={
+                "eps": eps_attr,
+                "group_size": IntegerAttr(group_size, IntegerType(64)),
+                "norm_before_gate": IntegerAttr(int(norm_before_gate), IntegerType(1)),
+            },
             result_types=[result_type],
         )
         block.add_op(op)

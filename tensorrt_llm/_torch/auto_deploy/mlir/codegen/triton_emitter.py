@@ -156,6 +156,27 @@ def _get_ncols(inputs: List[SSAValue]) -> int:
     raise ValueError("Cannot determine N_COLS from subgraph inputs")
 
 
+def _detect_group_size(subgraph) -> int:
+    """Detect if the subgraph uses grouped reduction.
+
+    Scans for ``AdReduceMean`` ops with ``group_size > 0``. Returns the group
+    size if found (all must agree), or 0 for standard full-dim mode.
+    """
+    from ..dialect import AdReduceMean as _AdReduceMean
+
+    group_size = 0
+    for op in subgraph.ops:
+        if isinstance(op, _AdReduceMean):
+            gs_attr = op.attributes.get("group_size")
+            if gs_attr is not None:
+                gs = gs_attr.value.data
+                if gs > 0:
+                    if group_size > 0 and gs != group_size:
+                        raise ValueError(f"Mixed group_sizes in subgraph: {group_size} vs {gs}")
+                    group_size = gs
+    return group_size
+
+
 def generate_kernel_from_subgraph(subgraph) -> Callable:
     """Generate a Triton kernel from a FusibleSubgraph and register it.
 
@@ -186,6 +207,12 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     n_outputs = len(subgraph.outputs)
     ncols = _get_ncols(subgraph.inputs)
 
+    # Detect grouped reduction mode (e.g. gated RMSNorm with group_size > 0).
+    # In grouped mode, the kernel processes one group per program instead of one
+    # full row, using a 2D grid (seq_len, ngroups).
+    group_size = _detect_group_size(subgraph)
+    grouped_mode = group_size > 0
+
     # Determine max rank among inputs to detect broadcast inputs
     max_rank = max((_get_tensor_rank(inp) for inp in subgraph.inputs), default=2)
 
@@ -214,22 +241,25 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     # kernels). Loads upcast to f32; stores downcast to the original dtype.
     body_lines = []
 
-    # Load all subgraph inputs and upcast to f32
+    # Load all subgraph inputs and upcast to f32.
+    # In grouped mode, full-row inputs are offset by both row and group:
+    #   ptr + pid_row * row_stride + pid_group * N_COLS + offs
+    # Broadcast (1D) inputs (e.g. weights) are offset by group only:
+    #   ptr + pid_group * N_COLS + offs
     for i, inp in enumerate(subgraph.inputs):
         if broadcast_flags[i]:
-            # Lower-rank input (e.g. 1D weight): load with offs only.
-            body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask).to(tl.float32)")
+            if grouped_mode:
+                body_lines.append(
+                    f"    v{i} = tl.load(in{i}_ptr + group_off + offs, mask=mask).to(tl.float32)"
+                )
+            else:
+                body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask).to(tl.float32)")
         elif narrow_flags[i]:
-            # Same-rank but narrow last dim (e.g. (-1, 1) gating scalar):
-            # load as a scalar so Triton broadcasts it when used with
-            # full-width (N_COLS) tensors.  This avoids mixing block
-            # sizes within a single kernel program.
             inp_last_dim = inp.type.get_shape()[-1]
             body_lines.append(
                 f"    v{i} = tl.load(in{i}_ptr + pid * {inp_last_dim}).to(tl.float32)"
             )
         else:
-            # Full-row input: load N_COLS elements.
             body_lines.append(
                 f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask).to(tl.float32)"
             )
@@ -344,17 +374,31 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     all_ptr_params = in_ptr_params + out_ptr_params
 
     kernel_name = f"fused_kernel_{sg_hash}"
-    params_str = ",\n    ".join(
-        all_ptr_params
-        + ["row_stride: tl.constexpr", "N_COLS: tl.constexpr", "BLOCK_N: tl.constexpr"]
-    )
+    constexpr_params = ["row_stride: tl.constexpr", "N_COLS: tl.constexpr", "BLOCK_N: tl.constexpr"]
+    if grouped_mode:
+        constexpr_params.append("FEAT_SIZE: tl.constexpr")
+    params_str = ",\n    ".join(all_ptr_params + constexpr_params)
 
-    preamble = textwrap.dedent("""\
-    pid = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_N)
-    mask = offs < N_COLS
-    row_off = pid * row_stride
-    out_row_off = pid * N_COLS""")
+    if grouped_mode:
+        # 2D grid: (seq_len, ngroups). Each program processes one group of one row.
+        # row_off uses input row_stride (may be non-contiguous).
+        # out_row_off uses FEAT_SIZE (output is always contiguous).
+        preamble = textwrap.dedent("""\
+        pid_row = tl.program_id(0)
+        pid_group = tl.program_id(1)
+        pid = pid_row
+        offs = tl.arange(0, BLOCK_N)
+        mask = offs < N_COLS
+        group_off = pid_group * N_COLS
+        row_off = pid_row * row_stride + group_off
+        out_row_off = pid_row * FEAT_SIZE + group_off""")
+    else:
+        preamble = textwrap.dedent("""\
+        pid = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_N)
+        mask = offs < N_COLS
+        row_off = pid * row_stride
+        out_row_off = pid * N_COLS""")
 
     preamble_lines = ["    " + line for line in preamble.splitlines()]
 
@@ -409,23 +453,47 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     return_tuple = ", ".join(f"out{i}" for i in range(n_outputs))
 
     launcher_name = f"launch_{sg_hash}"
-    launcher_src = (
-        f"def {launcher_name}({', '.join(in_tensor_params)}):\n"
-        f"    feat_size = {ref}.size(-1)\n"
-        f"    seq_len = {ref}.numel() // feat_size\n"
-        f"    row_stride = {ref}.stride(-2) if {ref}.dim() >= 2 else feat_size\n"
-        f"    BLOCK_N = triton.next_power_of_2(feat_size)\n" + "\n".join(out_alloc_lines) + "\n"
-        f"    grid = (seq_len,)\n"
-        f"    {kernel_name}[grid](\n"
-        f"        {', '.join(launch_args)},\n"
-        f"        row_stride=row_stride,\n"
-        f"        N_COLS=feat_size,\n"
-        f"        BLOCK_N=BLOCK_N,\n"
-        f"        num_warps=4,\n"
-        f"        num_stages=3,\n"
-        f"    )\n"
-        f"    return ({return_tuple},)\n"
-    )
+    if grouped_mode:
+        launcher_src = (
+            f"def {launcher_name}({', '.join(in_tensor_params)}):\n"
+            f"    feat_size = {ref}.size(-1)\n"
+            f"    seq_len = {ref}.numel() // feat_size\n"
+            f"    row_stride = {ref}.stride(-2) if {ref}.dim() >= 2 else feat_size\n"
+            f"    group_size = {group_size}\n"
+            f"    ngroups = feat_size // group_size\n"
+            f"    BLOCK_N = triton.next_power_of_2(group_size)\n"
+            + "\n".join(out_alloc_lines)
+            + "\n"
+            f"    grid = (seq_len, ngroups)\n"
+            f"    {kernel_name}[grid](\n"
+            f"        {', '.join(launch_args)},\n"
+            f"        row_stride=row_stride,\n"
+            f"        N_COLS=group_size,\n"
+            f"        BLOCK_N=BLOCK_N,\n"
+            f"        FEAT_SIZE=feat_size,\n"
+            f"        num_warps=4,\n"
+            f"        num_stages=3,\n"
+            f"    )\n"
+            f"    return ({return_tuple},)\n"
+        )
+    else:
+        launcher_src = (
+            f"def {launcher_name}({', '.join(in_tensor_params)}):\n"
+            f"    feat_size = {ref}.size(-1)\n"
+            f"    seq_len = {ref}.numel() // feat_size\n"
+            f"    row_stride = {ref}.stride(-2) if {ref}.dim() >= 2 else feat_size\n"
+            f"    BLOCK_N = triton.next_power_of_2(feat_size)\n" + "\n".join(out_alloc_lines) + "\n"
+            f"    grid = (seq_len,)\n"
+            f"    {kernel_name}[grid](\n"
+            f"        {', '.join(launch_args)},\n"
+            f"        row_stride=row_stride,\n"
+            f"        N_COLS=feat_size,\n"
+            f"        BLOCK_N=BLOCK_N,\n"
+            f"        num_warps=4,\n"
+            f"        num_stages=3,\n"
+            f"    )\n"
+            f"    return ({return_tuple},)\n"
+        )
 
     # Compile the kernel + launcher by writing to a temp file.
     # Triton's @jit requires inspect.getsourcelines() to work, which needs

@@ -183,6 +183,28 @@ class AdRMSNorm(IRDLOperation):
 
 
 @irdl_op_definition
+class AdGatedRMSNorm(IRDLOperation):
+    """Gated RMSNorm with optional grouped normalization.
+
+    Used by Mamba/hybrid models (e.g. Nemotron Nano). Applies SiLU gating
+    and grouped RMSNorm. Decomposed into primitives for fusion.
+
+    ``norm_before_gate``: 0 = gate before norm (Nemotron Nano default),
+                          1 = gate after norm.
+    ``group_size``: 0 = full-dim RMSNorm, >0 = grouped (H must be divisible).
+    """
+
+    name = "ad.gated_rmsnorm"
+    input = operand_def(AnyAttr())
+    weight = operand_def(AnyAttr())
+    gate = operand_def(AnyAttr())
+    eps = attr_def(FloatAttr)
+    group_size = attr_def(IntegerAttr)
+    norm_before_gate = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
 class AdToDtype(IRDLOperation):
     """Dtype cast — mirrors ``aten.to.dtype``."""
 
@@ -363,12 +385,20 @@ class AdReduceSum(IRDLOperation):
 
 @irdl_op_definition
 class AdReduceMean(IRDLOperation):
-    """Reduction mean along a dimension — mirrors ``aten.mean.dim``."""
+    """Reduction mean along a dimension — mirrors ``aten.mean.dim``.
+
+    When ``group_size > 0``, the reduction operates within groups of the last
+    dimension (the last dim is logically reshaped to ``(ngroups, group_size)``
+    and reduction is over ``group_size``).  The output has the group dimension
+    preserved, enabling grouped normalization patterns like gated RMSNorm.
+    ``group_size = 0`` (default) means full last-dim reduction.
+    """
 
     name = "ad.reduce_mean"
     input = operand_def(AnyAttr())
     dim = attr_def(IntegerAttr)
     keepdim = attr_def(IntegerAttr)
+    group_size = attr_def(IntegerAttr)
     output = result_def(AnyAttr())
 
 
@@ -401,6 +431,7 @@ class AdSplat(IRDLOperation):
 AD_OPS = [
     AdAdd,
     AdRMSNorm,
+    AdGatedRMSNorm,
     AdToDtype,
     AdOpaque,
     AdGraphInput,
