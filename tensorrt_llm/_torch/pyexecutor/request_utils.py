@@ -152,7 +152,7 @@ def get_from_waiting_queue(
 
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
-    waiting_queue.prepend_requests(reversed(pending_requests))
+    waiting_queue.prepend_requests(pending_requests)
 
     return items
 
