@@ -345,33 +345,22 @@ char const * const errStr = getErrorStr(status);
 ----
 
 ## Python Coding Guidelines
+Code should adhere to [PEP 8](https://peps.python.org/pep-0008/#fn-hi), unless otherwise noted.
+
 #### Python Standard
 1. The code developed for TensorRT-LLM should conform to Python 3.8+.
 
-#### Indentation
-1. Indent code with 4 spaces. Do not use tabs.
+#### Formatting
+
+1. Indent code with 4 spaces.  Do not use tabs.
+2. Code formatting is largely handled by the automatic tooling.  Do not override it unless it substantially improves readability.
+3. Note we have "legacy" files and "new" files that are formatted by different toolchains, see <pyproject.toml>.  This results in somewhat different formatting between the two classes of files.  Most notably legacy files are 80 characters wide while new files are 100.
+
 
 #### Imports
-1. Always maintain the namespace when importing, even if only one class or function from a module is used.
-
-For example instead of:
-
-```python
-from package.subpackage.foo import SomeClass
-SomeClass()
-```
-or
-```python
-import package
-package.subpackage.foo.SomeClass()
-```
-
-Do:
-
-```python
-from package.subpackage import foo
-foo.SomeClass()
-```
+1. The linter will have opinions on import ordering.  Please follow them.
+2. Do not use wildcard imports.
+3. Despite the prohibition on wildcard imports, keep `__all__` updated to keep the public interface clearly documented.
 
 #### Naming
 
@@ -385,26 +374,29 @@ foo.SomeClass()
 3. Functions and Methods
 - snake_case: `def my_awesome_function():`
 
-4. Local Variables
+4. Local Variables or Mutable Global Variables
 - snake_case: `my_variable = ...`
-- prefix `k` for variable names that start with a number: `k_99th_percentile = ...`
+- Single-letter variables may also be uppercase, e.g. `N`, `T`.
+- Variables should not start with a number, but if you must, prefix with `k`, e.g. `k_99th_percentile = ...`
 
-5. Global Variables
-- upper snake_case and prefix `G`: `G_MY_GLOBAL = ...`
+5. Constants (any scope)
+- UPPER\_SNAKE\_CASE: `MY_CONSTANT = ...`
 
-6. Constants
-- upper snake_case: `MY_CONSTANT = ...`
+Variables and functions not part of a class’s or module’s public interface should be prefixed with an underscore.  Double underscores are permitted only if necessary to avoid name conflicts with inherited classes, and even then you should pursue alternatives.
 
 ##### Identifier Guidelines
 1. Avoid shadowing variables declared in an outer scope.
-2. Initialize all externally visible memberes of a class in the constructor.
+2. Initialize all externally visible members of a class in the constructor.
+3. For variables referencing “container” type objects that could live explicitly on the host or a GPU, e.g. referencing a Tensor, consider appending `_host` or `_device`/`_cuda` suffixes if the location is ambiguous.  Particularly if copies of the data exist in both locations.
 
 #### Comments
 
 1. For interfaces that may be used outside a file, prefer docstrings over comments.
 2. Comments should be reserved for code within a function, or interfaces that are local to a file.
+3. Avoid overcommenting.  Reserve comments for things that need explaining, or breaking up long sections of code into functional parts.  But in that case, consider helper functions.
+4. For arguments to functions in the public interface to a file, documentation of Tensor-like arguments should include the expected dimensions, e.g. `[batch, seq_len, hdim]`, and the allowed dtype options if dtype is constrained.
 
-### Pydantic Guidelines
+#### Pydantic Guidelines
 
 When defining any user-facing configuration classes (particularly `LlmArgs` or any class used in its fields), **always** use Pydantic classes rather than dataclasses or vanilla classes.
 
@@ -445,7 +437,7 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 ##### Classes and Functions
 Use the [Google style](https://google.github.io/styleguide/pyguide.html), which can be parsed by Sphinx.
 
-#####  Attributes and Variables
+##### Attributes and Variables
 Attributes and variables can be documented inline. Attribute docstrings will be rendered under the docstring for the class. For example:
 ```python
 class MyClass:
@@ -459,6 +451,9 @@ class MyClass:
 y = 2
 """<type>: Description of 'y'"""
 ```
+
+However, attribute docstrings are relatively rare and not expected.  Externally called functions should have docstrings, and their arguments should be documented.  Class initializer arguments especially should be documented.
+
 
 #### Avoid Reflection
 Avoid using reflection when functionality can be easily achieved without reflection.
@@ -523,6 +518,126 @@ else:
     f.seek(0)
     f.read()
 ```
+
+Except in exceptional circumstances, use the built-in exception types.  For which type to use when, see [https://docs.python.org/3/library/exceptions.html](https://docs.python.org/3/library/exceptions.html). Use exceptions for error handling, not return values.  And despite the example above, prefer isinstance() to duck typing where possible.
+
+#### Static Typing
+
+1. Static type checking at pre-commit time is opt-in by submodule PICs. This is highly recommended because static type checking eliminates an entire class of bugs and makes your code more readable and maintainable overall.
+2. The presubmit system currently uses mypy.  However, many developers use pyright variants in their editors, so the code also has some `#pyright:` annotations.  As we don’t currently enforce pyright, maintaining these is best effort.  But if you notice they are broken, please fix them.
+3. Do not use `typing.Any` if you can avoid it. Similarly, avoid bypassing the type checker with `# type: ignore` annotations.
+4. Always annotate functions. Make the return type `None` if the function does not return anything (if you leave it empty, the type checker will infer the return type as `Any`).
+5. Annotate class members and other variables when necessary. Always annotate `dataclass` and `NamedTuple` members.
+
+```py
+class Foo:
+    def __init__(self, x: int) -> None:
+        self.x = x  # inferred as int, no extra annotation required
+        self.y: Optional[int] = None  # annotation required to prevent NoneType from being inferred
+```
+
+6.  Prefer using the built-in types `list`, `dict`, and `tuple` to the legacy `typing.List`, `typing.Dict`, and `typing.Tuple`. Similarly, use the `|` syntax instead of `typing.Union`.
+
+```py
+# Instead of
+def foo(x: List[int], y: Union[int, float]) -> None:
+    pass
+
+# Do:
+def foo(x: list[int], y: int | float) -> None:
+    pass
+```
+
+7. Prefer specifying argument types in `Callable`s.
+
+```py
+# Type checks, but not the best style
+def foo(c: Callable[..., int]) -> None:
+    c(42)
+
+# Best practice.
+def foo(c: Callable[[int], int]) -> None:
+    c(42)
+```
+
+8. Don’t annotate variables where it is obvious/not necessary.
+
+```py
+x: int = 42 # Not required
+```
+
+9. Prefer `Literal` to `str` when a fixed set of values is expected.
+
+```py
+# Works:
+def f(backend: str = "pytorch") -> None: pass
+
+# But this is preferred:
+def f(backend: Literal["pytorch", "tensorrt"] = "pytorch") -> None: pass
+```
+
+10. Use `@overload` when a return type depends on an input type. If the return type can be expressed using the input type, you can alternatively use a `TypeVar`.
+
+```py
+@overload
+def foo(a: str) -> int:
+    pass
+
+@overload
+def foo(a: float) -> float:
+    pass
+
+def foo(a: str | float) -> int | float:
+    if isinstance(a, str):
+        return 42
+    return 42.0
+
+def bar(a: float) -> None: pass
+
+bar(foo(1.0)) # This will type check thanks to @overload
+
+# In this example, the return type can be expressed as
+T = TypeVar("T")
+def baz(x: T) -> dict[str, T]:
+    return {"key": x}
+```
+
+11. Use a bounded TypeVar only when the type parameter appears in both input and return positions to preserve specific type information; if it appears only in the parameters, use the bound type directly.
+
+```py
+class Foo:
+    def f(self) -> None: pass
+
+class Bar(Foo): pass
+
+# Instead of:
+# T = TypeVar("T", bound=Foo)
+# def func(x: T) -> None:
+#     x.f()
+
+# We can just do:
+def func(x: Foo) -> None:
+    x.f()
+
+# Here, using a bound type var is actually useful. We prevent
+# func2 from losing type information.
+# def func2(x: Foo) -> Foo:
+#     return x
+# x = func2(Bar()) # Return type is Foo
+
+T = TypeVar("T", bound=Foo)
+def func2(x: T) -> T:
+    return x
+x = func2(Bar()) # Return type is Bar
+```
+
+12. Use typing.Protocol for duck typing. Prefer it when
+* You need an interface that third-party or unrelated classes can satisfy without inheriting from a base class.
+* You want to type-check that an object has specific methods/attributes without coupling to a class hierarchy.
+
+Do not use Protocol when a shared base class or ABC already exists and implementations naturally inherit from it — use the ABC directly. Also do not use it when you only need a union of concrete types — use Union or a type alias instead.
+
+Note that TypeVars can also be bound to `Protocol`s. Use this feature to specify the expected interface for an argument to a generic function if duck typing is desired.
 
 ## Documentation Guidelines
 
