@@ -893,14 +893,14 @@ rtd = ["ipython", "myst-nb", "sphinx", "sphinx-book-theme", "sphinx-examples"]
 
 [[package]]
 name = "sphinx-togglebutton"
-version = "0.4.4"
+version = "0.4.5"
 description = "Toggle page content and collapse admonitions in Sphinx."
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "sphinx_togglebutton-0.4.4-py3-none-any.whl", hash = "sha256:820658cd4c4c34c2ee7a21105e638b2f65a9e1d43ee991090715eb7fd9683cdf"},
-    {file = "sphinx_togglebutton-0.4.4.tar.gz", hash = "sha256:04c332692fd5f5363ad02a001e693369767d6c1f0e58279770a2aeb571b472a1"},
+    {file = "sphinx_togglebutton-0.4.5-py3-none-any.whl", hash = "sha256:74eac6d2426110c3e1e6f989a98e07d7823141a335df1ad8a9d637bdf6a7af62"},
+    {file = "sphinx_togglebutton-0.4.5.tar.gz", hash = "sha256:c870dfbd3bc6e119b50ff9a37a64f8991902269e856728931c7d89877e8d4b3d"},
 ]
 
 [package.dependencies]
@@ -1136,4 +1136,4 @@ test = ["pytest (>=6.0.0)", "setuptools (>=77)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "256b216c553d4b3ff1043839642f5d3dc9209194e901d7b189a92858a9e40b7a"
+content-hash = "fef81843f0886daa4a857820e7c67a3767075a8811beec2851a071f39a0a4aa6"
