@@ -9,7 +9,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "regex (>=2026.2.28,<2027.0.0)",
     "fire (>=0.7.1,<0.8.0)",
-    "tritonclient[all] (>=2.66.0,<3.0.0)",
+    "tritonclient[all] (>=2.67.0,<3.0.0)",
     "transformers (==4.57.3)",
     "tabulate (>=0.10.0,<0.11.0)",
     "torchao (>=0.14.1)"

@@ -516,37 +516,6 @@ def should_skip_deepgemm(
     if backend_type != MoeBackendType.DEEPGEMM:
         return None
 
-    # Issue: DEEPGEMM + FP8_BLOCK_SCALES crashes with CUDA illegal memory access
-    # in _resmooth_kernel (Triton JIT) during post_load_weights() FP8 E8M0 scale
-    # resmoothing on SM100f (Blackwell). Root cause is a Triton compiler/runtime
-    # bug on SM100f: the kernel crashes when total grid blocks exceed ~65K.
-    # The crash depends on grid size, not just num_experts — Grok-1 (e8, h=6144,
-    # i=32768) crashes despite having only 8 experts because its weight tensors
-    # produce grids with 196K+ blocks.
-    # Weight shapes: w3_w1=[E, I*2, H], w2=[E, H, I] (from quantization.py)
-    # Grid for resmooth: (E, cdiv(M,128), cdiv(K,128))
-    # Verified boundary: max_blocks <= 57344 passes, >= 98304 crashes.
-    # Threshold: 65536 blocks (64K). Affected: DeepSeek-V3, Kimi-K2, Grok-1.
-    _RESMOOTH_GRID_BLOCK_LIMIT = 65536
-    if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and model_config is not None:
-        num_e = model_config.num_experts
-        hidden = model_config.hidden_size
-        inter = model_config.intermediate_size
-
-        def _cdiv(x, y):
-            return (x + y - 1) // y
-
-        w31_blocks = num_e * _cdiv(inter * 2, 128) * _cdiv(hidden, 128)
-        w2_blocks = num_e * _cdiv(hidden, 128) * _cdiv(inter, 128)
-        max_blocks = max(w31_blocks, w2_blocks)
-        if max_blocks > _RESMOOTH_GRID_BLOCK_LIMIT:
-            return (
-                f"[Triton Bug] DeepGemmFusedMoE FP8_BLOCK_SCALES crashes in "
-                f"_resmooth_kernel on SM100f when grid blocks exceed ~64K "
-                f"(max_blocks={max_blocks:,} > {_RESMOOTH_GRID_BLOCK_LIMIT:,}). "
-                f"Affected: E={num_e}, H={hidden}, I={inter}."
-            )
-
     # TP per-shard alignment: FP8_BLOCK_SCALES requires 128-aligned per-shard
     # intermediate_size for block scale tensor operations.
     if moe_tp_size > 1 and quant_algo == QuantAlgo.FP8_BLOCK_SCALES and model_config is not None:

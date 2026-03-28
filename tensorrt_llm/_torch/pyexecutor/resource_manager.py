@@ -559,6 +559,37 @@ class KVCacheManager(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
+    def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
+        """Probe the KV cache radix tree for prefix match length.
+
+        Returns the number of prefix tokens already cached on this rank.
+        Used by KVCacheAwareADPRouter for cache-aware routing.
+        """
+        if not self.enable_block_reuse:
+            return 0
+        # is_variable_window is only defined on the concrete KVCacheManager
+        # nanobind class, not on BaseKVCacheManager. Use getattr to avoid
+        # AttributeError on other subclasses or mocks.
+        if getattr(self.impl, 'is_variable_window', False):
+            return 0
+        if not input_tokens:
+            return 0
+        from tensorrt_llm.bindings import SamplingConfig
+        from tensorrt_llm.bindings.internal.batch_manager import BlockKey
+        from tensorrt_llm.bindings.internal.batch_manager import \
+            LlmRequest as CppLlmRequest
+        block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
+        unique_tokens = block_key.unique_tokens
+        dummy_req = CppLlmRequest(request_id=0,
+                                  max_new_tokens=0,
+                                  input_tokens=input_tokens,
+                                  sampling_config=SamplingConfig(),
+                                  is_streaming=False,
+                                  lora_task_id=lora_task_id)
+        num_blocks = self.impl.count_reusable_blocks(unique_tokens, dummy_req,
+                                                     False)
+        return num_blocks * self.tokens_per_block
+
     def shutdown(self):
         self.impl.release_pools()
 
