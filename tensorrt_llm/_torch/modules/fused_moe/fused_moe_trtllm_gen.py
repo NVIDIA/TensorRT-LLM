@@ -318,6 +318,12 @@ class TRTLLMGenFusedMoE(MoE):
         return self.quant_config is None or not self.quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True)
 
+    @staticmethod
+    def _supports_flashinfer_bf16_routing_method(
+        routing_method: BaseMoeRoutingMethod, ) -> bool:
+        # FIXME: ban DeepSeekV3 FlashInfer trtllm_bf16_routed_moe() as it appears to have bug
+        return not isinstance(routing_method, DeepSeekV3MoeRoutingMethod)
+
     def _requires_separated_routing(self) -> bool:
         """Whether this backend instance expects precomputed top-k routing."""
         # FIXME: ban FlashInfer BF16 MoE direct routing as it appears to have accuracy bug
@@ -330,6 +336,9 @@ class TRTLLMGenFusedMoE(MoE):
             if not self._is_flashinfer_fused_moe_available():
                 return False
             if self.activation_type != ActivationType.Swiglu:
+                return False
+            if not self._supports_flashinfer_bf16_routing_method(
+                    self.routing_method):
                 return False
             return True
 

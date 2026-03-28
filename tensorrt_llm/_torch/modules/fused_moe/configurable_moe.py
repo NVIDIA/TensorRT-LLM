@@ -28,6 +28,7 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
+import copy
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -162,10 +163,23 @@ class ConfigurableMoE(MoE):
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # ========== Create MoE Backend (Default: Cutlass) ==========
-        from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+        from tensorrt_llm._torch.modules.fused_moe.create_moe import (
+            create_moe_backend,
+            resolve_moe_cls,
+        )
 
-        # Get MoE backend class based on override_quant_config or model_config
-        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
+        # Get MoE backend class based on override_quant_config, routing_method, and model_config
+        moe_cls = resolve_moe_cls(
+            model_config,
+            routing_method,
+            self.dtype,
+            override_quant_config=override_quant_config,
+        )
+
+        backend_model_config = model_config
+        if override_quant_config is not None:
+            backend_model_config = copy.deepcopy(model_config)
+            backend_model_config.quant_config = override_quant_config
 
         # Call create_moe_backend with all necessary parameters
         # init_load_balancer=False: Prevents backend from registering itself with load balancer
@@ -173,10 +187,10 @@ class ConfigurableMoE(MoE):
         # skip_create_weights_in_init=True: Prevents backend from creating weights in __init__
         #   because backend uses layer_idx=None and may have different expert assignments
         #   We will create weights after syncing attributes from ConfigurableMoE
-        tmp_skip_create_weights_in_init = model_config.skip_create_weights_in_init
-        model_config._frozen = False
-        model_config.skip_create_weights_in_init = True
-        model_config._frozen = True
+        tmp_skip_create_weights_in_init = backend_model_config.skip_create_weights_in_init
+        backend_model_config._frozen = False
+        backend_model_config.skip_create_weights_in_init = True
+        backend_model_config._frozen = True
 
         backend = create_moe_backend(
             moe_cls=moe_cls,
@@ -186,7 +200,7 @@ class ConfigurableMoE(MoE):
             intermediate_size=self.intermediate_size,
             dtype=self.dtype,
             reduce_results=self.reduce_results,
-            model_config=model_config,
+            model_config=backend_model_config,
             aux_stream_dict=self.aux_stream_dict,
             weight_loading_mode=self.weight_loading_mode,
             bias=kwargs.get("bias", False),
@@ -221,10 +235,10 @@ class ConfigurableMoE(MoE):
             self.backend.expert_size_per_partition = self.expert_size_per_partition
 
         # Create weights here, because the backend needs the layer_load_balancer info to create weights
-        model_config._frozen = False
-        model_config.skip_create_weights_in_init = tmp_skip_create_weights_in_init
-        model_config._frozen = True
-        if not model_config.skip_create_weights_in_init:
+        backend_model_config._frozen = False
+        backend_model_config.skip_create_weights_in_init = tmp_skip_create_weights_in_init
+        backend_model_config._frozen = True
+        if not backend_model_config.skip_create_weights_in_init:
             self.backend.create_weights()
 
         # ========== Create Communication Strategy ==========

@@ -77,6 +77,25 @@ def get_moe_cls(
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
 
+def resolve_moe_cls(
+        model_config: ModelConfig,
+        routing_method: BaseMoeRoutingMethod,
+        dtype: Optional[torch.dtype],
+        override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
+    moe_cls = get_moe_cls(model_config, override_quant_config)
+
+    effective_quant_config = override_quant_config or model_config.quant_config
+    has_quant = (effective_quant_config is not None
+                 and effective_quant_config.layer_quant_mode.has_any_quant(
+                     exclude_kv_cache=True))
+    if (moe_cls == TRTLLMGenFusedMoE and not has_quant
+            and not TRTLLMGenFusedMoE._supports_flashinfer_bf16_routing_method(
+                routing_method)):
+        return CutlassFusedMoE
+
+    return moe_cls
+
+
 def create_moe_backend(
     moe_cls: Type[MoE],
     routing_method: BaseMoeRoutingMethod,
@@ -353,7 +372,8 @@ def create_moe(
             pretrained_config, 'torch_dtype'):
         dtype = pretrained_config.torch_dtype
 
-    moe_cls = get_moe_cls(model_config, override_quant_config)
+    moe_cls = resolve_moe_cls(model_config, routing_method, dtype,
+                              override_quant_config)
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
