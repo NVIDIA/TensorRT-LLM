@@ -74,9 +74,8 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
 
     return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
         optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)),
-        optionalTensorToObject(std::get<4>(result)), optionalTensorToObject(std::get<5>(result)),
-        std::get<6>(result), std::get<7>(result), std::get<8>(result), std::get<9>(result), std::get<10>(result),
-        std::get<11>(result));
+        optionalTensorToObject(std::get<4>(result)), optionalTensorToObject(std::get<5>(result)), std::get<6>(result),
+        std::get<7>(result), std::get<8>(result), std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
 nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::Tensor workspace,
@@ -110,9 +109,9 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)),
-        std::get<4>(result), std::get<5>(result), std::get<6>(result), optionalTensorToObject(std::get<7>(result)),
-        std::get<8>(result), std::get<9>(result), std::get<10>(result), std::get<11>(result));
+        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)), std::get<4>(result),
+        std::get<5>(result), std::get<6>(result), optionalTensorToObject(std::get<7>(result)), std::get<8>(result),
+        std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
 } // namespace

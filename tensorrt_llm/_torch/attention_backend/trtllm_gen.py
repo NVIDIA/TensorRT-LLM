@@ -826,7 +826,9 @@ class FlashInferTrtllmGenAttention:
             )
         )
         cyclic_attn_window_size = attention_window_size
-        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, is_mla_enable)
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(
+            metadata, is_mla_enable, attention_layer.layer_idx
+        )
         params = EnqueueParams(
             forward=forward_args,
             workspace=workspace,
@@ -958,6 +960,7 @@ class FlashInferTrtllmGenAttention:
         self,
         metadata: "TrtllmAttentionMetadata",
         is_mla_enable: bool,
+        global_layer_idx: int,
     ) -> Tuple[int, int]:
         """Return (kv_factor, total_num_blocks) for building KV cache views."""
         kv_cache_manager = metadata.kv_cache_manager
@@ -966,15 +969,17 @@ class FlashInferTrtllmGenAttention:
 
         kv_factor = 1 if is_mla_enable else 2
         blocks_in_primary_pool = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
-        if blocks_in_primary_pool is None:
-            blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)
-            if blocks_per_window:
-                blocks_in_primary_pool = max(
-                    int(primary) for primary, _ in blocks_per_window.values()
-                )
-        total_num_blocks = (
-            int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * kv_factor
-        )
+        if blocks_in_primary_pool is not None:
+            total_num_blocks = (
+                int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * kv_factor
+            )
+        else:
+            from tensorrt_llm._torch.pyexecutor.resource_manager import Role
+
+            layer_offset = kv_cache_manager.layer_offsets[global_layer_idx]
+            total_num_blocks = kv_cache_manager.impl.get_page_index_upper_bound(
+                layer_offset, Role.KEY
+            )
         return kv_factor, total_num_blocks
 
     def run_context(

@@ -1399,9 +1399,9 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
 }
 
 std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedKvCacheBuffers(
-    at::Tensor host_kv_cache_pool_pointers,
-    at::Tensor host_kv_cache_pool_mapping, int64_t layer_idx, int64_t num_kv_heads, int64_t tokens_per_block,
-    int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks, int64_t kv_cache_quant_mode, at::ScalarType dtype)
+    at::Tensor host_kv_cache_pool_pointers, at::Tensor host_kv_cache_pool_mapping, int64_t layer_idx,
+    int64_t num_kv_heads, int64_t tokens_per_block, int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks,
+    int64_t kv_cache_quant_mode, at::ScalarType dtype)
 {
     auto const mapping = readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
     int32_t const poolIndex = mapping.poolIndex;
@@ -1442,8 +1442,9 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedK
     if (isFp4 && poolPointers.primaryBlockScalePoolPtr != nullptr)
     {
         auto scaleOptions
-            = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(c10::Device(at::kCUDA,
-                static_cast<c10::DeviceIndex>(at::cuda::current_device())));
+            = at::TensorOptions()
+                  .dtype(at::kFloat8_e4m3fn)
+                  .device(c10::Device(at::kCUDA, static_cast<c10::DeviceIndex>(at::cuda::current_device())));
         kvScalePool = torch::from_blob(poolPointers.primaryBlockScalePoolPtr,
             {total_num_blocks, num_kv_heads, tokens_per_block, head_dim / 16}, scaleOptions);
     }
