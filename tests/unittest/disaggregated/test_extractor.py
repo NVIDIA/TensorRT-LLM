@@ -203,8 +203,8 @@ def test_layer_group_meta_serialization():
     from tensorrt_llm._torch.disaggregation.base.region import DataRole
     from tensorrt_llm._torch.disaggregation.resource.page import (
         BUFFER_ENTRY_DTYPE,
+        AttentionLayerGroup,
         KVCachePageTable,
-        LayerGroup,
         LocalLayer,
         PhysicalPool,
         PhysicalPoolGroup,
@@ -221,7 +221,7 @@ def test_layer_group_meta_serialization():
         LocalLayer(local_layer_id=0, global_layer_id=0),
         LocalLayer(local_layer_id=1, global_layer_id=1),
     ]
-    lg = LayerGroup(
+    lg = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=4,
         sliding_window_size=512,
@@ -236,7 +236,108 @@ def test_layer_group_meta_serialization():
     d = page_table.to_dict()
     restored = KVCachePageTable.from_dict(d)
     restored_lg = restored.layer_groups[0]
+    assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
     assert restored_lg.sliding_window_size == 512
     assert restored_lg.kv_head_num_per_rank == 4
     assert len(restored_lg.local_layers) == 2
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
+
+
+def test_mamba_layer_group_serialization():
+    from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup, PhysicalPool
+
+    conv_pool = PhysicalPool(base_address=1000, slot_bytes=128, num_slots=10)
+    ssm_pool = PhysicalPool(base_address=8000, slot_bytes=256, num_slots=8)
+    mlg = MambaLayerGroup(
+        pool_group_idx=1,
+        mamba_layer_offsets={10: 0, 11: 1, 12: 2},
+        conv_states=conv_pool,
+        ssm_states=ssm_pool,
+        conv_section_bytes=[512, 256, 256],
+        ssm_bytes_per_head=128,
+    )
+
+    d = mlg.to_dict()
+    assert d["mamba_layer_offsets"] == {10: 0, 11: 1, 12: 2}
+    assert d["conv_section_bytes"] == [512, 256, 256]
+
+    from tensorrt_llm._torch.disaggregation.resource.page import LayerGroup
+
+    restored = LayerGroup.from_dict(d)
+    assert isinstance(restored, MambaLayerGroup)
+    assert restored.mamba_layer_offsets == {10: 0, 11: 1, 12: 2}
+    assert restored.conv_states.base_address == 1000
+    assert restored.conv_states.slot_bytes == 128
+    assert restored.conv_states.num_slots == 10
+    assert restored.ssm_states.base_address == 8000
+    assert restored.ssm_states.slot_bytes == 256
+    assert restored.ssm_states.num_slots == 8
+    assert restored.conv_section_bytes == [512, 256, 256]
+    assert restored.ssm_bytes_per_head == 128
+
+
+def test_mixed_page_table_serialization():
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.base.region import DataRole
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        AttentionLayerGroup,
+        KVCachePageTable,
+        LocalLayer,
+        MambaLayerGroup,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
+
+    # Attention layer group
+    entries = np.array(
+        [(0, int(DataRole.KEY), 0, 256), (0, int(DataRole.VALUE), 256, 256)],
+        dtype=BUFFER_ENTRY_DTYPE,
+    )
+    attn_lg = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=4,
+        local_layers=[LocalLayer(0, 0)],
+        pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
+    )
+
+    # Mamba layer group
+    mamba_lg = MambaLayerGroup(
+        pool_group_idx=1,
+        mamba_layer_offsets={1: 0, 2: 1},
+        conv_states=PhysicalPool(base_address=5000, slot_bytes=1024, num_slots=4),
+        ssm_states=PhysicalPool(base_address=9000, slot_bytes=2048, num_slots=4),
+        conv_section_bytes=[256, 128, 128],
+        ssm_bytes_per_head=64,
+    )
+
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[attn_lg, mamba_lg],
+        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)])],
+    )
+
+    d = page_table.to_dict()
+    restored = KVCachePageTable.from_dict(d)
+
+    assert len(restored.layer_groups) == 2
+    assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
+    assert isinstance(restored.layer_groups[1], MambaLayerGroup)
+    assert restored.layer_groups[0].kv_head_num_per_rank == 4
+    assert restored.layer_groups[1].mamba_layer_offsets == {1: 0, 2: 1}
+
+    # Verify utils work correctly with mixed page table
+    from tensorrt_llm._torch.disaggregation.resource.utils import (
+        get_layer_to_layer_group,
+        get_num_layer_groups,
+        get_num_layers,
+    )
+
+    assert get_num_layer_groups(restored) == 2
+    # get_num_layers counts only attention layers
+    assert get_num_layers(restored) == 1
+    # get_layer_to_layer_group maps only attention layers
+    layer_map = get_layer_to_layer_group(restored)
+    assert layer_map == {0: 0}
