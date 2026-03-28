@@ -24,6 +24,7 @@ import torch
 from cutlass.torch import dtype as torch_dtype
 from cutlass.utils.distributed import atomicAdd
 
+from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 from .block_scan import block_prefix_sum_kernel
 from .filtered_top_k_varlen_util import (
     FilteredTopKKernelVarlen,
@@ -310,6 +311,8 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
+        griddepcontrol_wait()
+
         smem = utils.SmemAllocator()
         # TODO: how to simplify the smem allocate codes?
         s_histogram_buf_layout = cute.make_ordered_layout((self.radix + 1), order=(0))
@@ -557,6 +560,8 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     )
                 work_remaining = has_work
 
+        griddepcontrol_launch_dependents()
+
     @cute.jit
     def __call__(
         self,
@@ -608,6 +613,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             grid=blocks,
             block=(tiled_copy.size, 1, 1),
             stream=stream,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
         return
 
