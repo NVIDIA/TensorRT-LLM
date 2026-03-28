@@ -60,7 +60,6 @@ def _make_request(
         encoder_output_len=encoder_output_len if encoder_output_len > 0 else None,
     )
     req.state = state
-    req.estimated_reusable_tokens = 0
     return req
 
 
