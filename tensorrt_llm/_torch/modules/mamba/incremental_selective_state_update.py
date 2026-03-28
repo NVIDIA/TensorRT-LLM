@@ -78,6 +78,7 @@ def _precompute_cb_scaled_kernel(
     HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
@@ -121,25 +122,32 @@ def _precompute_cb_scaled_kernel(
     decay_vec = tl.exp(cumAdt)
 
     # --- Store dt_proc, cumAdt to WRITE buffer ---
-    odp_base = old_dt_proc_ptr + cache_batch_idx * stride_old_dt_proc_cache + buf_write * stride_old_dt_proc_dbuf + pid_h * stride_old_dt_proc_head
-    tl.store(odp_base + offs_t * stride_old_dt_proc_T, dt_proc, mask=t_mask)
+    old_dt_proc_base = old_dt_proc_ptr + cache_batch_idx * stride_old_dt_proc_cache + buf_write * stride_old_dt_proc_dbuf + pid_h * stride_old_dt_proc_head
+    tl.store(old_dt_proc_base + offs_t * stride_old_dt_proc_T, dt_proc, mask=t_mask)
 
-    oca_base = old_cumAdt_ptr + cache_batch_idx * stride_old_cumAdt_cache + buf_write * stride_old_cumAdt_dbuf + pid_h * stride_old_cumAdt_head
-    tl.store(oca_base + offs_t * stride_old_cumAdt_T, cumAdt, mask=t_mask)
+    old_cumAdt_base = old_cumAdt_ptr + cache_batch_idx * stride_old_cumAdt_cache + buf_write * stride_old_cumAdt_dbuf + pid_h * stride_old_cumAdt_head
+    tl.store(old_cumAdt_base + offs_t * stride_old_cumAdt_T, cumAdt, mask=t_mask)
 
     # --- Store decay_vec ---
     dv_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
     tl.store(dv_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
+
+    # --- Wait for upstream kernel (external PDL) before loading B and C ---
+    # Everything above (dt processing, cumAdt, decay_vec stores) is independent
+    # of the upstream kernel's B/C outputs.
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
 
     # --- Load C and B, compute CB = C @ B^T ---
     group_idx = pid_h // nheads_ngroups_ratio
     C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
     B_ptr += pid_b * stride_B_batch + group_idx * stride_B_group
 
+    # C and B are bf16 — load directly without unnecessary fp32 cast
     C_all = tl.load(C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
-                    mask=t_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
+                    mask=t_mask[:, None] & n_mask[None, :], other=0.0)
     B_all = tl.load(B_ptr + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
-                    mask=t_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
+                    mask=t_mask[:, None] & n_mask[None, :], other=0.0)
 
     CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
 
@@ -157,10 +165,10 @@ def _precompute_cb_scaled_kernel(
 
     # --- Store B to WRITE buffer of old_B cache (once per group, not per head) ---
     if pid_h % nheads_ngroups_ratio == 0:
-        oB_base = (old_B_ptr + cache_batch_idx * stride_old_B_cache
-                   + buf_write * stride_old_B_dbuf + group_idx * stride_old_B_group)
-        tl.store(oB_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
-                 B_all.to(tl.bfloat16), mask=t_mask[:, None] & n_mask[None, :])
+        old_B_base = (old_B_ptr + cache_batch_idx * stride_old_B_cache
+                      + buf_write * stride_old_B_dbuf + group_idx * stride_old_B_group)
+        tl.store(old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
+                 B_all, mask=t_mask[:, None] & n_mask[None, :])
 
 
 # ============================================================================
@@ -262,19 +270,19 @@ def _incremental_selective_scan_update_kernel(
     group_idx = pid_h // nheads_ngroups_ratio
 
     # Load precomputed dt_proc and cumAdt from READ buffer
-    odp_base = (old_dt_proc_ptr + cache_batch_idx * stride_old_dt_proc_cache
+    old_dt_proc_base = (old_dt_proc_ptr + cache_batch_idx * stride_old_dt_proc_cache
                 + buf_read * stride_old_dt_proc_dbuf + pid_h * stride_old_dt_proc_head)
-    old_dt_proc_all = tl.load(odp_base + offs_t * stride_old_dt_proc_T,
+    old_dt_proc_all = tl.load(old_dt_proc_base + offs_t * stride_old_dt_proc_T,
                               mask=t_mask, other=0.0).to(tl.float32)
 
-    oca_base = (old_cumAdt_ptr + cache_batch_idx * stride_old_cumAdt_cache
+    old_cumAdt_base = (old_cumAdt_ptr + cache_batch_idx * stride_old_cumAdt_cache
                 + buf_read * stride_old_cumAdt_dbuf + pid_h * stride_old_cumAdt_head)
-    old_cumAdt_all = tl.load(oca_base + offs_t * stride_old_cumAdt_T,
+    old_cumAdt_all = tl.load(old_cumAdt_base + offs_t * stride_old_cumAdt_T,
                              mask=t_mask, other=0.0).to(tl.float32)
 
     # Load cumAdt at prev_k-1 directly via pointer math (avoids masked reduction)
     prev_k_idx = tl.maximum(prev_num_accepted_tokens - 1, 0)
-    total_cumAdt = tl.load(oca_base + prev_k_idx * stride_old_cumAdt_T).to(tl.float32)
+    total_cumAdt = tl.load(old_cumAdt_base + prev_k_idx * stride_old_cumAdt_T).to(tl.float32)
 
     # Compute per-token coefficients
     coeff = tl.exp(total_cumAdt - old_cumAdt_all) * old_dt_proc_all
@@ -389,6 +397,7 @@ def incremental_selective_state_update(
     dt_softplus: bool = False,
     state_batch_indices: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
+    launch_with_pdl=False,
     use_internal_pdl=True,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
@@ -542,8 +551,10 @@ def incremental_selective_state_update(
             old_cumAdt.stride(0), old_cumAdt.stride(1), old_cumAdt.stride(2), old_cumAdt.stride(3),
             dt_softplus,
             HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
+            LAUNCH_WITH_PDL=launch_with_pdl,
             num_warps=_precompute_num_warps or 1,
             **({'num_stages': _precompute_num_stages} if _precompute_num_stages else {}),
+            launch_pdl=launch_with_pdl,
         )
 
         # --- Main kernel ---
