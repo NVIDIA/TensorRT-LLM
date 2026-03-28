@@ -132,9 +132,13 @@ def _precompute_cb_scaled_kernel(
     dv_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
     tl.store(dv_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
 
+    # --- Precompute decay_matrix and causal_mask (only depend on cumAdt/offs_t) ---
+    causal_mask = offs_t[:, None] >= offs_t[None, :]
+    decay_matrix = tl.exp(cumAdt[:, None] - cumAdt[None, :])
+
     # --- Wait for upstream kernel (external PDL) before loading B and C ---
-    # Everything above (dt processing, cumAdt, decay_vec stores) is independent
-    # of the upstream kernel's B/C outputs.
+    # Everything above (dt processing, cumAdt, decay_vec, decay_matrix) is
+    # independent of the upstream kernel's B/C outputs.
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
 
@@ -152,8 +156,6 @@ def _precompute_cb_scaled_kernel(
     CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
 
     # --- Scale CB: decay * dt * causal_mask ---
-    causal_mask = offs_t[:, None] >= offs_t[None, :]
-    decay_matrix = tl.exp(cumAdt[:, None] - cumAdt[None, :])
     CB_scaled = tl.where(causal_mask & t_mask[:, None] & t_mask[None, :],
                          CB * decay_matrix * dt_proc[None, :], 0.0)
 
