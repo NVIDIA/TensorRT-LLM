@@ -36,7 +36,7 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, Role
 from tensorrt_llm._utils import (
     get_size_in_bytes,
     get_sm_version,
@@ -969,10 +969,16 @@ class FlashInferTrtllmGenAttention:
                 # layer_offsets keys are global layer indices (pp_layers); layer_idx here
                 # is the local index used for host_kv_cache_pool_mapping / build_kv_cache_buffers.
                 layer_offset = self._kv_cache_manager.layer_offsets[global_layer_idx]
-                total_num_blocks = (
-                    self._kv_cache_manager.impl.get_primary_pool_data(layer_offset).shape[0]
-                    * kv_factor
-                )
+                # V1 (C++ impl): primary pool tensor shape; V2 (Python impl): page index span.
+                if isinstance(self._kv_cache_manager, KVCacheManager):
+                    total_num_blocks = (
+                        self._kv_cache_manager.impl.get_primary_pool_data(layer_offset).shape[0]
+                        * kv_factor
+                    )
+                else:
+                    total_num_blocks = self._kv_cache_manager.impl.get_page_index_upper_bound(
+                        layer_offset, Role.KEY
+                    )
             else:
                 total_num_blocks = (
                     kv_cache_block_offsets.size(1) * kv_cache_block_offsets.size(-1) * kv_factor
