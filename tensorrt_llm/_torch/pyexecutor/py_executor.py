@@ -581,6 +581,19 @@ class PyExecutor:
             self.kv_connector_manager.wait_for_initialization()
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+        if self.kv_cache_transceiver and request in self.active_requests:
+            # Fast-transfer: KV transfer completed in the same iteration
+            # before _handle_responses could run. Create the response now
+            # while state is still TRANS_IN_PROGRESS (required by C++
+            # createResult). Then proceed with end_transfer + termination.
+            response = request.create_response(False, self.dist.rank)
+            if response:
+                response.result.cached_tokens = request.cached_tokens
+                self._enqueue_responses([(request.py_request_id, response)])
+            if self.async_transfer_manager.end_transfer(request):
+                self.active_requests.remove(request)
+                self._terminate_request(request)
+            return
         if self.async_transfer_manager.end_transfer(request):
             self._terminate_request(request)
 
@@ -1312,11 +1325,17 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and not all_gen_first:
-                        logger.warning(
-                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                        )
-                        self._check_disagg_ctx_cache_transfer_status(1)
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                        if not all_gen_first:
+                            logger.warning(
+                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                            )
+                            self._check_disagg_ctx_cache_transfer_status(1)
+                        elif self.async_transfer_manager.has_any_inflight_requests(
+                        ):
+                            # Non-blocking cleanup of completed/timed-out
+                            # transfers to free KV blocks (see _executor_loop).
+                            self._check_disagg_ctx_cache_transfer_status(0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -1813,11 +1832,19 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and not all_gen_first:
-                logger.warning(
-                    "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                )
-                self._check_disagg_ctx_cache_transfer_status(1)
+            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                if not all_gen_first:
+                    logger.warning(
+                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                    )
+                    self._check_disagg_ctx_cache_transfer_status(1)
+                elif self.async_transfer_manager.has_any_inflight_requests():
+                    # Non-blocking cleanup of completed/timed-out transfers
+                    # to free KV blocks. We avoid the blocking check because
+                    # gen-first requests may be waiting for peer info (which
+                    # would block indefinitely), but completed transfers must
+                    # still be reaped so that KV cache can be reclaimed.
+                    self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
@@ -1902,6 +1929,7 @@ class PyExecutor:
                 finished_requests = []
 
                 can_queue, _ = self._can_queue(scheduled_batch)
+
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -2165,6 +2193,7 @@ class PyExecutor:
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
+
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
