@@ -21,7 +21,7 @@ This module contains:
 """
 
 # Re-export from scheduler.py
-from .adp_router import ADPRouter, DefaultADPRouter, RankState
+from .adp_router import ADPRouter, DefaultADPRouter, KVCacheAwareADPRouter, RankState
 from .scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -66,6 +66,7 @@ __all__ = [
     # ADP
     "ADPRouter",
     "DefaultADPRouter",
+    "KVCacheAwareADPRouter",
     "RankState",
     # Waiting queues
     "FCFSWaitingQueue",
