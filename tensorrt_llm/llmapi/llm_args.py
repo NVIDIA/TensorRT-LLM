@@ -1857,6 +1857,7 @@ class WaitingQueuePolicy(StrEnum):
     """Waiting queue scheduling policy for managing pending requests."""
 
     FCFS = "fcfs"  # First-Come-First-Served
+    PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
