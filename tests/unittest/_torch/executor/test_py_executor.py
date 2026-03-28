@@ -201,6 +201,10 @@ class MockPyExecutorForWaiting:
     Calls PyExecutor._waiting_requests directly to avoid mirroring logic.
     """
 
+    # Expose the static method so self._compute_scheduled_tokens works
+    # when PyExecutor._waiting_requests is called with this mock as self.
+    _compute_scheduled_tokens = staticmethod(PyExecutor._compute_scheduled_tokens)
+
     def __init__(
         self, max_num_tokens=1000, batch_wait_max_tokens_ratio=0.5, batch_wait_timeout_iters=3
     ):
