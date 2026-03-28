@@ -705,13 +705,22 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        # Disagg for hybrid models is currently only supported with C++ RnnStateManager
+        # Use C++ MambaCacheManager by default for Disaggregated serving with hybrid model.
         config = model_engine.model.model_config.pretrained_config
-        if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
-            if is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
+
+        is_disagg = (cache_transceiver_config is not None
+                     and cache_transceiver_config.backend is not None)
+        is_hybrid = is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+
+        if is_disagg and is_hybrid:
+            if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
+                    "TRTLLM_USE_CPP_MAMBA") == "1":
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling C++ MambaCacheManager automatically.")
-                os.environ['TRTLLM_USE_CPP_MAMBA'] = '1'
+                            "Enabling C++ MambaCacheManager.")
+                os.environ["TRTLLM_USE_CPP_MAMBA"] = "1"
+            else:
+                logger.info("Disaggregated serving with hybrid model detected. "
+                            "Enabling Python MambaCacheManager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)

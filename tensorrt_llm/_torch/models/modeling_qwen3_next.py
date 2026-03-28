@@ -38,8 +38,6 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import \
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
@@ -779,11 +777,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         has_initial_states = mamba_metadata.has_initial_states
 
         batch_size = num_prefills + num_decodes
-        if use_cpp_mamba_cache_manager():
-            state_indices = mamba_metadata.state_indices[:batch_size]
-        else:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-            )[:batch_size]
+        state_indices = mamba_metadata.state_indices[:batch_size]
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)

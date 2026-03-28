@@ -46,6 +46,7 @@ l0_a10:
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/region/test_block.py
+  - unittest/disaggregated/test_mamba_transfer.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
