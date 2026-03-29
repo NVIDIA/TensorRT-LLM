@@ -115,7 +115,7 @@ from tensorrt_llm.sampling_params import SamplingParams
                     path_type=Path,
                     resolve_path=True),
     default=None,
-    required=False,
+    required=True,
     help="Pass in a dataset file for parsing instead of stdin.",
 )
 # For text models, tokenizer initialization is not needed when loading the model since the dataset is already tokenized.
