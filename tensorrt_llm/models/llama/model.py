@@ -173,7 +173,7 @@ class LLaMADecoderLayer(Module):
                     ).plugin_config.gemm_plugin == "nvfp4", "UB with nvfp4 model must use nvfp4 gemm plugin"
                     reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
                 else:
-                    assert False, "UB must enabled with fp8 or nvfp4 model"
+                    reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
             else:
                 reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
 
