@@ -699,16 +699,16 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[1] * 2 == w_scale_shape[1] * 32
     assert w_shape[2] == w_scale_shape[2]
 
-    # OOM fix: save reference to original storage before update_weight_stride
-    # makes a copy. We free the original to make room for convert_layout output.
+    # OOM fix: free the original storage after update_weight_stride, but only
+    # if .contiguous() actually created a new copy. When the input is already
+    # contiguous in the transposed layout, .contiguous() is a no-op and shares
+    # the same storage — resizing it would destroy the tensor we need.
     original_w_storage = w.data.untyped_storage()
-
-    w = update_weight_stride(
-        w)  # creates new tensor (transpose+contiguous+transpose)
-
-    # Free original parameter storage - update_weight_stride already made a copy
-    original_w_storage.resize_(0)
-    torch.cuda.empty_cache()
+    w = update_weight_stride(w)
+    if w.data.untyped_storage().data_ptr() != original_w_storage.data_ptr():
+        original_w_storage.resize_(0)
+        torch.cuda.empty_cache()
+    del original_w_storage
     #num_warps = 4 if batch <= 512 else 8
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
