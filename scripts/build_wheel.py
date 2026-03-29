@@ -632,14 +632,15 @@ def main(*,
         build_deep_gemm = "OFF"
         build_flash_mla = "OFF"
     else:
-        targets.extend([
-            "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
-            "flash_mla"
-        ])
         build_pyt = "ON"
-        build_deep_ep = "ON"
+        build_deep_ep = "ON" if not any("BUILD_DEEP_EP=OFF" in v
+                                        for v in extra_cmake_vars) else "OFF"
         build_deep_gemm = "ON"
         build_flash_mla = "ON"
+        targets.extend(
+            ["th_common", "bindings", "deep_gemm", "pg_utils", "flash_mla"])
+        if build_deep_ep == "ON":
+            targets.append("deep_ep")
 
     if benchmarks:
         targets.append("benchmarks")
@@ -916,9 +917,12 @@ def main(*,
         binding_lib_file_name = binding_lib_dir.name
         install_file(binding_lib_dir, pkg_dir)
 
-        with (build_dir / "tensorrt_llm" / "deep_ep" /
-              "cuda_architectures.txt").open() as f:
-            deep_ep_cuda_architectures = f.read().strip().strip(";")
+        deep_ep_arch_file = (build_dir / "tensorrt_llm" / "deep_ep" /
+                             "cuda_architectures.txt")
+        deep_ep_cuda_architectures = ""
+        if deep_ep_arch_file.exists():
+            with deep_ep_arch_file.open() as f:
+                deep_ep_cuda_architectures = f.read().strip().strip(";")
         if deep_ep_cuda_architectures:
             install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
                          pkg_dir)
