@@ -351,7 +351,9 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]
 
     def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
-        sharding_config = self.transforms.get("detect_sharding", {})
+        sharding_config = self.transforms.get(
+            "apply_sharding_hints", self.transforms.get("detect_sharding", {})
+        )
         dist_mapping_config = sharding_config.get("dist_mapping", {})
         enable_attention_dp = sharding_config.get("enable_attention_dp", False)
 

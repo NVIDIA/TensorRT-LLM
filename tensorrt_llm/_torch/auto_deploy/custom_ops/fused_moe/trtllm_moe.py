@@ -20,7 +20,7 @@ import torch
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
 )
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.utils import ActivationType
@@ -36,10 +36,11 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     Returns:
         (mapping, enable_alltoall) — mapping is None when mapping_config is empty.
     """
-    mapping = deserialize_mapping(mapping_config) if mapping_config else None
-    enable_alltoall = (
-        mapping is not None and mapping.enable_attention_dp and mapping.moe_ep_size > 1
-    )
+    if not mapping_config:
+        return None, False
+    dc = DistConfig.deserialize(mapping_config)
+    mapping = dc.to_mapping()
+    enable_alltoall = dc.enable_attention_dp and dc.moe_ep_size > 1
     if enable_alltoall and max_num_tokens <= 0:
         raise ValueError("max_num_tokens must be > 0 when enable_alltoall is True")
     return mapping, enable_alltoall

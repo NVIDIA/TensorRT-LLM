@@ -15,7 +15,7 @@
 
 """Custom op collection for uncached causal conv (sliding window with 1d)."""
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +31,11 @@ def _torch_causal_conv1d(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
+    shardable: bool = False,
+    output_sizes: Optional[List[int]] = None,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
+    """Causal 1D convolution; accepts ``tp_mode`` for sharding-aware AutoDeploy behavior."""
     assert padding_mode == "zeros", "padding_mode must be zeros"
 
     batch_size, seq_len, _ = input.shape
@@ -61,5 +65,8 @@ def _torch_causal_conv1d_meta(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
+    shardable: bool = False,
+    output_sizes: Optional[List[int]] = None,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.empty_like(input)

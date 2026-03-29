@@ -1,9 +1,10 @@
 """Common utils for torch fx graph transformation."""
 
+import functools
 import operator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict
@@ -34,7 +35,7 @@ OperatorLike = Union[OpOrOverload, Callable]
 class LayerType(Enum):
     """Enum for layer type."""
 
-    ATTENTION = "attention"
+    MHA = "mha"
     SSM = "ssm"
     MLP = "mlp"
     MOE = "moe"
@@ -272,6 +273,39 @@ class WeightBiasInfoCache:
         """Store weight shape in cache."""
         if cls._active_instance is not None:
             cls._active_instance._weight_shape_cache[node] = shape
+
+
+def get_source_nodes(
+    node: Union[Node, List[Node]],
+    allowed_ops: Optional[set] = None,
+) -> List[Node]:
+    """Walk backward through a computation chain and return all source (get_attr) nodes.
+
+    Args:
+        node: Starting node or list of starting nodes.
+        allowed_ops: If provided, only traverse through ``call_function`` nodes
+            whose ``target`` is in this set.  Nodes with targets outside the set
+            act as traversal boundaries (their inputs are NOT explored).  This
+            prevents cross-layer contamination through linear/conv/view ops when
+            searching for elementwise parameter chains (e.g., A_log -> exp -> neg).
+            When ``None``, all ``call_function`` nodes are traversed (original
+            behaviour).
+    """
+    roots = [node] if isinstance(node, Node) else list(node)
+    result = []
+    visited: set[Node] = set()
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        if n in visited:
+            continue
+        visited.add(n)
+        if n.op == "get_attr":
+            result.append(n)
+        elif n.op == "call_function":
+            if allowed_ops is None or n.target in allowed_ops:
+                stack.extend(n.all_input_nodes)
+    return result
 
 
 def extract_weight_nodes(node: Node) -> WeightNodes:
@@ -630,6 +664,133 @@ def filtered_nodes(
                 yield node
 
 
+class ShardableOp(Enum):
+    """Ops that carry sharding hints for ``apply_sharding_hints``."""
+
+    LINEAR = "linear"
+    VIEW = "view"
+    SPLIT_WITH_SIZES = "split_with_sizes"
+    ALL_REDUCE = "all_reduce"
+    CONV1D = "conv1d"
+    SSM = "ssm"
+    GATED_DELTA = "gated_delta"
+    MLA = "mla"
+    NORM = "norm"
+    MOE = "moe"
+
+
+def is_any_shardable_op(node: Node) -> Union[ShardableOp, None]:
+    """Return the ``ShardableOp`` kind if *node* is a shardable custom op, else ``None``."""
+    if not isinstance(node, Node) or node.op != "call_function":
+        return None
+    if is_op(node, torch.ops.auto_deploy.torch_linear_simple):
+        return ShardableOp.LINEAR
+    if is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+            torch.ops.auto_deploy.torch_fake_quant_int4_linear,
+            torch.ops.auto_deploy.torch_fake_quant_int4_gptq_linear,
+            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
+            torch.ops.auto_deploy.trtllm_finegrained_fp8_linear,
+            torch.ops.auto_deploy.torch_quant_fp8_linear,
+            torch.ops.auto_deploy.trtllm_quant_fp8_linear,
+            torch.ops.auto_deploy.torch_quant_nvfp4_linear,
+        ],
+    ):
+        return ShardableOp.LINEAR
+    if is_op(node, torch.ops.auto_deploy.view):
+        return ShardableOp.VIEW
+    if is_op(node, torch.ops.auto_deploy.split_with_sizes):
+        return ShardableOp.SPLIT_WITH_SIZES
+    if is_op(node, torch.ops.auto_deploy.all_reduce):
+        return ShardableOp.ALL_REDUCE
+    if is_op(
+        node,
+        [torch.ops.auto_deploy.torch_causal_conv1d],
+    ):
+        return ShardableOp.CONV1D
+    if is_op(node, [torch.ops.auto_deploy.torch_ssm]):
+        return ShardableOp.SSM
+    if is_op(node, [torch.ops.auto_deploy.torch_gated_delta_rule]):
+        return ShardableOp.GATED_DELTA
+    if is_op(node, [torch.ops.auto_deploy.torch_mla]):
+        return ShardableOp.MLA
+    if is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_rmsnorm_gated,
+            torch.ops.auto_deploy.triton_rmsnorm_gated,
+        ],
+    ):
+        return ShardableOp.NORM
+    if is_any_moe_op(node):
+        return ShardableOp.MOE
+    return None
+
+
+_SHARDING_HINT_NAMES = frozenset(
+    {"tp_mode", "output_sizes", "tp_min_local_shape", "layer_type", "shardable", "tp_scaled_dim"}
+)
+
+
+@functools.lru_cache(maxsize=1)
+def get_shardable_op_hint_positions() -> Dict:
+    """Return ``{op_target: {arg_position: default_value}}`` for all shardable ops.
+
+    The result maps each shardable op target to the positions and defaults of
+    its sharding hint arguments.  Built once on first call by inspecting each
+    op's schema; subsequent calls return the cached result.
+    """
+    all_targets = [
+        torch.ops.auto_deploy.torch_linear_simple,
+        torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+        torch.ops.auto_deploy.torch_fake_quant_int4_linear,
+        torch.ops.auto_deploy.torch_fake_quant_int4_gptq_linear,
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
+        torch.ops.auto_deploy.trtllm_finegrained_fp8_linear,
+        torch.ops.auto_deploy.torch_quant_fp8_linear,
+        torch.ops.auto_deploy.trtllm_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear,
+        torch.ops.auto_deploy.view,
+        torch.ops.auto_deploy.split_with_sizes,
+        torch.ops.auto_deploy.all_reduce,
+        torch.ops.auto_deploy.torch_causal_conv1d,
+        torch.ops.auto_deploy.torch_ssm,
+        torch.ops.auto_deploy.torch_gated_delta_rule,
+        torch.ops.auto_deploy.torch_mla,
+        torch.ops.auto_deploy.torch_rmsnorm_gated,
+        torch.ops.auto_deploy.triton_rmsnorm_gated,
+        torch.ops.auto_deploy.torch_moe,
+        torch.ops.auto_deploy.torch_quant_fp8_moe,
+        torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+        torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
+        torch.ops.auto_deploy.triton_mxfp4_moe,
+        torch.ops.auto_deploy.torch_moe_fused,
+        torch.ops.auto_deploy.torch_moe_dense_mlp,
+    ]
+
+    result: Dict = {}
+    for target in all_targets:
+        schema = None
+        if hasattr(target, "_schemas"):
+            schema = next(iter(target._schemas.values()))
+        elif hasattr(target, "_schema"):
+            schema = target._schema
+        if schema is None:
+            continue
+        positions: Dict[int, Any] = {}
+        for i, a in enumerate(schema.arguments):
+            if a.name in _SHARDING_HINT_NAMES:
+                positions[i] = a.default_value if a.has_default_value else None
+        if positions:
+            result[target] = positions
+
+    return result
+
+
 def is_any_lin_op(node: Node) -> bool:
     return is_linear_op(node) or is_fake_quantized_linear_op(node)
 
@@ -653,6 +814,8 @@ def is_any_moe_op(node: Node) -> bool:
             torch.ops.auto_deploy.torch_quant_nvfp4_moe,
             torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
             torch.ops.auto_deploy.triton_mxfp4_moe,
+            torch.ops.auto_deploy.torch_moe_fused,
+            torch.ops.auto_deploy.torch_moe_dense_mlp,
         ],
     )
 
@@ -708,6 +871,30 @@ def is_any_mla_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_mla,
+        ],
+    )
+
+
+def is_any_view_op(node: Node) -> bool:
+    """Check if the node is a view/reshape op (aten or auto_deploy variant)."""
+    return is_op(
+        node,
+        [
+            torch.ops.aten.view,
+            torch.ops.aten.reshape,
+            torch.ops.auto_deploy.view,
+        ],
+    )
+
+
+def is_any_split_op(node: Node) -> bool:
+    """Check if the node is a split/split_with_sizes op (aten or auto_deploy variant)."""
+    return is_op(
+        node,
+        [
+            torch.ops.aten.split,
+            torch.ops.aten.split_with_sizes,
+            torch.ops.auto_deploy.split_with_sizes,
         ],
     )
 
@@ -1466,7 +1653,7 @@ def get_layer_after_linear_node(
             head_size = shape(attention_nodes[0])[-1]
             if len(intermediate_lin_nodes) > 0:
                 return LayerType.UNKNOWN, 1
-            return LayerType.ATTENTION, head_size
+            return LayerType.MHA, head_size
 
         if len(ssm_nodes) == 1:
             head_size = shape(ssm_nodes[0])[-1]

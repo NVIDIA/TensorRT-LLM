@@ -129,6 +129,8 @@ transforms:
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
+  strip_sharding_hints:
+    stage: weight_load
   load_weights:
     stage: weight_load
     run_per_gm: false

@@ -212,8 +212,13 @@ class Quantization(BaseTransform):
 
         custom_args = self.build_custom_args_for_linear(scales)
 
+        # Restructure args: (input, weight, bias, scales..., sharding_hints...)
+        # node.args currently: (input, weight, bias, tp_mode, output_sizes, tp_min_local_shape)
+        # target schema:       (input, weight, bias, scales..., tp_mode, output_sizes, tp_min_local_shape)
+        base_args = node.args[:3]
+        hint_args = node.args[3:]
         node.target = self.target_op()
-        node.args = (*node.args, *custom_args)
+        node.args = (*base_args, *custom_args, *hint_args)
 
     def _insert_quantized_bmm(
         self,

@@ -24,14 +24,23 @@ from .interface import (
 
 class InferenceOptimizer:
     def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig, mapping=None):
+        from ..utils.dist_config import DistConfig
+
         self.factory = factory
         self.config = self._clean_config(config)
         if not dist.is_initialized():
             local_rank, world_size = 0, 1
         else:
             local_rank, world_size = dist_ad.get_rank_world_size()
+
+        dist_config = None
+        if mapping is not None:
+            dist_config = DistConfig.from_mapping(mapping)
         self.shared_config = SharedConfig(
-            local_rank=local_rank, world_size=world_size, mapping=mapping
+            local_rank=local_rank,
+            world_size=world_size,
+            mapping=mapping,
+            dist_config=dist_config,
         )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
