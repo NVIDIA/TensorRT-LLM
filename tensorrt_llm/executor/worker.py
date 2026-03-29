@@ -312,10 +312,9 @@ def worker_main(
 
     with worker:
         try:
-            # All ranks must enter the KV-cache control-plane broadcast path,
+            # All ranks must enter the KV cache control-plane broadcast path,
             # even though only the leader rank owns the IPC queue.
-            if has_kv_cache_control_queue and hasattr(
-                    worker.engine, 'enable_kv_cache_control_plane'):
+            if has_kv_cache_control_queue:
                 worker.engine.enable_kv_cache_control_plane()
 
             worker.block_subordinates()

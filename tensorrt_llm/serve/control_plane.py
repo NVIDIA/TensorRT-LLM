@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV-cache control plane for non-inference runtime operations.
+"""KV cache control plane for non-inference runtime operations.
 
 Handles KV cache management operations (e.g. truncation), separated from the
 OpenAI-compatible inference server.  Communicates with PyExecutor via a

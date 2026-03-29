@@ -258,7 +258,7 @@ class BaseWorker(GenerationExecutor):
         ) if self.llm_args is not None else _create_engine(
             self._executor_config)
 
-        if hasattr(self.engine, 'set_kv_cache_control_queue'):
+        if self._is_pytorch_backend:
             self.control_queue = IntraProcessQueue()
             self.engine.set_kv_cache_control_queue(self.control_queue)
 

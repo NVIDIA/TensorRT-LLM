@@ -478,13 +478,13 @@ class OpenAIServer:
             )
             self.kv_cache_control_plane.register_routes(self.app)
         else:
-            # KV-cache control plane is unavailable — the executor does not
+            # KV cache control plane is unavailable — the executor does not
             # expose a control_queue.  This is expected in RPC orchestrator
             # mode (GenerationExecutorRpcProxy) and for non-PyExecutor
             # backends.  The /_control/* endpoints will not be registered;
             # clients that attempt to call them will receive 404.
             logger.warning(
-                "KV-cache control plane is disabled: the executor backend "
+                "KV cache control plane is disabled: the executor backend "
                 "does not provide a control_queue (e.g. RPC orchestrator "
                 "mode). Endpoints under /_control/ (KV cache truncation, "
                 "etc.) will not be available.")

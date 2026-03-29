@@ -515,7 +515,7 @@ class PyExecutor:
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
 
-        # KV-cache control plane queue (IpcQueue in multi-process mode,
+        # KV cache control plane queue (IpcQueue in multi-process mode,
         # IntraProcessQueue in single-process mode) for receiving cache-
         # management requests (e.g. truncation) from KVCacheControlPlane.
         # Set via set_kv_cache_control_queue(); the broadcast-based sync
@@ -861,7 +861,7 @@ class PyExecutor:
         self._kv_cache_control_plane_enabled = True
 
     def enable_kv_cache_control_plane(self):
-        """Enable the broadcast-based KV-cache control sync in the decode loop.
+        """Enable the broadcast-based KV cache control sync in the decode loop.
 
         Call on every rank (including non-leader ranks that do not own the
         queue) so the collective broadcast in
@@ -2166,7 +2166,7 @@ class PyExecutor:
             self.control_action_done.clear()
 
     def _sync_and_process_kv_cache_control_queue(self):
-        """Synchronize and process KV-cache control requests across all ranks.
+        """Synchronize and process KV cache control requests across all ranks.
 
         Only called when ``_kv_cache_control_plane_enabled`` is ``True``.
         Uses a two-phase broadcast: first broadcast the count (a single int),
