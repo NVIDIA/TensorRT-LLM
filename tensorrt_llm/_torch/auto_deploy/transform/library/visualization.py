@@ -10,12 +10,6 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
-try:
-    import model_explorer
-except ImportError:
-    model_explorer = None
-
-
 @TransformRegistry.register("visualize_namespace")
 class VisualizeNamespace(BaseTransform):
     """Transform to visualize the graph using Model Explorer.
@@ -44,9 +38,12 @@ class VisualizeNamespace(BaseTransform):
             A tuple of the unchanged graph module and transform info indicating
             whether visualization was successful or skipped.
         """
-        if model_explorer is None:
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+        try:
+            import model_explorer
+        except ImportError:
+            raise ImportError(
+                "Model Explorer visualization is enabled but 'ai-edge-model-explorer' package is not installed. "
+                "Install with: pip install ai-edge-model-explorer>=0.1.14"
             )
 
         try:
