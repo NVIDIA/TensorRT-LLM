@@ -786,7 +786,11 @@ def get_shardable_op_hint_positions() -> Dict:
             if a.name in _SHARDING_HINT_NAMES:
                 positions[i] = a.default_value if a.has_default_value else None
         if positions:
-            result[target] = positions
+            if isinstance(target, OpOverloadPacket):
+                for overload_name in target.overloads():
+                    result[getattr(target, overload_name)] = positions
+            else:
+                result[target] = positions
 
     return result
 
