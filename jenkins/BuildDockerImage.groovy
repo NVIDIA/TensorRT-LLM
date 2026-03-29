@@ -429,7 +429,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         "Build Internal release (SBSA trtllm)": [
             target: "trtllm",
@@ -437,7 +437,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64",
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         "Build CI Image (x86_64 tritondevel)": [:],
         "Build CI Image (SBSA tritondevel)": [
