@@ -135,8 +135,8 @@ def _append_to_paged_cache(
             page_offset = abs_pos // page_size
             offset_in_page = abs_pos % page_size
             page_idx = int(cache_loc[page_start + page_offset].item())
-            kv_cache[page_idx, offset_in_page, 0, :kv_lora_rank] = compressed_kv[src_idx]
-            kv_cache[page_idx, offset_in_page, 0, kv_lora_rank:] = kpe[src_idx]
+            kv_cache[page_idx, offset_in_page, :kv_lora_rank] = compressed_kv[src_idx]
+            kv_cache[page_idx, offset_in_page, kv_lora_rank:] = kpe[src_idx]
 
 
 def _gather_seq_cache(
@@ -159,7 +159,7 @@ def _gather_seq_cache(
         take = min(page_size, remaining)
         if take <= 0:
             break
-        chunks.append(kv_cache[page_idx, :take, 0])
+        chunks.append(kv_cache[page_idx, :take])
         remaining -= take
     return torch.cat(chunks, dim=0)
 
@@ -334,13 +334,16 @@ def flashinfer_trtllm_mla_with_cache(
         and num_decode > 0
         and _is_blackwell_decode_supported(q_nope, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim)
     ):
+        page_size = mla_paged_cache.shape[1]
+        max_pages_per_seq = int(
+            (cu_num_pages_host[1 : num_decode + 1] - cu_num_pages_host[:num_decode]).max().item()
+        )
+        # FlashInfer requires block_num % (128 / block_size) == 0
+        alignment = max(1, 128 // page_size)
+        max_pages_per_seq = ((max_pages_per_seq + alignment - 1) // alignment) * alignment
         block_tables = torch.zeros(
             num_decode,
-            int(
-                (cu_num_pages_host[1 : num_decode + 1] - cu_num_pages_host[:num_decode])
-                .max()
-                .item()
-            ),
+            max_pages_per_seq,
             dtype=torch.int32,
             device=q_nope.device,
         )
@@ -371,7 +374,7 @@ def flashinfer_trtllm_mla_with_cache(
                 device=q_nope.device, dtype=torch.int32
             ),
             max_seq_len=mla_paged_cache.shape[0] * mla_paged_cache.shape[1],
-            bmm1_scale=1.0,
+            bmm1_scale=scale,
             bmm2_scale=1.0,
         ).squeeze(1)
         y[:num_decode] = torch.einsum("bnk,nvk->bnv", latent_out, w_v)
@@ -508,7 +511,6 @@ class FlashInferTrtllmMLAAttention(AttentionDescriptor):
 
         return {
             "mla_paged_cache": _CombinedMLAPagedResourceHandler(
-                1,
                 kv_lora_rank + qk_rope_head_dim,
                 dtype=cache_dtype,
             )
