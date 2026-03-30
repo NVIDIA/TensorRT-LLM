@@ -341,6 +341,8 @@ def flashinfer_trtllm_mla_with_cache(
         # FlashInfer requires block_num % (128 / block_size) == 0
         alignment = max(1, 128 // page_size)
         max_pages_per_seq = ((max_pages_per_seq + alignment - 1) // alignment) * alignment
+        # Block tables are zero-padded for alignment. Padding entries point to page 0
+        # but are never accessed because seq_lens constrains the kernel's read bounds.
         block_tables = torch.zeros(
             num_decode,
             max_pages_per_seq,
@@ -373,7 +375,7 @@ def flashinfer_trtllm_mla_with_cache(
             seq_lens=seq_len_with_cache_host[:num_decode].to(
                 device=q_nope.device, dtype=torch.int32
             ),
-            max_seq_len=mla_paged_cache.shape[0] * mla_paged_cache.shape[1],
+            max_seq_len=int(seq_len_with_cache_host[:num_decode].max().item()),
             bmm1_scale=scale,
             bmm2_scale=1.0,
         ).squeeze(1)

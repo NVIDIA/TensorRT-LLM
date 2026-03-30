@@ -143,7 +143,7 @@ def _run_trtllm_mla(inputs, flashinfer_meta, combined_cache, kv_lora_rank):
 # =============================================================================
 
 
-def test_flashinfer_trtllm_mla_decode_falls_back_to_torch_on_hopper():
+def test_flashinfer_trtllm_mla_decode_matches_torch_reference():
     if torch.cuda.get_device_capability() < (9, 0):
         pytest.skip("requires Hopper+ for MLA test setup")
 
