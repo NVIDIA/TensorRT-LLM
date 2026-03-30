@@ -122,12 +122,8 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Instantiate Pattern Functions
         # ============================================================================
 
-        if shared_config.dist_config is not None:
-            strategy = shared_config.dist_config.allreduce_strategy
-        elif hasattr(gm, "_sharding_transform_container"):
-            strategy = gm._sharding_transform_container.config.allreduce_strategy.name
-        else:
-            assert False, "No dist config found"
+        # Get the allreduce strategy from shared_config
+        strategy = gm._sharding_transform_container.config.allreduce_strategy.name
 
         # TRT-LLM backend (MPI mode) - two patterns for different addition orders
         _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(
