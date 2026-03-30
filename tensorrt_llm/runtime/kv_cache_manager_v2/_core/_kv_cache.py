@@ -178,6 +178,7 @@ class _KVCache:
         "_avg_history_length",
         "_avg_capacity",
         "_ssm_blocks",
+        "_num_released_prefix_blocks",
         "__rawref__",
     )
 
@@ -244,6 +245,7 @@ class _KVCache:
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
         self._ssm_blocks = None
+        self._num_released_prefix_blocks = 0
         self.__rawref__ = rawref.NULL
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
@@ -929,12 +931,16 @@ class _KVCache:
         for ordinal, block in typed_enumerate(self._blocks):
             is_committed = ordinal < self._num_committed_blocks
             assert is_committed == block.is_committed
+            prefix_released = ordinal < self._num_released_prefix_blocks
             for beam_block in block.pages:
                 assert typed_len(beam_block) == num_life_cycles
                 for lc in typed_range(num_life_cycles):
                     holder = beam_block[lc]
                     if lc == ssm_lc_id:
                         # SSM pages live in _ssm_blocks, not in _blocks
+                        assert holder is None
+                        continue
+                    if prefix_released:
                         assert holder is None
                         continue
                     start, end = stale_ranges[lc]
@@ -1124,6 +1130,42 @@ class _KVCache:
         # drop the last block first
         while self._blocks:
             self._blocks.pop()
+
+    def release_prefix(self, num_blocks: int) -> None:
+        """Release page holders for the first ``num_blocks`` blocks.
+
+        Used by disaggregated serving to free sender-side KV memory
+        for blocks whose data has already been transferred.  The page
+        holders within each ``SeqBlock`` are set to ``None``, which
+        drops the ``_PageHolder`` references and triggers
+        ``schedule_for_eviction`` on committed pages.  The ``_blocks``
+        list itself is **not** shortened so that block ordinals and
+        ``close()`` / ``stop_committing()`` invariants are preserved.
+
+        Args:
+            num_blocks: Number of leading blocks to release.  Clamped
+                to ``len(self._blocks)`` if larger.
+
+        Note:
+            Callers must ensure that no in-flight RDMA reads reference
+            the released blocks.
+        """
+        if num_blocks <= 0:
+            return
+        num_blocks = min(num_blocks, len(self._blocks))
+
+        with self._record_event():
+            for i in range(num_blocks):
+                block = self._blocks[i]
+                for beam_pages in block.pages:
+                    for lc_idx in range(len(beam_pages)):
+                        beam_pages[lc_idx] = None
+
+        for beam_indices in self._base_page_indices:
+            for indices in beam_indices:
+                for i in range(min(num_blocks, len(indices))):
+                    indices[i] = BAD_PAGE_INDEX
+        self._num_released_prefix_blocks = max(self._num_released_prefix_blocks, num_blocks)
 
     @contextmanager
     def _record_event(self) -> Iterator[None]:
