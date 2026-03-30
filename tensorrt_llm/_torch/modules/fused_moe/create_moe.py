@@ -5,6 +5,9 @@ import torch
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import (
+    get_mxfp4_support_error_message, get_sm_version_from_torch,
+    is_mxfp4_supported)
 
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType
@@ -19,6 +22,49 @@ from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
+
+
+def _validate_fp4_quant_config_support(
+        quant_config: Optional[QuantConfig]) -> None:
+    if quant_config is None:
+        return
+
+    quant_mode = quant_config.layer_quant_mode
+    if not (quant_mode.has_nvfp4() or quant_mode.has_w4a8_nvfp4_fp8()
+            or quant_mode.has_mxfp4()):
+        return
+
+    sm = get_sm_version_from_torch()
+    if not is_mxfp4_supported(sm, quant_mode):
+        raise ValueError(get_mxfp4_support_error_message(sm, quant_mode))
+
+
+def _validate_moe_backend_support(
+        moe_cls: Type[MoE], quant_config: Optional[QuantConfig],
+        dtype: Optional[torch.dtype], swiglu_alpha: Optional[torch.Tensor],
+        swiglu_beta: Optional[torch.Tensor],
+        swiglu_limit: Optional[torch.Tensor]) -> None:
+    _validate_fp4_quant_config_support(quant_config)
+
+    if quant_config is None or not hasattr(moe_cls, "can_implement"):
+        return
+
+    can_implement, skip_reason = moe_cls.can_implement(
+        quant_config.quant_algo,
+        dtype_activation=dtype or torch.bfloat16,
+        swiglu_gptoss_style=any(param is not None
+                                for param in (swiglu_alpha, swiglu_beta,
+                                              swiglu_limit)),
+    )
+    if can_implement:
+        return
+
+    quant_mode_name = "UNQUANTIZED" if quant_config.quant_algo is None else quant_config.quant_algo.name
+    if skip_reason is not None:
+        raise ValueError(f"{quant_mode_name}: {skip_reason}")
+    raise ValueError(
+        f"{moe_cls.__name__} does not support quantization mode {quant_mode_name}."
+    )
 
 
 def get_moe_cls(
@@ -134,6 +180,9 @@ def create_moe_backend(
     if dtype is None and pretrained_config is not None and hasattr(
             pretrained_config, 'torch_dtype'):
         dtype = pretrained_config.torch_dtype
+
+    _validate_moe_backend_support(moe_cls, model_config.quant_config, dtype,
+                                  swiglu_alpha, swiglu_beta, swiglu_limit)
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
@@ -345,6 +394,9 @@ def create_moe(
         dtype = pretrained_config.torch_dtype
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
+    quant_config = override_quant_config or model_config.quant_config
+    _validate_moe_backend_support(moe_cls, quant_config, dtype, swiglu_alpha,
+                                  swiglu_beta, swiglu_limit)
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"

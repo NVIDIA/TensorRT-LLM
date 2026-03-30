@@ -22,7 +22,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import (
+    QuantAlgo, get_mxfp4_support_error_message, get_sm_version_from_torch,
+    is_mxfp4_supported)
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
     transform_sf_into_required_layout)
@@ -95,6 +97,39 @@ class TensorParallelMode(str, enum.Enum):
     @classmethod
     def flip(cls, mode):
         return cls.ROW if mode == cls.COLUMN else cls.COLUMN
+
+
+def _get_fp4_quant_mode(quant_config: Optional[QuantConfig]):
+    if quant_config is None:
+        return None
+
+    quant_mode = quant_config.layer_quant_mode
+    if (quant_mode.has_nvfp4() or quant_mode.has_w4a8_nvfp4_fp8()
+            or quant_mode.has_mxfp4()):
+        return quant_mode
+    return None
+
+
+def _validate_fp4_quant_config_support(
+        quant_config: Optional[QuantConfig]) -> None:
+    quant_mode = _get_fp4_quant_mode(quant_config)
+    if quant_mode is None:
+        return
+
+    sm = get_sm_version_from_torch()
+    if not is_mxfp4_supported(sm, quant_mode):
+        raise ValueError(get_mxfp4_support_error_message(sm, quant_mode))
+
+
+def _require_fp4_metadata(
+        tensor: Optional[torch.Tensor], metadata_name: str,
+        quant_mode) -> torch.Tensor:
+    if tensor is not None:
+        return tensor
+
+    sm = get_sm_version_from_torch()
+    raise ValueError(
+        f"Missing FP4 metadata: {metadata_name} for {quant_mode} on SM{sm}.")
 
 
 def load_weight_shard(
@@ -1648,6 +1683,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
         tp_size: int = 1,
         tp_rank: int = 0,
         tp_mode: Optional[TensorParallelMode] = None,
+        quant_mode=None,
     ):
         # For concatenated weights (qkv_proj / up_gate_proj), the global scaling factors and input scaling factors should be shared.
         input_scale = None
@@ -1679,6 +1715,10 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}"
                     )
 
+        input_scale = _require_fp4_metadata(input_scale, "input_scale",
+                                            quant_mode)
+        weight_scale_2 = _require_fp4_metadata(weight_scale_2,
+                                               "weight_scale_2", quant_mode)
         # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
         input_scale = input_scale.to(torch.float32)
         weight_scale_2 = weight_scale_2.to(torch.float32)
@@ -1695,7 +1735,8 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
             weights,
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
-            tp_mode=module.tp_mode)
+            tp_mode=module.tp_mode,
+            quant_mode=module.quant_config.quant_algo)
 
         assert len(weights) == 1
         weight_scale = weight_scale[0]
@@ -1718,7 +1759,8 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
             weights,
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
-            tp_mode=module.tp_mode)
+            tp_mode=module.tp_mode,
+            quant_mode=module.quant_config.quant_algo)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
         # Shuffle and Swizzle weight scale
@@ -1749,7 +1791,8 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
             weights,
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
-            tp_mode=module.tp_mode)
+            tp_mode=module.tp_mode,
+            quant_mode=module.quant_config.quant_algo)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
         # Shuffle and Swizzle weight scale
@@ -2583,6 +2626,7 @@ class Linear(nn.Module):
         if self._weights_created:
             return
 
+        _validate_fp4_quant_config_support(self.quant_config)
         self.quant_method = self.get_quant_method(self.quant_config)
         self.quant_method.create_weights(self, self.in_features,
                                          self.out_features, self.has_bias,
