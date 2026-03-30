@@ -975,8 +975,11 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
-        available_gpus = get_device_count()
-        if available_gpus > 0 and self.num_gpus > available_gpus:
+        try:
+            available_gpus = get_device_count()
+        except Exception:
+            available_gpus = None
+        if available_gpus is not None and self.num_gpus > available_gpus:
             pytest.skip(
                 f"Test requires {self.num_gpus} GPUs but only {available_gpus} available"
             )
