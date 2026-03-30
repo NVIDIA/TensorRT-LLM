@@ -42,18 +42,22 @@ class KVCacheControlPlane:
 
     def __init__(
         self,
-        control_queue,
+        kv_cache_control_queue,
         tokenizer,
         model_config,
         processor=None,
         harmony_adapter_factory: Optional[Callable] = None,
     ):
-        self.control_queue = control_queue
+        self.kv_cache_control_queue = kv_cache_control_queue
         self.tokenizer = tokenizer
         self.model_config = model_config
         self.processor = processor
         self._harmony_adapter_factory = harmony_adapter_factory
         self._harmony_adapter = None
+
+    def close(self):
+        """Detach the control queue so subsequent requests get 503."""
+        self.kv_cache_control_queue = None
 
     def register_routes(self, app: FastAPI):
         if self._harmony_adapter_factory is not None:
@@ -64,6 +68,21 @@ class KVCacheControlPlane:
 
     def _create_error_response(self, message: str, status_code: int) -> JSONResponse:
         return JSONResponse(content={"error": message}, status_code=status_code)
+
+    def _put_or_unavailable(self, request: TruncateKVCacheRequest) -> Optional[Response]:
+        """Put a request on the control queue.
+
+        Returns ``None`` on success, or a 503 response if the control
+        plane has been closed (e.g. during executor shutdown).
+        """
+        queue = self.kv_cache_control_queue
+        if queue is None:
+            return self._create_error_response(
+                "KV cache control plane is shutting down",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        queue.put(request)
+        return None
 
     def _convert_messages(
         self,
@@ -124,18 +143,18 @@ class KVCacheControlPlane:
                 else []
             )
 
-            self.control_queue.put(
+            err = self._put_or_unavailable(
                 TruncateKVCacheRequest(
                     messages_to_retain=messages_to_retain,
                     messages=messages,
                 )
             )
-            return Response(status_code=200)
+            return err or Response(status_code=200)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_error_response(str(e), HTTPStatus.INTERNAL_SERVER_ERROR)
 
-    def _truncate_kv_cache_harmony(self, request: KVCacheTruncateRequest) -> Response:
+    async def _truncate_kv_cache_harmony(self, request: KVCacheTruncateRequest) -> Response:
         try:
             if self._harmony_adapter is None:
                 self._harmony_adapter = self._harmony_adapter_factory()
@@ -161,13 +180,13 @@ class KVCacheControlPlane:
                 tool_choice=request.tool_choice,
             )
 
-            self.control_queue.put(
+            err = self._put_or_unavailable(
                 TruncateKVCacheRequest(
                     messages_to_retain=messages_to_retain,
                     messages=messages,
                 )
             )
-            return Response(status_code=200)
+            return err or Response(status_code=200)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_error_response(str(e), HTTPStatus.INTERNAL_SERVER_ERROR)

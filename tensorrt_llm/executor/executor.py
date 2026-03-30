@@ -78,7 +78,6 @@ class IterationResultQueue:
 
 
 class GenerationExecutor(ABC):
-    control_queue = None
 
     def __init__(self,
                  num_postprocess_workers: int = 0,
@@ -302,6 +301,11 @@ class GenerationExecutor(ABC):
     @abstractmethod
     def shutdown(self):
         pass
+
+    @property
+    def kv_cache_control_queue(self):
+        """Return the KV cache control queue if this executor supports it."""
+        return None
 
     @property
     def enable_postprocess_parallel(self) -> bool:

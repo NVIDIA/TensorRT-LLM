@@ -860,16 +860,6 @@ class PyExecutor:
         self._kv_cache_control_queue = queue
         self._kv_cache_control_plane_enabled = True
 
-    def enable_kv_cache_control_plane(self):
-        """Enable the broadcast-based KV cache control sync in the decode loop.
-
-        Call on every rank (including non-leader ranks that do not own the
-        queue) so the collective broadcast in
-        ``_sync_and_process_kv_cache_control_queue`` is entered by all
-        participants.
-        """
-        self._kv_cache_control_plane_enabled = True
-
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
 

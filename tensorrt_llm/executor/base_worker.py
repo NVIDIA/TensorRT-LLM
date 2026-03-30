@@ -112,9 +112,14 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        self._kv_cache_control_queue = None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
+
+    @property
+    def kv_cache_control_queue(self):
+        return self._kv_cache_control_queue
 
     def _configure_affinity(self, device_id):
         '''Probe and configure the CPU affinity of the worker based on NUMA topology.
@@ -257,10 +262,6 @@ class BaseWorker(GenerationExecutor):
         self.engine = _create_py_executor(
         ) if self.llm_args is not None else _create_engine(
             self._executor_config)
-
-        if self._is_pytorch_backend:
-            self.control_queue = IntraProcessQueue()
-            self.engine.set_kv_cache_control_queue(self.control_queue)
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None

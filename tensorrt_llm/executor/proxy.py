@@ -140,7 +140,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue")
-        self.control_queue = IpcQueue(
+        self._kv_cache_control_queue = IpcQueue(
             is_server=True,
             name="proxy_control_queue") if self._is_pytorch_backend else None
         # Stats and KV events are now fetched via RPC, not IPC queues.
@@ -148,9 +148,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             request_queue_addr=self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
-            control_queue_addr=self.control_queue.address
-            if self.control_queue is not None else None,
+            control_queue_addr=self._kv_cache_control_queue.address
+            if self._kv_cache_control_queue is not None else None,
         )
+
+    @property
+    def kv_cache_control_queue(self):
+        return self._kv_cache_control_queue
 
     def abort_request(self, request_id: int) -> None:
         ''' Abort a request by sending a cancelling request to the request queue.
@@ -340,8 +344,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.close()
         self.worker_init_status_queue.close()
         self.result_queue.close()
-        if self.control_queue is not None:
-            self.control_queue.close()
+        if self._kv_cache_control_queue is not None:
+            self._kv_cache_control_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()
