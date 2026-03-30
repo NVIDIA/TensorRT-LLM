@@ -645,6 +645,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         # It's derived from the model's BuildConfig for consistency with the C++ backend.
         max_seq_len: int,
         max_batch_size: int,
+        spec_state_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
@@ -665,7 +666,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_head_dim,
             mamba_num_layers,
             max_batch_size,
-            max_batch_size,
+            spec_state_size,
             mapping,
             mamba_cache_dtype,
             mamba_ssm_cache_dtype,

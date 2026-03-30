@@ -280,6 +280,7 @@ def create_hybrid_cache_manager(mapping,
         max_batch_size=1,
         mapping=mapping,
         dtype=dtype,
+        spec_state_size=1,
     )
 
 

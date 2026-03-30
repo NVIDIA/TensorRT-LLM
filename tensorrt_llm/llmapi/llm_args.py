@@ -716,7 +716,7 @@ class DecodingBaseConfig(StrictBaseModel):
         description=
         "When specified (>0), speculation will be disabled at batch sizes above this value. Otherwise, "
         "speculation will always be on. PyTorch backend only. "
-        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly supports max concurrency control."
+        "Mutually exclusive with draft_len_schedule since draft_len_schedule implicitly supports max concurrency control."
     )
 
     draft_len_schedule: Optional[dict[int, int]] = Field(
@@ -779,9 +779,9 @@ class DecodingBaseConfig(StrictBaseModel):
                     raise ValueError(
                         f"draft_len_schedule: batch size threshold must be >= 1, got {batch_size}"
                     )
-                if draft_len < 0:
+                if draft_len <= 0:
                     raise ValueError(
-                        f"draft_len_schedule: draft length must be >= 0, got {draft_len}"
+                        f"draft_len_schedule: draft length must be > 0, got {draft_len}"
                     )
 
             # Enforce smallest schedule key maps to max_draft_len for consistency.

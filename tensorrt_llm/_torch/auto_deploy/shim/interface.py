@@ -406,6 +406,7 @@ class CachedSequenceInterface:
                 "tokens_per_block": kv_cache_config.tokens_per_block,
                 "max_seq_len": self.info.max_seq_len,
                 "max_batch_size": self.info.max_batch_size,
+                "spec_state_size": self.info.max_batch_size,
                 "mapping": Mapping(),
                 "layer_mask": None,
                 # NOTE (lucaslie): we can always run with False here since when we are estimating,

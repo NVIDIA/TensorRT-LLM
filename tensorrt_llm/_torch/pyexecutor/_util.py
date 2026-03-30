@@ -53,6 +53,14 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def get_speculative_max_concurrency(spec_config: Optional[SpeculativeConfig],
+                                    max_batch_size: int) -> int:
+    """Return the largest batch size that may still use speculative Mamba."""
+    if spec_config is not None and spec_config.draft_len_schedule is not None:
+        return min(max_batch_size, list(spec_config.draft_len_schedule)[-1])
+    return max_batch_size
+
+
 def get_kv_cache_manager_cls(model_config: ModelConfig,
                              kv_cache_config: KvCacheConfig):
     config = model_config.pretrained_config
@@ -921,6 +929,8 @@ def _create_kv_cache_manager(
             layer_mask=layer_mask,
         )
     elif is_nemotron_hybrid(config):
+        mamba_spec_state_size = get_speculative_max_concurrency(
+            spec_config, max_batch_size)
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -1003,10 +1013,13 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
+            spec_state_size=mamba_spec_state_size,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
         )
     elif is_qwen3_next(config):
+        mamba_spec_state_size = get_speculative_max_concurrency(
+            spec_config, max_batch_size)
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -1053,6 +1066,7 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
+            spec_state_size=mamba_spec_state_size,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
         )
