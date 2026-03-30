@@ -757,6 +757,19 @@ class DisaggTestCmds(NamedTuple):
         server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
         return server_logs
 
+    @staticmethod
+    def _wait_for_config_file(config_path: str, timeout: int = 600) -> None:
+        """Wait for a config file to be written by the primary (_0) worker."""
+        start_time = time.time()
+        while not os.path.exists(config_path):
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                raise RuntimeError(
+                    f"Timed out waiting for config file {config_path} after {timeout}s"
+                )
+            print_info(f"Waiting for config file {config_path}, elapsed: {elapsed:.0f}s")
+            time.sleep(1)
+
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
@@ -769,6 +782,12 @@ class DisaggTestCmds(NamedTuple):
             self._generate_hostname_file(server_idx, port)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
+
+            # Non-primary workers wait for _0 worker to write the config file
+            if self.disagg_serving_type not in ("CTX_0", "GEN_0"):
+                config_idx = server_cmd.index("--config") + 1
+                self._wait_for_config_file(server_cmd[config_idx])
+
             server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
             try:
                 print_info(
@@ -1328,7 +1347,7 @@ class PerfSanityTestConfig:
 
             # Generate ctx server command
             ctx_cmd = ctx_config.to_cmd(test_output_dir, numa_bind, "CTX")
-            if "CTX" in disagg_serving_type:
+            if disagg_serving_type == "CTX_0":
                 config_content = ctx_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
@@ -1338,7 +1357,7 @@ class PerfSanityTestConfig:
 
             # Generate gen server command
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
-            if "GEN" in disagg_serving_type:
+            if disagg_serving_type == "GEN_0":
                 config_content = gen_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
