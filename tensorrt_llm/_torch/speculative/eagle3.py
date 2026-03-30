@@ -1,4 +1,3 @@
-import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -17,11 +16,6 @@ from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
-
-if sys.version_info[:2] >= (3, 12):
-    from typing import override
-else:
-    from typing_extensions import override
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -444,7 +438,6 @@ class Eagle3OneModelSampler(MTPSampler):
         self._spec_config = spec_config
         super().__init__(args, nextn=args.max_total_draft_tokens)
 
-    @override
     def _get_max_new_tokens(self, args: TorchSampler.Args,
                             draft_len: int) -> int:
         """Dynamic tree: accepted path depth <= max_draft_len + 1."""
