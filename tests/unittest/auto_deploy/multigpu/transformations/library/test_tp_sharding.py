@@ -106,6 +106,19 @@ class FP8MLP(nn.Module):
         return self.linear2(y)
 
 
+def test_finegrained_fp8_split_scale_non_divisible_world_size():
+    """When scale_dim < world_size and not divisible, rank->scale mapping must stay in range."""
+    scale = torch.arange(3 * 4, dtype=torch.float32).view(3, 4)
+    world_size = 8
+
+    expected_groups = [0, 0, 0, 1, 1, 1, 2, 2]
+    for rank, group in enumerate(expected_groups):
+        shard = FineGrainedFP8WeightShardingInfo._split_scale(
+            scale=scale, dim=0, rank=rank, world_size=world_size
+        )
+        torch.testing.assert_close(shard, scale[group : group + 1, :])
+
+
 class MLA_Block(nn.Module):
     """Multi-Latent Attention block - simplified standalone version.
 

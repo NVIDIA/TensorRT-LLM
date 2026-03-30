@@ -2,10 +2,11 @@
 
 """Shared MLA RoPE utilities for auto_deploy custom models.
 
-Contains helper functions for RoPE weight de-interleaving,
+Contains helper functions for RoPE weight de-interleaving and FP8 dequantization,
 used by DeepSeek V3 and GLM4 MoE Lite model implementations.
 """
 
+import math
 from typing import Dict
 
 import torch
@@ -83,3 +84,103 @@ def _rope_deinterleave_load_hook(
             b_pe = b[kv_lora_rank:]
             b_pe = _index_select_with_float8_cpu_workaround(b_pe, 0, perm)
             state_dict[kv_bias_key] = torch.cat([b_kv, b_pe])
+
+
+def _kv_b_proj_dequant_load_hook(
+    state_dict: Dict[str, torch.Tensor],
+    prefix: str,
+    *args,
+    num_layers: int = None,
+):
+    """Pre-load hook that dequantizes FP8 kv_b_proj weights using per-block scales.
+
+    kv_b_proj.weight is passed directly to torch_mla (not via a quantized linear op),
+    so it is NOT processed by the standard FineGrainedFP8LinearQuantization transform.
+    Without this hook, the FP8 weight is loaded into the BF16 model parameter via a
+    raw dtype cast (FP8 -> BF16) without applying weight_scale_inv, producing values
+    that are ~1000x too large and causing NaN/Inf in attention scores.
+
+    This hook reads weight_scale_inv from the state_dict and performs the proper
+    block-wise dequantization before the weights are copied into the model parameters.
+    """
+    import os as _os
+    import re as _re
+
+    _rank = _os.environ.get("RANK", "0")
+
+    # Auto-detect num_layers when not provided by scanning state_dict keys.
+    if num_layers is None:
+        _max_layer = -1
+        for _k in state_dict:
+            _m = _re.search(r"model\.layers\.(\d+)\.self_attn\.kv_b_proj\.weight$", _k)
+            if _m:
+                _max_layer = max(_max_layer, int(_m.group(1)))
+        if _max_layer < 0:
+            return  # No kv_b_proj weights found; nothing to do.
+        num_layers = _max_layer + 1
+
+    _diag_printed = False
+    for layer_idx in range(num_layers):
+        layer_prefix = f"{prefix}model.layers.{layer_idx}.self_attn."
+        w_key = layer_prefix + "kv_b_proj.weight"
+        scale_key = layer_prefix + "kv_b_proj.weight_scale_inv"
+
+        if w_key not in state_dict:
+            if not _diag_printed and layer_idx == 0:
+                print(
+                    f"[DIAG rank={_rank}] _kv_b_proj_dequant_load_hook: key NOT found: {w_key}. "
+                    f"sd keys sample: {list(state_dict.keys())[:3]}",
+                    flush=True,
+                )
+                _diag_printed = True
+            continue
+
+        w = state_dict[w_key]
+        if not _diag_printed:
+            print(
+                f"[DIAG rank={_rank}] _kv_b_proj_dequant_load_hook CALLED: layer={layer_idx} "
+                f"key={w_key} dtype={w.dtype} shape={w.shape} prefix={repr(prefix)}",
+                flush=True,
+            )
+            _diag_printed = True
+        if w.dtype != torch.float8_e4m3fn:
+            # Already in a floating-point type; no dequantization needed.
+            continue
+
+        if scale_key not in state_dict:
+            # No scale available; fall back to plain cast and warn.
+            import warnings
+
+            warnings.warn(
+                f"kv_b_proj FP8 weight found at {w_key} but no scale at {scale_key}; "
+                "loading with raw dtype cast (weights will be incorrect)."
+            )
+            state_dict[w_key] = w.to(torch.bfloat16)
+            continue
+
+        scale = state_dict[scale_key]
+
+        # Expand block-wise scale to full weight shape.
+        # weight shape: [N, K], scale shape: [N/block_n, K/block_k]
+        N, K = w.shape
+        scale_n, scale_k = scale.shape
+        block_n = math.ceil(N / scale_n) if scale_n > 0 else 128
+        block_k = math.ceil(K / scale_k) if scale_k > 0 else 128
+        scale_expanded = (
+            scale.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)[:N, :K]
+        )
+
+        # Dequantize: BF16_weight = FP8_value * scale_inv
+        w_dequant = w.to(torch.bfloat16) * scale_expanded.to(torch.bfloat16)
+        if layer_idx == 0:
+            print(
+                f"[DIAG rank={_rank}] kv_b_proj layer0 dequant: "
+                f"max_before={w.to(torch.float32).abs().max().item():.4f} "
+                f"max_after={w_dequant.abs().max().item():.4f} "
+                f"scale_sample={scale.flatten()[:4].tolist()}",
+                flush=True,
+            )
+        state_dict[w_key] = w_dequant
+
+        # Remove scale from state_dict so it is not loaded into a non-existent buffer.
+        del state_dict[scale_key]

@@ -601,14 +601,18 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         ``scale.shape[dim] < world_size``.
 
         When the scale dimension is smaller than world_size (e.g. a 2-row scale
-        shared across 8 GPUs), we group ranks that share the same scale row:
-        ``group = rank // (world_size // scale_dim)``.
+        shared across 8 GPUs), multiple ranks must share each scale row.
         """
         scale_dim = scale.shape[dim]
+        if scale_dim <= 0:
+            raise ValueError(f"Invalid scale dimension ({scale_dim}) for dim={dim}.")
         if scale_dim >= world_size:
             return torch.tensor_split(scale, world_size, dim=dim)[rank]
-        # More ranks than scale rows → group ranks that share a row
-        group = rank // (world_size // scale_dim)
+
+        # More ranks than scale rows. Map ranks to available scale rows using
+        # proportional binning so it is safe even when scale_dim does not
+        # evenly divide world_size (e.g. scale_dim=3, world_size=8).
+        group = min((rank * scale_dim) // world_size, scale_dim - 1)
         return torch.tensor_split(scale, scale_dim, dim=dim)[group]
 
     def shard_scales(

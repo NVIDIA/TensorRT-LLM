@@ -1,0 +1,8 @@
+# Conservative runtime settings for DeepSeek-R1 bring-up.
+max_batch_size: 2
+compile_backend: torch-cudagraph
+disable_overlap_scheduler: true
+disable_flashinfer_sampling: true
+transforms:
+  insert_cached_mla_attention:
+    backend: flashinfer_mla

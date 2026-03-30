@@ -90,6 +90,29 @@ def simple_llm(request) -> LLM:
     return llm
 
 
+def test_top_k_top_p_sampling_batch_sanitizes_invalid_probabilities():
+    logits = torch.tensor(
+        [
+            [float("nan"), float("inf"), -1.0, float("-inf")],
+            [float("nan"), float("nan"), float("nan"), float("nan")],
+        ],
+        dtype=torch.float32,
+    )
+
+    next_tokens, probs = top_k_top_p_sampling_batch(
+        logits,
+        top_k=4,
+        top_p=1.0,
+        temperature=1.0,
+    )
+
+    assert next_tokens.shape == (2,)
+    assert torch.isfinite(probs).all()
+    assert (probs >= 0).all()
+    torch.testing.assert_close(probs.sum(dim=-1), torch.ones(2, dtype=probs.dtype))
+    assert probs[1, 0] == pytest.approx(1.0)
+
+
 def check_generated_output(
     gather_context_logits,
     gather_generation_logits,

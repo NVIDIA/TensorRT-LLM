@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,10 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
-from tensorrt_llm._torch.auto_deploy.shim.ad_executor import create_autodeploy_executor
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import (
+    create_autodeploy_executor,
+    instantiate_sampler,
+)
 
 
 class MockTokenizer:
@@ -70,6 +73,24 @@ class MockFactory:
     """Mock Factory that stores initialization arguments."""
 
     vocab_size_padded: Optional[int] = None
+
+
+@dataclass
+class MockTorchSamplerArgs:
+    max_seq_len: int
+    max_draft_len: int
+    max_num_sequences: int
+    max_beam_width: int
+    max_total_draft_tokens: int
+    disable_overlap_scheduler: bool = False
+    disable_flashinfer_sampling: bool = False
+
+
+class MockTorchSampler:
+    Args = MockTorchSamplerArgs
+
+    def __init__(self, args: MockTorchSamplerArgs):
+        self.args = args
 
 
 """Unit tests for create_autodeploy_executor function."""
@@ -151,3 +172,29 @@ def test_create_autodeploy_executor_with_guided_decoding(
         assert guided_decoder.guided_decoding_config == mock_guided_decoding_config
         assert guided_decoder.max_num_sequences == ad_config.max_batch_size
         assert guided_decoder.vocab_size_padded == vocab_size_padded
+
+
+def test_instantiate_sampler_forwards_disable_flashinfer_sampling():
+    ad_config = LlmArgs(
+        model="test-model",
+        backend="_autodeploy",
+        disable_overlap_scheduler=True,
+        disable_flashinfer_sampling=True,
+    )
+
+    with patch(
+        "tensorrt_llm._torch.auto_deploy.shim.ad_executor.TorchSampler",
+        MockTorchSampler,
+    ):
+        sampler = instantiate_sampler(
+            ad_config=ad_config,
+            max_num_sequences=4,
+            max_draft_len=0,
+            max_total_draft_tokens=0,
+            dist_mapping=Mock(),
+            engine=Mock(),
+        )
+
+    assert isinstance(sampler, MockTorchSampler)
+    assert sampler.args.disable_overlap_scheduler is True
+    assert sampler.args.disable_flashinfer_sampling is True
