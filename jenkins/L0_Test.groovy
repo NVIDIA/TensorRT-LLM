@@ -40,7 +40,7 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.12-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.02-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -1146,6 +1146,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     // Output is the corresponding scriptLaunchPathLocal script under the disaggMode
                     sh """
+                        pip3 install pyyaml && \\
                         python3 ${scriptSubmitLocalPath} \\
                         --run-ci \\
                         --llm-src ${llmSrcLocal} \\
@@ -1957,7 +1958,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=25.12 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.02 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -2967,17 +2968,19 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     echo "uploading ${wheelName} to ${cpu_arch}/${wheel_path}"
     trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
 
-    if (reinstall_dependencies == true) {
+    if (reinstall_dependencies) {
         // Test installation in the new environment
-        def pip_keep = "-e 'pip'"
+        // Reserve CUDA 13.0 torch and torchvision packages
+        def pip_keep = "^pip==|^torch==|^torchvision=="
         def remove_trt = "rm -rf /usr/local/tensorrt"
         if (env.alternativeTRT) {
-            pip_keep += " -e tensorrt"
+            pip_keep += "|^tensorrt=="
             remove_trt = "echo keep /usr/local/tensorrt"
         }
-        sh "#!/bin/bash \n" + "pip3 list --format=freeze | egrep -v ${pip_keep} | xargs pip3 uninstall -y"
-        sh "#!/bin/bash \n" + "yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}"
+        sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
+        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
     }
+
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install pytest build/tensorrt_llm-*.whl")
     if (env.alternativeTRT) {
@@ -3016,17 +3019,22 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "bash -c 'pip3 show tensorrt || true'"
     }
+
     if (reinstall_dependencies) {
         // Test installation in the new environment
-        def pip_keep = "-e 'pip'"
+        // Reserve CUDA 13.0 torch and torchvision packages
+        def pip_keep = "^pip==|^torch==|^torchvision=="
         def remove_trt = "rm -rf /usr/local/tensorrt"
         if (env.alternativeTRT) {
-            pip_keep += " -e tensorrt"
+            pip_keep += "|^tensorrt=="
             remove_trt = "echo keep /usr/local/tensorrt"
         }
-        sh "bash -c 'pip3 list --format=freeze | egrep -v ${pip_keep} | xargs pip3 uninstall -y'"
+        sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
         sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
     }
+    //WAR: remove python3-pygments first since it is installed in NGC PyTorch image
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
+
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
     if (env.alternativeTRT) {
@@ -3477,7 +3485,7 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
@@ -3515,8 +3523,8 @@ def launchTestJobs(pipeline, testFilter)
             AARCH64_TRIPLE,
             false,
             "",
-            DLFW_IMAGE,
-            false, // Extra PyTorch CUDA 13.0 install
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
         ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
@@ -3604,6 +3612,8 @@ def launchTestJobs(pipeline, testFilter)
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
+                            // Remove the python3-pygments pip package because the dlfw image already includes a Debian pygments package, which conflicts with the pip-installed version.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
@@ -3622,11 +3632,7 @@ def launchTestJobs(pipeline, testFilter)
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            if (k8s_arch == "amd64") {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
-                            } else {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
-                            }
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
                         def libEnv = []
