@@ -4,17 +4,9 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
-skip_loading_weights: false
 max_seq_len: 512
 world_size: 1
 
 # Gemma 3n uses shared-KV decode semantics in the tail layers. FlashInfer
 # supports the read-only shared-KV cache path and alternating sliding windows.
 attn_backend: flashinfer
-
-transforms:
-  fuse_trtllm_attn_quant_fp8:
-    enabled: true
-  fuse_rmsnorm_quant_fp8:
-    stage: post_load_fusion
-    enabled: true
