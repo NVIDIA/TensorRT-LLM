@@ -29,8 +29,8 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.quantization.mode import (
-    QuantAlgo, get_mxfp4_support_error_message, get_sm_version_from_torch,
-    is_mxfp4_supported)
+    QuantAlgo, QuantMode, get_mxfp4_support_error_message,
+    get_sm_version_from_torch, is_mxfp4_supported)
 from tensorrt_llm.quantization.utils import fp8_quantize
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
@@ -1009,7 +1009,7 @@ def nvfp4_gemm(
     Raises:
         ValueError: If backend is invalid/unavailable
     """
-    _validate_fp4_runtime_support(QuantAlgo.NVFP4)
+    _validate_fp4_runtime_support(QuantMode.from_quant_algo(QuantAlgo.NVFP4))
 
     valid_individual_backends = {'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'}
 
@@ -1296,7 +1296,8 @@ def w4a8_mxfp4_fp8_gemm(
         output_dtype: torch.dtype,
         output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
-    _validate_fp4_runtime_support(QuantAlgo.W4A8_MXFP4_FP8)
+    _validate_fp4_runtime_support(
+        QuantMode.from_quant_algo(QuantAlgo.W4A8_MXFP4_FP8))
 
     tuner = AutoTuner.get()
 
