@@ -23,7 +23,6 @@ import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
-    MemoryDesc,
     MemoryDescs,
     MemoryType,
     RegMemoryDescs,
