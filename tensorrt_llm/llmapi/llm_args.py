@@ -3539,7 +3539,22 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Bounded wait interval in milliseconds for polling KV transfer "
         "progress when active transfers block disaggregated admission.")
 
+    chunk_size_blocks: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Maximum number of KV cache blocks per layer group per chunk for "
+        "chunked KV cache transfer. When set, each layer group's block list "
+        "is partitioned into slices of at most this many blocks, and each "
+        "slice is transferred independently. The total data per chunk is "
+        "approximately chunk_size_blocks * num_layer_groups * slot_bytes. "
+        "This reduces per-transfer NIXL descriptor pressure for long "
+        "sequences. When None (default), the entire KV cache is transferred "
+        "in a single slice. Only effective with the Python transceiver "
+        "(transceiver_runtime='PYTHON').")
+
     def _to_pybind(self):
+        # chunk_size_blocks is consumed by the Python transceiver only
+        # and has no C++ counterpart, so it is intentionally omitted.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
