@@ -20,7 +20,6 @@ __all__ = [
     "PromptAdapterRequest",
     "GenerationRequest",
     "TruncateKVCacheRequest",
-    "KVCacheControlRequest",
     "CancellingRequest",
 ]
 
@@ -148,11 +147,7 @@ class GenerationRequest:
         return self
 
 
-class KVCacheControlRequest:
-    ''' Base class for KV cache control requests. '''
-
-
-class TruncateKVCacheRequest(KVCacheControlRequest):
+class TruncateKVCacheRequest:
 
     def __init__(self, messages_to_retain: List[int], messages: List[int]):
         self.messages_to_retain = messages_to_retain
