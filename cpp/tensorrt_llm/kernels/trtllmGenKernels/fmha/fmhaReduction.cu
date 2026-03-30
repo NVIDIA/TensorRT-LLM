@@ -33,7 +33,7 @@ namespace kernels
 template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
     typename DtypePartialO>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(KernelParams const params,
-    bool sparseAttention, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
+    int32_t sparseAttention, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
 {
 
     // clang-format off
@@ -372,7 +372,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
     config.numAttrs = 1;
 
     // Select the kernel function pointer.
-    void (*kernel)(KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
+    void (*kernel)(KernelParams const, int32_t, int32_t, int32_t, int32_t) = nullptr;
     if (headDimPerCtaV == 128)
     {
         SELECT_FMHA_REDUCTION_KERNEL(128);

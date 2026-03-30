@@ -552,7 +552,6 @@ class TrtllmAttentionWrapper:
                 has_cross_kv=False,
                 quant_config=self.quant_config,
                 kv_cache_manager=self.kv_cache_manager,
-                sparse_attention_config=self.sparse_attention_config,
                 skip_softmax_threshold_scale_factor_prefill=self.
                 skip_softmax_threshold_scale_factor_prefill,
                 skip_softmax_threshold_scale_factor_decode=self.

@@ -136,7 +136,6 @@ class TrtllmGenSupportChecker:
         quant_config: Optional[QuantConfig] = None,
         sparse_kv_indices: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
-        sparse_attention_config: Optional[object] = None,
         skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
         skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
     ) -> Tuple[bool, str]:
@@ -161,13 +160,6 @@ class TrtllmGenSupportChecker:
         if has_sparse_kv or has_sparse_attn:
             return False, "Sparse attention is not supported by trtllm-gen backend."
 
-        if sparse_attention_config is not None:
-            algo = getattr(sparse_attention_config, "algorithm", None)
-            if algo not in (None, "mqa_gqa", "skip_softmax"):
-                return (
-                    False,
-                    f"Sparse attention algorithm '{algo}' is not supported by trtllm-gen backend.",
-                )
         if is_mla_enable:
             return False, "MLA is not supported by trtllm-gen backend."
         if not is_fused_qkv:
@@ -1410,7 +1402,6 @@ def is_supported(
     has_cross_kv: bool = False,
     quant_config: Optional[QuantConfig] = None,
     kv_cache_manager: Optional[KVCacheManager] = None,
-    sparse_attention_config: Optional[object] = None,
     phase: str = "both",
     sparse_kv_indices: Optional[torch.Tensor] = None,
     sparse_attn_indices: Optional[torch.Tensor] = None,
@@ -1485,7 +1476,6 @@ def is_supported(
         quant_config=quant_config,
         sparse_kv_indices=sparse_kv_indices,
         sparse_attn_indices=sparse_attn_indices,
-        sparse_attention_config=sparse_attention_config,
         skip_softmax_threshold_scale_factor_prefill=skip_softmax_threshold_scale_factor_prefill,
         skip_softmax_threshold_scale_factor_decode=skip_softmax_threshold_scale_factor_decode,
     )

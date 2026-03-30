@@ -139,8 +139,8 @@ enum class SparseType : int32_t
 {
     None = 0,
     SparseMla = 1,
-    Reserved = 2,
-    SparseMqaGqa = 3,
+    Reserved = 2,     // Reserved for future sparse attention types. Do not use this value now.
+    SparseMqaGqa = 3, // TODO: change the order of the enum values.
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

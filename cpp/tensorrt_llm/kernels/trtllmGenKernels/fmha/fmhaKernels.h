@@ -192,8 +192,8 @@ public:
         // Bit 49 - 52: (log2(tileSizeQ)).
         // Bit 53 - 53: reuseSmemKForV.
         // Bit 54 - 54: uses2CtaMma.
-        // Bit 55 - 55: sparseAttention.
-        // Bit 56 - 56: skipsSoftmax.
+        // Bit 55 - 56: sparseAttention.
+        // Bit 57 - 57: skipsSoftmax.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -201,7 +201,7 @@ public:
             | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(log2(numTokensPerPage)) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 56);
+            | (static_cast<uint64_t>(skipsSoftmax) << 57);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
