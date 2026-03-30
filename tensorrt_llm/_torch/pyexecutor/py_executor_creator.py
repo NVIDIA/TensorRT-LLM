@@ -369,7 +369,9 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        spec_config.runtime_max_batch_size = max_batch_size
+        if hasattr(spec_config,
+                   'max_batch_size') and spec_config.max_batch_size is None:
+            spec_config.max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode

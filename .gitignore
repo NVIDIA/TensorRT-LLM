@@ -104,4 +104,3 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
-test_perf_b200/
