@@ -181,6 +181,9 @@ class _KVCache:
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
+    def get_ssm_block_base_index(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> int: ...
     def get_aggregated_page_indices(
         self,
         layer_group_id: LayerGroupId,
