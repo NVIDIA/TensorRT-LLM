@@ -133,8 +133,9 @@ class KvCacheCreator:
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
                 logger.warning(
-                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0."
-                )
+                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
+                    "Falling back to KVCacheManager.")
+                cls = KVCacheManager
         return cls
 
     def _get_kv_size_per_token(self):

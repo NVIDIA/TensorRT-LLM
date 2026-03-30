@@ -108,7 +108,7 @@ class BudgetTracker:
         executor — not yet terminated, so ensure_batch cannot evict it)."""
         if self._peft_cache_manager is None:
             return
-        lora_task_id = req.lora_task_id
+        lora_task_id = getattr(req, "lora_task_id", None)
         if lora_task_id is None or lora_task_id in self._seen_peft_task_ids:
             return
         pages = self._peft_cache_manager.determine_num_pages(req)
@@ -182,7 +182,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
         self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
-        self._consecutive_empty_schedules = 0
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -284,7 +283,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req_state_value == self._encoder_init_state_value
                 or req_state_value == self._context_init_state_value
             ):
-                # Always defer to phase 2.
+                # Defer to phase 2 so gen PEFT budget is settled first.
                 pending_ctx.append(req)
                 req_it += 1
                 continue
@@ -292,12 +291,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             else:
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
-                    # V1 parity: never reject gen requests for PEFT budget.
-                    # Gen adapters were loaded during their context phase
-                    # and remain on device.  The phase-2 budget guard on
-                    # context requests ensures conflicting adapters cannot
-                    # enter gen simultaneously.
-                    peft_pages = 0
+                    break
                 action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
                     req,
                     budget,
@@ -342,11 +336,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 budget.commit(req, tokens, peft_pages)
 
         # Deadlock detection: if generation requests exist but none were
-        # scheduled and none were evicted for several consecutive rounds,
-        # no forward pass will run and no KV cache pages will ever be
-        # freed — the scheduler will spin forever.  This typically happens
-        # when the KV cache pool is exhausted and no host cache tier is
-        # available for suspend/resume.
+        # scheduled and none were evicted, no forward pass will run and no
+        # KV cache pages will ever be freed — the scheduler will spin
+        # forever.  This typically happens when the KV cache pool is
+        # exhausted and no host cache tier is available for suspend/resume.
         if not scheduled_gen and not scheduled_ctx:
             num_gen_candidates = sum(
                 1
@@ -356,21 +349,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and r.request_id not in inflight_request_ids
             )
             if num_gen_candidates > 0 and not evicted:
-                self._consecutive_empty_schedules += 1
-                if self._consecutive_empty_schedules >= 10:
-                    raise RuntimeError(
-                        f"V2 scheduler deadlock: {num_gen_candidates} generation "
-                        f"request(s) active but none could be scheduled or "
-                        f"evicted for {self._consecutive_empty_schedules} "
-                        f"consecutive rounds. KV cache pool is likely exhausted "
-                        f"with no host cache tier for suspend/resume offload. "
-                        f"Configure kv_cache_config.host_cache_size or increase "
-                        f"kv_cache_config.max_tokens."
-                    )
-            else:
-                self._consecutive_empty_schedules = 0
-        else:
-            self._consecutive_empty_schedules = 0
+                raise RuntimeError(
+                    f"V2 scheduler deadlock: {num_gen_candidates} generation "
+                    f"request(s) active but none could be scheduled or "
+                    f"evicted. KV cache pool is likely exhausted with no "
+                    f"host cache tier for suspend/resume offload. "
+                    f"Configure kv_cache_config.host_cache_size or increase "
+                    f"kv_cache_config.max_tokens."
+                )
 
         return scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking
 
