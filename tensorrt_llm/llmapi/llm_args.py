@@ -2439,7 +2439,21 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
     )
 
+    chunk_size_blocks: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Maximum number of KV cache blocks per layer group per chunk for "
+        "chunked KV cache transfer. When set, each layer group's block list "
+        "is partitioned into slices of at most this many blocks, and each "
+        "slice is transferred independently. The total data per chunk is "
+        "approximately chunk_size_blocks * num_layer_groups * slot_bytes. "
+        "This reduces per-transfer NIXL descriptor pressure for long "
+        "sequences. When None (default), the entire KV cache is transferred "
+        "in a single slice.")
+
     def _to_pybind(self):
+        # chunk_size_blocks is consumed by the Python transceiver only
+        # and has no C++ counterpart, so it is intentionally omitted.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,

@@ -133,6 +133,76 @@ def test_session_status_enum():
     assert len(SessionStatus) == 6
 
 
+# ---------------------------------------------------------------------------
+# Chunked KV slice creation tests
+# ---------------------------------------------------------------------------
+
+
+def _chunk_block_ids(all_block_ids, chunk_size_blocks):
+    """Standalone helper that replicates _create_kv_slices chunking logic."""
+    import math
+
+    if chunk_size_blocks is None:
+        return [KVSlice(is_last_slice=True, block_ids_per_layer_groups=all_block_ids)]
+
+    max_blocks = max((len(ids) for ids in all_block_ids), default=0)
+    if max_blocks == 0:
+        return [KVSlice(is_last_slice=True, block_ids_per_layer_groups=all_block_ids)]
+
+    num_chunks = math.ceil(max_blocks / chunk_size_blocks)
+    slices = []
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * chunk_size_blocks
+        end = start + chunk_size_blocks
+        is_last = chunk_idx == num_chunks - 1
+        chunk_block_ids = [ids[start:end] for ids in all_block_ids]
+        slices.append(KVSlice(is_last_slice=is_last, block_ids_per_layer_groups=chunk_block_ids))
+    return slices
+
+
+@pytest.mark.parametrize(
+    "all_block_ids,chunk_size,expected_num_slices",
+    [
+        ([[0, 1, 2, 3, 4, 5, 6, 7]], None, 1),
+        ([[0, 1, 2, 3, 4, 5, 6, 7]], 4, 2),
+        ([list(range(10))], 4, 3),
+        ([[], []], 4, 1),
+        ([[0, 1, 2]], 64, 1),
+    ],
+    ids=["no_chunking", "even_split", "uneven_split", "empty_blocks", "chunk_larger_than_total"],
+)
+def test_create_kv_slices_basic(all_block_ids, chunk_size, expected_num_slices):
+    """Chunking produces the expected number of slices."""
+    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=chunk_size)
+    assert len(slices) == expected_num_slices
+    assert slices[-1].is_last_slice is True
+    if expected_num_slices > 1:
+        for s in slices[:-1]:
+            assert s.is_last_slice is False
+
+
+def test_create_kv_slices_integrity_check():
+    """Reassembled block IDs from all slices must match the original."""
+    all_block_ids = [list(range(17)), list(range(5))]
+    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4)
+    for lg_idx, original in enumerate(all_block_ids):
+        reassembled = []
+        for s in slices:
+            reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
+        assert reassembled == original
+
+
+def test_create_kv_slices_multiple_layer_groups():
+    """Different layer groups with different block counts produce correct chunking."""
+    all_block_ids = [list(range(8)), list(range(3))]
+    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4)
+    assert len(slices) == 2
+    assert slices[0].block_ids_per_layer_groups[0] == [0, 1, 2, 3]
+    assert slices[1].block_ids_per_layer_groups[0] == [4, 5, 6, 7]
+    assert slices[0].block_ids_per_layer_groups[1] == [0, 1, 2]
+    assert slices[1].block_ids_per_layer_groups[1] == []
+
+
 def create_transfer_worker_setup(
     ctx_tp: int,
     ctx_pp: int,
@@ -1040,6 +1110,226 @@ def test_transfer_worker_v2_with_window(
         add_and_verify_request(setup, 0, 1, request_len=16, send_first=True)
         add_and_verify_request(setup, 2, 3, request_len=32, send_first=True)
         add_and_verify_request(setup, 4, 5, request_len=64, send_first=False)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
+def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
+    """Shared setup for chunked transfer tests: create requests, allocate KV, get block IDs."""
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+    gen_kv_cache_managers = setup["gen_kv_cache_managers"]
+    ctx_info_endpoint = setup["ctx_info_endpoint"]
+    use_v2 = setup["use_v2"]
+    tokens_per_block = setup["tokens_per_block"]
+
+    sampling_params = SamplingParams()
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+
+    ctx_request = LlmRequest(
+        request_id=ctx_request_id,
+        max_new_tokens=1,
+        input_tokens=list(range(request_len)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    gen_request = LlmRequest(
+        request_id=gen_request_id,
+        max_new_tokens=1,
+        input_tokens=list(range(request_len)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx_request.py_request_id,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=unique_rid,
+    )
+
+    ctx_kv_caches, gen_kv_caches = [], []
+    for mgr in ctx_kv_cache_managers:
+        if use_v2:
+            kv = mgr._create_kv_cache(ctx_request.py_request_id, None, None)
+            assert kv.resume(torch.cuda.current_stream().cuda_stream)
+            assert kv.resize(request_len)
+            ctx_kv_caches.append(kv)
+        else:
+            mgr.impl.add_sequence(ctx_request.py_request_id, request_len, 1, ctx_request)
+
+    for mgr in gen_kv_cache_managers:
+        if use_v2:
+            kv = mgr._create_kv_cache(gen_request.py_request_id, None, None)
+            assert kv.resume(torch.cuda.current_stream().cuda_stream)
+            assert kv.resize(request_len)
+            gen_kv_caches.append(kv)
+        else:
+            mgr.impl.add_sequence(gen_request.py_request_id, request_len, 1, gen_request)
+
+    ctx_block_ids = [
+        get_block_ids_per_layer_groups(mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block)
+        for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers)
+    ]
+    gen_block_ids = [
+        get_block_ids_per_layer_groups(mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block)
+        for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers)
+    ]
+
+    return {
+        "ctx_request": ctx_request,
+        "gen_request": gen_request,
+        "ctx_kv_caches": ctx_kv_caches,
+        "gen_kv_caches": gen_kv_caches,
+        "ctx_block_ids": ctx_block_ids,
+        "gen_block_ids": gen_block_ids,
+    }
+
+
+def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions):
+    """Shared verification and cleanup for chunked transfer tests."""
+    ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
+    gen_kv_cache_managers = setup["gen_kv_cache_managers"]
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+    use_v2 = setup["use_v2"]
+
+    ctx_block_ids = ctx_info["ctx_block_ids"]
+    gen_block_ids = ctx_info["gen_block_ids"]
+
+    for session in sender_sessions:
+        assert session.status == SessionStatus.KV_TRANSFERRED
+    for session in receiver_sessions:
+        assert session.status == SessionStatus.KV_TRANSFERRED
+
+    num_layer_groups = len(ctx_block_ids[0])
+    for lg_id in range(num_layer_groups):
+        ctx_data = [
+            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["ctx_request"].py_request_id)
+            for mgr, bids in zip(ctx_kv_cache_managers, ctx_block_ids)
+        ]
+        gen_data = [
+            get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["gen_request"].py_request_id)
+            for mgr, bids in zip(gen_kv_cache_managers, gen_block_ids)
+        ]
+        for c, g in zip(ctx_data, gen_data):
+            assert c.equal(g), f"Layer group {lg_id}: data mismatch with chunked transfer"
+
+    for tw, s in zip(gen_transfer_workers, receiver_sessions):
+        tw.clear_session(s)
+    for tw, s in zip(ctx_transfer_workers, sender_sessions):
+        tw.clear_session(s)
+    if use_v2:
+        torch.cuda.current_stream().synchronize()
+        for kv in ctx_info["ctx_kv_caches"]:
+            kv.close()
+        for kv in ctx_info["gen_kv_caches"]:
+            kv.close()
+
+
+def add_and_verify_chunked_request(
+    setup,
+    ctx_request_id,
+    gen_request_id,
+    request_len,
+    chunk_size_blocks,
+):
+    """Chunked transfer variant: sender sends N slices, receiver sends 1."""
+    import math
+
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+
+    ctx_info = _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len)
+    ctx_block_ids = ctx_info["ctx_block_ids"]
+    gen_block_ids = ctx_info["gen_block_ids"]
+
+    sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
+    send_futures = []
+    for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids):
+        max_blocks = max(len(ids) for ids in block_ids_per_groups)
+        num_chunks = math.ceil(max_blocks / chunk_size_blocks)
+        chunk_offset = 0
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_size_blocks
+            end = start + chunk_size_blocks
+            is_last = chunk_idx == num_chunks - 1
+            chunk_block_ids = [ids[start:end] for ids in block_ids_per_groups]
+            kv_slice = KVSlice(
+                is_last_slice=is_last,
+                block_ids_per_layer_groups=chunk_block_ids,
+            )
+            send_futures.append(sender_session.send(kv_slice, chunk_block_offset=chunk_offset))
+            chunk_offset += max(len(ids) for ids in chunk_block_ids)
+
+    receiver_sessions = [
+        tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
+    ]
+    recv_futures = []
+    for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids):
+        full_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=block_ids_per_groups,
+        )
+        recv_futures.append(recv_session.receive(full_slice))
+
+    for f in send_futures:
+        f.result()
+    for f in recv_futures:
+        f.result()
+
+    _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions)
+
+
+CHUNKED_TEST_CONFIGS = [
+    (1, 1, False, 1, 1, False, False, True, "v2_tp1_pp1_chunked"),
+    (1, 1, False, 1, 1, False, False, False, "v1_tp1_pp1_chunked"),
+]
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,use_v2",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in CHUNKED_TEST_CONFIGS],
+    ids=[c[8] for c in CHUNKED_TEST_CONFIGS],
+)
+def test_transfer_worker_chunked(
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
+):
+    """Test transfer worker with sender-side chunking for V1 and V2."""
+    tensorrt_llm.logger.set_level("info")
+    logger.info(f"Test transfer worker {'V2' if use_v2 else 'V1'} with chunked transfer")
+
+    setup = create_transfer_worker_setup(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=is_mla,
+        use_v2=use_v2,
+    )
+
+    request_len = setup["request_len"]
+    tokens_per_block = setup["tokens_per_block"]
+    total_blocks = (request_len + tokens_per_block - 1) // tokens_per_block
+    chunk_size = max(1, total_blocks // 2)
+
+    try:
+        add_and_verify_chunked_request(setup, 0, 1, request_len, chunk_size_blocks=chunk_size)
+        add_and_verify_chunked_request(setup, 2, 3, request_len * 2, chunk_size_blocks=chunk_size)
     finally:
         for worker in setup["ctx_transfer_workers"]:
             worker.shutdown()
