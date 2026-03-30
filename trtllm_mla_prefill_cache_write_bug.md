@@ -14,6 +14,16 @@ via side-by-side dump comparison). With `torch-simple` + `tokens_per_block=64`:
   results, possibly from weight transform differences in the `fuse_rope_into_trtllm_mla`
   graph transform or different weight loading for the FP8 model
 
+### Root Cause: Mixed Prefill+Decode Batches
+The crash occurs ONLY in mixed batches (prefill + decode sequences together).
+Pure prefill batches work correctly — verified by forcing all sequences to
+prefill at once via high `max_num_tokens`. The context wrapper receives
+metadata tensors that include decode sequences' entries, confusing the C++
+kernel's cache write path.
+
+Fix: slice metadata to only include prefill sequences before passing to
+the context wrapper's plan/run.
+
 ### Investigation: K/V Magnitude Difference
 The K/V expansion is `K,V = kv_b_proj(compressed_kv)` where `kv_b_proj_weight` has
 shape `[num_heads*(qk_nope_head_dim+v_head_dim), kv_lora_rank]` = `[8192, 512]`.

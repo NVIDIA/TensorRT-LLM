@@ -293,12 +293,11 @@ class _TrtllmMLAPlanner:
             pool_mapping_size, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         for i in range(pool_mapping_size):
-            # Decode layers [0..29] and context layers [1000..1029] both map
-            # to the same physical pool layers [0..29].
-            if i < num_layers:
-                self.host_pool_mapping[i, 1] = i
-            else:
-                self.host_pool_mapping[i, 1] = i - 1000
+            # Map all layer indices to physical layers [0..29]:
+            # - Decode layers [0..29] → [0..29]
+            # - Context layers [30..59] → [0..29] (layer_idx + 30)
+            # - Context layers [1000..1029] → [0..29] (layer_idx + 1000)
+            self.host_pool_mapping[i, 1] = i % num_layers
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
@@ -852,34 +851,44 @@ def _handle_prefill_thop(
         # We pass 0 (matching PT when hidden_size is used as "full rank, no compression").
         # TODO: derive hidden_size from model config instead of hardcoding.
         wrapper.q_lora_rank = kv_lora_rank * 5  # hidden_size for DeepSeek MLA (512*5=2560)
-        # FP8 block scaling: always enable for FP8 models. The kv_b_proj_weight
-        # may be BF16 (AD casts FP8→BF16 during computation) but the model is FP8.
-        wrapper.quant_mode = int(QuantMode.FP8_1x128_128x128)
+        # FP8 block scaling: only enable when model actually uses FP8 weights.
+        if kv_b_proj_weight.dtype == torch.float8_e4m3fn:
+            wrapper.quant_mode = int(QuantMode.FP8_1x128_128x128)
         wrapper._ctx_configured = True
 
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
 
+    # Slice batch-level tensors to prefill-only. In mixed batches (prefill + decode),
+    # the metadata includes decode sequences which confuse the context FMHA cache write.
+    num_prefill = int((host_request_types == 0).sum().item())
+    pf = num_prefill  # shorthand for slicing
+
+    # Recompute host_total_kv_lens for prefill only
+    ctx_total_kv_lens = planner.host_total_kv_lens.clone()
+    ctx_total_kv_lens[0] = sequence_length[:pf].sum().item() if pf > 0 else 0
+    ctx_total_kv_lens[1] = 0  # no decode in context-only
+
     wrapper.plan(
-        layer_idx=layer_idx,  # same layer_idx as PT (not +1000)
+        layer_idx=layer_idx + 30,  # separate from decode's AttentionOp
         tokens_per_block=tokens_per_block,
         max_num_requests=max_num_requests,
-        max_sequence_length=max_context_length,  # PT: max_seq_len
-        max_context_length=max_context_length - 1,  # PT: min(max_seq_len-1, max_num_tokens)
+        max_sequence_length=max_context_length,
+        max_context_length=max_context_length - 1,
         beam_width=1,
-        sequence_length=sequence_length,
-        context_lengths=context_lengths,
-        host_past_key_value_lengths=host_past_kv_lengths,
-        host_total_kv_lens=host_total_kv_lens.int(),  # PT uses int32
-        host_context_lengths=host_context_lengths,
-        host_request_types=host_request_types,
+        sequence_length=sequence_length[:pf],
+        context_lengths=context_lengths[:pf],
+        host_past_key_value_lengths=host_past_kv_lengths[:pf],
+        host_total_kv_lens=ctx_total_kv_lens.int(),
+        host_context_lengths=host_context_lengths[:pf],
+        host_request_types=host_request_types[:pf],
         kv_cache_block_offsets=ctx_block_offsets,
         host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping[:30],  # PT: [30, 2]
-        block_ids_per_seq=planner.block_ids_per_seq,  # PT passes pre-allocated tensor
+        host_kv_cache_pool_mapping=planner.host_pool_mapping[:60],
+        block_ids_per_seq=planner.block_ids_per_seq,
         flash_mla_tile_scheduler_metadata=planner.flash_mla_tile_scheduler_metadata,
         flash_mla_num_splits=planner.flash_mla_num_splits,
         latent_cache=latent_cache,
-        workspace=torch.empty(0, dtype=torch.int8, device=device),  # PT starts empty
+        workspace=torch.empty(0, dtype=torch.int8, device=device),
         use_paged_context_fmha=False,
         attention_input_type=AttentionInputType.context_only,
         kv_scale_orig_quant=planner.kv_scale_orig_quant,
