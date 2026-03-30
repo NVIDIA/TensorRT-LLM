@@ -1213,9 +1213,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                             llm_models_root(), actual_lora_path)
                 lora_dir = os.path.join(engine_dir, "loras")
                 data_cmd += [f"mkdir -p {lora_dir}", ";"]
-                if len(actual_lora_paths) != nloras:
+                if len(actual_lora_paths) < nloras:
+                    # Replicate paths cyclically to match the requested count
+                    actual_lora_paths = [
+                        actual_lora_paths[i % len(actual_lora_paths)]
+                        for i in range(nloras)
+                    ]
+                elif len(actual_lora_paths) > nloras:
                     raise ValueError(
-                        f"Number of LoRA paths ({len(actual_lora_paths)}) does not match requested number of LoRAs ({nloras})"
+                        f"Number of LoRA paths ({len(actual_lora_paths)}) exceeds requested number of LoRAs ({nloras})"
                     )
                 for i, lora_path in enumerate(actual_lora_paths):
                     self.lora_dirs.append(f"{lora_dir}/{i}")

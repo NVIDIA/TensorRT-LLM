@@ -27,6 +27,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
 
+from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 from .block_scan import block_prefix_sum_kernel
 from .filtered_top_k_varlen_util import float_as_uint32, half_as_ushort
 
@@ -358,10 +359,37 @@ class SinglePassMultiCTARadixTopKKernel:
         return prologue_elems, aligned_size, left_size
 
     # ------------------------------------------------------------------
-    # Step 2a: Build local histogram and merge to global
+    # Prefix mask helper (shared by all radix round variants)
     # ------------------------------------------------------------------
     @cute.jit
-    def build_and_merge_histogram(
+    def _compute_prefix_mask(self, round_idx):
+        """Compute prefix_mask for the given radix round.
+
+        Returns the top ``round_idx * radix_bits`` bits set as a mask,
+        typed as Uint32 (Float32) or Uint16 (Float16/BFloat16).
+        """
+        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            if cutlass.const_expr(prefix_mask_bits == 0):
+                prefix_mask = cutlass.Uint32(0)
+            else:
+                prefix_mask = cutlass.Uint32(
+                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
+                )
+        else:
+            if cutlass.const_expr(prefix_mask_bits == 0):
+                prefix_mask = cutlass.Uint16(0)
+            else:
+                prefix_mask = cutlass.Uint16(
+                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
+                )
+        return prefix_mask
+
+    # ------------------------------------------------------------------
+    # Step 2a: Build local histogram (SMEM only, no global merge)
+    # ------------------------------------------------------------------
+    @cute.jit
+    def build_local_histogram(
         self,
         shared_ordered,
         actual_chunk_size,
@@ -369,10 +397,9 @@ class SinglePassMultiCTARadixTopKKernel:
         prefix_mask,
         shift,
         local_histogram,
-        global_histogram_ptr,
         tidx,
     ):
-        """Build per-CTA histogram on smem data and atomicAdd to global."""
+        """Build per-CTA histogram on smem data (no global merge)."""
         # Clear local histogram
         for i in range(tidx, self.radix, self.num_threads):
             local_histogram[i] = cutlass.Int32(0)
@@ -394,6 +421,32 @@ class SinglePassMultiCTARadixTopKKernel:
                 atomicAdd(local_histogram.iterator + bucket, val_one)
         cute.arch.barrier()
 
+    # ------------------------------------------------------------------
+    # Step 2a+: Build local histogram and merge to global
+    # ------------------------------------------------------------------
+    @cute.jit
+    def build_and_merge_histogram(
+        self,
+        shared_ordered,
+        actual_chunk_size,
+        prefix,
+        prefix_mask,
+        shift,
+        local_histogram,
+        global_histogram_ptr,
+        tidx,
+    ):
+        """Build per-CTA histogram on smem data and atomicAdd to global."""
+        self.build_local_histogram(
+            shared_ordered,
+            actual_chunk_size,
+            prefix,
+            prefix_mask,
+            shift,
+            local_histogram,
+            tidx,
+        )
+
         # Merge to global histogram
         for i in range(tidx, self.radix, self.num_threads):
             count = local_histogram[i]
@@ -405,7 +458,7 @@ class SinglePassMultiCTARadixTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def prefix_sum_and_find_threshold(
-        self, local_histogram, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
+        self, histogram_input, prefix_buf, s_scalars, remaining_k, s_warp_sums, tidx
     ):
         """Compute prefix sum over 256-bin histogram and find threshold bucket.
 
@@ -414,13 +467,16 @@ class SinglePassMultiCTARadixTopKKernel:
         largest elements.  The threshold bucket is the first one where:
           prefix_sum[b] >= remaining_k  AND  prefix_sum[b-1] < remaining_k
 
+        ``histogram_input`` is the source histogram (local_histogram for
+        single-CTA / distributed, prefix_buf for cluster after DSMEM merge).
+
         Results written to s_scalars:
           [0] = found_bucket
           [1] = found_remaining_k (remaining_k - prefix_sum[bucket-1])
         """
         # Step 1: Inclusive prefix sum directly on the histogram
         if tidx < self.radix:
-            val = local_histogram[tidx]
+            val = histogram_input[tidx]
             num_warps_scan = cutlass.const_expr(min(self.radix, 256) // 32)
             val, _ = block_prefix_sum_kernel(
                 val, s_warp_sums, tidx, self.radix, num_warps_scan, barrier_id=1
@@ -477,22 +533,7 @@ class SinglePassMultiCTARadixTopKKernel:
         the CTA owns all data, so ``local_histogram`` (smem) is already the
         complete histogram after the local build pass.
         """
-        # Compute prefix_mask for this round (top round_idx*8 bits)
-        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint32(0)
-            else:
-                prefix_mask = cutlass.Uint32(
-                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
-                )
-        else:
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint16(0)
-            else:
-                prefix_mask = cutlass.Uint16(
-                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
-                )
+        prefix_mask = self._compute_prefix_mask(round_idx)
 
         # Clear local histogram
         for i in range(tidx, self.radix, num_threads):
@@ -568,22 +609,7 @@ class SinglePassMultiCTARadixTopKKernel:
         next_hist_offset = next_hist_buf_idx * cutlass.Int32(self.radix)
         global_hist_ptr = state_base_ptr + hist_offset
 
-        # Compute prefix_mask for this round (top round_idx*8 bits)
-        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
-        if cutlass.const_expr(self.dtype == cutlass.Float32):
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint32(0)
-            else:
-                prefix_mask = cutlass.Uint32(
-                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits)
-                )
-        else:
-            if cutlass.const_expr(prefix_mask_bits == 0):
-                prefix_mask = cutlass.Uint16(0)
-            else:
-                prefix_mask = cutlass.Uint16(
-                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits)
-                )
+        prefix_mask = self._compute_prefix_mask(round_idx)
 
         # Build local histogram and merge to global
         self.build_and_merge_histogram(
@@ -671,6 +697,114 @@ class SinglePassMultiCTARadixTopKKernel:
         return local_histogram[0]
 
     # ------------------------------------------------------------------
+    # Step 3a: Collect elements strictly greater than pivot
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _collect_pass_gt(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        left_size,
+        ordered_pivot,
+        local_histogram,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Collect elements with float > pivot (ordered < ordered_pivot).
+
+        Uses FlashInfer-style batch atomicAdd: local_histogram[0] tracks
+        the local offset within the CTA's allocation, local_histogram[1]
+        holds the global base from the batch atomicAdd.
+
+        3-region structure mirrors the reordered smem layout from
+        load_chunk_to_smem.
+        """
+        val_one = cutlass.Int32(1)
+        for i in range(tidx, aligned_size, self.num_threads):
+            ordered = shared_ordered[i]
+            if ordered < ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered < ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered < ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(
+                    chunk_start + prologue_elems + aligned_size + i
+                )
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+
+    # ------------------------------------------------------------------
+    # Step 3b: Collect elements equal to pivot
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _collect_pass_eq(
+        self,
+        shared_ordered,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        left_size,
+        ordered_pivot,
+        top_k,
+        output_counter_ptr,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Collect elements with float == pivot (ordered == ordered_pivot).
+
+        Per-element atomicAdd on output_counter_ptr; writes only while pos < k.
+        Same 3-region structure as _collect_pass_gt.
+        """
+        val_one = cutlass.Int32(1)
+        for i in range(tidx, aligned_size, self.num_threads):
+            ordered = shared_ordered[i]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+        # TODO: move prologue region before aligned-region pass so that
+        # equal-to-pivot elements with smaller indices are placed first
+        # (stable output order).
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(
+                        chunk_start + prologue_elems + aligned_size + i
+                    )
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+
+    # ------------------------------------------------------------------
     # Step 3: Collect output indices and values
     # ------------------------------------------------------------------
     @cute.jit
@@ -706,8 +840,6 @@ class SinglePassMultiCTARadixTopKKernel:
         elements from all CTAs are counted before == pivot elements start
         filling the remaining slots.
         """
-        val_one = cutlass.Int32(1)
-
         # Reuse local_histogram for counters (FlashInfer convention):
         #   [0] = local_offset_gt  (local position within CTA allocation)
         #   [1] = global_base_gt   (global base from batch atomicAdd)
@@ -719,37 +851,18 @@ class SinglePassMultiCTARadixTopKKernel:
         cute.arch.barrier()
 
         # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
-        # 3-region structure mirrors the reordered smem layout from
-        # load_chunk_to_smem:
-        #   aligned:  smem[i]                       → gmem[chunk_start + prologue_elems + i]
-        #   prologue: smem[aligned_size + i]         → gmem[chunk_start + i]
-        #   tail:     smem[aligned_size+prologue+i]  → gmem[chunk_start + prologue_elems + aligned_size + i]
-        for i in range(tidx, aligned_size, self.num_threads):
-            ordered = shared_ordered[i]
-            if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
-                pos = local_histogram[1] + local_pos
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
-        for i in range(tidx, prologue_elems, self.num_threads):
-            ordered = shared_ordered[i + aligned_size]
-            if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
-                pos = local_histogram[1] + local_pos
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
-        for i in range(tidx, left_size, self.num_threads):
-            ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
-                pos = local_histogram[1] + local_pos
-                output_indices_row[pos] = cutlass.Int32(
-                    chunk_start + prologue_elems + aligned_size + i
-                )
-                if cutlass.const_expr(output_values_row is not None):
-                    output_values_row[pos] = self.from_ordered(ordered)
+        self._collect_pass_gt(
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            ordered_pivot,
+            local_histogram,
+            output_indices_row,
+            output_values_row,
+            tidx,
+        )
 
         # Inter-CTA barrier between pass 1 and pass 2 (only thread 0 signals)
         if tidx == 0:
@@ -757,33 +870,20 @@ class SinglePassMultiCTARadixTopKKernel:
         barrier_phase = barrier_phase + 1
         barrier_inter_cta(arrival_counter_ptr, barrier_phase * ctas_per_group, tidx)
 
-        # Pass 2: equal to pivot — same 3-region structure
-        for i in range(tidx, aligned_size, self.num_threads):
-            ordered = shared_ordered[i]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, prologue_elems, self.num_threads):
-            ordered = shared_ordered[i + aligned_size]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, left_size, self.num_threads):
-            ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(
-                        chunk_start + prologue_elems + aligned_size + i
-                    )
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+        # Pass 2: equal to pivot
+        self._collect_pass_eq(
+            shared_ordered,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            ordered_pivot,
+            top_k,
+            output_counter_ptr,
+            output_indices_row,
+            output_values_row,
+            tidx,
+        )
 
         return barrier_phase
 
@@ -875,6 +975,67 @@ class SinglePassMultiCTARadixTopKKernel:
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
 
     # ------------------------------------------------------------------
+    # Single-CTA radix select + collect (shared by parent and subclasses)
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _single_cta_radix_select_and_collect(
+        self,
+        shared_ordered,
+        actual_chunk_size,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        left_size,
+        local_histogram,
+        prefix_buf,
+        s_scalars,
+        s_warp_sums,
+        top_k,
+        num_threads,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Run all radix rounds (single-CTA) and collect output."""
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            prefix = cutlass.Uint32(0)
+        else:
+            prefix = cutlass.Uint16(0)
+        remaining_k = cutlass.Int32(top_k)
+
+        for r in cutlass.range_constexpr(self.num_rounds):
+            shift = cutlass.const_expr(self.ordered_bits - (r + 1) * self.radix_bits)
+            prefix, remaining_k = self._radix_round_single_cta(
+                r,
+                shift,
+                shared_ordered,
+                actual_chunk_size,
+                prefix,
+                remaining_k,
+                local_histogram,
+                prefix_buf,
+                s_scalars,
+                s_warp_sums,
+                num_threads,
+                tidx,
+            )
+
+        self.collect_output_single_cta(
+            shared_ordered,
+            actual_chunk_size,
+            chunk_start,
+            prologue_elems,
+            aligned_size,
+            left_size,
+            prefix,
+            top_k,
+            local_histogram,
+            output_indices_row,
+            output_values_row,
+            tidx,
+        )
+
+    # ------------------------------------------------------------------
     # Main kernel
     # ------------------------------------------------------------------
     @cute.kernel
@@ -905,6 +1066,8 @@ class SinglePassMultiCTARadixTopKKernel:
         cta_in_group = bidx % ctas_per_group
         num_groups = grid_size // ctas_per_group
         num_rows = input_data.shape[0]
+
+        griddepcontrol_wait()
 
         # ---- Shared memory allocation ----
         smem = SmemAllocator()
@@ -1022,79 +1185,19 @@ class SinglePassMultiCTARadixTopKKernel:
 
                 if cutlass.const_expr(ctas_per_group == 1):
                     # ---- Single-CTA path: no global state, no barriers ----
-                    # Round 0
-                    prefix, remaining_k = self._radix_round_single_cta(
-                        0,
-                        self.ordered_bits - 1 * self.radix_bits,
-                        shared_ordered,
-                        actual_chunk_size,
-                        prefix,
-                        remaining_k,
-                        local_histogram,
-                        prefix_buf,
-                        s_scalars,
-                        s_warp_sums,
-                        num_threads,
-                        tidx,
-                    )
-                    # Round 1
-                    prefix, remaining_k = self._radix_round_single_cta(
-                        1,
-                        self.ordered_bits - 2 * self.radix_bits,
-                        shared_ordered,
-                        actual_chunk_size,
-                        prefix,
-                        remaining_k,
-                        local_histogram,
-                        prefix_buf,
-                        s_scalars,
-                        s_warp_sums,
-                        num_threads,
-                        tidx,
-                    )
-                    if cutlass.const_expr(self.num_rounds > 2):
-                        # Round 2 (fp32 only)
-                        prefix, remaining_k = self._radix_round_single_cta(
-                            2,
-                            self.ordered_bits - 3 * self.radix_bits,
-                            shared_ordered,
-                            actual_chunk_size,
-                            prefix,
-                            remaining_k,
-                            local_histogram,
-                            prefix_buf,
-                            s_scalars,
-                            s_warp_sums,
-                            num_threads,
-                            tidx,
-                        )
-                        # Round 3 (fp32 only)
-                        prefix, remaining_k = self._radix_round_single_cta(
-                            3,
-                            self.ordered_bits - 4 * self.radix_bits,
-                            shared_ordered,
-                            actual_chunk_size,
-                            prefix,
-                            remaining_k,
-                            local_histogram,
-                            prefix_buf,
-                            s_scalars,
-                            s_warp_sums,
-                            num_threads,
-                            tidx,
-                        )
-
-                    # Step 3: Collect output (smem counter, no inter-CTA sync)
-                    self.collect_output_single_cta(
+                    self._single_cta_radix_select_and_collect(
                         shared_ordered,
                         actual_chunk_size,
                         chunk_start,
                         prologue_elems,
                         aligned_size,
                         left_size,
-                        prefix,
-                        top_k,
                         local_histogram,
+                        prefix_buf,
+                        s_scalars,
+                        s_warp_sums,
+                        top_k,
+                        num_threads,
                         output_indices_row,
                         output_values_row,
                         tidx,
@@ -1267,6 +1370,8 @@ class SinglePassMultiCTARadixTopKKernel:
                         state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(0)
                     )
 
+        griddepcontrol_launch_dependents()
+
     # ------------------------------------------------------------------
     # Host-side launcher
     # ------------------------------------------------------------------
@@ -1295,4 +1400,5 @@ class SinglePassMultiCTARadixTopKKernel:
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )

@@ -50,7 +50,8 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
-    bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
+    bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens
+        || (data.mNumTokens <= DynBlockKernelMaxNumTokens && data.mNumExperts <= DynBlockKernelMaxNumExperts);
 
     bool const useSingleCluster = data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)
                                           ? MaxNumTokensSingleClusterScores
