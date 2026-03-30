@@ -649,6 +649,13 @@ public:
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Release the first numBlocks prefix blocks of a sequence.
+    //! \details Used by disaggregated serving to free sender-side KV memory
+    //! for blocks whose data has already been transferred.  Reuses the
+    //! detachFrontBlock mechanism (decRefCount + eviction policy release).
+    //! Cumulative: calling with 3 then 5 releases blocks 0-4 total.
+    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks);
+
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
@@ -1123,6 +1130,13 @@ public:
 
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
+
+    //! \brief Release the first numBlocks prefix blocks of a sequence.
+    //! \details Mirrors detachFrontBlock logic: decRefCount + eviction policy
+    //! release for each prefix block.  The mNumFrontBlocksRemoved counter on
+    //! GenerationRequest ensures releaseBlocks (called during removeSequence)
+    //! skips already-freed prefix blocks.
+    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks);
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
@@ -1928,6 +1942,11 @@ public:
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
         OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false) override;
+
+    //! \brief Release prefix blocks for a sequence without removing it.
+    //! \details Used by disaggregated serving for early block release during
+    //! chunked KV cache transfer.  No-op if the sequence does not exist.
+    void releasePrefixBlocks(LlmRequest::RequestIdType requestId, SizeType32 numBlocks);
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) override;
 

@@ -260,9 +260,12 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         Returns:
             A callback ``(request_id, chunk_block_offset, num_blocks) -> None``
-            if chunking and V2 manager are both enabled, otherwise ``None``.
+            if chunking is enabled and the KV cache manager supports
+            ``release_prefix_blocks``, otherwise ``None``.
         """
-        if not self.is_v2_manager or self.chunk_size_blocks is None:
+        if self.chunk_size_blocks is None:
+            return None
+        if not hasattr(self.kv_cache_manager, "release_prefix_blocks"):
             return None
 
         release_queue = self._pending_prefix_releases

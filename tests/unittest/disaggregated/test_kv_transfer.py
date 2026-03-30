@@ -1332,22 +1332,23 @@ def add_and_verify_chunked_request(
 
 
 CHUNKED_TEST_CONFIGS = [
-    (1, 1, False, 1, 1, False, False, "tp1_pp1_chunked"),
+    (1, 1, False, 1, 1, False, False, True, "v2_tp1_pp1_chunked"),
+    (1, 1, False, 1, 1, False, False, False, "v1_tp1_pp1_chunked"),
 ]
 
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
-    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in CHUNKED_TEST_CONFIGS],
-    ids=[c[7] for c in CHUNKED_TEST_CONFIGS],
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,use_v2",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in CHUNKED_TEST_CONFIGS],
+    ids=[c[8] for c in CHUNKED_TEST_CONFIGS],
 )
-def test_transfer_worker_v2_chunked(
-    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla
+def test_transfer_worker_chunked(
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
 ):
-    """Test V2 transfer worker with sender-side chunking."""
+    """Test transfer worker with sender-side chunking for V1 and V2."""
     tensorrt_llm.logger.set_level("info")
-    logger.info("Test transfer worker V2 with chunked transfer")
+    logger.info(f"Test transfer worker {'V2' if use_v2 else 'V1'} with chunked transfer")
 
     setup = create_transfer_worker_setup(
         ctx_tp=ctx_tp,
@@ -1357,7 +1358,7 @@ def test_transfer_worker_v2_chunked(
         gen_pp=gen_pp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        use_v2=True,
+        use_v2=use_v2,
     )
 
     request_len = setup["request_len"]

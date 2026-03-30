@@ -284,17 +284,18 @@ def test_drain_pending_releases():
 
 
 @pytest.mark.parametrize(
-    "is_v2,chunk_size,expected_none",
+    "has_release,chunk_size,expected_none",
     [
         (False, 64, True),
         (True, None, True),
+        (False, None, True),
         (True, 64, False),
     ],
-    ids=["no_v2", "no_chunking", "v2_with_chunking"],
+    ids=["no_release_api", "no_chunking", "neither", "with_release_and_chunking"],
 )
-def test_make_chunk_callback_conditions(is_v2, chunk_size, expected_none):
-    """_make_chunk_callback returns None unless both V2 and chunking enabled."""
-    result = None if (not is_v2 or chunk_size is None) else "callback"
+def test_make_chunk_callback_conditions(has_release, chunk_size, expected_none):
+    """_make_chunk_callback returns None unless both release API and chunking enabled."""
+    result = None if (not has_release or chunk_size is None) else "callback"
     assert (result is None) == expected_none
 
 

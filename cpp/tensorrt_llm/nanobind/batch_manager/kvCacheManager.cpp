@@ -547,7 +547,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             { return self.getBlockManager().schedulingHasFreeBlocks(numRequired, windowSize); },
             nb::arg("num_required"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
-            "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); });
+            "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); })
+        .def("release_prefix_blocks", &tbk::KVCacheManager::releasePrefixBlocks, nb::arg("request_id"),
+            nb::arg("num_blocks"), nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
