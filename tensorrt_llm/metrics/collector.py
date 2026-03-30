@@ -33,13 +33,13 @@ class MetricsCollector:
         {"model_name": "nemotron-nano-3", "engine_type": "trtllm"}
 
     Created Prometheus metrics:
-        trtllm_request_success_total
-        trtllm_e2e_request_latency_seconds
-        trtllm_time_to_first_token_seconds
-        trtllm_time_per_output_token_seconds
-        trtllm_request_queue_time_seconds
-        trtllm_kv_cache_hit_rate
-        trtllm_kv_cache_utilization
+        request_success_total
+        e2e_request_latency_seconds
+        time_to_first_token_seconds
+        inter_token_latency_seconds
+        request_queue_time_seconds
+        kv_cache_hit_rate
+        kv_cache_utilization
     """
     labelname_finish_reason = "finished_reason"
 
@@ -47,7 +47,7 @@ class MetricsCollector:
         from prometheus_client import Counter, Gauge, Histogram
         self.last_log_time = time.time()
         self.labels = labels
-        self.metric_prefix = "trtllm_"
+        self.metric_prefix = ""
 
         self.finish_reason_label = {
             MetricsCollector.labelname_finish_reason: "unknown"
@@ -81,9 +81,9 @@ class MetricsCollector:
             ],
             labelnames=self.labels.keys())
 
-        self.histogram_time_per_output_token = Histogram(
-            name=self.metric_prefix + "time_per_output_token_seconds",
-            documentation="Histogram of time per output token in seconds.",
+        self.histogram_inter_token_latency = Histogram(
+            name=self.metric_prefix + "inter_token_latency_seconds",
+            documentation="Histogram of inter-token latency in seconds.",
             buckets=[
                 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75,
                 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0
@@ -144,7 +144,7 @@ class MetricsCollector:
                   request completion status.
                 - `MetricNames.E2E` (float): End-to-end request latency in seconds.
                 - `MetricNames.TTFT` (float): Time to first token in seconds.
-                - `MetricNames.TPOT` (float): Time per output token in seconds.
+                - `MetricNames.TPOT` (float): Inter-token latency in seconds.
                 - `MetricNames.REQUEST_QUEUE_TIME` (float): Request queue time in seconds.
 
         Returns:
@@ -168,7 +168,7 @@ class MetricsCollector:
             if ttft := metrics_dict.get(MetricNames.TTFT, 0):
                 self._log_histogram(self.histogram_time_to_first_token, ttft)
             if tpot := metrics_dict.get(MetricNames.TPOT, 0):
-                self._log_histogram(self.histogram_time_per_output_token, tpot)
+                self._log_histogram(self.histogram_inter_token_latency, tpot)
             if request_queue_time := metrics_dict.get(
                     MetricNames.REQUEST_QUEUE_TIME, 0):
                 self._log_histogram(self.histogram_queue_time_request,
