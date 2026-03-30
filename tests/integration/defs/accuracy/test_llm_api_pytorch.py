@@ -1705,7 +1705,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         )
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
         attention_dp_config = AttentionDpConfig(
             enable_kv_cache_aware_routing=True, )
         with LLM(self.MODEL_PATH,
