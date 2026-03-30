@@ -497,17 +497,28 @@ def get_sm_version_from_torch() -> Optional[int]:
 
 
 def is_mxfp4_supported(sm, quant_mode):
-    name = str(quant_mode)
+    if quant_mode is None or sm is None:
+        return True
 
-    if "W4A8_MXFP4" in name:
+    if hasattr(quant_mode,
+               "has_w4a8_mxfp4_fp8") and quant_mode.has_w4a8_mxfp4_fp8():
         return sm in (100, 103)
-    if "W4A16_MXFP4" in name:
+    if hasattr(
+            quant_mode,
+            "has_w4a8_mxfp4_mxfp8") and quant_mode.has_w4a8_mxfp4_mxfp8():
+        return sm in (100, 103)
+    if hasattr(quant_mode,
+               "has_w4a16_mxfp4") and quant_mode.has_w4a16_mxfp4():
         return sm == 90
-    if "NVFP4" in name:
+    if hasattr(quant_mode,
+               "has_w4a8_nvfp4_fp8") and quant_mode.has_w4a8_nvfp4_fp8():
+        return sm in (100, 103, 120, 121)
+    if hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4():
         return sm in (100, 103, 120, 121)
 
     return True
 
 
 def get_mxfp4_support_error_message(sm, quant_mode):
-    return f"{quant_mode} is not supported on SM{sm}. Supported on newer architectures only."
+    sm_str = f"SM{sm}" if sm is not None else "unknown GPU"
+    return f"{quant_mode} is not supported on {sm_str}. Supported on newer architectures only."
