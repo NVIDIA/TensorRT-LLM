@@ -751,6 +751,44 @@ TEST_P(ParamTest, createResponse)
     }
 }
 
+// Regression test for nvbug/5961736: createResult() must produce a valid
+// response with contextPhaseParams when the request is in
+// kDISAGG_CONTEXT_COMPLETE, not just kDISAGG_CONTEXT_TRANS_IN_PROGRESS.
+// Without the fix, createResult() returns nullopt for CONTEXT_COMPLETE,
+// causing ctx_request_id=None in the disaggregated serving response.
+TEST_F(LlmRequestTest, createResultDisaggContextComplete)
+{
+    VecTokens inputTokens{1, 2, 3, 4, 5};
+    SizeType32 maxNewTokens{10};
+    texec::IdType requestId{42};
+
+    // Build an executor::Request and configure it as context-only with ContextPhaseParams.
+    texec::Request execReq(inputTokens, maxNewTokens);
+    execReq.setRequestType(texec::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
+    texec::ContextPhaseParams ctxParams({100}, requestId, static_cast<void*>(nullptr), std::nullopt);
+    execReq.setContextPhaseParams(std::move(ctxParams));
+
+    tb::LlmRequest llmReq(requestId, execReq);
+    EXPECT_TRUE(llmReq.isContextOnlyRequest());
+
+    // Add a generated token (required by createResult's firstGenTokens extraction).
+    llmReq.addNewTokens(VecTokens{42});
+
+    // Verify isFinished() covers DISAGG_CONTEXT_COMPLETE.
+    llmReq.setState(tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+    EXPECT_TRUE(llmReq.isFinished());
+
+    // This is the regression case — without the fix, createResult() returns nullopt
+    // because DISAGG_CONTEXT_COMPLETE was not handled by createResult's early guard
+    // or its context-phase branch.
+    auto response = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
+    ASSERT_TRUE(response.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
+    EXPECT_TRUE(response->contextPhaseParams.has_value())
+        << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";
+    EXPECT_EQ(response->contextPhaseParams->getReqId(), requestId);
+    EXPECT_TRUE(response->isSequenceFinal);
+}
+
 INSTANTIATE_TEST_SUITE_P(LlmRequestTest, ParamTest,
     testing::Combine(
         // TODO: Support and add coverage for streamLLM
