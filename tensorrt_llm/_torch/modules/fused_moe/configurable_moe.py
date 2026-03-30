@@ -513,6 +513,10 @@ class ConfigurableMoE(MoE):
                 do_finalize,
             )
 
+        # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk)
+        if self.enable_dwdp:
+            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+
         # ========== Step 4: Handle output truncation and EPLB repeat ==========
         if self.use_dp and self.parallel_size > 1:
             outputs = outputs[: all_rank_num_tokens[self.mapping.tp_rank]]
@@ -808,8 +812,6 @@ class ConfigurableMoE(MoE):
                 router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
             ),
         )
-        if self.enable_dwdp:
-            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
 
         # ========== Step 8: EPLB - Start CPU stage ==========
         self._load_balancer_start_set_cpu_stage(is_last_call)
