@@ -4786,11 +4786,15 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
                 }
             }
 
-            // After adding tokens, initial remainingBlocksToCompletion should match current state + new
-            // remainingBlocksToCompletion
-            EXPECT_EQ(remainingBlocksToCompletion,
-                kvCacheManager.getNumAllocTotalBlocks()
-                    + kvCacheManager.getRemainingBlocksToCompletion(*llmRequest, onlyWindowSize));
+            // After adding tokens, the currently used blocks plus remaining blocks to
+            // completion should not exceed the initial estimate. With SWA, the initial
+            // estimate includes a conservative numExtraBlocksPerBeam for transient sliding
+            // window transitions, so actual consumption may be slightly less.
+            // Note: getNumAllocTotalBlocks() is cumulative and includes blocks that were
+            // detached and recycled during SWA, so we use getUsedNumBlocks() instead.
+            EXPECT_LE(kvCacheManager.getUsedNumBlocks()
+                    + kvCacheManager.getRemainingBlocksToCompletion(*llmRequest, onlyWindowSize),
+                remainingBlocksToCompletion);
         }
     }
 }
