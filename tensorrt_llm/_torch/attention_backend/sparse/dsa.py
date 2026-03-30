@@ -119,59 +119,33 @@ def transform_local_topk_and_prepare_pool_view(
     layer_idx: int,
     is_generation: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert local topk indices to global pool indices and prepare KV pool.
-    Auto-detects stride and handles both contiguous/strided layouts.
+    """Convert local topk indices to global pool indices and prepare KV pool.
 
-    Args:
-        topk_indices: [num_tokens, NUM_TOPK]
-        attn_metadata: Metadata with block_table and request mappings
-        kv_cache_manager: KV cache manager
-        layer_idx: Layer index
-        is_generation: Generation vs context phase
-
-    Returns:
-        (global_indices, kv_pool):
-            - global_indices: [num_tokens, NUM_TOPK]
-            - kv_pool: [total_tokens, 1, head_dim]
+    Uses cached values from attn_metadata._ensure_pool_view_cached()
+    to avoid redundant Python/CUDA overhead across layers.
     """
     assert topk_indices.dtype == torch.int32
 
-    # Get all layer KV cache pool: [num_blocks, num_layers, kv_factor, blockSize]
-    kv_cache_manager = attn_metadata.kv_cache_manager
-    all_layer_kv_pool = kv_cache_manager.get_unique_primary_pool(
-    )  # [num_blocks, num_layers, kv_factor, blockSize]
-    num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
-    tokens_per_block = kv_cache_manager.tokens_per_block
-    head_dim = kv_cache_manager.head_dim
-    assert all_layer_kv_pool.is_contiguous(
-    ), "all_layer_kv_pool should be contiguous"
-    all_layer_kv_pool = all_layer_kv_pool.squeeze(2).view(-1, 1, head_dim)
-    stride_factor = num_layers * tokens_per_block
+    attn_metadata._ensure_pool_view_cached()
 
-    # Get block_table and request indices for this phase
     if is_generation:
-        block_table = attn_metadata.block_table[
-            attn_metadata.num_contexts:attn_metadata.num_seqs]
-        req_idx = attn_metadata.req_idx_per_token[
-            attn_metadata.num_ctx_tokens:attn_metadata.num_tokens]
-        req_idx = req_idx - attn_metadata.num_contexts
+        block_table = attn_metadata._cached_block_table_gen
+        req_idx = attn_metadata._cached_req_idx_gen
     else:
-        block_table = attn_metadata.block_table[:attn_metadata.num_contexts]
-        req_idx = attn_metadata.req_idx_per_token[:attn_metadata.num_ctx_tokens]
+        block_table = attn_metadata._cached_block_table_ctx
+        req_idx = attn_metadata._cached_req_idx_ctx
 
-    # Convert to global indices
     global_indices = triton_convert_req_index_to_global_index(
         req_idx,
         block_table,
         topk_indices,
-        BLOCK_SIZE=tokens_per_block,
+        BLOCK_SIZE=attn_metadata._cached_tokens_per_block,
         NUM_TOPK_TOKENS=topk_indices.shape[1],
-        stride_factor=stride_factor,
+        stride_factor=attn_metadata._cached_stride_factor,
         layer_id=layer_idx,
     )
 
-    return global_indices, all_layer_kv_pool
+    return global_indices, attn_metadata._cached_pool_view
 
 
 def split_prefill_chunks(
@@ -346,6 +320,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
+        # Cached step-invariant values for transform_local_topk_and_prepare_pool_view.
+        # These are recomputed once per step in _ensure_pool_view_cached() and
+        # reused across all layers to avoid redundant Python/CUDA overhead.
+        # Initialized here as plain instance attributes (not class-level
+        # annotations) to stay invisible to dataclass/torch.compile introspection.
+        self._cached_pool_view = None
+        self._cached_stride_factor = 0
+        self._cached_tokens_per_block = 0
+        self._cached_pool_data_ptr = 0
+        self._cached_num_contexts = -1
+        self._cached_num_seqs = -1
+        self._cached_num_ctx_tokens = -1
+        self._cached_num_tokens = -1
+        self._cached_block_table_ctx = None
+        self._cached_block_table_gen = None
+        self._cached_req_idx_ctx = None
+        self._cached_req_idx_gen = None
         super().__init__(*args, **kwargs)
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
@@ -582,6 +573,69 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph = self.is_cuda_graph
             self.create_expanded_buffers(capture_graph=capture_graph)
 
+    def _invalidate_pool_view_cache(self):
+        """Invalidate the cached pool view and related step-invariant values.
+
+        Must be called at the start of each forward step (in prepare()) so that
+        _ensure_pool_view_cached() recomputes them for the new batch.
+        """
+        self._cached_pool_view = None
+        self._cached_stride_factor = 0
+        self._cached_tokens_per_block = 0
+        self._cached_pool_data_ptr = 0
+        self._cached_num_contexts = -1
+        self._cached_num_seqs = -1
+        self._cached_num_ctx_tokens = -1
+        self._cached_num_tokens = -1
+        self._cached_block_table_ctx = None
+        self._cached_block_table_gen = None
+        self._cached_req_idx_ctx = None
+        self._cached_req_idx_gen = None
+
+    def _ensure_pool_view_cached(self):
+        """Compute and cache values used by
+        transform_local_topk_and_prepare_pool_view().
+
+        These values (pool view, stride factor, block table slices, request
+        index slices) are constant across all layers sharing the same KV pool
+        and batch dimensions within a forward pass. Caching them avoids
+        redundant Python/CUDA overhead per layer.
+
+        The cache is invalidated when any of these change:
+        - The KV pool (main model and MTP draft model use different pools)
+        - num_contexts / num_seqs (block_table slice boundaries)
+        - num_ctx_tokens / num_tokens (req_idx slice boundaries)
+        """
+        pool = self.kv_cache_manager.get_unique_primary_pool()
+        pool_ptr = pool.data_ptr()
+        if (self._cached_pool_view is not None
+                and self._cached_pool_data_ptr == pool_ptr
+                and self._cached_num_contexts == self.num_contexts
+                and self._cached_num_seqs == self.num_seqs
+                and self._cached_num_ctx_tokens == self.num_ctx_tokens
+                and self._cached_num_tokens == self.num_tokens):
+            return
+
+        kv_cache_manager = self.kv_cache_manager
+        num_blocks, num_layers, _, _ = pool.shape
+        self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
+        head_dim = kv_cache_manager.head_dim
+        self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
+        self._cached_stride_factor = (num_layers *
+                                      self._cached_tokens_per_block)
+        self._cached_pool_data_ptr = pool_ptr
+        self._cached_num_contexts = self.num_contexts
+        self._cached_num_seqs = self.num_seqs
+        self._cached_num_ctx_tokens = self.num_ctx_tokens
+        self._cached_num_tokens = self.num_tokens
+        self._cached_block_table_ctx = self.block_table[:self.num_contexts]
+        self._cached_block_table_gen = self.block_table[self.num_contexts:self.
+                                                        num_seqs]
+        self._cached_req_idx_ctx = self.req_idx_per_token[:self.num_ctx_tokens]
+        self._cached_req_idx_gen = (
+            self.req_idx_per_token[self.num_ctx_tokens:self.num_tokens] -
+            self.num_contexts)
+
     @maybe_compile(dynamic=True)
     def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens, device):
         device = kv_lens.device
@@ -673,6 +727,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare(self):
         super().prepare()
+        self._invalidate_pool_view_cache()
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -858,6 +913,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
+
+        # _preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
+        # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
+        # pool_view cache here so it is recomputed on the next
+        # transform_local_topk_and_prepare_pool_view() call.
+        self._invalidate_pool_view_cache()
+
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
