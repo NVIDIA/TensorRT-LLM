@@ -560,7 +560,7 @@ def foo(c: Callable[[int], int]) -> None:
     c(42)
 ```
 
-8. Don’t annotate variables where it is obvious/not necessary.
+8. Don't annotate variables where it is obvious/not necessary.
 
 ```py
 x: int = 42 # Not required

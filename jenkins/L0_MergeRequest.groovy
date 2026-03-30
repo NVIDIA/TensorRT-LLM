@@ -417,7 +417,8 @@ def launchReleaseCheck(pipeline, globalVars)
                     "*/3rdparty/*",
                     "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
                     "*/examples/scaffolding/contrib/mcp/weather/weather.py",
-                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz",
+                    "*/triton_kernels/*.py"
                 ]
                 sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
                 def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
