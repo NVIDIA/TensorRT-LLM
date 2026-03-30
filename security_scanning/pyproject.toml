@@ -5,7 +5,7 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "accelerate (>=1.7.0)",
