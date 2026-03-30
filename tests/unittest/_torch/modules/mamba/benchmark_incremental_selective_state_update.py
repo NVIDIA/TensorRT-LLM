@@ -565,14 +565,6 @@ def _parse_args() -> argparse.Namespace:
         "--num-warps", type=str, default=None,
         help="Override num_warps: single value or comma-separated sweep (e.g. '1,2,4').")
     parser.add_argument(
-        "--fast-forward-replay", action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use fast-forward (parallel) replay vs sequential.")
-    parser.add_argument(
-        "--cb-output", action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use CB formulation for output phase vs sequential state update.")
-    parser.add_argument(
         "--internal-pdl", action=argparse.BooleanOptionalAction, default=True,
         help="Internal PDL between precompute and main kernels (default: on).")
     parser.add_argument(
