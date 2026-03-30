@@ -921,6 +921,11 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    @pytest.mark.skip(
+        reason="V2 KV cache scheduler exceeds max_batch_size in PP>1: "
+        "scheduler_capacity (pp_size*batch_size) is used as per-batch "
+        "budget instead of max_batch_size, causing tensor shape mismatch "
+        "in attention metadata")
     @parametrize_with_ids("enable_gemm_allreduce_fusion", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
     def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile):
