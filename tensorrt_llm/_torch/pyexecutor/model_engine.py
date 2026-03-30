@@ -1028,6 +1028,7 @@ class PyTorchModelEngine(ModelEngine):
                 logger.info(
                     f"Run piecewise CUDA graph warmup for num tokens={num_tokens} with most requests"
                 )
+                self._sync_kv_cache_for_warmup(resource_manager)
                 self.forward(batch,
                              new_tensors_device=None,
                              resource_manager=resource_manager)
