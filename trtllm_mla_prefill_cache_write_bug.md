@@ -2,14 +2,26 @@
 
 ## Latest Status
 
-With `torch-simple` (no CUDA graphs) and `tokens_per_block=32`:
-- **255/256 requests succeed** — the C++ FMHA context + cache write MOSTLY works
-- **1/256 fails** with illegal memory access — rare edge case in the C++ kernel
-- `tokens_per_block=64` (PT default) increases failures to **64/256**
-- `copy_batch_block_offsets` produces **identical values** to `ragged_to_block_table_triton`
-  — block offset encoding was never the root cause
-- With `torch-cudagraph`, the single failure corrupts memory and cascades to crash all
-  subsequent CUDA graph replays
+All `thop.attention` scalar/metadata params now match PT backend exactly (verified
+via side-by-side dump comparison). With `torch-simple` + `tokens_per_block=64`:
+- **192/256 requests succeed** with 2-token prefills
+- **64/256 fail** with illegal memory access
+- Page allocations differ (AD sequential, PT scattered) but both are valid
+- **Q values match** between PT and AD (identical min/max range)
+- **K/V values differ 50-100x**: PT K=±10, V=±0.3; AD K=±470, V=±800
+- `latent_cache` values are nearly identical (±12 both) — compressed_kv matches
+- The K/V magnitude issue suggests AD's `kv_b_proj` expansion produces different
+  results, possibly from weight transform differences in the `fuse_rope_into_trtllm_mla`
+  graph transform or different weight loading for the FP8 model
+
+### Investigation: K/V Magnitude Difference
+The K/V expansion is `K,V = kv_b_proj(compressed_kv)` where `kv_b_proj_weight` has
+shape `[num_heads*(qk_nope_head_dim+v_head_dim), kv_lora_rank]` = `[8192, 512]`.
+The `compressed_kv` (and `latent_cache`) values match between PT and AD. So the
+weight itself must differ. The `fuse_rope_into_trtllm_mla` transform modifies the
+model graph and may affect how `kv_b_proj_weight` is stored or applied.
+
+With `torch-cudagraph`, the failures cascade through CUDA graph corruption.
 
 ## Reproduction Commit
 

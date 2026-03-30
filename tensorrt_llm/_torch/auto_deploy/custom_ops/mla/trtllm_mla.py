@@ -807,6 +807,13 @@ def _handle_prefill_thop(
         return output
 
     # Expand compressed KV via kv_b_proj to get separate K, V for FMHA.
+    # NOTE: For FP8 models, kv_b_proj_weight may contain unscaled FP8 values
+    # (max ~448) because the AD pipeline's FP8 block-scaling transforms don't
+    # cover weights passed as constants to custom ops. The C++ thop.attention
+    # context kernel writes latent_cache to the paged cache directly (no KV
+    # expansion needed for the cache). The KV expansion here is ONLY for the
+    # Python-side FMHA computation.
+    # TODO: pass FP8 weight + scale to the custom op and use fp8_block_scaling_gemm.
     w = (
         kv_b_proj_weight.to(dtype)
         if kv_b_proj_weight.dtype == torch.float8_e4m3fn
@@ -851,6 +858,7 @@ def _handle_prefill_thop(
         wrapper._ctx_configured = True
 
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
+
     wrapper.plan(
         layer_idx=layer_idx,  # same layer_idx as PT (not +1000)
         tokens_per_block=tokens_per_block,
