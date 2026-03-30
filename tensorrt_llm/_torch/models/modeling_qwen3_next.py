@@ -744,7 +744,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             initial_state=recurrent_state,
             output_final_state=True,
             cu_seqlens=query_start_loc_long,
-            head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
         last_recurrent_state = last_recurrent_state.to(ssm_states.dtype,
