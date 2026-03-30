@@ -858,6 +858,7 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
         use_dynamic_tree=True,
         dynamic_tree_max_topK=dynamic_tree_max_topK,
         max_total_draft_tokens=max_total_draft_tokens,
+        max_batch_size=max_batch_size,
     )
 
     # Create the LLM instance

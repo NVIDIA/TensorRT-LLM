@@ -829,12 +829,6 @@ class DecodingBaseConfig(StrictBaseModel):
         "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
     )
 
-    runtime_max_batch_size: Optional[int] = Field(
-        default=None,
-        description=
-        "Runtime max batch size for pre-allocating buffers. Set by the executor at startup."
-    )
-
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -1230,6 +1224,11 @@ class SAEnhancerConfig(StrictBaseModel):
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
+
+    max_batch_size: Optional[int] = Field(
+        default=None,
+        description="Max batch size for pre-allocating dynamic tree buffers. "
+        "Required when use_dynamic_tree=True.")
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
