@@ -15,8 +15,8 @@ import openai
 import pytest
 import requests
 import yaml
-from defs.common import get_free_port_in_ci as get_free_port
 
+from defs.common import get_free_port_in_ci as get_free_port
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
@@ -62,28 +62,36 @@ def launch_dwdp_disaggregated_llm(
     serve_port = frontend_config["port"]
 
     child_env = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.startswith(('OMPI_', 'PMIX_', 'PMI_'))
+        k: v for k, v in os.environ.items() if not k.startswith(("OMPI_", "PMIX_", "PMI_"))
     }
 
     mpi_cmd = [
-        "mpirun", "--allow-run-as-root", "-n",
-        str(total_gpus), "trtllm-serve", "disaggregated_mpi_worker", "-c",
-        worker_config_path
+        "mpirun",
+        "--allow-run-as-root",
+        "-n",
+        str(total_gpus),
+        "trtllm-serve",
+        "disaggregated_mpi_worker",
+        "-c",
+        worker_config_path,
     ]
 
     frontend_cmd = [
-        "trtllm-serve", "disaggregated", "-c", frontend_config_path,
+        "trtllm-serve",
+        "disaggregated",
+        "-c",
+        frontend_config_path,
         "--server_start_timeout",
-        str(server_waiting_timeout), "-r", "360000"
+        str(server_waiting_timeout),
+        "-r",
+        "360000",
     ]
 
     with (
-            MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
-            temp_dir,
-            popen(mpi_cmd, env=child_env) as mpi_proc,
-            popen(frontend_cmd, env=child_env) as frontend_proc,
+        MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
+        temp_dir,
+        popen(mpi_cmd, env=child_env) as mpi_proc,
+        popen(frontend_cmd, env=child_env) as frontend_proc,
     ):
         start_time = time.time()
         server_is_ready = False
@@ -94,11 +102,9 @@ def launch_dwdp_disaggregated_llm(
                 (frontend_proc, "frontend"),
             ]:
                 if proc.poll() is not None:
-                    raise Exception(
-                        f"{name} process exited with code {proc.returncode}")
+                    raise Exception(f"{name} process exited with code {proc.returncode}")
             try:
-                response = requests.get(
-                    f"http://localhost:{serve_port}/cluster_info")
+                response = requests.get(f"http://localhost:{serve_port}/cluster_info")
                 if response.status_code == 200:
                     cluster_info = response.json()
                     if cluster_info.get("is_ready"):
@@ -108,45 +114,41 @@ def launch_dwdp_disaggregated_llm(
             except requests.exceptions.ConnectionError:
                 continue
         if not server_is_ready:
-            pytest.fail(
-                f"DWDP server not ready after {server_waiting_timeout}s")
+            pytest.fail(f"DWDP server not ready after {server_waiting_timeout}s")
 
         model_name = worker_config.get("model", model_path)
-        client = openai.OpenAI(api_key="1234567890",
-                               base_url=f"http://localhost:{serve_port}/v1",
-                               timeout=1800000)
+        client = openai.OpenAI(
+            api_key="1234567890", base_url=f"http://localhost:{serve_port}/v1", timeout=1800000
+        )
 
-        def send_request(prompt: str, sampling_params: SamplingParams,
-                         streaming: bool):
+        def send_request(prompt: str, sampling_params: SamplingParams, streaming: bool):
             kwargs = {}
             if sampling_params is not None:
                 kwargs.update(
                     max_tokens=sampling_params.max_tokens,
-                    temperature=(sampling_params.temperature
-                                 if sampling_params.top_p is not None else 0),
+                    temperature=(
+                        sampling_params.temperature if sampling_params.top_p is not None else 0
+                    ),
                     top_p=sampling_params.top_p,
                     stop=sampling_params.stop,
-                    seed=sampling_params.seed)
-            response = client.completions.create(model=model_name,
-                                                 prompt=prompt,
-                                                 stream=streaming,
-                                                 **kwargs)
-            result = Result(id=0,
-                            sampling_params=sampling_params,
-                            outputs=[
-                                CompletionOutput(text=response.choices[0].text,
-                                                 index=0)
-                            ])
-            requested_output = RequestOutput._from_generation_result(
-                result, prompt=prompt)
+                    seed=sampling_params.seed,
+                )
+            response = client.completions.create(
+                model=model_name, prompt=prompt, stream=streaming, **kwargs
+            )
+            result = Result(
+                id=0,
+                sampling_params=sampling_params,
+                outputs=[CompletionOutput(text=response.choices[0].text, index=0)],
+            )
+            requested_output = RequestOutput._from_generation_result(result, prompt=prompt)
             setattr(requested_output, "result", result.result)
             return requested_output
 
-        def generate_async(prompt: str,
-                           sampling_params: Optional[SamplingParams] = None,
-                           streaming: bool = False):
-            future = thread_pool.submit(send_request, prompt, sampling_params,
-                                        streaming)
+        def generate_async(
+            prompt: str, sampling_params: Optional[SamplingParams] = None, streaming: bool = False
+        ):
+            future = thread_pool.submit(send_request, prompt, sampling_params, streaming)
             thread_pool.futures.append(future)
             return future
 
@@ -275,9 +277,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
         }
 
-        with launch_dwdp_disaggregated_llm(worker_config,
-                                           frontend_config,
-                                           model_path,
-                                           total_gpus=4,
-                                           max_workers=128) as llm:
+        with launch_dwdp_disaggregated_llm(
+            worker_config, frontend_config, model_path, total_gpus=4, max_workers=128
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])

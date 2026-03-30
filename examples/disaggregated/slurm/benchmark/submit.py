@@ -524,8 +524,7 @@ def submit_job(config, log_dir, dry_run):
                 benchmark_mode=benchmark_config['mode'],
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
-                concurrency=benchmark_config['concurrency_list'].split(',')
-                [0],
+                concurrency=benchmark_config['concurrency_list'].split(',')[0],
             )
             export_str = format_export_string(worker_env)
 
