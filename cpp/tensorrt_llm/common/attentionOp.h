@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -252,6 +252,18 @@ public:
         static constexpr int block_size_m = 64;
         int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
         int sm_cnt = mMultiProcessorCount;
+        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+        return num_sm_parts;
+    }
+
+    static int getFlashMlaNumSmPartsStatic(int s_q, int num_heads, int num_kv_heads, int head_size_v)
+    {
+        static constexpr int block_size_m = 64;
+        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
+        int device;
+        cudaGetDevice(&device);
+        int sm_cnt;
+        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, device);
         int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
         return num_sm_parts;
     }

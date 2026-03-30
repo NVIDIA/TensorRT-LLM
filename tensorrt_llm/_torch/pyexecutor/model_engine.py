@@ -1501,6 +1501,11 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
+        attn_meta = inputs.get('attn_metadata')
+        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
+        if attn_meta is not None:
+            attn_meta.on_update_kv_lens()
+
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_total_draft_tokens. But we need to use

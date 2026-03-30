@@ -24,7 +24,7 @@ By NVIDIA TensorRT LLM Team
   - [Future Work](#future-work)
   - [Acknowledgement](#acknowledgement)
 
-In the past tech blogs, we have introduced optimization specifically for [low-latency](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [throughput](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) oriented optimizations. For production deployment, users also care about per GPU throughput satisfying certain latency constraints. In this tech blog, we will introduce the design concept and usage of the TensorRT LLM disaggregated serving which directly targets throughput@latency performance scenarios, together with performance study results.
+In the past tech blogs, we have introduced optimization specifically for [low-latency](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [throughput](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) oriented optimizations. For production deployment, users also care about per GPU throughput satisfying certain latency constraints. In this tech blog, we will introduce the design concept and usage of the TensorRT LLM disaggregated serving which directly targets throughput@latency performance scenarios, together with performance study results.
 
 ## Motivation
 

@@ -32,7 +32,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import triton_convert_req_index_to_global_index
+from .kernel import (triton_convert_req_index_to_global_index,
+                     triton_gather_k_cache)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -81,7 +82,7 @@ def _compute_slot_mappings(
 
     # on_update_kv_lens() calls this during CUDA graph capture;
     # .all()/.item() would trigger host-device sync and invalidate capture.
-    if not torch.cuda.is_current_stream_capturing():
+    if not block_indices_in_seq.is_cuda:
         max_blocks = block_offsets.shape[1]
         assert (block_indices_in_seq < max_blocks).all(), \
             f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
@@ -92,24 +93,6 @@ def _compute_slot_mappings(
     scale_indices = (block_ids * block_stride + scale_base_offset +
                      pos_in_blocks * scale_size)
     return fp8_indices, scale_indices
-
-
-def _unravel_indices(flat_indices: torch.Tensor,
-                     shape: Tuple[int, ...]) -> Tuple[torch.Tensor, ...]:
-    """
-    Unravel indices into multiple dimensions.
-    """
-    d3 = shape[3]
-    i3 = flat_indices % d3
-    flat_indices = flat_indices // d3
-    d2 = shape[2]
-    i2 = flat_indices % d2
-    flat_indices = flat_indices // d2
-    d1 = shape[1]
-    i1 = flat_indices % d1
-    flat_indices = flat_indices // d1
-    i0 = flat_indices
-    return i0, i1, i2, i3
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -1402,68 +1385,6 @@ class Indexer(nn.Module):
                                                     k_cache, flat_indices_fp8,
                                                     flat_indices_scale)
 
-    def _gather_k_cache_for_chunk(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        chunk: IndexerPrefillChunkMetadata,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Gather K values from indexer cache for a specific chunk.
-
-        Uses pre-computed extended slot mappings that cover cached + current batch context tokens.
-        chunk.k_token_start/k_token_end directly index into the extended slot mapping.
-
-        Args:
-            metadata: Attention metadata
-            chunk: Chunk metadata with k_token_start/end as indices into extended slot mapping
-
-        Returns:
-            k_fp8: FP8 quantized k tensor, shape [num_k_tokens, head_dim]
-            k_scale: Scaling factors, shape [num_k_tokens, 1]
-        """
-        assert metadata.slot_mapping_fp8_fullkv is not None, \
-            "_gather_k_cache_for_chunk requires extended slot mappings (only available with cached tokens)"
-
-        k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
-            self.layer_idx)
-
-        head_dim = self.head_dim
-        scale_size = 4  # float32 = 4 bytes
-
-        # Extract slot mappings using chunk's k_token_start/end
-        # These indices point directly into the extended slot mapping array
-        k_token_start = chunk.k_token_start
-        k_token_end = chunk.k_token_end
-        num_k_tokens = k_token_end - k_token_start
-
-        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8_fullkv[
-            k_token_start:k_token_end]
-        slot_mapping_scale_chunk = metadata.slot_mapping_scale_fullkv[
-            k_token_start:k_token_end]
-
-        # Vectorized gather using pre-computed slot mappings
-        # Gather FP8 data
-        byte_offsets_fp8 = torch.arange(
-            head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
-        gather_indices_fp8 = slot_mapping_fp8_chunk.unsqueeze(
-            1) + byte_offsets_fp8  # [num_k_tokens, head_dim]
-        gather_indices_fp8 = _unravel_indices(gather_indices_fp8, k_cache.shape)
-        k_fp8_bytes = k_cache[gather_indices_fp8]
-        k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(
-            num_k_tokens, head_dim)
-
-        # Gather scale data
-        byte_offsets_scale = torch.arange(
-            scale_size, device=k_cache.device).unsqueeze(0)  # [1, 4]
-        gather_indices_scale = slot_mapping_scale_chunk.unsqueeze(
-            1) + byte_offsets_scale  # [num_k_tokens, 4]
-        gather_indices_scale = _unravel_indices(gather_indices_scale,
-                                                k_cache.shape)
-        k_scale_bytes = k_cache[gather_indices_scale]
-        k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
-
-        return k_fp8, k_scale
-
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1502,10 +1423,23 @@ class Indexer(nn.Module):
                     tp_rank = metadata.mapping.tp_rank
                     tp_size = metadata.mapping.tp_size
 
+                # Use the 2D pool data directly (contiguous) instead of the
+                # 4D view, because the 4D view may have strides that
+                # prevent flattening via .view(-1).
+                layer_offset = metadata.kv_cache_manager.layer_offsets[
+                    self.layer_idx]
+                gather_k_cache_pool = metadata.kv_cache_manager.indexer_k_cache_pool_per_layer[
+                    layer_offset]
+
                 for chunk in metadata.indexer_prefill_chunks:
-                    # Gather K from cache for this chunk (dual to _update_k_cache)
-                    chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(
-                        metadata, chunk)
+                    chunk_k_fp8, chunk_k_scale = triton_gather_k_cache(
+                        gather_k_cache_pool,
+                        metadata.slot_mapping_fp8_fullkv,
+                        metadata.slot_mapping_scale_fullkv,
+                        chunk.k_token_start,
+                        chunk.k_token_end,
+                        self.head_dim,
+                    )
 
                     chunk_num_token = chunk.token_end - chunk.token_start
                     apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold

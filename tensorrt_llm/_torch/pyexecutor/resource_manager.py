@@ -559,6 +559,37 @@ class KVCacheManager(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
+    def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
+        """Probe the KV cache radix tree for prefix match length.
+
+        Returns the number of prefix tokens already cached on this rank.
+        Used by KVCacheAwareADPRouter for cache-aware routing.
+        """
+        if not self.enable_block_reuse:
+            return 0
+        # is_variable_window is only defined on the concrete KVCacheManager
+        # nanobind class, not on BaseKVCacheManager. Use getattr to avoid
+        # AttributeError on other subclasses or mocks.
+        if getattr(self.impl, 'is_variable_window', False):
+            return 0
+        if not input_tokens:
+            return 0
+        from tensorrt_llm.bindings import SamplingConfig
+        from tensorrt_llm.bindings.internal.batch_manager import BlockKey
+        from tensorrt_llm.bindings.internal.batch_manager import \
+            LlmRequest as CppLlmRequest
+        block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
+        unique_tokens = block_key.unique_tokens
+        dummy_req = CppLlmRequest(request_id=0,
+                                  max_new_tokens=0,
+                                  input_tokens=input_tokens,
+                                  sampling_config=SamplingConfig(),
+                                  is_streaming=False,
+                                  lora_task_id=lora_task_id)
+        num_blocks = self.impl.count_reusable_blocks(unique_tokens, dummy_req,
+                                                     False)
+        return num_blocks * self.tokens_per_block
+
     def shutdown(self):
         self.impl.release_pools()
 
@@ -785,9 +816,13 @@ class KVCacheManager(BaseResourceManager):
             if request.py_rewind_len > 0:
                 self.rewind_kv_cache(request, request.py_rewind_len)
 
-        # For context requests, we store the blocks for reuse.
+        # For context requests, store completed context blocks for KV cache reuse.
+        # We wait until context_remaining_length == 0 (all chunks processed) before
+        # storing, so that SWA windows are safe to store — blocks won't go out-of-window
+        # and be evicted while the context is still in-flight.
         for request in scheduled_batch.context_requests:
-            self.impl.store_context_blocks(request)
+            if request.context_remaining_length == 0:
+                self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,

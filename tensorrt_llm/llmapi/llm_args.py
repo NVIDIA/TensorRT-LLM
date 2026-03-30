@@ -540,6 +540,18 @@ class AttentionDpConfig(StrictBaseModel):
     batching_wait_iters: int = Field(
         default=10,
         description="The number of iterations to wait for batching.")
+    enable_kv_cache_aware_routing: bool = Field(
+        default=False,
+        description="Enable internal KV cache-aware routing for attention DP. "
+        "When enabled, distributes requests among ranks within a single "
+        "instance's attention DP group, routing them to the rank with the "
+        "matching prefix KV cache to reduce redundant prefill computation.")
+    kv_cache_routing_load_balance_weight: float = Field(
+        default=1.0,
+        description=
+        "Weight (beta) for the load-balance term in KV cache-aware routing. "
+        "Higher values prioritize load balance over cache affinity. "
+        "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -1857,6 +1869,7 @@ class WaitingQueuePolicy(StrEnum):
     """Waiting queue scheduling policy for managing pending requests."""
 
     FCFS = "fcfs"  # First-Come-First-Served
+    PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)

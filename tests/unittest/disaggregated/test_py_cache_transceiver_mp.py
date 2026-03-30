@@ -1,4 +1,4 @@
-"""Multi-process test for PyNativeCacheTransceiver (V2 backend).
+"""Multi-process test for KvCacheTransceiverV2 (V2 backend).
 
 This test uses torch.multiprocessing to spawn multiple processes simulating
 ctx and gen instances with different TP/PP configurations.
@@ -25,8 +25,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
-
-AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -105,7 +103,7 @@ def find_free_port():
 class TorchDistributedWrapper:
     """A wrapper that provides the Distributed interface using torch.distributed.
 
-    This is used to create a compatible Distributed object for PyNativeCacheTransceiver
+    This is used to create a compatible Distributed object for KvCacheTransceiverV2
     in multi-process tests.
     """
 
@@ -289,10 +287,8 @@ def worker_fn(
         else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
     )
 
-    # Import PyNativeCacheTransceiver
-    from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import (
-        PyNativeCacheTransceiver,
-    )
+    # Import KvCacheTransceiverV2
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     # ===== Create all TP/PP groups in the same order for all ranks =====
     # dist.new_group is a collective operation - ALL ranks must call it in the same order!
@@ -398,18 +394,17 @@ def worker_fn(
             backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
         )
 
-        # Create PyNativeCacheTransceiver
-        attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
+        # Create KvCacheTransceiverV2
         print(f"[Rank {rank}] CTX: Creating transceiver...", flush=True)
-        transceiver = PyNativeCacheTransceiver(
+        transceiver = KvCacheTransceiverV2(
             mapping=mapping,
             dist=dist_wrapper,
             kv_cache_manager=kv_cache_manager,
-            attention_type=attention_type,
             cache_transceiver_config=cache_transceiver_config,
         )
         print(f"[Rank {rank}] CTX: Transceiver created", flush=True)
-        ctx_info_endpoint = transceiver.context_info_endpoint if local_rank == 0 else None
+        endpoints = transceiver.get_disaggregated_params().get("ctx_info_endpoint") or []
+        ctx_info_endpoint = endpoints[0] if (local_rank == 0 and endpoints) else None
 
     else:  # gen process
         # Create gen mapping
@@ -466,14 +461,12 @@ def worker_fn(
             backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
         )
 
-        # Create PyNativeCacheTransceiver
-        attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
+        # Create KvCacheTransceiverV2
         print(f"[Rank {rank}] GEN: Creating transceiver...", flush=True)
-        transceiver = PyNativeCacheTransceiver(
+        transceiver = KvCacheTransceiverV2(
             mapping=mapping,
             dist=dist_wrapper,
             kv_cache_manager=kv_cache_manager,
-            attention_type=attention_type,
             cache_transceiver_config=cache_transceiver_config,
         )
         print(f"[Rank {rank}] GEN: Transceiver created", flush=True)
@@ -1024,7 +1017,7 @@ def run_v2_transceiver_mp(
     is_mla: bool = False,
     ctx_gen_workflow: str = "ctx_first",
 ):
-    """Multi-process test for PyNativeCacheTransceiver using mp.spawn."""
+    """Multi-process test for KvCacheTransceiverV2 using mp.spawn."""
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
@@ -1099,7 +1092,7 @@ MP_TEST_CONFIGS = [
 def test_v2_transceiver_mp(
     ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow
 ):
-    """Test PyNativeCacheTransceiver with context-first multi-process configurations."""
+    """Test KvCacheTransceiverV2 with context-first multi-process configurations."""
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:

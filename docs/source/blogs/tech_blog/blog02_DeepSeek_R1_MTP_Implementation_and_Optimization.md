@@ -25,7 +25,7 @@ by NVIDIA TensorRT LLM team
   - [Acknowledgment](#acknowledgment)
 
 
-TensorRT LLM achieves world-record inference performance for DeepSeek-R1 on NVIDIA Blackwell GPUs, where Multi-Token Prediction (MTP) delivers a significant speedup. In our [previous blog post](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md), we discussed the key optimizations that enable the outstanding inference latency of the DeepSeek-R1 model. This article dives deeper into the implementation and optimization of MTP in TensorRT LLM.
+TensorRT LLM achieves world-record inference performance for DeepSeek-R1 on NVIDIA Blackwell GPUs, where Multi-Token Prediction (MTP) delivers a significant speedup. In our [previous blog post](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md), we discussed the key optimizations that enable the outstanding inference latency of the DeepSeek-R1 model. This article dives deeper into the implementation and optimization of MTP in TensorRT LLM.
 
 ## MTP for inference
 Inspired by a previous [research work](https://arxiv.org/pdf/2404.19737), MTP is designed to help the DeepSeek-V3 training. It adds additional MTP modules at the end of the main model and uses them to predict additional tokens. In this way, MTP can extend the prediction scope to multiple future tokens at each position to achieve better model accuracy. During inference, those MTP modules can also be used for speculative decoding to improve the generation latency further. In this section, we will introduce the MTP speculative decoding algorithm for LLM inference.
@@ -114,7 +114,7 @@ Run DeepSeek-V3/R1 models with MTP, use [examples/llm-api/quickstart_advanced.py
 
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
 To benchmark min-latency performance with MTP, you need to follow [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation) to prepare your dataset, then follow the steps below:
@@ -170,7 +170,7 @@ Run DeepSeek-R1 models with MTP Relaxed Acceptance, use [examples/llm-api/quicks
 
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 10 --relaxed_delta 0.6
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N --use_relaxed_acceptance_for_thinking --relaxed_topk 10 --relaxed_delta 0.6
 ```
 
 To benchmark min-latency performance with MTP Relaxed Acceptance, you need to follow [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation) to prepare your dataset, then follow the steps below:
