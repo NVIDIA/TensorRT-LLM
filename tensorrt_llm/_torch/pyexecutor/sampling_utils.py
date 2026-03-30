@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -196,6 +196,14 @@ def top_k_top_p_sampling_batch(
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
     logits = logits / max(temperature, 1e-5)
+    all_non_finite_rows = ~torch.isfinite(logits).any(dim=-1, keepdim=True)
+    finite_limit = torch.finfo(logits.dtype).max / 4
+    logits = torch.nan_to_num(
+        logits,
+        nan=-finite_limit,
+        posinf=finite_limit,
+        neginf=-finite_limit,
+    )
     batch_size, vocab_size = logits.size()
 
     assert top_k > 1, "non-greedy sampling requires valid top_k"
@@ -249,10 +257,23 @@ def top_k_top_p_sampling_batch(
             ),  # needed for advanced indexing
             last_index_to_keep.squeeze(-1),
         ].unsqueeze(-1)
-        del logits  # do not use, inconsistent with probs
     else:
         # compute probability distribution
         probs = torch.softmax(logits, dim=-1)
+
+    # Numerically robust guard for any rows still invalid after filtering/softmax.
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    probs = probs.clamp_min(0.0)
+    probs_sum = probs.sum(dim=-1, keepdim=True)
+    invalid_rows = (probs_sum <= 0) | all_non_finite_rows
+    if invalid_rows.any():
+        invalid_rows_flat = invalid_rows.squeeze(-1)
+        fallback_tokens = torch.argmax(logits[invalid_rows_flat], dim=-1)
+        probs = probs.clone()
+        probs[invalid_rows_flat] = 0.0
+        probs[invalid_rows_flat, fallback_tokens] = 1.0
+        probs_sum = probs.sum(dim=-1, keepdim=True)
+    probs = probs / probs_sum
 
     # sample from the distribution and generate result of [batch_size, 1]
     next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)

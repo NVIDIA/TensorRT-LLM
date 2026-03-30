@@ -51,6 +51,12 @@ def rms_norm_kernel(
 
 def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
     """Rms norm."""
+    # Ensure contiguous: the Triton kernel uses the same stride for both input
+    # and output pointers, but torch.empty_like always produces a contiguous
+    # output. If hidden_states is non-contiguous (e.g. a split_with_sizes view),
+    # input_stride != output_stride → out-of-bounds writes → cudaErrorIllegalAddress.
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
     feat_size = weight.shape[0]
     seq_len = hidden_states.numel() // hidden_states.size(-1)
     input_stride = hidden_states.stride(-2)

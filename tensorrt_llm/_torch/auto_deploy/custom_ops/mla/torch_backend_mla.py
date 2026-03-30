@@ -72,6 +72,25 @@ def _update_mla_cache(
         # Update kpe portion
         mla_cache[cache_idx, pos : pos + length, kv_lora_rank:] = kpe[start : start + length]
 
+    import os as _os4
+    _rank4 = _os4.environ.get("RANK", "0")
+    _ctx_write_key = f"_mla_ctx_write_{_rank4}"
+    _ctx_write_count = int(_os4.environ.get(_ctx_write_key, "0"))
+    _os4.environ[_ctx_write_key] = str(_ctx_write_count + 1)
+    if _ctx_write_count < 4 and seq_len.shape[0] > 0 and _rank4 == "0":
+        _idx0 = 0
+        _ci = slot_idx[_idx0].item()
+        _p0 = input_pos[_idx0].item()
+        _ln = seq_len[_idx0].item()
+        _ckv_after_max = mla_cache[_ci, _p0 : _p0 + _ln, :kv_lora_rank].float().abs().max().item()
+        print(
+            f"[DIAG4 rank={_rank4}] _update_mla_cache write={_ctx_write_count} "
+            f"cache_idx={_ci} pos={_p0} length={_ln} "
+            f"compressed_kv_after_max={_ckv_after_max:.4f} "
+            f"mla_cache_dtype={mla_cache.dtype}",
+            flush=True,
+        )
+
 
 def _torch_mla_generate_with_absorption(
     q_nope: torch.Tensor,  # [B, 1, N, qk_nope_head_dim]
@@ -131,6 +150,23 @@ def _torch_mla_generate_with_absorption(
         q_nope_i = q_nope[i, 0]  # [N, qk_nope_head_dim]
         q_pe_i = q_pe[i, 0]  # [N, qk_rope_head_dim]
 
+        # DIAG4b: Check cache values before decode reads (to detect prefill write failure)
+        import os as _os4b
+        _rank4b = _os4b.environ.get("RANK", "0")
+        _ctx_read_key = f"_mla_ctx_read_{_rank4b}"
+        _ctx_read_count = int(_os4b.environ.get(_ctx_read_key, "0"))
+        _os4b.environ[_ctx_read_key] = str(_ctx_read_count + 1)
+        if i == 0 and _ctx_read_count < 4 and _rank4b == "0":
+            _prefill_len = pos  # positions 0..pos-1 should have been written by prefill
+            _all_zero = (mla_cache[cache_idx, :_prefill_len, :kv_lora_rank].float().abs().max().item() == 0.0) if _prefill_len > 0 else True
+            _prefill_max = mla_cache[cache_idx, :_prefill_len, :kv_lora_rank].float().abs().max().item() if _prefill_len > 0 else 0.0
+            print(
+                f"[DIAG4b rank={_rank4b}] decode_pre_read read={_ctx_read_count} "
+                f"cache_idx={cache_idx} pos={pos} prefill_positions={_prefill_len} "
+                f"cache_prefill_max={_prefill_max:.4f} all_zero={_all_zero}",
+                flush=True,
+            )
+
         # Retrieve cached data up to current position
         cached_data = mla_cache[cache_idx, : pos + 1]  # [seq_len, kv_lora_rank + qk_rope_head_dim]
         compressed_kv_cached = cached_data[:, :kv_lora_rank]  # [seq_len, kv_lora_rank]
@@ -151,6 +187,23 @@ def _torch_mla_generate_with_absorption(
         # w_k_nope: [N, qk_nope_head_dim, kv_lora_rank]
         # q_absorbed: [N, kv_lora_rank]
         q_absorbed = torch.einsum("nd,ndk->nk", q_nope_i, w_k_nope)
+
+        import os as _os3
+        _rank3 = _os3.environ.get("RANK", "0")
+        _qabs_key = f"_mla_qabs_diag_{_rank3}"
+        _qabs_count = int(_os3.environ.get(_qabs_key, "0"))
+        _os3.environ[_qabs_key] = str(_qabs_count + 1)
+        if i == 0 and _qabs_count < 6:
+            print(
+                f"[DIAG2 rank={_rank3}] q_absorbed call={_qabs_count} pos={pos} "
+                f"q_absorbed_max={q_absorbed.float().abs().max().item():.4f} "
+                f"w_k_nope_max={w_k_nope.float().abs().max().item():.4f} "
+                f"compressed_kv_cached_max={compressed_kv_cached.float().abs().max().item():.4f} "
+                f"kpe_cached_max={kpe_cached.float().abs().max().item():.4f} "
+                f"kv_b_proj_max={kv_b_proj_weight.float().abs().max().item():.4f} "
+                f"w_v_max={w_v.float().abs().max().item():.4f}",
+                flush=True,
+            )
 
         # Attention scores from absorbed Q and compressed KV
         # Compute in fp32 to match FlashInfer's use_fp16_qk_reduction=False
@@ -182,6 +235,25 @@ def _torch_mla_generate_with_absorption(
         # w_v: [N, v_head_dim, kv_lora_rank]
         # weighted_kv: [N, kv_lora_rank]
         attn_out = torch.einsum("nk,nvk->nv", weighted_kv, w_v)  # [N, v_head_dim]
+
+        import os as _os2
+        _rank2 = _os2.environ.get("RANK", "0")
+        _adec_key = f"_mla_attn_diag_{_rank2}"
+        _adec_count = int(_os2.environ.get(_adec_key, "0"))
+        _os2.environ[_adec_key] = str(_adec_count + 1)
+        if i == 0 and _adec_count < 6:
+            has_nan = torch.isnan(attn_scores).any().item()
+            has_inf = torch.isinf(attn_scores).any().item()
+            print(
+                f"[DIAG rank={_rank2}] decode_attn i=0 call={_adec_count} pos={pos} "
+                f"cached_kv_len={cached_data.shape[0]} "
+                f"scores_nope_max={scores_nope.float().abs().max().item():.4f} "
+                f"scores_pe_max={scores_pe.float().abs().max().item():.4f} "
+                f"attn_scores_nan={has_nan} attn_scores_inf={has_inf} "
+                f"attn_out_max={attn_out.float().abs().max().item():.4f} "
+                f"attn_out_mean={attn_out.float().abs().mean().item():.4f}",
+                flush=True,
+            )
 
         out[i] = attn_out
 
@@ -365,6 +437,26 @@ def torch_backend_mla_with_cache(
     kv_head_dim = out_features // num_heads
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
+    import os as _os
+    _rank = _os.environ.get("RANK", "0")
+    _call_key = f"_mla_call_count_{_rank}"
+    _call_count = int(_os.environ.get(_call_key, "0"))
+    _os.environ[_call_key] = str(_call_count + 1)
+    if s == 1:
+        # Decode phase - always print first few to diagnose
+        _dec_key = f"_mla_dec_count_{_rank}"
+        _dec_count = int(_os.environ.get(_dec_key, "0"))
+        _os.environ[_dec_key] = str(_dec_count + 1)
+        if _dec_count < 3:
+            print(
+                f"[DIAG rank={_rank}] torch_cached_mla DECODE call={_dec_count} b={b} "
+                f"num_heads={num_heads} kv_b_proj_shape={kv_b_proj_weight.shape} "
+                f"kv_head_dim={kv_head_dim} v_head_dim={v_head_dim} "
+                f"q_nope_max={q_nope.float().abs().max().item():.4f} "
+                f"compressed_kv_max={compressed_kv.float().abs().max().item():.4f}",
+                flush=True,
+            )
+
     # Get cleaned up metadata
     batch_info = BatchInfo(batch_info_host)
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
@@ -410,6 +502,19 @@ def torch_backend_mla_with_cache(
         # =====================================================================
         # Context phase: Expand and compute normal attention
         # =====================================================================
+        _ctx_key3 = f"_mla_ctx3_{_rank}"
+        _ctx_count3 = int(_os.environ.get(_ctx_key3, "0"))
+        _os.environ[_ctx_key3] = str(_ctx_count3 + 1)
+        if _ctx_count3 < 4 and _rank == "0":
+            print(
+                f"[DIAG3 rank={_rank}] CONTEXT call={_ctx_count3} b={b} s={s} "
+                f"num_heads={num_heads} "
+                f"q_nope_max={q_nope.float().abs().max().item():.4f} "
+                f"compressed_kv_max={compressed_kv.float().abs().max().item():.4f} "
+                f"mla_cache_dtype={mla_cache.dtype} mla_cache_shape={list(mla_cache.shape)}",
+                flush=True,
+            )
+
         bs_view = (bs,)
 
         q_nope_flat = q_nope.contiguous().view(*bs_view, num_heads, qk_nope_head_dim)
