@@ -126,11 +126,12 @@ def submit_source_code_licenses(
             if is_new:
                 new_items.append(doc)
             sbom_documents.append(doc)
-        _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
-        if sbom_errors:
-            raise RuntimeError(
-                "Elasticsearch bulk indexing reported errors for SBOM license report."
-            )
+        if sbom_documents:
+            _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
+            if sbom_errors:
+                raise RuntimeError(
+                    "Elasticsearch bulk indexing reported errors for SBOM license report."
+                )
     else:
         print(f"SBOM file not found, skipping GPL/LGPL license reporting: {input_file}")
 
@@ -221,8 +222,8 @@ def submit_container_licenses(
             "s_platform": platform,
             "s_release_image": release_image,
             "s_base_image": base_image,
-            "s_package_name": v.get("package"),
-            "s_package_version": v.get("version"),
+            "s_package_name": package_name,
+            "s_package_version": package_version,
             "s_package_type": v.get("type"),
             "s_license_ids": ",".join(v.get("licenses", [])),
             "b_is_new": is_new,
