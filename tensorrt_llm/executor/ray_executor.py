@@ -309,6 +309,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                   async_call=False,
                                   request_id=request_id)
 
+    def abort_all_requests(self) -> None:
+        """Abort all active generation requests."""
+        for result in list(self._results.values()):
+            result.abort()
+
     def shutdown(self):
         if hasattr(self, '_shutdown_event') and self._shutdown_event.is_set():
             return

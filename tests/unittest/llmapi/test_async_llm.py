@@ -135,3 +135,44 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
         llm.shutdown()
         if pg is not None:
             remove_placement_group(pg)
+
+
+@pytest.mark.ray
+@pytest.mark.asyncio
+async def test_async_llm_reset_prefix_cache():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+    prompt = "The future of AI is " * 20
+    sampling_params = SamplingParams(temperature=0, max_tokens=5, return_perf_metrics=True)
+
+    async with AsyncLLM(
+        model=llama_model_path,
+        kv_cache_config=kv_cache_config,
+        cuda_graph_config=None,
+    ) as llm:
+        # Cold cache: first run should have no reused blocks
+        out1 = await llm.generate_async(prompt, sampling_params)
+        m1 = out1.outputs[0].request_perf_metrics
+        assert m1 is not None
+        assert m1.kv_cache_metrics.num_reused_blocks == 0, (
+            f"Expected 0 reused blocks on cold cache, got {m1.kv_cache_metrics.num_reused_blocks}"
+        )
+
+        # Warm cache: same prompt should hit prefix cache
+        out2 = await llm.generate_async(prompt, sampling_params)
+        m2 = out2.outputs[0].request_perf_metrics
+        assert m2 is not None
+        assert m2.kv_cache_metrics.num_reused_blocks > 0, (
+            f"Expected >0 reused blocks on warm cache, got {m2.kv_cache_metrics.num_reused_blocks}"
+        )
+
+        await llm.collective_rpc("reset_prefix_cache")
+
+        # After reset: cache should be cold again
+        out3 = await llm.generate_async(prompt, sampling_params)
+        m3 = out3.outputs[0].request_perf_metrics
+        assert m3 is not None
+        assert m3.kv_cache_metrics.num_reused_blocks == 0, (
+            f"Expected 0 reused blocks after reset_prefix_cache, "
+            f"got {m3.kv_cache_metrics.num_reused_blocks}"
+        )
