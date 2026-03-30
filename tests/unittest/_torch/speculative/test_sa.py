@@ -12,22 +12,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
-def get_perf_metrics(result):
-    """Extract performance metrics from result using built-in request_perf_metrics."""
-    metrics = {}
-    if result.outputs and result.outputs[0].request_perf_metrics:
-        perf = result.outputs[0].request_perf_metrics
-        timing = perf.timing_metrics
-        # Convert timedelta to seconds
-        metrics['arrival_time'] = timing.arrival_time.total_seconds()
-        metrics['first_token_time'] = timing.first_token_time.total_seconds()
-        metrics['last_token_time'] = timing.last_token_time.total_seconds()
-        # Calculate TTFT and E2E latency
-        metrics['ttft'] = metrics['first_token_time'] - metrics['arrival_time']
-        metrics['e2e'] = metrics['last_token_time'] - metrics['arrival_time']
-    return metrics
-
-
 # Test parameter combinations:
 # - disable_overlap_scheduler: Controls scheduler mode (False=overlap enabled)
 # - use_cuda_graph: Whether to use CUDA graph capture
@@ -52,12 +36,14 @@ def get_perf_metrics(result):
 @pytest.mark.high_cuda_memory
 def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
                   attn_backend: str, max_matching_ngram_size: int):
-    """Test SA (Suffix Automaton) speculative decoding correctness and acceptance rate.
+    """Test SA (Suffix Automaton) speculative decoding acceptance rate.
 
     Verifies:
-    1. Speculative decoding produces identical results to baseline
-    2. SA drafting produces draft tokens that get accepted
-    3. Multi-token acceptance occurs (acceptanceLength > 1)
+    1. SA drafting produces draft tokens that get accepted
+    2. Multi-token acceptance occurs (acceptanceLength > 1)
+
+    Output correctness is validated by integration accuracy tests in
+    tests/integration/defs/accuracy/test_llm_api_pytorch.py.
     """
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
@@ -97,18 +83,13 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         "16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, "
         "34, 35,",
     ]
-    # Enable perf metrics collection via return_perf_metrics=True
     sampling_params = SamplingParams(max_tokens=64,
                                      ignore_eos=True,
-                                     temperature=0,
-                                     return_perf_metrics=True)
+                                     temperature=0)
 
-    # Run with speculative decoding
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.generate(prompts, sampling_params)
 
-    # Get spec decoding stats before shutdown
     stats = llm_spec.get_stats(timeout=5)
     iterations_with_spec = []
     for stat in stats:
@@ -117,31 +98,9 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
             if spec_stats.get('numDraftTokens', 0) > 0:
                 iterations_with_spec.append(spec_stats)
 
-    # Get perf metrics using built-in request_perf_metrics
-    spec_metrics = get_perf_metrics(results_spec[0]) if results_spec else {}
-
     llm_spec.shutdown()
 
-    # Run reference without speculative decoding
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-
-    # Get perf metrics for reference
-    ref_metrics = get_perf_metrics(results_ref[0]) if results_ref else {}
-
-    llm_ref.shutdown()
-
-    # Verify 1: Identical results (correctness)
-    for i, (text_spec,
-            text_ref) in enumerate(zip(generated_text_spec,
-                                       generated_text_ref)):
-        assert text_spec == text_ref, (
-            f"Prompt {i}: Spec decode result differs from baseline.\n"
-            f"Spec: {text_spec}\nRef: {text_ref}")
-    print(f"Correctness verified: spec decode matches baseline")
-
-    # Verify 2: Spec decoding stats show drafting occurred
+    # Verify 1: Spec decoding stats show drafting occurred
     assert len(iterations_with_spec) > 0, (
         f"SA should have iterations with specDecodingStats. "
         f"Got {len(stats)} total stats but 0 with draft tokens.")
@@ -164,7 +123,7 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         f"SA should accept some draft tokens. "
         f"Got {total_accepted} accepted out of {total_draft} drafted")
 
-    # Verify 3: Multi-token acceptance (acceptanceLength > 1)
+    # Verify 2: Multi-token acceptance (acceptanceLength > 1)
     has_multi_token_acceptance = any(s['acceptanceLength'] > 1.0
                                      for s in iterations_with_spec)
     print(f"  Has multi-token acceptance: {has_multi_token_acceptance}")
@@ -173,41 +132,6 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         "Expected at least one iteration with acceptanceLength > 1 "
         "for repetitive pattern")
 
-    # Print performance comparison using built-in metrics
-    print("\n" + "=" * 70)
-    print("PERFORMANCE COMPARISON (using request_perf_metrics)")
-    print("=" * 70)
-    print(
-        f"Config: overlap_scheduler={'enabled' if not disable_overlap_scheduler else 'disabled'}, "
-        f"cuda_graph={'enabled' if use_cuda_graph else 'disabled'}")
-    print("-" * 70)
-    print(f"{'Metric':<30} {'Spec Decoding':<20} {'Reference':<20}")
-    print("-" * 70)
-
-    # Print TTFT (Time to First Token)
-    ttft_spec = spec_metrics.get('ttft', None)
-    ttft_ref = ref_metrics.get('ttft', None)
-    ttft_spec_str = f"{ttft_spec*1000:.2f} ms" if ttft_spec else "N/A"
-    ttft_ref_str = f"{ttft_ref*1000:.2f} ms" if ttft_ref else "N/A"
-    print(f"{'TTFT':<30} {ttft_spec_str:<20} {ttft_ref_str:<20}")
-
-    # Print E2E latency
-    e2e_spec = spec_metrics.get('e2e', None)
-    e2e_ref = ref_metrics.get('e2e', None)
-    e2e_spec_str = f"{e2e_spec*1000:.2f} ms" if e2e_spec else "N/A"
-    e2e_ref_str = f"{e2e_ref*1000:.2f} ms" if e2e_ref else "N/A"
-    print(f"{'E2E Latency':<30} {e2e_spec_str:<20} {e2e_ref_str:<20}")
-
-    # Calculate and print speedup
-    if e2e_spec and e2e_ref and e2e_spec > 0:
-        speedup = e2e_ref / e2e_spec
-        print("-" * 70)
-        print(f"{'Speedup (E2E)':<30} {speedup:.2f}x")
-    print("=" * 70 + "\n")
-
-    # Synchronize CUDA to catch any async memory errors before test completes.
-    # This ensures errors are attributed to this test rather than propagating
-    # to subsequent tests.
     torch.cuda.synchronize()
 
 
@@ -259,9 +183,9 @@ def test_llama_sa_global_pool(disable_overlap_scheduler: bool,
                               use_cuda_graph: bool):
     """Test SA speculative decoding with global pool enabled.
 
-    Verifies:
-    1. Speculative decoding with global pool produces identical results to baseline
-    2. SA drafting produces draft tokens that get accepted
+    Verifies that SA drafting with global pool produces draft tokens that
+    get accepted. Output correctness is validated by integration accuracy
+    tests in tests/integration/defs/accuracy/test_llm_api_pytorch.py.
     """
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
@@ -304,13 +228,10 @@ def test_llama_sa_global_pool(disable_overlap_scheduler: bool,
     ]
     sampling_params = SamplingParams(max_tokens=64,
                                      ignore_eos=True,
-                                     temperature=0,
-                                     return_perf_metrics=True)
+                                     temperature=0)
 
-    # Run with speculative decoding + global pool
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.generate(prompts, sampling_params)
 
     stats = llm_spec.get_stats(timeout=5)
     iterations_with_spec = []
@@ -322,22 +243,7 @@ def test_llama_sa_global_pool(disable_overlap_scheduler: bool,
 
     llm_spec.shutdown()
 
-    # Run reference without speculative decoding
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
-
-    # Verify 1: Identical results (correctness)
-    for i, (text_spec,
-            text_ref) in enumerate(zip(generated_text_spec,
-                                       generated_text_ref)):
-        assert text_spec == text_ref, (
-            f"Prompt {i}: Global pool spec decode differs from baseline.\n"
-            f"Spec: {text_spec}\nRef: {text_ref}")
-    print("Correctness verified: global pool spec decode matches baseline")
-
-    # Verify 2: Spec decoding stats show drafting occurred
+    # Verify 1: Spec decoding stats show drafting occurred
     assert len(iterations_with_spec) > 0, (
         "SA global pool should have iterations with specDecodingStats.")
 

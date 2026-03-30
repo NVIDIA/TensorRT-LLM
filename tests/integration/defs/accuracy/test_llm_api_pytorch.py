@@ -58,7 +58,7 @@ from tensorrt_llm.llmapi import (
     DeepSeekSparseAttentionConfig, Eagle3DecodingConfig, KvCacheConfig,
     MoeConfig, MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
     RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
-    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig, 
+    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
     TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
