@@ -85,8 +85,10 @@ def process_req_perf_metrics(
         stat[MetricNames.GENERATION_TOKENS] = output_length
 
     # TPOT = decode duration per output token.  Requires at least 2 tokens
-    # (denominator would be 0 for a single-token output).
-    if output_length > 1 and not is_multiple_response:
+    # (denominator would be 0 for a single-token output) and both timestamps
+    # present (first_token=0 default would produce bogus values).
+    if (output_length > 1 and not is_multiple_response
+            and first_token > 0 and last_token > 0):
         stat[MetricNames.TPOT] = (last_token - first_token) / (output_length -
                                                                 1)
 
