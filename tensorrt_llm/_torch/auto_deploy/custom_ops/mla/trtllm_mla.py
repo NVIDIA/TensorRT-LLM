@@ -203,7 +203,7 @@ class _TrtllmMLAPlanner:
             # head_size=qk_head_dim (192), num_kv_heads=num_heads (32), v_head_dim=128
             # q_lora_rank=0: DeepSeek-V3-Lite has no Q compression (q_lora_rank=None)
             mla_params = MLAParams(
-                q_lora_rank=kv_lora_rank,
+                q_lora_rank=0,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
@@ -220,7 +220,7 @@ class _TrtllmMLAPlanner:
         else:
             # Decode wrapper: latent dimensions (matches PT's self.mqa)
             mla_params = MLAParams(
-                q_lora_rank=kv_lora_rank,
+                q_lora_rank=0,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
@@ -833,28 +833,45 @@ def _handle_prefill_thop(
         v_head_dim,
         for_context=True,
     )
+    # Match PT backend's q_lora_rank and quant_mode on the context wrapper.
+    if not hasattr(wrapper, "_ctx_configured"):
+        # PT uses q_lora_rank=hidden_size when model q_lora_rank=None.
+        # hidden_size = kv_b_proj_weight.shape[0] // (qk_nope_head_dim/v_head_dim_ratio + 1)
+        # For DeepSeek: kv_b_proj.shape[0]=8192, num_heads=32, hidden_size=2560.
+        # Detect from weight: out_features = num_heads * (qk_nope_head_dim + v_head_dim).
+        # hidden_size = out_features * v_head_dim / (qk_nope_head_dim + v_head_dim) ... no.
+        # Just compute: hidden_size = kv_b_proj.shape[1] * 5 for typical MLA models.
+        # Actually: for models with q_lora_rank=None, PT sets q_lora_rank=hidden_size.
+        # We pass 0 (matching PT when hidden_size is used as "full rank, no compression").
+        # TODO: derive hidden_size from model config instead of hardcoding.
+        wrapper.q_lora_rank = kv_lora_rank * 5  # hidden_size for DeepSeek MLA (512*5=2560)
+        # FP8 block scaling: always enable for FP8 models. The kv_b_proj_weight
+        # may be BF16 (AD casts FP8→BF16 during computation) but the model is FP8.
+        wrapper.quant_mode = int(QuantMode.FP8_1x128_128x128)
+        wrapper._ctx_configured = True
+
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
     wrapper.plan(
-        layer_idx=layer_idx + 1000,
+        layer_idx=layer_idx,  # same layer_idx as PT (not +1000)
         tokens_per_block=tokens_per_block,
         max_num_requests=max_num_requests,
-        max_sequence_length=max_context_length,
-        max_context_length=max_context_length,
+        max_sequence_length=max_context_length,  # PT: max_seq_len
+        max_context_length=max_context_length - 1,  # PT: min(max_seq_len-1, max_num_tokens)
         beam_width=1,
         sequence_length=sequence_length,
         context_lengths=context_lengths,
         host_past_key_value_lengths=host_past_kv_lengths,
-        host_total_kv_lens=host_total_kv_lens,
+        host_total_kv_lens=host_total_kv_lens.int(),  # PT uses int32
         host_context_lengths=host_context_lengths,
         host_request_types=host_request_types,
         kv_cache_block_offsets=ctx_block_offsets,
         host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-        block_ids_per_seq=None,
+        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping[:30],  # PT: [30, 2]
+        block_ids_per_seq=planner.block_ids_per_seq,  # PT passes pre-allocated tensor
+        flash_mla_tile_scheduler_metadata=planner.flash_mla_tile_scheduler_metadata,
+        flash_mla_num_splits=planner.flash_mla_num_splits,
         latent_cache=latent_cache,
-        workspace=planner._ctx_workspace
-        if hasattr(planner, "_ctx_workspace")
-        else planner._init_ctx_workspace(device),
+        workspace=torch.empty(0, dtype=torch.int8, device=device),  # PT starts empty
         use_paged_context_fmha=False,
         attention_input_type=AttentionInputType.context_only,
         kv_scale_orig_quant=planner.kv_scale_orig_quant,
