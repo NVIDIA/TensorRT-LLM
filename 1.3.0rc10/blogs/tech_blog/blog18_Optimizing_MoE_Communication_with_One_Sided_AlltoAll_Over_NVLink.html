@@ -1,0 +1,1331 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Optimizing MoE Communication with One-Sided AlltoAll Over NVLink &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Sparse Attention in TensorRT LLM" href="blog17_Sparse_Attention_in_TensorRT-LLM.html" />
+    <link rel="prev" title="Introduction to KV Cache Transmission" href="../../developer-guide/kv-transfer.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc10" />
+
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="optimizing-moe-communication-with-one-sided-alltoall-over-nvlink">
+<h1>Optimizing MoE Communication with One-Sided AlltoAll Over NVLink<a class="headerlink" href="#optimizing-moe-communication-with-one-sided-alltoall-over-nvlink" title="Link to this heading">#</a></h1>
+<p>Large-scale Mixture-of-Experts (MoE) models have become the dominant architecture for open-source LLMs. For inference, a common parallel strategy is <strong>Attention Data Parallel (DP) + MoE Expert Parallel (EP)</strong>: each GPU handles a portion of the requests (thus tokens) for attention and a portion of the experts for MoE. Since a token’s routed experts may reside on other GPUs, efficient communication is crucial for performance.</p>
+<p>In this blog, we introduce <strong>NVLinkOneSided AlltoAll</strong>, the MoE communication kernels in TensorRT LLM designed for NVLink-connected systems (DGX B200, GB200 NVL72, etc.). We describe the key design choices, implementation details and performance benchmark results.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#optimizing-moe-communication-with-one-sided-alltoall-over-nvlink">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#background">Background</a></p></li>
+<li><p><a class="reference internal" href="#design-overview">Design Overview</a></p>
+<ul>
+<li><p><a class="reference internal" href="#nvlink-symmetric-memory">NVLink Symmetric Memory</a></p></li>
+<li><p><a class="reference internal" href="#one-sided-communication">One-Sided Communication</a></p></li>
+<li><p><a class="reference internal" href="#token-major-data-layout">Token-Major Data Layout</a></p></li>
+<li><p><a class="reference internal" href="#quantization-agnostic-communication">Quantization-Agnostic Communication</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#implementation-details">Implementation Details</a></p>
+<ul>
+<li><p><a class="reference internal" href="#interface-between-communication-and-moe">Interface Between Communication and MoE</a></p></li>
+<li><p><a class="reference internal" href="#dispatch-put-and-combine-get">Dispatch Put and Combine Get</a></p></li>
+<li><p><a class="reference internal" href="#synchronization">Synchronization</a></p></li>
+<li><p><a class="reference internal" href="#saturating-nvlink-bandwidth">Saturating NVLink Bandwidth</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#performance-benchmark">Performance Benchmark</a></p>
+<ul>
+<li><p><a class="reference internal" href="#reproduction">Reproduction</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#future-work-and-conclusion">Future Work And Conclusion</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="background">
+<h2>Background<a class="headerlink" href="#background" title="Link to this heading">#</a></h2>
+<p>There are two communication patterns that can be used between attention DP and MoE EP:</p>
+<p><strong>1. AllGather + ReduceScatter.</strong> After attention, AllGather brings all tokens to every rank. Each rank computes MoE on the full token set using its local experts. After MoE, ReduceScatter sums the partial results back to each rank.</p>
+<p><strong>2. AlltoAll (Dispatch + Combine).</strong> AllGather is redundant: if a token is not routed to any expert on a given rank, it does not need to be communicated there. The waste is especially significant when the EP size is larger than <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, since a token is routed to at most <code class="docutils literal notranslate"><span class="pre">top_k</span></code> experts. AlltoAll sends each token only to the ranks that own its routed experts, eliminating the redundancy. The AlltoAll after attention is called <strong>dispatch</strong> and the AlltoAll after MoE is called <strong>combine</strong>.</p>
+<p>Concretely, the total message size of AllGather/ReduceScatter scales as <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">×</span> <span class="pre">num_tokens_per_rank</span> <span class="pre">×</span> <span class="pre">hidden_dim</span></code> (including data movement to self), while AlltoAll scales as <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">×</span> <span class="pre">num_tokens_per_rank</span> <span class="pre">×</span> <span class="pre">hidden_dim</span></code>, since each token is dispatched to at most <code class="docutils literal notranslate"><span class="pre">top_k</span></code> target ranks. When <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">&gt;</span> <span class="pre">top_k</span></code>, AlltoAll communicates strictly less data.</p>
+</section>
+<section id="design-overview">
+<h2>Design Overview<a class="headerlink" href="#design-overview" title="Link to this heading">#</a></h2>
+<p>NVLinkOneSided AlltoAll is built around three key design ideas: a shared memory substrate for direct GPU-to-GPU access, a one-sided communication model that eliminates intermediate copies, and a token-major data layout that enables deduplication. We discuss each in turn.</p>
+<section id="nvlink-symmetric-memory">
+<h3>NVLink Symmetric Memory<a class="headerlink" href="#nvlink-symmetric-memory" title="Link to this heading">#</a></h3>
+<p>Communication across GPUs is enabled by CUDA’s Virtual Memory Management (VMM) APIs. Each GPU allocates a piece of physical memory and exports a shareable handle for its allocation. These handles are then exchanged across all participating GPUs, allowing each GPU to import the remote handles and map the remote memory into its own virtual address space. The result is a <strong>symmetric memory workspace</strong>: any GPU can read from or write to any other GPU’s portion of this workspace via NVLink using standard instructions in kernels, as if they were normal global memory pointers. This works within a single NVLink domain — 8 GPUs on a DGX B200, or all 72 GPUs on a GB200 NVL72 rack.</p>
+<p align="center"><img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_symmetric_memory.png" alt="Symmetric memory across GPUs" width="600"/></p>
+<p align="center"><em>Symmetric memory registration across GPUs. (Image courtesy: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 Blog</a>)</em></p>
+</section>
+<section id="one-sided-communication">
+<h3>One-Sided Communication<a class="headerlink" href="#one-sided-communication" title="Link to this heading">#</a></h3>
+<p>Typically, collective communication employs a <strong>two-sided</strong> model: each rank acts as both sender and receiver. The sender loads data from local memory and stores it into a FIFO buffer in the receiver’s local memory. The receiver then loads the data from the FIFO and stores it into its local output buffer. This has two shortcomings:</p>
+<ul class="simple">
+<li><p><strong>Extra data movement.</strong> The receiver performs additional data movement after the data has already arrived over NVLink and resides in the target GPU’s memory.</p></li>
+<li><p><strong>Data dependency.</strong> The receiver’s work depends on the arrival of the sender’s data. For example, the FIFO has a fixed capacity, so the sender (producer) or receiver (consumer) may block when the FIFO is full or empty.</p></li>
+</ul>
+<p><strong>NVLinkOneSided</strong> eliminates both issues by simplifying the communication model:</p>
+<ul class="simple">
+<li><p>The <strong>dispatch</strong> kernel only <em>puts</em>: it loads token data from local memory and writes it directly into the target rank’s workspace.</p></li>
+<li><p>The <strong>combine</strong> kernel only <em>gets</em>: it reads data from source ranks’ workspaces, reduces, and writes to local memory.</p></li>
+</ul>
+<p>The workspace itself serves as the recv buffer — no intermediate FIFO, no extra copy on the receiver side. The dispatch OP returns <strong>tensor views</strong> directly into the workspace rather than allocating new tensors, so the MoE module could directly take the data on the workspace as input. Each direction of communication involves one less data movement step compared to two-sided.</p>
+<p align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_one_sided_vs_two_sided.png" alt="One-sided vs two-sided communication" width="700"/>
+</p>
+</section>
+<section id="token-major-data-layout">
+<h3>Token-Major Data Layout<a class="headerlink" href="#token-major-data-layout" title="Link to this heading">#</a></h3>
+<p>Some AlltoAll implementations (e.g., <a class="reference external" href="https://github.com/deepseek-ai/DeepEP">DeepEP Low Latency</a>) use an <strong>expert-major layout</strong>: the recv buffer is shaped as <code class="docutils literal notranslate"><span class="pre">[num_experts_per_rank,</span> <span class="pre">max_num_tokens,</span> <span class="pre">...]</span></code>, so that each expert gets its assigned tokens. If a token routes to multiple experts on the same rank, it is sent and stored multiple times — once per expert. Note that <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span> <span class="pre">=</span> <span class="pre">ep_size</span> <span class="pre">*</span> <span class="pre">max_tokens_per_rank</span></code>, which is enough for accommodating tokens from all the ranks.</p>
+<p>NVLinkOneSided uses a <strong>token-major layout</strong>: the recv buffer is shaped as <code class="docutils literal notranslate"><span class="pre">[max_num_tokens,</span> <span class="pre">...]</span></code>, indexed by source rank. The transformation from token-major to expert-major layout is known as expert <strong>permutation</strong>. By directly employing token-major layout, the recv buffer size is shrunk by <code class="docutils literal notranslate"><span class="pre">num_experts_per_rank</span></code>. When a token routes to multiple experts on the same rank, the token data is <strong>sent only once</strong>. This deduplication reduces communication volume, which is especially beneficial when <code class="docutils literal notranslate"><span class="pre">top_k</span></code> is large, e.g., if <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">&gt;</span> <span class="pre">ep_size</span></code> then duplication is guaranteed to occur. The figure below shows the permutation from token-major to expert-major layout for 6 tokens routed to 4 experts with <code class="docutils literal notranslate"><span class="pre">top_k=2</span></code>. NVLinkOneSided requires only <code class="docutils literal notranslate"><span class="pre">1/num_experts_per_rank</span></code> of the pre-allocated recv buffer compared to expert-major implementations like DeepEP Low Latency.</p>
+<p align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_token_major_vs_expert_major.png" alt="Token-major vs expert-major layout" width="700"/>
+</p>
+<p>The MoE module directly consumes the token-major recv buffer, and it is up to the MoE module to decide whether expert permutation is needed for GroupGEMM. For example, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py">trtllm-gen MoE</a> can efficiently operate on token-major input without additional permutation.</p>
+</section>
+<section id="quantization-agnostic-communication">
+<h3>Quantization-Agnostic Communication<a class="headerlink" href="#quantization-agnostic-communication" title="Link to this heading">#</a></h3>
+<p>NVLinkOneSided is <strong>quantization-agnostic</strong>. It does not perform any quantization internally — instead, the quantization happens <em>before</em> dispatch (post-quant dispatch). This design has two advantages:</p>
+<ul class="simple">
+<li><p><strong>Flexibility.</strong> Any quantization recipe works — FP8 block scales, NVFP4, or no quantization at all. The AlltoAll kernel does not need to change when the quantization format changes.</p></li>
+<li><p><strong>Bandwidth savings.</strong> Communicating quantized data (e.g., NVFP4 reduces data to ~28% of BF16) directly reduces the bytes transferred over NVLink, unlike implementations that must communicate in BF16 and quantize afterward.</p></li>
+</ul>
+<p>Note that pre-dispatch quantization is naturally aligned with the model’s quantization recipe — the activations need to be quantized anyway before the MoE GEMMs. Pre-combine quantization, on the other hand, would be an additional step that alters the model’s numerical output. For this reason, combine currently communicates in BF16. Optionally, FP8 static per-tensor quantization can be applied before combine — this is fast and introduces minimal accuracy impact.</p>
+</section>
+</section>
+<section id="implementation-details">
+<h2>Implementation Details<a class="headerlink" href="#implementation-details" title="Link to this heading">#</a></h2>
+<section id="interface-between-communication-and-moe">
+<h3>Interface Between Communication and MoE<a class="headerlink" href="#interface-between-communication-and-moe" title="Link to this heading">#</a></h3>
+<p>In TensorRT LLM, the MoE module takes 4 payloads as input. The dispatch kernel communicates all of them to target ranks at once; the combine kernel performs the reverse — gathering results back and reducing them with router weights:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Dispatch: scatter local tokens to all ranks</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">dispatch</span><span class="p">(</span>
+    <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>          <span class="c1"># [local_num_tokens, hidden_size]</span>
+    <span class="n">hidden_states_sf</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>       <span class="c1"># [local_num_tokens, sf_size]</span>
+    <span class="n">token_selected_experts</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="c1"># [local_num_tokens, top_k]</span>
+    <span class="n">token_final_scales</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>     <span class="c1"># [local_num_tokens, top_k]</span>
+    <span class="o">...</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
+    <span class="c1"># Returns same 4 payloads, each reshaped to [ep_size * max_tokens_per_rank, ...]</span>
+</pre></div>
+</div>
+<p>Here <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code> is the (possibly quantized) activation tensor with <code class="docutils literal notranslate"><span class="pre">hidden_size</span></code> elements per token (or packed elements for certain quantization schemes — e.g., FP4 packs two elements per byte). <code class="docutils literal notranslate"><span class="pre">hidden_states_sf</span></code> carries the optional blockwise quantization scales. <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code> contains the <code class="docutils literal notranslate"><span class="pre">top_k</span></code> routed expert ids per token, and <code class="docutils literal notranslate"><span class="pre">token_final_scales</span></code> holds the corresponding router weights.</p>
+<p>The recv buffer is pre-allocated with <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">*</span> <span class="pre">max_tokens_per_rank</span></code> slots to accommodate the maximum number of tokens from all ranks, as described in <a class="reference internal" href="#token-major-data-layout">Token-Major Data Layout</a>. The MoE module then performs GroupGEMM on the received payloads. Two points are worth noting:</p>
+<ul class="simple">
+<li><p>The MoE module only computes the experts on the local rank. For example, if a token’s <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code> is <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1,</span> <span class="pre">4,</span> <span class="pre">7]</span></code> and only experts <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1,</span> <span class="pre">2,</span> <span class="pre">3]</span></code> reside locally, the MoE output for that token is the weighted sum of experts <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1]</span></code> only.</p></li>
+<li><p>Some slots are empty after dispatch. The dispatch kernel sets <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code> of empty slots to an invalid expert id (<code class="docutils literal notranslate"><span class="pre">-1</span></code>), so the MoE module knows to skip them.</p></li>
+</ul>
+<p>The MoE module writes its output for each token to the same slot in the recv buffer. To obtain the final result, each rank combines the partial results from peer ranks.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Combine: gather results back to local tokens</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">combine</span><span class="p">(</span>
+    <span class="n">final_hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>    <span class="c1"># [ep_size * max_tokens_per_rank, hidden_size]</span>
+    <span class="o">...</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+    <span class="c1"># Returns [local_num_tokens, hidden_size]</span>
+</pre></div>
+</div>
+</section>
+<section id="dispatch-put-and-combine-get">
+<h3>Dispatch Put and Combine Get<a class="headerlink" href="#dispatch-put-and-combine-get" title="Link to this heading">#</a></h3>
+<p>The dispatch and combine kernels have complementary data movement patterns.</p>
+<p><strong>Dispatch (put).</strong> For each payload tensor, the recv buffer on each rank has shape <code class="docutils literal notranslate"><span class="pre">[ep_size,</span> <span class="pre">max_num_tokens,</span> <span class="pre">...]</span></code>. The split <code class="docutils literal notranslate"><span class="pre">[src_rank,</span> <span class="pre">:,</span> <span class="pre">:]</span></code> stores data received from <code class="docutils literal notranslate"><span class="pre">src_rank</span></code>, so different source ranks never race when writing to the same peer. Each CTA handles one token. For each of the <code class="docutils literal notranslate"><span class="pre">top_k</span></code> routed experts, the kernel computes <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> (the rank owning that expert, derived from <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code>) and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> (the slot index within the <code class="docutils literal notranslate"><span class="pre">src_rank</span></code> split). To obtain a unique <code class="docutils literal notranslate"><span class="pre">target_indices</span></code>, the kernel maintains atomic counters <code class="docutils literal notranslate"><span class="pre">send_counters[ep_size]</span></code> that track how many tokens have been sent from the local rank to each target rank — an atomic increment yields the next available slot. In this way, the unique slot assignment can be accomplished while the rank does not need to know how are the tokens on other ranks are routed.</p>
+<p>If multiple of a token’s <code class="docutils literal notranslate"><span class="pre">top_k</span></code> experts map to the same rank, only the first gets a valid entry; duplicates are assigned <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> of <code class="docutils literal notranslate"><span class="pre">-1</span></code>. For each payload, the kernel loads the token data from local memory once and stores it to up to <code class="docutils literal notranslate"><span class="pre">top_k</span></code> remote workspaces — one per unique target rank.</p>
+<p><strong>Combine (get).</strong> Each CTA handles one token in the reverse direction. The combine kernel reuses the <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> recorded during dispatch to read from the exact same workspace slots. For each payload element, it loads from up to <code class="docutils literal notranslate"><span class="pre">top_k</span></code> remote workspaces into registers, performs a weighted reduction, and stores the result to local memory once. The reduction uses a pairwise tree pattern rather than sequential accumulation, keeping the dependency chain shallow.
+The MoE module can write its output directly into the symmetric memory workspace, so that the combine kernel can read peer ranks’ MoE output without an intermediate copy. This <strong>zero-copy</strong> path avoids a staging copy before the combine kernel starts; it requires small modifications to the MoE ops to accept a provided output buffer instead of allocating their own in PyTorch.</p>
+<p>The following diagram illustrates the complete dispatch → MoE → combine flow with <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">=</span> <span class="pre">2</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">2</span></code> and <code class="docutils literal notranslate"><span class="pre">batch_size</span> <span class="pre">=</span> <span class="pre">3</span></code>. Dispatch computes <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> to put tokens into the correct slots in the recv buffer; combine reuses the same routing to get results back. Dashed arrows indicate deduplicated entries in the dispatch phase.</p>
+<p align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_dispatch_moe_combine.png" alt="Dispatch, MoE, and combine data flow with index calculation and deduplication" width="900"/>
+</p>
+</section>
+<section id="synchronization">
+<h3>Synchronization<a class="headerlink" href="#synchronization" title="Link to this heading">#</a></h3>
+<p>One-sided communication requires explicit synchronization at two points:</p>
+<p><strong>End of dispatch.</strong> Before the MoE module can consume the dispatched data, all source ranks must have finished writing to the workspace.
+<strong>Beginning of combine.</strong> Before getting data from peer workspaces, the MoE module on each rank must have finished writing its output.</p>
+<p>We implement <strong>flag-based synchronization</strong>. Each dispatch-combine round increments a monotonically increasing epoch counter, so flags never need to be reset between rounds — a rank simply waits until the polled value equals the current epoch.</p>
+<p>At the <strong>end of dispatch</strong>, the kernel issues a release fence to ensure all preceding stores (token data written to peer workspaces) are globally visible, then writes the epoch value to every peer’s flag entry. It then spin-polls its own flag entries until all peers have signaled completion — at that point, every rank has finished writing and the MoE module can safely consume the dispatched data.</p>
+<p>A similar barrier is used at the <strong>start of combine</strong>: each rank signals readiness and polls until every peer has done the same. An acquire fence follows the polling loop to ensure that subsequent loads (reading MoE output from peer workspaces) observe the data written before each peer’s release fence.</p>
+</section>
+<section id="saturating-nvlink-bandwidth">
+<h3>Saturating NVLink Bandwidth<a class="headerlink" href="#saturating-nvlink-bandwidth" title="Link to this heading">#</a></h3>
+<p>The key to high throughput is keeping bytes in flight across NVLink at all times. We apply both data-level parallelism (DLP) and instruction-level parallelism (ILP):</p>
+<ul class="simple">
+<li><p><strong>Vectorized load/store.</strong> The kernel uses the widest vector type (up to 128-bit) allowed by the payload data’s alignment.</p></li>
+<li><p><strong>Dispatch:</strong> Load from local memory once, store to remote memory <code class="docutils literal notranslate"><span class="pre">top_k</span></code> times. The <code class="docutils literal notranslate"><span class="pre">top_k</span></code> loop is unrolled via template instantiation.</p></li>
+<li><p><strong>Combine:</strong> load from <code class="docutils literal notranslate"><span class="pre">top_k</span></code> remote workspaces (unrolled, kept in registers), reduce pairwise in a tree fashion rather than sequentially, and store to local memory once.</p></li>
+</ul>
+</section>
+</section>
+<section id="performance-benchmark">
+<h2>Performance Benchmark<a class="headerlink" href="#performance-benchmark" title="Link to this heading">#</a></h2>
+<p>We benchmark the dispatch+combine communication kernels on <strong>GB200 NVL72</strong> using the DeepSeek-V3 model profile: <code class="docutils literal notranslate"><span class="pre">hidden_size=7168</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k=8</span></code>, 256 total experts, FP8 blockwise quantization.</p>
+<p>The tables below report the dispatch and combine kernel latency (µs) and achieved NVLink bandwidth (GB/s) for <strong>NVLinkOneSided</strong> across varying EP sizes and batch sizes. The achieved bandwidth is computed as:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>bandwidth = batch_size × min(ep_size, top_k) × bytes_per_token / latency
+</pre></div>
+</div>
+<p>where <code class="docutils literal notranslate"><span class="pre">bytes_per_token</span></code> takes the quantization into account. We neglect the smaller payloads (quantization scaling factors, expert IDs, and expert scales) as they are small compared to the hidden states. The <code class="docutils literal notranslate"><span class="pre">min(ep_size,</span> <span class="pre">top_k)</span></code> factor reflects deduplication.</p>
+<p><strong>ep_size=8:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Batch Size</p></th>
+<th class="head text-center"><p>Dispatch (µs)</p></th>
+<th class="head text-center"><p>Dispatch (GB/s)</p></th>
+<th class="head text-center"><p>Combine (µs)</p></th>
+<th class="head text-center"><p>Combine (GB/s)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>1</p></td>
+<td class="text-center"><p>18.9</p></td>
+<td class="text-center"><p>3.03</p></td>
+<td class="text-center"><p>31.0</p></td>
+<td class="text-center"><p>3.70</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2</p></td>
+<td class="text-center"><p>18.4</p></td>
+<td class="text-center"><p>6.24</p></td>
+<td class="text-center"><p>31.1</p></td>
+<td class="text-center"><p>7.36</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>4</p></td>
+<td class="text-center"><p>18.1</p></td>
+<td class="text-center"><p>12.67</p></td>
+<td class="text-center"><p>31.4</p></td>
+<td class="text-center"><p>14.59</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>8</p></td>
+<td class="text-center"><p>17.6</p></td>
+<td class="text-center"><p>26.11</p></td>
+<td class="text-center"><p>31.4</p></td>
+<td class="text-center"><p>29.23</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>16</p></td>
+<td class="text-center"><p>18.5</p></td>
+<td class="text-center"><p>49.67</p></td>
+<td class="text-center"><p>32.6</p></td>
+<td class="text-center"><p>56.31</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>32</p></td>
+<td class="text-center"><p>18.2</p></td>
+<td class="text-center"><p>100.86</p></td>
+<td class="text-center"><p>32.7</p></td>
+<td class="text-center"><p>112.25</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>64</p></td>
+<td class="text-center"><p>22.3</p></td>
+<td class="text-center"><p>164.34</p></td>
+<td class="text-center"><p>34.1</p></td>
+<td class="text-center"><p>215.18</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>128</p></td>
+<td class="text-center"><p>31.7</p></td>
+<td class="text-center"><p>231.20</p></td>
+<td class="text-center"><p>38.1</p></td>
+<td class="text-center"><p>384.96</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>256</p></td>
+<td class="text-center"><p>50.8</p></td>
+<td class="text-center"><p>289.09</p></td>
+<td class="text-center"><p>53.0</p></td>
+<td class="text-center"><p>554.44</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>512</p></td>
+<td class="text-center"><p>89.5</p></td>
+<td class="text-center"><p>328.12</p></td>
+<td class="text-center"><p>91.7</p></td>
+<td class="text-center"><p>640.56</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>1024</p></td>
+<td class="text-center"><p>166.3</p></td>
+<td class="text-center"><p>353.17</p></td>
+<td class="text-center"><p>175.6</p></td>
+<td class="text-center"><p>668.62</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2048</p></td>
+<td class="text-center"><p>311.8</p></td>
+<td class="text-center"><p>376.64</p></td>
+<td class="text-center"><p>322.6</p></td>
+<td class="text-center"><p>728.20</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>ep_size=16:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Batch Size</p></th>
+<th class="head text-center"><p>Dispatch (µs)</p></th>
+<th class="head text-center"><p>Dispatch (GB/s)</p></th>
+<th class="head text-center"><p>Combine (µs)</p></th>
+<th class="head text-center"><p>Combine (GB/s)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>1</p></td>
+<td class="text-center"><p>18.8</p></td>
+<td class="text-center"><p>3.05</p></td>
+<td class="text-center"><p>30.8</p></td>
+<td class="text-center"><p>3.72</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2</p></td>
+<td class="text-center"><p>19.1</p></td>
+<td class="text-center"><p>6.01</p></td>
+<td class="text-center"><p>31.4</p></td>
+<td class="text-center"><p>7.31</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>4</p></td>
+<td class="text-center"><p>18.5</p></td>
+<td class="text-center"><p>12.42</p></td>
+<td class="text-center"><p>31.6</p></td>
+<td class="text-center"><p>14.54</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>8</p></td>
+<td class="text-center"><p>18.9</p></td>
+<td class="text-center"><p>24.31</p></td>
+<td class="text-center"><p>31.8</p></td>
+<td class="text-center"><p>28.86</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>16</p></td>
+<td class="text-center"><p>18.4</p></td>
+<td class="text-center"><p>49.75</p></td>
+<td class="text-center"><p>33.0</p></td>
+<td class="text-center"><p>55.61</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>32</p></td>
+<td class="text-center"><p>20.2</p></td>
+<td class="text-center"><p>90.99</p></td>
+<td class="text-center"><p>34.2</p></td>
+<td class="text-center"><p>107.46</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>64</p></td>
+<td class="text-center"><p>24.1</p></td>
+<td class="text-center"><p>152.45</p></td>
+<td class="text-center"><p>35.6</p></td>
+<td class="text-center"><p>206.35</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>128</p></td>
+<td class="text-center"><p>34.6</p></td>
+<td class="text-center"><p>212.05</p></td>
+<td class="text-center"><p>39.9</p></td>
+<td class="text-center"><p>367.72</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>256</p></td>
+<td class="text-center"><p>54.8</p></td>
+<td class="text-center"><p>267.92</p></td>
+<td class="text-center"><p>57.0</p></td>
+<td class="text-center"><p>514.83</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>512</p></td>
+<td class="text-center"><p>97.1</p></td>
+<td class="text-center"><p>302.27</p></td>
+<td class="text-center"><p>98.2</p></td>
+<td class="text-center"><p>597.79</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>1024</p></td>
+<td class="text-center"><p>181.2</p></td>
+<td class="text-center"><p>324.00</p></td>
+<td class="text-center"><p>188.2</p></td>
+<td class="text-center"><p>624.15</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2048</p></td>
+<td class="text-center"><p>343.3</p></td>
+<td class="text-center"><p>342.05</p></td>
+<td class="text-center"><p>348.4</p></td>
+<td class="text-center"><p>674.15</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>ep_size=32:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Batch Size</p></th>
+<th class="head text-center"><p>Dispatch (µs)</p></th>
+<th class="head text-center"><p>Dispatch (GB/s)</p></th>
+<th class="head text-center"><p>Combine (µs)</p></th>
+<th class="head text-center"><p>Combine (GB/s)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>1</p></td>
+<td class="text-center"><p>19.8</p></td>
+<td class="text-center"><p>2.89</p></td>
+<td class="text-center"><p>31.4</p></td>
+<td class="text-center"><p>3.65</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2</p></td>
+<td class="text-center"><p>19.7</p></td>
+<td class="text-center"><p>5.82</p></td>
+<td class="text-center"><p>31.3</p></td>
+<td class="text-center"><p>7.34</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>4</p></td>
+<td class="text-center"><p>19.6</p></td>
+<td class="text-center"><p>11.72</p></td>
+<td class="text-center"><p>31.4</p></td>
+<td class="text-center"><p>14.60</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>8</p></td>
+<td class="text-center"><p>19.4</p></td>
+<td class="text-center"><p>23.64</p></td>
+<td class="text-center"><p>32.2</p></td>
+<td class="text-center"><p>28.53</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>16</p></td>
+<td class="text-center"><p>18.9</p></td>
+<td class="text-center"><p>48.58</p></td>
+<td class="text-center"><p>33.4</p></td>
+<td class="text-center"><p>54.89</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>32</p></td>
+<td class="text-center"><p>21.1</p></td>
+<td class="text-center"><p>86.79</p></td>
+<td class="text-center"><p>34.6</p></td>
+<td class="text-center"><p>105.95</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>64</p></td>
+<td class="text-center"><p>26.2</p></td>
+<td class="text-center"><p>139.83</p></td>
+<td class="text-center"><p>36.4</p></td>
+<td class="text-center"><p>201.45</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>128</p></td>
+<td class="text-center"><p>37.8</p></td>
+<td class="text-center"><p>193.93</p></td>
+<td class="text-center"><p>41.1</p></td>
+<td class="text-center"><p>356.77</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>256</p></td>
+<td class="text-center"><p>61.5</p></td>
+<td class="text-center"><p>238.55</p></td>
+<td class="text-center"><p>59.7</p></td>
+<td class="text-center"><p>492.00</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>512</p></td>
+<td class="text-center"><p>109.6</p></td>
+<td class="text-center"><p>267.97</p></td>
+<td class="text-center"><p>102.5</p></td>
+<td class="text-center"><p>572.90</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>1024</p></td>
+<td class="text-center"><p>197.5</p></td>
+<td class="text-center"><p>297.37</p></td>
+<td class="text-center"><p>197.5</p></td>
+<td class="text-center"><p>594.69</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2048</p></td>
+<td class="text-center"><p>373.7</p></td>
+<td class="text-center"><p>314.27</p></td>
+<td class="text-center"><p>369.5</p></td>
+<td class="text-center"><p>635.66</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>ep_size=64:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Batch Size</p></th>
+<th class="head text-center"><p>Dispatch (µs)</p></th>
+<th class="head text-center"><p>Dispatch (GB/s)</p></th>
+<th class="head text-center"><p>Combine (µs)</p></th>
+<th class="head text-center"><p>Combine (GB/s)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>1</p></td>
+<td class="text-center"><p>27.8</p></td>
+<td class="text-center"><p>2.06</p></td>
+<td class="text-center"><p>32.6</p></td>
+<td class="text-center"><p>3.52</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2</p></td>
+<td class="text-center"><p>24.8</p></td>
+<td class="text-center"><p>4.62</p></td>
+<td class="text-center"><p>32.2</p></td>
+<td class="text-center"><p>7.13</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>4</p></td>
+<td class="text-center"><p>29.1</p></td>
+<td class="text-center"><p>7.87</p></td>
+<td class="text-center"><p>33.0</p></td>
+<td class="text-center"><p>13.92</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>8</p></td>
+<td class="text-center"><p>20.4</p></td>
+<td class="text-center"><p>22.51</p></td>
+<td class="text-center"><p>33.3</p></td>
+<td class="text-center"><p>27.53</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>16</p></td>
+<td class="text-center"><p>20.6</p></td>
+<td class="text-center"><p>44.57</p></td>
+<td class="text-center"><p>35.0</p></td>
+<td class="text-center"><p>52.46</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>32</p></td>
+<td class="text-center"><p>23.1</p></td>
+<td class="text-center"><p>79.60</p></td>
+<td class="text-center"><p>36.1</p></td>
+<td class="text-center"><p>101.68</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>64</p></td>
+<td class="text-center"><p>28.8</p></td>
+<td class="text-center"><p>127.62</p></td>
+<td class="text-center"><p>37.7</p></td>
+<td class="text-center"><p>194.70</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>128</p></td>
+<td class="text-center"><p>41.6</p></td>
+<td class="text-center"><p>176.35</p></td>
+<td class="text-center"><p>44.5</p></td>
+<td class="text-center"><p>330.08</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>256</p></td>
+<td class="text-center"><p>65.3</p></td>
+<td class="text-center"><p>224.88</p></td>
+<td class="text-center"><p>62.9</p></td>
+<td class="text-center"><p>466.65</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>512</p></td>
+<td class="text-center"><p>115.7</p></td>
+<td class="text-center"><p>253.67</p></td>
+<td class="text-center"><p>106.7</p></td>
+<td class="text-center"><p>550.16</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>1024</p></td>
+<td class="text-center"><p>209.4</p></td>
+<td class="text-center"><p>280.38</p></td>
+<td class="text-center"><p>199.2</p></td>
+<td class="text-center"><p>589.48</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2048</p></td>
+<td class="text-center"><p>399.2</p></td>
+<td class="text-center"><p>294.17</p></td>
+<td class="text-center"><p>372.1</p></td>
+<td class="text-center"><p>631.18</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The uni-directional NVLink Bandwidth of GB200 NVL72 is <strong>900GB/s</strong>. We plot the achieved bandwidth below:</p>
+<p align="left">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_bandwidth.png" alt="NVLinkOneSided bandwidth on GB200 NVL72" width="600"/>
+</p>
+<p><strong>Key observations:</strong></p>
+<ul class="simple">
+<li><p>Given sufficient batch size, the combine kernel achieves <strong>~80%</strong> of the peak NVLink bandwidth.</p></li>
+<li><p>The achieved bandwidth of dispatch is lower than that of combine, since the dispatch kernel also performs token routing and slot index computation. The combine kernel, by contrast, is more communication-centric.</p></li>
+<li><p>At small batch sizes, latency dominates the kernel execution time.</p></li>
+</ul>
+<section id="reproduction">
+<h3>Reproduction<a class="headerlink" href="#reproduction" title="Link to this heading">#</a></h3>
+<p>The benchmark is available in the TensorRT LLM repository. Example command:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>tests/microbenchmarks/bench_moe_comm.py<span class="w"> </span>--backend<span class="w"> </span>NVLINK_ONE_SIDED<span class="w"> </span>--profile<span class="w"> </span>deepseek_v3<span class="w"> </span>--perfect_router<span class="w"> </span>--kernel_breakdown<span class="w"> </span>--iter_stats<span class="w"> </span>--ep_size<span class="w"> </span><span class="m">8</span><span class="w"> </span>-b<span class="w"> </span><span class="m">1</span><span class="w"> </span>-e<span class="w"> </span><span class="m">2048</span><span class="w"> </span>-f<span class="w"> </span><span class="m">2</span><span class="w"> </span>--output_file<span class="w"> </span>nvlink_one_sided.json
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">srun</span></code> is required for multi-node NVLink benchmarking. See <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">tests/microbenchmarks/bench_moe_comm.py</span> <span class="pre">--help</span></code> for the full set of options.</p>
+</section>
+</section>
+<section id="future-work-and-conclusion">
+<h2>Future Work And Conclusion<a class="headerlink" href="#future-work-and-conclusion" title="Link to this heading">#</a></h2>
+<p>At small batch sizes, the performance bottleneck of NVLinkOneSided shifts from data movement bandwidth to <strong>latency</strong>. Besides the data movement itself, the flag writes and memory fences also contribute to this latency floor. To quantify the synchronization cost, we measure kernel latency with the barrier disabled (note: this breaks correctness due to potential data races):</p>
+<p><strong>ep_size=8:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Batch Size</p></th>
+<th class="head text-center"><p>Dispatch w/ sync (µs)</p></th>
+<th class="head text-center"><p>Dispatch w/o sync (µs)</p></th>
+<th class="head text-center"><p>Combine w/ sync (µs)</p></th>
+<th class="head text-center"><p>Combine w/o sync (µs)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>1</p></td>
+<td class="text-center"><p>18.9</p></td>
+<td class="text-center"><p>11.3</p></td>
+<td class="text-center"><p>31.0</p></td>
+<td class="text-center"><p>28.1</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2</p></td>
+<td class="text-center"><p>18.4</p></td>
+<td class="text-center"><p>11.1</p></td>
+<td class="text-center"><p>31.1</p></td>
+<td class="text-center"><p>29.2</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>4</p></td>
+<td class="text-center"><p>18.1</p></td>
+<td class="text-center"><p>11.5</p></td>
+<td class="text-center"><p>31.4</p></td>
+<td class="text-center"><p>28.6</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>8</p></td>
+<td class="text-center"><p>17.6</p></td>
+<td class="text-center"><p>11.3</p></td>
+<td class="text-center"><p>31.4</p></td>
+<td class="text-center"><p>29.4</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>16</p></td>
+<td class="text-center"><p>18.5</p></td>
+<td class="text-center"><p>11.6</p></td>
+<td class="text-center"><p>32.6</p></td>
+<td class="text-center"><p>32.2</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>32</p></td>
+<td class="text-center"><p>18.2</p></td>
+<td class="text-center"><p>12.6</p></td>
+<td class="text-center"><p>32.7</p></td>
+<td class="text-center"><p>32.3</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>64</p></td>
+<td class="text-center"><p>22.3</p></td>
+<td class="text-center"><p>16.8</p></td>
+<td class="text-center"><p>34.1</p></td>
+<td class="text-center"><p>33.2</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>128</p></td>
+<td class="text-center"><p>31.7</p></td>
+<td class="text-center"><p>25.8</p></td>
+<td class="text-center"><p>38.1</p></td>
+<td class="text-center"><p>36.2</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>256</p></td>
+<td class="text-center"><p>50.8</p></td>
+<td class="text-center"><p>43.8</p></td>
+<td class="text-center"><p>53.0</p></td>
+<td class="text-center"><p>50.3</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>512</p></td>
+<td class="text-center"><p>89.5</p></td>
+<td class="text-center"><p>79.3</p></td>
+<td class="text-center"><p>91.7</p></td>
+<td class="text-center"><p>74.8</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>1024</p></td>
+<td class="text-center"><p>166.3</p></td>
+<td class="text-center"><p>149.5</p></td>
+<td class="text-center"><p>175.6</p></td>
+<td class="text-center"><p>145.3</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>2048</p></td>
+<td class="text-center"><p>311.8</p></td>
+<td class="text-center"><p>291.5</p></td>
+<td class="text-center"><p>322.6</p></td>
+<td class="text-center"><p>278.5</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In the future, we will continue to optimize the latency-bound scenarios and explore more aggressive MoE communication-computation overlap/fusion.</p>
+<p>In conclusion, NVLinkOneSided AlltoAll is a symmetric memory-based MoE communication kernel that combines a simple one-sided design with minimal overhead and a modular, quantization-agnostic interface. It is the default communication strategy within a single NVLink domain in TensorRT LLM and delivers the best performance among known MoE communication implementations for inference.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/kv-transfer.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Introduction to KV Cache Transmission</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog17_Sparse_Attention_in_TensorRT-LLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Sparse Attention in TensorRT LLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background">Background</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#design-overview">Design Overview</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#nvlink-symmetric-memory">NVLink Symmetric Memory</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#one-sided-communication">One-Sided Communication</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#token-major-data-layout">Token-Major Data Layout</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization-agnostic-communication">Quantization-Agnostic Communication</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#implementation-details">Implementation Details</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#interface-between-communication-and-moe">Interface Between Communication and MoE</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dispatch-put-and-combine-get">Dispatch Put and Combine Get</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#synchronization">Synchronization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#saturating-nvlink-bandwidth">Saturating NVLink Bandwidth</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-benchmark">Performance Benchmark</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reproduction">Reproduction</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work-and-conclusion">Future Work And Conclusion</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on March 30, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
