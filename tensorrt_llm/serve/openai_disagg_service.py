@@ -206,6 +206,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
             if disaggregated_params:
+                # ctx_info_endpoint from get_disaggregated_params() is a list;
+                # the Pydantic model expects a single str.
+                ep = disaggregated_params.get("ctx_info_endpoint")
+                if isinstance(ep, list) and ep:
+                    disaggregated_params = {**disaggregated_params, "ctx_info_endpoint": ep[0]}
                 request.disaggregated_params = request.disaggregated_params.model_copy(
                     update=disaggregated_params
                 )
