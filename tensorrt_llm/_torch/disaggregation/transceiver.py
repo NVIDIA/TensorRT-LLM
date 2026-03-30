@@ -1,3 +1,4 @@
+import math
 import time
 import uuid
 from collections import defaultdict
@@ -104,6 +105,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
         self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+        self._chunk_size_blocks = cache_transceiver_config.chunk_size_blocks
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -258,6 +260,86 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 pool = get_physical_pool(pt, lg_id, pv.pool_idx)
                 total += n * pool.slot_bytes
         return total
+
+    def _collect_base_slice(self, req: LlmRequest) -> KVSlice:
+        """Collect a full KVSlice (including metadata) for a request.
+
+        This returns the complete slice produced by ``_create_kv_slice``,
+        preserving fields like ``mamba_state_index`` that are required
+        for hybrid-state model transfers.
+
+        Args:
+            req: The LLM request whose KV cache block IDs to collect.
+
+        Returns:
+            A ``KVSlice`` with all metadata populated.
+        """
+        return self._create_kv_slice(req)
+
+    def _create_kv_slices(self, req: LlmRequest) -> List[KVSlice]:
+        """Create one or more KVSlice objects for a request.
+
+        When ``chunk_size_blocks`` is ``None``, returns a single slice
+        covering all blocks.  Otherwise, each layer group's block ID
+        list is partitioned into slices of at most ``chunk_size_blocks``
+        blocks.
+
+        Args:
+            req: The LLM request to create slices for.
+
+        Returns:
+            A list of ``KVSlice`` objects.  Only the last slice has
+            ``is_last_slice=True``.
+
+        Raises:
+            ValueError: If the reassembled block IDs from all slices do not
+                match the original block IDs.
+        """
+        base_slice = self._collect_base_slice(req)
+        all_block_ids = base_slice.block_ids_per_layer_groups
+
+        if self._chunk_size_blocks is None:
+            return [base_slice]
+
+        max_blocks = max((len(ids) for ids in all_block_ids), default=0)
+        if max_blocks == 0:
+            return [base_slice]
+
+        num_chunks = math.ceil(max_blocks / self._chunk_size_blocks)
+        slices: List[KVSlice] = []
+        block_offset = 0
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * self._chunk_size_blocks
+            end = start + self._chunk_size_blocks
+            is_last = chunk_idx == num_chunks - 1
+
+            chunk_block_ids = [ids[start:end] for ids in all_block_ids]
+            slices.append(
+                KVSlice(
+                    is_last_slice=is_last,
+                    block_ids_per_layer_groups=chunk_block_ids,
+                    mamba_state_index=base_slice.mamba_state_index,
+                    token_range=base_slice.token_range,
+                    chunk_block_offset=block_offset,
+                )
+            )
+            # Use the max length across layer groups to advance the receiver
+            # offset.  This is the contract that lets receiver-side slicing in
+            # native/transfer.py (`_build_kv_write_meta`) trim the per-LG dst
+            # range with `len(src_block_ids)`, so asymmetric layer groups still
+            # land at the right destination position even though the offset is
+            # shared across groups.
+            block_offset += max((len(ids) for ids in chunk_block_ids), default=0)
+
+        for lg_idx, original_ids in enumerate(all_block_ids):
+            reassembled = np.concatenate([s.block_ids_per_layer_groups[lg_idx] for s in slices])
+            if not np.array_equal(reassembled, original_ids):
+                raise ValueError(
+                    f"Chunking integrity check failed for layer group {lg_idx}: "
+                    f"expected {len(original_ids)} blocks, got {len(reassembled)}"
+                )
+
+        return slices
 
     @staticmethod
     def _split_packed_beam_block_ids(
@@ -485,7 +567,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ever_had_send_session = True
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        session.send(self._create_kv_slice(req))
+        for kv_slice in self._create_kv_slices(req):
+            session.send(kv_slice)
         self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
@@ -525,7 +608,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_reqs.pop(rid, None)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
-    def request_and_receive_async(self, req: LlmRequest):
+    def request_and_receive_async(self, req: LlmRequest) -> None:
+        """Start background KV cache receive from the context server.
+
+        The receiver always uses a single monolithic slice.  Chunking is
+        sender-only: the sender splits its source blocks into chunks and
+        slices the receiver's destination blocks to match each chunk.
+
+        Args:
+            req: The generation request whose KV cache blocks to receive
+                into.
+        """
         self._ever_had_recv_session = True
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
@@ -548,6 +641,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._ctx_need_tp_sync or self._ctx_need_pp_sync
         ):
             return [], []
+
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 

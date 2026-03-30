@@ -238,6 +238,16 @@ class AuxSendTask(SendTaskBase):
 
 
 class KVSendTask(SendTaskBase):
+    """A per-slice send task within a TxSession.
+
+    Args:
+        kv_slice: The KV slice describing which blocks to transfer.
+            The slice's ``chunk_block_offset`` field indicates the
+            offset into the receiver's destination block list.
+        params: Disaggregated serving parameters for this request.
+        slice_id: Index of this slice within the session's task list.
+    """
+
     def __init__(
         self,
         kv_slice: KVSlice,
@@ -245,7 +255,7 @@ class KVSendTask(SendTaskBase):
         slice_id: int,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
-    ):
+    ) -> None:
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
@@ -531,7 +541,7 @@ class Sender(SenderBase):
                 f"in {status.value} state; sending FAILED to receiver"
             )
             # Task may have been enqueued after cancel() already iterated kv_tasks,
-            # so its future was never set by cancel(). Set it here as a fallback.
+            # so its event was never set by cancel(). Set it here as a fallback.
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
@@ -584,7 +594,10 @@ class Sender(SenderBase):
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
-        ## TODO: just last slice need to send task state?
+        # The receiver always has a single monolithic task (slice_id=0).
+        # Sender-side chunking is transparent to the receiver: only the
+        # last chunk carries is_last_slice=True so the receiver knows
+        # when all data has arrived.
         tail = (
             encode_result_tail(write_meta)
             if send_slot_id is not None and agent_result == AgentResult.SUCCESS
@@ -753,10 +766,24 @@ class Sender(SenderBase):
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-            # Aggregate fragments from all matching pools using numpy concatenation
+            chunk_offset = task._slice.chunk_block_offset
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
-                dst_block_ids = dst_block_ids_per_groups[peer_lg]
+                full_dst_block_ids = dst_block_ids_per_groups[peer_lg]
+
+                # When sender uses chunking, the receiver sends all dst
+                # blocks in a single RecvReqInfo.  Slice dst to match
+                # this task's src chunk position.
+                if chunk_offset > 0 or not task._slice.is_last_slice:
+                    chunk_end = chunk_offset + len(src_block_ids)
+                    if chunk_end > full_dst_block_ids.size:
+                        raise ValueError(
+                            f"dst chunk range out of bounds: offset={chunk_offset}, "
+                            f"len={len(src_block_ids)}, dst_blocks={full_dst_block_ids.size}"
+                        )
+                    dst_block_ids = full_dst_block_ids[chunk_offset:chunk_end]
+                else:
+                    dst_block_ids = full_dst_block_ids
 
                 # Speculative decoding: generation may have one extra draft-token block.
                 block_diff = dst_block_ids.size - src_block_ids.size
@@ -1018,7 +1045,7 @@ class Sender(SenderBase):
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
             # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
-            # Send it directly to unblock the receiver's TRANSFERRING task future;
+            # Send it directly to unblock the receiver's TRANSFERRING task event;
             # CANCEL_SESSION alone would leave it stuck indefinitely.
             if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
                 self._send_failed_result_to_receiver(info)
@@ -1195,6 +1222,10 @@ class TxSession(TxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self.kv_tasks):
+            return SessionStatus.ERROR
+        if self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR:
+            return SessionStatus.ERROR
         kv_all_transferred = bool(self.kv_tasks) and all(
             t.status == TaskStatus.TRANSFERRED for t in self.kv_tasks
         )
@@ -1916,15 +1947,15 @@ class RxSession(RxSessionBase):
                 )
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
-        # Aux is session-level (not per-slice); expected_transfers is identical
-        # across all kv_tasks, so any task provides the right count.
+        # Aux is session-level (not per-slice); use the final KV task's
+        # expected transfer count so chunked sessions wait for all senders.
         with self.lock:
             if not self._kv_tasks:
                 logger.warning(
                     f"Aux result received before any KV tasks for request {self.request_id}"
                 )
                 return
-            task = self._kv_tasks[0]
+            task = self._kv_tasks[-1]
             if status == AgentResult.SUCCESS:
                 self._aux_count += 1
 
@@ -2186,7 +2217,18 @@ class TransferWorker:
         self._rank_info.sender_endpoints = endpoints
         self._rank_info.layer_num_per_pp = layer_num_per_pp
 
-    def create_tx_session(self, request: LlmRequest) -> TxSession:
+    def create_tx_session(
+        self,
+        request: LlmRequest,
+    ) -> TxSession:
+        """Create a TxSession for the given request.
+
+        Args:
+            request: The LLM request to create a send session for.
+
+        Returns:
+            A new ``TxSession`` ready to accept ``send()`` calls.
+        """
         params = request.py_disaggregated_params
         assert params is not None
         return TxSession(
