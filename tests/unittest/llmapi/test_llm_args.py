@@ -549,6 +549,126 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
     check_nested_dict_equality(build_config_dict1, build_config_dict2)
 
 
+class TestTelemetryConfigPrecedence:
+    """Test that telemetry config follows: default < YAML < CLI precedence."""
+
+    def test_default_telemetry_config_preserved_when_no_yaml(self):
+        """Default telemetry_config survives YAML merge when YAML has none."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"max_batch_size": 8}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is False
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    def test_yaml_can_override_disabled(self):
+        """YAML telemetry_config.disabled overrides the default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is True
+
+    def test_yaml_cannot_override_usage_context(self):
+        """usage_context is coupled to the CLI entry point (serve, eval, etc.)
+        that first creates the TelemetryConfig, so YAML must not override it."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {
+            "telemetry_config": {
+                "disabled": True,
+                "usage_context": "cli_eval",
+            }
+        }
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is True
+
+    def test_cli_disabled_overrides_yaml_enabled(self):
+        """CLI --telemetry-disabled wins over YAML disabled=false."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_EVAL),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": False}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # Simulate CLI --no-telemetry (as done in eval.py / serve.py)
+        telemetry = False
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_EVAL
+
+    def test_yaml_disabled_respected_when_cli_not_set(self):
+        """When CLI doesn't set --no-telemetry, YAML disabled=true is kept."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # CLI flag not set (--telemetry is default True) — no override
+        telemetry = True
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    @pytest.mark.parametrize("yaml_value", [None, False, "invalid", 0])
+    def test_yaml_null_telemetry_config_preserves_default(self, yaml_value):
+        """YAML telemetry_config: null/false/invalid preserves the CLI default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": yaml_value}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is False
+
+
 class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):

@@ -428,6 +428,8 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend
+        if bench_env.telemetry_config is not None:
+            kwargs["telemetry_config"] = bench_env.telemetry_config
 
         llm = get_llm(runtime_config, kwargs)
 
