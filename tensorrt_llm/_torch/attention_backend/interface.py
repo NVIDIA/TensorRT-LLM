@@ -10,8 +10,6 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ..speculative.utils import SpecDecodingTensor
-    from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import maybe_pin_memory
@@ -361,7 +359,8 @@ class AttentionMetadata:
         return cuda_graph_metadata
 
     def prepare_for_spec_dec(self, *fields) -> None:
-        assert len(self._saved_tensors) == 0
+        if len(self._saved_tensors) > 0:
+            self.restore_from_spec_dec()
         for f in fields:
             v = getattr(self, f)
             assert isinstance(v, torch.Tensor)
@@ -381,10 +380,10 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
+            is_target_model: bool = True,
             model_is_wrapped: bool = False,
-            spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
-            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
+            runtime_draft_len: Optional[int] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """

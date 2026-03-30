@@ -1740,7 +1740,7 @@ class PyExecutor:
 
             self.model_engine.runtime_draft_len = runtime_draft_len
         else:
-            self.model_engine.runtime_draft_len = self.model_engine.max_draft_len
+            self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
 
     def _can_queue(self, scheduled_batch):
 
