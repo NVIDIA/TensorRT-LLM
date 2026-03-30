@@ -55,7 +55,7 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../../_static/togglebutton.js?v=1ae7504c"></script>
+    <script src="../../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc9';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -511,7 +511,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc9" />
+  <meta name="docsearch:version" content="1.3.0rc10" />
 
 
   </head>
@@ -1003,6 +1003,7 @@ window.runMermaid = runMermaid;</script>
                         <span class="n">GenerationResult</span><span class="p">,</span> <span class="n">IterationResult</span><span class="p">,</span> <span class="n">LoRARequest</span><span class="p">,</span>
                         <span class="n">PostprocWorkerConfig</span><span class="p">,</span> <span class="n">PromptAdapterRequest</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.postproc_worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">PostprocParams</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..executor.request</span><span class="w"> </span><span class="kn">import</span> <span class="n">DEFAULT_REQUEST_PRIORITY</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">RequestError</span><span class="p">,</span> <span class="n">create_mpi_comm_session</span><span class="p">,</span>
                               <span class="n">get_spawn_proxy_process_env</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..inputs</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">create_input_processor</span><span class="p">,</span>
@@ -1280,6 +1281,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">scheduling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">,</span>
                                           <span class="n">List</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">priority</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">DEFAULT_REQUEST_PRIORITY</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">]]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate output for the given prompts in the synchronous mode.</span>
 <span class="sd">        Synchronous generation accepts either single prompt or batched prompts.</span>
@@ -1301,6 +1303,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):</span>
 <span class="sd">                Scheduling parameters. Defaults to None.</span>
 <span class="sd">            cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
+<span class="sd">            priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -1313,6 +1316,20 @@ window.runMermaid = runMermaid;</script>
             <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">inputs</span><span class="p">]</span>
 
         <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">prompt_inputs</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">]</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">priority</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">priority</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;priority list length (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">priority</span><span class="p">)</span><span class="si">}</span><span class="s2">) does not match &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;number of prompts (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">priority</span><span class="p">:</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="mf">0.0</span> <span class="o">&lt;=</span> <span class="n">p</span> <span class="o">&lt;=</span> <span class="mf">1.0</span><span class="p">):</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;priority must be a float in [0.0, 1.0], got </span><span class="si">{</span><span class="n">p</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="mf">0.0</span> <span class="o">&lt;=</span> <span class="n">priority</span> <span class="o">&lt;=</span> <span class="mf">1.0</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;priority must be a float in [0.0, 1.0], got </span><span class="si">{</span><span class="n">priority</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">_item_at</span><span class="p">(</span><span class="n">maybe_batched</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Any</span><span class="p">]],</span> <span class="n">pos</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">maybe_batched</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
@@ -1332,6 +1349,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">disaggregated_params</span><span class="o">=</span><span class="n">_item_at</span><span class="p">(</span><span class="n">disaggregated_params</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">scheduling_params</span><span class="o">=</span><span class="n">_item_at</span><span class="p">(</span><span class="n">scheduling_params</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">cache_salt</span><span class="o">=</span><span class="n">_item_at</span><span class="p">(</span><span class="n">cache_salt</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
+                <span class="n">priority</span><span class="o">=</span><span class="n">_item_at</span><span class="p">(</span><span class="n">priority</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="n">futures</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">future</span><span class="p">)</span>
@@ -1361,6 +1379,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">_postproc_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PostprocParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">scheduling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">priority</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">DEFAULT_REQUEST_PRIORITY</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RequestOutput</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate output for the given prompt in the asynchronous mode.</span>
 <span class="sd">        Asynchronous generation accepts single prompt only.</span>
@@ -1377,6 +1396,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.</span>
 <span class="sd">            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.</span>
 <span class="sd">            cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
+<span class="sd">            priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -1433,6 +1453,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">scheduling_params</span><span class="o">=</span><span class="n">scheduling_params</span><span class="p">,</span>
             <span class="n">cache_salt_id</span><span class="o">=</span><span class="n">cache_salt_id</span><span class="p">,</span>
             <span class="n">arrival_time</span><span class="o">=</span><span class="n">arrival_time</span><span class="p">,</span>
+            <span class="n">priority</span><span class="o">=</span><span class="n">priority</span><span class="p">,</span>
         <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span><span class="p">:</span>
@@ -2395,9 +2416,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 22, 2026.</p>
+  <p>Last updated on March 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3353334">3353334</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
   
 </div></div>
       

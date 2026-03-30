@@ -56,14 +56,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../_static/togglebutton.js?v=1ae7504c"></script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog11_GPT_OSS_Eagle3';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc9';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc9" />
+  <meta name="docsearch:version" content="1.3.0rc10" />
 
 
   </head>
@@ -554,15 +554,16 @@
 </pre></div>
 </div>
 </section>
-<section id="get-the-tensorrt-llm-container-1-1-0rc0">
-<h2>Get the TensorRT LLM Container (1.1.0rc0)<a class="headerlink" href="#get-the-tensorrt-llm-container-1-1-0rc0" title="Link to this heading">#</a></h2>
-<p>If required by your environment, log into NGC and pull the image:</p>
+<section id="get-the-tensorrt-llm-container">
+<h2>Get the TensorRT LLM Container<a class="headerlink" href="#get-the-tensorrt-llm-container" title="Link to this heading">#</a></h2>
+<p>If required by your environment, log into NGC and pull the image. Check the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release">NGC catalog</a> for the latest available release tag:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Create an API key at https://ngc.nvidia.com (if you don&#39;t have one)</span>
 docker<span class="w"> </span>login<span class="w"> </span>nvcr.io
 <span class="c1"># Username: $oauthtoken</span>
 <span class="c1"># Password: &lt;your NGC API key&gt;</span>
 
-docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0
+<span class="c1"># Replace &lt;version&gt; with the latest release tag from the NGC catalog</span>
+docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:&lt;version&gt;
 </pre></div>
 </div>
 </section>
@@ -575,7 +576,7 @@ docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorr
 <span class="w">  </span>--gpus<span class="w"> </span>all<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-v<span class="w"> </span>/path/to/models:/config/models:rw<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>nvcr.io/nvidia/tensorrt-llm/release:&lt;version&gt;<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>/bin/bash
 </pre></div>
 </div>
@@ -619,7 +620,7 @@ cat<span class="w"> </span>&gt;<span class="w"> </span>/config/models/eagle/eagl
 <span class="s">  speculative_model_dir: /config/models/eagle/</span>
 <span class="s">cuda_graph_config:</span>
 <span class="s">  max_batch_size: 10</span>
-<span class="s">use_torch_sampler: true</span>
+<span class="s">sampler_type: TorchSampler</span>
 <span class="s">moe_config:</span>
 <span class="s">  backend: TRTLLM</span>
 <span class="s">EOF</span>
@@ -629,7 +630,7 @@ cat<span class="w"> </span>&gt;<span class="w"> </span>/config/models/eagle/eagl
 <ul class="simple">
 <li><p>Ensure your base model directory is <code class="docutils literal notranslate"><span class="pre">/config/models/gpt-oss-120b</span></code>.</p></li>
 <li><p>Ensure your Eagle3 assets are present under <code class="docutils literal notranslate"><span class="pre">/config/models/eagle/</span></code>.</p></li>
-<li><p>If you are running on Top of Tree, replace <code class="docutils literal notranslate"><span class="pre">use_torch_sampler:</span> <span class="pre">true</span></code> with <code class="docutils literal notranslate"><span class="pre">sampler_type:</span> <span class="pre">TorchSampler</span></code>.</p></li>
+<li><p>On older releases (pre-1.1.0), replace <code class="docutils literal notranslate"><span class="pre">sampler_type:</span> <span class="pre">TorchSampler</span></code> with <code class="docutils literal notranslate"><span class="pre">use_torch_sampler:</span> <span class="pre">true</span></code>.</p></li>
 </ul>
 </section>
 <section id="launch-the-server-eagle3-speculative-decoding">
@@ -717,7 +718,7 @@ cat<span class="w"> </span>&gt;<span class="w"> </span>/config/models/eagle/eagl
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#get-the-tensorrt-llm-container-1-1-0rc0">Get the TensorRT LLM Container (1.1.0rc0)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#get-the-tensorrt-llm-container">Get the TensorRT LLM Container</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#start-the-tensorrt-llm-container">Start the TensorRT LLM Container</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#download-the-models-base-eagle3">Download the models (Base + Eagle3)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#create-the-eagle3-configuration">Create the Eagle3 Configuration</a></li>
@@ -815,9 +816,9 @@ cat<span class="w"> </span>&gt;<span class="w"> </span>/config/models/eagle/eagl
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 22, 2026.</p>
+  <p>Last updated on March 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3353334">3353334</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
   
 </div></div>
       
