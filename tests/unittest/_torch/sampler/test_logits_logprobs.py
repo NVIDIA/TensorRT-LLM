@@ -303,7 +303,7 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
         print(f"Prompt token IDs: {output.prompt_token_ids}")
 
         logprobs = output.outputs[0].prompt_logprobs
-        token_ids = output.prompt_token_ids[1:]
+        token_ids = output.prompt_token_ids[1:] + output.outputs[0].token_ids[:1]
 
         assert len(logprobs) == len(token_ids), (
             f"Expected {len(token_ids)} logprob entries, got {len(logprobs)}"
@@ -431,7 +431,7 @@ def test_logprobs_against_logits(
                 logprobs_offset=0,
             )
         if prompt_logprobs_k is not None:
-            context_tokens = output.prompt_token_ids
+            context_tokens = output.prompt_token_ids + output.outputs[0].token_ids[:1]
             context_logprobs = output.outputs[0].prompt_logprobs
             context_logits = output.context_logits.to(device="cuda")
             check_logprobs(
@@ -442,6 +442,47 @@ def test_logprobs_against_logits(
                 "context",
                 logprobs_offset=1,  # Prompt logprobs are offset by 1 relative to the prompt token ids
             )
+        # The last context logprob dict and the first generation logprob dict should agree on
+        # the top-n entries (n = min(prompt_logprobs_k, logprobs_k)) and the sampled token's logprob.
+        if prompt_logprobs_k is not None and logprobs_k is not None:
+            last_context_logprob = context_logprobs[-1]
+            first_generation_logprob = generation_logprobs[0]
+            less_prompt_logprobs = prompt_logprobs_k <= logprobs_k
+            expected = last_context_logprob if less_prompt_logprobs else first_generation_logprob
+            compare = first_generation_logprob if less_prompt_logprobs else last_context_logprob
+            sampled_token_id = generation_tokens[0]
+            assert sampled_token_id in last_context_logprob, (
+                f"Sampled token {sampled_token_id} is not a valid key in the last entry "
+                f"of the context logprob dict: {list(last_context_logprob.keys())}"
+            )
+            assert sampled_token_id in first_generation_logprob, (
+                f"Sampled token {sampled_token_id} is not a valid key in the first entry "
+                f"of the generation logprob dict: {list(first_generation_logprob.keys())}"
+            )
+            torch.testing.assert_close(
+                last_context_logprob[sampled_token_id].logprob,
+                first_generation_logprob[sampled_token_id].logprob,
+                msg=(
+                    f"logprob {last_context_logprob[sampled_token_id].logprob} in the last "
+                    f"entry of the context logprob dict does not match the corresponding "
+                    f"logprob {first_generation_logprob[sampled_token_id].logprob} in the "
+                    f"first entry of the generation logprob dict for token {sampled_token_id}"
+                ),
+            )
+            for key, value in expected.items():
+                assert key in compare, (
+                    f"Token {key} is not a valid key in the other dict: {list(compare.keys())}"
+                )
+                expected_logprob = value.logprob
+                compare_logprob = compare[key].logprob
+                torch.testing.assert_close(
+                    expected_logprob,
+                    compare_logprob,
+                    msg=(
+                        f"logprob {expected_logprob} does not match the corresponding "
+                        f"logprob {compare_logprob} in the other dict for token {key}"
+                    ),
+                )
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
