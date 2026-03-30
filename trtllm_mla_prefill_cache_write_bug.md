@@ -1,5 +1,16 @@
 # MLA Context (Prefill) Cache Write Bug in AutoDeploy
 
+## Latest Status
+
+With `torch-simple` (no CUDA graphs) and `tokens_per_block=32`:
+- **255/256 requests succeed** — the C++ FMHA context + cache write MOSTLY works
+- **1/256 fails** with illegal memory access — rare edge case in the C++ kernel
+- `tokens_per_block=64` (PT default) increases failures to **64/256**
+- `copy_batch_block_offsets` produces **identical values** to `ragged_to_block_table_triton`
+  — block offset encoding was never the root cause
+- With `torch-cudagraph`, the single failure corrupts memory and cascades to crash all
+  subsequent CUDA graph replays
+
 ## Reproduction Commit
 
 - **Branch**: `eg/ds_with_mla_enablement`
