@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 
 import pickle
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import cloudpickle
 import mpi4py
@@ -173,6 +173,48 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
         assert scheduled_requests.context_requests_last_chunk == [req1]
 
     run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_scheduler_output_block_hashes_front_run_completed_block():
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0]
+    kv_cache_manager.tokens_per_block = 4
+
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_draft_tokens = []
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_connector.get_stored_block_hashes"
+    ) as get_stored_block_hashes_mock:
+        get_stored_block_hashes_mock.side_effect = [[], [12345]]
+
+        req.get_tokens.return_value = [1, 2, 3]
+        scheduler_output = manager.build_scheduler_output(
+            scheduled_batch, AsyncRequests({}, {}), kv_cache_manager)
+
+        request_data = scheduler_output.cached_requests[0]
+        assert request_data.new_tokens == [1, 2, 3]
+        assert request_data.block_hashes == []
+
+        req.get_tokens.return_value = [1, 2, 3, 4]
+        scheduler_output = manager.build_scheduler_output(
+            scheduled_batch, AsyncRequests({}, {}), kv_cache_manager)
+
+        request_data = scheduler_output.cached_requests[0]
+        assert request_data.new_tokens == [4]
+        # The connector-facing hash chain is updated as soon as the block is
+        # complete, even if KV cache event emission may lag slightly.
+        assert request_data.block_hashes == [12345]
+
+        assert get_stored_block_hashes_mock.call_count == 2
+        get_stored_block_hashes_mock.assert_any_call(req, 4)
 
 
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
