@@ -39,10 +39,12 @@ _DECOMP_REGISTRY: Dict[type, Callable] = {}
 def decomposition(op_cls):
     """Decorator to register a decomposition rule for an MLIR op class.
 
-    The decorated function receives an op instance and returns a tuple of
-    ``(new_ops, result_val)`` where ``new_ops`` is a list of new operations
-    to insert before the original op and ``result_val`` is the SSA value
-    that replaces the original op's output.
+    The decorated function receives an op instance and returns either:
+    - A tuple of ``(new_ops, result_val)`` where ``new_ops`` is a list of
+      new operations to insert before the original op and ``result_val``
+      is the SSA value that replaces the original op's output.
+    - ``None`` to skip decomposition for this particular op instance
+      (e.g. when an op variant is not yet supported).
     """
 
     def decorator(

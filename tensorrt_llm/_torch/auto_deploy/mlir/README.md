@@ -28,7 +28,7 @@ sequenceDiagram
 
     loop For each FX node
         FX2MLIR->>FX2MLIR: _convert_node(node, block)
-        Note over FX2MLIR: aten.add → ad.add<br/>torch_rmsnorm → ad.rmsnorm<br/>aten.mul → ad.mul<br/>aten.pow → ad.pow<br/>aten.mean → ad.reduce_mean<br/>aten.add(t, scalar) → ad.splat + ad.add<br/>unmapped ops → ad.opaque
+        Note over FX2MLIR: aten.add → ad.add (scalar → ad.splat + ad.add)<br/>aten.mul/sub → ad.mul/sub<br/>aten.neg/silu/gelu/relu/tanh/sigmoid → ad.neg/…<br/>aten.exp/softplus/rsqrt/sqrt → ad.exp/…<br/>aten.pow → ad.pow, aten.mean → ad.reduce_mean<br/>rmsnorm variants → ad.rmsnorm<br/>gated rmsnorm → ad.gated_rmsnorm<br/>aten.to.dtype → ad.to_dtype<br/>unmapped ops → ad.opaque
     end
 
     FX2MLIR-->>Transform: mlir_module, metadata
@@ -39,9 +39,9 @@ sequenceDiagram
     Transform->>Decompose: run_decomposition(mlir_module)
     activate Decompose
 
-    loop For each decomposable op (ad.rmsnorm)
+    loop For each decomposable op (ad.rmsnorm, ad.gated_rmsnorm)
         Decompose->>Decompose: _DecompPattern.match_and_rewrite(op)
-        Note over Decompose: ad.rmsnorm(x, w, eps) →<br/>ad.mul(x, x)<br/>ad.reduce_mean(sq, dim=-1)<br/>ad.splat(eps)<br/>ad.add(var, eps_t)<br/>ad.rsqrt(var_eps)<br/>ad.mul(x, inv)<br/>ad.mul(normed, w)
+        Note over Decompose: ad.rmsnorm(x, w, eps) →<br/>ad.mul(x, x)<br/>ad.reduce_mean(sq, dim=-1)<br/>ad.splat(eps)<br/>ad.add(var, eps_t)<br/>ad.rsqrt(var_eps)<br/>ad.mul(x, inv)<br/>ad.mul(normed, w)<br/><br/>ad.gated_rmsnorm(x, w, gate, …) →<br/>ad.silu(gate) + ad.mul(x, silu_gate)<br/>then rmsnorm primitives (or reverse order<br/>depending on norm_before_gate)
     end
 
     Decompose-->>Transform: num_decomposed = 53
@@ -106,7 +106,7 @@ sequenceDiagram
 
     loop For each MLIR op
         MLIR2FX->>MLIR2FX: _convert_op(mlir_op, graph, metadata)
-        Note over MLIR2FX: ad.graph_input → placeholder / get_attr<br/>ad.add → aten.add.Tensor<br/>ad.mul → aten.mul.Tensor<br/>ad.reduce_mean → aten.mean.dim<br/>ad.splat → aten.scalar_tensor<br/>ad.opaque (fused) → torch.ops.auto_deploy.mlir_fused_{hash}<br/>  + getitem(result, i) for each output<br/>ad.opaque (other) → original FX target<br/>ad.graph_output → output
+        Note over MLIR2FX: ad.graph_input → placeholder / get_attr<br/>ad.add/mul/sub → aten.add/mul/sub.Tensor<br/>ad.neg/silu/gelu/relu/tanh/sigmoid → aten.*<br/>ad.exp/softplus/rsqrt/sqrt → aten.*<br/>ad.pow → aten.pow.Tensor_Scalar<br/>ad.reduce_mean/sum → aten.mean/sum.dim<br/>ad.splat → aten.scalar_tensor<br/>ad.cast → aten.to.dtype<br/>ad.rmsnorm → flashinfer_rms_norm<br/>ad.gated_rmsnorm → triton_rmsnorm_gated<br/>ad.opaque (fused) → torch.ops.auto_deploy.mlir_fused_{hash}<br/>  + getitem(result, i) for each output<br/>ad.opaque (other) → original FX target<br/>ad.graph_output → output
     end
 
     MLIR2FX-->>Transform: new_gm (FX GraphModule with fused kernel calls)
@@ -125,13 +125,17 @@ Original FX Graph (1045 call_function nodes)
 ┌─────────────────────────────────────┐
 │  FX → MLIR  (FXToMLIRConverter)     │
 │                                     │
-│  aten.add.Tensor    → ad.add        │
-│  torch_rmsnorm      → ad.rmsnorm    │
-│  aten.mul.Tensor    → ad.mul        │
+│  aten.add/mul/sub   → ad.add/mul/sub│
+│  aten.neg           → ad.neg        │
 │  aten.pow.T_Scalar  → ad.pow        │
 │  aten.mean.dim      → ad.reduce_mean│
-│  aten.rsqrt         → ad.rsqrt      │
-│  aten.silu          → ad.silu       │
+│  aten.rsqrt/sqrt    → ad.rsqrt/sqrt │
+│  aten.silu/gelu/relu/tanh/sigmoid   │
+│    → ad.silu/gelu/relu/tanh/sigmoid │
+│  aten.exp/softplus  → ad.exp/…      │
+│  rmsnorm variants   → ad.rmsnorm    │
+│  gated rmsnorm      → ad.gated_rms… │
+│  aten.to.dtype      → ad.to_dtype   │
 │  aten.add(t, 1e-5)  → ad.splat+add  │
 │  everything else    → ad.opaque     │
 └──────────────┬──────────────────────┘
@@ -149,6 +153,12 @@ Original FX Graph (1045 call_function nodes)
 │  ad.rsqrt(var_eps)     # 1/√(v+e)  │
 │  ad.mul(x, inv)        # normalize  │
 │  ad.mul(normed, w)     # scale      │
+│                                     │
+│  ad.gated_rmsnorm(x, w, gate, …)   │
+│       ↓                             │
+│  ad.silu(gate) + ad.mul(x, silu_g) │
+│  then rmsnorm primitives above      │
+│  (order depends on norm_before_gate)│
 │                                     │
 │  53 rmsnorm ops → 371 primitives    │
 └──────────────┬──────────────────────┘
@@ -201,6 +211,11 @@ Original FX Graph (1045 call_function nodes)
 ┌─────────────────────────────────────┐
 │  MLIR → FX  (MLIRToFXConverter)     │
 │                                     │
+│  ad.add/mul/sub → aten.add/mul/sub  │
+│  ad.neg/silu/… → aten.neg/silu/…    │
+│  ad.rmsnorm → flashinfer_rms_norm   │
+│  ad.gated_rmsnorm → triton_rmsnorm… │
+│                                     │
 │  ad.opaque(mlir_fused_{hash})       │
 │       ↓                             │
 │  call_function(torch.ops.auto_      │
@@ -208,7 +223,6 @@ Original FX Graph (1045 call_function nodes)
 │  getitem(result, 0)  # output 0    │
 │  getitem(result, 1)  # output 1    │
 │                                     │
-│  Unfused primitives → aten ops      │
 │  Other opaques → original targets   │
 └──────────────┬──────────────────────┘
                │

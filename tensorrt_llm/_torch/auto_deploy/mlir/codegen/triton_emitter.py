@@ -13,17 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Template-based Triton kernel generation from fused MLIR ops.
+"""Triton kernel generation from fused MLIR subgraphs.
 
-Two operating modes:
-    - ``preexisting``: Map fused ops to existing custom ops (FlashInfer/Triton).
-    - ``generate``: Generate Triton kernels from MLIR op semantics, registered
-      as proper ``torch.library.custom_op`` for FX graph compatibility.
+Walks a ``FusibleSubgraph`` in topological order, emits Triton expressions
+for each op via the ``_EMIT`` table, writes the generated source to a temp
+file (required by Triton's ``@jit`` for ``inspect.getsourcelines``), and
+registers the result as a ``torch.library.custom_op`` for FX graph
+compatibility.
 
-String-based codegen:
-    - ``generate_kernel_from_subgraph()``: Walk a ``FusibleSubgraph`` in topo
-      order, emit Triton expressions per op, compile via ``exec()``, and
-      register as ``torch.library.custom_op``.
+Supports two grid modes:
+    - **Standard (1D grid)**: one program per row, processes the full last
+      dimension.
+    - **Grouped (2D grid)**: one program per (row, group) pair, used for
+      patterns like gated RMSNorm where reductions operate on sub-slices
+      of the last dimension (controlled by ``group_size`` on reduction ops).
+
+All arithmetic is performed in f32 for numerical stability; loads upcast
+from the original dtype and stores downcast back.
+
+Generated kernels are cached by subgraph hash via ``KernelCache`` and an
+in-memory ``_generated_op_cache`` to avoid redundant compilation.
 """
 
 import textwrap
@@ -178,18 +187,24 @@ def _detect_group_size(subgraph) -> int:
 
 
 def generate_kernel_from_subgraph(subgraph) -> Callable:
-    """Generate a Triton kernel from a FusibleSubgraph and register it.
+    """Generate a Triton kernel from a FusibleSubgraph and register it as a custom op.
 
-    Walks the subgraph ops in topological order, emits Triton expressions,
-    wraps them in kernel boilerplate, compiles via ``exec()``, and registers
-    the result as a ``torch.library.custom_op``.
+    Walks subgraph ops in topological order, emits Triton expressions via the
+    ``_EMIT`` table, writes the generated kernel + launcher to a temp ``.py``
+    file (Triton's ``@jit`` requires ``inspect.getsourcelines``), imports it,
+    and registers it as a ``torch.library.custom_op``.
+
+    Results are cached by subgraph hash (both on-disk via ``KernelCache`` and
+    in-memory via ``_generated_op_cache``) so repeated calls with the same
+    subgraph skip compilation entirely.
 
     Args:
         subgraph: A ``FusibleSubgraph`` with ops, inputs, and outputs.
 
     Returns:
-        A callable that takes torch tensors (matching subgraph inputs) and
-        returns a tuple of output tensors.
+        A wrapper callable that dispatches to the registered
+        ``torch.ops.auto_deploy.mlir_fused_<hash>`` op.  Takes torch tensors
+        matching subgraph inputs and returns a tuple of output tensors.
     """
     sg_hash = KernelCache.hash_subgraph(subgraph)
 

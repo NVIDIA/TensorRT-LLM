@@ -22,6 +22,7 @@ dynamic dims (``-1``) for shape representation.
 Ops:
     - ``ad.add``: Elementwise add (maps to ``aten.add.Tensor``)
     - ``ad.rmsnorm``: RMSNorm with eps attribute (backend-agnostic)
+    - ``ad.gated_rmsnorm``: Gated RMSNorm with group_size and norm_before_gate
     - ``ad.to_dtype``: Dtype cast (maps to ``aten.to.dtype``)
     - ``ad.opaque``: Catch-all for unmodeled FX ops
     - ``ad.graph_input`` / ``ad.graph_output``: Graph boundaries
@@ -29,7 +30,7 @@ Ops:
     - ``ad.pow``, ``ad.rsqrt``, ``ad.sqrt``: Power/root primitives
     - ``ad.silu``, ``ad.gelu``, ``ad.relu``, ``ad.tanh``, ``ad.sigmoid``: Activation primitives
     - ``ad.exp``, ``ad.softplus``: Elementwise math primitives
-    - ``ad.reduce_sum``, ``ad.reduce_mean``: Reduction primitives
+    - ``ad.reduce_sum``, ``ad.reduce_mean``: Reduction primitives (mean supports group_size)
     - ``ad.cast``: Dtype cast primitive
     - ``ad.splat``: Constant scalar splat
 """
