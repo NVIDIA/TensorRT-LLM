@@ -44,6 +44,7 @@ from ..interface import (
     TransformRegistry,
 )
 
+
 class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
@@ -172,7 +173,9 @@ class _InsertCachedOperator(BaseTransform):
         source_ops = attn_descriptor.get_source_attention_ops()
 
         # look for relevant source attention nodes
-        source_attn_nodes = [n for n in gm.graph.nodes if any(is_op(n, source_op) for source_op in source_ops)]
+        source_attn_nodes = [
+            n for n in gm.graph.nodes if any(is_op(n, source_op) for source_op in source_ops)
+        ]
 
         if not source_attn_nodes:
             # If there are no nodes for kv cache insertion found, return current graph
@@ -213,8 +216,8 @@ class _InsertCachedOperator(BaseTransform):
                     attn_node, cm.kv_cache_config
                 ).items():
                     k_indexed = f"{k}_{idx}"
-                    cm.add_resource(k_indexed, resource_handler)
-                    cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
+                    resource_name = cm.add_resource(k_indexed, resource_handler)
+                    cache_in_nodes.append(self._process_cache_node(gm, resource_name))
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
 

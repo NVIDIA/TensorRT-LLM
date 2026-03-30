@@ -39,6 +39,13 @@ from ..attention_interface import (
 from .torch_attention import repeat_kv
 
 
+def _get_absorbed_batch_info(batch_info_host: torch.Tensor) -> tuple[int, int, int]:
+    """Return (num_prefill, num_prefill_tokens, num_decode) for legacy and current metadata."""
+    if batch_info_host.numel() == 3:
+        return tuple(batch_info_host.tolist())
+    return BatchInfo(batch_info_host).get_absorbed_info()
+
+
 def _update_kv_cache(
     key_states: torch.Tensor,
     value_states: torch.Tensor,
@@ -532,7 +539,9 @@ def torch_backend_mha_with_cache(
     return y.view(*output_shape)
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_shared_kv_attention_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::torch_cached_shared_kv_attention_with_cache", mutates_args=()
+)
 def torch_backend_shared_kv_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -555,7 +564,7 @@ def torch_backend_shared_kv_mha_with_cache(
     v_head_dim = v_cache.shape[-1]
     b, s = q.shape[:2]
 
-    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_prefill, _, num_decode = _get_absorbed_batch_info(batch_info_host)
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]

@@ -11,11 +11,14 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention i
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_backend_attention import (
     TorchBackendAttention,
 )
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, Stages
-from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import InsertCachedAttentionConfig
-from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import _InsertCachedOperator
+from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
+    InsertCachedAttentionConfig,
+    _InsertCachedOperator,
+)
 
 
 class _TinySharedKVModule(torch.nn.Module):
@@ -107,8 +110,9 @@ def _manual_attention(
 
 def _make_layer_inputs(offset: float, seq_len: int, decode: bool = False):
     base_q = torch.tensor(
-        [[[1.0, 0.0], [0.0, 1.0]]] if decode else
-        [
+        [[[1.0, 0.0], [0.0, 1.0]]]
+        if decode
+        else [
             [[1.0, 0.0], [0.0, 1.0]],
             [[0.5, 0.5], [0.5, -0.5]],
             [[0.25, 0.75], [0.75, 0.25]],
@@ -116,13 +120,11 @@ def _make_layer_inputs(offset: float, seq_len: int, decode: bool = False):
         dtype=torch.float32,
     )
     base_k = torch.tensor(
-        [[[1.0, 0.0]]] if decode else
-        [[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]],
+        [[[1.0, 0.0]]] if decode else [[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]],
         dtype=torch.float32,
     )
     base_v = torch.tensor(
-        [[[10.0, 1.0]]] if decode else
-        [[[10.0, 1.0]], [[2.0, 20.0]], [[30.0, 3.0]]],
+        [[[10.0, 1.0]]] if decode else [[[10.0, 1.0]], [[2.0, 20.0]], [[30.0, 3.0]]],
         dtype=torch.float32,
     )
     q = (base_q + offset).unsqueeze(0)
@@ -150,10 +152,11 @@ def test_shared_kv_transform_aliases_source_cache_placeholders():
     assert info.num_matches == 2
 
     placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
-    assert placeholder_names.count("k_cache_0") == 1
-    assert placeholder_names.count("v_cache_0") == 1
-    assert "k_cache_1" not in placeholder_names
-    assert "v_cache_1" not in placeholder_names
+    assert placeholder_names.count("r0_k_cache_0") == 1
+    assert placeholder_names.count("r1_v_cache_0") == 1
+    assert "r2_k_cache_1" not in placeholder_names
+    assert "r3_v_cache_1" not in placeholder_names
+    assert set(cm._resource_lookup).issubset(set(placeholder_names))
 
     cached_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
     regular_node = next(
@@ -187,11 +190,13 @@ def test_shared_kv_cached_attention_reads_without_writing():
     k_cache_before = k_cache.clone()
     v_cache_before = v_cache.clone()
 
+    batch_info_host = BatchInfo()
+    batch_info_host.update([0, 0, 0, 0, 1, 1])
     output = torch.ops.auto_deploy.torch_cached_shared_kv_attention_with_cache(
         q,
         dummy_k,
         dummy_v,
-        torch.tensor([0, 0, 1], dtype=torch.int32),
+        batch_info_host.serialize(),
         torch.tensor([1], dtype=torch.int32),
         torch.tensor([2], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int64),
@@ -219,9 +224,15 @@ def test_torch_backend_attention_metadata_for_shared_kv_node():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
     source_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
-    regular = next(node for node in source_nodes if node.target == torch.ops.auto_deploy.torch_attention.default)
+    regular = next(
+        node
+        for node in source_nodes
+        if node.target == torch.ops.auto_deploy.torch_attention.default
+    )
     shared = next(
-        node for node in source_nodes if node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default
+        node
+        for node in source_nodes
+        if node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default
     )
 
     assert TorchBackendAttention.get_layer_idx(regular) == 0
@@ -234,9 +245,15 @@ def test_flashinfer_backend_attention_metadata_for_shared_kv_node():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
     source_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
-    regular = next(node for node in source_nodes if node.target == torch.ops.auto_deploy.torch_attention.default)
+    regular = next(
+        node
+        for node in source_nodes
+        if node.target == torch.ops.auto_deploy.torch_attention.default
+    )
     shared = next(
-        node for node in source_nodes if node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default
+        node
+        for node in source_nodes
+        if node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default
     )
 
     assert FlashInferAttention.get_layer_idx(regular) == 0
@@ -271,8 +288,9 @@ def test_shared_kv_transform_aliases_source_cache_placeholders_for_flashinfer():
     assert info.num_matches == 2
 
     placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
-    assert placeholder_names.count("kv_cache_0") == 1
-    assert "kv_cache_1" not in placeholder_names
+    assert placeholder_names.count("r0_kv_cache_0") == 1
+    assert "r1_kv_cache_1" not in placeholder_names
+    assert set(cm._resource_lookup).issubset(set(placeholder_names))
 
     cached_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
     regular_node = next(
@@ -283,14 +301,17 @@ def test_shared_kv_transform_aliases_source_cache_placeholders_for_flashinfer():
     shared_node = next(
         node
         for node in cached_nodes
-        if node.target == torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default
+        if node.target
+        == torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default
     )
 
     assert regular_node.args[11] is shared_node.args[11]
 
 
 def test_flashinfer_shared_kv_cached_attention_is_dynamic_for_piecewise():
-    shared_op_name = torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default.name()
+    shared_op_name = (
+        torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default.name()
+    )
 
     class _FakeNode:
         op = "call_function"
@@ -299,7 +320,9 @@ def test_flashinfer_shared_kv_cached_attention_is_dynamic_for_piecewise():
             self.target = target
 
     assert "flashinfer_attention_shared_kv_mha_with_cache" in shared_op_name
-    assert is_dynamic_cached_op(_FakeNode(torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default))
+    assert is_dynamic_cached_op(
+        _FakeNode(torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default)
+    )
 
 
 @torch.no_grad()
@@ -329,7 +352,8 @@ def test_flashinfer_shared_kv_cached_attention_reads_aliased_cache_without_writi
     kv_cache[0, 1, 0, :3, :] = owner_v[0, :, 0, :]
     kv_cache_before = kv_cache.clone()
 
-    batch_info_host = torch.tensor([0, 0, 1], dtype=torch.int32, device="cpu")
+    batch_info_host = BatchInfo()
+    batch_info_host.update([0, 0, 0, 0, 1, 1])
     cu_seqlen_host = torch.tensor([0, 1], dtype=torch.int32, device="cpu")
     cu_num_pages = torch.tensor([0, 1], dtype=torch.int32, device=device)
     cu_num_pages_host = torch.tensor([0, 1], dtype=torch.int32, device="cpu")
@@ -344,7 +368,7 @@ def test_flashinfer_shared_kv_cached_attention_reads_aliased_cache_without_writi
         q,
         dummy_k,
         dummy_v,
-        batch_info_host,
+        batch_info_host.serialize(),
         cu_seqlen_host,
         cu_num_pages,
         cu_num_pages_host,
@@ -382,7 +406,9 @@ def test_shared_kv_six_layer_stack_matches_reference_for_prefill_and_decode():
     owner_history = {}
 
     for layer_idx in range(6):
-        q_prefill, k_prefill, v_prefill = _make_layer_inputs(offset=float(layer_idx), seq_len=prefill_len)
+        q_prefill, k_prefill, v_prefill = _make_layer_inputs(
+            offset=float(layer_idx), seq_len=prefill_len
+        )
         batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen = _context_meta(prefill_len)
         sliding_window = 2 if layer_idx in sliding_layers else None
 
@@ -498,8 +524,12 @@ def test_shared_kv_six_layer_stack_matches_reference_for_prefill_and_decode():
             expected_v = torch.cat([owner_history[layer_idx]["v_prefill"], v_decode], dim=1)
             owner_history[layer_idx]["k_full"] = expected_k
             owner_history[layer_idx]["v_full"] = expected_v
-            torch.testing.assert_close(k_cache[0, : decode_pos + 1], expected_k[0], rtol=0.0, atol=0.0)
-            torch.testing.assert_close(v_cache[0, : decode_pos + 1], expected_v[0], rtol=0.0, atol=0.0)
+            torch.testing.assert_close(
+                k_cache[0, : decode_pos + 1], expected_k[0], rtol=0.0, atol=0.0
+            )
+            torch.testing.assert_close(
+                v_cache[0, : decode_pos + 1], expected_v[0], rtol=0.0, atol=0.0
+            )
 
         expected_decode = _manual_attention(
             q_decode,
