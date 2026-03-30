@@ -86,6 +86,23 @@ class MistralAttention(Attention):
             config=model_config,
         )
 
+        self.attention_window_size = getattr(config, "sliding_window", None)
+
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_window_size=self.attention_window_size,
+            **kwargs,
+        )
+
 
 class MistralDecoderLayer(DecoderLayer):
 
