@@ -513,6 +513,8 @@ def flashinfer_shared_kv_mha_with_cache(
     sliding_window: Optional[int],
     k_scale: float,
     v_scale: float,
+    # OPTIONAL PRE-ALLOCATED OUTPUT
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     _GlobalFlashInferPlanner.reset(q.device)
 
@@ -533,7 +535,11 @@ def flashinfer_shared_kv_mha_with_cache(
     n_kv_heads = kv_cache.shape[2]
     window_left = _to_flashinfer_window_left(sliding_window)
 
-    y = torch.zeros_like(q)
+    bs = b * s
+    if out is not None:
+        y = out.view(bs, n_heads, head_dim)
+    else:
+        y = torch.zeros((bs, n_heads, head_dim), dtype=q.dtype, device=q.device)
 
     if num_prefill > 0:
         q_prefill = q[:num_prefill_tokens]
@@ -598,6 +604,11 @@ def flashinfer_shared_kv_mha_with_cache(
             enable_pdl=get_env_enable_pdl(),
         )
         y[num_prefill_tokens:num_total_tokens] = y_decode
+
+    if out is not None:
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
+        return out.new_empty(0)
 
     return y.view(q_shape_og)
 

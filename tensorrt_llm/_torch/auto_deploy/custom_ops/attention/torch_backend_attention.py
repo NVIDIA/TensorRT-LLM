@@ -557,6 +557,7 @@ def torch_backend_shared_kv_mha_with_cache(
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Torch backend MHA using an aliased KV cache owned by an earlier layer."""
     del k, v
@@ -606,6 +607,19 @@ def torch_backend_shared_kv_mha_with_cache(
             sliding_window_size,
             sinks,
         )
+    num_total_tokens = int(seq_len.sum().item()) if s > 1 else num_seq
+    bs = b * s
+
+    if out is not None:
+        out_flat = out.view(*bs_view, num_heads, v_head_dim)
+        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
+        if num_total_tokens < bs:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
+    if num_total_tokens < bs:
+        y[num_total_tokens:].zero_()
+
     return y.view(*output_shape)
 
 
@@ -625,9 +639,12 @@ def torch_backend_shared_kv_mha_with_cache_fake(
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     del k, v, batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen, k_cache, v_cache
     del scale, sinks, sliding_window_size, logit_cap
+    if out is not None:
+        return out.new_empty(0)
     return q.new_empty(*q.shape[:-1], q.shape[-1]).contiguous()
 
 
