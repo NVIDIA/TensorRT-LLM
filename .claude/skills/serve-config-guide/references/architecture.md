@@ -1,23 +1,12 @@
 # Architecture Reference
 
-## Architecture Classes
-
-Config knobs vary by two architecture dimensions:
-
-| Dimension | Classes | Impact |
-|---|---|---|
-| **Expert structure** | **Dense** (all parameters active per token) vs **MoE** (Mixture-of-Experts, subset of experts active per token) | MoE models use `moe_expert_parallel_size` and `moe_config.backend`; generally cap `max_batch_size` lower than dense due to per-expert memory scaling. |
-| **Attention type** | **GQA** (Grouped-Query Attention, full KV per head group) vs **MLA** (Multi-Latent Attention, compressed KV via latent projection) | MLA models have smaller per-token KV footprint, tolerate higher `free_gpu_memory_fraction`, and have lower `enable_attention_dp` memory overhead. GQA models need more KV cache headroom. |
-
-Common combinations in supported models: Dense+GQA (Llama-3.3-70B), MoE+GQA (Qwen3-235B, Llama-4 Scout, GPT-OSS-120B), MoE+MLA (DeepSeek-R1, DeepSeek-V3, Kimi-K2).
-
 ## Model-to-Source Mapping
 
 Consult this table to find the primary checked-in sources for each supported model family before selecting or adjusting configs. This table is derived from the repo's lookup YAML files — update it when those files change.
 
 | Model family | Primary sources | Notes |
 |---|---|---|
-| DeepSeek-R1 | `examples/configs/database/`, `examples/configs/curated/deepseek-*.yaml`, `docs/source/deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.md` | MoE/ADP choices are model-specific. Deployment guide points to `deepseek-r1-throughput.yaml` and `deepseek-r1-deepgemm.yaml`; treat `deepseek-r1-latency.yaml` as source-backed but not deployment-guide-explicit. **MTP eligible:** exact checked-in configs for `deepseek-ai/DeepSeek-R1-0528` or `nvidia/DeepSeek-R1-0528-FP4-v2` with `speculative_config.decoding_type: MTP` are in scope — copy the full `speculative_config` block verbatim, never interpolate, and do not generalize MTP to other models. |
+| DeepSeek-R1 | `examples/configs/database/`, `examples/configs/curated/deepseek-*.yaml`, `docs/source/deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.md` | MoE/ADP choices are model-specific. Deployment guide points to `deepseek-r1-throughput.yaml` and `deepseek-r1-deepgemm.yaml`; `deepseek-r1-latency.yaml` is not referenced by the deployment guide but is a valid checked-in config. **MTP eligible** per SKILL.md Constraint 1 — exact checked-in configs for `deepseek-ai/DeepSeek-R1-0528` or `nvidia/DeepSeek-R1-0528-FP4-v2` with `speculative_config.decoding_type: MTP`. |
 | DeepSeek-V3 / V3.2-Exp | `examples/models/core/deepseek_v3/README.md` plus nearby DeepSeek configs | Use the V3 README for V3-family behavior, not the R1 deployment guide. |
 | GPT-OSS-120B | `examples/configs/database/openai/gpt-oss-120b/`, `examples/configs/curated/gpt-oss-120b-*.yaml`, `docs/source/deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.md` | Uses `moe_config` and `moe_expert_parallel_size`. |
 | Qwen3 | `examples/configs/curated/qwen3.yaml`, `docs/source/deployment-guide/deployment-guide-for-qwen3-on-trtllm.md`, `examples/models/core/qwen/` | Exclude `qwen3-disagg-prefill.yaml` for basic aggregate scope. |

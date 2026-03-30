@@ -6,13 +6,13 @@ Read an exact or nearby checked-in config and the model's deployment guide **bef
 
 | Field | Guidance |
 |---|---|
-| `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. MoE models generally cap lower than dense. The `max_requests` upper bound from the KV cache estimation section below caps reachable batch size. |
+| `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. MoE models generally cap lower than dense due to per-expert memory scaling. The `max_requests` upper bound from the KV cache estimation section below caps reachable batch size. |
 | `max_num_tokens` | Scheduler token budget. When chunked prefill is **disabled** (default): must exceed ISL plus chat template overhead; sweet spot is ISL to 2× ISL. When chunked prefill is **enabled**: acts as the chunk size — see `enable_chunked_prefill` section below. General default is 8192. Tune together with `max_batch_size`. |
 | `enable_chunked_prefill` | Disabled by default. Splits long prefills into chunks so decode batches are not starved. See the dedicated section below for MLA-specific guidance and trade-offs. |
-| `enable_attention_dp` | Usually shines only in high-throughput / high-concurrency traffic scenarios; at low concurrency the memory and compute overhead can be prohibitively resource-intensive with little throughput gain. Follow the exact model guide/config. |
-| `kv_cache_config.free_gpu_memory_fraction` | OOM lever. Safe range depends on attention architecture (MLA vs GQA) and whether attention data parallelism (ADP) is enabled. Guides often adjust `max_batch_size` or `max_seq_len` first. |
+| `enable_attention_dp` | High-throughput knob. MoE+GQA models benefit at lower concurrency thresholds than MoE+MLA or Dense+GQA. Memory overhead: small for MLA (compressed attention), substantial for GQA (full replication). Can trigger OOM when combined with aggressive KV cache fraction. Follow the exact model guide/config. |
+| `kv_cache_config.free_gpu_memory_fraction` | OOM lever. MLA models (compressed KV) tolerate higher fractions; GQA models need more headroom. Lower when ADP enabled to account for replicated attention overhead. Large MoE models with ADP may need notably conservative fractions. Guides often adjust `max_batch_size` or `max_seq_len` first. |
 | `moe_expert_parallel_size` | MoE only. Copy from checked-in source; do not assume it equals TP. |
-| `moe_config.backend` | Backend choice depends on quantization, GPU generation, and concurrency level. Set only when model guide or checked-in config specifies it. |
+| `moe_config.backend` | CUTLASS/DEEPGEMM dominate at high concurrency; TRTLLM safer at low. FP8 on Hopper uses CUTLASS (DEEPGEMM unavailable on SM90). Wrong backend at high concurrency leaves significant throughput on the table. Set only when model guide or checked-in config specifies it. |
 | `stream_interval` | Model-specific variation; no single global value. |
 | `num_postprocess_workers` | Present in some streaming/higher-concurrency configs. |
 | `attention_dp_config.*` | Preserve when present in source configs. |
@@ -26,9 +26,10 @@ Use these formulas to sanity-check whether a concurrency target fits in GPU memo
 **Per-token KV cache size:**
 
 - **GQA (standard grouped-query attention):**
-  `kv_per_token = 2 × num_hidden_layers × (num_key_value_heads / TP) × head_dim × dtype_bytes`
+  `kv_per_token = 2 × num_attention_layers × (num_key_value_heads / TP) × head_dim × dtype_bytes`
+  When `enable_attention_dp` is enabled, KV cache is fully replicated per rank (not TP-sharded); use divisor 1 instead of TP.
 - **MLA (multi-latent attention, e.g. DeepSeek-V2/V3):**
-  `kv_per_token = num_hidden_layers × (kv_lora_rank + qk_rope_head_dim) × dtype_bytes`
+  `kv_per_token = num_attention_layers × (kv_lora_rank + qk_rope_head_dim) × dtype_bytes`
 
 Where `dtype_bytes` is 2 for BF16/FP16, 1 for FP8/INT8.
 
@@ -38,29 +39,17 @@ Where `dtype_bytes` is 2 for BF16/FP16, 1 for FP8/INT8.
 max_requests ≈ floor((GPU_HBM × 0.90 − model_weights_bytes / TP) / (kv_per_token × (ISL + OSL)))
 ```
 
-**HF config fields to read:** `num_hidden_layers`, `num_key_value_heads`, `head_dim` (or `hidden_size / num_attention_heads`), `kv_lora_rank`, `qk_rope_head_dim`.
+The 0.90 factor reserves ~10% of HBM for CUDA context, driver, and runtime overhead. Result is per-GPU.
+
+**HF config fields to read:** `num_attention_layers` (equals `num_hidden_layers` for standard transformers; differs for hybrid models like Nemotron-H), `num_key_value_heads`, `head_dim` (or `hidden_size / num_attention_heads`), `kv_lora_rank`, `qk_rope_head_dim`.
 
 **Caveats:** This estimate ignores activation memory, CUDA graph workspace, MoE expert workspace, and attention data parallelism (ADP) overhead. Always prefer checked-in config values over formula-derived estimates. Mark any formula-derived number as unverified.
-
-## Generally Observed Patterns
-
-These patterns are generally observed across benchmark data. A checked-in config or deployment guide always takes precedence.
-
-- **`enable_attention_dp`** — A high-throughput knob. Generally turned on for throughput-oriented workloads at higher concurrency. MoE+GQA models tend to benefit at lower concurrency thresholds than MoE+MLA or Dense+GQA. Memory overhead is architecture-dependent: small for MLA (compressed attention), substantial for GQA (full attention replication). Can trigger OOM when combined with aggressive KV cache fraction.
-
-- **`moe_config.backend`** — Highest-impact MoE knob. Backend choice depends on quantization and GPU generation: CUTLASS and DEEPGEMM tend to dominate at higher concurrency; TRTLLM is generally safer at low concurrency. FP8 on Hopper uses CUTLASS (DEEPGEMM unavailable on SM90). Wrong backend at high concurrency can leave significant throughput on the table.
-
-- **`kv_cache_config.free_gpu_memory_fraction`** — Safe range depends on attention architecture. MLA models tolerate higher fractions (compressed KV footprint). GQA models need more headroom (larger per-token KV). Lower the fraction when ADP is enabled to account for replicated attention weight overhead. Large MoE models with ADP may need notably conservative fractions to avoid MoE GEMM autotuner workspace failures.
-
-- **`max_num_tokens`** (when chunked prefill is **disabled**, the default) — Must exceed ISL plus chat template overhead or requests get rejected. Sweet spot is generally ISL to 2× ISL. Setting it far above ISL wastes activation buffer memory and can counterintuitively shrink KV cache capacity. Higher values help scheduler packing at high concurrency but with diminishing returns. The general default (8192) is a reasonable starting point for most non-max-throughput workloads.
-
-- **`max_batch_size`** — MoE models generally cap lower than dense models due to per-expert memory scaling. Reachable batch size is bounded by KV cache capacity, which depends on sequence length, GPU memory, and ADP state.
 
 ## Chunked Prefill
 
 Chunked prefill (`enable_chunked_prefill: true`) splits long prefill sequences into chunks so that decode batches sharing the same iteration are not starved. It is **disabled by default** and should be treated as an advanced latency optimization, not a default recommendation.
 
-**When chunked prefill is disabled (default):** `max_num_tokens` acts as the scheduler token budget. The heuristics in the "Generally Observed Patterns" section above apply. The general default of 8192 is a reasonable starting point for most non-max-throughput workloads.
+**When chunked prefill is disabled (default):** `max_num_tokens` acts as the scheduler token budget. The heuristics in the Commonly Tuned Fields table above apply. The general default of 8192 is a reasonable starting point for most non-max-throughput workloads. When chunked prefill is disabled, `max_num_tokens` must be >= ISL (the runtime rejects requests where the input exceeds the token budget).
 
 **When chunked prefill is enabled:** `max_num_tokens` becomes the **chunk size**. Smaller values reduce TPOT (time per output token) but decrease overall throughput. The ISL-based sizing heuristics above do not apply — instead, tune the chunk size to balance latency and throughput for the target workload.
 
@@ -73,16 +62,6 @@ Chunked prefill (`enable_chunked_prefill: true`) splits long prefill sequences i
 **Non-MLA models (GQA):** chunked prefill is more broadly supported across GPU generations. Still disabled by default; enable when long prefill sequences cause decode latency spikes.
 
 **Source:** `py_executor_creator.py:535-542`, `_torch/modules/attention.py` (chunked prefill MLA path), `docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md:419-423`.
-
-## Bench-Derived Hints (fallback only)
-
-These come from `tensorrt_llm/bench/` and are benchmark heuristics, not serve rules. Mark any bench-derived value as unverified.
-
-- `benchmark/throughput.py` and `build/build.py` seed target ISL/OSL from `DatasetMetadata.avg_isl`/`avg_osl` — use as a fallback when no exact scenario match exists.
-- `build/tuning.py` derives `max_batch_size` and `max_num_tokens` together from ISL/OSL and estimated KV-cache capacity. Rounds upward into coarse buckets; enforces min `max_num_tokens` of 2048. Outputs are "slightly optimistic" upper bounds for benchmark engine builds.
-- `benchmark/utils/general.py` raises `max_num_tokens` to at least `max_isl + max_batch_size` on the non-chunked-prefill path. Benchmark safeguard, not a serve invariant.
-- `dataclasses/configuration.py` fills `cuda_graph_config.max_batch_size` from runtime `max_batch_size` when both `batch_sizes` and `max_batch_size` are unset. Skip if the source config already sets graph batch sizes.
-- If a bench-derived value diverges from nearby checked-in serve configs, prefer the serve config.
 
 ## OOM Triage
 
