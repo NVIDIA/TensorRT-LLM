@@ -1227,9 +1227,17 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
                     data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
                 data_cmd += [
-                    "trtllm-bench", f"--model={tokenizer_dir}",
-                    "prepare-dataset", "--output", f"{dataset_path}",
-                    f"--rand-task-id 0 {nloras-1}", f"--lora-dir={lora_dir}",
+                    "trtllm-bench",
+                    f"--model={tokenizer_dir}",
+                    "prepare-dataset",
+                    "--output",
+                    f"{dataset_path}",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--lora-dir={lora_dir}",
+                ]
+                if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+                    data_cmd += ["--trust-remote-code"]
+                data_cmd += [
                     f"token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
@@ -1246,8 +1254,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             if self._build_script == 'trtllm-bench':
                 data_cmd += [
-                    "trtllm-bench", f"--model={tokenizer_dir}",
-                    "prepare-dataset", "--output", f"{dataset_path}",
+                    "trtllm-bench",
+                    f"--model={tokenizer_dir}",
+                    "prepare-dataset",
+                    "--output",
+                    f"{dataset_path}",
+                ]
+                if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+                    data_cmd += ["--trust-remote-code"]
+                data_cmd += [
                     "token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
