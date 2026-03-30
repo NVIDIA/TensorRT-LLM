@@ -583,15 +583,18 @@ def trtllm_finegrained_fp8_linear(
             f"(shape={weight_scale.shape}), weight shape={weight.shape}. "
             f"This usually means scale tensor sharding produced an empty tensor."
         )
-    block_n = N // scale_n
-    block_k = K // scale_k
 
-    # TRT-LLM fp8_block_scaling_gemm requires exact 128x128 blocks.
-    # For small layers where a dimension < 128 (e.g. N=64), the derived block
-    # size will be < 128.  Fall back to BF16 dequant + cuBLAS.
-    if block_n != 128 or block_k != 128:
-        # BF16 fallback: the Triton FP8 kernel launches Grid=1x1x1 for tiny N,
-        # wasting 99% of SM capacity. Dequantize weight + cuBLAS is faster.
+    # Floor division gives the wrong block size when N (or K) is not a
+    # perfect multiple of the true block size (e.g. N=576, scale_n=5 →
+    # 576//5=115 instead of 128).  Check consistency with the standard
+    # 128×128 FP8 block scheme before falling back to floor division.
+    block_n = 128 if scale_n == -(-N // 128) else N // scale_n
+    block_k = 128 if scale_k == -(-K // 128) else K // scale_k
+
+    # TRT-LLM fp8_block_scaling_gemm requires exact 128x128 blocks AND
+    # dimensions that are multiples of 128.  Fall back to BF16 dequant +
+    # cuBLAS when either condition is not met.
+    if block_n != 128 or block_k != 128 or N % 128 != 0 or K % 128 != 0:
         weight_dequant = _dequant_block_fp8_weight(
             weight, weight_scale, block_n, block_k, dtype=input.dtype
         )

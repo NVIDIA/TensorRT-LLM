@@ -233,6 +233,9 @@ transforms:
     stage: cache_init
     requires_shape_prop: true
     backend: flashinfer_mla
+  fuse_rope_into_trtllm_mla:
+    stage: cache_init
+    enabled: false
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm

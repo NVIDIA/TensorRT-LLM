@@ -570,6 +570,89 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         print_memory_usage("after evaluation")
 
 
+class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for DeepSeek-V3-Lite with MLA backends.
+
+    Tests both flashinfer_mla and trtllm_mla attention backends with the
+    DeepSeek-V3 MLA architecture (kv_lora_rank=512, qk_nope_head_dim=128,
+    qk_rope_head_dim=64, v_head_dim=128, num_heads=16).
+    """
+
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+
+    def get_default_kwargs(self,
+                           enable_chunked_prefill=False,
+                           mla_attn_backend="trtllm_mla"):
+        config = {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "compile_backend": "torch-cudagraph",
+            "max_batch_size": 128,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
+            "skip_loading_weights": False,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.8,
+            },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+            "transforms": {
+                "multi_stream_moe": {
+                    "stage": "compile",
+                    "enabled": False,
+                },
+                "multi_stream_mla_attn": {
+                    "stage": "compile",
+                    "enabled": False,
+                },
+                "insert_cached_mla_attention": {
+                    "backend": mla_attn_backend,
+                },
+                "fuse_rope_into_trtllm_mla": {
+                    "stage": "cache_init",
+                    "enabled": mla_attn_backend == "trtllm_mla",
+                },
+            },
+        }
+        if enable_chunked_prefill:
+            config["enable_chunked_prefill"] = True
+            config["max_num_tokens"] = 512
+            config["transforms"]["compile_model"] = {
+                "piecewise_enabled": True,
+            }
+        return config
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+    @pytest.mark.parametrize("mla_attn_backend",
+                             ["flashinfer_mla", "trtllm_mla"])
+    def test_auto_dtype(self, enable_chunked_prefill, mla_attn_backend):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill,
+                                         mla_attn_backend=mla_attn_backend)
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.NUM_SAMPLES = 100
+            task.evaluate(llm, sampling_params=sampling_params)
+
+
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for GLM-4.7-Flash variants"""
 
@@ -584,11 +667,10 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
-                           attn_backend="flashinfer"):
+                           mla_attn_backend="flashinfer_mla"):
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "attn_backend": attn_backend,
             "compile_backend": "torch-cudagraph",
             "max_batch_size": 128,
             "max_seq_len": self.MAX_SEQ_LEN,
@@ -615,6 +697,13 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                     "stage": "compile",
                     "enabled": True,
                 },
+                "insert_cached_mla_attention": {
+                    "backend": mla_attn_backend,
+                },
+                "fuse_rope_into_trtllm_mla": {
+                    "stage": "cache_init",
+                    "enabled": mla_attn_backend == "trtllm_mla",
+                },
             }
         }
         if enable_chunked_prefill:
@@ -636,9 +725,11 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
-    def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
-        kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
+    @pytest.mark.parametrize("mla_attn_backend",
+                             ["flashinfer_mla", "trtllm_mla"])
+    def test_auto_dtype(self, enable_chunked_prefill, mla_attn_backend):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill,
+                                         mla_attn_backend=mla_attn_backend)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
@@ -994,3 +1085,80 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, **evaluate_kwargs)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
+
+
+class TestKimiK2_5(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Kimi-K2.5 via AutoDeploy.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    Configuration derived from examples/auto_deploy/model_registry/configs/kimi_k2.yaml.
+    """
+
+    MODEL_NAME = "nvidia/Kimi-K2.5-NVFP4"
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "compile_backend": "torch-cudagraph",
+            "max_batch_size": 64,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64],
+            "kv_cache_config": {
+                "dtype": "bfloat16",
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7,
+                "tokens_per_block": 64,
+            },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+            "transforms": {
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
+                },
+                "fuse_nvfp4_moe": {
+                    "allow_different_input_scales": True,
+                },
+                "insert_cached_mla_attention": {
+                    "backend": "trtllm_mla",
+                },
+                "fuse_rope_into_trtllm_mla": {
+                    "enabled": True,
+                },
+                "multi_stream_mla_attn": {
+                    "enabled": True,
+                },
+            },
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [4])
+    def test_nvfp4(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           dtype="bfloat16",
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.NUM_SAMPLES = 100
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.NUM_SAMPLES = 100
+            task.evaluate(llm)

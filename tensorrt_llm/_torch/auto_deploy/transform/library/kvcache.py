@@ -208,6 +208,13 @@ class _InsertCachedOperator(BaseTransform):
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
 
+            # Append layer_idx so the cached op can pass it to thop.attention.
+            # This ensures each layer creates a separate C++ AttentionOp
+            # (which is cached by layer_idx) rather than sharing one across
+            # all layers.
+            if hasattr(attn_descriptor, "needs_layer_idx") and attn_descriptor.needs_layer_idx():
+                constants = list(constants) + [num_cached_attn_replacements]
+
             # insert cached attention replacement op
             self._insert_cached_attn_node(
                 gm,
@@ -271,7 +278,18 @@ class ResizeKVCache(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Run a forward pass to get the extra memory usage
+        # Run a forward pass to get the extra memory usage.
+        # Skip MLA attention during resize (estimation-mode cache is too small
+        # for the synthetic batch, causing out-of-bounds KV cache writes).
+        try:
+            from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import (
+                set_mla_skip_attention,
+            )
+
+            set_mla_skip_attention(True)
+        except Exception:
+            pass
+
         cm.info.set_max_num_tokens_sample()
         try:
             # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
@@ -290,8 +308,30 @@ class ResizeKVCache(BaseTransform):
         # may not be accurate.
         *_, mem_reserved_for_forward = get_mem_info(empty_cache=False, unit="B")
 
+        # Re-enable MLA attention after resize forward.
+        try:
+            set_mla_skip_attention(False)
+        except Exception:
+            pass
+
+        # Sync to flush any async CUDA errors from the resize forward before
+        # destroying the estimation-mode KVCacheManager.
+        import torch as _torch
+
+        _torch.cuda.synchronize()
+
         # Resize - KVCacheManager will compute optimal capacity based on free memory
         cm.resize_kv_cache_manager(mem_reserved_for_forward)
+
+        # Update MLA planner with the new (resized) kv_cache_manager.
+        try:
+            from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import (
+                set_mla_kv_cache_manager,
+            )
+
+            set_mla_kv_cache_manager(cm.kv_cache_manager)
+        except (ImportError, AssertionError):
+            pass
 
         info = TransformInfo(
             skipped=False,

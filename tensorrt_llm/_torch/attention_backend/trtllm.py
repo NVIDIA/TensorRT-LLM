@@ -641,6 +641,78 @@ class TrtllmAttentionWrapper:
                 global_layer_idx=self.global_layer_idx,
             )
         else:
+            # DEBUG: dump args for MLA context comparison
+            if self.is_mla_enable and int(self.attention_input_type) == 1:
+                try:
+                    import sys
+                    sys.path.insert(0, "/tmp/claude-144080")
+                    from dump_attn_args import dump_attn_args
+                    dump_attn_args(
+                        "PT", self.layer_idx, int(self.attention_input_type), {
+                            "q": q,
+                            "k": k,
+                            "v": v,
+                            "output": output,
+                            "output_sf": output_sf,
+                            "workspace": self.workspace,
+                            "sequence_length": self.sequence_length,
+                            "host_past_kv_lengths":
+                            self.host_past_key_value_lengths,
+                            "host_total_kv_lens": self.host_total_kv_lens,
+                            "context_lengths": self.context_lengths,
+                            "host_context_lengths": self.host_context_lengths,
+                            "host_request_types": self.host_request_types,
+                            "kv_cache_block_offsets":
+                            self.kv_cache_block_offsets,
+                            "host_kv_cache_pool_pointers":
+                            self.host_kv_cache_pool_pointers,
+                            "host_kv_cache_pool_mapping":
+                            self.host_kv_cache_pool_mapping,
+                            "cache_indirection": self.cache_indirection,
+                            "latent_cache": self.latent_cache,
+                            "q_pe": self.q_pe,
+                            "block_ids_per_seq": self.block_ids_per_seq,
+                            "is_fused_qkv": is_fused_qkv,
+                            "update_kv_cache": update_kv_cache,
+                            "predicted_tokens_per_seq":
+                            self.predicted_tokens_per_seq,
+                            "layer_idx": self.layer_idx,
+                            "num_heads": self.num_heads,
+                            "num_kv_heads": self.num_kv_heads,
+                            "head_size": self.head_size,
+                            "tokens_per_block": self.tokens_per_block,
+                            "max_num_requests": self.max_num_requests,
+                            "max_context_length": self.max_context_length,
+                            "attention_window_size": self.attention_window_size,
+                            "sink_token_length": self.sink_token_length,
+                            "beam_width": self.beam_width,
+                            "mask_type": int(mask_type),
+                            "quant_mode": self.quant_mode,
+                            "q_scaling": self.q_scaling,
+                            "position_embedding_type":
+                            self.position_embedding_type,
+                            "rotary_embedding_dim": self.rotary_embedding_dim,
+                            "use_paged_context_fmha":
+                            self.use_paged_context_fmha,
+                            "attention_input_type": int(
+                                self.attention_input_type),
+                            "is_mla_enable": self.is_mla_enable,
+                            "chunked_prefill_buffer_batch_size":
+                            self.chunked_prefill_buffer_batch_size,
+                            "q_lora_rank": self.q_lora_rank,
+                            "kv_lora_rank": self.kv_lora_rank,
+                            "qk_nope_head_dim": self.qk_nope_head_dim,
+                            "qk_rope_head_dim": self.qk_rope_head_dim,
+                            "v_head_dim": self.v_head_dim,
+                            "rotary_cos_sin": self.rotary_cos_sin,
+                            "flash_mla_tile_scheduler_metadata":
+                            self.flash_mla_tile_scheduler_metadata,
+                            "flash_mla_num_splits": self.flash_mla_num_splits,
+                        })
+                except Exception as e:
+                    import sys
+                    print(f"[DUMP ERR] {e}", file=sys.stderr, flush=True)
+
             thop.attention(
                 q,
                 k,
