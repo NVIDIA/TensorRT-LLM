@@ -276,9 +276,6 @@ class TaskMetricsCollector(TaskCollection):
                                                      0)
                 task_info['completion_tokens'] = getattr(
                     task, 'completion_tokens_num', 0)
-                task_info['reasoning_tokens'] = getattr(task,
-                                                        'reasoning_tokens_num',
-                                                        0)
                 task_info['total_tokens'] = task_info[
                     'prompt_tokens'] + task_info['completion_tokens']
                 task_info['finish_reason'] = getattr(task, 'finish_reason',

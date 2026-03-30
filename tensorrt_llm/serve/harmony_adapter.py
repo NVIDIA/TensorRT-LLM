@@ -24,9 +24,8 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               ChatCompletionResponseStreamChoice,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
-                              CompletionTokensDetails, DeltaFunctionCall,
-                              DeltaMessage, DeltaToolCall, UsageInfo,
-                              to_disaggregated_params)
+                              DeltaFunctionCall, DeltaMessage, DeltaToolCall,
+                              UsageInfo, to_disaggregated_params)
 
 # yapf: enable
 
@@ -1742,13 +1741,10 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         parsed_output = {}
 
     # Get reasoning text for token counting
-    reasoning_text = parsed_output.get("reasoning", None)
+    parsed_output.get("reasoning", None)
 
     # Create usage info from metrics (RequestOutput doesn't have usage in v1)
-    usage_info = _create_usage_info(num_prompt_tokens,
-                                    outputs,
-                                    reasoning_text=reasoning_text,
-                                    tokenizer=tokenizer)
+    usage_info = _create_usage_info(num_prompt_tokens, outputs)
 
     # Create response
     response = ChatCompletionResponse(
@@ -1795,28 +1791,12 @@ def _determine_finish_reason(parsed_output: dict[str, Any],
         return reason
 
 
-def _create_usage_info(num_prompt_tokens,
-                       outputs,
-                       reasoning_text: str = None,
-                       tokenizer=None) -> UsageInfo:
+def _create_usage_info(num_prompt_tokens, outputs) -> UsageInfo:
     """Create usage info from RequestOutput following serving_chat.py pattern."""
-    # Calculate completion tokens from all outputs
     num_generated_tokens = sum(len(output.token_ids) for output in outputs)
-
-    # Calculate reasoning tokens if reasoning_text is present
-    reasoning_tokens = 0
-    if reasoning_text and tokenizer is not None:
-        reasoning_token_ids = tokenizer.encode(reasoning_text,
-                                               add_special_tokens=False)
-        reasoning_tokens = len(reasoning_token_ids)
-
-    # Create usage info
-    usage = UsageInfo(prompt_tokens=num_prompt_tokens,
-                      completion_tokens=num_generated_tokens,
-                      total_tokens=num_prompt_tokens + num_generated_tokens,
-                      completion_tokens_details=CompletionTokensDetails(
-                          reasoning_tokens=reasoning_tokens))
-    return usage
+    return UsageInfo(prompt_tokens=num_prompt_tokens,
+                     completion_tokens=num_generated_tokens,
+                     total_tokens=num_prompt_tokens + num_generated_tokens)
 
 
 def maybe_transform_reasoning_effort(
