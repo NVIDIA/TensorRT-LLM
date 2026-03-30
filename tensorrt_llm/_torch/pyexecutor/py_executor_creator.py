@@ -812,7 +812,7 @@ def create_py_executor(
         # KV cache allocation will OOM.
         try:
             if hasattr(py_executor, 'kv_cache_transceiver'
-                       ) and py_executor.kv_cache_transceiver is not None:
+                       ) and py_executor.kv_cache_transceiver.enabled:
                 py_executor.kv_cache_transceiver.shutdown()
         finally:
             kv_cache_creator.teardown_managers(resources)

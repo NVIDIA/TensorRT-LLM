@@ -94,6 +94,14 @@ def create_kv_cache_transceiver(
 
 class KvCacheTransceiver(ABC):
 
+    # True for real transceivers, False for NoOpKvCacheTransceiver.
+    # Prefer checking .enabled over ``is None`` comparisons.
+    enabled: bool = True
+
+    # Timeout in milliseconds for KV cache transfers; None means no timeout.
+    # Concrete subclasses set this in __init__ or as a class attribute.
+    kv_transfer_timeout_ms: Optional[int] = None
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
         raise NotImplementedError
@@ -142,6 +150,45 @@ class KvCacheTransceiver(ABC):
 
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
+
+
+class NoOpKvCacheTransceiver(KvCacheTransceiver):
+    """A no-op transceiver used when disaggregated serving is disabled.
+
+    Eliminates the need for ``if self.kv_cache_transceiver:`` null-checks
+    throughout the executor by providing safe, do-nothing implementations of
+    every method.
+    """
+
+    enabled: bool = False
+    kv_transfer_timeout_ms: Optional[int] = None
+
+    def respond_and_send_async(self, req: LlmRequest):
+        pass
+
+    def request_and_receive_sync(self, req: LlmRequest):
+        pass
+
+    def request_and_receive_async(self, req: LlmRequest):
+        pass
+
+    def check_context_transfer_status(self, at_least_request_num: int):
+        return [], []
+
+    def check_gen_transfer_status(self, at_least_request_num: int):
+        pass
+
+    def check_gen_transfer_complete(self):
+        pass
+
+    def cancel_request(self, req: LlmRequest):
+        return False
+
+    def prepare_context_requests(self, requests: List[LlmRequest]):
+        pass
+
+    def get_disaggregated_params(self) -> Dict[str, Any]:
+        return {}
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
