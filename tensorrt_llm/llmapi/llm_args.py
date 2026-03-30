@@ -2387,8 +2387,16 @@ class _ModelWrapper:
 
 
 class DwdpConfig(StrictBaseModel):
-    """
-    Configuration for DWDP.
+    """Configuration for Distributed Weight Data Parallelism (DWDP).
+
+    DWDP accelerates the context (prefill) phase of disaggregated MoE serving
+    by combining data parallelism with NVLink-based expert weight sharing.
+    Each worker holds a subset of experts locally and asynchronously prefetches
+    the remaining experts from peer workers via CUDA IPC, enabling fully
+    asynchronous execution across ranks without synchronization barriers.
+
+    Currently supported with the CuteDSL MoE backend and NVFP4 quantization
+    on NVLink-connected multi-GPU systems.
     """
     enabled: bool = Field(default=False, description="Whether to enable DWDP.")
     dwdp_size: int = Field(default=1,
