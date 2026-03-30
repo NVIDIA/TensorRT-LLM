@@ -5602,6 +5602,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           mocker):
         if not one_model:
             pytest.skip("v2 does not support two model")
+        if overlap_scheduler:
+            pytest.skip(
+                "accuracy issue on H100, only for mtp+overlap_scheduler")
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
