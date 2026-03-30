@@ -14,7 +14,7 @@
 # limitations under the License.
 """Eagle3 one-model dynamic tree speculative decoding."""
 
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -156,7 +156,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self.K = spec_config.dynamic_tree_max_topK
         self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         self.tokens_per_gen_step = spec_config.tokens_per_gen_step
-        self._max_batch_size = spec_config.runtime_max_batch_size or 256
+        if spec_config.max_batch_size is None:
+            raise ValueError(
+                "Eagle3OneModelDynamicTreeWorker requires max_batch_size to be set "
+                "on Eagle3DecodingConfig when use_dynamic_tree=True."
+            )
+        self._max_batch_size = spec_config.max_batch_size
 
         K = self.K
         max_draft_len = spec_config.max_draft_len
@@ -316,10 +321,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     cache_mgr.head_dim * _dtype_bytes.get(cache_mgr.dtype, 0.5)
                 )
 
-    # ---- Overridden dispatch methods ----
-
     @nvtx_range("eagle3_dyn.forward")
-    @override
     def forward(
         self,
         input_ids,
@@ -387,7 +389,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
     @nvtx_range("eagle3_dyn.sample_and_accept_draft_tokens")
-    @override
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
         """Override to handle dynamic tree verification."""
         batch_size = attn_metadata.num_seqs
@@ -402,7 +403,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         return accepted_tokens, num_accepted_tokens
 
     @nvtx_range("eagle3_dyn.prepare_1st_drafter_inputs")
-    @override
     def prepare_1st_drafter_inputs(
         self,
         input_ids,
@@ -502,9 +502,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             "spec_metadata": spec_metadata,
         }
 
-    # ---- Dynamic tree draft loop ----
-
-    @override
     def _forward_draft_loop(
         self,
         inputs,
@@ -690,8 +687,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             spec_tree_manager.mark_tree_valid(gen_slots, num_gens)
 
         return real_draft_tokens.to(torch.int32)
-
-    # ---- Dynamic tree verification ----
 
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens

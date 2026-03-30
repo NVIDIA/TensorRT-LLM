@@ -20,7 +20,6 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
-#include <algorithm>
 #include <cstdint>
 
 namespace
@@ -285,7 +284,7 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
-        tllmRunnerParams.mMultiCtasKvMode = false;
+        tllmRunnerParams.mMultiCtasKvMode = !tllmRunnerParams.mIsSpecDecTree;
         // Assume same head size for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSize;

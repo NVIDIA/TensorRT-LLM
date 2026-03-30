@@ -63,8 +63,6 @@ void build_dynamic_tree_op(th::Tensor& parentList, th::Tensor& selectedIndex, th
 }
 
 //! \brief Verify dynamic tree using greedy strategy
-//! All index/token tensors use int64.
-//! Returns tuple of (predicts, acceptIndex, acceptTokenNum, acceptToken)
 std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_greedy_op(th::Tensor& candidates,
     th::Tensor& retrieveIndex, th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling,
     th::Tensor& targetPredict, th::Tensor& treeValid, int64_t numSpecStep)
@@ -122,7 +120,6 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_g
 
 //! \brief In-place variant of verify_dynamic_tree_greedy_op.
 //! Writes to pre-allocated output buffers instead of allocating new tensors.
-//! Inputs (candidates, targetPredict) MUST already be int64.
 void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retrieveIndex, th::Tensor& retrieveNextToken,
     th::Tensor& retrieveNextSibling, th::Tensor& targetPredict, th::Tensor& predicts, th::Tensor& acceptIndex,
     th::Tensor& acceptTokenNum, th::Tensor& acceptToken, th::Tensor& treeValid, int64_t numSpecStep)
