@@ -25,7 +25,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings,
     update_sampler_args_with_extra_options, ALL_SUPPORTED_BACKENDS)
 # isort: on
-from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
+from tensorrt_llm.bench.utils.data import (DatasetFormatError,
+                                           create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.logger import logger
@@ -205,14 +206,17 @@ def latency_command(
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
-        metadata, requests = create_dataset_from_stream(
-            tokenizer,
-            dataset,
-            num_requests=options.num_requests,
-            model_dir=options.checkpoint_path,
-            model_type=options.model_type,
-            modality=options.modality,
-            max_input_seq_len_for_multimodal=options.max_input_len)
+        try:
+            metadata, requests = create_dataset_from_stream(
+                tokenizer,
+                dataset,
+                num_requests=options.num_requests,
+                model_dir=options.checkpoint_path,
+                model_type=options.model_type,
+                modality=options.modality,
+                max_input_seq_len_for_multimodal=options.max_input_len)
+        except DatasetFormatError as e:
+            raise click.UsageError(str(e))
 
         metadata.dataset_path = options.dataset_path
 
