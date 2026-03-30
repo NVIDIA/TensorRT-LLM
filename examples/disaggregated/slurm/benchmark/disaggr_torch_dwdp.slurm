@@ -150,6 +150,11 @@ replace_placeholder "${start_server_cmds_base_file}" "${all_nodes_str}" "${start
 server_config_base_file=${full_logdir}/server_config_base.yaml
 server_config_file=${full_logdir}/server_config.yaml
 replace_placeholder "${server_config_base_file}" "${all_nodes_str}" "${server_config_file}"
+mpi_worker_config_base_file=${full_logdir}/mpi_worker_config_base.yaml
+mpi_worker_config_file=${full_logdir}/mpi_worker_config.yaml
+if [ -f "${mpi_worker_config_base_file}" ]; then
+    replace_placeholder "${mpi_worker_config_base_file}" "${all_nodes_str}" "${mpi_worker_config_file}"
+fi
 client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"

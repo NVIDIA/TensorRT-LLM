@@ -380,7 +380,7 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp1dp2cp2]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp2tp1cp2]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
-accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_dwdp_accuracy
+accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
