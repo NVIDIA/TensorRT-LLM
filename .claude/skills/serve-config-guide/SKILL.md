@@ -1,5 +1,5 @@
 ---
-name: basic-agg-singlenode-config-guide
+name: serve-config-guide
 disable-model-invocation: true
 description: Generate a source-backed starting `trtllm-serve --config` YAML for
   basic aggregate single-node PyTorch serving, aligned with checked-in TensorRT-LLM
@@ -8,7 +8,7 @@ description: Generate a source-backed starting `trtllm-serve --config` YAML for
   exact-source-backed MTP recipes are allowed.
 ---
 
-# Basic Aggregate Single-Node Config Guide
+# Serve Config Guide
 
 **Scope:** aggregate/IFB (in-flight batching) colocated prefill+decode, single node, PyTorch backend, non-speculative by default.
 
