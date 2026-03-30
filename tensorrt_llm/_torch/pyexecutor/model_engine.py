@@ -1049,9 +1049,8 @@ class PyTorchModelEngine(ModelEngine):
         """
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        if (isinstance(kv_cache_manager, KVCacheManager)
-                and getattr(kv_cache_manager, 'blocks_in_secondary_pool', 0)
-                > 0):
+        if (isinstance(kv_cache_manager, KVCacheManager) and getattr(
+                kv_cache_manager, 'blocks_in_secondary_pool', 0) > 0):
             kv_cache_manager.impl.sync_transfer_manager_with_buffer_manager()
             kv_cache_manager.impl.refresh_blocks()
 
