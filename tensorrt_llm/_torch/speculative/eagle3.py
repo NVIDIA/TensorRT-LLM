@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -16,6 +17,11 @@ from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
+
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -73,7 +79,8 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.spec_tree_manager = None
 
         if isinstance(config,
-                      EagleDecodingConfig) and config.eagle_choices is not None:
+                      EagleDecodingConfig) and (config.eagle_choices is not None
+                                                or config.use_dynamic_tree):
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
                 use_dynamic_tree=config.use_dynamic_tree,
@@ -114,6 +121,43 @@ class Eagle3ResourceManager(BaseResourceManager):
     def shutdown(self):
         if self.sa_manager is not None:
             self.sa_manager.shutdown()
+
+    def get_max_resource_count(self) -> int:
+        return self.max_num_requests
+
+    def get_needed_resource_to_completion(self, request: LlmRequest):
+        return 0
+
+
+class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
+    """
+    Lightweight resource manager for one-model EAGLE3 dynamic tree mode.
+    Holds a SpecTreeManager so that model_engine and sampler can access it
+    for tree attention setup and verification routing.
+    """
+
+    def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
+        self.max_num_requests = max_num_requests
+        self.spec_tree_manager = SpecTreeManager(
+            max_num_requests=max_num_requests,
+            use_dynamic_tree=config.use_dynamic_tree,
+            max_draft_len=config.max_draft_len,
+            max_total_draft_tokens=config.tokens_per_gen_step - 1,
+            eagle_choices=config.eagle_choices,
+            dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+        )
+
+    def free_resources(self, request: LlmRequest):
+        """Clear tree validity for the freed request slot."""
+        if request.py_seq_slot is not None:
+            self.spec_tree_manager.mark_tree_invalid(request.py_seq_slot)
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        """Handle CUDA graph dummy request registration.
+
+        Dummies use _dummy_slot_id on the spec_tree_manager, so no
+        per-request slot allocation is needed.
+        """
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -313,6 +357,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     batch_indices_cuda: Optional[torch.Tensor] = None
     # Optional resource manager (used to access SA manager for EAGLE3+SA)
     spec_resource_manager: Optional[Eagle3ResourceManager] = None
+    # Dynamic tree flags
+    use_dynamic_tree: bool = False
+    eagle_choices: Optional[List[List[int]]] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -339,11 +386,16 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             device='cuda',
         )
 
-        # currently Eagle3 only supports linear tree
-        self.is_spec_dec_tree = False
-
-        # currently Eagle3 only supports static tree
-        self.is_spec_dec_dynamic_tree = False
+        # Set tree flags based on config
+        if self.use_dynamic_tree:
+            self.is_spec_dec_tree = True
+            self.is_spec_dec_dynamic_tree = True
+        elif self.eagle_choices is not None:
+            self.is_spec_dec_tree = True
+            self.is_spec_dec_dynamic_tree = False
+        else:
+            self.is_spec_dec_tree = False
+            self.is_spec_dec_dynamic_tree = False
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -358,7 +410,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        self.num_tokens -= (self.num_generations) * self.runtime_draft_len
+        if self.is_spec_dec_tree:
+            self.num_tokens -= (
+                self.num_generations) * self.max_total_draft_tokens
+        else:
+            self.num_tokens -= (self.num_generations) * self.max_draft_len
 
         sa_manager = getattr(self.spec_resource_manager, 'sa_manager', None)
         if sa_manager is not None:
@@ -382,12 +438,28 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
 
 class Eagle3OneModelSampler(MTPSampler):
+    """Sampler for one-model EAGLE3 (linear and dynamic tree modes)."""
 
-    def __init__(self, args: TorchSampler.Args):
-        super().__init__(args, nextn=args.max_draft_len)
+    def __init__(self, args: TorchSampler.Args, spec_config=None):
+        self._spec_config = spec_config
+        super().__init__(args, nextn=args.max_total_draft_tokens)
+
+    @override
+    def _get_max_new_tokens(self, args: TorchSampler.Args,
+                            draft_len: int) -> int:
+        """Dynamic tree: accepted path depth <= max_draft_len + 1."""
+        if (self._spec_config is not None
+                and getattr(self._spec_config, 'use_dynamic_tree', False)):
+            return self._spec_config.max_draft_len + 1
+        return self._get_max_tokens(args, draft_len)
 
 
 class Eagle3OneModelWorker(SpecWorkerBase):
+    """Eagle3 one-model worker for linear tree speculative decoding.
+
+    For dynamic tree mode, use Eagle3OneModelDynamicTreeWorker from
+    eagle3_dynamic_tree.py instead.
+    """
 
     def __init__(self,
                  spec_config: "EagleDecodingConfig",
@@ -399,6 +471,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if getattr(spec_config, 'use_sa_spec', False):
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
+        self.use_dynamic_tree = getattr(spec_config, 'use_dynamic_tree', False)
+        self.spec_tree_manager = None
 
     @property
     def max_draft_len(self) -> int:
@@ -417,6 +491,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         else:
             self._saved_kv_lens_cuda = None
 
+        # Save spec-dec params that the drafting loop will overwrite.
+        # Without this, CUDA graph warmup's second iteration would run
+        # the target model attention with stale draft-layer masks
+        # instead of the correct target-tree masks.
+        if attn_metadata.spec_decoding_packed_mask is not None:
+            self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:
+                                                                              batch_size].clone(
+                                                                              )
+        else:
+            self._saved_packed_mask = None
+        if attn_metadata.spec_decoding_position_offsets is not None:
+            self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
+            )
+        else:
+            self._saved_position_offsets = None
+        if attn_metadata.spec_decoding_generation_lengths is not None:
+            self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
+            )
+        else:
+            self._saved_generation_lengths = None
+
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
         if self._saved_kv_lens_cuda is not None:
@@ -424,6 +519,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[:batch_size].copy_(
                 self._saved_kv_lens_cuda)
             self._saved_kv_lens_cuda = None
+
+        if self._saved_packed_mask is not None:
+            batch_size = self._saved_packed_mask.shape[0]
+            attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(
+                self._saved_packed_mask)
+            self._saved_packed_mask = None
+        if self._saved_position_offsets is not None:
+            attn_metadata.spec_decoding_position_offsets.copy_(
+                self._saved_position_offsets)
+            self._saved_position_offsets = None
+        if self._saved_generation_lengths is not None:
+            batch_size = self._saved_generation_lengths.shape[0]
+            attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
+                self._saved_generation_lengths)
+            self._saved_generation_lengths = None
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -484,16 +594,64 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata=spec_metadata,
             draft_model=draft_model)
 
-        next_draft_tokens = []
+        # Predict draft tokens
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         # Get the draft KV cache manager if using separate layouts
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
+        next_draft_tokens = self._forward_draft_loop(
+            inputs, attn_metadata, spec_metadata, draft_model,
+            draft_kv_cache_manager, num_contexts, num_gens, batch_size,
+            num_accepted_tokens, original_all_rank_num_tokens, resource_manager)
+        # restore attn_metadata to support cuda graph
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        # restore all_rank_num_tokens for attention DP
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+
+        # prepare next new tokens to support overlap scheduler
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens,
+            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
+
+        attn_metadata.use_spec_decoding = True
+
+        return {
+            'logits': raw_logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens,
+        }
+
+    def _forward_draft_loop(self, inputs, attn_metadata, spec_metadata,
+                            draft_model, draft_kv_cache_manager, num_contexts,
+                            num_gens, batch_size, num_accepted_tokens,
+                            original_all_rank_num_tokens, resource_manager):
+        """Dispatch to the appropriate draft loop. Subclasses can override."""
+        return self._forward_linear_draft_loop(inputs, attn_metadata,
+                                               spec_metadata, draft_model,
+                                               draft_kv_cache_manager,
+                                               num_contexts, batch_size,
+                                               num_accepted_tokens,
+                                               original_all_rank_num_tokens)
+
+    def _forward_linear_draft_loop(self, inputs, attn_metadata, spec_metadata,
+                                   draft_model, draft_kv_cache_manager,
+                                   num_contexts, batch_size,
+                                   num_accepted_tokens,
+                                   original_all_rank_num_tokens):
+        """Original linear draft loop (1 token per layer)."""
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        next_draft_tokens = []
+        position_ids = inputs["position_ids"]
+
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
                 if i == 0:
+                    num_gens = batch_size - num_contexts
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
                         (runtime_draft_len + 1)).long()
@@ -581,26 +739,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
-        # restore attn_metadata to support cuda graph
-        self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        # restore all_rank_num_tokens for attention DP
-        if original_all_rank_num_tokens is not None:
-            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-
-        # prepare next new tokens to support overlap scheduler
-        next_new_tokens = self._prepare_next_new_tokens(
-            accepted_tokens, next_draft_tokens,
-            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
-
-        attn_metadata.use_spec_decoding = True
-
-        return {
-            'logits': raw_logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens,
-        }
+        return next_draft_tokens
 
     def sample_and_accept_draft_tokens(
         self,
@@ -612,8 +751,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
+        # Linear mode: reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens, spec_metadata.runtime_draft_len)
+            num_gens,
+            spec_metadata.runtime_draft_len) if num_gens > 0 else torch.empty(
+                0,
+                spec_metadata.runtime_draft_len,
+                dtype=torch.int,
+                device=logits.device)
         return self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 

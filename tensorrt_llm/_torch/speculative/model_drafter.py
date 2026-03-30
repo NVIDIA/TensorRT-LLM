@@ -650,7 +650,7 @@ class ModelDrafter(Drafter):
             target_model_req = self.req_id_to_old_request[request.py_request_id]
             if target_model_req.is_context_init_state:
                 continue
-            target_model_req.py_draft_tokens = [0] * self.max_draft_len
+            target_model_req.py_draft_tokens = [0] * self.max_total_draft_tokens
 
         self.draft_seq_slot_manager.prepare_resources(draft_batch)
         return draft_batch
@@ -960,11 +960,8 @@ class ModelDrafter(Drafter):
         self.last_draft_latency_ms = (draft_end_time - draft_start_time) * 1e3
 
     @nvtx_range("prepare_draft_tokens")
-    def prepare_draft_tokens(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
+    def prepare_draft_tokens(self, scheduled_requests: ScheduledRequests,
+                             resource_manager: ResourceManager) -> None:
         """
         Prepare draft tokens for the scheduled requests.
 

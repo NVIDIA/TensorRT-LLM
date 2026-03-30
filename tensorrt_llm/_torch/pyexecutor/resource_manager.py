@@ -237,7 +237,9 @@ def _update_kv_cache_draft_token_location(cache_manager,
             past_key_value_lengths,
             True,
             cache_manager.num_layers,
-            cache_manager.num_kv_heads,
+            # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
+            # total so the C++ kernel computes correct strides and grid dims.
+            cache_manager.num_kv_heads_per_layer[0],
             int(cache_manager.head_dim * kv_cache_dtype_byte_size),
             cache_manager.max_total_draft_tokens,
             cache_manager.max_attention_window_vec[0],
@@ -801,11 +803,6 @@ class KVCacheManager(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        if not self.is_draft:
-            _update_kv_cache_draft_token_location(self, scheduled_batch,
-                                                  attn_metadata,
-                                                  kv_cache_dtype_byte_size)
-
         # Rewind KV cache for requests with rejected draft tokens.
         # Skip:
         # - GENERATION_COMPLETE: finished requests

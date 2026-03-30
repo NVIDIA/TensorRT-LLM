@@ -14,9 +14,11 @@ from ..speculative.interface import SpecMetadata
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
+from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
+                     Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
+from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -91,6 +93,8 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
             spec_resource_manager=spec_resource_manager,
+            use_dynamic_tree=spec_config.use_dynamic_tree,
+            eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
@@ -180,6 +184,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             sa_manager=sa_manager,
         )
+    if spec_dec_mode.is_eagle3_one_model() and getattr(
+            spec_config, 'use_dynamic_tree', False):
+        return Eagle3OneModelDynamicTreeResourceManager(spec_config,
+                                                        max_num_requests)
     if spec_dec_mode.is_eagle3_one_model():
         sa_manager = None
         if getattr(spec_config, 'use_sa_spec', False):
@@ -241,7 +249,7 @@ def get_spec_decoder(
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelSampler(sampler_args)
+        return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
     if spec_config.spec_dec_mode.is_pard():
         return MTPSampler(sampler_args,
                           nextn=spec_config.tokens_per_gen_step - 1)
@@ -304,6 +312,9 @@ def get_spec_worker(spec_config,
         return MTPEagleWorker(spec_config, model_config,
                               use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
+        if getattr(spec_config, 'use_dynamic_tree', False):
+            return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
+                                                   use_separate_draft_kv_cache)
         return Eagle3OneModelWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
