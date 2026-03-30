@@ -4,7 +4,7 @@ import concurrent.futures
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, cast
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -108,74 +108,46 @@ class ReceiverBase(ABC):
     ...
 
 
-class TxSessionBase(ABC):
+class _SessionBase(ABC):
+    """Shared base for Tx/Rx sessions."""
+
+    def __init__(self, args: SessionArgsBase):
+        self._base_args = args
+
+    @property
+    def disagg_request_id(self) -> int:
+        return cast(int, self._base_args.params.disagg_request_id)
+
+    @abstractmethod
+    def is_completed(self) -> bool: ...
+
+    @abstractmethod
+    def wait_complete(self) -> Optional[WaitResult]: ...
+
+    @property
+    @abstractmethod
+    def exception(self) -> Optional[Exception]: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+
+class TxSessionBase(_SessionBase):
     def __init__(self, sender: SenderBase, args: SessionArgsBase):
-        """
-        Initializes the transmission session.
-        :param sender: The sender instance responsible for sending data.
-        :param args: The session arguments.
-        """
+        super().__init__(args)
         self._sender = sender
-        self._base_args = args
-
-    @property
-    def disagg_request_id(self) -> int:
-        return self._base_args.params.disagg_request_id
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> concurrent.futures.Future:
-        """
-        Sends a slice of KV cache data and returns a Future for the transfer.
-        :param slice: The KV slice to send.
-        """
-        ...
-
-    @property
-    @abstractmethod
-    def exception(self) -> Optional[Exception]:
-        """
-        Returns any exception that occurred during the session.
-        """
-        ...
-
-    @abstractmethod
-    def close(self) -> None:
-        """
-        Closes the session and releases any resources.
-        """
-        ...
+    def send(self, slice: KVSlice) -> concurrent.futures.Future: ...
 
 
-class RxSessionBase(ABC):
+class RxSessionBase(_SessionBase):
     def __init__(self, receiver: ReceiverBase, args: SessionArgsBase):
-        """
-        Initializes the reception session.
-        :param receiver: The receiver instance responsible for receiving data.
-        """
+        super().__init__(args)
         self._receiver = receiver
-        self._base_args = args
-
-    @property
-    def disagg_request_id(self) -> int:
-        return self._base_args.params.disagg_request_id
 
     @abstractmethod
-    def receive(self, slice: KVSlice) -> concurrent.futures.Future:
-        """
-        Receives a slice of KV cache data and returns a Future for the transfer.
-        :param slice: The KV slice to receive.
-        """
-        ...
-
-    @property
-    @abstractmethod
-    def exception(self) -> Optional[Exception]:
-        """Returns any exception that occurred during the session."""
-        ...
+    def receive(self, slice: KVSlice) -> concurrent.futures.Future: ...
 
     @abstractmethod
-    def close(self) -> None:
-        """
-        Closes the session and releases any resources.
-        """
-        ...
+    def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]: ...
