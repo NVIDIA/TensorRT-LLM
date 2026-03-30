@@ -231,6 +231,10 @@ methods:
         annotation: Optional[Dict[str, str]]
         default: null
         status: prototype
+      telemetry_config:
+        annotation: tensorrt_llm.usage.config.TelemetryConfig
+        default: null
+        status: prototype
       max_stats_len:
         annotation: int
         default: 1000

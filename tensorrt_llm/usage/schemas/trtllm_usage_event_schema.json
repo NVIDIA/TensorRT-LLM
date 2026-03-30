@@ -1,0 +1,166 @@
+{
+    "oneOf": [
+        {
+            "$ref": "#/definitions/events/trtllm_initial_report"
+        },
+        {
+            "$ref": "#/definitions/events/trtllm_heartbeat"
+        }
+    ],
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "schemaMeta": {
+        "schemaVersion": "0.1",
+        "clientId": "616561816355034",
+        "clientName": "TrtllmTelemetry",
+        "definitionVersion": "2.0"
+    },
+    "description": "TensorRT-LLM usage telemetry events. Collects anonymous session-level deployment data (GPU type, parallelism config, model architecture class) with opt-out via TRTLLM_NO_USAGE_STATS=1. Auto-disabled in CI/test environments.",
+    "definitions": {
+        "types": {
+            "ShortString": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 128
+            },
+            "LongString": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 256
+            },
+            "PositiveInt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+            }
+        },
+        "events": {
+            "trtllm_initial_report": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM initial session report with system and config details. No PII collected."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "trtllmVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "platform": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "pythonVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuArchitecture": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "gpuMemoryMB": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "cudaVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "architectureClassName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "backend": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "tensorParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "pipelineParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "contextParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "moeExpertParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "moeTensorParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "dtype": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "quantizationAlgo": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "kvCacheDtype": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "featuresJson": {
+                        "type": "string",
+                        "description": "JSON-serialized dict of feature flags (lora, speculative_decoding, prefix_caching, cuda_graphs, chunked_context, data_parallel_size)"
+                    },
+                    "disaggRole": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "deploymentId": {
+                        "$ref": "#/definitions/types/ShortString"
+                    }
+                },
+                "required": [
+                    "trtllmVersion",
+                    "platform",
+                    "pythonVersion",
+                    "cpuArchitecture",
+                    "cpuCount",
+                    "gpuCount",
+                    "gpuName",
+                    "gpuMemoryMB",
+                    "cudaVersion",
+                    "architectureClassName",
+                    "backend",
+                    "tensorParallelSize",
+                    "pipelineParallelSize",
+                    "contextParallelSize",
+                    "moeExpertParallelSize",
+                    "moeTensorParallelSize",
+                    "dtype",
+                    "quantizationAlgo",
+                    "kvCacheDtype",
+                    "ingressPoint",
+                    "featuresJson",
+                    "disaggRole",
+                    "deploymentId"
+                ]
+            },
+            "trtllm_heartbeat": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM periodic heartbeat for session duration tracking. No payload beyond sequence number."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "seq": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "seq"
+                ]
+            }
+        }
+    }
+}

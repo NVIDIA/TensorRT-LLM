@@ -283,6 +283,8 @@ def latency_command(
     llm = None
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = options.backend
+    if bench_env.telemetry_config is not None:
+        kwargs["telemetry_config"] = bench_env.telemetry_config
 
     # Set environment variables for setting runtime options.
     default_env_overrides = {
