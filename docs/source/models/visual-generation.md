@@ -1,7 +1,7 @@
-# Visual Generation (Prototype)
+# Visual Generation (Beta)
 
 ```{note}
-This feature is in **prototype** stage. APIs, supported models, and optimization options are
+This feature is in **beta** stage. APIs, supported models, and optimization options are
 actively evolving and may change in future releases.
 ```
 
