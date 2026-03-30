@@ -582,42 +582,44 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph = self.is_cuda_graph
             self.create_expanded_buffers(capture_graph=capture_graph)
 
+    @maybe_compile(dynamic=True)
+    def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens, device):
+        device = kv_lens.device
+        past_kv_lens = kv_lens - seq_lens
+        # get position ids
+        seq_ends = torch.cumsum(seq_lens, dim=0)
+        seq_starts = seq_ends - seq_lens
+        per_seq_offsets = past_kv_lens - seq_starts  # Shape: [batch_size]
+        global_indices = torch.arange(num_tokens, device=device)
+        batch_indices = torch.searchsorted(seq_ends,
+                                           global_indices,
+                                           side='right')
+        repeated_offsets = per_seq_offsets[batch_indices]
+        position_ids = global_indices + repeated_offsets
+        # get the dense topk indices with causal mask
+        range_row = torch.arange(self.sparse_mla_topk, device=device)
+        mask = range_row <= position_ids.unsqueeze(1)
+        return torch.where(mask, range_row, -1)
+
     def prepare_dense_topk_indices(self,
                                    kv_lens,
                                    device=False):  # device=False means use CPU
-
-        @maybe_compile(dynamic=True)
-        def _get_dense_topk_indices(seq_lens, kv_lens, num_tokens):
-            device = kv_lens.device
-            past_kv_lens = kv_lens - seq_lens
-            # get position ids
-            seq_ends = torch.cumsum(seq_lens, dim=0)
-            seq_starts = seq_ends - seq_lens
-            per_seq_offsets = past_kv_lens - seq_starts  # Shape: [batch_size]
-            global_indices = torch.arange(num_tokens, device=device)
-            batch_indices = torch.searchsorted(seq_ends,
-                                               global_indices,
-                                               side='right')
-            repeated_offsets = per_seq_offsets[batch_indices]
-            position_ids = global_indices + repeated_offsets
-            # get the dense topk indices with causal mask
-            range_row = torch.arange(self.sparse_mla_topk, device=device)
-            mask = range_row <= position_ids.unsqueeze(1)
-            return torch.where(mask, range_row, -1)
 
         if self.num_contexts > 0 and self.skip_indexer_for_ctx_reqs:
             ctx_range = slice(self.num_ctx_tokens)
             if device:
                 self.topk_indices_buffer[ctx_range, :].copy_(
-                    _get_dense_topk_indices(
+                    self._get_dense_topk_indices(
                         self.seq_lens_cuda[:self.num_contexts],
-                        kv_lens[:self.num_contexts], self.num_ctx_tokens),
+                        kv_lens[:self.num_contexts], self.num_ctx_tokens,
+                        device),
                     non_blocking=True)
             else:
                 self.host_topk_indices_buffer[
-                    ctx_range, :] = _get_dense_topk_indices(
+                    ctx_range, :] = self._get_dense_topk_indices(
                         self.seq_lens[:self.num_contexts],
-                        kv_lens[:self.num_contexts], self.num_ctx_tokens)
+                        kv_lens[:self.num_contexts], self.num_ctx_tokens,
+                        device)
                 self.topk_indices_buffer[ctx_range, :].copy_(
                     self.host_topk_indices_buffer[ctx_range, :],
                     non_blocking=True)
@@ -626,17 +628,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             gen_range = slice(self.num_ctx_tokens, self.num_tokens)
             if device:
                 self.topk_indices_buffer[gen_range, :].copy_(
-                    _get_dense_topk_indices(
+                    self._get_dense_topk_indices(
                         self.seq_lens_cuda[self.num_contexts:self.num_seqs],
                         kv_lens[self.num_contexts:self.num_seqs],
-                        self.num_tokens - self.num_ctx_tokens),
+                        self.num_tokens - self.num_ctx_tokens, device),
                     non_blocking=True)
             else:
                 self.host_topk_indices_buffer[
-                    gen_range, :] = _get_dense_topk_indices(
+                    gen_range, :] = self._get_dense_topk_indices(
                         self.seq_lens[self.num_contexts:self.num_seqs],
                         kv_lens[self.num_contexts:self.num_seqs],
-                        self.num_tokens - self.num_ctx_tokens)
+                        self.num_tokens - self.num_ctx_tokens, device)
                 self.topk_indices_buffer[gen_range, :].copy_(
                     self.host_topk_indices_buffer[gen_range, :],
                     non_blocking=True)
