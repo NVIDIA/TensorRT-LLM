@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -481,3 +481,33 @@ class GroupwiseQuantAlgo:
     PRE_QUANT_SCALE = 4
     W4A8_ALPHA = 8
     INT8_WEIGHT = 16
+
+
+def get_sm_version_from_torch() -> Optional[int]:
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+
+    major, minor = torch.cuda.get_device_capability(torch.device("cuda:0"))
+    return major * 10 + minor
+
+
+def is_mxfp4_supported(sm, quant_mode):
+    name = str(quant_mode)
+
+    if "W4A8_MXFP4" in name:
+        return sm in (100, 103)
+    if "W4A16_MXFP4" in name:
+        return sm == 90
+    if "NVFP4" in name:
+        return sm in (100, 103, 120, 121)
+
+    return True
+
+
+def get_mxfp4_support_error_message(sm, quant_mode):
+    return f"{quant_mode} is not supported on SM{sm}. Supported on newer architectures only."
