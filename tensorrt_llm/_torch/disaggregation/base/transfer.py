@@ -158,7 +158,17 @@ class TxSessionBase(_SessionBase):
         self._sender = sender
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> None: ...
+    def send(self, slice: KVSlice, chunk_block_offset: int = 0) -> None:
+        """Send a KV slice.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+            chunk_block_offset: Block offset into the receiver's full
+                destination block list for this chunk. Used by sender-side
+                chunking to slice the receiver's destination blocks correctly.
+                Defaults to 0 for monolithic transfer.
+        """
+        ...
 
 
 class RxSessionBase(_SessionBase):

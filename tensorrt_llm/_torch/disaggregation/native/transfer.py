@@ -7,7 +7,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -202,6 +202,17 @@ class AuxSendTask(SendTaskBase):
 
 
 class KVSendTask(SendTaskBase):
+    """A per-slice send task within a TxSession.
+
+    Args:
+        kv_slice: The KV slice describing which blocks to transfer.
+        params: Disaggregated serving parameters for this request.
+        slice_id: Index of this slice within the session's task list.
+        chunk_block_offset: Block offset into the receiver's full
+            destination block list.  Used by sender-side chunking to
+            slice the receiver's destination blocks correctly.
+    """
+
     def __init__(
         self,
         kv_slice: KVSlice,
@@ -209,13 +220,15 @@ class KVSendTask(SendTaskBase):
         slice_id: int,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
-    ):
+        chunk_block_offset: int = 0,
+    ) -> None:
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
         self._prompt_len = prompt_len
         self._beam_width = beam_width
+        self.chunk_block_offset = chunk_block_offset
 
 
 class Sender(SenderBase):
@@ -493,7 +506,7 @@ class Sender(SenderBase):
                 f"in {status.value} state; sending FAILED to receiver"
             )
             # Task may have been enqueued after cancel() already iterated kv_tasks,
-            # so its future was never set by cancel(). Set it here as a fallback.
+            # so its event was never set by cancel(). Set it here as a fallback.
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
@@ -503,7 +516,7 @@ class Sender(SenderBase):
                     str(self._instance_rank).encode("ascii"),
                     str(write_meta.unique_rid).encode("ascii"),
                     str(write_meta.slice_id).encode("ascii"),
-                    b"True",  # is_last_slice — ensures receiver resolves its task future
+                    b"True",  # is_last_slice — ensures receiver resolves its task event
                     AgentResult.FAILED.value.encode("ascii"),
                 ]
             )
@@ -536,13 +549,19 @@ class Sender(SenderBase):
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
-        ## TODO: just last slice need to send task state?
+        # The receiver always has a single monolithic task (slice_id=0).
+        # Sender-side chunking is transparent to the receiver: only the
+        # last chunk carries is_last_slice=True so the receiver knows
+        # when all data has arrived.  Intermediate chunk results are
+        # sent (not suppressed) so that RDMA failures propagate to the
+        # receiver immediately rather than requiring a timeout.
+        receiver_slice_id = 0
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.KV_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
                 str(write_meta.unique_rid).encode("ascii"),
-                str(write_meta.slice_id).encode("ascii"),
+                str(receiver_slice_id).encode("ascii"),
                 str(write_meta.is_last_slice).encode("ascii"),
                 agent_result.value.encode("ascii"),
             ]
@@ -569,6 +588,29 @@ class Sender(SenderBase):
                 )
             else:
                 task.complete()
+                if session._on_chunk_transferred is not None:
+                    try:
+                        # Use the max across layer groups as the
+                        # cumulative release count.  For asymmetric
+                        # layer groups (e.g., sliding window), shorter
+                        # groups may have fewer blocks per chunk, but
+                        # each WindowBlockManager independently clamps
+                        # to its own allocated block count via
+                        # min(numBlocks, allocatedBlocks.size()).
+                        num_blocks = max(
+                            (len(ids) for ids in task._slice.block_ids_per_layer_groups),
+                            default=0,
+                        )
+                        session._on_chunk_transferred(
+                            request_id=session.request_id,
+                            chunk_block_offset=task.chunk_block_offset,
+                            num_blocks=num_blocks,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"on_chunk_transferred callback failed for "
+                            f"request {session.request_id} slice {write_meta.slice_id}: {e}"
+                        )
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -701,10 +743,20 @@ class Sender(SenderBase):
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-            # Aggregate fragments from all matching pools using numpy concatenation
+            chunk_offset = task.chunk_block_offset
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
-                dst_block_ids = dst_block_ids_per_groups[peer_lg]
+                full_dst_block_ids = dst_block_ids_per_groups[peer_lg]
+
+                # When sender uses chunking, the receiver sends all dst
+                # blocks in a single RecvReqInfo.  Slice dst to match
+                # this task's src chunk position.
+                if chunk_offset > 0 or len(src_block_ids) < len(full_dst_block_ids):
+                    dst_block_ids = full_dst_block_ids[
+                        chunk_offset : chunk_offset + len(src_block_ids)
+                    ]
+                else:
+                    dst_block_ids = full_dst_block_ids
 
                 # Speculative decoding: generation may have one extra draft-token block.
                 block_diff = dst_block_ids.size - src_block_ids.size
@@ -965,7 +1017,7 @@ class Sender(SenderBase):
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
             # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
-            # Send it directly to unblock the receiver's TRANSFERRING task future;
+            # Send it directly to unblock the receiver's TRANSFERRING task event;
             # CANCEL_SESSION alone would leave it stuck indefinitely.
             if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
                 self._send_failed_result_to_receiver(info)
@@ -1104,6 +1156,7 @@ class TxSession(TxSessionBase):
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
+        on_chunk_transferred: Optional[Callable] = None,
     ):
         super().__init__(
             sender,
@@ -1119,6 +1172,7 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
+        self._on_chunk_transferred = on_chunk_transferred
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -1154,7 +1208,7 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
-    def send(self, slice: KVSlice) -> None:
+    def send(self, slice: KVSlice, chunk_block_offset: int = 0) -> None:
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
@@ -1164,6 +1218,7 @@ class TxSession(TxSessionBase):
                 slice_id,
                 prompt_len=self._base_args.prompt_len,
                 beam_width=self._base_args.beam_width,
+                chunk_block_offset=chunk_block_offset,
             )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
@@ -1996,7 +2051,23 @@ class TransferWorker:
         self._rank_info.sender_endpoints = endpoints
         self._rank_info.layer_num_per_pp = layer_num_per_pp
 
-    def create_tx_session(self, request: LlmRequest) -> TxSession:
+    def create_tx_session(
+        self,
+        request: LlmRequest,
+        on_chunk_transferred: Optional[Callable] = None,
+    ) -> TxSession:
+        """Create a TxSession for the given request.
+
+        Args:
+            request: The LLM request to create a send session for.
+            on_chunk_transferred: Optional callback invoked on the
+                sender worker thread after each chunk's RDMA completes.
+                Signature: ``(request_id: int, chunk_block_offset: int,
+                num_blocks: int) -> None``.
+
+        Returns:
+            A new ``TxSession`` ready to accept ``send()`` calls.
+        """
         params = request.py_disaggregated_params
         assert params is not None
         return TxSession(
@@ -2007,6 +2078,7 @@ class TransferWorker:
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
             beam_width=request.py_beam_width,
+            on_chunk_transferred=on_chunk_transferred,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
