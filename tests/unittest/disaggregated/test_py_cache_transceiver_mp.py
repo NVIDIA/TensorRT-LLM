@@ -1021,7 +1021,6 @@ def run_v2_transceiver_mp(
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
-    master_port = find_free_port()
 
     dp_str = (
         f", ctx_dp={ctx_enable_dp}, gen_dp={gen_enable_dp}"
@@ -1036,24 +1035,45 @@ def run_v2_transceiver_mp(
         f"{dp_str}{mla_str}{mode_str}"
     )
 
-    mp.spawn(
-        worker_fn,
-        args=(
-            world_size,
-            master_addr,
-            master_port,
-            ctx_tp,
-            ctx_pp,
-            gen_tp,
-            gen_pp,
-            ctx_enable_dp,
-            gen_enable_dp,
-            is_mla,
-            ctx_gen_workflow,
-        ),
-        nprocs=world_size,
-        join=True,
-    )
+    # Retry on EADDRINUSE: find_free_port() has a TOCTOU race in CI where
+    # parallel tests may grab the port between discovery and mp.spawn binding.
+    max_retries = 5
+    last_exc = None
+    for attempt in range(max_retries):
+        master_port = find_free_port()
+        try:
+            mp.spawn(
+                worker_fn,
+                args=(
+                    world_size,
+                    master_addr,
+                    master_port,
+                    ctx_tp,
+                    ctx_pp,
+                    gen_tp,
+                    gen_pp,
+                    ctx_enable_dp,
+                    gen_enable_dp,
+                    is_mla,
+                    ctx_gen_workflow,
+                ),
+                nprocs=world_size,
+                join=True,
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            if "EADDRINUSE" in str(e) or "address already in use" in str(e).lower():
+                if attempt < max_retries - 1:
+                    print(
+                        f"Port {master_port} already in use, retrying with a new port "
+                        f"(attempt {attempt + 1}/{max_retries})...",
+                        flush=True,
+                    )
+                    continue
+            raise
+    else:
+        raise last_exc
 
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 
