@@ -367,7 +367,9 @@ def test_gemma3n_causal_lm_ties_lm_head_to_input_embeddings():
 
 def test_gemma3n_conditional_lm_ties_lm_head_to_input_embeddings():
     model = Gemma3nForConditionalGeneration(_small_full_config())
-    assert model.lm_head.weight.data_ptr() == model.model.language_model.embed_tokens.weight.data_ptr()
+    assert (
+        model.lm_head.weight.data_ptr() == model.model.language_model.embed_tokens.weight.data_ptr()
+    )
 
 
 def test_gemma3n_shared_kv_layer_metadata_matches_config():
