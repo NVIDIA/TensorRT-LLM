@@ -382,7 +382,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # requests before context-phase response data arrives.
         return {
             "ctx_dp_rank": self._dp_rank,
-            "ctx_info_endpoint": self._context_info_endpoint or None,
+            "ctx_info_endpoint": [self._context_info_endpoint]
+            if self._context_info_endpoint
+            else None,
         }
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
