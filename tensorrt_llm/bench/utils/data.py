@@ -32,12 +32,17 @@ def initialize_tokenizer(model_name: str,
         tokenizer_path = TOKENIZER_ALIASES.get(custom_tokenizer,
                                                custom_tokenizer)
         from importlib import import_module
-        module_path, class_name = tokenizer_path.rsplit('.', 1)
-        module = import_module(module_path)
-        tokenizer_class = getattr(module, class_name)
-        tokenizer = tokenizer_class.from_pretrained(model_name,
-                                                    padding_side="left",
-                                                    trust_remote_code=True)
+        try:
+            module_path, class_name = tokenizer_path.rsplit('.', 1)
+            module = import_module(module_path)
+            tokenizer_class = getattr(module, class_name)
+            tokenizer = tokenizer_class.from_pretrained(model_name,
+                                                        padding_side="left",
+                                                        trust_remote_code=True)
+        except (ValueError, ImportError, AttributeError) as e:
+            raise ValueError(
+                f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
+                "Expected alias or 'module.path.ClassName'.") from e
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_name,
                                                   padding_side="left",

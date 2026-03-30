@@ -101,8 +101,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     "--custom_tokenizer",
     type=str,
     default=None,
-    help=
-    "Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+    help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
     "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
     "is incompatible with AutoTokenizer.",
 )
@@ -211,8 +210,7 @@ def latency_command(
     medusa_choices = params.get("medusa_choices")
     custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(options.checkpoint_path,
-                                     custom_tokenizer)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
