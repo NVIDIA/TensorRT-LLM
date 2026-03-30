@@ -29,7 +29,7 @@ These methods run on the leader process and drive the connector's behavior.
 
 * **`build_connector_meta(self, scheduler_output: SchedulerOutput) -> object`**
   * **Description**: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.
-  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, and current request states.
+  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` uses the same hash construction as KV cache events, but it can appear slightly earlier than the corresponding event emission because it is updated as soon as a full block is available.
   * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**

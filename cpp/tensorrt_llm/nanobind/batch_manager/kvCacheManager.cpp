@@ -395,6 +395,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
         .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
 
+    m.def("get_stored_block_hashes", &tbk::getStoredBlockHashes, nb::arg("llm_request"),
+        nb::arg("tokens_per_block"));
+
     nb::class_<tbk::KVCacheEventManager>(m, "KVCacheEventManager")
         .def(nb::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),
             nb::arg("max_kv_event_entries"), nb::arg("attention_dp_rank") = std::nullopt,

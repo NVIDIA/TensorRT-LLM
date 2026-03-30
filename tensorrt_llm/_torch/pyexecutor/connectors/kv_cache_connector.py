@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,6 +45,7 @@ from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheConnectorManager as KvCacheConnectorManagerCpp,
+    get_stored_block_hashes,
 )
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -54,7 +55,6 @@ from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from ..resource_manager import KVCacheManager
-
 
 # Used to store data for a single inflight request.
 @dataclass
@@ -69,6 +69,11 @@ class RequestData:
     computed_position: int
     # The number of scheduled tokens for the upcoming forward pass.
     num_scheduled_tokens: int
+    # The cumulative sequence block hash chain built with the same hash
+    # function as KV cache events. This can front-run event emission slightly:
+    # when a token completes a block, the corresponding block hash is appended
+    # in the same scheduler iteration that reports that token.
+    block_hashes: List[int] = field(default_factory=list)
     # The retention priorities for each new block (same length as new_block_ids).
     # Used for priority-based offload filtering. None means use default priority.
     priorities: Optional[List[int]] = None
@@ -308,6 +313,8 @@ class KvCacheConnectorSchedulerOutputRequest:
     def update_and_build_data(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
         block_ids = kv_cache_manager.get_cache_indices(req)
         tokens = req.get_tokens(0)
+        block_hashes = list(
+            get_stored_block_hashes(req, kv_cache_manager.tokens_per_block))
 
         new_block_ids = block_ids[len(self.block_ids) :]
         new_tokens = tokens[len(self.tokens) :]
@@ -341,7 +348,8 @@ class KvCacheConnectorSchedulerOutputRequest:
             new_block_ids,
             computed_position,
             num_scheduled_tokens,
-            priorities,
+            block_hashes=block_hashes,
+            priorities=priorities,
         )
 
 

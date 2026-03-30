@@ -111,6 +111,47 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
+std::vector<HashIdType> getStoredBlockHashes(LlmRequest const& llmRequest, SizeType32 tokensPerBlock)
+{
+    TLLM_CHECK_WITH_INFO(tokensPerBlock > 0, "tokensPerBlock must be > 0.");
+    TLLM_CHECK_WITH_INFO(
+        llmRequest.getTokens().size() == 1, "getStoredBlockHashes only supports beam width 1 requests.");
+
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(0);
+    if (uniqueTokens.empty())
+    {
+        return {};
+    }
+
+    auto const usableSize = static_cast<SizeType32>(uniqueTokens.size());
+    auto const vecEnd = uniqueTokens.begin() + usableSize;
+
+    std::list<VecUniqueTokens> blockedUniqueTokens;
+    for (auto begin = uniqueTokens.begin(); begin < vecEnd; begin += tokensPerBlock)
+    {
+        auto const blockSize = std::min(tokensPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
+        if (blockSize == tokensPerBlock)
+        {
+            blockedUniqueTokens.emplace_back(begin, begin + blockSize);
+        }
+    }
+
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+
+    std::vector<HashIdType> blockHashes;
+    blockHashes.reserve(blockKeys.size());
+
+    HashIdType parentHash = 0;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto const blockHash = static_cast<HashIdType>(BlockKeyHasher::hash(blockKey, parentHash));
+        blockHashes.push_back(blockHash);
+        parentHash = blockHash;
+    }
+
+    return blockHashes;
+}
+
 bool BlockKey::operator==(BlockKey const& other) const noexcept
 {
     return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens
