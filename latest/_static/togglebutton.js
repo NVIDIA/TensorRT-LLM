@@ -50,7 +50,7 @@ var initToggleItems = () => {
 
       // Add click handlers for the button + admonition title (if admonition)
       admonitionTitle = document.querySelector(
-        `#${toggleID} > .admonition-title`
+        `#` + CSS.escape(toggleID) + ` > .admonition-title`
       );
       if (admonitionTitle) {
         // If an admonition, then make the whole title block clickable

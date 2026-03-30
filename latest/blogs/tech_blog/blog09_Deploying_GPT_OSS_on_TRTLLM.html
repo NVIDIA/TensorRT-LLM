@@ -56,14 +56,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../_static/togglebutton.js?v=1ae7504c"></script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc9';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc9" />
+  <meta name="docsearch:version" content="1.3.0rc10" />
 
 
   </head>
@@ -554,7 +554,7 @@ This guide covers both low-latency and max-throughput cases.</p>
 </section>
 <section id="launching-the-tensorrt-llm-docker-container">
 <h2>Launching the TensorRT LLM docker container<a class="headerlink" href="#launching-the-tensorrt-llm-docker-container" title="Link to this heading">#</a></h2>
-<p>The container image that you will use will be pulled from NVIDIA’s NGC. This container is multi-platform and will run on both x64 and arm64 architectures: <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev</span></code></p>
+<p>The container image that you will use will be pulled from NVIDIA’s NGC. This container is multi-platform and will run on both x64 and arm64 architectures: <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc1</span></code></p>
 <p>Run the follow docker command to start the TensorRT LLM container in interactive mode:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--ipc<span class="o">=</span>host<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span><span class="se">\</span>
@@ -690,7 +690,7 @@ This guide covers both low-latency and max-throughput cases.</p>
 </section>
 <section id="launch-the-tensorrt-llm-server">
 <h2>Launch the TensorRT-LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h2>
-<p>We can use <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to serve the model by translating the benchmark commands above. For low-latency configuration, run:
+<p>We can use <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to serve the model by translating the benchmark commands above. For low-latency configuration, run:<br />
 <strong>Note:</strong> You can also point to a local path containing the model weights instead of the HF repo (e.g., <code class="docutils literal notranslate"><span class="pre">${local_model_path}</span></code>).</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
 trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
@@ -856,7 +856,7 @@ others according to your needs.</p>
 <section id="troubleshooting-tips">
 <h2>Troubleshooting Tips<a class="headerlink" href="#troubleshooting-tips" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p>If you encounter CUDA out-of-memory errors, try reducing <code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code>, or <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code>. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md">doc</a> for the explanation of these parameters.</p></li>
+<li><p>If you encounter CUDA out-of-memory errors, try reducing <code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code>, or <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code>. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md">doc</a> for the explanation of these parameters.</p></li>
 <li><p>Add <code class="docutils literal notranslate"><span class="pre">print_iter_log:</span> <span class="pre">true</span></code> to extra LLM API options YAML file to inspect the per-iteration log.</p></li>
 <li><p>Check GPU utilization with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> while the server is running to inspect GPU status and memory usage.</p></li>
 <li><p>If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed</p></li>
@@ -1031,9 +1031,9 @@ others according to your needs.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 22, 2026.</p>
+  <p>Last updated on March 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3353334">3353334</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
   
 </div></div>
       

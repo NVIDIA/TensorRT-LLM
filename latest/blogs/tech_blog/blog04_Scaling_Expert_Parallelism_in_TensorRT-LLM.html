@@ -56,7 +56,7 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../_static/togglebutton.js?v=1ae7504c"></script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc9';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -80,7 +80,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc9" />
+  <meta name="docsearch:version" content="1.3.0rc10" />
 
 
   </head>
@@ -941,7 +941,7 @@ More details can be found in <a class="reference external" href="https://github.
 </section>
 <section id="offline-ep-load-balancer">
 <h3>Offline EP Load Balancer<a class="headerlink" href="#offline-ep-load-balancer" title="Link to this heading">#</a></h3>
-<p>Online EP balancer is more suitable for production deployment needs to react timely to online traffic changes. However, Offline EP Balancer provides a lightweight way for performance study/debugging and validation. You can refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/4695">this PR</a> to learn more about the implementation of the Offline EP Load Balancer. Also there is a tool provided to collect statistics about the expert activation distribution which can be used as the input to deduce the EP balancing placement strategy. You can refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/examples/ep_load_balancer#offline-ep-load-balancer">this</a> doc to learn more details as well as how how to run through the Offline EP Load Balancer in E2E approach.</p>
+<p>Online EP balancer is more suitable for production deployment needs to react timely to online traffic changes. However, Offline EP Balancer provides a lightweight way for performance study/debugging and validation. You can refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/4695">this PR</a> to learn more about the implementation of the Offline EP Load Balancer. Also there is a tool provided to collect statistics about the expert activation distribution which can be used as the input to deduce the EP balancing placement strategy. You can refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#offline-ep-load-balancer">this</a> doc to learn more details as well as how to run through the Offline EP Load Balancer in E2E approach.</p>
 </section>
 </section>
 <section id="e2e-evaluation">
@@ -1090,7 +1090,7 @@ Clearly in Figure 25, we can see that EPLB brings a clear performance improvemen
 <p>The code and scripts required in the reproducing steps described in this section have been merged to the main branch.</p>
 <section id="id3">
 <h3>The effect of EP Load Balancer<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
-<p>Please, refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/examples/ep_load_balancer">EP Load Balancer example</a> for how to reproduce the results for the offline EP Load Balancer.</p>
+<p>Please, refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer">EP Load Balancer example</a> for how to reproduce the results for the offline EP Load Balancer.</p>
 <section id="step-1-run-inference-and-collect-statistics">
 <h4>Step 1: Run inference and collect statistics<a class="headerlink" href="#step-1-run-inference-and-collect-statistics" title="Link to this heading">#</a></h4>
 <p>To generate the necessary statistics for load rebalancing, run your model on a target dataset and count the routed expert IDs during inference. Once the counting process is complete, the statistics will be saved for further processing.</p>
@@ -1103,7 +1103,7 @@ Clearly in Figure 25, we can see that EPLB brings a clear performance improvemen
 <span class="nb">export</span><span class="w"> </span><span class="nv">EXPERT_STATISTIC_ITER_RANGE</span><span class="o">=</span><span class="m">100</span>-200
 </pre></div>
 </div>
-<p>Prepare a dataset following the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-benchmarking.md#preparing-a-dataset">benchmarking documentation</a> and save it as <code class="docutils literal notranslate"><span class="pre">./dataset.json</span></code>.</p>
+<p>Prepare a dataset following the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-benchmarking.md#preparing-a-dataset">benchmarking documentation</a> and save it as <code class="docutils literal notranslate"><span class="pre">./dataset.json</span></code>.</p>
 <p>Run 32-way expert parallelism inference on the prepared dataset. Please refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_bench.sh">LLM API MGMN example</a> for details on running <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> on Slurm.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span>&gt;<span class="w"> </span>./config.yaml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
 <span class="s">enable_attention_dp: true</span>
@@ -1123,8 +1123,8 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="
 <span class="w">    </span>--eos_id<span class="w"> </span>-1
 </pre></div>
 </div>
-<p>After inference, review the dumped statistic files in <code class="docutils literal notranslate"><span class="pre">$EXPERT_STATISTIC_PATH</span></code>. Run the <code class="docutils literal notranslate"><span class="pre">examples/ep_load_balancer/report_load_statistics.py</span></code> script to show the standard deviation and imbalance ratio metrics:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/ep_load_balancer/report_load_statistics.py<span class="w"> </span>--expert_statistic_path<span class="w"> </span><span class="nv">$EXPERT_STATISTIC_PATH</span>
+<p>After inference, review the dumped statistic files in <code class="docutils literal notranslate"><span class="pre">$EXPERT_STATISTIC_PATH</span></code>. Run the <code class="docutils literal notranslate"><span class="pre">examples/wide_ep/ep_load_balancer/report_load_statistics.py</span></code> script to show the standard deviation and imbalance ratio metrics:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/wide_ep/ep_load_balancer/report_load_statistics.py<span class="w"> </span>--expert_statistic_path<span class="w"> </span><span class="nv">$EXPERT_STATISTIC_PATH</span>
 </pre></div>
 </div>
 <p>The output would look like:</p>
@@ -1143,8 +1143,8 @@ average  1024.0  491.651199         1.564272
 </section>
 <section id="step-2-generate-the-eplb-configuration">
 <h4>Step 2: Generate the EPLB configuration<a class="headerlink" href="#step-2-generate-the-eplb-configuration" title="Link to this heading">#</a></h4>
-<p>Use the provided <code class="docutils literal notranslate"><span class="pre">examples/ep_load_balancer/generate_eplb_config.py</span></code> script to convert the collected statistics into an EPLB configuration file. Specify the target expert parallelism size (<code class="docutils literal notranslate"><span class="pre">--ep_size</span></code>) and the total number of slots (<code class="docutils literal notranslate"><span class="pre">--num_slots</span></code>) that will be used for deployment. For example, if we choose to maintain 8 expert slots per rank while increasing expert parallelism to 36 ways, there should be 32 redundant experts and 288 expert slots in total.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/ep_load_balancer/generate_eplb_config.py<span class="w"> </span><span class="se">\</span>
+<p>Use the provided <code class="docutils literal notranslate"><span class="pre">examples/wide_ep/ep_load_balancer/generate_eplb_config.py</span></code> script to convert the collected statistics into an EPLB configuration file. Specify the target expert parallelism size (<code class="docutils literal notranslate"><span class="pre">--ep_size</span></code>) and the total number of slots (<code class="docutils literal notranslate"><span class="pre">--num_slots</span></code>) that will be used for deployment. For example, if we choose to maintain 8 expert slots per rank while increasing expert parallelism to 36 ways, there should be 32 redundant experts and 288 expert slots in total.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/wide_ep/ep_load_balancer/generate_eplb_config.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ep_size<span class="w"> </span><span class="m">36</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num_slots<span class="w"> </span><span class="m">288</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--expert_statistic_path<span class="w"> </span><span class="nv">$EXPERT_STATISTIC_PATH</span><span class="w"> </span><span class="se">\</span>
@@ -1195,8 +1195,8 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="
 <span class="w">    </span>--eos_id<span class="w"> </span>-1
 </pre></div>
 </div>
-<p>Run the <code class="docutils literal notranslate"><span class="pre">examples/ep_load_balancer/report_load_statistics.py</span></code> script again:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/ep_load_balancer/report_load_statistics.py<span class="w"> </span>--expert_statistic_path<span class="w"> </span><span class="nv">$EXPERT_STATISTIC_PATH</span>
+<p>Run the <code class="docutils literal notranslate"><span class="pre">examples/wide_ep/ep_load_balancer/report_load_statistics.py</span></code> script again:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/wide_ep/ep_load_balancer/report_load_statistics.py<span class="w"> </span>--expert_statistic_path<span class="w"> </span><span class="nv">$EXPERT_STATISTIC_PATH</span>
 </pre></div>
 </div>
 <p>The output would look like:</p>
@@ -1482,9 +1482,9 @@ Based on our current performance analysis, when you plan to apply large-scale EP
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 22, 2026.</p>
+  <p>Last updated on March 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3353334">3353334</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
   
 </div></div>
       
