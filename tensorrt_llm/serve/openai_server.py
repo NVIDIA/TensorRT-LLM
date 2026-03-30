@@ -1448,7 +1448,6 @@ class OpenAIServer:
             )
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
-                postproc_args.tokenizer = self.tokenizer
 
             # Disconnect cancellation
             asyncio.create_task(self.await_disconnected(raw_request, promise))
