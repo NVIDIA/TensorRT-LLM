@@ -303,6 +303,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: HuggingFaceTB/SmolLM3-3B-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Gemma 3n (Jun 2025) - on-device VLM ---
+- name: google/gemma-3n-E2B-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml']
+- name: google/gemma-3n-E4B-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- JetBrains Mellum (Apr 2025) - code specialist ---
 - name: JetBrains/Mellum-4b-sft-all
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
