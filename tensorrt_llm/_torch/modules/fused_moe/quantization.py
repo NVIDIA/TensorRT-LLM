@@ -251,6 +251,8 @@ class FusedMoEMethodBase(ABC):
     to work with online EPLB should override this to SUPPORTED; those that
     have not yet been tested may set it to NOT_VERIFIED.
     """
+    needs_post_load_processing_for_dummy: bool = False
+    """Whether LoadFormat.DUMMY must finish weight processing in post_load_weights()."""
 
     @classmethod
     def supports_online_eplb(cls) -> bool:
@@ -326,6 +328,8 @@ class FusedMoEMethodBase(ABC):
             module.w2_bias = None
 
         module.rebuild_tensor_metadata = {}
+        module._needs_post_load_weight_processing = True
+        module._weights_loaded_via_load_weights = False
 
     def load_expert_weights_to_dst(
             self,
@@ -437,6 +441,7 @@ class FusedMoEMethodBase(ABC):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        module._weights_loaded_via_load_weights = True
         if allow_partial_loading:
             if not isinstance(self,
                               (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
@@ -519,8 +524,23 @@ class FusedMoEMethodBase(ABC):
 
         if not allow_partial_loading:
             self.process_weights_after_loading(module)
+            module._needs_post_load_weight_processing = False
 
     def post_load_weights(self, module: torch.nn.Module):
+        # LoadFormat.DUMMY initializes parameters in-place without calling
+        # load_weights(), so only methods that explicitly opt in should finish
+        # their processing here unless load_weights() left work unfinished.
+        needs_post_load_processing = getattr(
+            module, "_needs_post_load_weight_processing", True)
+        loaded_via_load_weights = getattr(module,
+                                          "_weights_loaded_via_load_weights",
+                                          False)
+        if needs_post_load_processing and (
+                loaded_via_load_weights
+                or self.needs_post_load_processing_for_dummy):
+            self.process_weights_after_loading(module)
+            module._needs_post_load_weight_processing = False
+
         if self.need_load_shared_weights(module):
             weight_fns = {
                 'w3_w1_weight': getattr(module, 'local_shared_w3_w1_tensors'),
@@ -676,6 +696,7 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
     block_k = 64
     use_shuffled_weight = True
     weight_layout = TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
+    needs_post_load_processing_for_dummy = True
     _cache_permute_indices: Dict[tuple[tuple[int, ...], str, int],
                                  torch.Tensor] = {}
 
