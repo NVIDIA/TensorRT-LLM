@@ -203,7 +203,7 @@ class _TrtllmMLAPlanner:
             # head_size=qk_head_dim (192), num_kv_heads=num_heads (32), v_head_dim=128
             # q_lora_rank=0: DeepSeek-V3-Lite has no Q compression (q_lora_rank=None)
             mla_params = MLAParams(
-                q_lora_rank=0,
+                q_lora_rank=kv_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
@@ -220,7 +220,7 @@ class _TrtllmMLAPlanner:
         else:
             # Decode wrapper: latent dimensions (matches PT's self.mqa)
             mla_params = MLAParams(
-                q_lora_rank=0,
+                q_lora_rank=kv_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
