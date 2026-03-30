@@ -496,6 +496,7 @@ def prepare_trtllm_mla_metadata_host(
     seq_len_with_cache_host: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_host: torch.Tensor,
+    request_ids_host: torch.Tensor,
 ) -> None:
     """Fill thop-specific HOST metadata (pinned tensors for thop.attention).
 
@@ -508,9 +509,10 @@ def prepare_trtllm_mla_metadata_host(
     max_blocks_per_seq = batch_info.get_max_blocks_per_seq()
     max_batch_size = batch_info.get_max_batch_size()
 
-    _GlobalTrtllmMLAPlanner.reset(torch.device("cuda"), max_batch_size, max_blocks_per_seq)
+    planner = _GlobalTrtllmMLAPlanner
+    planner.reset(torch.device("cuda"), max_batch_size, max_blocks_per_seq)
 
-    _GlobalTrtllmMLAPlanner.plan_host(
+    planner.plan_host(
         num_prefill=num_prefill,
         num_decode=num_decode,
         max_context_length=max_context_length,
@@ -518,6 +520,26 @@ def prepare_trtllm_mla_metadata_host(
         input_pos_host=input_pos_host,
         seq_len_host=seq_len_host,
     )
+
+    # Use KVCacheManager.copy_batch_block_offsets to fill a SEPARATE block_offsets
+    # tensor for the context path, producing the same encoding as the PT backend.
+    # The decode path continues to use plan_device()'s ragged_to_block_table_triton.
+    num_seq = num_prefill + num_decode
+    # Only call copy_batch_block_offsets when request_ids are valid (non-zero).
+    has_valid_request_ids = num_seq > 0 and request_ids_host[:num_seq].any().item()
+    if planner.kv_cache_manager is not None and has_valid_request_ids:
+        if not hasattr(planner, "_ctx_block_offsets") or planner._ctx_block_offsets is None:
+            planner._ctx_block_offsets = torch.zeros_like(planner.block_offsets)
+        req_ids = request_ids_host[:num_seq].tolist()
+        planner.kv_cache_manager.copy_batch_block_offsets(
+            planner._ctx_block_offsets,
+            req_ids,
+            beam_width=1,
+            num_context=num_prefill,
+            num_seqs=num_seq,
+        )
+        planner._request_ids = req_ids
+        planner._num_prefill_host = num_prefill
 
 
 # =============================================================================
@@ -738,7 +760,6 @@ def _handle_prefill_thop(
     kpe_flat: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
     latent_cache: torch.Tensor,
-    kv_cache: torch.Tensor,
     num_tokens: int,
     num_heads: int,
     num_kv_heads: int,
@@ -800,65 +821,54 @@ def _handle_prefill_thop(
     k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
     q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
-    # Batched SDPA for attention (C++ FMHA cache write is incompatible with AD
-    # block offsets, and update_kv_cache=False is blocked by global assertion).
-    q_3d = q.view(num_tokens, num_heads, qk_head_dim)
-    k_3d = k.view(num_tokens, num_heads, qk_head_dim)
-    v_3d = v.view(num_tokens, num_heads, v_head_dim)
-    num_prefill = int((host_request_types == 0).sum().item())
-    ctx_lens = host_context_lengths[:num_prefill]
-    max_ctx = int(ctx_lens.max().item()) if num_prefill > 0 else 0
-    all_same_len = num_prefill > 0 and int(ctx_lens.min().item()) == max_ctx
-    if all_same_len and num_prefill > 0:
-        q_4d = q_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, qk_head_dim).transpose(1, 2)
-        k_4d = k_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, qk_head_dim).transpose(1, 2)
-        v_4d = v_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, v_head_dim).transpose(1, 2)
-        o_4d = torch.nn.functional.scaled_dot_product_attention(
-            q_4d,
-            k_4d,
-            v_4d,
-            is_causal=True,
-            scale=1.0 / math.sqrt(qk_head_dim),
-        )
-        output[:num_tokens] = o_4d.transpose(1, 2).reshape(num_tokens, num_heads * v_head_dim)
-    elif num_prefill > 0:
-        ctx_lens_list = ctx_lens.tolist()
-        offset = 0
-        for i in range(num_prefill):
-            sl = ctx_lens_list[i]
-            qi = q_3d[offset : offset + sl].transpose(0, 1).unsqueeze(0)
-            ki = k_3d[offset : offset + sl].transpose(0, 1).unsqueeze(0)
-            vi = v_3d[offset : offset + sl].transpose(0, 1).unsqueeze(0)
-            oi = torch.nn.functional.scaled_dot_product_attention(
-                qi,
-                ki,
-                vi,
-                is_causal=True,
-                scale=1.0 / math.sqrt(qk_head_dim),
-            )
-            output[offset : offset + sl] = (
-                oi.squeeze(0).transpose(0, 1).reshape(sl, num_heads * v_head_dim)
-            )
-            offset += sl
-
-    # Manual cache write: scatter latent_cache tokens into the paged KV cache.
-    num_prefill = int((host_request_types == 0).sum().item())
-    ctx_lens = host_context_lengths[:num_prefill].tolist()
-    kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
-    offset = 0
-    for i in range(num_prefill):
-        seq_len_i = ctx_lens[i]
-        seq_latent = latent_cache[offset : offset + seq_len_i]
-        positions = torch.arange(seq_len_i, device=device)
-        page_ids = planner.block_ids_per_seq[i][(positions // tokens_per_block).long()]
-        flat_idx = page_ids.long() * rpb + positions % tokens_per_block
-        src = (
-            seq_latent
-            if seq_latent.dtype == kv_cache_2d.dtype
-            else seq_latent.to(kv_cache_2d.dtype)
-        )
-        kv_cache_2d.index_copy_(0, flat_idx, src)
-        offset += seq_len_i
+    # Context wrapper: head_size=192, num_kv_heads=32 (matching PT backend's self.mha).
+    # Uses _ctx_block_offsets filled by KVCacheManager.copy_batch_block_offsets
+    # (same encoding as PT backend), and layer_idx+1000 for separate C++ AttentionOp.
+    wrapper = planner.get_or_create_wrapper(
+        layer_idx,
+        num_heads,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        for_context=True,
+    )
+    ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
+    wrapper.plan(
+        layer_idx=layer_idx + 1000,
+        tokens_per_block=tokens_per_block,
+        max_num_requests=max_num_requests,
+        max_sequence_length=max_context_length,
+        max_context_length=max_context_length,
+        beam_width=1,
+        sequence_length=sequence_length,
+        context_lengths=context_lengths,
+        host_past_key_value_lengths=host_past_kv_lengths,
+        host_total_kv_lens=host_total_kv_lens,
+        host_context_lengths=host_context_lengths,
+        host_request_types=host_request_types,
+        kv_cache_block_offsets=ctx_block_offsets,
+        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+        block_ids_per_seq=None,
+        latent_cache=latent_cache,
+        workspace=planner._ctx_workspace
+        if hasattr(planner, "_ctx_workspace")
+        else planner._init_ctx_workspace(device),
+        use_paged_context_fmha=False,
+        attention_input_type=AttentionInputType.context_only,
+        kv_scale_orig_quant=planner.kv_scale_orig_quant,
+        kv_scale_quant_orig=planner.kv_scale_quant_orig,
+        kv_cache_manager=planner.kv_cache_manager,
+    )
+    wrapper.run(
+        q=q,
+        k=k,
+        v=v,
+        output=output,
+        is_fused_qkv=False,
+        update_kv_cache=True,
+    )
 
     return output
 
@@ -1357,7 +1367,6 @@ def _mla_with_cache_impl(
             kpe_pre,
             kv_b_proj_weight,
             lc,
-            kv_cache,
             n_tok,
             num_heads,
             num_kv_heads,

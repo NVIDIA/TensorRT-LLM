@@ -652,6 +652,7 @@ class SequenceInfo:
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
+            ("request_ids", self.max_batch_size, torch.int),
             ("token_gather_indices", self.max_num_tokens, torch.long),
             ("_gather_idx", self.max_num_tokens, torch.int),
             ("_gather_slot_idx", self.max_batch_size, torch.long),
@@ -1035,6 +1036,7 @@ class SequenceInfo:
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        request_ids: Union[Sequence[int], torch.Tensor, None] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1131,6 +1133,10 @@ class SequenceInfo:
 
         # check for updated slot_idx
         self._stage_arg("slot_idx", slot_idx)
+
+        # check for updated request_ids (optional — only provided by AD executor)
+        if request_ids is not None:
+            self._stage_arg("request_ids", request_ids)
 
         # check for updated extra_page_per_seq
         self._stage_arg("extra_page_per_seq", extra_page_per_seq)
