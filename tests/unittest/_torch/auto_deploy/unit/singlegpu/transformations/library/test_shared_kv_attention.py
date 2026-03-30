@@ -326,6 +326,54 @@ def test_flashinfer_shared_kv_cached_attention_is_dynamic_for_piecewise():
 
 
 @torch.no_grad()
+def test_torch_shared_kv_cached_attention_supports_out_buffer():
+    q = torch.randn(1, 3, 2, 4)
+    k = torch.randn(1, 3, 1, 4)
+    v = torch.randn(1, 3, 1, 4)
+    batch_info_host = BatchInfo()
+    batch_info_host.update([1, 3, 0, 0, 1, 1])
+    seq_len = torch.tensor([3], dtype=torch.int32)
+    input_pos = torch.tensor([0, 1, 2], dtype=torch.int32)
+    slot_idx = torch.tensor([0, 1, 2], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0], dtype=torch.int32)
+    k_cache = torch.randn(1, 4, 1, 4)
+    v_cache = torch.randn(1, 4, 1, 4)
+
+    expected = torch.ops.auto_deploy.torch_cached_shared_kv_attention_with_cache.default(
+        q,
+        k,
+        v,
+        batch_info_host.data,
+        seq_len,
+        input_pos,
+        slot_idx,
+        cu_seqlen,
+        k_cache,
+        v_cache,
+        None,
+    )
+
+    out = torch.full_like(expected, float("nan"))
+    ret = torch.ops.auto_deploy.torch_cached_shared_kv_attention_with_cache.default(
+        q,
+        k,
+        v,
+        batch_info_host.data,
+        seq_len,
+        input_pos,
+        slot_idx,
+        cu_seqlen,
+        k_cache,
+        v_cache,
+        None,
+        out=out,
+    )
+
+    assert ret.numel() == 0
+    torch.testing.assert_close(out, expected)
+
+
+@torch.no_grad()
 def test_flashinfer_shared_kv_cached_attention_reads_aliased_cache_without_writing():
     if not torch.cuda.is_available():
         return
