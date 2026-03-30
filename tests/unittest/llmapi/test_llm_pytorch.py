@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import time
@@ -11,7 +12,8 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
+                                          SchedulerConfig, WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1528,6 +1530,73 @@ async def test_llm_disagg_gen_cancelled():
     finally:
         llm_ctx.shutdown()
         llm_gen.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.timeout(60)
+def test_priority_request_completes_before_low_priority():
+    """High-priority request must be scheduled before a lower-priority one.
+
+    Setup (max_batch_size=1, WaitingQueuePolicy.PRIORITY):
+      - Request 1: no explicit priority (default 0.5), max_tokens=500  – long, ignore_eos
+      - Request 2: no explicit priority (default 0.5), max_tokens=5   – short
+      - Request 3: priority=0.9,                       max_tokens=5   – short + high priority
+
+    All three requests are submitted before the executor has a chance to
+    schedule any of them.  With a PRIORITY waiting queue the executor will
+    pick Request 3 ahead of Request 2.  Therefore Request 3 must complete
+    before Request 2 regardless of how long Request 1 takes.
+    """
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY),
+    )
+
+    prompt = "A B C D E F G H I J"
+    completion_order = []
+
+    async def run():
+        # Submit all three requests before the event loop can schedule any of
+        # them – they all land in the waiting queue simultaneously.
+        # Request 1 uses ignore_eos so it keeps the batch slot busy for the
+        # full max_tokens count rather than stopping at an early EOS token.
+        out1 = llm.generate_async(
+            prompt,
+            SamplingParams(max_tokens=500, temperature=0, ignore_eos=True))
+        out2 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0))
+        out3 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0),
+                                  priority=0.9)
+
+        async def await_and_record(output, req_id: int):
+            await output.aresult()
+            completion_order.append(req_id)
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                await_and_record(out1, 1),
+                await_and_record(out2, 2),
+                await_and_record(out3, 3),
+            ),
+            timeout=55,
+        )
+
+    asyncio.run(run())
+    del llm
+
+    assert 2 in completion_order and 3 in completion_order, (
+        f"Not all requests completed. Completion order: {completion_order}")
+    idx_req2 = completion_order.index(2)
+    idx_req3 = completion_order.index(3)
+    assert idx_req3 < idx_req2, (
+        f"Request 3 (priority=0.9) should complete before Request 2 (no priority). "
+        f"Completion order: {completion_order}")
 
 
 @pytest.mark.threadleak(enabled=False)

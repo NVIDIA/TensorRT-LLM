@@ -38,9 +38,14 @@ set_bash_env() {
 cleanup() {
   # Clean up apt/dnf cache
   if [ -f /etc/debian_version ]; then
+    echo "Removing python3-pygments from Ubuntu..."
+    apt-get remove -y python3-pygments || true
+    apt-get autoremove -y || true
     apt-get clean
     rm -rf /var/lib/apt/lists/*
   elif [ -f /etc/redhat-release ]; then
+    echo "Removing python3-pygments from Rocky Linux..."
+    dnf remove -y python3-pygments || true
     dnf clean all
     rm -rf /var/cache/dnf
   fi
