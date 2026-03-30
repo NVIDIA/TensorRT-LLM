@@ -23,13 +23,16 @@ def _parse_profile_range():
     Same env var as the LLM path (PyExecutor) for consistent UX.
     Use with ``nsys profile -c cudaProfilerApi ...``.
 
-    Supported formats:
+    Supported formats (same as LLM path):
 
-    * ``A-B``  – profile denoise steps A through B (same ``A-B`` format as LLM path)
-    * ``all``  – profile the full generation forward (denoise + VAE), skip warmup
-    * (unset)  – no profiler API calls; plain ``nsys profile`` captures everything
+    * ``A-B``            – profile denoise steps A through B
+    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
+    * ``A,B,...``        – individual steps treated as single-step ranges
+    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
+    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
 
-    Returns ``None`` when unset, ``"all"`` for keyword, or ``(start, stop)`` tuple.
+    Returns ``None`` when unset, ``"all"`` for keyword, or
+    ``(frozenset(starts), frozenset(stops))`` for numeric ranges.
     """
     val = os.environ.get("TLLM_PROFILE_START_STOP")
     if not val:
@@ -37,13 +40,20 @@ def _parse_profile_range():
     val = val.strip()
     if val.lower() == "all":
         return "all"
-    # A-B format (same parser as LLM path)
-    if "-" in val:
-        start, stop = val.split("-")
-        return int(start), int(stop)
-    # Single step
-    v = int(val)
-    return v, v
+    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
+    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
+    starts, stops = [], []
+    for span in val.split(","):
+        span = span.strip()
+        if "-" in span:
+            start, stop = span.split("-", 1)
+            starts.append(int(start))
+            stops.append(int(stop))
+        else:
+            v = int(span)
+            starts.append(v)
+            stops.append(v)
+    return frozenset(starts), frozenset(stops)
 
 
 if TYPE_CHECKING:
@@ -879,11 +889,11 @@ class BasePipeline(nn.Module):
         prof = self._profile_range
         if prof == "all" and not self._is_warmup:
             self._cuda_profiler_start()
-        prof_step_start = prof[0] if isinstance(prof, tuple) else None
-        prof_step_stop = prof[1] if isinstance(prof, tuple) else None
+        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
+        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
 
         for i, t in enumerate(timesteps):
-            if prof_step_start is not None and i == prof_step_start and not self._is_warmup:
+            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
                 self._cuda_profiler_start()
 
             step_start = time.time()
@@ -945,7 +955,7 @@ class BasePipeline(nn.Module):
                 )
 
             # Step-level profiler stop
-            if prof_step_stop is not None and i == prof_step_stop and not self._is_warmup:
+            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
                 self._cuda_profiler_stop()
 
         if self.rank == 0:
