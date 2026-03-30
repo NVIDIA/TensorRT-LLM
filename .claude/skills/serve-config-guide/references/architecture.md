@@ -16,3 +16,7 @@ Consult this table to find the primary checked-in sources for each supported mod
 | Kimi-K2 | `examples/configs/curated/kimi-k2-thinking.yaml`, `docs/source/deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.md` | Maps to `DeepseekV3ForCausalLM`; nearby DeepSeek configs are secondary comparators only. Enables `trust_remote_code: true` — call out as a trust boundary. |
 
 If a model has no deployment guide or nearby checked-in config, label any draft as unverified.
+
+## Excluded Sources
+
+**Do NOT cite `docs/source/legacy/` tuning values or benchmark numbers** — those were measured on the TensorRT engine-building backend and do not transfer to PyTorch backend serving. Scheduler concepts (IFB scheduling, how `max_batch_size`/`max_num_tokens` interact) are backend-agnostic, but specific optimal values are not.

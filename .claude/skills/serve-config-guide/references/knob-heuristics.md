@@ -6,17 +6,18 @@ Read an exact or nearby checked-in config and the model's deployment guide **bef
 
 | Field | Guidance |
 |---|---|
-| `max_batch_size` | Affects throughput. Reachable batch size depends on total sequence length and GPU memory. MoE models generally cap lower than dense due to per-expert memory scaling. The `max_requests` upper bound from the KV cache estimation section below caps reachable batch size. |
+| `max_batch_size` | Scheduler ceiling, not a memory reservation — actual batch size adapts at runtime. Prefer keeping the curated/source value unless OOM occurs. MoE models generally cap lower than dense. |
 | `max_num_tokens` | Scheduler token budget. When chunked prefill is **disabled** (default): must exceed ISL plus chat template overhead; sweet spot is ISL to 2× ISL. When chunked prefill is **enabled**: acts as the chunk size — see `enable_chunked_prefill` section below. General default is 8192. Tune together with `max_batch_size`. |
+| `max_seq_len` | Global hard cap on total tokens per request (prompt + output). Set to `ISL + OSL + chat_template_overhead`. Chat templates and benchmarking preambles add tokens beyond raw ISL — overhead varies by model (checked-in configs show 20–200 tokens). Setting too tight rejects or truncates requests; setting too loose wastes KV cache per request. Copy from nearest checked-in config when available. |
 | `enable_chunked_prefill` | Disabled by default. Splits long prefills into chunks so decode batches are not starved. See the dedicated section below for MLA-specific guidance and trade-offs. |
 | `enable_attention_dp` | High-throughput knob. MoE+GQA models benefit at lower concurrency thresholds than MoE+MLA or Dense+GQA. Memory overhead: small for MLA (compressed attention), substantial for GQA (full replication). Can trigger OOM when combined with aggressive KV cache fraction. Follow the exact model guide/config. |
 | `kv_cache_config.free_gpu_memory_fraction` | OOM lever. MLA models (compressed KV) tolerate higher fractions; GQA models need more headroom. Lower when ADP enabled to account for replicated attention overhead. Large MoE models with ADP may need notably conservative fractions. Guides often adjust `max_batch_size` or `max_seq_len` first. |
 | `moe_expert_parallel_size` | MoE only. Copy from checked-in source; do not assume it equals TP. |
-| `moe_config.backend` | CUTLASS/DEEPGEMM dominate at high concurrency; TRTLLM safer at low. FP8 on Hopper uses CUTLASS (DEEPGEMM unavailable on SM90). Wrong backend at high concurrency leaves significant throughput on the table. Set only when model guide or checked-in config specifies it. |
+| `moe_config.backend` | Copy from checked-in source. If no source exists, mark as unverified — the best backend depends on the specific model, not just GPU+precision. Benchmark both CUTLASS and TRTLLM when interpolating. |
 | `stream_interval` | Model-specific variation; no single global value. |
 | `num_postprocess_workers` | Present in some streaming/higher-concurrency configs. |
 | `attention_dp_config.*` | Preserve when present in source configs. |
-| `cuda_graph_config.max_batch_size` / `batch_sizes` | Align with source config. Not necessarily equal to server `max_batch_size`. |
+| `cuda_graph_config.max_batch_size` / `batch_sizes` | Caps which decode batch sizes get CUDA graphs captured; batches above this fall back to eager execution (no error, just slower). If user specifies concurrency, set to the next power of 2 above it (e.g., concurrency 128 → 256) to cover burst traffic, since stated concurrency is typically the mean, not the hard cap. If peak concurrency is unknown, default to `max_batch_size` (safe, just uses more memory). Capturing graphs for unreachable batch sizes wastes GPU memory and warmup time (e.g., DeepSeek-R1 conc=1 uses `cuda_graph_config.max_batch_size: 1` with server `max_batch_size: 512`). Also capped by `max_num_tokens / (1 + max_total_draft_tokens)` at runtime. |
 | MTP fields (`num_nextn_predict_layers`, `use_relaxed_acceptance_for_thinking`, `relaxed_topk`, `relaxed_delta`) | DeepSeek-R1 MTP only. Copy verbatim from the selected checked-in config; never interpolate. |
 
 ## KV Cache Estimation
