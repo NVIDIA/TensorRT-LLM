@@ -79,7 +79,7 @@ void mamba2_mtp_ssm_cache_update(th::Tensor ssm, th::Tensor x, th::Tensor dt, th
         "B tensor has incorrect shapes");
     TORCH_CHECK(B.device() == device && B.is_contiguous(), "B is not a contiguous tensor of the same device as ssm");
     int const ngroups = B.size(2);
-    TORCH_CHECK(nheads % ngroups == 0, "unsupported pair of nheads and ngroups");
+    TORCH_CHECK(ngroups > 0 && (nheads % ngroups == 0), "unsupported pair of nheads and ngroups");
 
     TORCH_CHECK(C.sizes() == B.sizes(), "C tensor has the incorrect shape");
     TORCH_CHECK(C.device() == device && C.is_contiguous(), "C is not a contiguous tensor of the same device as ssm");
