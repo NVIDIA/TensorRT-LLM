@@ -26,9 +26,7 @@ class BasePipeline(nn.Module):
     """
 
     @classmethod
-    def resolve_variant(
-        cls, config: "DiffusionModelConfig"
-    ) -> Type["BasePipeline"]:
+    def resolve_variant(cls, config: "DiffusionModelConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
 
         Override in subclasses to select a variant pipeline at creation
