@@ -2970,12 +2970,16 @@ class PyExecutor:
             self, num_schedulable_requests: int) -> bool:
         """Decide whether to skip ADP dummy insertion during benchmark disagg fill.
 
-        During the fill phase no requests are schedulable yet, but adding
-        dummies would occupy KV cache slots needed by real requests.
-        However, with ADP, ranks that have zero requests (not even INIT)
-        still need a dummy for collective operations.  Skipping is only
-        safe once every rank has at least one request routed to it
-        (``num_fetch_requests >= tp_size``).
+        Dummies are permanent — once added they are never removed.  In
+        benchmark disagg mode we skip dummy insertion in almost all cases
+        because the ``can_forward`` gate prevents forward-pass collectives
+        during the fill phase, so temporarily-empty ranks are safe.
+
+        The only exception is the terminal case where all benchmark
+        requests have been fetched but there are fewer requests than TP
+        ranks (``benchmark_req_queues_size < tp_size``).  In that case
+        some ranks will **never** receive a real request and need a
+        permanent dummy for forward-pass collectives once the gate opens.
 
         Args:
             num_schedulable_requests: Number of active requests that have
@@ -2988,8 +2992,16 @@ class PyExecutor:
             return False
         if num_schedulable_requests > 0:
             return False
-        if self.enable_attention_dp and self.num_fetch_requests < self.dist.tp_size:
-            return False
+
+        fill_phase_complete = (self.num_fetch_requests
+                               >= self.benchmark_req_queues_size)
+        some_ranks_permanently_empty = (self.enable_attention_dp
+                                        and self.benchmark_req_queues_size
+                                        < self.dist.tp_size)
+
+        if fill_phase_complete and some_ranks_permanently_empty:
+            return False  # allow dummy — rank will never get a real request
+
         logger.info(f"Skipped adding dummy requests: "
                     f"num_fetch_requests={self.num_fetch_requests}, "
                     f"num_schedulable_requests={num_schedulable_requests}")
