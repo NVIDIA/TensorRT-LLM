@@ -52,6 +52,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
+    apt remove python3-wheel && \
     pip3 install --ignore-installed --no-cache-dir -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt && \
     pip3 uninstall -y nbconvert || true
