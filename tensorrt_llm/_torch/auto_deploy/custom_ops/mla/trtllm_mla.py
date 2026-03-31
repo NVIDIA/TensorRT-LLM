@@ -858,37 +858,28 @@ def _handle_prefill_thop(
 
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
 
-    # Slice batch-level tensors to prefill-only. In mixed batches (prefill + decode),
-    # the metadata includes decode sequences which confuse the context FMHA cache write.
-    num_prefill = int((host_request_types == 0).sum().item())
-    pf = num_prefill  # shorthand for slicing
-
-    # Recompute host_total_kv_lens for prefill only
-    ctx_total_kv_lens = planner.host_total_kv_lens.clone()
-    ctx_total_kv_lens[0] = sequence_length[:pf].sum().item() if pf > 0 else 0
-    ctx_total_kv_lens[1] = 0  # no decode in context-only
-
+    # Pass full batch metadata (including decode sequences) like the PT backend.
+    # The C++ kernel filters by host_request_types (type 0 = context, type 1 = decode)
+    # and only processes context sequences when attention_input_type=context_only.
     wrapper.plan(
-        layer_idx=layer_idx + 30,  # separate from decode's AttentionOp
+        layer_idx=layer_idx + 30,  # separate context AttentionOp (1 fewer failure than shared)
         tokens_per_block=tokens_per_block,
         max_num_requests=max_num_requests,
         max_sequence_length=max_context_length,
         max_context_length=max_context_length - 1,
         beam_width=1,
-        sequence_length=sequence_length[:pf],
-        context_lengths=context_lengths[:pf],
-        host_past_key_value_lengths=host_past_kv_lengths[:pf],
-        host_total_kv_lens=ctx_total_kv_lens.int(),
-        host_context_lengths=host_context_lengths[:pf],
-        host_request_types=host_request_types[:pf],
-        kv_cache_block_offsets=ctx_block_offsets[:, :pf, :, :] if pf > 0 else ctx_block_offsets,
+        sequence_length=sequence_length,
+        context_lengths=context_lengths,
+        host_past_key_value_lengths=host_past_kv_lengths,
+        host_total_kv_lens=host_total_kv_lens.int(),
+        host_context_lengths=host_context_lengths,
+        host_request_types=host_request_types,
+        kv_cache_block_offsets=ctx_block_offsets,
         host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping=planner.host_pool_mapping[:60],
-        block_ids_per_seq=planner.block_ids_per_seq[:pf] if pf > 0 else planner.block_ids_per_seq,
+        block_ids_per_seq=planner.block_ids_per_seq,
         flash_mla_tile_scheduler_metadata=planner.flash_mla_tile_scheduler_metadata,
-        flash_mla_num_splits=planner.flash_mla_num_splits[: pf + 1]
-        if pf > 0 and planner.flash_mla_num_splits is not None
-        else planner.flash_mla_num_splits,
+        flash_mla_num_splits=planner.flash_mla_num_splits,
         latent_cache=latent_cache,
         workspace=torch.empty(0, dtype=torch.int8, device=device),
         use_paged_context_fmha=False,
