@@ -397,8 +397,7 @@ class FusedMoEMethodBase(ABC):
             if module.bias:
                 self.load_expert_w3_w1_weight(
                     module, w1_bias, w3_bias,
-                    dst_w3_w1_bias_tensor.data[expert_idx],
-                    **w3_w1_kargs)
+                    dst_w3_w1_bias_tensor.data[expert_idx], **w3_w1_kargs)
 
                 self.load_expert_w2_weight(module, w2_bias,
                                            dst_w2_bias_tensor.data[expert_idx],
@@ -2029,14 +2028,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         module.register_parameter("fc2_alpha", fc2_alpha)
 
         # Per-expert weight_scale_2 for dynamic quantization (fixed address for CUDA graph)
-        fc31_weight_scale_2 = nn.Parameter(torch.ones(module.expert_size_per_partition,
-                                                       dtype=torch.float32),
-                                            requires_grad=False)
+        fc31_weight_scale_2 = nn.Parameter(torch.ones(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                           requires_grad=False)
         module.register_parameter("fc31_weight_scale_2", fc31_weight_scale_2)
 
-        fc2_weight_scale_2 = nn.Parameter(torch.ones(module.expert_size_per_partition,
-                                                      dtype=torch.float32),
-                                           requires_grad=False)
+        fc2_weight_scale_2 = nn.Parameter(torch.ones(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                          requires_grad=False)
         module.register_parameter("fc2_weight_scale_2", fc2_weight_scale_2)
 
         # Optional per-channel act scale for NVFP4_AWQ (pre_quant_scale support)
@@ -2338,8 +2337,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                              dst_fc2_alpha[expert_idx])
 
             # Store per-expert weight_scale_2 for dynamic quantization
-            module.fc31_weight_scale_2.data[expert_idx] = w1_ws2[...].reshape([]).float()
-            module.fc2_weight_scale_2.data[expert_idx] = w2_ws2[...].reshape([]).float()
+            module.fc31_weight_scale_2.data[expert_idx] = w1_ws2[...].reshape(
+                []).float()
+            module.fc2_weight_scale_2.data[expert_idx] = w2_ws2[...].reshape(
+                []).float()
 
     def _finalize_pre_quant_scales(self, module: torch.nn.Module):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
@@ -2529,7 +2530,9 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                self.block_scales_vec_size)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            self,
+            module: torch.nn.Module,
+            w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor,
             expert_idx: int = -1):
@@ -2555,7 +2558,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         if not hasattr(module, '_tmp_cutlass_w3_w1_weight_scales'):
             module._tmp_cutlass_w3_w1_weight_scales = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
-        expert_entry = module._tmp_cutlass_w3_w1_weight_scales.setdefault(expert_idx, {})
+        expert_entry = module._tmp_cutlass_w3_w1_weight_scales.setdefault(
+            expert_idx, {})
         expert_entry['dst'] = dst_w3_w1_weight_scale
         if w3_weight_scale is not None:
             expert_entry['w3'] = w3_weight_scale.contiguous().view(
@@ -2642,7 +2646,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         if not hasattr(module, '_tmp_cutlass_w3_w1_weights'):
             module._tmp_cutlass_w3_w1_weights = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
-        expert_entry = module._tmp_cutlass_w3_w1_weights.setdefault(expert_idx, {})
+        expert_entry = module._tmp_cutlass_w3_w1_weights.setdefault(
+            expert_idx, {})
         expert_entry['dst'] = dst_w3_w1_weight
         if w1_weight_shard is not None:
             expert_entry['w1'] = w1_weight_shard.contiguous().view(
@@ -2735,7 +2740,9 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             assert w1_weight is not None and w3_weight is not None
         if w1_weight is None and w3_weight is None:
             return
-        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+        super().load_expert_w3_w1_weight(module,
+                                         w1_weight,
+                                         w3_weight,
                                          dst_w3_w1_weight,
                                          allow_partial_loading,
                                          expert_idx=expert_idx)
@@ -2752,11 +2759,14 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             w3_w1_weight_interleaved.view(dst_w3_w1_weight.dtype))
 
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            self,
+            module: torch.nn.Module,
+            w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor,
             expert_idx: int = -1):
-        super().load_expert_w3_w1_weight_scale_nvfp4(module, w1_weight_scale,
+        super().load_expert_w3_w1_weight_scale_nvfp4(module,
+                                                     w1_weight_scale,
                                                      w3_weight_scale,
                                                      dst_w3_w1_weight_scale,
                                                      expert_idx=expert_idx)

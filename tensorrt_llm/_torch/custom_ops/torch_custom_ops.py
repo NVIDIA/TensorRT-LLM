@@ -264,8 +264,7 @@ def fused_moe(
                          cluster_size, cluster_rank, enable_alltoall,
                          min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
                          activation_type, unpadded_hidden_size,
-                         tuner_num_tokens, out_tensor,
-                         use_dynamic_fc2_scale)
+                         tuner_num_tokens, out_tensor, use_dynamic_fc2_scale)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:

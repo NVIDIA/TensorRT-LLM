@@ -444,9 +444,7 @@ class ModelConfig(Generic[TConfig]):
             group_size = hf_quant_config.get("group_size", 16)
             assert group_size == 16, "NVFP4 only supports group_size=16"
             quant_config.group_size = group_size
-            default_exclude = [
-                '*.mlp.gate', 'lm_head'
-            ]
+            default_exclude = ['*.mlp.gate', 'lm_head']
 
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:

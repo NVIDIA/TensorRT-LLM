@@ -445,8 +445,7 @@ public:
 
         // Dynamic fc2 scale: allocate workspace buffers
         at::Tensor dynamic_fc2_amax_tensor, dynamic_fc2_alpha_tensor, dynamic_fc2_bf16_tensor;
-        if (use_dynamic_fc2_scale && isNvfp4Quant() && quant_scales.has_value()
-            && quant_scales.value().size() >= 7)
+        if (use_dynamic_fc2_scale && isNvfp4Quant() && quant_scales.has_value() && quant_scales.value().size() >= 7)
         {
             auto opts_f32 = at::TensorOptions().dtype(at::ScalarType::Float).device(input.device());
             auto opts_bf16 = at::TensorOptions().dtype(at::ScalarType::BFloat16).device(input.device());
@@ -460,8 +459,7 @@ public:
             quant_params.dynamic_fc2_alpha = dynamic_fc2_alpha_tensor.data_ptr<float>();
             quant_params.dynamic_fc2_bf16_buffer = dynamic_fc2_bf16_tensor.data_ptr();
             // 7th element: per-expert fc2_weight_scale_2 passed directly from Python
-            quant_params.fc2_weight_scale_2
-                = static_cast<float const*>(quant_scales.value()[6].data_ptr());
+            quant_params.fc2_weight_scale_2 = static_cast<float const*>(quant_scales.value()[6].data_ptr());
         }
 
         kernels::MoeMinLatencyParams min_latency_params{};

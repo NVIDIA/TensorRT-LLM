@@ -251,8 +251,9 @@ class MoE(nn.Module):
 
         # could be modified later
         self.quant_config = model_config.quant_config
-        self.force_dynamic_quantization = getattr(
-            model_config, 'force_dynamic_quantization', False)
+        self.force_dynamic_quantization = getattr(model_config,
+                                                  'force_dynamic_quantization',
+                                                  False)
 
         self.cluster_rank = model_config.mapping.moe_cluster_rank
         self.cluster_size = model_config.mapping.moe_cluster_size
