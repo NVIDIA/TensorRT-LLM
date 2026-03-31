@@ -612,6 +612,16 @@ class Attention(nn.Module):
                                 or self.o_proj.has_fp8_rowwise
                                 or self.o_proj.has_w4a8_nvfp4_fp8)
 
+        # For mixed precision (e.g. nvfp4+fp8 autoquant): the attention
+        # backend's has_nvfp4 is derived from q_proj's quant config (set via
+        # apply_layerwise_quant_config), but NVFP4 attention output should
+        # only be enabled when o_proj can actually consume it.  If o_proj is
+        # FP8 (or another non-NVFP4 method), forcing NVFP4 output would pass
+        # an Fp4QuantizedTensor to a linear layer that cannot handle it.
+        if hasattr(self.attn, 'has_nvfp4'
+                   ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
+            self.attn.has_nvfp4 = False
+
     def split_qkv(self, q, k=None, v=None):
         if k is None and v is None:
             q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -716,7 +726,21 @@ class Attention(nn.Module):
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
         # and keeps attention output in BF16 for better precision when applying pre_quant_scale
         # Also don't set out_scale if LoRA is active - LoRA grouped_gemm doesn't support FP8
-        if self._use_quantize_output() and not has_lora:
+        #
+        # For mixed precision (e.g. autoquant with BF16 q/k/v but FP8 o_proj): the FMHA kernel
+        # only produces quantized (FP8/NVFP4) output when the QKV projections are also quantized
+        # (has_fp8_qdq / has_nvfp4 etc.).  When q/k/v are BF16, the FMHA outputs BF16 even for
+        # FP8-KV-cache layers.  Passing out_scale in that case causes the legacy thop.attention
+        # kernel to multiply the BF16 output by inv_input_scale (~300x), which then saturates the
+        # FP8 quantisation inside o_proj, producing ~100x wrong values.
+        _attn_will_quantize_output = (
+            getattr(self.attn, 'has_fp8_qdq', False)
+            or getattr(self.attn, 'has_fp8_block_wise', False)
+            or getattr(self.attn, 'has_fp8_rowwise', False)
+            or getattr(self.attn, 'has_w4a8_nvfp4_fp8', False)
+            or getattr(self.attn, 'has_nvfp4', False))
+        if self._use_quantize_output(
+        ) and not has_lora and _attn_will_quantize_output:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
