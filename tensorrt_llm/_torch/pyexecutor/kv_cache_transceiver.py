@@ -44,10 +44,7 @@ def create_kv_cache_transceiver(
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend for non hybrid models
-        if mamba_cache_manager is None:
-            cache_transceiver_config.backend = "NIXL"
-        else:
-            cache_transceiver_config.backend = "UCX"
+        cache_transceiver_config.backend = "NIXL"
         # Ordered by priority
         env_vars = [
             ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
@@ -72,14 +69,6 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
-    if mamba_cache_manager is not None and cache_transceiver_config.backend in [
-            "NIXL", "MOONCAKE"
-    ]:
-        raise ValueError(
-            "NIXL or MOONCAKE backend does not support hybrid models with RNN (Mamba) states. "
-            "Please use UCX or MPI backend for cache transfer with hybrid models."
-        )
-
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
@@ -91,12 +80,11 @@ def create_kv_cache_transceiver(
                 f"got {cache_transceiver_config.backend}. "
                 f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
             )
-        from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import \
-            PyNativeCacheTransceiver
-        logger.info("Using PyNativeCacheTransceiver")
-        return PyNativeCacheTransceiver(mapping, dist, kv_cache_manager,
-                                        attention_type,
-                                        cache_transceiver_config)
+        from tensorrt_llm._torch.disaggregation.transceiver import \
+            KvCacheTransceiverV2
+        logger.info("Using KvCacheTransceiverV2")
+        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                    cache_transceiver_config)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
@@ -151,6 +139,9 @@ class KvCacheTransceiver(ABC):
         The generation server will use it to get kvcache in generation-first mode.
         """
         ...
+
+    def shutdown(self):
+        """Shut down the transceiver and release registered resources."""
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):

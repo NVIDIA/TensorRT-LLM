@@ -69,6 +69,8 @@ enum class ContextAttentionMaskType
     CAUSAL,
     // Causal mask + attend to the specific sliding window or chunk.
     SLIDING_OR_CHUNKED_CAUSAL,
+    // Bidirectional sliding window attention.
+    BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
     CUSTOM_MASK
 };

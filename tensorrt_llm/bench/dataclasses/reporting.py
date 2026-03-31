@@ -508,7 +508,12 @@ class ReportUtility:
               and self.kwargs["speculative_config"] is not None):
             # pytorch speculative decoding
             spec_decoding = True
-            decoding_mode = self.kwargs["speculative_config"].decoding_type
+            spec_config = self.kwargs["speculative_config"]
+            # Handle both dict (from YAML) and object types
+            if isinstance(spec_config, dict):
+                decoding_mode = spec_config.get("decoding_type")
+            else:
+                decoding_mode = spec_config.decoding_type
         if (spec_decoding):
             stats_dict["decoding_stats"] = {
                 "mode":
@@ -770,6 +775,12 @@ class ReportUtility:
         # Try to get from speculative_config
         if ("speculative_config" in self.kwargs
                 and self.kwargs["speculative_config"] is not None):
-            return self.kwargs["speculative_config"].max_draft_len or 0
+            spec_config = self.kwargs["speculative_config"]
+            # Handle both dict (from YAML) and object types
+            if isinstance(spec_config, dict):
+                draft_len = (spec_config.get("max_draft_len")
+                             or spec_config.get("num_nextn_predict_layers"))
+                return draft_len or 0
+            return spec_config.max_draft_len or 0
 
         return 0

@@ -93,6 +93,7 @@ Pre-configured settings for deploying popular models with `trtllm-serve` can be 
 ```
 
 ## Run Offline Inference with LLM API
+
 The LLM API is a Python API designed to facilitate setup and inference with TensorRT LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing model loading, optimization, and inference, all through a single `LLM` instance.
 
 Here is a simple example to show how to use the LLM API with TinyLlama.
@@ -104,6 +105,18 @@ Here is a simple example to show how to use the LLM API with TinyLlama.
 
 You can also directly load pre-quantized models [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
 To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
+
+
+## Run Offline Inference with VisualGen API
+
+The VisualGen API provides a similar interface for diffusion-based image and video generation. Here is a simple example to generate a video with Wan 2.1.
+
+```{literalinclude} ../../examples/visual_gen/quickstart_example.py
+    :language: python
+    :linenos:
+```
+
+To learn more about VisualGen, check out the [Visual Generation](models/visual-generation.md) documentation and [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen).
 
 ## Next Steps
 

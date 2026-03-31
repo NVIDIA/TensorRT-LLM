@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +37,19 @@ except (ImportError, ModuleNotFoundError):
     from pip._vendor.packaging.requirements import Requirement
 
 build_run = partial(run, shell=True, check=True)
+
+
+def get_available_cpu_count() -> int:
+    """Return the number of CPUs available to this process.
+
+    Respects the process CPU affinity mask (Linux) so that builds launched
+    inside a cgroup or taskset-constrained environment don't over-subscribe.
+    Falls back to the total CPU count on platforms that don't expose affinity.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return cpu_count() or 1
 
 
 @contextmanager
@@ -554,7 +567,7 @@ def main(*,
         cmake_generator = "-G" + generator
 
     if job_count is None:
-        job_count = cpu_count()
+        job_count = get_available_cpu_count()
 
     if len(extra_cmake_vars):
         # Backwards compatibility, we also support semicolon expansion for each value.
@@ -1074,10 +1087,10 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument(
         "--job_count",
         "-j",
-        const=cpu_count(),
+        const=get_available_cpu_count(),
         nargs="?",
         help=
-        "Number of parallel jobs for compilation (default: number of CPU cores)"
+        "Number of parallel jobs for compilation (default: number of CPUs available to this process, respecting affinity)"
     )
     parser.add_argument(
         "--cpp_only",

@@ -185,7 +185,7 @@ l0_a10:
       linux_distribution_name: ubuntu*
   tests:
   # ------------- PyTorch tests ---------------
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
@@ -200,7 +200,7 @@ l0_a10:
 2. Copy all items in `tests` field to a text file, for example, `a10_list.txt`. Don't forget to remove extra characters like comments and the dash marks.
 
 ```
-disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
@@ -225,7 +225,7 @@ To set a timeout for specific long-running test cases, follow these steps:
 1. Locate the test case line in the corresponding test-db YAML file (e.g., `tests/integration/test_lists/test-db/l0_a10.yml`).
 2. Append `TIMEOUT (...)` to the test case line, as shown below:
    ```yaml
-   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
    ```
    - Ensure there is **at least one space** before and after the `TIMEOUT` keyword.
    - The time value inside the parentheses `()` must be a **number** representing the timeout in **minutes**.
@@ -233,7 +233,7 @@ To set a timeout for specific long-running test cases, follow these steps:
 ### For Local Testing (TXT files):
 1. If you are running the tests locally using a prepared `.txt` file (e.g., `a10_list.txt`), append the `TIMEOUT` setting to the test case line in the same way:
    ```
-   disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
    ```
 
 ## 6. Set isolated execution for cases individually
@@ -251,7 +251,7 @@ Add `ISOLATION` to the test case line with proper spacing:
 
 **For CI (test-db YAML files):**
 ```yaml
-- disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] ISOLATION
+- disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0] ISOLATION
 ```
 
 ## 7. Combining test markers

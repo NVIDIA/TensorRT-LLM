@@ -189,6 +189,7 @@ set(TRTLLM_LINK_LIBS
     trtllm_gen_batched_gemm
     selective_scan_src
     ws_layernorm_src
+    fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src

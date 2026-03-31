@@ -50,6 +50,7 @@ TokenIdExt = TokenId | bytes
 
 BlockOrdinal = NewType("BlockOrdinal", int)
 BlockOrdinalT = type(BlockOrdinal(0))
+BAD_BLOCK_ORDINAL: Final[BlockOrdinal] = BlockOrdinal(-1)
 
 LayerId = NewType("LayerId", int)
 

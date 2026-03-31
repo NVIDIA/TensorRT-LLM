@@ -3,12 +3,13 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegion,
     SpecRegionPair,
 )
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.native.region.block import (
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     HeadMatchMapper,
     HeadMismatchMapper,
     IdentityMapper,
 )
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
 
 def make_rankinfo(
@@ -38,18 +39,19 @@ def make_rankinfo(
         cp_size=cp_size,
         cp_rank=cp_rank,
         device_id=0,
-        kv_heads_per_rank=kv_heads_per_rank,
-        tokens_per_block=tokens_per_block,
-        dims_per_head=dims_per_head,
-        element_bytes=element_bytes,
-        enable_attention_dp=False,
-        is_mla=is_mla,
         layer_num_per_pp=[1],
-        kv_ptrs=[],
-        aux_ptrs=[],
+        sender_endpoints=[],
         server_endpoint="",
         self_endpoint="",
         transfer_engine_info=b"",
+        attention=AttentionInfo(
+            kv_heads_per_rank=kv_heads_per_rank,
+            tokens_per_block=tokens_per_block,
+            dims_per_head=dims_per_head,
+            element_bytes=element_bytes,
+            enable_attention_dp=False,
+            is_mla=is_mla,
+        ),
         aux_meta=None,
     )
 
@@ -97,20 +99,28 @@ def test_head_match_mapper():
     transfer_layers = 2
     src_layer_off = 1
     dst_layer_off = 1
+    # slot_size_per_layer = kv_factor * kv_heads * tokens_per_block * dims_per_head * element_bytes
+    slot_size_per_layer = (
+        self_ri.attention.kv_factor
+        * self_ri.attention.kv_heads_per_rank
+        * self_ri.attention.tokens_per_block
+        * self_ri.attention.dims_per_head
+        * self_ri.attention.element_bytes
+    )
     src_group = MemRegionGroup(ptrs=[10, 20], bytes_per_region=1)
     dst_group = MemRegionGroup(ptrs=[30, 40], bytes_per_region=1)
     src_spec = SpecRegion(memory=src_group, spec="srcspec")
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
-    mapper = HeadMatchMapper(transfer_layers, src_layer_off, dst_layer_off, self_ri, peer_ri)
-    result = mapper.map(src_spec, dst_spec)
-    expected_off = (
-        transfer_layers
-        * mapper._kv_factor
-        * self_ri.kv_heads_per_rank
-        * self_ri.tokens_per_block
-        * self_ri.dims_per_head
-        * self_ri.element_bytes
+    mapper = HeadMatchMapper(
+        transfer_layers,
+        src_layer_off,
+        dst_layer_off,
+        self_ri,
+        peer_ri,
+        slot_size_per_layer=slot_size_per_layer,
     )
+    result = mapper.map(src_spec, dst_spec)
+    expected_off = transfer_layers * slot_size_per_layer
     assert list(result.src.memory.ptrs) == [10 + mapper._src_block_off, 20 + mapper._src_block_off]
     assert list(result.dst.memory.ptrs) == [30 + mapper._dst_block_off, 40 + mapper._dst_block_off]
     assert result.src.memory.bytes_per_region == expected_off
@@ -129,7 +139,7 @@ def test_head_mismatch_mapper():
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
     mapper = HeadMismatchMapper(transfer_layers, src_layer_off, peer_layer_off, self_ri, peer_ri)
     result = mapper.map(src_spec, dst_spec)
-    expected_frag_count = self_ri.kv_factor * transfer_layers
+    expected_frag_count = self_ri.attention.kv_factor * transfer_layers
     assert isinstance(result, SpecRegionPair)
     assert len(result.src.memory.ptrs) == expected_frag_count
     assert len(result.dst.memory.ptrs) == expected_frag_count
@@ -142,5 +152,5 @@ def test_head_mismatch_mapper():
 def test_rankinfo_kv_factor():
     ri1 = make_rankinfo(is_mla=False)
     ri2 = make_rankinfo(is_mla=True)
-    assert ri1.kv_factor == 2
-    assert ri2.kv_factor == 1
+    assert ri1.attention.kv_factor == 2
+    assert ri2.attention.kv_factor == 1

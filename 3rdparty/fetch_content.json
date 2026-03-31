@@ -11,7 +11,7 @@
     {
       "name": "cutlass",
       "git_repository": "https://github.com/NVIDIA/cutlass",
-      "git_tag": "v4.3.0",
+      "git_tag": "v4.4.1",
       "git_shallow": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
@@ -93,9 +93,10 @@
     {
       "name": "xgrammar",
       "git_repository": "https://github.com/mlc-ai/xgrammar",
-      "git_tag": "v0.1.25",
+      "git_tag": "v0.1.32",
       "git_shallow": true,
-      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/xgrammar_constexpr.patch"
     }
   ]
 }

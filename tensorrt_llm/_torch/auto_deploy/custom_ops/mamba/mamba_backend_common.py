@@ -27,6 +27,7 @@ from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
+    BatchInfo,
     Constant,
     PrepareMetadataCallable,
     ResourceHandlerDict,
@@ -49,7 +50,8 @@ def _mamba_ssm_prepare_metadata(
     Returns a tuple of (chunk_indices, chunk_offsets, seq_idx_prefill).
     """
     device = cu_seqlen.device
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
 
     if num_prefill > 0:
         chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
@@ -122,6 +124,7 @@ def _run_ssm_prefill(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     chunk_indices: torch.Tensor,
     chunk_offsets: torch.Tensor,
     seq_idx_prefill: torch.Tensor,
@@ -130,7 +133,8 @@ def _run_ssm_prefill(
     chunk_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], int, int, int, int]:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
@@ -142,8 +146,11 @@ def _run_ssm_prefill(
     C_prefill = C_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
     dt_prefill = dt_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H]
 
+    seq_idx_prefill = seq_idx_prefill[:, :num_prefill_tokens]
+
     initial_states = None
-    if torch.any(use_initial_states[:num_prefill]):
+    # Use precomputed host flag to avoid GPU->CPU sync from torch.any()
+    if any_prefill_use_initial_states_host.item():
         initial_states = torch.where(
             use_initial_states[:num_prefill, None, None, None],
             ssm_state_cache[slot_idx[:num_prefill]],
@@ -246,7 +253,13 @@ class BaseBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return [
+            "batch_info_host",
+            "cu_seqlen",
+            "slot_idx",
+            "use_initial_states",
+            "any_prefill_use_initial_states_host",
+        ]
 
     @classmethod
     def get_prepare_extra_metadata_info(

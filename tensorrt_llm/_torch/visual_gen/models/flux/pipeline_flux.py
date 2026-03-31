@@ -4,7 +4,7 @@
 """FLUX.1 Pipeline implementation following WAN pattern."""
 
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -22,10 +22,13 @@ from tensorrt_llm.logger import logger
 from .transformer_flux import FluxTransformer2DModel
 
 # TeaCache coefficients for FLUX.1 variants
+# Source: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4FLUX/teacache_flux.py
+# Official default threshold: 0.6 (~2x speedup), range: 0.25 (~1.5x) to 0.8 (~2.25x)
 FLUX_TEACACHE_COEFFICIENTS = {
     "dev": {
-        "ret_steps": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
-        "standard": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
+        "ret_steps": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "standard": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "default_thresh": 0.6,
     },
     "schnell": {
         "ret_steps": [1.0, 0.0],  # Schnell is already fast, minimal caching
@@ -50,32 +53,40 @@ class FluxPipeline(BasePipeline):
         super().__init__(model_config)
 
     @staticmethod
-    def _compute_flux_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX transformer.
+    def _compute_flux_timestep_embedding(
+        module,
+        hidden_states=None,
+        timestep=None,
+        guidance=None,
+        pooled_projections=None,
+        **kwargs,
+    ):
+        """Compute modulated input for FLUX.1 TeaCache (matches original paper).
 
-        FLUX combines timestep and guidance embeddings.
-
-        Args:
-            module: FluxTransformer2DModel instance
-            timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional)
-
-        Returns:
-            Combined timestep embedding for TeaCache distance calculation
+        Computes norm1(x_embedder(hidden_states), emb=temb) from the first
+        transformer block, which captures both temporal (timestep) and content
+        (hidden_states) changes for cache distance calculation.
         """
-        # Cast to embedder's dtype (avoid int8 quantized layers)
-        te_dtype = next(iter(module.time_text_embed.parameters())).dtype
-        if timestep.dtype != te_dtype and te_dtype != torch.int8:
-            timestep = timestep.to(te_dtype)
 
-        temb = module.time_text_embed(timestep)
+        # Embed hidden states through x_embedder (same as forward() line 790)
+        x = module.x_embedder(hidden_states.contiguous())
 
-        if module.guidance_embeds and guidance is not None:
-            if guidance.dtype != te_dtype and te_dtype != torch.int8:
-                guidance = guidance.to(te_dtype)
-            temb = temb + module.guidance_embed(guidance)
+        # Scale timestep/guidance (FLUX convention: multiply by 1000)
+        timestep = timestep.to(x.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(x.dtype) * 1000
 
-        return temb
+        # Compute full temb (timestep + guidance + pooled_projection)
+        if module.config.guidance_embeds and guidance is not None:
+            temb = module.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = module.time_text_embed(timestep, pooled_projections)
+
+        # Apply AdaLayerNorm from first transformer block:
+        # norm1(x, emb=temb) -> (modulated_x, gate, shift_mlp, scale_mlp, gate_mlp)
+        modulated_input = module.transformer_blocks[0].norm1(x, emb=temb)[0]
+
+        return modulated_input
 
     @property
     def dtype(self):
@@ -88,29 +99,32 @@ class FluxPipeline(BasePipeline):
         return torch.device("cuda:0")
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes (height, width, num_frames)."""
-        return [(1024, 1024, 1)]
+    def default_warmup_resolutions(self):
+        return [(1024, 1024)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [1]
+
+    def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
+        return (height, width)
 
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
         logger.info("Creating FLUX transformer with quantization support...")
         self.transformer = FluxTransformer2DModel(model_config=self.model_config)
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init."""
-        for height, width, _ in self.common_warmup_shapes:
-            logger.info(f"Warmup: FLUX.1 {height}x{width}, {warmup_steps} steps")
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    height=height,
-                    width=width,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=3.5,
-                    seed=0,
-                    max_sequence_length=512,
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=3.5,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def load_standard_components(
         self,
@@ -209,8 +223,8 @@ class FluxPipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=FLUX_TEACACHE_COEFFICIENTS)
+            # Enable TeaCache with FLUX.1-specific polynomial coefficients
+            self._setup_teacache(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
@@ -227,7 +241,7 @@ class FluxPipeline(BasePipeline):
     @torch.inference_mode()
     def forward(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
@@ -235,21 +249,29 @@ class FluxPipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 512,
     ):
-        """Generate image from text prompt.
+        """Generate image(s) from text prompt(s).
 
         Args:
-            prompt: Text prompt for image generation
+            prompt: Text prompt or list of prompts for image generation.
+                When a list is provided, generates one image per prompt in a
+                single batched forward pass.
             height: Output image height (default: 1024)
             width: Output image width (default: 1024)
             num_inference_steps: Number of denoising steps (50 for dev, 4 for schnell)
             guidance_scale: Embedded guidance scale (3.5 for dev)
-            seed: Random seed for reproducibility
+            seed: Random seed for reproducibility.
             max_sequence_length: Maximum text sequence length
 
         Returns:
-            MediaOutput with image tensor
+            MediaOutput with image tensor (B, H, W, C).
         """
         pipeline_start = time.time()
+
+        # Determine batch size
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        batch_size = len(prompt)
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Encode prompt
@@ -260,8 +282,7 @@ class FluxPipeline(BasePipeline):
         )
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
-        # Prepare latents
-        latents, latent_ids = self._prepare_latents(height, width, generator)
+        latents, latent_ids = self._prepare_latents(batch_size, height, width, generator)
         logger.info(f"Latents shape: {latents.shape}")
 
         # Prepare timesteps with dynamic shifting (FLUX uses mu parameter)
@@ -325,19 +346,19 @@ class FluxPipeline(BasePipeline):
 
     def _encode_prompt(
         self,
-        prompt: str,
+        prompt: List[str],
         max_sequence_length: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Encode prompt using CLIP and T5.
+        """Encode prompt(s) using CLIP and T5.
 
         Args:
-            prompt: Text prompt
-            max_sequence_length: Maximum T5 sequence length
+            prompt: List of prompts.
+            max_sequence_length: Maximum T5 sequence length.
 
         Returns:
-            Tuple of (T5 embeddings, CLIP pooled embeddings, text position IDs)
+            Tuple of (T5 embeddings [B, seq, dim], CLIP pooled [B, dim],
+            text position IDs [seq, 3])
         """
-        prompt = [prompt] if isinstance(prompt, str) else prompt
 
         # CLIP encoding (pooled embeddings)
         clip_inputs = self.tokenizer(
@@ -467,33 +488,54 @@ class FluxPipeline(BasePipeline):
 
     def _prepare_latents(
         self,
+        batch_size: int,
         height: int,
         width: int,
         generator: torch.Generator,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Prepare random latents in FLUX packed format and position IDs."""
+        """Prepare random latents in FLUX packed format and position IDs.
+
+        Args:
+            batch_size: Number of images to generate.
+            height: Output image height.
+            width: Output image width.
+            generator: Random generator.
+
+        Returns:
+            Tuple of (latents [B, seq, 64], latent_ids [seq, 3])
+        """
         latent_height = height // self.vae_scale_factor
         latent_width = width // self.vae_scale_factor
 
         # Use VAE channels (16), not transformer channels (64)
         # The packing will convert 16 -> 64
         vae_channels = self.vae.config.latent_channels  # 16
+        shape = (batch_size, vae_channels, latent_height, latent_width)
 
-        # Create random latents in VAE spatial format [B, 16, H, W]
-        shape = (1, vae_channels, latent_height, latent_width)
-        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
+        latents_4d = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
-        # Prepare position IDs for packed format
+        # Prepare position IDs for packed format (shared across batch)
         latent_ids = self._prepare_latent_ids(height, width)
         latent_ids = latent_ids.to(self.device)
 
         # Pack latents to FLUX sequence format [B, seq_len, 64]
-        latents = self._pack_latents(latents, 1, vae_channels, latent_height, latent_width)
+        latents = self._pack_latents(
+            latents_4d, batch_size, vae_channels, latent_height, latent_width
+        )
 
         return latents, latent_ids
 
     def _decode_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        """Decode latents to image tensor."""
+        """Decode latents to image tensor.
+
+        Args:
+            latents: Packed latents [B, seq, 64].
+            height: Output image height.
+            width: Output image width.
+
+        Returns:
+            Image tensor (B, H, W, C).
+        """
         # Unpack latents: (batch, seq_len, channels) -> (batch, channels, h, w)
         latents = self._unpack_latents(latents, height, width)
 
@@ -504,9 +546,9 @@ class FluxPipeline(BasePipeline):
         latents = latents.to(self.vae.dtype)
         image = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process to tensor (H, W, C) uint8
+        # Post-process to tensor uint8
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
         image = (image * 255).round().to(torch.uint8)
 
-        return image[0]  # Remove batch dimension
+        return image  # (B, H, W, C)

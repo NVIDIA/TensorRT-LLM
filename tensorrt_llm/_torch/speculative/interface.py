@@ -39,6 +39,89 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     return spec_config._allow_separate_draft_kv_cache
 
 
+def prepare_attn_metadata_for_draft_replay(attn_metadata,
+                                           draft_kv_cache_manager):
+    """
+    Prepare attention metadata for CUDA graph replay when using separate draft KV cache.
+    Swaps to draft manager and (for DSA) re-prepares indexer slot mappings for the current
+    batch. Call restore_attn_metadata_after_draft_replay after replay in a finally block.
+    Returns saved state or None if no-op.
+    """
+    if draft_kv_cache_manager is None:
+        return None
+    if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+        return None
+    draft_block_offsets = getattr(attn_metadata, 'draft_kv_cache_block_offsets',
+                                  None)
+    if draft_block_offsets is None:
+        return None
+
+    saved = {
+        'target_kv_cache_manager':
+        attn_metadata.kv_cache_manager,
+        'target_kv_cache_block_offsets':
+        attn_metadata.kv_cache_block_offsets,
+        'target_host_kv_cache_block_offsets':
+        attn_metadata.host_kv_cache_block_offsets,
+    }
+    attn_metadata.kv_cache_manager = draft_kv_cache_manager
+    attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+    attn_metadata.host_kv_cache_block_offsets = (
+        draft_kv_cache_manager.host_kv_cache_block_offsets)
+
+    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                Indexer)
+    if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
+            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
+        m = attn_metadata
+        saved['saved_dsa_state'] = {
+            'host_indexer_k_cache_block_offsets':
+            m.host_indexer_k_cache_block_offsets.clone(),
+            'indexer_k_cache_block_offsets':
+            m.indexer_k_cache_block_offsets.clone(),
+            'host_slot_mapping_fp8':
+            m.host_slot_mapping_fp8.clone(),
+            'host_slot_mapping_scale':
+            m.host_slot_mapping_scale.clone(),
+            'slot_mapping_fp8':
+            m.slot_mapping_fp8.clone(),
+            'slot_mapping_scale':
+            m.slot_mapping_scale.clone(),
+        }
+        block_ids_per_seq = draft_kv_cache_manager.get_block_ids_per_seq(
+            m.request_ids)
+        num_blocks = block_ids_per_seq.shape[1]
+        m.host_indexer_k_cache_block_offsets[:len(
+            block_ids_per_seq), :num_blocks].copy_(block_ids_per_seq)
+        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
+            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
+            non_blocking=True)
+        Indexer.recompute_slot_mappings(m)
+    return saved
+
+
+def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
+    """Restore attention metadata after draft replay. No-op if saved_state is None."""
+    if saved_state is None:
+        return
+    attn_metadata.kv_cache_manager = saved_state['target_kv_cache_manager']
+    attn_metadata.kv_cache_block_offsets = (
+        saved_state['target_kv_cache_block_offsets'])
+    attn_metadata.host_kv_cache_block_offsets = (
+        saved_state['target_host_kv_cache_block_offsets'])
+    saved_dsa = saved_state.get('saved_dsa_state')
+    if saved_dsa is not None:
+        m = attn_metadata
+        m.host_indexer_k_cache_block_offsets.copy_(
+            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
+        m.indexer_k_cache_block_offsets.copy_(
+            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
+        m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
+        m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
+        m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
+        m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+
+
 def get_force_num_accepted_tokens() -> int:
     """
     Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment variable.
@@ -63,7 +146,9 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
+    SA = auto()
     DRAFT_TARGET = auto()
+    DRAFT_TARGET_ONE_MODEL = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
@@ -87,7 +172,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
-        ) or self.is_pard()
+        ) or self.is_external_drafter() or self.is_sa()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -98,6 +183,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
+    def is_sa(self):
+        return self == SpeculativeDecodingMode.SA
+
     def is_user_provided(self):
         return self == SpeculativeDecodingMode.USER_PROVIDED
 
@@ -107,27 +195,38 @@ class SpeculativeDecodingMode(IntEnum):
     def is_draft_target(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
 
+    def is_draft_target_one_model(self):
+        return self == SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
+
     def is_save_hidden_states(self):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
+    def is_external_drafter(self):
+        return self.is_pard() or self.is_draft_target_one_model()
+
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_pard()
+        ) or self.is_external_drafter() or self.is_sa()
 
     def needs_kv_cache_rewind(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram() or self.is_pard()
+        ) or self.is_ngram() or self.is_sa() or self.is_external_drafter()
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.has_draft_model() or self.is_pard()
+        ) or self.is_sa() or self.has_draft_model() or self.is_external_drafter(
+        )
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_pard()
+        ) or self.is_external_drafter() or self.is_sa()
+
+    def support_dynamic_draft_len(self):
+        # TODO: expand to all one-model algorithms
+        return self.is_eagle3_one_model()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -145,11 +244,12 @@ class SpeculativeDecodingMode(IntEnum):
         Whether the draft model and target model are in the same model engine,
         and the draft model needs to load weights from the separate checkpoint.
         """
-        return self.is_eagle3_one_model() or self.is_pard()
+        return self.is_eagle3_one_model() or self.is_external_drafter()
 
     def has_spec_decoder(self):
         return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model() or self.is_pard()
+        ) or self.is_eagle3_one_model() or self.is_external_drafter(
+        ) or self.is_sa()
 
     def has_spec_drafter(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
@@ -260,6 +360,12 @@ class SpecMetadata:
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
 
+    # The draft length used for the current iteration.
+    # With dynamic draft length enabled, this varies per batch based on
+    # draft_len_schedule.  Otherwise it equals max_draft_len (the static max).
+    # Always set by model_engine.forward() before any downstream code reads it.
+    runtime_draft_len: int = 0
+
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
@@ -341,7 +447,7 @@ class SpecMetadata:
             tp_val = tp[0] if tp is not None and len(tp) > 0 else None
 
             # Context requests have no draft tokens yet.
-            num_tokens = 1 + self.max_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temp_val,
@@ -415,6 +521,7 @@ class SpecWorkerBase(nn.Module, ABC):
         spec_metadata,
         draft_model,
     ):
+        """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
         batch_size = attn_metadata.num_seqs
         accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
@@ -428,6 +535,54 @@ class SpecWorkerBase(nn.Module, ABC):
         next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
+        return {
+            'logits': logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
+
+    def skip_drafting(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """
+        Used when speculation is disabled for dynamic draft length (e.g., large batch size).
+        """
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
+
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        accepted_tokens = torch.zeros((batch_size, 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        accepted_tokens[:, 0] = target_tokens
+
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        next_draft_tokens = torch.zeros((batch_size, 0),
+                                        dtype=torch.int,
+                                        device=logits.device)
+
+        next_new_tokens = torch.zeros((batch_size, 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        next_new_tokens[:, 0] = target_tokens
+
         return {
             'logits': logits,
             'new_tokens': accepted_tokens,
@@ -455,7 +610,8 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 
-    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts):
+    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
+                                     runtime_draft_len: int):
         """
         Apply forced number of accepted tokens if environment variable is set.
         This is used for testing and debugging.
@@ -463,18 +619,15 @@ class SpecWorkerBase(nn.Module, ABC):
         Args:
             num_accepted_tokens: Tensor of shape [batch_size] with current accepted counts
             num_contexts: Number of context (prefill) requests
+            runtime_draft_len: The draft length for the current iteration.
 
         Returns:
             Modified num_accepted_tokens tensor
-
-        Note:
-            For MTPWorker, self.max_draft_len equals num_nextn_predict_layers (mtp_num_modules).
-            For Eagle3OneModelWorker, self.max_draft_len equals spec_config.max_draft_len.
         """
         if self.force_num_accepted_tokens != 0:
             # total tokens per iteration = accepted draft tokens + 1 target token
             force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     self.max_draft_len + 1)
+                                     runtime_draft_len + 1)
             num_accepted_tokens[num_contexts:] = force_total_tokens
         return num_accepted_tokens
 
@@ -495,22 +648,27 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Args:
             logits: [num_tokens, vocab_size] - Target model logits
-            draft_tokens: [num_gens, max_draft_len] - Previously predicted draft tokens
+            draft_tokens: [num_gens, runtime_draft_len] - Previously predicted draft tokens
             num_contexts: Number of context requests
             batch_size: Total number of requests
             spec_metadata: Speculative decoding metadata
 
         Returns:
-            accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
+            accepted_tokens: [batch_size, runtime_draft_len + 1] - Accepted tokens (padded)
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
+        # Derive draft length from the actual draft_tokens shape rather than
+        # spec_metadata.runtime_draft_len, because they can differ: PARD sets
+        # runtime_draft_len = 2K-1 for input sizing but only passes K draft
+        # tokens for acceptance;
+        runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
         # Allocate return buffers
-        accepted_tokens = torch.empty((batch_size, self.max_draft_len + 1),
+        accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
                                       dtype=torch.int,
                                       device=logits.device)
         num_accepted_tokens = torch.ones(batch_size,
@@ -526,17 +684,19 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Generation requests: verify draft tokens against target tokens
         gen_target_tokens = target_tokens[num_contexts:].reshape(
-            num_gens, self.max_draft_len + 1)
-        accepted_tokens[num_contexts:, :] = gen_target_tokens
+            num_gens, runtime_draft_len + 1)
+        accepted_tokens[num_contexts:, :runtime_draft_len +
+                        1] = gen_target_tokens
+
         # Compare draft tokens with target tokens using cumulative product
         # Counts consecutive matches from the start
         num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
+            (draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
             dim=-1).sum(1)
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts)
+            num_accepted_tokens, num_contexts, runtime_draft_len)
 
         return accepted_tokens, num_accepted_tokens
 
@@ -572,13 +732,13 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Args:
             accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
-            next_draft_tokens: [batch_size, max_draft_len] - Predicted draft tokens
+            next_draft_tokens: [batch_size, runtime_draft_len] - Predicted draft tokens (NOT padded)
             batch_indices_cuda: Batch indices tensor
             batch_size: Number of requests
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
 
         Returns:
-            next_new_tokens: [batch_size, max_draft_len + 1] - Input tokens for next iteration
+            next_new_tokens: [batch_size, runtime_draft_len + 1] - Input tokens for next iteration
         """
         next_new_tokens = accepted_tokens[batch_indices_cuda[:batch_size],
                                           num_accepted_tokens - 1].unsqueeze(1)
@@ -692,13 +852,15 @@ class SpecWorkerBase(nn.Module, ABC):
             from .one_model_sampler import sampling_batch_spec_dec_one_model
 
             num_gens = batch_size - num_contexts
-            num_tokens = num_contexts + num_gens * (self.max_draft_len + 1)
+            num_tokens = num_contexts + num_gens * (
+                spec_metadata.runtime_draft_len + 1)
 
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
+                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
                     self.seed = torch.tensor([0],

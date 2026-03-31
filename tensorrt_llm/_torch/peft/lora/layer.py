@@ -74,6 +74,10 @@ class LoraModuleType(IntEnum):
     MLP_ROUTER = 17  # MLP router
     MLP_GATE_UP = 18  # Combined gate and up projections
 
+    SHARED_EXPERT_H_TO_4H = 19  # Shared expert first projection
+    SHARED_EXPERT_4H_TO_H = 20  # Shared expert second projection
+    SHARED_EXPERT_GATE = 21  # Shared expert gate projection
+
     def __str__(self):
         """Return the name of the enum value."""
         return self.name

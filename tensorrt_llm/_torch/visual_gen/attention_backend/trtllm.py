@@ -211,8 +211,8 @@ class TrtllmAttention(BaseTrtllmAttention):
     def forward(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         batch_size: int,
         seq_len: int,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
@@ -241,7 +241,10 @@ class TrtllmAttention(BaseTrtllmAttention):
         # Handle cross-attention where K/V have different sequence length than Q
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
 
-        qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
+        if k is None and v is None:
+            qkv = q.reshape(batch_size * seq_len, -1)
+        else:
+            qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         output = super().forward(
             q=qkv,

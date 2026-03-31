@@ -3,6 +3,7 @@ import json
 import logging
 import os
 
+from tensorrt_llm._torch.visual_gen.config import ParallelConfig
 from tensorrt_llm.llmapi.utils import download_hf_partial
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ def get_model_path(extra_argv):
 
 
 VISUAL_GEN_PARTIAL_MODEL_NAME_TO_MODEL_TYPE = {
+    "FLUX.1": "flux1",
     "FLUX.2": "flux2",
     "LTX-2": "ltx2",
     "Wan2": "wan2",
@@ -130,3 +132,15 @@ def get_visual_gen_model_type(model_path: str):
         f"Unknown VISUAL_GEN model type for model path: {model_path},"
         f"available models: {VISUAL_GEN_PARTIAL_MODEL_NAME_TO_MODEL_TYPE.keys()}"
     )
+
+
+def get_visual_gen_num_gpus(diffusion_config: dict) -> int:
+    """Compute the number of GPUs from a visual_gen config.
+
+    Uses ParallelConfig.model_construct (skips env validators)
+    so this is safe to call from non-worker processes.
+    """
+    parallel = diffusion_config.get("parallel", {})
+    if isinstance(parallel, dict):
+        parallel = ParallelConfig.model_construct(**parallel)
+    return parallel.n_workers

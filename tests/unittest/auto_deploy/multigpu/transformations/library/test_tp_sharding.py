@@ -1,0 +1,1301 @@
+"""Tests for basic graph sharding."""
+
+import copy
+from functools import partial
+from types import SimpleNamespace
+from typing import Type
+
+import pytest
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from _dist_test_utils import get_device_counts
+from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
+from _model_test_utils import FakeFineGrainedFP8Linear, FakeFP8Linear
+from torch._inductor.pattern_matcher import stable_topological_sort
+
+import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMamba2Mixer
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    FineGrainedFP8WeightShardingInfo,
+    FP8WeightShardingInfo,
+    LayerType,
+    ShardingTransformConfig,
+    SplitDimension,
+    WeightShardingInfo,
+    _update_node_args,
+)
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+    modelopt_fp4_scale_to_cutlass_fp4_scale,
+)
+from tensorrt_llm.functional import AllReduceStrategy
+
+
+class GQA_Block(nn.Module):
+    def __init__(
+        self,
+        num_attention_heads: int,
+        hidden_size: int,
+        num_key_value_heads: int,
+    ):
+        super().__init__()
+        self.num_attention_heads = num_attention_heads
+        self.hidden_size = hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.is_gqa = num_key_value_heads < num_attention_heads
+        assert self.hidden_size == self.num_attention_heads * self.head_dim
+
+        # key, query, value, out projections
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.head_dim * self.num_key_value_heads,
+            bias=False,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.head_dim * self.num_key_value_heads,
+            bias=False,
+        )
+
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+
+        q = self.q_proj(x).view(b, s, -1, self.head_dim)
+        k = self.k_proj(x).view(b, s, -1, self.head_dim)
+        v = self.v_proj(x).view(b, s, -1, self.head_dim)
+
+        y = torch.ops.auto_deploy.torch_attention(q, k, v, is_causal=True, layout="bsnd")
+        y = y.contiguous().view(b, s, -1)
+
+        return self.o_proj(y)
+
+
+class MLP(nn.Module):
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.linear1 = nn.Linear(in_features, 4 * in_features, bias=bias)
+        self.linear2 = nn.Linear(4 * in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        y = F.relu(self.linear1(x))
+        return self.linear2(y)
+
+
+class FP8MLP(nn.Module):
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.linear1 = FakeFP8Linear(in_features, 4 * in_features, bias=bias)
+        self.linear2 = FakeFP8Linear(4 * in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        y = F.relu(self.linear1(x))
+        return self.linear2(y)
+
+
+class MLA_Block(nn.Module):
+    """Multi-Latent Attention block - simplified standalone version.
+
+    Based on DeepSeek MLA architecture with KV compression.
+    This is a minimal, self-contained implementation for testing sharding patterns.
+    Based on models/custom/modeling_deepseek.py:DeepSeekV3Attention
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+
+        # KV compression path (not sharded - gather)
+        self.kv_a_proj_with_mqa = nn.Linear(hidden_size, kv_lora_rank + qk_rope_head_dim, bias=bias)
+        self.kv_a_layernorm = nn.LayerNorm(kv_lora_rank)
+
+        # KV decompression weight (absorbed into torch_mla, sharded column-wise)
+        # NOTE: This is nn.Parameter, not nn.Linear - the weight is passed directly to torch_mla
+        self.kv_b_proj_weight = nn.Parameter(
+            torch.randn(num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank)
+        )
+
+        # Query path (sharded column-wise)
+        self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=bias)
+        self.q_b_proj = nn.Linear(q_lora_rank, num_heads * self.qk_head_dim, bias=bias)
+        self.q_a_layernorm = nn.LayerNorm(q_lora_rank)
+
+        # Output projection (sharded row-wise)
+        self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=bias)
+
+        # Softmax scale
+        self.softmax_scale = self.qk_head_dim ** (-0.5)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+
+        # Compress KV to latent
+        compressed_kv_rope = self.kv_a_proj_with_mqa(x)  # (b, s, kv_lora_rank + rope_dim)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv_rope, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+
+        # Apply layernorm to compressed KV
+        compressed_kv = self.kv_a_layernorm(compressed_kv)  # (b, s, kv_lora_rank)
+
+        # k_pe: shared across heads for simplified version
+        k_pe = k_pe.view(b, s, 1, self.qk_rope_head_dim)  # (b, s, 1, qk_rope_head_dim)
+
+        # Query projection: q = q_b_proj @ (layernorm(q_a_proj @ x))
+        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))  # (b, s, num_heads * qk_head_dim)
+        q = q.view(b, s, self.num_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # Call MLA kernel with compressed KV and kv_b_proj weight absorbed
+        # NOTE: kv_b_proj weight is passed directly to the kernel instead of calling Linear
+        attn_out = torch.ops.auto_deploy.torch_mla(
+            q_nope,  # [B, S, N, qk_nope_head_dim]
+            q_pe,  # [B, S, N, qk_rope_head_dim]
+            compressed_kv,  # [B, S, kv_lora_rank]
+            k_pe,  # [B, S, 1, qk_rope_head_dim]
+            self.kv_b_proj_weight,  # [N*(qk_nope+v), kv_lora_rank] - absorbed weight
+            True,  # is_causal
+            self.softmax_scale,  # softmax_scale
+            "bsnd",  # layout
+        )
+
+        # Output: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
+        attn_out = attn_out.reshape(b, s, self.num_heads * self.v_head_dim)
+
+        # Output projection
+        output = self.o_proj(attn_out)
+        return output
+
+
+class FineGrainedFP8MLP(nn.Module):
+    """MLP using FineGrainedFP8 quantization for testing."""
+
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Use larger features divisible by block size (128)
+        hidden_features = max(4 * in_features, 128)
+        self.linear1 = FakeFineGrainedFP8Linear(in_features, hidden_features, bias=bias)
+        self.linear2 = FakeFineGrainedFP8Linear(hidden_features, out_features, bias=bias)
+
+    def forward(self, x):
+        y = F.relu(self.linear1(x))
+        return self.linear2(y)
+
+
+class GDN_Block(nn.Module):
+    """Gated DeltaNet block - minimal standalone version for testing sharding.
+
+    Based on Qwen3NextGatedDeltaNet. Implements the minimum graph structure
+    required by delta layer detection (node_utils.py) and sharding (sharding.py).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int = 4,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.key_dim = head_k_dim * num_k_heads
+        self.value_dim = head_v_dim * num_v_heads
+
+        self.in_proj_qkvz = nn.Linear(
+            hidden_size, self.key_dim * 2 + self.value_dim * 2, bias=False
+        )
+        self.in_proj_ba = nn.Linear(hidden_size, num_v_heads * 2, bias=False)
+
+        conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            kernel_size=conv_kernel_size,
+            groups=conv_dim,
+            bias=bias,
+            padding=conv_kernel_size - 1,
+        )
+
+        self.A_log = nn.Parameter(torch.randn(num_v_heads))
+        self.dt_bias = nn.Parameter(torch.ones(num_v_heads))
+        self.norm = nn.LayerNorm(head_v_dim)  # operates on head_v_dim -- NOT sharded
+        self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+        projected_qkvz = self.in_proj_qkvz(x)
+        projected_ba = self.in_proj_ba(x)
+
+        # Reshape into [b, s, num_k_heads, features_per_head]
+        qkvz = projected_qkvz.view(b, s, self.num_k_heads, -1)
+        ba = projected_ba.view(b, s, self.num_k_heads, -1)
+
+        # Slice features per head (dim=-1), NOT across heads
+        heads_ratio = self.num_v_heads // self.num_k_heads
+        q = qkvz[..., : self.head_k_dim]
+        k = qkvz[..., self.head_k_dim : 2 * self.head_k_dim]
+        v = qkvz[..., 2 * self.head_k_dim : 2 * self.head_k_dim + heads_ratio * self.head_v_dim]
+        v = v.reshape(b, s, -1, self.head_v_dim)
+        z = qkvz[..., 2 * self.head_k_dim + heads_ratio * self.head_v_dim :]
+        z = z.reshape(b, s, -1, self.head_v_dim)
+        b_tensor = ba[..., :heads_ratio].reshape(b, s, -1)
+        a = ba[..., heads_ratio:].reshape(b, s, -1)
+
+        # Concatenate q, k, v and apply conv1d + silu
+        mixed_qkv = torch.cat(
+            [q.reshape(b, s, -1), k.reshape(b, s, -1), v.reshape(b, s, -1)], dim=-1
+        )
+        mixed_qkv_conv = F.silu(self.conv1d(mixed_qkv.transpose(1, 2))[:, :, :s].transpose(1, 2))
+
+        # Split back into q, k, v (sizes depend on num_heads -- updated during sharding)
+        q_conv, k_conv, v_conv = torch.split(
+            mixed_qkv_conv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        q_conv = q_conv.reshape(b, s, q_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
+        k_conv = k_conv.reshape(b, s, k_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
+        v_conv = v_conv.reshape(b, s, v_conv.shape[-1] // self.head_v_dim, self.head_v_dim)
+
+        # L2 norm, GQA repeat-interleave, and gating are handled inside the op
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q_conv, k_conv, v_conv, a, b_tensor, self.A_log, self.dt_bias
+        )
+
+        # Gated norm on head_v_dim, then project
+        attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        normed = self.norm(attn_out_flat) * z_flat
+        return self.out_proj(normed.reshape(b, s, -1))
+
+
+class GDN_Block_Unfused(nn.Module):
+    """Gated DeltaNet block with unfused projections for testing sharding.
+
+    Based on Qwen3.5 MoE's Qwen3_5MoeGatedDeltaNet. Uses 4 separate opening
+    projections (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a) instead of
+    the 2 fused projections in GDN_Block (in_proj_qkvz, in_proj_ba).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int = 4,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.key_dim = head_k_dim * num_k_heads
+        self.value_dim = head_v_dim * num_v_heads
+
+        # 4 separate projections (unfused, matching Qwen3.5 MoE layout)
+        self.in_proj_qkv = nn.Linear(hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+        self.in_proj_z = nn.Linear(hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(hidden_size, num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(hidden_size, num_v_heads, bias=False)
+
+        conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            kernel_size=conv_kernel_size,
+            groups=conv_dim,
+            bias=bias,
+            padding=conv_kernel_size - 1,
+        )
+
+        self.A_log = nn.Parameter(torch.randn(num_v_heads))
+        self.dt_bias = nn.Parameter(torch.ones(num_v_heads))
+        self.norm = nn.LayerNorm(head_v_dim)  # operates on head_v_dim -- NOT sharded
+        self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+
+        # 1. Separate projections (4 opening nodes)
+        mixed_qkv = self.in_proj_qkv(x)  # [b, s, conv_dim]
+        z = self.in_proj_z(x)  # [b, s, value_dim]
+        z = z.reshape(b, s, self.num_v_heads, self.head_v_dim)
+        b_tensor = self.in_proj_b(x)  # [b, s, num_v_heads]
+        a = self.in_proj_a(x)  # [b, s, num_v_heads]
+
+        # 2. Conv1d + silu on the QKV path
+        mixed_qkv_conv = F.silu(self.conv1d(mixed_qkv.transpose(1, 2))[:, :, :s].transpose(1, 2))
+
+        # 3. Split back into q, k, v
+        q_conv, k_conv, v_conv = torch.split(
+            mixed_qkv_conv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        q_conv = q_conv.reshape(b, s, q_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
+        k_conv = k_conv.reshape(b, s, k_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
+        v_conv = v_conv.reshape(b, s, v_conv.shape[-1] // self.head_v_dim, self.head_v_dim)
+
+        # 4. Gated delta rule (L2 norm, GQA expand, gating handled inside the op)
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q_conv, k_conv, v_conv, a, b_tensor, self.A_log, self.dt_bias
+        )
+
+        # 5. Gated norm on head_v_dim, then project
+        attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        normed = self.norm(attn_out_flat) * z_flat
+        return self.out_proj(normed.reshape(b, s, -1))
+
+
+class SymbolicShapeView(nn.Module):
+    def forward(self, x):
+        b = torch.ops.aten.sym_size.int(x, 0)
+        s = torch.ops.aten.sym_size.int(x, 1)
+        return torch.ops.aten.view.default(x, (b, s, 32, 128))
+
+
+def test_update_node_args_preserves_nested_symbolic_shape_nodes():
+    gm = torch.fx.symbolic_trace(SymbolicShapeView())
+    view_node = next(node for node in gm.graph.nodes if is_op(node, [torch.ops.aten.view]))
+    original_shape_nodes = view_node.args[1][:2]
+
+    # Simulate a stored ParameterUpdateInfo arg tuple that carries copied shape nodes
+    # from an older graph. The sharding update should preserve the current symbolic
+    # shape producers and only change the literal dimension.
+    copied_shape = list(copy.deepcopy(view_node.args[1]))
+    copied_shape[2] = -1
+    _update_node_args(view_node, (view_node.args[0], tuple(copied_shape)))
+
+    updated_shape = view_node.args[1]
+    assert updated_shape[:2] == tuple(original_shape_nodes)
+    assert updated_shape[2:] == (-1, 128)
+
+    stable_topological_sort(gm.graph)
+    placeholder_targets = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
+    assert placeholder_targets == ["x"]
+
+
+def _run_sharding_execution_job(
+    model_cls: nn.Module,
+    dist_op_expected: str,
+    bias: bool,
+    from_config: bool,
+    rank: int,
+    world_size: int,
+) -> None:
+    # global predefined_config
+    # init model and input
+    batch_size = 4
+    sequence_len = 8
+    num_features = 32
+    skip_output_assert = False
+
+    # GQA specific parameters
+    num_heads = 4
+    num_key_value_heads = 1
+
+    if model_cls == GQA_Block:
+        model = model_cls(
+            num_attention_heads=num_heads,
+            hidden_size=num_features,
+            num_key_value_heads=num_key_value_heads,
+        ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {
+            "tp_plan": {
+                "q_proj": "colwise",
+                "k_proj": "colwise",
+                "v_proj": "colwise",
+                "o_proj": "rowwise",
+            }
+        }
+    elif model_cls == FP8MLP:
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
+        predefined_config = {
+            "tp_plan": {
+                # gated MLP
+                "gate_proj": "colwise",
+                "up_proj": "colwise",
+                "down_proj": "rowwise",
+                # GPT-style MLP
+                "linear1": "colwise",
+                "linear2": "rowwise",
+            }
+        }
+    elif model_cls == NemotronHMamba2Mixer:
+        # Create config for Mamba2 based on Nemotron models
+        # Scaled down from typical values: hidden_size=5120, ssm_state_size=128
+        mamba_config = SimpleNamespace(
+            hidden_size=num_features,
+            ssm_state_size=16,  # Scaled from 128
+            mamba_num_heads=num_heads,
+            mamba_head_dim=num_features // num_heads,  # 8
+            n_groups=num_heads,  # Typical value
+            chunk_size=256,
+            conv_kernel=4,
+            use_conv_bias=bias,
+            use_bias=bias,
+            mamba_hidden_act="silu",
+            layer_norm_epsilon=1e-5,
+            time_step_limit=(0.0, float("inf")),
+            time_step_min=0.001,
+            time_step_max=0.1,
+            time_step_floor=1e-4,
+            initializer_range=0.02,
+            rescale_prenorm_residual=False,
+            residual_in_fp32=False,
+            num_hidden_layers=1,
+        )
+        model = model_cls(mamba_config, layer_idx=0).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj": "mamba"}}
+    elif model_cls == MLA_Block:
+        # Use actual DeepSeek-V3/R1 production values
+        # From HuggingFace config (HunYuanPretrainedConfig defaults):
+        # hidden_size=4096, num_attention_heads=32
+        # kv_lora_rank=512, q_lora_rank=1536
+        # qk_rope_head_dim=64, v_head_dim=128, qk_nope_head_dim=128
+        num_heads_mla = 16
+        qk_nope_head_dim = 64
+        qk_rope_head_dim = 32
+        v_head_dim = 64
+        kv_lora_rank = 256
+        skip_output_assert = True
+
+        model = model_cls(
+            hidden_size=num_features,
+            num_heads=num_heads_mla,
+            q_lora_rank=kv_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            bias=bias,
+        ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"q_a_proj": "mla"}}
+    elif model_cls in (GDN_Block, GDN_Block_Unfused):
+        num_k_heads_gdn = 4
+        num_v_heads_gdn = 8
+        head_k_dim = 8
+        head_v_dim = 8
+        skip_output_assert = True
+        model = model_cls(
+            hidden_size=num_features,
+            num_k_heads=num_k_heads_gdn,
+            num_v_heads=num_v_heads_gdn,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            bias=bias,
+        ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj_qkv": "delta"}}
+    elif model_cls == nn.Linear:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+        predefined_config = {"tp_plan": {"*": "gather"}}
+    elif model_cls == FineGrainedFP8MLP:
+        # FineGrainedFP8MLP needs features divisible by 128 (block size)
+        num_features = 128
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
+        predefined_config = {"tp_plan": {"linear1": "colwise", "linear2": "rowwise"}}
+    else:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+        predefined_config = {
+            "tp_plan": {
+                # gated MLP
+                "gate_proj": "colwise",
+                "up_proj": "colwise",
+                "down_proj": "rowwise",
+                # GPT-style MLP
+                "linear1": "colwise",
+                "linear2": "rowwise",
+            }
+        }
+    x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
+
+    # Scale down GDN_Block weights if needed to avoid numerical instability
+    if model_cls in (GDN_Block, GDN_Block_Unfused):
+        with torch.no_grad():
+            y_test = model(x)
+        if torch.isnan(y_test).any():
+            with torch.no_grad():
+                for param in model.parameters():
+                    param.mul_(0.1)
+            x = x * 0.1
+
+    if model_cls == GQA_Block:
+        head_dim = num_features // num_heads
+        min_local_size = head_dim
+    else:
+        min_local_size = 1
+
+    def _get_expected_num_params(num_p_og: int) -> int:
+        if model_cls in (GDN_Block, GDN_Block_Unfused):
+            # norm.weight + norm.bias are replicated (operate on constant head_v_dim)
+            norm_params = 2 * head_v_dim
+            return (num_p_og - norm_params) // world_size + norm_params
+
+        num_update = 0
+        if bias and dist_op_expected == "torch_dist_all_reduce":
+            num_p_og -= num_features
+            num_update = num_features * (rank == world_size - 1)
+
+        if min_local_size > 1:
+            # it means we are in the GQA. W_kv are partially replicated, we need to count
+            # the number of parameters manually.
+            W_q_local_size = num_features * num_features // world_size
+            W_o_local_size = W_q_local_size
+            W_k_local_size = num_features * head_dim * max(num_key_value_heads // world_size, 1)
+            W_v_local_size = W_k_local_size
+            num_params = W_q_local_size + W_k_local_size + W_v_local_size + W_o_local_size
+        else:
+            num_params = num_p_og // world_size + num_update
+        if model_cls == MLA_Block:
+            # Both q_a_layernorm and kv_a_layernorm are replicated because their preceding
+            # projections (q_a_proj, kv_a_proj_with_mqa) use simple-shard/all_gather.
+            # Each LayerNorm has weight + bias of size kv_lora_rank → 4 * kv_lora_rank
+            # replicated params total.  The base formula (num_p_og // world_size) treated
+            # these as sharded, so we add back the under-counted fraction.
+            replicated_ln_params = (
+                4 * kv_lora_rank
+            )  # q_a_layernorm + kv_a_layernorm, weight+bias each
+            num_params += replicated_ln_params * (world_size - 1) // world_size
+        return num_params
+
+    def verify_local_weight_sizes(gm) -> bool:
+        """Verify that all weight tensors have first dimension >= min_local_size after sharding."""
+        for name, param in gm.named_parameters():
+            # Only check parameters that have at least 1 dimension and are weight matrices
+            if param.dim() >= 1 and "weight" in name:
+                if param.shape[0] < min_local_size:
+                    print(
+                        f"Weight {name} has shape {param.shape}, dim {param.shape[0]} < min_local_size {min_local_size}"
+                    )
+                    return False
+        return True
+
+    # now run the test
+    op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    sharding_source = "heuristic" if from_config else "manual"
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_scope": ["tp"],
+                "sharding_source": [sharding_source],
+                "manual_config": predefined_config,
+                # needed for a solitary Linear node that is not part of any layer subgraph
+                "shard_all_unprocessed": True,
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
+
+    def combined_graph_check(gm) -> bool:
+        # Check for expected distributed operations
+        has_expected_dist_ops = any(is_op(n, op_expected) for n in gm.graph.nodes) == (
+            world_size > 1
+        )
+        weight_sizes_valid = verify_local_weight_sizes(gm)
+        return has_expected_dist_ops and weight_sizes_valid
+
+    # FineGrainedFP8 shard_load_hook always shards scales from the full state dict,
+    # so skip the round-trip load hook test (loading from already-sharded state dict).
+    test_load = model_cls != FineGrainedFP8MLP
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        check_transformed_graph=combined_graph_check,
+        _get_expected_num_params=_get_expected_num_params,
+        skip_output_assert=skip_output_assert,
+        test_load_hook=test_load,
+        strict_loading=test_load,
+    )
+
+
+def _run_pattern_detection_job(
+    model_cls: nn.Module,
+    bias: bool,
+    rank: int,
+    world_size: int,
+    from_config: bool,
+) -> None:
+    # init model and input
+    batch_size = 4
+    sequence_len = 8
+    num_features = 32
+
+    # GQA specific parameters
+    num_heads = 4
+    num_key_value_heads = 1
+
+    if model_cls == GQA_Block:
+        model = model_cls(
+            num_attention_heads=num_heads,
+            hidden_size=num_features,
+            num_key_value_heads=num_key_value_heads,
+        ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {
+            "tp_plan": {
+                "q_proj": "colwise",
+                "k_proj": "colwise",
+                "v_proj": "colwise",
+                "o_proj": "rowwise",
+            }
+        }
+    elif model_cls == NemotronHMamba2Mixer:
+        # Create config for Mamba2
+        mamba_config = SimpleNamespace(
+            hidden_size=num_features,
+            ssm_state_size=16,
+            mamba_num_heads=num_heads,
+            mamba_head_dim=num_features // num_heads,
+            n_groups=num_heads,
+            chunk_size=256,
+            conv_kernel=4,
+            use_conv_bias=bias,
+            use_bias=bias,
+            mamba_hidden_act="silu",
+            layer_norm_epsilon=1e-5,
+            time_step_limit=(0.0, float("inf")),
+            time_step_min=0.001,
+            time_step_max=0.1,
+            time_step_floor=1e-4,
+            initializer_range=0.02,
+            rescale_prenorm_residual=False,
+            residual_in_fp32=False,
+            num_hidden_layers=1,
+        )
+        model = model_cls(mamba_config, layer_idx=0).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj": "mamba"}}
+    elif model_cls == MLA_Block:
+        # Create simplified MLA based on DeepSeek-V3 architecture
+        qk_nope_head_dim = 2
+        qk_rope_head_dim = 1
+        v_head_dim = 2
+        kv_lora_rank = 8
+
+        model = model_cls(
+            hidden_size=num_features,
+            num_heads=num_heads,
+            q_lora_rank=kv_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            bias=bias,
+        ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"q_a_proj": "mla"}}
+    elif model_cls in (GDN_Block, GDN_Block_Unfused):
+        num_k_heads_gdn = 4
+        num_v_heads_gdn = 8
+        head_k_dim = 8
+        head_v_dim = 8
+        model = model_cls(
+            hidden_size=num_features,
+            num_k_heads=num_k_heads_gdn,
+            num_v_heads=num_v_heads_gdn,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            bias=bias,
+        ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj_qkv": "delta"}}
+    elif model_cls == nn.Linear:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+        predefined_config = {"tp_plan": {"*": "gather"}}
+    elif model_cls == FineGrainedFP8MLP:
+        # FineGrainedFP8MLP needs features divisible by 128 (block size)
+        num_features = 128
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
+        predefined_config = {"tp_plan": {"linear1": "colwise", "linear2": "rowwise"}}
+    else:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+        predefined_config = {
+            "tp_plan": {
+                "gate_proj": "colwise",
+                "up_proj": "colwise",
+                "down_proj": "rowwise",
+                "linear1": "colwise",
+                "linear2": "rowwise",
+            }
+        }
+    x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
+
+    # Test pattern detection - create expected transformations for validation
+    config = ShardingTransformConfig(
+        rank=rank,
+        world_size=world_size,
+        stage="sharding",
+        allreduce_strategy=AllReduceStrategy.AUTO,
+    )
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    expected_transformations = []
+    # if world_size == 1, no sharding transformations should be detected
+    if world_size > 1:
+        if model_cls == GQA_Block:
+            head_dim = num_features // num_heads
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    # for Q, K, V layers, we expect:
+                    # dim = 0, add_dist = False
+                    # for O layer, we expect:
+                    # dim = 1, add_dist = True
+                    if "o_proj" in node.args[1].name:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                        min_local_shape = 1
+                    else:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                        min_local_shape = head_dim
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=min_local_shape,
+                            layer_type=LayerType.ATTENTION,
+                        )
+                    )
+        elif model_cls == MLP:
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
+                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
+                    if "linear1" in node.args[1].name:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    else:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                            layer_type=LayerType.MLP,
+                        )
+                    )
+        elif model_cls == nn.Linear:
+            # expect simple shard only (dim=0, add_dist=True, min_local_shape=1)
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
+                            config=config,
+                            dist_op="all_gather",
+                            min_local_shape=1,
+                            layer_type=LayerType.UNKNOWN,
+                        )
+                    )
+        elif model_cls == FP8MLP:
+            for node in gm.graph.nodes:
+                if is_op(node, torch.ops.auto_deploy.torch_fake_quant_fp8_linear):
+                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
+                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
+                    if "linear1" in node.args[1].name:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    else:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    expected_transformations.append(
+                        FP8WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                        )
+                    )
+        elif model_cls == NemotronHMamba2Mixer:
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    # in_proj should be sharded column-wise
+                    # out_proj should be sharded row-wise with all_reduce
+                    if "out_proj" in node.args[1].name:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                        fused_weight_dims = None
+                    else:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                        fused_weight_dims = (
+                            num_features,
+                            num_features,
+                            16 * num_heads,
+                            16 * num_heads,
+                            num_heads,
+                        )
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=fused_weight_dims,
+                        )
+                    )
+                elif is_op(node, torch.ops.auto_deploy.torch_causal_conv1d):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=(num_features, 16 * num_heads, 16 * num_heads),
+                        )
+                    )
+                elif is_op(node, torch.ops.auto_deploy.torch_ssm):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=None,
+                        )
+                    )
+                elif len(node.args) > 1 and (
+                    "norm_weight" in node.args[0].name or "a_log" in node.args[0].name
+                ):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=None,
+                        )
+                    )
+        elif model_cls == MLA_Block:
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    # kv_a_proj_with_mqa: gather (no sharding)
+                    # q_b_proj/kv_b_proj: column-wise
+                    # o_proj: row-wise with all_reduce
+                    min_local_shape = 2
+                    if "o_proj" in node.args[1].name:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    elif (
+                        "kv_a_proj_with_mqa" in node.args[1].name or "q_a_proj" in node.args[1].name
+                    ):
+                        # This is simple-shard gather
+                        dim = SplitDimension.COLUMN
+                        dist_op = "all_gather"
+                        min_local_shape = 1
+                    else:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=min_local_shape,
+                            layer_type=LayerType.MLA,
+                        )
+                    )
+                if is_weight_node(node):
+                    if "kv_b_proj_weight" in node.name:
+                        expected_transformations.append(
+                            WeightShardingInfo(
+                                target_node=node.name,
+                                split_dim=SplitDimension.COLUMN,
+                                config=config,
+                                layer_type=LayerType.MLA,
+                            )
+                        )
+        elif model_cls in (GDN_Block, GDN_Block_Unfused):
+            key_dim = num_k_heads_gdn * head_k_dim
+            value_dim = num_v_heads_gdn * head_v_dim
+            conv_fused_dims = (key_dim, key_dim, value_dim)
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    weight_name = node.args[1].name
+                    if "out_proj" in weight_name:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                        fused_weight_dims = None
+                    elif "in_proj_qkv" in weight_name and model_cls == GDN_Block_Unfused:
+                        # Unfused in_proj_qkv has contiguous [Q, K, V] and needs fused dims
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                        fused_weight_dims = conv_fused_dims
+                    else:
+                        # Fused in_proj_qkvz (interleaved), in_proj_ba, in_proj_z/b/a
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                        fused_weight_dims = None
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                            layer_type=LayerType.DELTA,
+                            fused_weight_dims=fused_weight_dims,
+                        )
+                    )
+                elif node.op == "get_attr" and isinstance(node.target, str):
+                    # Non-linear weight nodes: conv1d.weight, A_log, dt_bias
+                    target = node.target
+                    if "norm" in target:
+                        continue  # norm weights are replicated
+                    if "conv1d" in target and ("weight" in target or "bias" in target):
+                        fused_weight_dims = conv_fused_dims
+                    else:
+                        fused_weight_dims = None
+                    if "conv1d" in target or "A_log" in target or "dt_bias" in target:
+                        expected_transformations.append(
+                            WeightShardingInfo(
+                                target_node=node.name,
+                                split_dim=SplitDimension.COLUMN,
+                                config=config,
+                                dist_op=None,
+                                min_local_shape=1,
+                                layer_type=LayerType.DELTA,
+                                fused_weight_dims=fused_weight_dims,
+                            )
+                        )
+        elif model_cls == FineGrainedFP8MLP:
+            for node in gm.graph.nodes:
+                if is_op(node, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear):
+                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
+                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
+                    if "linear1" in node.args[1].name:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    else:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    expected_transformations.append(
+                        FineGrainedFP8WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                        )
+                    )
+
+    sharding_source = "heuristic" if from_config else "manual"
+    # get detected transformations
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_scope": ["tp"],
+                "sharding_source": [sharding_source],
+                "shard_all_unprocessed": True,
+                "manual_config": predefined_config,
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = rank
+    optimizer.shared_config.world_size = world_size
+    _ = optimizer(None, gm)
+    detected_transformations = gm._sharding_transform_container.weight_sharding_transforms
+
+    print(f"detected_transformations: {detected_transformations}")
+    print(f"expected_transformations: {expected_transformations}")
+    # Run pattern detection test
+    run_sharding_pattern_detection_test(detected_transformations, expected_transformations)
+
+
+@pytest.mark.parametrize("device_count", get_device_counts())
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
+@pytest.mark.parametrize(
+    "model_cls, dist_op_expected",
+    (
+        (MLP, "torch_dist_all_reduce"),
+        (FP8MLP, "torch_dist_all_reduce"),
+        (FineGrainedFP8MLP, "torch_dist_all_reduce"),
+        (nn.Linear, "torch_dist_all_gather"),
+        (GQA_Block, "torch_dist_all_reduce"),
+        (NemotronHMamba2Mixer, "torch_dist_all_reduce"),
+        (MLA_Block, "torch_dist_all_reduce"),
+        (GDN_Block, "torch_dist_all_reduce"),
+        (GDN_Block_Unfused, "torch_dist_all_reduce"),
+    ),
+)
+def test_sharding(
+    model_cls: Type[nn.Module],
+    dist_op_expected: str,
+    bias: bool,
+    device_count: int,
+    from_config: bool,
+):
+    dist_common.spawn_multiprocess_job(
+        job=partial(_run_sharding_execution_job, model_cls, dist_op_expected, bias, from_config),
+        size=device_count,
+    )
+
+
+@pytest.mark.parametrize("world_size", [1, 8])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
+@pytest.mark.parametrize(
+    "model_cls, dist_op_expected",
+    (
+        (MLP, "torch_dist_all_reduce"),
+        (FP8MLP, "torch_dist_all_reduce"),
+        (FineGrainedFP8MLP, "torch_dist_all_reduce"),
+        (nn.Linear, "torch_dist_all_gather"),
+        (GQA_Block, "torch_dist_all_reduce"),
+        (NemotronHMamba2Mixer, "torch_dist_all_reduce"),
+        (MLA_Block, "torch_dist_all_reduce"),
+        (GDN_Block, "torch_dist_all_reduce"),
+        (GDN_Block_Unfused, "torch_dist_all_reduce"),
+    ),
+)
+def test_sharding_pattern_detection(
+    model_cls: Type[nn.Module],
+    dist_op_expected: str,
+    bias: bool,
+    world_size: int,
+    from_config: bool,
+):
+    """Test pattern detection logic without distributed execution.
+
+    This test verifies only the pattern detection logic with provided world_size.
+    No need to run distributed job, can be run on single process.
+    """
+    _run_pattern_detection_job(model_cls, bias, 0, world_size, from_config)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_unfused_delta_fused_weight_correctness(world_size: int):
+    """Verify that unfused in_proj_qkv is fused-sliced, not contiguously sliced.
+
+    This single-process test checks that the sharding transform applies
+    fused_weight_dims=(key_dim, key_dim, value_dim) to in_proj_qkv, producing
+    [Q_shard, K_shard, V_shard] per rank rather than a contiguous first-N-rows slice.
+    It also verifies the load hook correctly re-applies fused slicing from the
+    original state dict.
+    """
+    num_features = 32
+    num_k_heads = 4
+    num_v_heads = 8
+    head_k_dim = 8
+    head_v_dim = 8
+    key_dim = num_k_heads * head_k_dim  # 32
+    value_dim = num_v_heads * head_v_dim  # 64
+    rank = 0
+
+    model = GDN_Block_Unfused(
+        hidden_size=num_features,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+    ).to(device="cuda", dtype=torch.float16)
+
+    x = torch.randn(2, 4, num_features, device="cuda", dtype=torch.float16)
+
+    # Save original weight for in_proj_qkv before sharding
+    original_qkv_weight = model.in_proj_qkv.weight.data.clone()
+    original_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+    assert original_qkv_weight.shape[0] == key_dim * 2 + value_dim  # 128
+
+    # Export and apply sharding
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "use_sharding_from_factory": False,
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = rank
+    optimizer.shared_config.world_size = world_size
+    gm_transformed = optimizer(None, gm)
+    gm_transformed = gm_transformed.to("cuda")
+
+    # Find the sharded in_proj_qkv weight
+    sharded_qkv_weight = None
+    for name, param in gm_transformed.named_parameters():
+        if "in_proj_qkv" in name and "weight" in name:
+            sharded_qkv_weight = param.data
+            break
+    assert sharded_qkv_weight is not None, "Could not find sharded in_proj_qkv weight"
+
+    # Compute the expected fused slice: [Q_shard, K_shard, V_shard] for rank 0
+    q_rows = original_qkv_weight[0:key_dim]  # Q component
+    k_rows = original_qkv_weight[key_dim : key_dim * 2]  # K component
+    v_rows = original_qkv_weight[key_dim * 2 : key_dim * 2 + value_dim]  # V component
+    expected_fused_weight = torch.cat(
+        [
+            torch.tensor_split(q_rows, world_size, dim=0)[rank],
+            torch.tensor_split(k_rows, world_size, dim=0)[rank],
+            torch.tensor_split(v_rows, world_size, dim=0)[rank],
+        ],
+        dim=0,
+    )
+
+    # Verify the sharded weight matches the fused slice
+    expected_shard_rows = key_dim // world_size + key_dim // world_size + value_dim // world_size
+    assert sharded_qkv_weight.shape[0] == expected_shard_rows, (
+        f"Sharded in_proj_qkv has {sharded_qkv_weight.shape[0]} rows, "
+        f"expected {expected_shard_rows} (fused slice)"
+    )
+    torch.testing.assert_close(
+        sharded_qkv_weight,
+        expected_fused_weight,
+        msg="Sharded in_proj_qkv weight does not match expected fused slice. "
+        "This indicates contiguous slicing was used instead of fused per-component slicing.",
+    )
+
+    # Verify the contiguous (buggy) slice would differ
+    contiguous_slice = original_qkv_weight[0 : (key_dim * 2 + value_dim) // world_size]
+    assert not torch.equal(sharded_qkv_weight, contiguous_slice), (
+        "Sharded weight unexpectedly matches contiguous slice -- "
+        "fused_weight_dims may not be taking effect"
+    )
+
+    # Verify load hook: reload original state dict and check fused slicing is re-applied
+    for name, param in gm_transformed.named_parameters():
+        param.data.fill_(0.0)
+    gm_transformed.load_state_dict(original_state_dict, strict=False)
+
+    reloaded_qkv_weight = None
+    for name, param in gm_transformed.named_parameters():
+        if "in_proj_qkv" in name and "weight" in name:
+            reloaded_qkv_weight = param.data
+            break
+
+    torch.testing.assert_close(
+        reloaded_qkv_weight,
+        expected_fused_weight,
+        msg="After reloading original state dict, in_proj_qkv weight does not match "
+        "expected fused slice. The load hook may not be applying fused slicing correctly.",
+    )
+
+
+@pytest.mark.parametrize(
+    "n, k",
+    [
+        (144, 128),  # n%32=16, k%32=0: column-sharding misalignment (e.g. MoE experts)
+        (128, 144),  # n%32=0, k%32=16: row-sharding misalignment (e.g. shared expert down_proj)
+        (144, 176),  # both misaligned
+    ],
+)
+def test_pad_nvfp4_weight_scale_roundtrip(n, k):
+    """Verify _pad_nvfp4_weight preserves cutlass-format weight scales through padding.
+
+    After TP sharding, weight_scale is in cutlass format (swizzled/padded via
+    modelopt_fp4_scale_to_cutlass_fp4_scale). The _pad_nvfp4_weight function pads
+    weight/scale/alpha so dimensions become multiples of 32 for nvfp4_gemm.
+
+    A previous bug treated the cutlass-format (swizzled) scale buffer as row-major
+    data when reshaping for padding, silently corrupting scale values and causing
+    accuracy degradation proportional to world_size.
+    """
+    block_size = 16
+    device = "cuda"
+
+    torch.manual_seed(42)
+    modelopt_scale = torch.rand(n, k // block_size, device=device).to(torch.float8_e4m3fn)
+    cutlass_scale = modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale)
+
+    weight_fp4 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=device)
+    alpha = torch.ones(n, device=device)
+
+    _, padded_scale, _, n_padded, k_padded = _pad_nvfp4_weight(
+        weight_fp4, cutlass_scale, alpha, n, k
+    )
+
+    padded_modelopt = cutlass_fp4_scale_to_modelopt_fp4_scale(padded_scale, (n_padded, k_padded))
+    recovered = padded_modelopt[:n, : k // block_size]
+
+    torch.testing.assert_close(
+        recovered.float(),
+        modelopt_scale.float(),
+        msg="Scale values were corrupted during padding. "
+        "_pad_nvfp4_weight may be treating cutlass-format (swizzled) data as row-major.",
+    )
+
+    if n_padded > n:
+        pad_region_n = padded_modelopt[n:, : k // block_size]
+        assert (pad_region_n.float() == 0).all(), "n-padding region should be zero"
+    if k_padded > k:
+        pad_region_k = padded_modelopt[:n, k // block_size :]
+        assert (pad_region_k.float() == 0).all(), "k-padding region should be zero"

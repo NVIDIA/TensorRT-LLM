@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import math
+import os
+import sys
+import tempfile
 import time
 from unittest.mock import MagicMock, patch
 
@@ -171,7 +174,7 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
     ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
 
     # Once for the initial poll, then once for each token. One extra token when using the overlap scheduler.
-    assert worker.get_finished.call_count == NUM_TOKENS + int(
+    assert worker.get_finished.call_count == NUM_TOKENS + 1 + int(
         use_overlap_scheduler)
 
     # In the first iteration, there should be a single request id provided.
@@ -391,16 +394,16 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
         scheduler.request_finished.return_value = False
         worker.get_finished.return_value = [], []
 
-    result = prefill_worker.generate([0] * 48,
-                                     sampling_params=sampling_params,
-                                     disaggregated_params=disaggregated_params)
+    result = generate_and_sleep(prefill_worker, [0] * 48,
+                                sampling_params=sampling_params,
+                                disaggregated_params=disaggregated_params)
 
     gen_disagg_params = result.disaggregated_params
     gen_disagg_params.request_type = "generation_only"
 
-    decode_worker.generate([0] * 48,
-                           sampling_params=sampling_params,
-                           disaggregated_params=gen_disagg_params)
+    generate_and_sleep(decode_worker, [0] * 48,
+                       sampling_params=sampling_params,
+                       disaggregated_params=gen_disagg_params)
 
     assert scheduler.build_connector_meta.call_count == 1
 
@@ -432,12 +435,13 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
     worker.get_finished.side_effect = lambda finished_gen, load_async: (
         finished_gen, load_async)
 
-    generate_and_sleep(model, [[0] * 48, [1] * 48],
-                       sampling_params=[
-                           SamplingParams(ignore_eos=True, max_tokens=4),
-                           SamplingParams(ignore_eos=True, max_tokens=3)
-                       ])
+    model.generate([[0] * 48, [1] * 48],
+                   sampling_params=[
+                       SamplingParams(ignore_eos=True, max_tokens=4),
+                       SamplingParams(ignore_eos=True, max_tokens=3)
+                   ])
 
+    # The KV cache of both prior requests should be freed, allowing the third request to run.
     model.generate([2] * 110, sampling_params=sampling_params)
 
 
@@ -466,7 +470,7 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     # - First 32 tokens (block 0): high priority (e.g., system prompt)
     # - Remaining tokens (block 1+): low priority (e.g., user input)
     retention_config = KvCacheRetentionConfig(
-        token_range_retention_priorities=[
+        token_range_retention_configs=[
             KvCacheRetentionConfig.TokenRangeRetentionConfig(
                 token_start=0,
                 token_end=32,
@@ -536,3 +540,67 @@ def test_connector_priorities_default(enforce_single_worker,
 
     # Without retention config, priorities should be None
     assert request.priorities is None
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_e2e_persistent_cache(enforce_single_worker):
+    """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
+
+    Runs generation twice with separate LLM instances sharing a disk-based
+    connector cache, verifying that outputs are identical (proving cache
+    save/load works end-to-end).
+    """
+    examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                "..", "examples", "llm-api")
+    examples_dir = os.path.abspath(examples_dir)
+    sys.path.insert(0, examples_dir)
+
+    cache_dir = tempfile.mkdtemp()
+    os.environ["CONNECTOR_CACHE_FOLDER"] = cache_dir
+
+    try:
+        kv_connector_config = KvCacheConnectorConfig(
+            connector_module="llm_kv_cache_connector",
+            connector_scheduler_class="PersistentKvCacheConnectorLeader",
+            connector_worker_class="PersistentKvCacheConnectorWorker",
+        )
+
+        llm_kwargs = dict(
+            model=f"{llm_models_root()}/Qwen2-0.5B",
+            backend="pytorch",
+            kv_connector_config=kv_connector_config,
+            cuda_graph_config=None,
+            disable_overlap_scheduler=True,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+        )
+
+        prompt = (
+            "Nvidia Corporation is an American technology company "
+            "headquartered in Santa Clara, California. Founded in 1993 by "
+            "Jensen Huang, Chris Malachowsky, and Curtis Priem, it develops "
+            "graphics processing units (GPUs), system on a chips (SoCs), and "
+            "application programming interfaces (APIs) for data science, "
+            "high-performance computing, and mobile and automotive "
+            "applications. Tell me about the company.")
+
+        sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+        llm1 = LLM(**llm_kwargs)
+        output1 = llm1.generate([prompt], sampling_params)
+        output1[0].outputs[0].text
+        del llm1
+
+        cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".pt")]
+        assert len(cache_files) > 0, "No cache files written by connector"
+
+        llm2 = LLM(**llm_kwargs)
+        llm2.generate([prompt], sampling_params)
+        del llm2
+    finally:
+        os.environ.pop("CONNECTOR_CACHE_FOLDER", None)
+
+        if examples_dir in sys.path:
+            sys.path.remove(examples_dir)
+
+        import shutil
+        shutil.rmtree(cache_dir, ignore_errors=True)

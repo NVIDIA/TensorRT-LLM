@@ -106,7 +106,7 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
             std::string moduleName(LoraModule::toModuleName(modId));
             TLLM_CHECK_WITH_INFO(it != loraModules.end(), "lora module " + moduleName + " not enabled for this model");
             TLLM_CHECK_WITH_INFO(it->flattenedInOutSize(adapterSize, isDora) <= weights->getShape().d[2],
-                "lora_weights has to few values for " + moduleName);
+                "lora_weights has too few values for " + moduleName);
             TLLM_CHECK_WITH_INFO(adapterSize <= maxAdapterSize,
                 "Invalid low_rank (" + std::to_string(adapterSize) + "). low_rank must be smaller than mMaxLowRank ("
                     + std::to_string(maxAdapterSize) + ")");

@@ -2,6 +2,7 @@ import copy
 import inspect
 import os
 import traceback
+import warnings
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -9,7 +10,7 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -25,6 +26,8 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
+from ..virtual_memory import RestoreMode
+from ..virtual_memory import scope as virtual_memory_scope
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -34,8 +37,11 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
 
-def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
-                                           mamba_ssm_cache_dtype: str) -> None:
+def validate_and_set_mamba_ssm_cache_dtype(
+        config: ModelConfig,
+        mamba_ssm_cache_dtype: str,
+        mamba_ssm_stochastic_rounding: bool = False,
+        mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
         hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
                            None)
@@ -47,6 +53,8 @@ def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 
     config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
+    config.quant_config.mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
+    config.quant_config.mamba_ssm_philox_rounds = mamba_ssm_philox_rounds
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
@@ -182,6 +190,15 @@ def _construct_checkpoint_loader(
     return checkpoint_loader
 
 
+def _apply_to_buffers_only(model: torch.nn.Module, fn):
+    """Apply *fn* to every buffer in *model*, skipping parameters.
+    """
+    for module in model.modules():
+        for key, buf in module._buffers.items():
+            if buf is not None:
+                module._buffers[key] = fn(buf)
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -195,7 +212,9 @@ class ModelLoader:
                  sparse_attention_config: Optional["SparseAttentionConfig"],
                  max_num_tokens: int,
                  max_seq_len: Optional[int],
-                 lora_config: Optional[LoraConfig] = None):
+                 lora_config: Optional[LoraConfig] = None,
+                 model_weights_memory_tag: Optional[ExecutorMemoryType] = None,
+                 model_weights_restore_mode: Optional[RestoreMode] = None):
         """
         Initializes the ModelLoader.
 
@@ -206,6 +225,11 @@ class ModelLoader:
             max_num_tokens: The maximum number of tokens the engine will handle.
             max_seq_len: The maximum sequence length.
             lora_config: Configuration for LoRA.
+            model_weights_memory_tag: When set, parameter allocations during
+                ``load()`` are placed under a separate virtual-memory tag so
+                they can be released/materialized independently of buffers.
+            model_weights_restore_mode: RestoreMode for the model weights
+                virtual-memory scope.
         """
         self.llm_args = llm_args
         self.mapping = mapping
@@ -214,6 +238,9 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
+        self.model_weights_memory_tag = model_weights_memory_tag
+        self.model_weights_restore_mode = model_weights_restore_mode
+        self._weight_pool_proxy = None
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -275,29 +302,81 @@ class ModelLoader:
                 config_copy = copy.deepcopy(config)
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
+                config = config_copy
+                is_meta_init = True
+            except Exception:
+                logger.info(
+                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}"
+                )
+                model = AutoModelForCausalLM.from_config(config)
+                is_meta_init = False
 
-                memo = dict()
+            memo = dict()
+
+            if self.model_weights_memory_tag is not None:
+                # Allocate buffers to the outer virtual_memory_scope,
+                # but parameters (weights) to the dedicated inner virtual_memory_scope.
+
+                def allocate_buffer_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        if t.device == torch.device('meta'):
+                            cuda_t = torch.empty_like(t, device='cuda')
+                        else:
+                            cuda_t = t.cuda()
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                _apply_to_buffers_only(model, allocate_buffer_on_cuda)
+
+                need_initialized_weights = load_format not in (LoadFormat.AUTO,
+                                                               LoadFormat.DUMMY)
+
+                def allocate_weights_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        cuda_t = torch.empty_like(t, device='cuda')
+                        if t.device != torch.device('meta') and (
+                                need_initialized_weights or is_meta_init):
+                            if t.is_cuda:
+                                memory_type_map = {
+                                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
+                                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
+                                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT:
+                                    ExecutorMemoryType.MODEL_ENGINE_DRAFT,
+                                }
+
+                                warnings.warn(
+                                    f"A weight tensor of shape {t.shape} is already allocated on CUDA device before "
+                                    f"the weight allocation stage. This will cause extra CUDA memory usage in the "
+                                    f"'{memory_type_map[self.model_weights_memory_tag]}' scope."
+                                )
+                            cuda_t.copy_(t)
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                with virtual_memory_scope(
+                        self.model_weights_memory_tag,
+                        self.model_weights_restore_mode) as pool:
+                    model._apply(allocate_weights_on_cuda)
+                self._weight_pool_proxy = pool
+            elif is_meta_init:
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
                         return t
+
                     if t not in memo:
                         memo[t] = torch.empty_like(t, device='cuda')
                     return memo[t]
 
                 model._apply(init_meta_tensor)
-                config = config_copy
 
-            except Exception:
-                logger.info(
-                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
-                )
-                model = AutoModelForCausalLM.from_config(config)
-            finally:
-                if 'memo' in locals():
-                    del memo
-
+            # Ensure everything is at least on CUDA
+            # No-op if worked as expected
             model.to("cuda")
+            del memo
+
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
@@ -406,6 +485,7 @@ class ModelLoader:
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
+            video_pruning_rate=self.llm_args.video_pruning_rate,
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -421,7 +501,9 @@ class ModelLoader:
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
-            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
+            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
+            self.llm_args.kv_cache_config.mamba_ssm_stochastic_rounding,
+            self.llm_args.kv_cache_config.mamba_ssm_philox_rounds)
 
         # Allow overriding the number of layers via environment variable
         # Note: This is kept for backward compatibility, but model_kwargs is preferred

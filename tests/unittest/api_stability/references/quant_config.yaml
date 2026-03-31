@@ -19,6 +19,12 @@ methods:
       mamba_ssm_cache_dtype:
         annotation: Optional[str]
         default: null
+      mamba_ssm_philox_rounds:
+        annotation: int
+        default: 10
+      mamba_ssm_stochastic_rounding:
+        annotation: bool
+        default: false
       pre_quant_scale:
         annotation: bool
         default: false

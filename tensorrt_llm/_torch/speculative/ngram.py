@@ -1,4 +1,3 @@
-from itertools import chain
 from typing import Optional
 
 from ordered_set import OrderedSet
@@ -75,8 +74,7 @@ class NGramPoolManager(BaseResourceManager):
             return
 
         # Remove the pairs if the request is completed in private pool mode.
-        for request in chain(scheduled_batch.context_requests,
-                             scheduled_batch.generation_requests):
+        for request in scheduled_batch.all_requests():
             if request.state == LlmRequestState.GENERATION_COMPLETE:
                 request_id = request.request_id
                 if request_id in self.pool:

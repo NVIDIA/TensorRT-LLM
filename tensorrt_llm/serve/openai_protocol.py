@@ -220,8 +220,12 @@ def _response_format_to_guided_decoding_params(
             raise ValueError(
                 f"response_format.json_schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        guided_decoding_params = GuidedDecodingParams(
-            json=response_format.json_schema)
+        # OpenAI API spec wraps the actual JSON schema under a "schema" key.
+        # Extract the actual schema if the wrapper format is used.
+        json_schema = response_format.json_schema
+        if isinstance(json_schema, dict) and "schema" in json_schema:
+            json_schema = json_schema["schema"]
+        guided_decoding_params = GuidedDecodingParams(json=json_schema)
     elif response_format.type == "json_object":
         guided_decoding_params = GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
@@ -504,7 +508,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    top_logprobs: List[ChatCompletionLogProb] = None
+    top_logprobs: Optional[List[ChatCompletionLogProb]] = None
 
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
@@ -543,6 +547,9 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     """Assistant message that includes reasoning tokens."""
     reasoning: Optional[str]
+    # NOTE: some older benchmarks and chat templates assume the below, which has been deprecated
+    # in other inference frameworks in favor of the above `reasoning` field.
+    reasoning_content: Optional[str]
 
 
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
@@ -1379,6 +1386,14 @@ class VideoGenerationRequest(OpenAIBaseModel):
         description="Text describing what to avoid in the generated video.")
     seed: Optional[int] = Field(default=None,
                                 description="Random seed for reproducibility.")
+    output_format: Literal["mp4", "avi", "auto"] = Field(
+        default="auto",
+        description=(
+            "Video encode format. "
+            "'mp4' for H.264 encoding (requires ffmpeg installed on server), "
+            "'avi' for MJPEG encoding (always available, no audio support), "
+            "'auto' to use best available (H.264 if ffmpeg installed, "
+            "otherwise MJPEG)."))
 
     @field_validator("size")
     @classmethod

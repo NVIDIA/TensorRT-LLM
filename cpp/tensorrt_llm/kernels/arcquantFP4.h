@@ -1,0 +1,43 @@
+/*
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/common.h"
+
+namespace tc = tensorrt_llm::common;
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
+{
+
+enum class ArcQuantType
+{
+    ACT,
+    WEIGHT,
+};
+
+template <typename T, int group_size, ArcQuantType quant_type>
+void run_quantize_reorder_nvfp4(int16_t* hidden_states, float* input_scale, int16_t* reorder_index, uint8_t* q_out,
+    uint8_t* q_scale, int seq_len, int KQ, int KE, cudaStream_t stream);
+
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

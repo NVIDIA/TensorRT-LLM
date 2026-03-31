@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              get_model_architecture, register_auto_model)
 
@@ -280,6 +282,7 @@ class Eagle3DraftModel(DecoderModel):
         self.num_layers = model_config.pretrained_config.num_hidden_layers
         self._eh_proj_before_attn = eagle_config.get("eh_proj_before_attn",
                                                      False)
+        self._norm_before_fc = eagle_config.get("norm_before_fc", False)
         self._use_mla = use_mla
 
         if hasattr(config, "target_hidden_size"):
@@ -301,6 +304,15 @@ class Eagle3DraftModel(DecoderModel):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
             )
+        if self._norm_before_fc:
+            self.input_norm = RMSNorm(
+                hidden_size=self.hidden_size_in *
+                self.spec_config.num_capture_layers,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+        else:
+            self.input_norm = None
 
         if self.num_layers > 1:
             self.midlayer = nn.ModuleList([
@@ -550,6 +562,8 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
 
         expected_hidden_size = self.model.hidden_size
         if hidden_states.shape[-1] != expected_hidden_size:
+            if self.model._norm_before_fc:
+                hidden_states = self.model.input_norm(hidden_states)
             hidden_states = self.model.fc(hidden_states)
 
         return hidden_states
@@ -784,7 +798,7 @@ class MTPForCausalLM(nn.Module):
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
-            case "deepseek_v3" | "deepseek_v32":
+            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
                 from .modeling_deepseekv3 import DeepseekV3MTP
                 mtp_layer = DeepseekV3MTP
             case "exaone_moe":
@@ -828,7 +842,7 @@ class MTPDraftModel(nn.Module):
                                 layer_idx,
                                 aux_stream_dict,
                                 is_separate_draft_engine=True)
-        elif model_type in ["deepseek_v3", "deepseek_v32"]:
+        elif model_type in ["deepseek_v3", "deepseek_v32", "glm_moe_dsa"]:
             from .modeling_deepseekv3 import DeepseekV3MTP
             mtp_layer = DeepseekV3MTP(model_config,
                                       layer_idx,
@@ -913,7 +927,7 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
             case "glm4_moe":
                 from .modeling_glm import Glm4WeightLoader
                 weight_loader = Glm4WeightLoader(self, is_draft_model=True)
-            case "deepseek_v3" | "deepseek_v32":
+            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
                 from .modeling_deepseekv3 import DeepseekV3WeightLoader
                 weight_loader = DeepseekV3WeightLoader(self,
                                                        is_draft_model=True)
@@ -984,6 +998,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         return MTPDraftModelForCausalLM(model_config)
     elif spec_dec_mode.is_pard():
         return PARDForCausalLM(draft_config)
+    elif spec_dec_mode.is_draft_target_one_model():
+        return AutoModelForCausalLM.from_config(draft_config)
     else:
         raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
@@ -1000,77 +1016,78 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                          vocab_size=model_config.pretrained_config.vocab_size)
         self.draft_model = None
         self.draft_config = None
+        self.spec_worker = None
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
+        self.spec_config = spec_config
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
-            if spec_config.spec_dec_mode.is_eagle3_one_model():
-                if spec_config.eagle3_model_arch == "mistral_large3":
-                    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-                        MistralConfigLoader
-                    self.draft_config = MistralConfigLoader().load(
-                        spec_config.speculative_model,
-                        mapping=model_config.mapping,
-                        moe_backend=model_config.moe_backend,
-                        moe_max_num_tokens=model_config.moe_max_num_tokens,
-                        max_num_tokens=model_config.max_num_tokens,
-                        moe_load_balancer=model_config.moe_load_balancer,
-                        skip_create_weights_in_init=True,
-                    )
+            # Only create draft_model for modes MTP, Eagle3 (not SA)
+            if not spec_config.spec_dec_mode.is_sa():
+                if spec_config.spec_dec_mode.is_eagle3_one_model():
+                    if spec_config.eagle3_model_arch == "mistral_large3":
+                        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+                            MistralConfigLoader
+                        self.draft_config = MistralConfigLoader().load(
+                            spec_config.speculative_model,
+                            mapping=model_config.mapping,
+                            moe_backend=model_config.moe_backend,
+                            moe_max_num_tokens=model_config.moe_max_num_tokens,
+                            max_num_tokens=model_config.max_num_tokens,
+                            moe_load_balancer=model_config.moe_load_balancer,
+                            skip_create_weights_in_init=True,
+                        )
+                    elif spec_config.eagle3_model_arch == "llama3":
+                        self.draft_config = ModelConfig.from_pretrained(
+                            model_config.spec_config.speculative_model,
+                            trust_remote_code=True,
+                            attn_backend=model_config.attn_backend,
+                            moe_backend=model_config.moe_backend,
+                            mapping=model_config.mapping,
+                            spec_config=model_config.spec_config,
+                            max_num_tokens=model_config.max_num_tokens,
+                            moe_max_num_tokens=model_config.moe_max_num_tokens)
+                    else:
+                        raise ValueError(
+                            f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
+                        )
+                    self.draft_config.quant_config.kv_cache_quant_algo = \
+                    model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
-                elif spec_config.eagle3_model_arch == "llama3":
+
+                elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
                         model_config.spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=model_config.moe_backend,
                         mapping=model_config.mapping,
-                        spec_config=model_config.spec_config,
+                        spec_config=None,  # Avoid recursive spec-dec
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
-                else:
-                    raise ValueError(
-                        f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
-                    )
-                self.draft_config.quant_config.kv_cache_quant_algo = \
-                model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.quant_config.kv_cache_quant_algo = \
+                        model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.extra_attrs = model_config.extra_attrs
 
-            elif spec_config.spec_dec_mode.is_pard():
-                self.draft_config = ModelConfig.from_pretrained(
-                    model_config.spec_config.speculative_model,
-                    trust_remote_code=True,
-                    attn_backend=model_config.attn_backend,
-                    moe_backend=model_config.moe_backend,
-                    mapping=model_config.mapping,
-                    spec_config=None,  # Avoid recursive spec-dec
-                    max_num_tokens=model_config.max_num_tokens,
-                    moe_max_num_tokens=model_config.moe_max_num_tokens)
-                self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
+                self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
+                    spec_config)
 
-            self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
-                spec_config)
+                self.draft_model = get_draft_model(model_config,
+                                                   self.draft_config,
+                                                   self.lm_head, self.model)
+                if self.draft_model is not None:
+                    self.epilogue.append(self.draft_model)
+                if spec_config.spec_dec_mode.is_pard(
+                ) and self.draft_model is not None:
+                    self.draft_model.logits_processor = self.logits_processor
 
-            self.draft_model = get_draft_model(model_config, self.draft_config,
-                                               self.lm_head, self.model)
-            if spec_config.spec_dec_mode.is_pard(
-            ) and self.draft_model is not None:
-                self.draft_model.logits_processor = self.logits_processor
+            # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
-            self.epilogue.append(self.draft_model)
-            self.epilogue.append(self.spec_worker)
-
-            # EAGLE3-specific logic: merge extra_attrs from draft model for Llama3
-            if (self.draft_config is not None and model_config.spec_config.
-                    spec_dec_mode.is_eagle3_one_model()
-                    and model_config.spec_config.eagle3_model_arch == "llama3"):
-                for key, value in self.draft_config.extra_attrs.items():
-                    assert key in ('attn_layers', 'mla_layers')
-                    assert key in model_config.extra_attrs
-                    model_config.extra_attrs[key].update(value)
+            if self.spec_worker is not None:
+                self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
     def forward(
@@ -1099,7 +1116,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if attn_metadata.padded_num_tokens is not None:
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
-        if self.draft_model is not None:
+        if self.spec_worker is not None:
             # get logits
             logits = self.logits_processor.forward(
                 hidden_states[spec_metadata.gather_ids],
@@ -1107,20 +1124,21 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 attn_metadata,
                 True,
             )
-            mtp_input_ids = input_ids
-            mtp_position_ids = position_ids
+
+            spec_input_ids = input_ids
+            spec_position_ids = position_ids
             if attn_metadata.padded_num_tokens is not None:
                 if input_ids is not None:
                     # Slice along the first dimension
-                    mtp_input_ids = input_ids[:attn_metadata.num_tokens]
+                    spec_input_ids = input_ids[:attn_metadata.num_tokens]
                 if position_ids is not None:
                     # Slice along the last dimension
-                    mtp_position_ids = position_ids[:, :attn_metadata.
-                                                    num_tokens]
+                    spec_position_ids = position_ids[:, :attn_metadata.
+                                                     num_tokens]
 
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=mtp_input_ids,
-                                    position_ids=mtp_position_ids,
+            return self.spec_worker(input_ids=spec_input_ids,
+                                    position_ids=spec_position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
                                     attn_metadata=attn_metadata,
@@ -1151,10 +1169,15 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def load_draft_weights(self,
                            weights: Dict,
                            weight_mapper: Optional[BaseWeightMapper] = None):
-        self.draft_model.load_weights(weights=weights,
-                                      weight_mapper=weight_mapper)
-        # PARD has independent weights; other methods share with target model
-        if not self.model_config.spec_config.spec_dec_mode.is_pard():
+        args = inspect.getfullargspec(self.draft_model.load_weights).args
+        if "weight_mapper" in args:
+            self.draft_model.load_weights(weights=weights,
+                                          weight_mapper=weight_mapper)
+        else:
+            self.draft_model.load_weights(weights=weights)
+
+        if self.spec_config and not self.spec_config.spec_dec_mode.is_external_drafter(
+        ):
             self.draft_model.load_weights_from_target_model(self)
 
     def set_guided_decoder(self,

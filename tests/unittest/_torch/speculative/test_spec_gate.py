@@ -57,7 +57,6 @@ def test_spec_gate_e2e(enforce_single_worker):
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
         eagle3_one_model=False,
-        max_concurrency=10000,
         acceptance_window=acceptance_window,
         acceptance_length_threshold=acceptance_threshold,
     )

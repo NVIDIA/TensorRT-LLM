@@ -19,7 +19,7 @@ from typing import NamedTuple, cast
 
 from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
-from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
+from .._life_cycle_registry import LayerGroupId, LifeCycleId, LifeCycleRegistry, make_life_cycle
 from .._storage._core import PoolGroupIndex, PoolIndex
 from .._utils import (
     HomoTuple,
@@ -164,7 +164,7 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     tokens_per_block = config.tokens_per_block
     expansion_map = dict[BufferId, int]()
     for layer in config.layers:
-        life_cycle = LifeCycle.make(layer.window_size, layer.num_sink_tokens, tokens_per_block)
+        life_cycle = make_life_cycle(layer, tokens_per_block)
         life_cycle_id = life_cycle_registry.get_id(life_cycle)
         size_to_buffers = buffer_groups[life_cycle_id]
         for buffer in layer.buffers:

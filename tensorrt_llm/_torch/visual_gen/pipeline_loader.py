@@ -15,6 +15,7 @@ Dynamic Quantization:
 """
 
 import os
+import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -25,8 +26,7 @@ from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .checkpoints import WeightLoader
-from .config import DiffusionArgs, DiffusionModelConfig, PipelineComponent
+from .config import DiffusionModelConfig, VisualGenArgs
 from .models import AutoPipeline
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ class PipelineLoader:
     on-the-fly during loading.
 
     Example:
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path="/path/to/model",
             linear=LinearConfig(type="trtllm-fp8-blockwise"),
             parallel=ParallelConfig(dit_tp_size=2),
@@ -52,7 +52,7 @@ class PipelineLoader:
 
     def __init__(
         self,
-        args: Optional[DiffusionArgs] = None,
+        args: Optional[VisualGenArgs] = None,
         *,
         mapping: Optional[Mapping] = None,
         device: str = "cuda",
@@ -61,7 +61,7 @@ class PipelineLoader:
         Initialize model loader.
 
         Args:
-            args: DiffusionArgs containing all configuration (preferred)
+            args: VisualGenArgs containing all configuration (preferred)
             mapping: Tensor parallel mapping (fallback if args is None)
             device: Device to load model on (fallback if args is None)
         """
@@ -120,8 +120,8 @@ class PipelineLoader:
         1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID)
         2. Load config via DiffusionModelConfig.from_pretrained()
         3. Create pipeline via AutoPipeline.from_config() with MetaInit
-        4. Load transformer weights via pipeline.load_weights()
-        5. Load auxiliary components (VAE, text_encoder) via diffusers
+        4. Load transformer weights via pipeline.load_transformer_weights()
+        5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
 
         Args:
@@ -134,15 +134,18 @@ class PipelineLoader:
         # Resolve checkpoint_dir
         checkpoint_dir = checkpoint_dir or (self.args.checkpoint_path if self.args else None)
         if not checkpoint_dir:
-            raise ValueError("checkpoint_dir must be provided or set in DiffusionArgs")
+            raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
 
         # Get loading options from args
         skip_components = self.args.skip_components if self.args else []
 
+        load_start = time.time()
+        text_encoder_path = self.args.text_encoder_path if self.args else ""
+
         # =====================================================================
         # STEP 1: Load Config (includes quant config parsing)
-        # Merge pretrained checkpoint config with user-provided DiffusionArgs
+        # Merge pretrained checkpoint config with user-provided VisualGenArgs
         # =====================================================================
         logger.info(f"Loading config from {checkpoint_dir}")
         config = DiffusionModelConfig.from_pretrained(
@@ -172,40 +175,40 @@ class PipelineLoader:
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
+        # Each pipeline implements load_transformer_weights() for its own
+        # checkpoint format.  The default (BasePipeline) uses WeightLoader
+        # for diffusers-compatible checkpoints with a transformer/ subdir.
         # If dynamic_weight_quant=True:
         #   - BF16 checkpoint weights are loaded
         #   - Quantized on-the-fly to FP8/NVFP4 by DynamicLinearWeightLoader
         #   - Copied into model's quantized buffers
         # =====================================================================
-        if pipeline.transformer is None:
-            raise ValueError("Pipeline has no transformer component")
-
-        transformer_components = pipeline.transformer_components
-        logger.info(f"Transformer components: {transformer_components}")
-
-        transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
-        if not os.path.exists(transformer_path):
-            raise FileNotFoundError(
-                f"Transformer path does not exist: {transformer_path}. "
-                f"Checkpoint directory must contain a 'transformer' subdirectory."
-            )
-
-        weight_loader = WeightLoader(components=transformer_components)
-        # TODO: accelerate the cpu loading w/ multiprocessing
-        weights = weight_loader.load_weights(checkpoint_dir, self.mapping)
-
-        # Load weights into pipeline
+        weights = pipeline.load_transformer_weights(checkpoint_dir)
         pipeline.load_weights(weights)
 
         # =====================================================================
-        # STEP 4: Load Standard Components (VAE, TextEncoder via diffusers)
+        # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
         # These are NOT quantized - loaded as-is from checkpoint
         # =====================================================================
-        pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
+        extra_kwargs = {}
+        if text_encoder_path:
+            extra_kwargs["text_encoder_path"] = text_encoder_path
+        pipeline.load_standard_components(
+            checkpoint_dir,
+            self.device,
+            skip_components,
+            **extra_kwargs,
+        )
+        logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================
         # STEP 5: Post-load Hooks (TeaCache setup, etc.)
         # =====================================================================
+
+        t0 = time.time()
+        if config.parallel.enable_parallel_vae:
+            pipeline.setup_parallel_vae()
+
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
@@ -217,21 +220,30 @@ class PipelineLoader:
 
         if not skip_warmup:
             if config.torch_compile.enable_autotune:
-                with autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")):
+                with autotune(
+                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
+                    skip_dynamic_tuning_buckets=True,
+                ):
                     pipeline.warmup()
             else:
                 pipeline.warmup()
+            logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
+        else:
+            logger.info("Warmup skipped (skip_warmup=True)")
 
         if config.pipeline.enable_layerwise_nvtx_marker:
             from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 
             marker = LayerwiseNvtxMarker()
             module_prefix = pipeline.__class__.__name__
-            for transformer_component in transformer_components:
+            for transformer_component in pipeline.transformer_components:
                 logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
                 marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 
-        logger.info(f"Pipeline loaded: {pipeline.__class__.__name__}")
+        logger.info(
+            f"Pipeline loaded: {pipeline.__class__.__name__} "
+            f"(total load time: {time.time() - load_start:.2f}s)"
+        )
         return pipeline
 
     def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:

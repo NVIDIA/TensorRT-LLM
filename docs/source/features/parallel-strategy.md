@@ -172,7 +172,7 @@ The system maintains a routing table that maps Expert IDs to Slot IDs, which can
 
 ### References
 
-- [Technical Blog: Scaling Expert Parallelism in TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+- [Technical Blog: Scaling Expert Parallelism in TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
 - [DeepSeek-V3 Paper](https://arxiv.org/abs/2412.19437)
 - [EPLB Implementation](https://github.com/deepseek-ai/EPLB)
 

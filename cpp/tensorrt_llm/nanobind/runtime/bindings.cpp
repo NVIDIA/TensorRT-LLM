@@ -343,20 +343,18 @@ void initBindings(nb::module_& m)
         nb::rv_policy::reference);
 
     m.def(
-        "set_virtual_memory_allocator",
+        "push_virtual_memory_allocator",
         [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
         {
             static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
-            tr::setVirtualMemoryAllocator(tag, mode,
+            tr::pushVirtualMemoryAllocator(tag, mode,
                 std::make_shared<tr::CudaStream>(
                     reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
         },
-        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations",
-        nb::call_guard<nb::gil_scoped_release>());
+        "Push a virtual memory allocator onto the allocator stack.", nb::call_guard<nb::gil_scoped_release>());
 
-    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
-        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations",
-        nb::call_guard<nb::gil_scoped_release>());
+    m.def("pop_virtual_memory_allocator", &tr::popVirtualMemoryAllocator,
+        "Pop the top virtual memory allocator from the allocator stack", nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, bool, int64_t>(), nb::arg("buf_size"),

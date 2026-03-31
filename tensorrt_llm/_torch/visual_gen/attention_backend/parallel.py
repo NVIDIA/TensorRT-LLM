@@ -32,7 +32,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch.distributed import all_to_all_4d
+from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
 from .interface import AttentionTensorLayout
 
@@ -43,6 +43,11 @@ class UlyssesAttention(nn.Module):
 
     Wraps any attention backend with sequence parallelism via all-to-all.
     Not a standalone backend — compose around a real backend (VANILLA/TRTLLM).
+
+    Two modes:
+    - fuse_qkv_a2a=False (default): 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
+    - fuse_qkv_a2a=True: stacks Q/K/V into [B, S/P, 3, H, D], 1 fused 5D all-to-all
+      + 1 for output (2 collectives total)
     """
 
     def __init__(
@@ -55,18 +60,15 @@ class UlyssesAttention(nn.Module):
         self.process_group = process_group
         self._preferred_layout = AttentionTensorLayout.NHD
 
-        # Derive head info from inner backend
         self.head_dim = inner_backend.head_dim
         self.sharded_num_heads = inner_backend.num_heads
         self.sharded_num_kv_heads = getattr(inner_backend, "num_kv_heads", self.sharded_num_heads)
 
-        # Get world size from process group
         try:
             self.world_size = torch.distributed.get_world_size(group=process_group)
         except (RuntimeError, ValueError):
             self.world_size = 1
 
-        # Full (unsharded) head counts for external interface
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
 
@@ -82,23 +84,49 @@ class UlyssesAttention(nn.Module):
         """
         Forward pass with Ulysses sequence parallelism.
 
-        Input/Output: [B, S/P, H, D] (sequence sharded)
-
-        Args:
-            q: Query tensor [B, S/P, H, D]
-            k: Key tensor [B, S/P, H, D]
-            v: Value tensor [B, S/P, H, D]
-            batch_size: Batch size
-            attention_mask: Optional attention mask
-
-        Returns:
-            Output tensor [B, S/P, H, D] (sequence sharded)
-
-        Note:
-            seq_len is computed from tensor shape after all-to-all, not passed as parameter.
+        q/k/v: [B, S/P, H, D] each.
+        When fuse_qkv_a2a=True: stacks Q/K/V → 1 fused 5D all-to-all (2 collectives)
+        When fuse_qkv_a2a=False: 3 separate 4D all-to-all (4 collectives)
         """
-        # Step 1: All-to-All to gather full sequence, shard heads
-        # [B, S/P, H, D] -> [B, S, H/P, D]
+        if self.inner_backend.support_fused_qkv():
+            # default to fused QKV A2A if backend supports it.
+            # This is more efficient than the unfused path.
+            return self._forward_fused(q, k, v, batch_size, attention_mask)
+        return self._forward_unfused(q, k, v, batch_size, attention_mask)
+
+    def _forward_fused(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch_size: int,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Stack Q/K/V → [B, S/P, 3, H, D], then fused 5D all-to-all
+        # 5D A2A is faster than 4D A2A with dim=0 or dim=-1 concat
+        qkv = torch.stack([q, k, v], dim=2)
+        if self.world_size > 1:
+            # [B, S, 3, H/P, D]
+            qkv = all_to_all_5d(qkv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
+
+        B, seq_len, _, Hp, D = qkv.shape
+
+        # pass as fused QKV
+        output = self.inner_backend.forward(
+            q=qkv, k=None, v=None, batch_size=batch_size, seq_len=seq_len
+        )
+
+        return self._output_a2a(output, batch_size, seq_len)
+
+    def _forward_unfused(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch_size: int,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # [B, S/P, H, D] → 3 separate all-to-all → [B, S, H/P, D]
         if self.world_size > 1:
             q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
             k = all_to_all_4d(k, scatter_dim=2, gather_dim=1, process_group=self.process_group)
@@ -107,46 +135,39 @@ class UlyssesAttention(nn.Module):
         seq_len_full = q.shape[1]
         inner_layout = self.inner_backend.preferred_layout
 
-        # Step 2: Call wrapped backend for attention
-        # Transpose only if inner backend expects HND layout
         if inner_layout == AttentionTensorLayout.HND:
-            # VANILLA expects [B, H/P, S, D]
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-        # NHD backends (TRTLLM) keep [B, S, H/P, D] as-is
 
-        inner_kwargs = dict(
-            q=q,
-            k=k,
-            v=v,
-            batch_size=batch_size,
-            seq_len=seq_len_full,
-        )
+        inner_kwargs = dict(q=q, k=k, v=v, batch_size=batch_size, seq_len=seq_len_full)
         if attention_mask is not None:
             inner_kwargs["attention_mask"] = attention_mask
         output = self.inner_backend.forward(**inner_kwargs)
 
-        # Convert output back to [B, S, H/P, D] for the reverse all-to-all
+        return self._output_a2a(output, batch_size, seq_len_full)
+
+    def _output_a2a(
+        self,
+        output: torch.Tensor,
+        batch_size: int,
+        seq_len_full: int,
+    ) -> torch.Tensor:
+        """Reverse all-to-all: [B, S, H/P, D] → [B, S/P, H, D]"""
+        inner_layout = self.inner_backend.preferred_layout
+
         if inner_layout == AttentionTensorLayout.HND:
-            # VANILLA returns [B, H/P, S, D] -> transpose to [B, S, H/P, D]
             output = output.transpose(1, 2).contiguous()
         else:
-            # TRTLLM returns [B, S, (H/P)*D] (3D) -> reshape to [B, S, H/P, D]
             if output.dim() == 3:
                 output = output.view(
                     batch_size, seq_len_full, self.sharded_num_heads, self.head_dim
                 )
             output = output.contiguous()
 
-        # Step 3: All-to-All to restore sequence sharding
-        # [B, S, H/P, D] -> [B, S/P, H, D]
         if self.world_size > 1:
             output = all_to_all_4d(
-                output,
-                scatter_dim=1,
-                gather_dim=2,
-                process_group=self.process_group,
+                output, scatter_dim=1, gather_dim=2, process_group=self.process_group
             )
 
         return output
@@ -158,5 +179,4 @@ class UlyssesAttention(nn.Module):
 
     @classmethod
     def support_fused_qkv(cls) -> bool:
-        """This backend does not support fused QKV."""
-        return False
+        return True

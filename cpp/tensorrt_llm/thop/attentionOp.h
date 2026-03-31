@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,15 @@
 
 #pragma once
 
+#include <climits>
 #include <optional>
 #include <torch/extension.h>
 
+#include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -71,8 +76,39 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer);
+    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+    std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata = std::nullopt,
+    std::optional<torch::Tensor> flash_mla_num_splits = std::nullopt);
+
+struct KvCachePoolPointers
+{
+    void* primaryPoolPtr{nullptr};
+    void* secondaryPoolPtr{nullptr};
+    void* primaryBlockScalePoolPtr{nullptr};
+    void* secondaryBlockScalePoolPtr{nullptr};
+};
+
+KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
+    int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache);
+
+common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
+    std::optional<torch::Tensor> const& kv_cache_block_offsets,
+    std::optional<torch::Tensor> const& host_kv_cache_pool_pointers,
+    std::optional<torch::Tensor> const& host_kv_cache_pool_mapping, common::QuantMode quantMode, int64_t layer_idx,
+    int64_t batch_size, int64_t tokens_per_block, int64_t kv_head_num, int64_t size_per_head,
+    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t sink_token_length,
+    int64_t beam_width, int64_t seq_offset, bool is_mla_enable, size_t elem_size);
 
 } // namespace torch_ext
+
+/**
+ * @brief Compute FlashMLA tile-scheduler metadata in-place.
+ *
+ * Call once per forward pass before the attention layers to pre-compute
+ * get_mla_metadata and store the results in the provided tensors. Pass
+ * these tensors to the attention op so all layers reuse the same metadata.
+ */
+void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits,
+    int64_t batch_size, int64_t s_q, int64_t num_q_heads, int64_t num_kv_heads, int64_t head_size_v);
 
 TRTLLM_NAMESPACE_END

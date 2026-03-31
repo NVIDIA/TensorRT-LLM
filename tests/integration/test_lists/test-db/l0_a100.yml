@@ -105,4 +105,4 @@ l0_a100:
       stage: post_merge
       backend: fmha
   tests:
-  - test_fmha.py::test_fmha TIMEOUT (90)
+  - test_fmha.py::test_fmha TIMEOUT (120) # Longer timeout for A100 as it builds all the architectures

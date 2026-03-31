@@ -42,7 +42,9 @@ def _extract_transpose_prefill_kernel(
     conv_mask = conv_offsets < conv_dim
     mask = seq_mask[:, None] & conv_mask[None, :]
 
-    src_offsets = seq_offsets[:, None] * d_in_proj + (d_inner + conv_offsets[None, :])
+    # Cast to int64 to avoid overflow: seq_offsets * d_in_proj can exceed INT32_MAX
+    # (e.g., 131071 * 22656 = 2,969,544,576 > 2,147,483,647)
+    src_offsets = seq_offsets[:, None].to(tl.int64) * d_in_proj + d_inner + conv_offsets[None, :]
     data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
 
     dst_offsets = conv_offsets[:, None] * num_prefill_tokens + seq_offsets[None, :]

@@ -52,8 +52,12 @@ class ActivationType(IntEnum):
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
+    # act = x0 * x1 * sigmoid(x1)
     SwiGlu = 0
+    # act = relu(x0) ^ 2
     Relu2 = 1
+    # act = x0 * sigmoid(x0)
+    Silu = 2
 
 
 # IMPORTANT: when adding a new activation type, please update this function.

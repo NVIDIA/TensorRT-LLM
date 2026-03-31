@@ -115,6 +115,8 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
+
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use

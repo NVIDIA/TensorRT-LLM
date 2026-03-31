@@ -13,7 +13,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -455,6 +455,41 @@ class PurePythonEncoder(VideoEncoder):
             f.write(riff_data)
 
 
+def resolve_video_format(output_format: str) -> Tuple[str, str]:
+    """Resolve the requested output format to a concrete format and extension.
+
+    Args:
+        output_format: One of 'mp4', 'avi', or 'auto'.
+
+    Returns:
+        Tuple of (format, extension), e.g. ('mp4', '.mp4') or ('avi', '.avi').
+
+    Raises:
+        RuntimeError: If 'mp4' is requested but ffmpeg is not available.
+        ValueError: If an unsupported output format is provided.
+    """
+    if output_format == "mp4":
+        if _check_ffmpeg_available():
+            return "mp4", ".mp4"
+        raise RuntimeError(
+            "MP4 (H.264) format requires ffmpeg to be installed. "
+            "Install ffmpeg (e.g., 'apt-get install ffmpeg' on Ubuntu/Debian) "
+            "or use output_format='avi' for MJPEG encoding (no ffmpeg required). "
+            "See https://ffmpeg.org/download.html for installation instructions."
+        )
+    elif output_format == "avi":
+        return "avi", ".avi"
+    elif output_format == "auto":
+        if _check_ffmpeg_available():
+            return "mp4", ".mp4"
+        return "avi", ".avi"
+    else:
+        raise ValueError(
+            f"Unsupported video format: {output_format}. Please use 'auto' if you"
+            f"want to automatically choose the best format based on availability."
+        )
+
+
 def get_video_encoder() -> Optional["VideoEncoder"]:
     """Get the best available video encoder (cached singleton).
 
@@ -467,15 +502,8 @@ def get_video_encoder() -> Optional["VideoEncoder"]:
     """
     global _VIDEO_ENCODER
     if _VIDEO_ENCODER is None:
-        if _check_ffmpeg_available():
-            logger.info("Using ffmpeg CLI for video encoding")
-            _VIDEO_ENCODER = FfmpegCliEncoder()
-        else:
-            logger.warning(
-                "FFmpeg is unavailable so no MP4 generation support."
-                "Using pure Python MJPEG/AVI encoder (no audio support)"
-            )
-            _VIDEO_ENCODER = PurePythonEncoder()
+        _VIDEO_ENCODER = FfmpegCliEncoder() if _check_ffmpeg_available() else PurePythonEncoder()
+        logger.info(f"Using {_VIDEO_ENCODER.__class__.__name__} for video encoding")
     return _VIDEO_ENCODER
 
 
@@ -489,7 +517,7 @@ class MediaStorage:
         """Save image to file.
 
         Args:
-            image: torch.Tensor (H, W, C) uint8
+            image: torch.Tensor (B, H, W, C) or (H, W, C) uint8
             output_path: Path to save the image
             format: Image format (png, jpg, webp). If None, infer from extension
             quality: Quality for lossy formats (1-100, higher is better)
@@ -497,6 +525,9 @@ class MediaStorage:
         Returns:
             Path where the image was saved
         """
+        # Extract first image from batch if needed
+        if hasattr(image, "dim") and image.dim() == 4:
+            image = image[0]
         # Ensure output directory exists
         output_dir = os.path.dirname(output_path)
         if output_dir:
@@ -550,13 +581,18 @@ class MediaStorage:
         """Convert torch.Tensor to PIL Image.
 
         Args:
-            image: torch.Tensor (H, W, C) uint8
+            image: torch.Tensor (H, W, C) or (B, H, W, C) uint8.
+                   If a batch dimension is present, the first image is extracted.
 
         Returns:
             PIL Image
         """
         if not isinstance(image, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor, got {type(image)}")
+
+        # Squeeze batch dimension if present: (B, H, W, C) -> (H, W, C)
+        if image.dim() == 4:
+            image = image[0]
 
         # Convert to numpy for PIL
         image_np = image.cpu().numpy()
@@ -606,15 +642,18 @@ class MediaStorage:
         """Save video to file with optional audio.
 
         Args:
-            video: Video frames as torch.Tensor (T, H, W, C) uint8
+            video: Video frames as torch.Tensor (B, T, H, W, C) or (T, H, W, C) uint8
             output_path: Path to save the video
             audio: Optional audio as torch.Tensor
             frame_rate: Frames per second (default: 24.0)
-            format: Video format (mp4, gif, png). If None, infer from extension
+            format: Video format (mp4, avi). If None, infer from extension
 
         Returns:
             Path where the video was saved
         """
+        # Extract first video from batch if needed
+        if hasattr(video, "dim") and video.dim() == 5:
+            video = video[0]
         # Ensure output directory exists
         if isinstance(output_path, Path):
             output_path = str(output_path)
@@ -631,17 +670,12 @@ class MediaStorage:
         format = format.lower()
 
         # Save based on format
-        if format == "mp4":
-            # _save_mp4 may return a different path (e.g., .avi when using PurePythonEncoder)
-            output_path = MediaStorage._save_mp4(video, audio, output_path, frame_rate)
-        elif format == "gif":
-            output_path = MediaStorage._save_gif(video, output_path, frame_rate)
-        elif format == "png":
-            output_path = MediaStorage._save_middle_frame(video, output_path)
+        if format in ("mp4", "avi"):
+            output_path = MediaStorage._save_encoded_video(video, audio, output_path, frame_rate)
         else:
             logger.warning(f"Unsupported video format: {format}, defaulting to mp4")
             output_path = output_path.rsplit(".", 1)[0] + ".mp4"
-            output_path = MediaStorage._save_mp4(video, audio, output_path, frame_rate)
+            output_path = MediaStorage._save_encoded_video(video, audio, output_path, frame_rate)
 
         return output_path
 
@@ -655,7 +689,7 @@ class MediaStorage:
             video: Video frames as torch.Tensor (T, H, W, C) uint8
             audio: Optional audio as torch.Tensor
             frame_rate: Frames per second
-            format: Video format (mp4, gif)
+            format: Video format (mp4, avi)
 
         Returns:
             Video bytes
@@ -682,18 +716,18 @@ class MediaStorage:
                     os.unlink(path)
 
     @staticmethod
-    def _save_mp4(
+    def _save_encoded_video(
         video: torch.Tensor, audio: Optional[torch.Tensor], output_path: str, frame_rate: float
     ) -> str:
-        """Save video with optional audio as MP4.
+        """Save video with optional audio using the best available encoder.
 
-        Uses ffmpeg CLI if available (supports audio), otherwise raises an error
-        to prompt ffmpeg installation.
+        For MP4 output, ffmpeg CLI is required. For AVI output, the pure Python
+        MJPEG encoder is used directly.
 
         Args:
             video: Video frames as torch.Tensor (T, H, W, C) uint8
             audio: Optional audio as torch.Tensor
-            output_path: Output path for MP4
+            output_path: Output path (MP4 or AVI)
             frame_rate: Frames per second
 
         Returns:
@@ -712,74 +746,7 @@ class MediaStorage:
             )
 
         try:
-            if encoder is not None:
-                return encoder.encode_video(video, output_path, frame_rate, audio)
-            else:
-                logger.warning(
-                    "No video encoder available. Falling back to saving middle frame as PNG."
-                )
-                png_path = os.path.splitext(output_path)[0] + ".png"
-                return MediaStorage._save_middle_frame(video, png_path)
+            return encoder.encode_video(video, output_path, frame_rate, audio)
         except Exception as e:
             logger.error(f"Error encoding video: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
-            logger.warning("Falling back to saving middle frame as PNG.")
-            png_path = os.path.splitext(output_path)[0] + ".png"
-            return MediaStorage._save_middle_frame(video, png_path)
-
-    @staticmethod
-    def _save_gif(video: torch.Tensor, output_path: str, frame_rate: float) -> str:
-        """Save video as animated GIF.
-
-        Args:
-            video: Video frames as torch.Tensor (T, H, W, C) uint8
-            output_path: Output path for GIF
-            frame_rate: Frames per second
-
-        Returns:
-            Path where the GIF was saved
-        """
-        if not isinstance(video, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor for video, got {type(video)}")
-
-        # Convert to numpy and then to list of PIL Images
-        video_np = video.cpu().numpy()
-        frames = [Image.fromarray(video_np[i]) for i in range(video_np.shape[0])]
-
-        # Save as GIF
-        duration_ms = int(1000 / frame_rate)
-        frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=frames[1:],
-            optimize=False,
-            duration=duration_ms,
-            loop=0,
-        )
-        logger.info(f"Saved video as GIF to {output_path} ({len(frames)} frames)")
-        return output_path
-
-    @staticmethod
-    def _save_middle_frame(video: torch.Tensor, output_path: str) -> str:
-        """Save middle frame of video as PNG.
-
-        Args:
-            video: Video frames as torch.Tensor (T, H, W, C) uint8
-            output_path: Output path for PNG
-
-        Returns:
-            Path where the frame was saved
-        """
-        if not isinstance(video, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor for video, got {type(video)}")
-
-        # Extract middle frame
-        video_np = video.cpu().numpy()
-        frame_idx = video_np.shape[0] // 2
-        image = Image.fromarray(video_np[frame_idx])
-
-        image.save(output_path)
-        logger.info(f"Saved frame {frame_idx} to {output_path}")
-        return output_path
+            raise e

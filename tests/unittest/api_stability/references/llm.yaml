@@ -9,7 +9,7 @@ methods:
       moe_cluster_parallel_size:
         annotation: Optional[int]
         default: null
-        status: beta
+        status: deprecated
       enable_attention_dp:
         annotation: bool
         default: False
@@ -155,6 +155,10 @@ methods:
         annotation: int
         default: 0
         status: prototype
+      enable_energy_metrics:
+        annotation: bool
+        default: False
+        status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null
@@ -215,9 +219,9 @@ methods:
         annotation: Optional[dict[str, str]]
         default: null
         status: prototype
-      enable_sleep:
-        annotation: bool
-        default: False
+      sleep_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
+        default: null
         status: prototype
       env_overrides:
         annotation: Optional[Dict[str, str]]
@@ -229,6 +233,10 @@ methods:
         status: prototype
       layer_wise_benchmarks_config:
         annotation: tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig
+        default: null
+        status: prototype
+      video_pruning_rate:
+        annotation: Optional[float]
         default: null
         status: prototype
       model_kwargs:
@@ -258,6 +266,10 @@ methods:
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
+      priority:
+        annotation: Union[float, List[float]]
+        default: 0.5
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -277,6 +289,10 @@ methods:
       trace_headers:
         annotation: Optional[Mapping[str, str]]
         default: null
+        status: prototype
+      priority:
+        annotation: float
+        default: 0.5
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   preprocess:

@@ -9,7 +9,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm.serve.media_storage import MediaStorage, PurePythonEncoder, get_video_encoder
+from tensorrt_llm.serve.media_storage import (
+    MediaStorage,
+    PurePythonEncoder,
+    get_video_encoder,
+    resolve_video_format,
+)
 
 
 def _make_dummy_video_tensor(
@@ -17,40 +22,6 @@ def _make_dummy_video_tensor(
 ) -> torch.Tensor:
     """Create a small dummy uint8 video tensor (T, H, W, C)."""
     return torch.randint(0, 256, (num_frames, height, width, 3), dtype=torch.uint8)
-
-
-class TestMediaStoragePNGFallback:
-    """Test PNG fallback path handling when video encoding fails."""
-
-    def test_png_fallback_with_avi_extension(self, tmp_path):
-        """Test that PNG fallback uses correct path after .avi extension change."""
-        video = _make_dummy_video_tensor()
-        output_path = str(tmp_path / "test.avi")
-
-        # Mock encoder to return None (no encoder available)
-        with patch("tensorrt_llm.serve.media_storage.get_video_encoder", return_value=None):
-            result = MediaStorage._save_mp4(video, None, output_path, 24.0)
-
-        # Should create PNG file with correct name
-        assert result.endswith(".png")
-        assert os.path.exists(result)
-        expected_path = str(tmp_path / "test.png")
-        assert result == expected_path
-
-    def test_png_fallback_with_mp4_extension(self, tmp_path):
-        """Test that PNG fallback uses correct path after .mp4 extension."""
-        video = _make_dummy_video_tensor()
-        output_path = str(tmp_path / "test.mp4")
-
-        # Mock encoder to return None (no encoder available)
-        with patch("tensorrt_llm.serve.media_storage.get_video_encoder", return_value=None):
-            result = MediaStorage._save_mp4(video, None, output_path, 24.0)
-
-        # Should create PNG file with correct name
-        assert result.endswith(".png")
-        assert os.path.exists(result)
-        expected_path = str(tmp_path / "test.png")
-        assert result == expected_path
 
 
 class TestMediaStorageMP4Encoding:
@@ -67,7 +38,7 @@ class TestMediaStorageMP4Encoding:
             return_value=PurePythonEncoder(),
         ):
             with pytest.raises(RuntimeError) as exc_info:
-                MediaStorage._save_mp4(video, None, output_path, 24.0)
+                MediaStorage._save_encoded_video(video, None, output_path, 24.0)
 
             assert "MP4 format requires ffmpeg" in str(exc_info.value)
             assert "apt-get install ffmpeg" in str(exc_info.value)
@@ -117,3 +88,134 @@ class TestVideoEncoderCaching:
 
         # Clean up
         ms._VIDEO_ENCODER = None
+
+
+class TestResolveVideoFormat:
+    """Test resolve_video_format() for explicit format selection."""
+
+    def test_resolve_mp4_with_ffmpeg(self):
+        """When mp4 is requested and ffmpeg is available, resolve to mp4."""
+        with patch(
+            "tensorrt_llm.serve.media_storage._check_ffmpeg_available",
+            return_value=True,
+        ):
+            fmt, ext = resolve_video_format("mp4")
+        assert fmt == "mp4"
+        assert ext == ".mp4"
+
+    def test_resolve_mp4_without_ffmpeg_raises(self):
+        """When mp4 is requested but ffmpeg is unavailable, raise RuntimeError."""
+        with patch(
+            "tensorrt_llm.serve.media_storage._check_ffmpeg_available",
+            return_value=False,
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                resolve_video_format("mp4")
+            assert "ffmpeg" in str(exc_info.value).lower()
+            assert "output_format='avi'" in str(exc_info.value)
+
+    def test_resolve_avi_always_succeeds(self):
+        """AVI format should always resolve regardless of ffmpeg availability."""
+        # Even without ffmpeg
+        with patch(
+            "tensorrt_llm.serve.media_storage._check_ffmpeg_available",
+            return_value=False,
+        ):
+            fmt, ext = resolve_video_format("avi")
+        assert fmt == "avi"
+        assert ext == ".avi"
+
+    def test_resolve_avi_with_ffmpeg(self):
+        """AVI format should resolve to avi even when ffmpeg is available."""
+        with patch(
+            "tensorrt_llm.serve.media_storage._check_ffmpeg_available",
+            return_value=True,
+        ):
+            fmt, ext = resolve_video_format("avi")
+        assert fmt == "avi"
+        assert ext == ".avi"
+
+    def test_resolve_auto_with_ffmpeg(self):
+        """Auto mode with ffmpeg should resolve to mp4."""
+        with patch(
+            "tensorrt_llm.serve.media_storage._check_ffmpeg_available",
+            return_value=True,
+        ):
+            fmt, ext = resolve_video_format("auto")
+        assert fmt == "mp4"
+        assert ext == ".mp4"
+
+    def test_resolve_auto_without_ffmpeg(self):
+        """Auto mode without ffmpeg should resolve to avi."""
+        with patch(
+            "tensorrt_llm.serve.media_storage._check_ffmpeg_available",
+            return_value=False,
+        ):
+            fmt, ext = resolve_video_format("auto")
+        assert fmt == "avi"
+        assert ext == ".avi"
+
+
+class TestExplicitFormatSaveVideo:
+    """Test MediaStorage.save_video with explicit output_format."""
+
+    def test_save_video_avi_format(self, tmp_path):
+        """Test saving video with explicit avi format uses PurePythonEncoder."""
+        video = _make_dummy_video_tensor()
+        output_path = str(tmp_path / "test.avi")
+
+        result = MediaStorage.save_video(
+            video=video,
+            output_path=output_path,
+            frame_rate=24.0,
+            format="avi",
+        )
+
+        assert result.endswith(".avi")
+        assert os.path.exists(result)
+
+    def test_save_video_mp4_format_without_ffmpeg_raises(self, tmp_path):
+        """Test that explicit mp4 format without ffmpeg raises RuntimeError."""
+        video = _make_dummy_video_tensor()
+        output_path = str(tmp_path / "test.mp4")
+
+        with patch(
+            "tensorrt_llm.serve.media_storage.get_video_encoder",
+            return_value=PurePythonEncoder(),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                MediaStorage.save_video(
+                    video=video,
+                    output_path=output_path,
+                    frame_rate=24.0,
+                    format="mp4",
+                )
+            assert "MP4 format requires ffmpeg" in str(exc_info.value)
+
+
+class TestVideoGenerationRequestOutputFormat:
+    """Test VideoGenerationRequest output_format field."""
+
+    def test_default_output_format_is_auto(self):
+        """Default output_format should be 'auto'."""
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        req = VideoGenerationRequest(prompt="test")
+        assert req.output_format == "auto"
+
+    def test_valid_output_formats(self):
+        """All valid output_format values should be accepted."""
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        for fmt in ["mp4", "avi", "auto"]:
+            req = VideoGenerationRequest(prompt="test", output_format=fmt)
+            assert req.output_format == fmt
+
+    def test_invalid_output_format_raises(self):
+        """Invalid output_format should raise validation error."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        with pytest.raises(ValidationError):
+            VideoGenerationRequest(prompt="test", output_format="webm")

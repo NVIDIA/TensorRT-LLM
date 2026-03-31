@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import time
@@ -11,7 +12,8 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
+                                          SchedulerConfig, WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -28,6 +30,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness, llm_test_harness,
                        prompts, run_llm_abort_request,
+                       sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, similarity_score,
@@ -106,14 +109,19 @@ def test_llm_capture_request_error():
 
 @force_ampere
 @pytest.mark.mpi_ray_parity
-@pytest.mark.parametrize(
-    "sampling_params",
-    [
-        SamplingParams()  # pytorch only supports n=1
-    ])
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
 @pytest.mark.part0
 def test_llm_abort_request(sampling_params):
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    llm_kwargs = {}
+    if sampling_params.use_beam_search:
+        if sampling_params.best_of is None:
+            llm_kwargs["max_beam_width"] = sampling_params.n
+        else:
+            llm_kwargs["max_beam_width"] = sampling_params.best_of
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              **llm_kwargs)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
@@ -920,6 +928,72 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
         llm.shutdown()
 
 
+@skip_gpu_memory_less_than_40gb
+@pytest.mark.part0
+def test_qwen_moe_shared_expert_lora():
+    """Test MoE shared expert LoRA on Qwen1.5-MoE with PyTorch backend.
+
+    Verifies that LoRA adapters targeting the shared expert in MoE models
+    are correctly applied and produce different outputs from the base model.
+    Uses the same model/adapter/prompt as the TRT integration test
+    (test_llm_qwen1_5_moe_single_gpu_lora in test_qwen.py).
+    """
+    model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
+    lora_dir = f"{llm_models_root()}/Upcycled-Qwen1.5-MoE2.7B-LoRA"
+
+    lora_config = LoraConfig(
+        lora_dir=[lora_dir],
+        lora_target_modules=[
+            'attn_q',
+            'attn_k',
+            'attn_v',
+            'attn_dense',
+            'mlp_h_to_4h',
+            'mlp_gate',
+            'mlp_4h_to_h',
+        ],
+        max_lora_rank=64,
+        max_loras=2,
+        max_cpu_loras=2,
+    )
+
+    llm = LLM(model=model_dir,
+              lora_config=lora_config,
+              gather_generation_logits=True)
+    sampling_params = SamplingParams(max_tokens=20, temperature=0.0, logprobs=0)
+
+    try:
+        lora_request = LoRARequest("moe-lora", 0, lora_dir)
+        outputs_with = llm.generate(["What is your name?"],
+                                    sampling_params,
+                                    lora_request=lora_request)
+        tokens_with = list(outputs_with[0].outputs[0].token_ids)
+        logprobs_with = outputs_with[0].outputs[0].logprobs
+
+        outputs_without = llm.generate(["What is your name?"],
+                                       sampling_params,
+                                       lora_request=None)
+        tokens_without = list(outputs_without[0].outputs[0].token_ids)
+        logprobs_without = outputs_without[0].outputs[0].logprobs
+
+        tokens_differ = tokens_with != tokens_without
+        logprobs_differ = False
+        if logprobs_with and logprobs_without:
+            for lp_w, lp_wo in zip(logprobs_with, logprobs_without,
+                                   strict=True):
+                lp_val_w = next(iter(lp_w.values())).logprob
+                lp_val_wo = next(iter(lp_wo.values())).logprob
+                if abs(lp_val_w - lp_val_wo) > 1e-6:
+                    logprobs_differ = True
+                    break
+
+        assert tokens_differ or logprobs_differ, (
+            "LoRA outputs identical to base model (same tokens AND same "
+            "logprobs) -- shared expert LoRA not applied")
+    finally:
+        llm.shutdown()
+
+
 class TestLlmError:
 
     @pytest.mark.part3
@@ -1008,6 +1082,44 @@ def test_min_tokens(use_speculative: bool):
 
     assert len(res.outputs) == 1
     assert len(res.outputs[0].token_ids) == output_len
+
+
+@pytest.mark.part0
+def test_min_tokens_long_prompt():
+    """Check min_tokens is respected when prompt is longer than min_tokens.
+
+    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    total token count (prompt + generated) against the raw min_tokens value
+    instead of comparing generated token count only.  When prompt_len >=
+    min_tokens the EOS suppression was never activated, allowing early
+    termination.
+    """
+    min_tok = 50
+    max_tok = 100
+    # Prompt long enough so that prompt_len > min_tok.  "Hello " tokenises
+    # to ~1-2 tokens with most tokenizers, so 200 repetitions ≈ 200-400
+    # tokens >> min_tok.
+    long_prompt = "Hello " * 200
+
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=2,
+        kv_cache_config=global_kvcache_config,
+        max_num_tokens=2048,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tok,
+        min_tokens=min_tok,
+        temperature=1,
+    )
+    res = llm.generate(long_prompt, sampling_params=sampling_params)
+
+    assert len(res.outputs) == 1
+    generated_len = len(res.outputs[0].token_ids)
+    assert generated_len >= min_tok, (
+        f"Generated only {generated_len} tokens with min_tokens={min_tok} "
+        f"and a long prompt.  Bug 5823135 regression.")
 
 
 @skip_ray
@@ -1418,6 +1530,73 @@ async def test_llm_disagg_gen_cancelled():
     finally:
         llm_ctx.shutdown()
         llm_gen.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.timeout(60)
+def test_priority_request_completes_before_low_priority():
+    """High-priority request must be scheduled before a lower-priority one.
+
+    Setup (max_batch_size=1, WaitingQueuePolicy.PRIORITY):
+      - Request 1: no explicit priority (default 0.5), max_tokens=500  – long, ignore_eos
+      - Request 2: no explicit priority (default 0.5), max_tokens=5   – short
+      - Request 3: priority=0.9,                       max_tokens=5   – short + high priority
+
+    All three requests are submitted before the executor has a chance to
+    schedule any of them.  With a PRIORITY waiting queue the executor will
+    pick Request 3 ahead of Request 2.  Therefore Request 3 must complete
+    before Request 2 regardless of how long Request 1 takes.
+    """
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY),
+    )
+
+    prompt = "A B C D E F G H I J"
+    completion_order = []
+
+    async def run():
+        # Submit all three requests before the event loop can schedule any of
+        # them – they all land in the waiting queue simultaneously.
+        # Request 1 uses ignore_eos so it keeps the batch slot busy for the
+        # full max_tokens count rather than stopping at an early EOS token.
+        out1 = llm.generate_async(
+            prompt,
+            SamplingParams(max_tokens=500, temperature=0, ignore_eos=True))
+        out2 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0))
+        out3 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0),
+                                  priority=0.9)
+
+        async def await_and_record(output, req_id: int):
+            await output.aresult()
+            completion_order.append(req_id)
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                await_and_record(out1, 1),
+                await_and_record(out2, 2),
+                await_and_record(out3, 3),
+            ),
+            timeout=55,
+        )
+
+    asyncio.run(run())
+    del llm
+
+    assert 2 in completion_order and 3 in completion_order, (
+        f"Not all requests completed. Completion order: {completion_order}")
+    idx_req2 = completion_order.index(2)
+    idx_req3 = completion_order.index(3)
+    assert idx_req3 < idx_req2, (
+        f"Request 3 (priority=0.9) should complete before Request 2 (no priority). "
+        f"Completion order: {completion_order}")
 
 
 @pytest.mark.threadleak(enabled=False)

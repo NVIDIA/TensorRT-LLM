@@ -17,8 +17,8 @@ from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
 from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
-from ..speculative.mtp import SampleStateTensorsMTP
 from .drafter import Drafter
+from .spec_sampler_base import SampleStateTensorsSpec
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DecodingBaseConfig
@@ -262,11 +262,11 @@ class ModelDrafter(Drafter):
         # Copy additional properties
         draft_request.py_stop_words_list = original_request.py_stop_words_list
 
-        # Add to appropriate batch based on request typetensorrt_llm/_torch/speculative/model_drafter.py
+        # Add to appropriate batch based on request type
         if draft_request.state == LlmRequestState.GENERATION_IN_PROGRESS:
-            draft_batch.generation_requests.append(draft_request)
+            draft_batch.append_generation_request(draft_request)
         else:
-            draft_batch.context_requests.append(draft_request)
+            draft_batch.append_context_request(draft_request)
 
     @nvtx_range("_prepare_draft_batch")
     def _prepare_draft_batch(
@@ -448,12 +448,12 @@ class ModelDrafter(Drafter):
 
     def process_decoded_tokens(
             self,
-            draft_batch: ScheduledRequests,
+            draft_batch: list[LlmRequest],
             draft_position: int,
             cleanup_resources: bool = True) -> List[LlmRequest]:
         """Process decoded tokens and determine which requests to continue processing."""
         new_requests = []
-        for req in draft_batch.all_requests():
+        for req in draft_batch:
             target_model_req = self.req_id_to_old_request[req.py_request_id]
             if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 # This is a chunked prefill request and we have more prefill chunks
@@ -524,9 +524,9 @@ class ModelDrafter(Drafter):
     def _initialize_draft_tokens_for_target_inputs(
         self,
         scheduled_batch: ScheduledRequests,
-        target_inputs: Optional[SampleStateTensorsMTP] = None,
+        target_inputs: Optional[SampleStateTensorsSpec] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None
-    ) -> Optional[SampleStateTensorsMTP]:
+    ) -> Optional[SampleStateTensorsSpec]:
         """
         Convert tensors for draft model processing.
 
@@ -535,7 +535,7 @@ class ModelDrafter(Drafter):
             new_tensors_device: The device tensors to convert
 
         Returns:
-            SampleStateTensorsMTP: Converted tensors or None
+            SampleStateTensorsSpec: Converted tensors or None
         """
         if target_inputs is None:
             return None
@@ -567,7 +567,7 @@ class ModelDrafter(Drafter):
 
     @nvtx_range("_update_draft_tokens_for_target_inputs")
     def _update_draft_tokens_for_target_inputs(
-            self, target_inputs: SampleStateTensorsMTP,
+            self, target_inputs: SampleStateTensorsSpec,
             draft_tensors: Optional[torch.Tensor], draft_position: int,
             draft_length: int, draft_batch: ScheduledRequests) -> None:
         """
@@ -701,8 +701,8 @@ class ModelDrafter(Drafter):
         self.update_requests(outputs, resource_manager)
 
         # Create accumulator for draft tokens and process them
-        self.process_decoded_tokens(outputs.scheduled_requests,
-                                    self.max_draft_len, cleanup_resources)
+        self.process_decoded_tokens(outputs.requests, self.max_draft_len,
+                                    cleanup_resources)
 
         # Update py_draft_tokens after processing
         for req_id, tokens in self.draft_tokens_accumulator.items():
@@ -788,7 +788,7 @@ class ModelDrafter(Drafter):
         self,
         draft_batch: ScheduledRequests,
         resource_manager: ResourceManager,
-        target_inputs: Optional[SampleStateTensorsMTP] = None,
+        target_inputs: Optional[SampleStateTensorsSpec] = None,
         num_draft_reqs: Optional[int] = None,
         initial_draft_state: Optional[SampleState] = None
     ) -> Optional[SampleState]:
@@ -808,8 +808,9 @@ class ModelDrafter(Drafter):
         # Convert context requests to generation requests
         for req in draft_batch.generation_requests:
             req.py_is_first_draft = False
-        draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
-        draft_batch.context_requests = []
+        draft_batch.generation_requests = draft_batch.all_requests()
+        draft_batch.context_requests_chunking = []
+        draft_batch.context_requests_last_chunk = []
 
         previous_draft_state = initial_draft_state
         # reset draft tokens accumulator
@@ -834,8 +835,7 @@ class ModelDrafter(Drafter):
 
             if sample_state is not None and previous_draft_state is not None:
                 new_requests = self.process_decoded_tokens(
-                    previous_draft_state.scheduled_requests,
-                    draft_position=i + 1)
+                    previous_draft_state.requests, draft_position=i + 1)
             else:
                 new_requests = []
 
@@ -850,7 +850,7 @@ class ModelDrafter(Drafter):
             scheduled_batch: ScheduledRequests,
             resource_manager: ResourceManager,
             previous_tensors: Optional[SampleStateTensors],
-            target_inputs: Optional[SampleStateTensorsMTP],
+            target_inputs: Optional[SampleStateTensorsSpec],
             num_accepted_tokens_device: Optional[torch.Tensor] = None) -> None:
         """
         Generate draft tokens with overlap scheduling support.
@@ -862,7 +862,7 @@ class ModelDrafter(Drafter):
             guided_decoder: The guided decoder
 
         Returns:
-            Tuple[Optional[SampleStateTensorsMTP], Optional[SampleState]]:
+            Tuple[Optional[SampleStateTensorsSpec], Optional[SampleState]]:
                 - Updated target inputs or None
                 - Draft sample state or None
         """
@@ -911,7 +911,7 @@ class ModelDrafter(Drafter):
             sampler_event.record()
 
             sample_state = SampleState(
-                scheduled_requests=draft_batch,
+                requests=draft_batch.all_requests(),
                 device=SampleStateTensors(
                     new_tokens=outputs["new_draft_tokens"]),
                 host=SampleStateTensors(new_tokens=new_tokens_host),

@@ -390,10 +390,10 @@ class RequestTimeBreakdown:
         # Calculate e2e time for each request
         def get_e2e_time(data):
             """Calculate end-to-end time from arrival to last token."""
-            # Get arrival time
-            arrival = data.get('ctx_server_arrival_time', float('nan'))
+            # Get arrival time (executor arrival first, then server arrival)
+            arrival = data.get('ctx_arrival_time', float('nan'))
             if math.isnan(arrival):
-                arrival = data.get('ctx_arrival_time', float('nan'))
+                arrival = data.get('ctx_server_arrival_time', float('nan'))
             if math.isnan(arrival):
                 arrival = data.get('disagg_server_arrival_time', float('nan'))
 
@@ -407,9 +407,9 @@ class RequestTimeBreakdown:
             return 0
 
         def get_arrival_time(data):
-            arrival = data.get('ctx_server_arrival_time', float('nan'))
+            arrival = data.get('ctx_arrival_time', float('nan'))
             if math.isnan(arrival):
-                arrival = data.get('ctx_arrival_time', float('nan'))
+                arrival = data.get('ctx_server_arrival_time', float('nan'))
             if math.isnan(arrival):
                 arrival = data.get('disagg_server_arrival_time', float('inf'))
             return arrival

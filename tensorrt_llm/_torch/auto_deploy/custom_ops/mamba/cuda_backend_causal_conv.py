@@ -31,7 +31,7 @@ import torch
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
-from ..attention_interface import AttentionRegistry, MHACallable
+from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable
 from .causal_conv_common import BaseCausalConvDescriptor
 
 
@@ -69,13 +69,18 @@ def _cuda_cached_causal_conv1d(
     """
     b, s = input.shape[:2]
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
     # Flatten tokens
     bs = b * s
     inp_flat = input.reshape(bs, *input.shape[2:])  # [total_s, C_in]
+
+    # Zero padding positions beyond valid tokens upfront
+    if num_total_tokens < bs:
+        inp_flat[num_total_tokens:].zero_()
 
     # Prepare weight as [dim, width] (depthwise)
     if weight.ndim == 3:

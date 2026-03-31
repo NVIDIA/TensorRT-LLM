@@ -60,6 +60,11 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Whether PDL is enabled for MoE Renormalize routing kernel.
+// Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
+// Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
+bool getEnvEnableTrtllmgenMoeRoutingRenormPDL();
+
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
     cudaStream_t stream, Args&&... args)
