@@ -84,3 +84,45 @@ class TestSimConfig:
         restored = SimConfig(**data)
         assert restored.predictor.constant_prefill_time_ms == 25.0
         assert restored.predictor.constant_decode_time_ms == 12.0
+
+
+class TestAIConfiguratorConfig:
+
+    def test_aiconfigurator_with_required_fields(self):
+        config = PredictorConfig(
+            name="aiconfigurator",
+            device_name="h100_sxm",
+            backend_version="1.2.0rc5")
+        assert config.name == "aiconfigurator"
+        assert config.device_name == "h100_sxm"
+
+    def test_aiconfigurator_missing_device_name_rejected(self):
+        with pytest.raises(ValidationError):
+            PredictorConfig(name="aiconfigurator", backend_version="1.2.0rc5")
+
+    def test_aiconfigurator_missing_backend_version_rejected(self):
+        with pytest.raises(ValidationError):
+            PredictorConfig(name="aiconfigurator", device_name="h100_sxm")
+
+    def test_aiconfigurator_with_scale_factors(self):
+        config = PredictorConfig(
+            name="aiconfigurator",
+            device_name="h100_sxm",
+            backend_version="1.2.0rc5",
+            prefill_scale_factor=1.05,
+            decode_scale_factor=0.95)
+        assert config.prefill_scale_factor == 1.05
+        assert config.decode_scale_factor == 0.95
+
+    def test_scale_factor_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            PredictorConfig(
+                name="aiconfigurator",
+                device_name="h100_sxm",
+                backend_version="1.2.0rc5",
+                prefill_scale_factor=0.0)
+
+    def test_constant_predictor_still_works(self):
+        config = PredictorConfig(name="constant")
+        assert config.device_name is None
+        assert config.backend_version is None

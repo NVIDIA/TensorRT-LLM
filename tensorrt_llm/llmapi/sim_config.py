@@ -14,9 +14,9 @@
 # limitations under the License.
 """Simulation mode configuration."""
 
-from typing import Literal
+from typing import Literal, Optional
 
-from pydantic import Field, NonNegativeFloat
+from pydantic import Field, NonNegativeFloat, model_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
@@ -24,17 +24,56 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel
 class PredictorConfig(StrictBaseModel):
     """Configuration for the batch time predictor."""
 
-    name: Literal["constant"] = Field(
+    name: Literal["constant", "aiconfigurator"] = Field(
         default="constant",
-        description="Predictor type. 'constant' returns fixed time per batch.")
+        description="Predictor type. 'constant' returns fixed time per batch. "
+        "'aiconfigurator' uses analytical per-operation predictions.")
 
+    # --- Constant predictor fields ---
     constant_prefill_time_ms: NonNegativeFloat = Field(
         default=10.0,
-        description="Fixed prefill (context) batch time in milliseconds.")
+        description="Fixed prefill (context) batch time in milliseconds. "
+        "Only used when name='constant'.")
 
     constant_decode_time_ms: NonNegativeFloat = Field(
         default=5.0,
-        description="Fixed decode (generation) batch time in milliseconds.")
+        description="Fixed decode (generation) batch time in milliseconds. "
+        "Only used when name='constant'.")
+
+    # --- AIConfigurator predictor fields ---
+    device_name: Optional[str] = Field(
+        default=None,
+        description="AIC system name for target hardware, e.g. 'h100_sxm', "
+        "'a100_sxm', 'b200_sxm'. Required when name='aiconfigurator'.")
+
+    database_path: Optional[str] = Field(
+        default=None,
+        description="Custom path to AIC systems/ directory. "
+        "Defaults to the bundled database in the aiconfigurator package.")
+
+    backend_version: Optional[str] = Field(
+        default=None,
+        description="TRT-LLM version for AIC database lookup, e.g. '1.2.0rc5'. "
+        "Required when name='aiconfigurator'.")
+
+    prefill_scale_factor: float = Field(
+        default=1.0, gt=0,
+        description="Multiplicative correction factor for prefill predictions.")
+
+    decode_scale_factor: float = Field(
+        default=1.0, gt=0,
+        description="Multiplicative correction factor for decode predictions.")
+
+    @model_validator(mode='after')
+    def validate_aiconfigurator_fields(self):
+        if self.name == "aiconfigurator":
+            if not self.device_name:
+                raise ValueError(
+                    "device_name is required when name='aiconfigurator'")
+            if not self.backend_version:
+                raise ValueError(
+                    "backend_version is required when name='aiconfigurator'")
+        return self
 
 
 class SimConfig(StrictBaseModel):
