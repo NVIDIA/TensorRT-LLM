@@ -106,7 +106,8 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
             # Part 2: process unfinished tests
             if test in unfinished_tests:
                 rerun_0_file.write(test_to_line[test] + '\n')
-                print(test + " will not rerun because it terminated unexpectedly.")
+                print(test +
+                      " will not rerun because it terminated unexpectedly.")
             # Part 3: process tests that did not run
             elif test not in ran_tests:
                 rerun_1_file.write(test_to_line[test] + '\n')
