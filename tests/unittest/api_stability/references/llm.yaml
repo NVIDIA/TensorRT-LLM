@@ -88,9 +88,9 @@ methods:
         default: null
         status: beta
       dwdp_config:
-        annotation: tensorrt_llm.llmapi.llm_args.DwdpConfig
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DwdpConfig]
         default: null
-        status: beta
+        status: prototype
       checkpoint_loader:
         annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
