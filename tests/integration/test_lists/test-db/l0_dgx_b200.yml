@@ -148,6 +148,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_nixl_backend TIMEOUT (60)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_ctx_dp2_gen_tp4 TIMEOUT (60)
 - condition:
     ranges:
       system_gpu_count:

@@ -1741,14 +1741,23 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
     MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
 
-    def _make_configs(self, backend: str):
+    def _make_configs(self, backend: str, use_python_runtime: bool = False):
+        if use_python_runtime:
+            cache_transceiver_config = {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "PYTHON",
+            }
+        else:
+            cache_transceiver_config = {
+                "backend": backend,
+                "max_tokens_in_buffer": 8192,
+            }
+
         ctx_server_config = {
             "max_batch_size": 32,
             "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": backend,
-                "max_tokens_in_buffer": 8192,
-            },
+            "cache_transceiver_config": cache_transceiver_config,
             "tensor_parallel_size": 4,
             "moe_expert_parallel_size": 4,
             "kv_cache_config": {
@@ -1764,10 +1773,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "max_batch_size": 32,
             "disable_overlap_scheduler": False,
-            "cache_transceiver_config": {
-                "backend": backend,
-                "max_tokens_in_buffer": 8192,
-            },
+            "cache_transceiver_config": cache_transceiver_config,
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
             "pipeline_parallel_size": 2,
@@ -1808,8 +1814,19 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(8)
-    def test_nixl_backend(self):
+    def test_nixl_backend(self, use_python_runtime):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("NIXL")
+        with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(8)
+    def test_ctx_dp2_gen_tp4(self):
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
+            "NIXL", use_python_runtime=True)
+        ctx_cfg["tensor_parallel_size"] = 2
+        ctx_cfg["enable_attention_dp"] = True
+        gen_cfg["tensor_parallel_size"] = 4
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])

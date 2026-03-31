@@ -14,10 +14,15 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     get_unique_rid,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    PythonMambaCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -110,9 +115,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
-        layer_num_per_pp = cast(
-            list, getattr(self._dist, "pp_allgather")(len(self._kv_cache_manager.pp_layers))
-        )
+        layer_num = len(self._kv_cache_manager.pp_layers)
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+            assert isinstance(self._kv_cache_manager._impl, PythonMambaCacheManager), (
+                "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
+            )
+            layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
+        layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
         )
@@ -153,6 +162,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         groups = []
         assert self._page_table is not None
         for idx, lg in enumerate(self._page_table.layer_groups):
+            if isinstance(lg, MambaLayerGroup):
+                # Mamba layer groups have no KV cache blocks; skip.
+                groups.append([])
+                continue
             block_ids = self._get_block_ids(req, idx, lg)
 
             # Filter to only window-relevant blocks for sliding window layer groups.
@@ -175,7 +188,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
             groups.append(list(block_ids))
 
-        return KVSlice(is_last_slice=True, block_ids_per_layer_groups=groups)
+        mamba_state_index = None
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+            mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
+
+        return KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=groups,
+            mamba_state_index=mamba_state_index,
+        )
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:

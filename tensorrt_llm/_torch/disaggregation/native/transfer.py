@@ -41,6 +41,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -70,6 +71,7 @@ class RecvReqInfo:
     unique_rid: int
     start_token_idx: Optional[int] = None
     aux_slot: Optional[int] = None
+    mamba_state_index: Optional[int] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(asdict(self))
@@ -519,6 +521,20 @@ class Sender(SenderBase):
                     dst_frags.extend(rp.dst.memory.ptrs)  # type: ignore[attr-defined]
                     frag_size = rp.src.memory.bytes_per_region  # type: ignore[attr-defined]
                     kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))  # type: ignore[attr-defined]
+
+            # handle mamba fragments
+            m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
+                self_page_table=extractor.page_table,
+                peer_page_table=peer_extractor.page_table,
+                src_slot=task._slice.mamba_state_index,
+                dst_slot=req_info.mamba_state_index,
+                self_ri=self._registrar.self_rank_info,
+                peer_ri=peer_ri,
+            )
+            if m_src:
+                src_frags.extend(m_src)
+                dst_frags.extend(m_dst)
+                kv_sizes.extend(m_sizes)
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -975,6 +991,7 @@ class Receiver(ReceiverBase):
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
             aux_slot=task._aux_slot,
+            mamba_state_index=task._kv_slice.mamba_state_index,
         )
 
     def dispatch_task(self, task: KVRecvTask):
