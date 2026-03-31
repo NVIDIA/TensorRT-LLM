@@ -457,8 +457,7 @@ def torch_backend_mha_with_cache(
     b, s = q.shape[:2]
 
     # get cleaned up metadata
-    batch_info = BatchInfo(batch_info_host)
-    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+    num_prefill, num_prefill_tokens, num_decode = _get_absorbed_batch_info(batch_info_host)
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]
@@ -522,7 +521,7 @@ def torch_backend_mha_with_cache(
             sinks,
         )
 
-    num_total_tokens = num_prefill_tokens + num_decode
+    num_total_tokens = int(seq_len.sum().item()) if s > 1 else num_prefill_tokens + num_decode
     bs = b * s
 
     if out is not None:
