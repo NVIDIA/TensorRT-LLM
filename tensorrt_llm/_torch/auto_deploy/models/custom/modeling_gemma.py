@@ -175,6 +175,7 @@ class GemmaADAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -200,9 +201,9 @@ class GemmaADAttention(nn.Module):
             q,  # [B, S, N, head_dim]
             k,  # [B, S, N_kv, head_dim]
             v,  # [B, S, N_kv, head_dim]
-            None,  # attn_mask
+            attention_mask,  # attn_mask
             0.0,  # dropout_p
-            True,  # is_causal
+            False,  # is_causal
             self.scaling,  # scale
             None,  # sinks
             None,  # sliding_window
@@ -233,11 +234,16 @@ class GemmaADDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states = self.self_attn(
+            hidden_states,
+            position_embeddings,
+            attention_mask=attention_mask,
+        )
         hidden_states = residual + hidden_states
 
         # MLP
@@ -312,11 +318,20 @@ class GemmaADModel(GemmaADPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    @staticmethod
+    def _build_causal_mask(
+        batch_size: int, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        causal_mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        return causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> GemmaADOutput:
         if input_ids is not None and inputs_embeds is not None:
@@ -332,11 +347,21 @@ class GemmaADModel(GemmaADPreTrainedModel):
         # Gemma-specific: scale embeddings by sqrt(hidden_size)
         hidden_states = inputs_embeds * self.normalizer
 
+        if attention_mask is None:
+            batch_size, seq_len, _ = hidden_states.shape
+            attention_mask = self._build_causal_mask(
+                batch_size, seq_len, hidden_states.device, hidden_states.dtype
+            )
+
         # Compute position embeddings once (sliced by position_ids in RoPE)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, position_embeddings)
+            hidden_states = decoder_layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask=attention_mask,
+            )
 
         hidden_states = self.norm(hidden_states)
 

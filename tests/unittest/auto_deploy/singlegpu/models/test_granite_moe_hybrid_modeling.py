@@ -410,6 +410,10 @@ def test_granite_moe_hybrid_moe_equivalence(B, S, dtype):
     config = _create_small_hybrid_config()
 
     hf_moe = HFMoE(config)
+    # HF ParallelExperts stores expert weights in torch.empty() buffers.
+    # Reinitialize to avoid comparing NaN-filled reference outputs.
+    for _, param in hf_moe.named_parameters():
+        torch.nn.init.normal_(param, std=0.02)
     hf_moe.to(device=device, dtype=dtype)
     hf_moe.eval()
 
