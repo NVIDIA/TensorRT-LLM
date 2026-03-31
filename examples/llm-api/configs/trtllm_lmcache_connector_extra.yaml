@@ -4,13 +4,16 @@
 #   - lmcache installed: pip install lmcache
 #   - PyTorch backend (LMCache connector is wired through the PyTorch executor)
 #
+# IMPORTANT: Set PYTHONHASHSEED=0 before starting the process for
+# deterministic cache key hashing in LMCache.
+#
 # Example:
-#   trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
+#   PYTHONHASHSEED=0 trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
 #     --trust_remote_code \
 #     --extra_llm_api_options /path/to/this/file
 #
 # Or use the CLI shorthand (no YAML needed):
-#   trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --kv-connector lmcache
+#   PYTHONHASHSEED=0 trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --kv-connector lmcache
 
 kv_cache_config:
   enable_block_reuse: true
