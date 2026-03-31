@@ -90,14 +90,18 @@ The implementation follows a **half → 11 → 11 → 10** bit decomposition (4 
 
 ### Complexity of Classical Top-K Approaches
 
-| Algorithm | Time Complexity | Global Memory Passes | GPU Suitability |
-|-----------|----------------|---------------------|-----------------|
-| `torch.topk` (sorting-based) | O(N log N) | Multiple | General-purpose, high constant |
-| Radix Select (TRT-LLM production) | O(R·N/P) | R passes (R ≤ 4) | Good, distribution-agnostic |
-| Heap/Priority Queue | O(N log K) | 1 pass | Poor GPU parallelism for large K |
-| **Heuristic-Guided (this work)** | O((I+1)·N/P) | I+1 passes (I ≈ 1–2) | Optimal with good prediction |
+<div align="center">
 
-Here N is the sequence length, K = 2048, P is the thread count, and R or I denotes the number of iterative passes. The key distinction of the heuristic approach is that the effective number of global-memory passes $I$ depends on the quality of the initial threshold estimate — which, as we will show, is consistently high in LLM decoding workloads.
+| Algorithm | Time Complexity | Global Memory Passes | GPU Suitability |
+|:-----------:|:----------------:|:---------------------:|:-----------------:|
+| `torch.topk` (sorting-based) | $O(N \log N)$ | Multiple | General-purpose, high constant |
+| Radix Select (TRT-LLM production) | $O(R \cdot N/P)$ | $R$ passes ($R \leq 4$) | Good, distribution-agnostic |
+| Heap/Priority Queue | $O(N \log K)$ | 1 pass | Poor GPU parallelism for large $K$ |
+| **Heuristic-Guided (this work)** | $O((I+1) \cdot N/P)$ | $I+1$ passes ($I \approx 1$–$2$) | Optimal with good prediction |
+
+</div>
+
+Here $N$ is the sequence length, $K = 2048$, $P$ is the thread count, and $R$ or $I$ denotes the number of iterative passes. The key distinction of the heuristic approach is that the effective number of global-memory passes $I$ depends on the quality of the initial threshold estimate — which, as we will show, is consistently high in LLM decoding workloads.
 
 ## The Long-Sequence Challenge
 
@@ -115,15 +119,19 @@ These workloads stress every component of the inference pipeline that scales wit
 
 The three DSA decode-step components have fundamentally different scaling characteristics. Since all three are memory-bound during decode, the roofline cost of each is proportional to its total memory traffic:
 
+<div align="center">
+
 | Component | Scaling | Total Memory Traffic | Trend as $N$ Grows |
-|-----------|---------|---------------------|-------------------|
-| **Indexer MQA** | O(N) | N × d_i × 2B | Linear growth |
-| **Top-K (radix-select)** | O(R·N) | R × N × 4B | Linear growth (R passes) |
-| **Sparse MLA** | O(K) | K × d × 2B | **Constant** (K fixed) |
+|:-----------:|:---------:|:---------------------:|:-------------------:|
+| **Indexer MQA** | $O(N)$ | $N \cdot d_i \cdot 2$B | Linear growth |
+| **Top-K (radix-select)** | $O(R \cdot N)$ | $R \cdot N \cdot 4$B | Linear growth ($R$ passes) |
+| **Sparse MLA** | $O(K)$ | $K \cdot d \cdot 2$B | **Constant** ($K$ fixed) |
 
-<sub><em>N: sequence length. K = 2048: fixed Top-K count. R ≈ 3: radix-select passes over the full score array. d_i = 128: indexer head dimension. d = 192: MLA head dimension (128 non-PE + 64 PE).</em></sub>
+</div>
 
-The Top-K memory traffic R·N·4B grows linearly with N while sparse MLA remains constant at K·d·2B. This means the **Top-K fraction of DSA latency increases monotonically** with sequence length — from a minor component at short sequences to a dominant bottleneck at long sequences. The production radix-select kernel already achieves 7.4× over `torch.topk` (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), yet two factors limit its efficiency beyond the raw O(R·N) traffic:
+<sub><em>N: sequence length. K = 2048: fixed Top-K count. R ≈ 3: radix-select passes. d<sub>i</sub> = 128: indexer head dimension. d = 192: MLA head dimension (128 non-PE + 64 PE).</em></sub>
+
+The Top-K memory traffic $R \cdot N \cdot 4$B grows linearly with $N$ while sparse MLA remains constant at $K \cdot d \cdot 2$B. This means the **Top-K fraction of DSA latency increases monotonically** with sequence length — from a minor component at short sequences to a dominant bottleneck at long sequences. The production radix-select kernel already achieves 7.4× over `torch.topk` (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), yet two factors limit its efficiency beyond the raw $O(R \cdot N)$ traffic:
 
 - **Multi-pass data re-reads**: each of the $R \approx 3$ radix-select steps performs two full scans of all $N$ elements (histogram build + filter/collect), totaling ~6 $N$-element scans per kernel invocation.
 - **Shared-memory atomic serialization**: the histogram phase uses `atomicAdd` on shared-memory bin counters (2048 bins, hot-bin contention), and the collect phase funnels all qualifying elements through a single `atomicAdd(&counter, 1)` — serializing threads that compete on the same address and reducing effective SIMT utilization well below the memory bandwidth ceiling.
@@ -267,15 +275,19 @@ If the candidate count does not exactly equal $K$, a shared-memory refinement se
 
 ### Complexity Analysis
 
-| Phase | Time Complexity | Memory Access | Space |
-|-------|----------------|---------------|-------|
-| Phase 1 (PreIdx Stats) | O(M/P) | M scattered global reads | O(1) registers |
-| Phase 2 (Threshold Search) | O(I·N/P) | I×N sequential reads (L2) | O(1) registers |
-| Phase 3 (Candidate Collect) | O(N/P) | N sequential reads (L2) | O(C) shared memory |
-| Phase 4 (Exact Selection) | O(S·C/P) | Shared memory only | O(B) shared memory |
-| **Total** | **O((I+1)·N/P + S·C/P)** | (I+1)×N + M global | ~60 KB shared |
+<div align="center">
 
-For real decoding data (I ≈ 2, S ≈ 2, P = 512, B = 2048, C ≤ 6144): approximately 3N/P + 2C/P memory accesses. The Phase 3 count-cache optimization eliminates one full N-scan (the count sub-pass), reducing the total from (I+2) to (I+1) global-memory passes. Compared to the radix-select baseline which requires R·N/P accesses with R ≈ 3–4 passes (each pass includes histogram + prefix sum + filter), the heuristic approach has fewer global memory accesses and significantly less shared-memory synchronization overhead.
+| Phase | Time Complexity | Memory Access | Space |
+|:-------:|:----------------:|:---------------:|:-------:|
+| Phase 1 (PreIdx Stats) | $O(M/P)$ | $M$ scattered global reads | $O(1)$ registers |
+| Phase 2 (Threshold Search) | $O(I \cdot N/P)$ | $I \times N$ sequential reads (L2) | $O(1)$ registers |
+| Phase 3 (Candidate Collect) | $O(N/P)$ | $N$ sequential reads (L2) | $O(C)$ shared memory |
+| Phase 4 (Exact Selection) | $O(S \cdot C/P)$ | Shared memory only | $O(B)$ shared memory |
+| **Total** | $O((I+1) \cdot N/P + S \cdot C/P)$ | $(I+1) \times N + M$ global | ~60 KB shared |
+
+</div>
+
+For real decoding data ($I \approx 2$, $S \approx 2$, $P = 512$, $B = 2048$, $C \leq 6144$): approximately $3N/P + 2C/P$ memory accesses. The Phase 3 count-cache optimization eliminates one full N-scan (the count sub-pass), reducing the total from $(I+2)$ to $(I+1)$ global-memory passes. Compared to the radix-select baseline which requires $R \cdot N/P$ accesses with $R \approx 3$–$4$ passes (each pass includes histogram + prefix sum + filter), the heuristic approach has fewer global memory accesses and significantly less shared-memory synchronization overhead.
 
 ## GPU Kernel Implementation on Blackwell
 
@@ -294,13 +306,17 @@ Each CTA processes one row of the batch (one query token's indexer scores). The 
 
 The kernel incorporates multiple optimizations targeting specific bottlenecks identified through systematic profiling:
 
+<div align="center">
+
 | Optimization | Description |
-|-------------|-------------|
+|:-------------:|:-------------:|
 | `__ldg` + `redux.sync` | Read-only texture cache loads + single-instruction warp reduction (sm\_80+) |
 | Ballot-free Phase 3 | Eliminates `__ballot_sync` compiler barriers that serialize L2 load pipelining |
 | Safety-net guard | Skips redundant `blockCountGE` when Phase 2 converges cleanly |
 | 2048-bin histogram + warp-parallel scan | Warp-parallel K-th bin search reduces serial scan steps; fewer snap iterations |
 | Phase 3 count-cache | Caches per-thread counts from Phase 2's `blockCountGE`; eliminates Phase 3's redundant $N$-scan |
+
+</div>
 
 ### Shared Memory Layout
 
@@ -321,11 +337,15 @@ On Blackwell (sm\_100), the kernel opts in to extended shared memory (>48 KB) vi
 
 ### Memory Footprint Comparison
 
+<div align="center">
+
 | Metric | Radix Sort | Heuristic-Guided |
-|--------|:----------:|:-----------------:|
+|:--------:|:----------:|:-----------------:|
 | **SMEM per CTA** | ~28 KB (union-based, time-multiplexed) | ~60 KB (flat struct, persistent candidates) |
 | **Extended SMEM opt-in** | No | Yes (>48 KB) |
 | **Additional HBM** | 0 | Scratch + prev\_topk (see below) |
+
+</div>
 
 The heuristic kernel uses ~2× the SMEM of radix-select because candidates collected in Phase 3 must remain accessible through Phase 4 (no union reuse possible). On Blackwell (sm\_100, 228 KB shared memory per SM), this still allows 3 CTAs per SM — sufficient occupancy for typical batch sizes.
 
@@ -342,10 +362,14 @@ The heuristic path requires two additional persistently pre-allocated HBM buffer
 
 **Input data** falls into two categories:
 
+<div align="center">
+
 | Category | Source | preIdx | Temporal Correlation |
-|----------|--------|--------|---------------------|
+|:----------:|:--------:|:--------:|:---------------------:|
 | **Synthetic random** | Random Q/K ($1 + A_m \cdot \mathcal{N}(0,1)$) + YaRN-RoPE → single-head $q^T R_\Delta k$ | Static RoPE prior (all-ones Q/K → $f(\Delta)$ Top-K) | Moderate (~60%+ overlap, $A_m$-dependent) |
 | **Real decode** | DeepSeek-V3.2 SWE-Bench-64K indexer logits (multi-head MQA with $W^I$, ReLU) | Previous step's actual Top-K output | High (~35–50% overlap) |
+
+</div>
 
 The synthetic pipeline computes a simplified single-head dot product on RoPE dimensions only ($d_{\text{rope}} = 64$), while the real indexer uses a multi-head weighted sum $I_t = \sum_j W_j^I \cdot \text{ReLU}(Q_{t,j}^I (K_t^I)^T)$ across 64 heads. Synthetic data captures positional structure but lacks the content-dependent correlations present in real decode, resulting in lower preIdx quality and more Phase 2 iterations.
 
@@ -405,14 +429,18 @@ The heuristic Top-K kernel produces **bit-exact** Top-K index sets compared to `
 </div>
 <p align="center"><sub><em>Figure 7. Kernel latency vs sequence length on synthetic data (B200). Both kernels scale as O(N); the heuristic kernel's fitted slope is ~42% of the baseline, reflecting fewer global-memory passes. Speedup labels show the ratio at representative N values.</em></sub></p>
 
+<div align="center">
+
 | $N$ | Heuristic (ns) | Production Baseline (ns) | Speedup |
-|-----|----------------|--------------------------|--------|
+|:-----:|:----------------:|:--------------------------:|:--------:|
 | 8,192 | 16,512 | 11,200 | 0.68× |
 | 16,384 | 21,856 | 21,984 | **1.01×** |
 | 32,768 | 26,112 | 32,928 | **1.26×** |
 | 65,536 | 31,904 | 47,936 | **1.50×** |
 | 70,690 | 36,864 | 51,200 | **1.39×** |
 | 131,072 | 43,392 | 76,128 | **1.75×** |
+
+</div>
 
 <sub><em>Table 1. B200, synthetic input with norm/gamma/beta distribution. "Production Baseline" is the `topKPerRowDecode` kernel (insert sort for $N < 12{,}288$, radix sort for $N \geq 12{,}288$). "Speedup" = baseline time / heuristic time.</em></sub>
 
@@ -433,8 +461,10 @@ We evaluate on real DeepSeek-V3.2 decode-stage indexer logits captured from SWE-
 
 **Average speedup across all 17 sampled decode steps ($N = 68{,}667$–$70{,}690$):**
 
+<div align="center">
+
 | Layer | Avg Speedup | Min Speedup | Max Speedup |
-|-------|-------------|-------------|-------------|
+|:-------:|:-------------:|:-------------:|:-------------:|
 | 0 | **1.48×** | 1.17× | 1.83× |
 | 1 | **1.72×** | 1.57× | 1.89× |
 | 20 | **1.76×** | 1.32× | 2.21× |
@@ -445,6 +475,8 @@ We evaluate on real DeepSeek-V3.2 decode-stage indexer logits captured from SWE-
 | 42 | **2.00×** | 1.33× | 2.36× |
 | 60 | **1.86×** | 1.33× | 2.14× |
 | **Overall Avg** | **1.81×** | — | — |
+
+</div>
 
 <sub><em>Table 3. Per-layer average, min, and max speedup ratios (radix sort / heuristic) across 17 sampled decode steps (stride 128 from 2,024 total). The heuristic kernel achieves an overall average of 1.81× vs the production radix-select baseline.</em></sub>
 
@@ -457,8 +489,10 @@ On real decoding data, `pmean` closely approximates the true threshold due to th
 
 Understanding the score distribution per layer is essential for interpreting performance variance. We performed statistical fitting on the SWE-Bench-64K decode logits (9 layers × 2,024 decode steps × ~70,690 elements) to characterize each layer's distribution:
 
+<div align="center">
+
 | Layer | Best-Fit Distribution | % Rows | Runner-Up | % Rows | Mean Logit | Kurtosis |
-|-------|----------------------|--------|-----------|--------|------------|----------|
+|:-------:|:----------------------:|:--------:|:-----------:|:--------:|:------------:|:----------:|
 | L0 | **lognorm** | 42.9% | beta | 26.0% | −4.12 | −0.128 |
 | L1 | **logistic** | 59.4% | t | 40.6% | −0.47 | +0.931 |
 | L20 | **beta** | 90.1% | weibull\_min | 9.9% | −0.65 | −0.282 |
@@ -468,6 +502,8 @@ Understanding the score distribution per layer is essential for interpreting per
 | L41 | **beta** | 79.5% | lognorm | 10.3% | −2.76 | −0.138 |
 | L42 | **beta** | 63.7% | weibull\_min | 36.4% | −4.51 | −0.621 |
 | L60 | **weibull\_min** | 93.6% | beta | 6.3% | −2.26 | −0.396 |
+
+</div>
 
 Key observations for threshold search performance:
 - **Beta distributions dominate** L20/21/40/41/42 — bounded, shaped distributions where `pmean` accurately approximates the Top-K threshold, enabling fast Phase 2 convergence (1–2 iterations).
@@ -481,13 +517,17 @@ The heuristic Top-K algorithm's speedup is fundamentally sensitive to the input 
 
 Combining the synthetic and real-data benchmarks reveals a clear pattern:
 
+<div align="center">
+
 | Distribution Type | Representative | preIdx Overlap | Phase 2 Iters | Observed Speedup |
-|-------------------|---------------|----------------|--------------|-----------------|
+|:-------------------:|:---------------:|:----------------:|:--------------:|:-----------------:|
 | **Beta** (bounded, peaked) | L21, L40, L41 | High | 1–2 | **1.80–2.11×** |
 | **Weibull** (right-skewed) | L22, L60 | Moderate–High | 2–3 | **1.72–1.92×** |
 | **Logistic/t** (heavy-tailed) | L1 | Moderate | 2–3 | **1.74×** |
 | **Lognorm** (heterogeneous) | L0 | Lower | 3–4 | **1.32×** |
 | **Synthetic** (gamma/beta-like, static preIdx) | N=70K | Moderate | 2–4 | **1.39×** |
+
+</div>
 
 The pattern is consistent: **bounded, peaked distributions** (beta) yield the best speedup because `pmean` sits close to the Top-K threshold and the candidate count drops quickly during interpolation. **Heavy-tailed distributions** (logistic, lognorm) spread the score mass across a wider range, causing `pmean` to be a less precise initial estimate — more interpolation iterations are needed, and the candidate set around the threshold may be denser (more snap iterations).
 
@@ -544,13 +584,17 @@ This YAML can be passed to `trtllm-serve`, `trtllm-bench`, or `trtllm-eval` via 
 
 We validated end-to-end model accuracy using `trtllm-eval` on five benchmarks with DeepSeek-V3.2 NVFP4 (B200 ×8, EP8+DP8, MTP-1). Each benchmark was run multiple times independently to assess run-to-run variance.
 
+<div align="center">
+
 | Benchmark | Samples | Baseline (avg) | Heuristic (avg) | Delta | Exps (B / H) |
-|-----------|---------|---------------|-----------------|-------|--------------|
+|:-----------:|:---------:|:---------------:|:-----------------:|:-------:|:--------------:|
 | **MMLU** | 14,042 | 87.51 | 87.50 | **−0.01** | 1 / 4 |
 | **GSM8K** | 1,319 | 95.11 | 95.23 | **+0.12** | 1 / 4 |
 | **GPQA-Diamond** | 198 | 77.27 | 77.15 | **−0.12** | 1 / 4 |
 | **LongBench V1** | ~5,000 | 44.61 | 44.28 | **−0.33** | 8 / 8 |
 | **LongBench V2** | 215 | 49.58 | 49.12 | **−0.46** | 5 / 5 |
+
+</div>
 
 <sub><em>Table 4. End-to-end accuracy summary on DeepSeek-V3.2 NVFP4. "Exps (B / H)" = number of independent runs for Baseline / Heuristic. All deltas are within run-to-run variance and statistically insignificant.</em></sub>
 
@@ -564,26 +608,22 @@ We validated end-to-end model accuracy using `trtllm-eval` on five benchmarks wi
 
 **Reproduction.** All accuracy experiments use the same YAML config (key fields shown below) passed to `trtllm-eval`. To switch between heuristic and baseline, set `enable_heuristic_topk` to `true` or `false`:
 
-```bash
-# All benchmarks: pass the config via --config (alias: --extra_llm_api_options)
-trtllm-eval --model ${model_path} ... --config ./config.yml ...  mmlu
-trtllm-eval --model ${model_path} ... --config ./config.yml ...  gsm8k
-trtllm-eval --model ${model_path} ... --config ./config.yml ...  gpqa_diamond ...
-trtllm-eval --model ${model_path} ... --config ./config.yml ...  longbench_v1
-trtllm-eval --model ${model_path} ... --config ./config.yml ...  longbench_v2
-```
 
 ### End-to-End Throughput
 
 We benchmarked end-to-end min-latency inference on B200 ×8 with DeepSeek-V3.2 NVFP4 (EP8, MTP-1, NVFP4 quantization, FP8 KV cache), using `trtllm-bench` with a **long-context synthetic dataset** (ISL=16K, OSL=131K, batch=1, concurrency=1). This workload stress-tests the decode phase where the heuristic Top-K is most active — generating 131K output tokens with a sequence length growing from 16K to ~147K.
 
+<div align="center">
+
 | Metric | Baseline | Heuristic | Delta |
-|--------|----------|-----------|-------|
+|:--------:|:----------:|:-----------:|:-------:|
 | **TPOT** (ms) | 9.456 | 9.410 | **−0.49%** |
 | **Output Throughput** (tps) | 105.66 | 106.18 | **+0.49%** |
 | **Per GPU Output** (tps/gpu) | 13.21 | 13.27 | **+0.49%** |
 | **TTFT** (ms) | 1051.19 | 1051.01 | −0.02% |
 | **Total Latency** (s) | 1240.5 | 1234.5 | **−0.48%** |
+
+</div>
 
 <sub><em>Table 5. Min-latency scenario on B200 ×8, Batch=1, ISL=16K, OSL=131K, EP8+DP8, MTP-1. Synthetic random dataset (generated via `prepare_dataset.py` with fixed ISL/OSL).</em></sub>
 
