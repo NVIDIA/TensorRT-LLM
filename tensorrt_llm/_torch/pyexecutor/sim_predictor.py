@@ -15,7 +15,14 @@
 """Batch time predictors for simulation mode."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class SimBatchRequest:
+    """Per-request info within a batch."""
+    input_length: int
+    past_kv_length: int
 
 
 @dataclass
@@ -30,6 +37,7 @@ class SimBatch:
     num_context_tokens: int
     num_generation_requests: int
     num_generation_tokens: int
+    requests: list[SimBatchRequest] = field(default_factory=list)
 
     @property
     def is_prefill(self) -> bool:

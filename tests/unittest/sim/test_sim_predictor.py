@@ -18,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.sim_predictor import (
     ConstantPredictor,
     InferTimePredictor,
     SimBatch,
+    SimBatchRequest,
 )
 
 
@@ -60,6 +61,29 @@ class TestSimBatch:
         b = SimBatch(num_context_requests=0, num_context_tokens=0,
                      num_generation_requests=0, num_generation_tokens=0)
         assert b.is_prefill is False
+
+
+class TestSimBatchRequest:
+
+    def test_fields(self):
+        r = SimBatchRequest(input_length=128, past_kv_length=512)
+        assert r.input_length == 128
+        assert r.past_kv_length == 512
+
+    def test_batch_with_requests(self):
+        reqs = [SimBatchRequest(128, 0), SimBatchRequest(64, 64)]
+        b = SimBatch(
+            num_context_requests=2, num_context_tokens=192,
+            num_generation_requests=0, num_generation_tokens=0,
+            requests=reqs)
+        assert len(b.requests) == 2
+        assert b.requests[0].input_length == 128
+
+    def test_batch_without_requests_backward_compat(self):
+        b = SimBatch(num_context_requests=1, num_context_tokens=128,
+                     num_generation_requests=0, num_generation_tokens=0)
+        assert b.requests == []
+        assert b.is_prefill is True
 
 
 class TestConstantPredictor:
