@@ -45,6 +45,7 @@ if HAS_FUSED_SILU_AND_MUL:
     @silu_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
         """Fake implementation for tracing."""
+        assert x.shape[-1] % 2 == 0, f"silu_and_mul requires even last dimension, got {x.shape[-1]}"
         half_size = x.shape[-1] // 2
         output_shape = list(x.shape[:-1]) + [half_size]
         return x.new_empty(output_shape, dtype=x.dtype)
