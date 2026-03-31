@@ -14,9 +14,10 @@ from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, EagleDecodingConfig, KvCacheConfig,
-    MTPDecodingConfig, PeftCacheConfig, SamplerType, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
+    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
+    WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -43,7 +44,7 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2DummyScheduler, SimpleScheduler,
+                        KVCacheV2Scheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -332,6 +333,14 @@ class KvCacheCreator:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += ceil_div(num_req_tokens, self._tokens_per_block)
+
+        # With ADP enabled, _create_dummy_context_requests produces tp_size
+        # copies so each rank gets work during the estimation warmup. But the
+        # scheduler distributes them evenly (1 per rank), so each rank's KV
+        # cache only needs capacity for its own share, not all of them.
+        if self._mapping.enable_attention_dp and self._mapping.tp_size > 1:
+            num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
+                                1) // self._mapping.tp_size
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
@@ -1267,9 +1276,26 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    use_python_scheduler = scheduler_config.use_python_scheduler if scheduler_config is not None else False
-    if use_python_scheduler and not isinstance(kv_cache_manager,
-                                               KVCacheManagerV2):
+    if isinstance(kv_cache_manager, KVCacheManagerV2):
+        # V2: interleaved scheduler handles both capacity and budget
+        draft_kv_cache_manager = resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        scheduler_policy = (scheduler_config.capacity_scheduler_policy
+                            if scheduler_config is not None else
+                            CapacitySchedulerPolicy.MAX_UTILIZATION)
+        scheduler = KVCacheV2Scheduler(
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=kv_cache_manager,
+            scheduler_policy=scheduler_policy,
+            ctx_chunk_config=ctx_chunk_config,
+            peft_cache_manager=peft_cache_manager.impl
+            if peft_cache_manager is not None else None,
+            scheduler_capacity=scheduler_capacity,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
+    elif (scheduler_config is not None
+          and scheduler_config.use_python_scheduler):
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1282,20 +1308,12 @@ def create_py_executor_instance(
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity)
     else:
-        if isinstance(kv_cache_manager, KVCacheManagerV2):
-            capacity_scheduler = KVCacheV2DummyScheduler(
-                scheduler_capacity,
-                kv_cache_manager if kv_cache_manager is not None else None,
-                peft_cache_manager.impl
-                if peft_cache_manager is not None else None)
-        else:
-            capacity_scheduler = BindCapacityScheduler(
-                scheduler_capacity,
-                kv_cache_manager.impl if kv_cache_manager is not None else None,
-                peft_cache_manager.impl
-                if peft_cache_manager is not None else None,
-                scheduler_config.capacity_scheduler_policy,
-                two_step_lookahead=mapping.has_pp())
+        capacity_scheduler = BindCapacityScheduler(
+            scheduler_capacity,
+            kv_cache_manager.impl if kv_cache_manager is not None else None,
+            peft_cache_manager.impl if peft_cache_manager is not None else None,
+            scheduler_config.capacity_scheduler_policy,
+            two_step_lookahead=mapping.has_pp())
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
@@ -1317,6 +1335,7 @@ def create_py_executor_instance(
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
+
     return PyExecutor(
         resource_manager,
         scheduler,

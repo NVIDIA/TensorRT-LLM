@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,18 +14,62 @@
 # limitations under the License.
 
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
 
 import yaml
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field, RootModel, field_validator
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 DATABASE_LIST_PATH = Path(__file__).parent / "lookup.yaml"
+CURATED_LIST_PATH = Path(__file__).parent.parent / "curated" / "lookup.yaml"
 
 LOW_LATENCY_CONCURRENCY_THRESHOLD = 8
 HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD = 32
 KEY_PROFILES = {"Min Latency", "Balanced", "Max Throughput"}
+
+
+class CuratedRecipe(BaseModel):
+    """A curated (hand-tuned) recipe entry."""
+
+    model: str = Field(description="HuggingFace model ID")
+    arch: str = Field(description="Model architecture class name")
+    config_path: str = Field(description="Relative path to YAML config")
+    scenario: str = Field(default="", description="Deployment scenario label")
+    gpu_compatibility: str = Field(default="Any", description="Compatible GPU families")
+    disagg: bool = Field(default=False, description="Requires disaggregated serving")
+
+    @field_validator("config_path")
+    @classmethod
+    def _validate_config_path(cls, v: str) -> str:
+        p = Path(v)
+        if p.is_absolute() or ".." in p.parts:
+            raise ValueError(f"Invalid config path: {v}")
+        return v
+
+
+class CuratedRecipeList(RootModel[List[CuratedRecipe]]):
+    """Validated list of curated recipe entries."""
+
+    @classmethod
+    def from_yaml(cls, yaml_path: Path) -> "CuratedRecipeList":
+        """Load and validate curated recipe list from YAML file."""
+        try:
+            with open(yaml_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            return cls(data)
+        except Exception as e:
+            logger.error("Failed to load curated recipe list from %s: %s", yaml_path, e)
+            raise
+
+    def __iter__(self) -> Iterator[CuratedRecipe]:
+        return iter(self.root)
+
+    def __len__(self) -> int:
+        return len(self.root)
 
 
 class Recipe(BaseModel):

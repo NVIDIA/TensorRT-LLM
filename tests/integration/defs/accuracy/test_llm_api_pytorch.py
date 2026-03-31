@@ -54,11 +54,11 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 
 # isort: off
 from tensorrt_llm.llmapi import (
-    AutoDecodingConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
-    Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
-    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SADecodingConfig, SamplingParams, SchedulerConfig,
-    SkipSoftmaxAttentionConfig, TorchCompileConfig)
+    AttentionDpConfig, AutoDecodingConfig, CudaGraphConfig,
+    DeepSeekSparseAttentionConfig, Eagle3DecodingConfig, KvCacheConfig,
+    MoeConfig, MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
+    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
+    SchedulerConfig, SkipSoftmaxAttentionConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -1592,6 +1592,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
     @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("v2_kv_cache", [True, False])
     # Chunked Prefill for MLA can only be enabled on SM100
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
@@ -1602,8 +1603,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
-                      overlap_scheduler, torch_compile, enable_chunked_prefill):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+                      overlap_scheduler, torch_compile, enable_chunked_prefill,
+                      v2_kv_cache):
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            use_kv_cache_manager_v2=v2_kv_cache,
+        )
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1632,17 +1637,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                        cuda_graph, overlap_scheduler,
                                        enable_chunked_prefill):
         scheduler_config = SchedulerConfig(use_python_scheduler=True)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            scheduler_config=scheduler_config,
         )
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
-                 scheduler_config=scheduler_config,
                  enable_chunked_prefill=enable_chunked_prefill,
                  max_num_tokens=256 if enable_chunked_prefill else 8192,
                  **pytorch_config,
@@ -1687,6 +1692,32 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
+
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    def test_bfloat16_4gpus_kv_cache_aware_routing(self, mtp_nextn):
+        """Accuracy test for attention DP with KV cache-aware routing."""
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=True)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        attention_dp_config = AttentionDpConfig(
+            enable_kv_cache_aware_routing=True, )
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=True,
+                 attention_dp_config=attention_dp_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("torch_compile", [False, True])
@@ -5863,6 +5894,63 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
                  moe_config=moe_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(183000)
+@pytest.mark.timeout(14400)
+class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    GSM8K_MAX_OUTPUT_LEN = 512
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp",
+        [
+            (4, 4, True, True, False),
+            (4, 4, True, True, True),
+        ],
+        ids=[
+            "tep4",
+            "adp4",
+        ],
+    )
+    def test_nvfp4(self, tp_size, ep_size, cuda_graph, overlap_scheduler,
+                   attention_dp, mocker):
+        model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
+
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=32, enable_padding=False)
+                              if cuda_graph else None)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 max_num_tokens=16384,
+                 max_batch_size=32,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=MoeConfig(backend='TRTLLM'),
+                 enable_attention_dp=attention_dp,
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)

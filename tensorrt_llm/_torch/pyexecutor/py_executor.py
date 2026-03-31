@@ -60,14 +60,14 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
-from .resource_manager import (ResourceManager, ResourceManagerType,
-                               request_context)
+from .resource_manager import (KVCacheManagerV2, ResourceManager,
+                               ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, DefaultADPRouter
+from .scheduler.adp_router import ADPRouter
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -285,8 +285,7 @@ class PyExecutor:
             virtual_memory_pools: Optional[dict] = None,
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
-            adp_router: Optional[ADPRouter] = None):
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -313,7 +312,6 @@ class PyExecutor:
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
-        self.adp_router: ADPRouter = (adp_router or DefaultADPRouter(dist=dist))
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
@@ -374,11 +372,24 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        # V2 scheduler calls suspend_request() during scheduling, which
+        # offloads GPU pages while preserving the radix tree.  The executor
+        # does not need to call _terminate_requests (GPU resources are already
+        # freed by suspend) or _pause_requests (V2's prepare_context handles
+        # resume internally, so resetting to CONTEXT_INIT is unnecessary).
+        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
+                                                        KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
+
+        self.adp_router: ADPRouter = ADPRouter.create(
+            dist=self.dist,
+            kv_cache_manager=self.kv_cache_manager,
+            attention_dp_config=self.llm_args.attention_dp_config,
+        )
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -566,6 +577,8 @@ class PyExecutor:
                         self.kv_connector_manager.layer_pre_hook)
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
+
+            self.kv_connector_manager.wait_for_initialization()
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.async_transfer_manager.end_transfer(request):
@@ -1866,8 +1879,9 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
-                self._terminate_requests(scheduled_batch.paused_requests)
-                self._pause_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
 
@@ -1885,6 +1899,10 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
@@ -2122,7 +2140,8 @@ class PyExecutor:
                         else:
                             can_forward = True
 
-                self._terminate_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -2152,6 +2171,10 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
@@ -2233,7 +2256,8 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                self._pause_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
                     guided_decoder_failed_requests = None
@@ -2563,6 +2587,9 @@ class PyExecutor:
 
         # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
+            if self.adp_router.needs_prefix_matches:
+                self.adp_router.gather_prefix_matches(new_requests)
+
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
@@ -3276,7 +3303,12 @@ class PyExecutor:
             self._terminate_request(request)
 
     def _terminate_request(self, request: LlmRequest):
-        if self._disagg_pp_termination_handler is not None:
+        # Dummy requests don't participate in disagg KV cache transfers,
+        # so they must bypass the PP termination handler to avoid stale
+        # sequences in the KV cache manager (the handler delays removal,
+        # but the dummy ID is reused every iteration).
+        if (self._disagg_pp_termination_handler is not None
+                and not request.is_dummy_request):
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request)

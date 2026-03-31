@@ -341,6 +341,72 @@ TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationTop4)
     this->runTest(param);
 };
 
+TYPED_TEST(RoutingRenormalizeKernelTest, DynBlockBasic)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/8,
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, DynBlockMaxTokens)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/16,
+        /*numExperts=*/512, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, DynBlockWithExpertParallelization)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/12,
+        /*numExperts=*/512, /*topK=*/8,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/192,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, DynBlockWithTopKAsInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/8,
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, DynBlockWithInvalidTopKInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/10,
+        /*numExperts=*/512, /*topK=*/8,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, DynBlockWithRenormalizeNaive)
+{
+    RoutingKernelTestParam param(RoutingMethodType::RenormalizeNaive, /*numTokens=*/16,
+        /*numExperts=*/512, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
 TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelizationLargeN)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/4,

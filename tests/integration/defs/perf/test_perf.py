@@ -26,7 +26,8 @@ import yaml
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
-from ..conftest import get_llm_root, llm_models_root, trt_environment
+from ..conftest import (get_device_count, get_llm_root, llm_models_root,
+                        trt_environment)
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
@@ -974,6 +975,15 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
+        try:
+            available_gpus = get_device_count()
+        except Exception:
+            available_gpus = None
+        if available_gpus is not None and self.num_gpus > available_gpus:
+            pytest.skip(
+                f"Test requires {self.num_gpus} GPUs but only {available_gpus} available"
+            )
+
     def get_model_family(self) -> str:
         """
         Get the model family of the current model.
@@ -1213,9 +1223,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                             llm_models_root(), actual_lora_path)
                 lora_dir = os.path.join(engine_dir, "loras")
                 data_cmd += [f"mkdir -p {lora_dir}", ";"]
-                if len(actual_lora_paths) != nloras:
+                if len(actual_lora_paths) < nloras:
+                    # Replicate paths cyclically to match the requested count
+                    actual_lora_paths = [
+                        actual_lora_paths[i % len(actual_lora_paths)]
+                        for i in range(nloras)
+                    ]
+                elif len(actual_lora_paths) > nloras:
                     raise ValueError(
-                        f"Number of LoRA paths ({len(actual_lora_paths)}) does not match requested number of LoRAs ({nloras})"
+                        f"Number of LoRA paths ({len(actual_lora_paths)}) exceeds requested number of LoRAs ({nloras})"
                     )
                 for i, lora_path in enumerate(actual_lora_paths):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
