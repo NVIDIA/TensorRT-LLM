@@ -3,6 +3,9 @@ BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 TRITON_IMAGE       ?= $(shell grep '^ARG TRITON_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 TRITON_BASE_TAG    ?= $(shell grep '^ARG TRITON_BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+RUNTIME_BASE_IMAGE ?= $(shell grep '^ARG RUNTIME_BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+RUNTIME_BASE_TAG   ?= $(shell grep '^ARG RUNTIME_BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+ARCH_ALT           ?= $(if $(filter arm64,$(PLATFORM)),aarch64,x86_64)
 # Name of the new image
 IMAGE_NAME         ?= tensorrt_llm
 IMAGE_TAG          ?= latest
@@ -105,6 +108,9 @@ base_pull:
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(RUNTIME_BASE_IMAGE), --build-arg RUNTIME_BASE_IMAGE="$(RUNTIME_BASE_IMAGE)") \
+		$(if $(RUNTIME_BASE_TAG), --build-arg RUNTIME_BASE_TAG="$(RUNTIME_BASE_TAG)") \
+		$(if $(ARCH_ALT), --build-arg ARCH_ALT="$(ARCH_ALT)") \
 		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
 		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
@@ -189,6 +195,9 @@ wheel_run: WORK_DIR = /src/tensorrt_llm
 release_%: STAGE = release
 release_run: WORK_DIR = /app/tensorrt_llm
 
+runtime_%: STAGE = runtime
+runtime_run: WORK_DIR = /app/tensorrt_llm
+
 # For x86_64
 jenkins_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE)
 jenkins_%: STAGE = tritondevel
@@ -248,6 +257,18 @@ ngc-release_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
 ngc-release_run:  IMAGE_TAG = $(TRT_LLM_VERSION)
 ngc-release_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
 ngc-release_pull: IMAGE_TAG = $(TRT_LLM_VERSION)
+
+ngc-runtime_%: STAGE = runtime
+ngc-runtime_%: DOCKER_BUILD_OPTS = --pull --load --platform linux/$(PLATFORM)
+ngc-runtime_%: DEVEL_IMAGE = $(NGC_STAGING_REPO)/devel:$(TRT_LLM_VERSION)
+ngc-runtime_%: IMAGE_NAME = $(NGC_STAGING_REPO)
+ngc-runtime_%: IMAGE_TAG = $(TRT_LLM_VERSION)-$(PLATFORM)
+
+ngc-runtime_run:  WORK_DIR = /app/tensorrt_llm
+ngc-runtime_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-runtime_run:  IMAGE_TAG = $(TRT_LLM_VERSION)
+ngc-runtime_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-runtime_pull: IMAGE_TAG = $(TRT_LLM_VERSION)
 
 ngc-manifest_%: STAGE = release
 ngc-manifest_%: IMAGE_NAME = $(NGC_STAGING_REPO)
