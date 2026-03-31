@@ -273,7 +273,15 @@ def _create_sim_py_executor(
     tokens_per_block = kv_cache_config.tokens_per_block
 
     # Sim engine and sampler — no model weights loaded
-    model_engine = SimModelEngine(llm_args, vocab_size, max_num_sequences)
+    from .sim_predictor import ConstantPredictor
+
+    sim_config = llm_args.sim_config
+    predictor = ConstantPredictor(
+        prefill_time_ms=sim_config.predictor.constant_prefill_time_ms,
+        decode_time_ms=sim_config.predictor.constant_decode_time_ms)
+
+    model_engine = SimModelEngine(llm_args, vocab_size, max_num_sequences,
+                                   time_predictor=predictor)
     sampler = SimSampler()
 
     # We need a minimal model shim so KvCacheCreator can read model_config

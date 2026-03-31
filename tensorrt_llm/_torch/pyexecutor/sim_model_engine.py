@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import time
+
 import torch
 
 from tensorrt_llm.logger import logger
@@ -40,10 +42,11 @@ class SimModelEngine:
     """
 
     def __init__(self, llm_args: TorchLlmArgs, vocab_size: int,
-                 max_num_sequences: int):
+                 max_num_sequences: int, time_predictor=None):
         self.llm_args = llm_args
         self.vocab_size = vocab_size
         self._max_num_sequences = max_num_sequences
+        self.time_predictor = time_predictor
 
         # Attributes read by PyExecutor.__init__ and _executor_loop
         self.spec_config = None
@@ -88,9 +91,18 @@ class SimModelEngine:
         }
 
         total_tokens = num_ctx_tokens + num_gen_tokens
-        logger.info("[SimModelEngine] forward: ctx=%d(%d tokens) gen=%d total=%d",
-                    num_ctx_requests, num_ctx_tokens, num_gen_tokens,
-                    total_tokens)
+
+        if self.time_predictor is not None:
+            from .sim_predictor import SimBatch
+            batch = SimBatch(
+                num_context_requests=num_ctx_requests,
+                num_context_tokens=num_ctx_tokens,
+                num_generation_requests=num_gen_tokens,
+                num_generation_tokens=num_gen_tokens)
+            predicted_time = self.time_predictor.predict(batch)
+            if predicted_time > 0:
+                time.sleep(predicted_time)
+
         logits = torch.zeros(total_tokens, self.vocab_size)
         return {'logits': logits}
 
