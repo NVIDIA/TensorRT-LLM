@@ -766,6 +766,18 @@ class DecodingBaseConfig(StrictBaseModel):
         "rolling average over the last N completed requests (N = acceptance_window) drops below this value. "
         "PyTorch backend only.")
 
+    # If true, uses rejection sampling for draft token acceptance instead of strict token equality.
+    # Rejection sampling provides lossless acceleration that exactly matches the target model's
+    # distribution. Requires allow_advanced_sampling=True. Only applicable to 1-model code paths.
+    use_rejection_sampling: bool = Field(
+        default=False,
+        description=
+        "If true, uses rejection sampling for draft token acceptance instead of "
+        "strict token equality. Rejection sampling provides lossless acceleration "
+        "that exactly matches the target model's distribution. Requires "
+        "allow_advanced_sampling=True. Only applicable to 1-model code paths. "
+        "PyTorch backend only.")
+
     allow_advanced_sampling: bool = Field(
         default=False,
         status="prototype",

@@ -1,7 +1,7 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
-from flashinfer.sampling import top_k_top_p_sampling_from_logits
+from flashinfer.sampling import chain_speculative_sampling, top_k_top_p_sampling_from_logits
 
 
 def forward_native(
@@ -95,3 +95,85 @@ def sampling_batch_spec_dec_one_model(
         return top_k_top_p_sampling_from_logits(logits, top_k, top_p, seed=seed, offset=offset)
     random_sampled = forward_native(logits, top_k, top_p)
     return random_sampled
+
+
+def compute_probs_from_logits(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Compute probabilities from logits with temperature, top-k, and top-p applied.
+
+    Args:
+        logits: [num_tokens, vocab_size] - Raw logits
+        temperatures: [num_tokens] - Temperature for each token
+        top_k: [num_tokens] or None - Top-k values
+        top_p: [num_tokens] or None - Top-p values
+
+    Returns:
+        probs: [num_tokens, vocab_size] - Probability distribution
+    """
+    # Apply temperature (in-place)
+    logits = apply_temperature(logits, temperatures)
+    # Apply top-k and top-p masking
+    logits = apply_top_k_top_p(logits, top_k, top_p)
+    # Compute softmax to get probabilities
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
+    return probs
+
+
+def rejection_sampling_one_model(
+    draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+    deterministic: bool = True,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    CUDA-graph compatible rejection sampling for one-engine speculative decoding.
+
+    This function performs rejection sampling to verify draft tokens against
+    the target model's probability distribution. It uses flashinfer's
+    chain_speculative_sampling kernel which is CUDA graph compatible when
+    seed and offset are provided.
+
+    Note: This function assumes all requests are generation requests (no context/prefill requests).
+
+    Args:
+        draft_probs: [batch_size, max_draft_len, vocab_size] - Draft model probabilities.
+        draft_token_ids: [batch_size, max_draft_len] - Draft token IDs.
+        target_probs: [batch_size, max_draft_len + 1, vocab_size] - Target model probabilities.
+        deterministic: Whether to use deterministic sampling.
+        seed: Random seed for CUDA graph compatibility.
+        offset: Random offset for CUDA graph compatibility.
+
+    Returns:
+        accepted_tokens: [batch_size, max_draft_len + 1] - Accepted token IDs
+        num_accepted_tokens: [batch_size] - Number of accepted tokens per request
+    """
+    batch_size = draft_token_ids.shape[0]
+    device = draft_token_ids.device
+
+    output_accepted_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    output_emitted_draft_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+    accepted_tokens, _, output_emitted_draft_token_num = chain_speculative_sampling(
+        draft_probs,
+        draft_token_ids,
+        target_probs,
+        maybe_output_accepted_token_num=output_accepted_token_num,
+        maybe_output_emitted_draft_token_num=output_emitted_draft_token_num,
+        deterministic=deterministic,
+        generator=None,
+        seed=seed,
+        offset=offset,
+    )
+
+    # output_emitted_draft_token_num is the number of emitted draft tokens (not including bonus token)
+    # Total accepted tokens = emitted_draft_tokens + 1 (bonus token)
+    num_accepted_tokens = output_emitted_draft_token_num + 1
+
+    return accepted_tokens, num_accepted_tokens
