@@ -9,6 +9,9 @@ import torch
 from torch.export import Dim
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_backend_attention import (
+    TorchBackendAttention,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma3n import (
     Gemma3nAudioConfig,
@@ -401,20 +404,33 @@ def test_gemma3n_export_uses_shared_kv_attention_for_shared_layers():
     )
 
     attn_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
-    regular_nodes = [
+    attn_nodes = [
         node for node in attn_nodes if node.target == torch.ops.auto_deploy.torch_attention.default
+    ]
+    regular_nodes = [
+        node
+        for node in attn_nodes
+        if TorchBackendAttention.get_shared_kv_source_layer_idx(node) is None
     ]
     shared_nodes = [
         node
         for node in attn_nodes
-        if node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default
+        if TorchBackendAttention.get_shared_kv_source_layer_idx(node) is not None
     ]
 
+    assert len(attn_nodes) == config.num_hidden_layers
     assert len(regular_nodes) == config.num_hidden_layers - config.num_kv_shared_layers
     assert len(shared_nodes) == config.num_kv_shared_layers
-    assert [regular.args[-1] for regular in regular_nodes] == [0, 1, 2, 3]
-    assert [shared.args[-2] for shared in shared_nodes] == [4, 5]
-    assert [shared.args[-1] for shared in shared_nodes] == [2, 3]
+    assert [TorchBackendAttention.get_layer_idx(regular) for regular in regular_nodes] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert [TorchBackendAttention.get_layer_idx(shared) for shared in shared_nodes] == [4, 5]
+    assert [
+        TorchBackendAttention.get_shared_kv_source_layer_idx(shared) for shared in shared_nodes
+    ] == [2, 3]
 
 
 def test_gemma3n_model_can_be_exported():

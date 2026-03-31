@@ -1829,11 +1829,6 @@ class AttentionDescriptor(ABC):
         """Get the source attention op that we target for replacement."""
 
     @classmethod
-    def get_source_attention_ops(cls) -> List[OpOverloadPacket]:
-        """Get all source attention ops targeted for replacement."""
-        return [cls.get_source_attention_op()]
-
-    @classmethod
     @abstractmethod
     def get_cached_attention_op(cls) -> MHACallable:
         """Get the cached attention op .
@@ -1858,16 +1853,6 @@ class AttentionDescriptor(ABC):
 
         """
         raise NotImplementedError
-
-    @classmethod
-    def get_cached_attention_op_for_source_node(cls, source_attn_node: Node) -> MHACallable:
-        """Get the cached attention op for a specific source node.
-
-        Backends that distinguish between multiple source attention variants can override this to
-        select a different cached op based on the source node metadata. The default behavior is to
-        use the backend's single cached attention op for all source nodes.
-        """
-        return cls.get_cached_attention_op()
 
     @classmethod
     @abstractmethod

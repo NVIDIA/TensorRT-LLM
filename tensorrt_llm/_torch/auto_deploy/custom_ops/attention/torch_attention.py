@@ -133,7 +133,6 @@ def torch_attention(
     """
     # `layer_idx` and `shared_kv_source_layer_idx` are graph metadata used by the KV-cache
     # transform; the eager attention kernel itself does not need them.
-    del shared_kv_source_layer_idx
     if layout not in ("bnsd", "bsnd"):
         raise ValueError(f"layout must be 'bnsd' or 'bsnd', got {layout!r}")
 
@@ -233,61 +232,6 @@ def torch_attention(
 
 @torch_attention.register_fake
 def torch_attention_fake(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    scale=None,
-    sinks=None,
-    sliding_window=None,
-    logit_cap=None,
-    layout: str = "bnsd",
-    layer_idx: Optional[int] = None,
-    shared_kv_source_layer_idx: Optional[int] = None,
-):
-    return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
-
-
-@torch.library.custom_op("auto_deploy::torch_attention_shared_kv", mutates_args=())
-def torch_attention_shared_kv(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attn_mask: Optional[torch.Tensor] = None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    scale: Optional[float] = None,
-    sinks: Optional[torch.Tensor] = None,
-    sliding_window: Optional[int] = None,
-    logit_cap: Optional[float] = None,
-    layout: str = "bnsd",
-    layer_idx: Optional[int] = None,
-    shared_kv_source_layer_idx: Optional[int] = None,
-) -> torch.Tensor:
-    """Source attention op variant that marks a layer as reusing another layer's KV cache."""
-    if shared_kv_source_layer_idx is None:
-        raise ValueError("torch_attention_shared_kv requires shared_kv_source_layer_idx")
-    return torch_attention(
-        query,
-        key,
-        value,
-        attn_mask,
-        dropout_p,
-        is_causal,
-        scale,
-        sinks,
-        sliding_window,
-        logit_cap,
-        layout,
-        layer_idx,
-        shared_kv_source_layer_idx,
-    )
-
-
-@torch_attention_shared_kv.register_fake
-def torch_attention_shared_kv_fake(
     query,
     key,
     value,
