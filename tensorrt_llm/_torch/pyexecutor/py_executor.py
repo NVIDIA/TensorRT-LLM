@@ -2688,6 +2688,7 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+
     def _emit_initial_stats(self) -> None:
         """Emit a startup stats snapshot so that cache_config_info is
         immediately available to external metric scrapers (e.g. the
