@@ -32,7 +32,7 @@ class BasePipeline(nn.Module):
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
-        self._warmed_up_shapes: Set[Tuple[int, int, int]] = set()
+        self._warmed_up_shapes: Set[tuple] = set()
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -100,6 +100,15 @@ class BasePipeline(nn.Module):
     def transformer_components(self) -> list:
         """Return list of transformer components this pipeline needs."""
         return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
+
+    def warmup_cache_key(self, height: int, width: int, num_frames: int) -> tuple:
+        """Return the cache key for a given warmup shape.
+
+        Image models (FLUX) override to return (height, width), ignoring
+        num_frames.  Video models use the default (height, width, num_frames).
+        The executor uses this to check whether a request shape was warmed up.
+        """
+        return (height, width, num_frames)
 
     @property
     def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
@@ -436,7 +445,9 @@ class BasePipeline(nn.Module):
             self._run_warmup(height, width, num_frames, steps)
             torch.cuda.synchronize()
 
-        self._warmed_up_shapes = set(tuple(s) for s in shapes)
+        self._warmed_up_shapes = set(
+            self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
+        )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 

@@ -758,6 +758,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
+        .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
