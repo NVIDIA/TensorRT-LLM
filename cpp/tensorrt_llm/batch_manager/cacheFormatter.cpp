@@ -219,7 +219,16 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     }
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
-    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd, llmRequest);
+
+    if (llmRequest.getInputTokensExtraIds().has_value())
+    {
+        auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+            lastBlockKey.uniqueTokens, lastBlockKey.uniqueTokens.size(), tokensPerBlock, /*allowPartial=*/true);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
+    }
+    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,

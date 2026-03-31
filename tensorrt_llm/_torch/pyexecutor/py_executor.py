@@ -396,8 +396,8 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        # TODO: Remove the condition on the PP size once disagg support for
-        # pipeline parallelism is added.
+        # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
+        # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
@@ -3530,8 +3530,8 @@ class PyExecutor:
                                 )
 
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
-                # then we need to terminate the request. TODO: Remove the condition on the PP size once disagg
-                # support for pipeline parallelism is added.
+                # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
+                # path is fixed.
                 if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
                     requests_to_terminate.append(request)
                 else:

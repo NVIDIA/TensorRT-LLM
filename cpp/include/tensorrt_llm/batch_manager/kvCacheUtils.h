@@ -69,16 +69,34 @@ public:
         return BlockRange(cacheManager, requestId);
     }
 
-    static BlockRange fromReuseTree(BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey,
-        int32_t indexFromEnd, OptionalRef<LlmRequest const> llmRequest = std::nullopt)
+    static BlockRange fromReuseTree(
+        BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
     {
+        auto windowSize = getCheckedWindowSize(cacheManager);
+        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
+        return collectBlocks(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
+    }
 
+    static BlockRange fromReuseTree(
+        BaseKVCacheManager& cacheManager, std::vector<BlockKey> const& blockKeys, int32_t indexFromEnd)
+    {
+        auto windowSize = getCheckedWindowSize(cacheManager);
+        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
+        return collectBlocks(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
+    }
+
+private:
+    static SizeType32 getCheckedWindowSize(BaseKVCacheManager& cacheManager)
+    {
         auto poolNum = cacheManager.getBlockManager().getNumPools(
             /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
         TLLM_CHECK_WITH_INFO(poolNum == 1, "Reuse tree is not supported for multiple pools or variable window size");
+        return cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
+    }
 
-        auto windowSize = cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
-        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize, llmRequest);
+    static BlockRange collectBlocks(BaseKVCacheManager const& cacheManager,
+        std::shared_ptr<KVCacheBlock> lastBlock, int32_t indexFromEnd, SizeType32 windowSize)
+    {
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
         int32_t const numBlocksToCollect = indexFromEnd + 1;
 
@@ -101,6 +119,8 @@ public:
         blockIdsPerWindow[windowSize] = blockIds;
         return BlockRange(cacheManager, blockIdsPerWindow, 0);
     }
+
+public:
 
     void setBlockIdsForWindow(SizeType32 windowSize, std::vector<SizeType32> blockIds)
     {
