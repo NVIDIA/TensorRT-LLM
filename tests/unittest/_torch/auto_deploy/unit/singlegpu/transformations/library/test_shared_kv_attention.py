@@ -70,8 +70,10 @@ class _DuplicateLayerOwnerSharedKVModule(torch.nn.Module):
 
 
 def _context_meta(seq_len: int):
+    batch_info_host = BatchInfo()
+    batch_info_host.update([1, seq_len, 0, 0, 0, 0])
     return (
-        torch.tensor([1, 0, 0], dtype=torch.int32),
+        batch_info_host.serialize(),
         torch.tensor([seq_len], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int64),
@@ -80,8 +82,10 @@ def _context_meta(seq_len: int):
 
 
 def _decode_meta(input_pos: int):
+    batch_info_host = BatchInfo()
+    batch_info_host.update([0, 0, 0, 0, 1, 1])
     return (
-        torch.tensor([0, 0, 1], dtype=torch.int32),
+        batch_info_host.serialize(),
         torch.tensor([1], dtype=torch.int32),
         torch.tensor([input_pos], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int64),

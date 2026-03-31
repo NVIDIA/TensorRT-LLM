@@ -254,13 +254,6 @@ class _FlashInferPlanner:
 _GlobalFlashInferPlanner = _FlashInferPlanner()
 
 
-def _get_absorbed_batch_info(batch_info_host: torch.Tensor) -> Tuple[int, int, int]:
-    """Return (num_prefill, num_prefill_tokens, num_decode) for legacy and current metadata."""
-    if batch_info_host.numel() == 3:
-        return tuple(batch_info_host.tolist())
-    return BatchInfo(batch_info_host).get_absorbed_info()
-
-
 def _to_flashinfer_window_left(sliding_window: Optional[int]) -> int:
     """Convert AD sliding-window size to FlashInfer's inclusive window_left contract."""
     if sliding_window is None or sliding_window <= 0:
@@ -282,7 +275,8 @@ def prepare_flashinfer_metadata(
     to understand the convention.
     """
     # retrieve host-side metadata
-    num_prefill, num_prefill_tokens, num_decode = _get_absorbed_batch_info(batch_info_host)
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
@@ -322,7 +316,8 @@ def prepare_flashinfer_metadata_host(
     cache_loc_host: torch.Tensor,
     last_page_len_host: torch.Tensor,
 ) -> None:
-    num_prefill, num_prefill_tokens, num_decode = _get_absorbed_batch_info(batch_info_host)
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
 
     if num_prefill == 0:
         _GlobalFlashInferPlanner.plan_generate_only(
@@ -376,7 +371,8 @@ def flashinfer_mha_with_cache(
     v = v.reshape(b * s, -1, head_dim).contiguous()
 
     # convert to flashinfer-style metadata
-    num_prefill, num_prefill_tokens, num_decode = _get_absorbed_batch_info(batch_info_host)
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
@@ -524,7 +520,8 @@ def flashinfer_shared_kv_mha_with_cache(
 
     q = q.reshape(b * s, -1, head_dim).contiguous()
 
-    num_prefill, num_prefill_tokens, num_decode = _get_absorbed_batch_info(batch_info_host)
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
