@@ -110,9 +110,10 @@ __device__ __forceinline__ __half mtp_from_float<__half>(float val)
     return __float2half(val);
 }
 
-__device__ __forceinline__ float mtp_softplus(float dt_value)
+__device__ __forceinline__ float mtp_thresholded_softplus(float dt_value)
 {
-    return __logf(1.f + __expf(dt_value));
+    constexpr float threshold = 20.f;
+    return (dt_value <= threshold) ? __logf(1.f + __expf(dt_value)) : dt_value;
 }
 
 __device__ __forceinline__ float mtp_warp_reduce_sum(float val)
@@ -402,7 +403,7 @@ __global__ void __launch_bounds__(MTP_NUM_BLOCK_THREADS)
             }
             if constexpr (DT_SOFTPLUS)
             {
-                dt_val = mtp_softplus(dt_val);
+                dt_val = mtp_thresholded_softplus(dt_val);
             }
             dA_val = __expf(A_val * dt_val);
             xdt_val_a = x_val_a * dt_val;
