@@ -7,9 +7,14 @@ import torch
 
 from tensorrt_llm.bindings.internal.runtime import \
     CudaVirtualMemoryAllocatorRestoreMode as RestoreMode
-from tensorrt_llm.bindings.internal.runtime import (
-    get_virtual_memory_manager, pop_virtual_memory_allocator,
-    push_virtual_memory_allocator)
+try:
+    from tensorrt_llm.bindings.internal.runtime import (
+        get_virtual_memory_manager, pop_virtual_memory_allocator,
+        push_virtual_memory_allocator)
+except ImportError:
+    get_virtual_memory_manager = None
+    pop_virtual_memory_allocator = None
+    push_virtual_memory_allocator = None
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
