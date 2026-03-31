@@ -1920,7 +1920,9 @@ class DSACacheManager(KVCacheManager):
         super().shutdown()
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+    def get_cache_size_per_token(model_config: ModelConfig,
+                                 mapping: Mapping,
+                                 num_layers: Optional[int] = None,
                                  **kwargs):
         config = model_config.pretrained_config
         sparse_attn_config = model_config.sparse_attention_config
@@ -1937,9 +1939,8 @@ class DSACacheManager(KVCacheManager):
         # get head dim
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+            model_config, mapping, num_layers)
         mem_per_token *= num_attention_layers * head_dim
 
         # 1 for K, others for indexer K cache
