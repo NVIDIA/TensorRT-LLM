@@ -1649,6 +1649,13 @@ class PyExecutor:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
                 self._update_requests(executed_batch.sample_state)
 
+                # In PP, logprobs have been broadcast via
+                # sample_state.host.logprobs_state. Clear the logprobs from the
+                # py_result.diff so they are not sent again in next round.
+                if self.dist.pp_size > 1:
+                    for request in executed_batch.sample_state.requests:
+                        request.py_result.diff.log_probs_list.clear()
+
                 scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk

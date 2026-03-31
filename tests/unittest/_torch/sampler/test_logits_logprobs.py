@@ -759,3 +759,36 @@ def test_logprobs_match_hf_tp2():
     print(f"Diff: {(trtllm_logprobs - hf_logprobs).abs()}")
 
     torch.testing.assert_close(trtllm_logprobs, hf_logprobs, atol=0.15, rtol=0)
+
+
+@pytest.mark.gpu2
+def test_logprobs_pp2():
+    """Test that logprobs count matches generated token count with PP=2.
+
+    Regression test for https://github.com/NVIDIA/TensorRT-LLM/issues/12444
+    Without the fix, logprobs length = 2N-1 instead of N due to duplication
+    in the PP ring broadcast diff mechanism.
+    """
+    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    max_tokens = 16
+    llm = LLM(
+        model=model_path,
+        pipeline_parallel_size=2,
+        max_batch_size=1,
+        max_num_tokens=128,
+        max_seq_len=256,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tokens,
+        logprobs=5,
+    )
+
+    output = list(llm.generate(["The future of the AI is"], sampling_params=sampling_params))[0]
+
+    num_tokens = len(output.outputs[0].token_ids)
+    num_logprobs = len(output.outputs[0].logprobs)
+    assert num_logprobs == num_tokens, (
+        f"logprobs length {num_logprobs} != generated tokens {num_tokens} "
+        f"(expected 1:1 ratio, got {num_logprobs / num_tokens:.2f}:1)"
+    )
