@@ -442,7 +442,7 @@ The heuristic Top-K kernel produces **bit-exact** Top-K index sets compared to `
 
 </div>
 
-<sub><em>Table 1. B200, synthetic input with norm/gamma/beta distribution. "Production Baseline" is the `topKPerRowDecode` kernel (insert sort for $N < 12{,}288$, radix sort for $N \geq 12{,}288$). "Speedup" = baseline time / heuristic time.</em></sub>
+<sub><em>Table 1. B200, synthetic input with norm/gamma/beta distribution. "Production Baseline" is the `topKPerRowDecode` kernel (insert sort for $N < 12288$, radix sort for $N \geq 12288$). "Speedup" = baseline time / heuristic time.</em></sub>
 
 At short sequences ($N = 8192$), the overhead of Phase 1 (scattered preIdx reads) and Phase 2 (interpolation iterations) outweighs the savings, making the heuristic kernel ~32% slower. The heuristic kernel breaks even around $N = 16384$ and increasingly outperforms the baseline as sequence length grows — reaching **1.75×** at $N = 131072$. This scaling advantage arises because the heuristic kernel's global-memory pass count (I + 1 ≈ 3–4) grows slowly relative to the radix-select approach, whose multi-pass histogram + prefix-sum + filter pipeline incurs higher per-pass overhead at large $N$.
 
@@ -631,13 +631,11 @@ The end-to-end improvement is modest (~0.5%) for two reasons: (1) the Top-K kern
 
 ## Future Work
 
-- **Longer sequence benchmarks**: Evaluate at ISL=32K and ISL=64K where the Top-K fraction is significantly larger, expecting more pronounced end-to-end gains.
-- **Adaptive prediction sources**: Explore using the static RoPE-based candidate set as a fallback when temporal correlation is low (e.g., the first token after a distribution shift), and dynamically blending static and temporal predictions.
-- **Multi-CTA heuristic**: Extend the heuristic approach to the multi-CTA split-work regime for very long sequences ($N > 200$K), where the current implementation falls back to radix-select.
-- **Prefill-phase heuristic**: Investigate whether the heuristic approach can benefit the prefill phase, where multiple query tokens share the same key set and inter-query prediction may be feasible.
-- **Cross-model generalization**: Apply the temporal-correlation-guided Top-K to other sparse attention methods that use Top-K selection, such as RocketKV's generation-phase dynamic Top-K.
-- **FP8 indexer score support**: As indexer MQA moves toward lower-precision outputs, adapt the histogram and threshold logic for FP8 or BF16 score distributions.
-- **Integration with kernel-level sparsity**: Explore combining the heuristic Top-K with Skip Softmax Attention for models that use both framework-level and kernel-level sparse attention, potentially achieving compounding benefits.
+- **Multi-CTA heuristic for ultra-long sequences**: The current single-CTA design falls back to radix-select when $N > 200$K. Extending the heuristic approach to a multi-CTA split-work regime would unlock acceleration for ultra-long sequences, improve GPU occupancy and throughput through cooperative CTA-level parallelism, and eliminate the last fallback path in the dispatch logic.
+- **Prefill-phase analytical prediction**: During prefill, no previous-step Top-K exists to serve as `preIdx`. Investigate analytically derived prediction signals — such as the static RoPE/YaRN frequency prior $f(\Delta)$ or inter-query correlation within the same prefill batch — to bootstrap the heuristic path without temporal history, potentially accelerating the prefill-phase indexer Top-K as well.
+- **Cross-model generalization**: Validate the temporal-correlation-guided Top-K on other sparse attention architectures that employ Top-K selection in their critical path, such as RocketKV's generation-phase dynamic Top-K and NSA-style block-sparse selection, to establish the approach as a general-purpose sparse attention primitive.
+- **Multi-batch and variable-length sequence tuning**: The current kernel is optimized for batch=1 minimum-latency scenarios. Extend to multi-batch decode workloads and variable-length sequences arising from MTP > 1 speculative decoding, where per-request sequence lengths diverge and unified kernel parameterization (thread count, iteration budget, candidate capacity) requires adaptive tuning.
+- **Next-generation GPU architecture adaptation**: Port and optimize for post-Blackwell architectures (e.g., sm\_120+), leveraging anticipated improvements in shared memory capacity, warp-level reduction primitives, and L2 cache bandwidth to further reduce the per-iteration cost of `blockCountGE` and histogram operations.
 
 ## Acknowledgement
 
