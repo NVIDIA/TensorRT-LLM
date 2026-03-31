@@ -32,7 +32,10 @@ Prerequisites:
   pip install lmcache
 
 How to run:
-  python llm_lmcache_connector.py Qwen/Qwen2-1.5B-Instruct
+  PYTHONHASHSEED=0 python llm_lmcache_connector.py Qwen/Qwen2-1.5B-Instruct
+
+Note: PYTHONHASHSEED=0 must be set before the Python process starts
+to ensure deterministic cache key hashing in LMCache.
 
 Expected output:
   Second request logs show "Retrieved N tokens" and both outputs are identical.
