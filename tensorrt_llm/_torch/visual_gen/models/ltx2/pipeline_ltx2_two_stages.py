@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
+import json
+import math
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -10,8 +12,18 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.quantization.ops import (
+    quantize_fp8_blockwise,
+    quantize_nvfp4,
+)
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    align,
+    inverse_transform_sf,
+    resmooth_to_fp8_e8m0,
+    transform_sf_into_required_layout,
+)
 
 from .ltx2_core.audio_vae import decode_audio
 from .ltx2_core.modality import Modality
@@ -186,8 +198,6 @@ def _requantize_fp4_weight(
 
     Returns ``(qweight, interleaved_scale, weight_scale_2)``.
     """
-    from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_nvfp4
-
     qweight, linear_scale, weight_scale_2 = quantize_nvfp4(bf16_weight, block_size)
     # block_scale_interleave expects uint8; quantize_nvfp4 returns float8_e4m3fn
     interleaved_scale = torch.ops.trtllm.block_scale_interleave(linear_scale.view(torch.uint8))
@@ -214,10 +224,6 @@ def _is_fp8_scale_packed(
     if weight_scale.dtype != torch.int32 or weight_scale.ndim != 2:
         return False
 
-    import math
-
-    from tensorrt_llm.quantization.utils.fp8_utils import align
-
     nb_in = math.ceil(in_features / block_size)
     aligned_k = align(nb_in, 4)
     expected_cols = aligned_k // 4
@@ -237,8 +243,6 @@ def _dequantize_fp8_weight(
     out_features, in_features = fp8_weight.shape
 
     if packed:
-        from tensorrt_llm.quantization.utils.fp8_utils import inverse_transform_sf
-
         block_scale = inverse_transform_sf(
             weight_scale,
             mn=out_features,
@@ -267,16 +271,9 @@ def _requantize_fp8_weight(
 
     Returns ``(qweight, block_scales)``.
     """
-    from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise
-
     qw, scale = quantize_fp8_blockwise(bf16_weight, block_size)
 
     if repack:
-        from tensorrt_llm.quantization.utils.fp8_utils import (
-            resmooth_to_fp8_e8m0,
-            transform_sf_into_required_layout,
-        )
-
         qw, scale = resmooth_to_fp8_e8m0(qw, scale)
         scale = transform_sf_into_required_layout(
             scale,
@@ -482,8 +479,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 with safetensors.torch.safe_open(sft_paths[0], framework="pt") as f:
                     meta = f.metadata()
                     if meta and "config" in meta:
-                        import json
-
                         config = json.loads(meta["config"])
             except Exception:
                 pass
