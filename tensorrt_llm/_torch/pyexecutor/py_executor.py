@@ -1860,7 +1860,7 @@ class PyExecutor:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
 
-    def _emit_initial_stats(self):
+    def _emit_initial_stats(self) -> None:
         """Emit a startup stats snapshot so that cache_config_info is
         immediately available to external metric scrapers (e.g. the
         Kubernetes Inference Gateway EPP) before any inference request."""

@@ -57,12 +57,17 @@ def test_metrics_available_before_first_request(client):
     before any inference request is sent.  This is critical for external
     metric scrapers (e.g. the Kubernetes Inference Gateway EPP) that need
     cache_config_info immediately to make routing decisions."""
-    # Give the background stats collector a moment to process the initial stats
-    time.sleep(2)
-    response = client.get("/metrics")
-    assert response.status_code == 200
-    stats = response.json()
-    assert len(stats) > 0, "Expected initial stats before first request"
+    # Poll until the background stats collector processes the initial stats
+    deadline = time.time() + 5.0
+    stats = []
+    while time.time() < deadline:
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        stats = response.json()
+        if stats:
+            break
+        time.sleep(0.1)
+    assert stats, "Expected initial stats before first request"
     response_dict = stats[0]
     assert "kvCacheStats" in response_dict, \
         "kvCacheStats should be present before first request"
