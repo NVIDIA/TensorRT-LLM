@@ -937,17 +937,11 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    if mla_layer.is_dsa:
-        mla_layer.forward_impl_with_dsa(position_ids,
-                                        hidden_states,
-                                        metadata,
-                                        output=output)
-    else:
-        mla_layer.forward_impl(position_ids,
-                               hidden_states,
-                               metadata,
-                               output=output,
-                               latent_cache_gen=latent_cache_gen)
+    mla_layer.forward_impl(position_ids,
+                           hidden_states,
+                           metadata,
+                           output=output,
+                           latent_cache_gen=latent_cache_gen)
 
 
 @torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
@@ -996,8 +990,7 @@ def _mla_dsa_proj_fake(
         dtype=torch.float8_e4m3fn)
     k_fp8 = hidden_states.new_empty([num_tokens, indexer.head_dim],
                                     dtype=torch.float8_e4m3fn)
-    k_scale = hidden_states.new_empty([num_tokens, indexer.head_dim // 128],
-                                      dtype=torch.float32)
+    k_scale = hidden_states.new_empty([num_tokens, 1], dtype=torch.float32)
     weights = hidden_states.new_empty([num_tokens, indexer.n_heads],
                                       dtype=torch.float32)
     return [
@@ -2761,10 +2754,7 @@ class MLA(nn.Module):
             if self.is_dsa:
                 proj_outputs = torch.ops.trtllm.mla_dsa_proj(
                     hidden_states, position_ids, self.layer_idx_str)
-                q, compressed_kv, k_pe, latent_cache = (proj_outputs[0],
-                                                        proj_outputs[1],
-                                                        proj_outputs[2],
-                                                        proj_outputs[3])
+                q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
                 indexer_intermediates = proj_outputs[4:]
                 torch.ops.trtllm.mla_dsa_attn_inplace(
                     q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
