@@ -122,7 +122,7 @@ The three DSA decode-step components have fundamentally different scaling charac
 <div align="center">
 
 | Component | Scaling | Total Memory Traffic | Trend as $N$ Grows |
-|:-----------:|:---------:|:----------------- ----:|:-------------------:|
+|:-----------:|:---------:|:---------------------:|:-------------------:|
 | **Indexer MQA** | $O(N)$ | N·d_i·2B | Linear growth |
 | **Top-K (radix-select)** | $O(R \cdot N)$ | R·N·4B | Linear growth ($R$ passes) |
 | **Sparse MLA** | $O(K)$ | K·d·2B | **Constant** ($K$ fixed) |
