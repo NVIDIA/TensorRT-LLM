@@ -43,9 +43,9 @@ NVIDIA TensorRT LLM 团队
 
 ## 引言
 
-Agentic AI 工作负载的兴起——LLM 自主浏览网页、规划任务、编写代码以及编排多步工具调用——推动上下文长度从数千 token 增长到数十万 token。在这些场景中，推理流水线中与序列长度线性相关的每一个组件都可能成为潜在瓶颈。[DeepSeek-V3.2](https://api-docs.deepseek.com/news/news251201) 引入的 DeepSeek 稀疏注意力 (DSA) 通过轻量级 **Lightning Indexer** 和 **Top-K 选择器** 仅保留最重要的键值条目，从而缓解注意力的二次复杂度。尽管稀疏 MLA 内核和 Indexer MQA 内核已经过深度优化（参见 [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)），Top-K 选择本身——从数万乃至数十万个 indexer 分数中选取 top-2048 条目——随着序列增长在 DSA 模块延迟中占比越来越大。
+Agentic AI 工作负载的兴起——LLM 自主浏览网页、规划任务、编写代码以及编排多步工具调用——推动上下文长度从数千 token 增长到数十万 token。在这些场景中，推理流水线中与序列长度线性相关的每一个组件都可能成为潜在瓶颈。稀疏注意力已成为应对二次复杂度的主流策略：DeepSeek 的 [DSA](https://api-docs.deepseek.com/news/news251201) 和 [NSA](https://arxiv.org/abs/2502.11089)、Moonshot 的 [MoBA](https://arxiv.org/abs/2502.13189)、NVIDIA 的 [RocketKV](https://arxiv.org/abs/2502.15579)、MIT 的 [Quest](https://proceedings.mlr.press/v235/tang24l.html) 以及 [SAGE-KV](https://arxiv.org/abs/2503.08879) 等方法均依赖 **Top-K 选择**——在 token、page 或 block 粒度上——为每个查询筛选最重要的键值条目。当序列长度进入 100K+ 范围时，Top-K 算子本身在稀疏注意力延迟中的占比不可忽视，亟需专门的内核级优化。
 
-本文介绍一种 **时序相关启发式引导 Top-K 算法**，该算法利用了 LLM 推理的一个基本特性：重要键值 token 的集合在连续解码步之间变化缓慢。通过将上一步的 Top-K 结果作为预测信号，算法仅需 1–2 次全局数据遍历即可估计出紧凑的阈值，随后利用无 ballot 共享内存技术收集和精炼候选集。在 NVIDIA Blackwell GPU 上运行真实 DeepSeek-V3.2 解码工作负载时，该数据感知方法相比生产环境的基数选择 (radix-select) 内核平均获得 **1.81×** 的单算子加速（单层单步最高达 **2.36×**），且不损失输出精度。
+本文以 DeepSeek 稀疏注意力 (DSA) 作为具体案例展开。DSA 通过轻量级 **Lightning Indexer** 和 **Top-K 选择器** 从数万乃至数十万个 indexer 分数中选取 top-2048 条目。尽管稀疏 MLA 内核和 Indexer MQA 内核已经过深度优化（参见 [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)），Top-K 选择随着序列增长在 DSA 模块延迟中占比越来越大。我们引入一种 **时序相关启发式引导 Top-K 算法**，利用自回归 LLM 解码的基本特性：重要键值 token 的集合在连续解码步之间变化缓慢。通过将上一步的 Top-K 结果作为预测信号，算法仅需 1–2 次全局数据遍历即可估计出紧凑的阈值，随后利用无 ballot 共享内存技术收集和精炼候选集。在 NVIDIA Blackwell GPU 上运行真实 DeepSeek-V3.2 解码工作负载时，该数据感知方法相比生产环境的基数选择 (radix-select) 内核平均获得 **1.81×** 的单算子加速（单层单步最高达 **2.36×**），且不损失输出精度。尽管本文以 DSA 为例，该方法可推广到任何解码阶段 Top-K 具有时序相关性的稀疏注意力方法。
 
 我们将详细阐述基于 RoPE 频率结构的理论基础、包含逐阶段复杂度分析的四阶段算法、与 `torch.topk` 对比的正确性验证、单算子和端到端基准测试以及在 TensorRT-LLM 中的集成路径。
 
