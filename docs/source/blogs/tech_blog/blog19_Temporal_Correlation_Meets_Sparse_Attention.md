@@ -639,6 +639,4 @@ The end-to-end improvement is modest (~0.5%) for two reasons: (1) the Top-K kern
 
 ## Acknowledgement
 
-This work builds upon the foundation of the DeepSeek-V3.2 sparse attention implementation in TensorRT-LLM. We thank the teams responsible for the radix-select Top-K kernel, the sparse MLA kernel, and the sparse attention framework for their foundational contributions. The temporal correlation insight was validated using real decoding data from SWE-Bench evaluations, and the algorithm was iteratively refined through systematic profiling on NVIDIA Blackwell GPUs.
-
-This heuristic-guided approach demonstrates a broader principle: **data-aware algorithm design** — tailoring GPU kernel algorithms to the statistical properties of their target workloads — can yield significant performance gains beyond what distribution-agnostic methods achieve. As LLM inference workloads continue to evolve with longer contexts and more complex agentic behaviors, we expect this principle to find broader application across the inference stack.
+This work demonstrates that **data-aware algorithm design** — tailoring GPU kernels to the statistical properties of their target workloads — can yield meaningful gains beyond what distribution-agnostic methods achieve. We welcome contributions from the community to extend this approach, whether through new prediction strategies, cross-model validation, or next-generation architecture support. TensorRT-LLM is open source — join us in building a faster GPU inference ecosystem for the agentic era.
