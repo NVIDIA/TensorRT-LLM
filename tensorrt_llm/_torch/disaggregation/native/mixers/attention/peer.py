@@ -253,11 +253,11 @@ class HeadMismatchMapper(RegionMapperBase):
         # handles head duplication (total_kv_heads < tp_per_dp) correctly.
         if self_tp_per_dp < peer_tp_per_dp:
             total_unique = self_kv_heads * self_tp_per_dp
-            src_head_idx = (peer_tp_rank * total_unique) // peer_tp_per_dp
+            src_head_idx = (peer_tp_rank * total_unique) // peer_tp_per_dp % self_kv_heads
             return src_head_idx * bytes_per_head, 0
         else:
             total_unique = peer_kv_heads * peer_tp_per_dp
-            dst_head_idx = (self_tp_rank * total_unique) // self_tp_per_dp
+            dst_head_idx = (self_tp_rank * total_unique) // self_tp_per_dp % peer_kv_heads
             return 0, dst_head_idx * bytes_per_head
 
     @staticmethod
