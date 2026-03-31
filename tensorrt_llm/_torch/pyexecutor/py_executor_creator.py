@@ -392,7 +392,7 @@ def create_py_executor(
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
 
-    if llm_args.simulation_mode:
+    if llm_args.sim_config is not None:
         return _create_sim_py_executor(llm_args, checkpoint_dir,
                                        checkpoint_loader)
 
