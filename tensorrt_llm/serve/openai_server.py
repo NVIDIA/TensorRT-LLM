@@ -402,8 +402,8 @@ class OpenAIServer:
             import torch
             if torch.cuda.is_available():
                 model_config["gpu_type"] = torch.cuda.get_device_name(0)
-        except Exception:
-            pass
+        except (ImportError, RuntimeError) as e:
+            logger.debug("Could not detect GPU type for config metrics: %s", e)
 
         # Parallel config
         tp_size = getattr(args, "tensor_parallel_size", 1) or 1
