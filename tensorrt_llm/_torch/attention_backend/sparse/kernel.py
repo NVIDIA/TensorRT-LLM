@@ -1799,12 +1799,12 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-    # shapes (compile-time where possible)
-    max_num_blocks_per_req: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    BLOCK_N: tl.constexpr,  # tile width along columns # strides (in elements)
-    stride_factor: tl.constexpr,  # for strided memory layout adjustment
-    layer_id: tl.constexpr,  # for layer interleaving layout
+    # shapes
+    max_num_blocks_per_req,
+    BLOCK_SIZE,
+    BLOCK_N: tl.constexpr,  # tile width along columns (used in tl.arange)
+    stride_factor,  # for strided memory layout adjustment
+    layer_id,  # for layer interleaving layout
     bt_stride0,
     bt_stride1,
     ti_stride0,
@@ -1890,13 +1890,6 @@ def triton_convert_req_index_to_global_index(
     """
     if stride_factor is None:
         stride_factor = BLOCK_SIZE
-    assert req_id.dtype == torch.int32
-    assert block_table.dtype == torch.int32
-    assert token_indices.dtype == torch.int32
-    assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by" \
-        f"BLOCK_N ({BLOCK_N})"
 
     num_tokens = req_id.shape[0]
     num_requests, max_num_blocks_per_req = block_table.shape

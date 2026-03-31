@@ -325,14 +325,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # reused across all layers to avoid redundant Python/CUDA overhead.
         # Initialized here as plain instance attributes (not class-level
         # annotations) to stay invisible to dataclass/torch.compile introspection.
+        self._pool_cache_valid = False
+        self._cached_kv_mgr_id = 0
         self._cached_pool_view = None
         self._cached_stride_factor = 0
         self._cached_tokens_per_block = 0
-        self._cached_pool_data_ptr = 0
-        self._cached_num_contexts = -1
-        self._cached_num_seqs = -1
-        self._cached_num_ctx_tokens = -1
-        self._cached_num_tokens = -1
         self._cached_block_table_ctx = None
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
@@ -579,18 +576,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         Must be called at the start of each forward step (in prepare()) so that
         _ensure_pool_view_cached() recomputes them for the new batch.
         """
-        self._cached_pool_view = None
-        self._cached_stride_factor = 0
-        self._cached_tokens_per_block = 0
-        self._cached_pool_data_ptr = 0
-        self._cached_num_contexts = -1
-        self._cached_num_seqs = -1
-        self._cached_num_ctx_tokens = -1
-        self._cached_num_tokens = -1
-        self._cached_block_table_ctx = None
-        self._cached_block_table_gen = None
-        self._cached_req_idx_ctx = None
-        self._cached_req_idx_gen = None
+        self._pool_cache_valid = False
 
     def _ensure_pool_view_cached(self):
         """Compute and cache values used by
@@ -601,21 +587,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         and batch dimensions within a forward pass. Caching them avoids
         redundant Python/CUDA overhead per layer.
 
-        The cache is invalidated when any of these change:
-        - The KV pool (main model and MTP draft model use different pools)
-        - num_contexts / num_seqs (block_table slice boundaries)
-        - num_ctx_tokens / num_tokens (req_idx slice boundaries)
+        Safety: _invalidate_pool_view_cache() is called unconditionally at the
+        start of every step (prepare() and on_update_kv_lens()), so the boolean
+        flag is always cleared before the first per-layer call within a step.
         """
-        pool = self.kv_cache_manager.get_unique_primary_pool()
-        pool_ptr = pool.data_ptr()
-        if (self._cached_pool_view is not None
-                and self._cached_pool_data_ptr == pool_ptr
-                and self._cached_num_contexts == self.num_contexts
-                and self._cached_num_seqs == self.num_seqs
-                and self._cached_num_ctx_tokens == self.num_ctx_tokens
-                and self._cached_num_tokens == self.num_tokens):
+        if self._pool_cache_valid and self._cached_kv_mgr_id == id(
+                self.kv_cache_manager):
             return
 
+        pool = self.kv_cache_manager.get_unique_primary_pool()
         kv_cache_manager = self.kv_cache_manager
         num_blocks, num_layers, _, _ = pool.shape
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
@@ -623,11 +603,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
         self._cached_stride_factor = (num_layers *
                                       self._cached_tokens_per_block)
-        self._cached_pool_data_ptr = pool_ptr
-        self._cached_num_contexts = self.num_contexts
-        self._cached_num_seqs = self.num_seqs
-        self._cached_num_ctx_tokens = self.num_ctx_tokens
-        self._cached_num_tokens = self.num_tokens
         self._cached_block_table_ctx = self.block_table[:self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts:self.
                                                         num_seqs]
@@ -635,6 +610,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_req_idx_gen = (
             self.req_idx_per_token[self.num_ctx_tokens:self.num_tokens] -
             self.num_contexts)
+        self._cached_kv_mgr_id = id(kv_cache_manager)
+        self._pool_cache_valid = True
 
     @maybe_compile(dynamic=True)
     def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens, device):
