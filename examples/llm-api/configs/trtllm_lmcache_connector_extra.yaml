@@ -1,0 +1,25 @@
+# Extra LLM API options for trtllm-serve with the LMCache KV connector.
+#
+# Prerequisites:
+#   - lmcache installed: pip install lmcache
+#   - PyTorch backend (LMCache connector is wired through the PyTorch executor)
+#
+# Example:
+#   export PYTHONHASHSEED=0
+#   export LMCACHE_CPU_SIZE_GB=10   # adjust to available RAM (default 20)
+#   trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
+#     --trust_remote_code \
+#     --extra_llm_api_options /path/to/this/file
+#
+# See also: examples/llm-api/benchmark_trtllm_lmcache_long_doc_qa.sh
+
+kv_cache_config:
+  enable_block_reuse: true
+  max_tokens: 150000
+
+kv_connector_config:
+  connector_module: lmcache.integration.tensorrt_llm.tensorrt_adapter
+  connector_scheduler_class: LMCacheKvConnectorScheduler
+  connector_worker_class: LMCacheKvConnectorWorker
+
+cuda_graph_config: null
