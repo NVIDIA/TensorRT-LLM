@@ -2031,6 +2031,21 @@ class Qwen3_5MoeModel(nn.Module):
         has_images = pixel_values is not None and image_grid_thw is not None
         has_videos = pixel_values_videos is not None and video_grid_thw is not None
 
+        # Fast path for text-only AD runtime: skip all multimodal/mRoPE overhead.
+        # When position_ids is provided and there are no images/videos, just expand
+        # to 3D and call the language model directly — matching the original behavior.
+        if position_ids is not None and not has_images and not has_videos:
+            if position_ids.ndim == 1 or (position_ids.ndim == 2 and position_ids.shape[0] == 1):
+                position_ids_3d = position_ids.reshape(1, 1, -1).expand(3, 1, -1)
+            elif position_ids.ndim == 2:
+                position_ids_3d = position_ids[None].expand(3, -1, -1)
+            else:
+                position_ids_3d = position_ids
+            return self.language_model(
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids_3d,
+            )
+
         image_embeds_list = None
         if has_images:
             image_embeds_list = [
