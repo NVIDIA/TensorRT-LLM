@@ -112,7 +112,7 @@ Still on old path (standalone, with embedded communication):
 
 Communication strategies are auto-selected at runtime by `CommunicationFactory` based on hardware and configuration. See `communication_factory.py` for selection logic and `base.py` for the `Communication` ABC.
 
-### Tests (`tests/unittest/_torch/modules/moe/`)
+### Tests
 
 | File | Tests | Status |
 |------|-------|--------|
