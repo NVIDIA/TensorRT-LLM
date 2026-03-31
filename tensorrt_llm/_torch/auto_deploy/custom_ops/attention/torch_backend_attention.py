@@ -641,11 +641,11 @@ def torch_backend_shared_kv_mha_with_cache_fake(
     logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
 ):
-    del k, v, batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen, k_cache, v_cache
+    del k, batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen, k_cache, v_cache
     del scale, sinks, sliding_window_size, logit_cap
     if out is not None:
         return out.new_empty(0)
-    return q.new_empty(*q.shape[:-1], q.shape[-1]).contiguous()
+    return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 
 @torch_backend_mha_with_cache.register_fake
