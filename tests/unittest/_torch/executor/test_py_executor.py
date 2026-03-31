@@ -186,12 +186,16 @@ def test_getter_methods(mock_executor):
 # ---------------------------------------------------------------------------
 
 
-def _make_ctx_request(num_tokens, estimated_reusable_tokens=0, is_first_context_chunk=True):
+def _make_ctx_request(
+    num_tokens, estimated_reusable_tokens=0, is_first_context_chunk=True, context_current_position=0
+):
     """Helper to create a mock context request."""
     req = Mock()
     req.get_tokens = Mock(return_value=list(range(num_tokens)))
     req.estimated_reusable_tokens = estimated_reusable_tokens
     req.is_first_context_chunk = is_first_context_chunk
+    req.context_current_position = context_current_position
+    req.context_chunk_size = num_tokens
     return req
 
 
