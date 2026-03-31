@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import pytest
@@ -176,3 +177,55 @@ async def test_async_llm_reset_prefix_cache():
             f"Expected 0 reused blocks after reset_prefix_cache, "
             f"got {m3.kv_cache_metrics.num_reused_blocks}"
         )
+
+
+@pytest.mark.ray
+@pytest.mark.asyncio
+async def test_async_llm_pause_resume():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    prompt = "The future of AI is"
+    sampling_params = SamplingParams(temperature=0, max_tokens=10)
+
+    async with AsyncLLM(
+        model=llama_model_path,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        cuda_graph_config=None,
+    ) as llm:
+        baseline = (await llm.generate_async(prompt, sampling_params)).outputs[0].text
+        assert baseline
+
+        for _ in range(2):
+            await llm.pause_generation()
+            assert llm._paused
+            with pytest.raises(RuntimeError, match="paused"):
+                llm.generate_async(prompt, sampling_params)
+
+            await llm.resume_generation()
+            assert not llm._paused
+            out = await llm.generate_async(prompt, sampling_params)
+            assert out.outputs[0].text == baseline
+
+
+@pytest.mark.ray
+@pytest.mark.asyncio
+async def test_async_llm_pause_aborts_inflight():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    prompt = "The future of AI is"
+    inflight_params = SamplingParams(temperature=0, max_tokens=512)
+    normal_params = SamplingParams(temperature=0, max_tokens=10)
+
+    async with AsyncLLM(
+        model=llama_model_path,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        cuda_graph_config=None,
+    ) as llm:
+        inflight = llm.generate_async(prompt, inflight_params)
+
+        await llm.pause_generation()
+
+        result = await asyncio.wait_for(inflight, timeout=30.0)
+        assert result.aborted
+
+        await llm.resume_generation()
+        out = await llm.generate_async(prompt, normal_params)
+        assert out.outputs[0].text
