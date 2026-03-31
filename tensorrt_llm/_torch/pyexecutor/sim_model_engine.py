@@ -93,12 +93,24 @@ class SimModelEngine:
         total_tokens = num_ctx_tokens + num_gen_tokens
 
         if self.time_predictor is not None:
-            from .sim_predictor import SimBatch
+            from .sim_predictor import SimBatch, SimBatchRequest
+
+            requests = []
+            for r in scheduled_requests.context_requests:
+                requests.append(SimBatchRequest(
+                    input_length=r.context_chunk_size,
+                    past_kv_length=r.get_num_tokens(0) - r.context_chunk_size))
+            for r in scheduled_requests.generation_requests:
+                requests.append(SimBatchRequest(
+                    input_length=1,
+                    past_kv_length=r.get_num_tokens(0) - 1))
+
             batch = SimBatch(
                 num_context_requests=num_ctx_requests,
                 num_context_tokens=num_ctx_tokens,
                 num_generation_requests=num_gen_tokens,
-                num_generation_tokens=num_gen_tokens)
+                num_generation_tokens=num_gen_tokens,
+                requests=requests)
             predicted_time = self.time_predictor.predict(batch)
             if predicted_time > 0:
                 time.sleep(predicted_time)

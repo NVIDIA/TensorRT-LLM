@@ -273,12 +273,25 @@ def _create_sim_py_executor(
     tokens_per_block = kv_cache_config.tokens_per_block
 
     # Sim engine and sampler — no model weights loaded
-    from .sim_predictor import ConstantPredictor
-
     sim_config = llm_args.sim_config
-    predictor = ConstantPredictor(
-        prefill_time_ms=sim_config.predictor.constant_prefill_time_ms,
-        decode_time_ms=sim_config.predictor.constant_decode_time_ms)
+    pc = sim_config.predictor
+    if pc.name == "constant":
+        from .sim_predictor import ConstantPredictor
+        predictor = ConstantPredictor(
+            prefill_time_ms=pc.constant_prefill_time_ms,
+            decode_time_ms=pc.constant_decode_time_ms)
+    elif pc.name == "aiconfigurator":
+        from .sim_predictor_aic import AIConfiguratorPredictor
+        predictor = AIConfiguratorPredictor(
+            model_path=checkpoint_dir,
+            device_name=pc.device_name,
+            backend_version=pc.backend_version,
+            database_path=pc.database_path,
+            tp_size=mapping.tp_size,
+            prefill_scale_factor=pc.prefill_scale_factor,
+            decode_scale_factor=pc.decode_scale_factor)
+    else:
+        raise ValueError(f"Unknown predictor name: {pc.name}")
 
     model_engine = SimModelEngine(llm_args, vocab_size, max_num_sequences,
                                    time_predictor=predictor)
