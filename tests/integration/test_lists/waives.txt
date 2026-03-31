@@ -242,7 +242,6 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-cutlass-auto] SK
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5800646)
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5748664)
 examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch[llama-3.2-1b-instruct] SKIP (https://nvbugs/5838178)
-accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[bf16-4-attn_dp_off-trtllm] SKIP (http://nvbugs/5919796)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (https://nvbugs/5838199)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-cutlass-auto] SKIP (https://nvbugs/5838211)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutlass-auto] SKIP (https://nvbugs/5838211)
@@ -387,3 +386,5 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughp
 unittest/disaggregated/test_py_cache_transceiver_mp.py::test_v2_transceiver_mp[ctx_first-v2_mp_tp2_pp1_to_tp2_pp1] SKIP (https://nvbugs/6018051)
 test_fmha.py::test_fmha SKIP (https://nvbugs/6018058)
 accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype SKIP (https://nvbugs/6027560)
+accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_nixl_backend SKIP (https://nvbugs/6027560)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/6029882)
