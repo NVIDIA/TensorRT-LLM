@@ -26,6 +26,33 @@ if ENABLE_MULTI_DEVICE:
 
 T = TypeVar("T")
 
+# Environment variable to redirect MPI worker stdout/stderr to a log file.
+# When set, MPI worker processes (Rank 1..N) redirect their stdout and stderr
+# to the specified file path in append mode.
+TLLM_WORKER_LOG_FILE_ENV = "TLLM_WORKER_LOG_FILE"
+
+
+def redirect_output_to_file(log_file_path: str):
+    """Redirect stdout and stderr to a log file at OS file descriptor level.
+
+    Uses os.dup2 for fd-level redirection so that output from C/C++ libraries
+    (CUDA, NCCL, etc.) is also captured.  Append mode and line-buffered Python
+    streams keep concurrent writers from clobbering each other.
+    """
+    fd = os.open(log_file_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(fd, 1)  # stdout
+    os.dup2(fd, 2)  # stderr
+    os.close(fd)
+    sys.stdout = open(1, 'w', buffering=1, closefd=False)
+    sys.stderr = open(2, 'w', buffering=1, closefd=False)
+
+
+def _mpi_worker_log_initializer():
+    """MPIPoolExecutor initializer: redirect output if TLLM_WORKER_LOG_FILE is set."""
+    log_file = os.environ.get(TLLM_WORKER_LOG_FILE_ENV)
+    if log_file:
+        redirect_output_to_file(log_file)
+
 
 class MPINodeState:
     ''' MPINodeState acts as a central global state shares between tasks on MPI node.
@@ -175,9 +202,11 @@ class MpiPoolSession(MpiSession):
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
+        initializer = _mpi_worker_log_initializer if TLLM_WORKER_LOG_FILE_ENV in env else None
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
-                                        env=env)
+                                        env=env,
+                                        initializer=initializer)
 
     def __del__(self):
         self.shutdown_abort()
