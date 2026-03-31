@@ -1346,6 +1346,7 @@ def create_py_executor_instance(
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
+
     return PyExecutor(
         resource_manager,
         scheduler,
