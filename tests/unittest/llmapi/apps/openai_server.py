@@ -79,13 +79,51 @@ class RemoteOpenAIServer:
     def __exit__(self, exc_type, exc_value, traceback):
         self.terminate()
 
+    def _dump_stacks(self, pid: int):
+        """Dump stack traces of a hanging process for debugging."""
+        try:
+            # Try pystack first (best for Python processes)
+            result = subprocess.run(
+                ["pystack", "remote", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                print(f"=== pystack for PID {pid} ===")
+                print(result.stdout)
+                return
+            else:
+                print(
+                    f"pystack failed (rc={result.returncode}): {result.stderr}")
+        except FileNotFoundError:
+            print("pystack not found, falling back to /proc stacks")
+        except subprocess.TimeoutExpired:
+            print("pystack timed out")
+
+        # Fallback: kernel-level stacks via /proc
+        try:
+            for task_dir in os.listdir(f"/proc/{pid}/task"):
+                stack_path = f"/proc/{pid}/task/{task_dir}/stack"
+                if os.path.exists(stack_path):
+                    with open(stack_path) as f:
+                        stack = f.read().strip()
+                    if stack:
+                        print(f"=== /proc stack for TID {task_dir} ===")
+                        print(stack)
+        except Exception as e:
+            print(f"Failed to read /proc stacks: {e}")
+
     def terminate(self):
         if self.proc is None:
             return
         self.proc.terminate()
         try:
             self.proc.wait(timeout=30)
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired:
+            print(f"[teardown] SIGTERM timed out for PID {self.proc.pid}, "
+                  "dumping stacks before SIGKILL...")
+            self._dump_stacks(self.proc.pid)
             self.proc.kill()
             self.proc.wait(timeout=30)
         try:
