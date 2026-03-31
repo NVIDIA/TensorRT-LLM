@@ -752,10 +752,16 @@ template <typename T, typename IdxT = int>
 cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M, int topK, T* outputValues,
     IdxT* outputIndices, cudaStream_t stream = 0, int thresholdPos = -1)
 {
+    static_assert(sizeof(IdxT) == sizeof(int), "launchHeuristicTopK only supports 32-bit indices");
+
+    if (topK != TOP_K)
+        return cudaErrorInvalidValue;
+
     size_t smemSize = sizeof(KernelSmem);
 
-    static bool configured = false;
-    if (!configured)
+    // Opt-in to extended shared memory. cudaFuncSetAttribute is device-scoped
+    // and cheap — call unconditionally to be safe across multi-GPU processes.
+    if (smemSize > 48u * 1024u)
     {
         int device;
         cudaGetDevice(&device);
@@ -763,15 +769,12 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
         cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
         if (smemSize > static_cast<size_t>(maxSmem))
             return cudaErrorInvalidConfiguration;
-        if (smemSize > 48u * 1024u)
-            cudaFuncSetAttribute(
-                heuristicTopKKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
-        configured = true;
+        cudaFuncSetAttribute(
+            heuristicTopKKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
     }
 
-    heuristicTopKKernel<<<1, BLOCK_SIZE, smemSize, stream>>>(reinterpret_cast<float const*>(input), N,
-        reinterpret_cast<int const*>(preIdx), M, topK, reinterpret_cast<float*>(outputValues),
-        reinterpret_cast<int*>(outputIndices), thresholdPos);
+    heuristicTopKKernel<<<1, BLOCK_SIZE, smemSize, stream>>>(
+        input, N, preIdx, M, topK, outputValues, outputIndices, thresholdPos);
 
     return cudaGetLastError();
 }
