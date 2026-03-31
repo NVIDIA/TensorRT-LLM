@@ -508,7 +508,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    top_logprobs: List[ChatCompletionLogProb] = None
+    top_logprobs: Optional[List[ChatCompletionLogProb]] = None
 
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):

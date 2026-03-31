@@ -52,7 +52,9 @@ def _layer_norm_fwd_1pass_kernel(
     X += row * stride_x_row + group * N
     Y += row * stride_y_row + group * N
     if HAS_Z:
-        Z += row * stride_z_row + group * N
+        # Cast to int64 to avoid overflow: row * stride_z_row can exceed INT32_MAX
+        # when Z is a non-contiguous slice (e.g., 131071 * 22656 = 2,969,544,576)
+        Z += tl.cast(row, tl.int64) * stride_z_row + group * N
     if not IS_RMS_NORM:
         Mean += group * M
     Rstd += group * M

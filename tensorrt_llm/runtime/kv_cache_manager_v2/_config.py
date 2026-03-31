@@ -18,7 +18,7 @@
 # As the ratio between KV data size and KV block scale size is fixed, we can simply use a pool with
 # smaller block size and the same number of blocks for block scale.
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import ClassVar, NewType, Protocol
 
@@ -132,10 +132,33 @@ class SsmLayerConfig:
     buffers: list[BufferConfig]
 
     def __post_init__(self) -> None:
+        assert len(set(buffer.role for buffer in self.buffers)) == len(self.buffers), (
+            "duplicate buffer role"
+        )
         assert all(buf.tokens_per_block_override is None for buf in self.buffers)
 
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
+
+
+@dataclass(slots=True, frozen=True)
+class KVCacheDesc:
+    capacity: int
+    history_length: int
+
+    def __post_init__(self) -> None:
+        assert 0 <= self.history_length <= self.capacity
+
+
+# A batch of requests, working as a use case the KVCacheManager must always support.
+@dataclass(slots=True, frozen=True)
+class BatchDesc:
+    kv_caches: list[KVCacheDesc]
+    # Tokens shared by all requests. Set to 0 if no kv cache reuse.
+    system_prompt_length: int = 0
+
+    def __post_init__(self) -> None:
+        assert self.system_prompt_length >= 0
 
 
 @dataclass(slots=True)
@@ -170,6 +193,17 @@ class KVCacheManagerConfig:
     enable_partial_reuse: bool = True
     """
     If True, we will try to reuse tokens from partially matched blocks.
+    """
+
+    constraints: list[BatchDesc] = field(default_factory=list)
+    """
+    A list of step configurations that must always be supported.
+    """
+
+    typical_step: BatchDesc | None = None
+    """
+    A typical step configuration used to decide initial memory partitioning between
+    layer groups.
     """
 
     # unsupported yet

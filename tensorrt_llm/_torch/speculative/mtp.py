@@ -816,7 +816,8 @@ class MTPWorker(SpecWorkerBase):
 
             # Apply force override for relaxed acceptance path
             num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts)
+                num_accepted_tokens, num_contexts,
+                spec_metadata.runtime_draft_len)
 
         # Strict acceptance
         else:
@@ -832,7 +833,8 @@ class MTPWorker(SpecWorkerBase):
 
                 # Apply force override for THOP path
                 num_accepted_tokens = self._apply_force_accepted_tokens(
-                    num_accepted_tokens, num_contexts)
+                    num_accepted_tokens, num_contexts,
+                    spec_metadata.runtime_draft_len)
             else:
                 # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
@@ -876,6 +878,7 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                 mtp_num_modules + 1 -
                 num_accepted_tokens[num_contexts:batch_size])
+            attn_metadata.on_update_kv_lens()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):
@@ -1140,6 +1143,7 @@ class MTPEagleWorker(MTPWorker):
         draft_model,
         resource_manager=None,
     ):
+
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts

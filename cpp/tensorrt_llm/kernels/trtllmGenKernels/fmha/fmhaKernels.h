@@ -767,7 +767,7 @@ private:
         }
 
         // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-        if (mDtypeQ != mDtypeKv || mDtypeOut == DATA_TYPE_E2M1)
+        if (mDtypeQ != mDtypeKv)
         {
             tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
             kernelType = FmhaKernelType::SwapsMmaAbForGeneration;

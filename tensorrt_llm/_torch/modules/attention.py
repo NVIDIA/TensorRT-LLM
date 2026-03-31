@@ -937,11 +937,17 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    mla_layer.forward_impl(position_ids,
-                           hidden_states,
-                           metadata,
-                           output=output,
-                           latent_cache_gen=latent_cache_gen)
+    if mla_layer.is_dsa:
+        mla_layer.forward_impl_with_dsa(position_ids,
+                                        hidden_states,
+                                        metadata,
+                                        output=output)
+    else:
+        mla_layer.forward_impl(position_ids,
+                               hidden_states,
+                               metadata,
+                               output=output,
+                               latent_cache_gen=latent_cache_gen)
 
 
 def fp8_block_scaling_bmm_out(
@@ -1595,11 +1601,8 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        q, compressed_kv, k_pe, indexer_k = self.kv_a_proj_with_mqa(
-            hidden_states).split([
-                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
-                self.indexer.head_dim
-            ], -1)
+        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
 
         # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
@@ -1629,13 +1632,11 @@ class MLA(nn.Module):
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
         else:
-            # Indexer
             topk_indices = self.indexer(
                 qr,
                 hidden_states,
                 attn_metadata,
                 position_ids,
-                indexer_k=indexer_k,  # indexer K proj
             )
 
         assert q.shape[
@@ -2597,16 +2598,15 @@ class MLA(nn.Module):
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
-        if self.is_dsa:
+        if self.register_to_config:
+            torch.ops.trtllm.mla_custom_op_inplace(
+                hidden_states, position_ids, self.layer_idx_str, attn_output,
+                None if self.is_dsa else latent_cache_gen)
+        elif self.is_dsa:
             self.forward_impl_with_dsa(position_ids,
                                        hidden_states,
                                        attn_metadata,
                                        output=attn_output)
-        elif self.register_to_config:
-            torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
-                                                   self.layer_idx_str,
-                                                   attn_output,
-                                                   latent_cache_gen)
         else:
             self.forward_impl(position_ids,
                               hidden_states,

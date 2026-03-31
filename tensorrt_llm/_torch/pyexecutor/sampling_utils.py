@@ -135,7 +135,7 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
 
 
 def top_k_sampling_batch(
-    logits,
+    logits: torch.Tensor,
     *,
     top_k: int,
     temperature: float,
@@ -260,7 +260,7 @@ def top_k_top_p_sampling_batch(
 
 
 def greedy_search_sampling_batch(
-    logits,
+    logits: torch.Tensor,
     *,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -476,33 +476,35 @@ def sample(
     group_metadata: StrategyMetadata | None = None,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+    softmax: torch.Tensor | None
+    # 'cast' needed b/c of https://github.com/python/mypy/issues/19081
     match strategy:
         case ("top_k", top_k, temperature):
             tokens, softmax = top_k_sampling_batch(
                 logits,
-                top_k=top_k,
-                temperature=temperature,
+                top_k=cast(int, top_k),
+                temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("top_p", top_p, temperature):
             tokens, softmax = top_p_sampling_batch(
                 logits,
-                top_p=top_p,
+                top_p=cast(float, top_p),
                 generator=generator,
-                temperature=temperature,
+                temperature=cast(float, temperature),
             )
         case ("top_k_top_p", top_k, top_p, temperature):
             tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
+                top_k=cast(int, top_k),
+                top_p=cast(float, top_p),
+                temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("temperature", temperature):
             tokens, softmax = temperature_sampling_batch(
                 logits,
-                temperature=temperature,
+                temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("greedy", None):
@@ -514,13 +516,13 @@ def sample(
             )
             tokens, softmax = beam_search_sampling_batch(
                 logits,
-                beam_width_in=beam_width_in,
-                beam_width_out=beam_width_out,
+                beam_width_in=cast(int, beam_width_in),
+                beam_width_out=cast(int, beam_width_out),
                 beam_search_args=group_metadata,
-                temperature=temperature,
+                temperature=cast(float, temperature),
                 return_probs=return_probs,
             )
-    return tokens, softmax, temperature
+    return tokens, softmax, cast(float, temperature)
 
 
 GenericStrategyKeyType = TypeVar("GenericStrategyKeyType", bound=Hashable)

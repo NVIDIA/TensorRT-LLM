@@ -175,8 +175,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     }
     def nodeLabelPrefix = "cpu"
     def jobName = "llm-build-images"
-    def buildID = env.BUILD_ID
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
+    def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix, jobName)
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",

@@ -1304,6 +1304,7 @@ class TestPydanticBestPractices:
             "draft_checkpoint_loader",  # typed as object due to circular import
             "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
             "model_kwargs",  # typed as Dict[str, Any] for flexibility
+            "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)
             "tokenizer_kwargs",  # typed as Dict[str, Any] for flexibility
         ],
         UserProvidedDecodingConfig: [

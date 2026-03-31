@@ -60,14 +60,14 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
-from .resource_manager import (ResourceManager, ResourceManagerType,
-                               request_context)
+from .resource_manager import (KVCacheManagerV2, ResourceManager,
+                               ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, DefaultADPRouter
+from .scheduler.adp_router import ADPRouter
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -76,6 +76,11 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+
+# Environment variable to control which ranks print step logging.
+# Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
+# Default: "0" (only rank 0 prints, matching existing behavior).
+PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
 
 class PPCommTag(IntEnum):
@@ -280,8 +285,7 @@ class PyExecutor:
             virtual_memory_pools: Optional[dict] = None,
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
-            adp_router: Optional[ADPRouter] = None):
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -308,7 +312,6 @@ class PyExecutor:
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
-        self.adp_router: ADPRouter = (adp_router or DefaultADPRouter(dist=dist))
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
@@ -369,11 +372,24 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        # V2 scheduler calls suspend_request() during scheduling, which
+        # offloads GPU pages while preserving the radix tree.  The executor
+        # does not need to call _terminate_requests (GPU resources are already
+        # freed by suspend) or _pause_requests (V2's prepare_context handles
+        # resume internally, so resetting to CONTEXT_INIT is unnecessary).
+        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
+                                                        KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
+
+        self.adp_router: ADPRouter = ADPRouter.create(
+            dist=self.dist,
+            kv_cache_manager=self.kv_cache_manager,
+            attention_dp_config=self.llm_args.attention_dp_config,
+        )
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -561,6 +577,8 @@ class PyExecutor:
                         self.kv_connector_manager.layer_pre_hook)
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
+
+            self.kv_connector_manager.wait_for_initialization()
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.async_transfer_manager.end_transfer(request):
@@ -835,6 +853,14 @@ class PyExecutor:
                                                     record_shapes=True,
                                                     with_modules=True)
 
+        log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
+        if log_ranks_str.strip().lower() == "all":
+            log_all_ranks = True
+            log_ranks = set()
+        else:
+            log_all_ranks = False
+            log_ranks = {int(r) for r in log_ranks_str.split(",")}
+
         calibrator = get_calibrator()
 
         def profile_step():
@@ -851,7 +877,8 @@ class PyExecutor:
                 calibrator.stop()
                 enabled = False
 
-            if start_time is not None and self.print_log and self.dist.rank == 0:
+            if start_time is not None and self.print_log and (
+                    log_all_ranks or self.dist.rank in log_ranks):
                 end_time = time.time()
                 if it % 2 == 0:
                     end_event_1.record()
@@ -1310,6 +1337,8 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     # The generation requests that do not have batch_idx
@@ -1533,7 +1562,7 @@ class PyExecutor:
         tag = PPCommTag.SAMPLE_STATE
         microbatch_id = executed_batch.microbatch_id
         sample_state = executed_batch.sample_state
-        requests = sample_state.scheduled_requests.all_requests()
+        requests = sample_state.requests
 
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
@@ -1568,13 +1597,9 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                scheduled_requests = executed_batch.scheduled_requests
-                sampling_requests = ScheduledRequests()
-                sampling_requests.context_requests_last_chunk = scheduled_requests.context_requests_last_chunk
-                sampling_requests.generation_requests = scheduled_requests.generation_requests
-                executed_batch.sample_state.scheduled_requests = sampling_requests
                 self._update_requests(executed_batch.sample_state)
 
+                scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -1611,6 +1636,55 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    def _handle_dynamic_draft_len(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
+        """Handle dynamic draft length for the current batch.
+
+        Must be called BEFORE prepare_resources so that KV cache allocation
+        uses the correct draft length.
+
+        Two things happen here:
+        1. Determine the runtime draft length from the draft_len_schedule
+           based on the current batch size, and store it on model_engine so
+           that the rest of the forward path can read it.
+        2. Pad / truncate each request's py_draft_tokens to exactly match
+           the determined draft length, ensuring uniform draft token counts across the
+           batch (required by CUDA graph replay and the attention kernel).
+
+        When dynamic draft length is not enabled, runtime_draft_len is simply
+        set to max_draft_len (the static maximum).
+        """
+        if not hasattr(self.model_engine, 'max_draft_len'):
+            return
+
+        if (self.model_engine.spec_config is not None
+                and self.model_engine.spec_config.draft_len_schedule is not None
+                and self.model_engine.spec_config.spec_dec_mode.
+                support_dynamic_draft_len()):
+            from tensorrt_llm._torch.speculative.utils import \
+                get_draft_len_for_batch_size
+
+            # 1. Resolve runtime draft length from schedule
+            runtime_draft_len = get_draft_len_for_batch_size(
+                self.model_engine.spec_config.draft_len_schedule,
+                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+
+            # 2. Pad or truncate draft tokens to the resolved length
+            PADDING_TOKEN = 0
+            for request in scheduled_batch.generation_requests:
+                current_draft_len = len(request.py_draft_tokens)
+                if current_draft_len < runtime_draft_len:
+                    padding_needed = runtime_draft_len - current_draft_len
+                    request.py_draft_tokens.extend([PADDING_TOKEN] *
+                                                   padding_needed)
+                elif current_draft_len > runtime_draft_len:
+                    request.py_draft_tokens = request.py_draft_tokens[:
+                                                                      runtime_draft_len]
+
+            self.model_engine.runtime_draft_len = runtime_draft_len
+        else:
+            self.model_engine.runtime_draft_len = self.model_engine.max_draft_len
 
     def _can_queue(self, scheduled_batch):
 
@@ -1729,6 +1803,36 @@ class PyExecutor:
                 )
                 self._check_disagg_ctx_cache_transfer_status(1)
 
+            # In gen-only benchmark mode, all requests must fit in KV cache
+            # simultaneously. If some requests are stuck in INIT state and the
+            # scheduler could not allocate KV for any of them, the benchmark
+            # will hang forever because in-progress generation requests won't
+            # release their KV cache.
+            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
+                    and not fitting_disagg_gen_init_requests):
+                stuck_init_requests = [
+                    req for req in self.active_requests
+                    if req.is_disagg_generation_init_state
+                ]
+                # Only fail once all benchmark requests have been fetched
+                # so that _handle_errors covers every request and every
+                # client receives an error response.
+                if (stuck_init_requests and self.num_fetch_requests
+                        >= self.benchmark_req_queues_size):
+                    error_msg = (
+                        f"Insufficient KV cache for gen-only benchmark mode: "
+                        f"{len(stuck_init_requests)} request(s) are waiting for "
+                        f"KV cache allocation but the scheduler could not fit "
+                        f"any of them. Increase free_gpu_memory_fraction or "
+                        f"reduce TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                        f"{self.benchmark_req_queues_size}).")
+                    logger.error(error_msg)
+                    # Fail all active and waiting requests so every
+                    # client receives an error instead of hanging.
+                    self._handle_errors(error_msg,
+                                        requests=self.active_requests)
+                    return None, None
+
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
@@ -1775,8 +1879,9 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
-                self._terminate_requests(scheduled_batch.paused_requests)
-                self._pause_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
 
@@ -1789,8 +1894,15 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
@@ -2028,7 +2140,8 @@ class PyExecutor:
                         else:
                             can_forward = True
 
-                self._terminate_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -2054,8 +2167,14 @@ class PyExecutor:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
 
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
@@ -2137,7 +2256,8 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                self._pause_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
                     guided_decoder_failed_requests = None
@@ -2313,9 +2433,11 @@ class PyExecutor:
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
+        sampling_requests = scheduled_batch.context_requests_last_chunk + scheduled_batch.generation_requests
         return self.sampler.SampleState(
-            scheduled_requests=scheduled_batch,
+            requests=sampling_requests,
             sampler_event=SamplerEvent(cuda_event=sampler_event),
+            runtime_draft_len=self.model_engine.runtime_draft_len,
         )
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:
@@ -2465,6 +2587,9 @@ class PyExecutor:
 
         # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
+            if self.adp_router.needs_prefix_matches:
+                self.adp_router.gather_prefix_matches(new_requests)
+
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
@@ -3178,7 +3303,12 @@ class PyExecutor:
             self._terminate_request(request)
 
     def _terminate_request(self, request: LlmRequest):
-        if self._disagg_pp_termination_handler is not None:
+        # Dummy requests don't participate in disagg KV cache transfers,
+        # so they must bypass the PP termination handler to avoid stale
+        # sequences in the KV cache manager (the handler delays removal,
+        # but the dummy ID is reused every iteration).
+        if (self._disagg_pp_termination_handler is not None
+                and not request.is_dummy_request):
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request)

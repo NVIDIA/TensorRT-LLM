@@ -55,7 +55,9 @@ MODEL_PATH_DICT = {
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
+    "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
+    "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -162,6 +164,8 @@ class ServerConfig:
         self.enable_attention_dp = server_config_data.get("enable_attention_dp", False)
         self.trust_remote_code = server_config_data.get("trust_remote_code", False)
         self.enable_lm_head_tp_in_adp = server_config_data.get("enable_lm_head_tp_in_adp", False)
+        self.backend = server_config_data.get("backend", "pytorch")
+        self.extra_llm_api_config_path = server_config_data.get("extra_llm_api_config_path", "")
 
         # attention_dp_config
         attention_dp_config = server_config_data.get("attention_dp_config", {})
@@ -246,6 +250,8 @@ class ServerConfig:
             "match_mode",
             "client_configs",
             "match_mode",
+            "backend",
+            "extra_llm_api_config_path",
         ]
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
@@ -268,7 +274,7 @@ class ServerConfig:
             "trtllm-serve",
             self.model_path,
             "--backend",
-            "pytorch",
+            self.backend,
             "--config",
             config_path,
         ]
@@ -290,6 +296,7 @@ class ServerConfig:
             "b_enable_chunked_prefill",
             "b_enable_attention_dp",
             "b_enable_lm_head_tp_in_adp",
+            "s_serving_backend",
             # attention_dp_config
             "b_attention_dp_balance",
             # cuda_graph_config
@@ -325,6 +332,7 @@ class ServerConfig:
             "b_enable_attention_dp": self.enable_attention_dp,
             "b_trust_remote_code": self.trust_remote_code,
             "b_enable_lm_head_tp_in_adp": self.enable_lm_head_tp_in_adp,
+            "s_serving_backend": self.backend,
             # attention_dp_config
             "b_attention_dp_balance": self.attention_dp_balance,
             "l_batching_wait_iters": self.batching_wait_iters,
@@ -362,6 +370,17 @@ class ServerConfig:
     def generate_extra_llm_api_config(self) -> str:
         """Generate extra-llm-api-config.yml content."""
         config_data = dict(self.extra_llm_api_config_data)
+
+        # Merge external AutoDeploy config if specified
+        if self.extra_llm_api_config_path:
+            config_path = self.extra_llm_api_config_path
+            if not os.path.isabs(config_path):
+                config_path = os.path.join(get_llm_root(), config_path)
+            with open(config_path, "r") as f:
+                external_config = yaml.safe_load(f) or {}
+            # Fields in extra_llm_api_config_data (from perf YAML) take precedence
+            merged = {**external_config, **config_data}
+            config_data = merged
 
         # Handle speculative_model path conversion
         if (
@@ -610,6 +629,7 @@ class DisaggTestCmds(NamedTuple):
     num_gen_servers: int
     output_dir: str
     test_output_dir: str
+    model_name: str = ""
 
     def _generate_hostname_file(self, server_idx: int, port: int):
         """Create hostname file for coordination."""
@@ -737,6 +757,19 @@ class DisaggTestCmds(NamedTuple):
         server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
         return server_logs
 
+    @staticmethod
+    def _wait_for_config_file(config_path: str, timeout: int = 600) -> None:
+        """Wait for a config file to be written by the primary (_0) worker."""
+        start_time = time.time()
+        while not os.path.exists(config_path):
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                raise RuntimeError(
+                    f"Timed out waiting for config file {config_path} after {timeout}s"
+                )
+            print_info(f"Waiting for config file {config_path}, elapsed: {elapsed:.0f}s")
+            time.sleep(1)
+
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
@@ -749,6 +782,12 @@ class DisaggTestCmds(NamedTuple):
             self._generate_hostname_file(server_idx, port)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
+
+            # Non-primary workers wait for _0 worker to write the config file
+            if self.disagg_serving_type not in ("CTX_0", "GEN_0"):
+                config_idx = server_cmd.index("--config") + 1
+                self._wait_for_config_file(server_cmd[config_idx])
+
             server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
             try:
                 print_info(
@@ -824,6 +863,22 @@ class DisaggTestCmds(NamedTuple):
                         benchmark_ctx.write(output)
                     outputs.append(output)
 
+                # Run accuracy tests after benchmark (if configured)
+                acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
+                if acc_cfg_json:
+                    import json as _json
+
+                    acc_cfg = _json.loads(acc_cfg_json)
+                    if acc_cfg.get("enable_accuracy_test"):
+                        _run_accuracy_tests(
+                            acc_cfg,
+                            self.model_name,
+                            disagg_server_hostname,
+                            disagg_server_port,
+                            self.test_output_dir,
+                            server_idx,
+                        )
+
             finally:
                 with open(benchmark_status_file, "w") as status_file:
                     status_file.write("Done")
@@ -832,6 +887,60 @@ class DisaggTestCmds(NamedTuple):
 
     def get_cmd_str(self, server_idx: int) -> List[str]:
         return ["multi-node disaggregated server tests, please check config files"]
+
+
+def _run_accuracy_tests(
+    accuracy_cfg: dict,
+    model_name: str,
+    server_hostname: str,
+    server_port: int,
+    output_dir: str,
+    server_idx: int,
+) -> None:
+    """Run lm_eval against the running disagg server. Saves results only — no validation."""
+    endpoint_map = {
+        "local-completions": "v1/completions",
+        "local-chat-completions": "v1/chat/completions",
+    }
+    env_var = accuracy_cfg.get("env_var") or {}
+    model_path = get_model_dir(model_name)
+
+    for task_name, task_cfg in accuracy_cfg.get("tasks", {}).items():
+        model_type = task_cfg.get("model", "local-completions")
+        model_args_extra = task_cfg.get("model_args_extra", "")
+        extra_kwargs = task_cfg.get("extra_kwargs", {})
+        base_url = f"http://{server_hostname}:{server_port}/{endpoint_map.get(model_type, 'v1/completions')}"
+        model_args = f"model={model_path},base_url={base_url},{model_args_extra}"
+
+        acc_output_dir = os.path.join(output_dir, f"accuracy_eval_{task_name}.{server_idx}")
+        log_file = os.path.join(output_dir, f"accuracy_eval_{task_name}.{server_idx}.log")
+        os.makedirs(acc_output_dir, exist_ok=True)
+
+        cmd = [
+            "lm_eval",
+            "--model",
+            model_type,
+            "--tasks",
+            task_name,
+            "--model_args",
+            model_args,
+            "--log_samples",
+            "--output_path",
+            acc_output_dir,
+        ]
+        if "include_path" in extra_kwargs:
+            cmd += ["--include_path", extra_kwargs["include_path"]]
+        for k, v in extra_kwargs.items():
+            if k == "include_path":
+                continue
+            cmd += [f"--{k}"] if isinstance(v, bool) and v else [f"--{k}", str(v)]
+
+        run_env = copy.deepcopy(os.environ)
+        run_env.update({k: str(v) for k, v in env_var.items()})
+        print_info(f"[Accuracy] Running {task_name}, output: {log_file}")
+        with open(log_file, "w") as lf:
+            ret = subprocess.run(cmd, env=run_env, stdout=lf, stderr=subprocess.STDOUT)
+        print_info(f"[Accuracy] {task_name} done, exit_code={ret.returncode}")
 
 
 def parse_select_pattern(select_pattern: str) -> list:
@@ -1238,7 +1347,7 @@ class PerfSanityTestConfig:
 
             # Generate ctx server command
             ctx_cmd = ctx_config.to_cmd(test_output_dir, numa_bind, "CTX")
-            if "CTX" in disagg_serving_type:
+            if disagg_serving_type == "CTX_0":
                 config_content = ctx_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
@@ -1248,7 +1357,7 @@ class PerfSanityTestConfig:
 
             # Generate gen server command
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
-            if "GEN" in disagg_serving_type:
+            if disagg_serving_type == "GEN_0":
                 config_content = gen_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
@@ -1287,6 +1396,7 @@ class PerfSanityTestConfig:
             num_gen_servers=disagg_config.num_gen_servers,
             output_dir=output_dir,
             test_output_dir=test_output_dir,
+            model_name=disagg_config.model_name,
         )
 
     def _check_benchmark_errors(self, output: str) -> None:

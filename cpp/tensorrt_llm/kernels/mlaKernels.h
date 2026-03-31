@@ -89,6 +89,10 @@ struct MlaParams
     int32_t q_pe_stride;
     MlaMetaParams meta;
     int const* block_ids_per_seq;
+    // Pre-computed FlashMLA tile-scheduler metadata and num_splits from Python.
+    // When non-null, mlaGeneration uses these directly and skips get_mla_metadata_func.
+    int const* flash_mla_tile_scheduler_metadata = nullptr;
+    int const* flash_mla_num_splits = nullptr;
     KvCacheDataType cache_type;
     // Scales for mla quantization
     float* bmm1_scale;

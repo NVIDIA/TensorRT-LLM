@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -24,6 +25,8 @@ from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any
 
+import aiohttp
+import numpy as np
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
@@ -51,6 +54,16 @@ class TestConfig:
 
     def __str__(self):
         return self.test_desc
+
+
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    """
+    if get_sm_version() < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
 
 
 def cleanup_output_files():
@@ -140,6 +153,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml",
         "gen_only_bs1":
         f"{test_configs_root}/disagg_config_gen_only_bs1.yaml",
+        "gen_only_insufficient_kv":
+        f"{test_configs_root}/disagg_config_gen_only_insufficient_kv.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "4_ranks_trt_backend":
@@ -214,6 +229,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml",
         "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml",
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse":
+        f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse.yaml",
         "deepseek_v3_lite_bf16_empty_batch":
         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml",
         "llama4_kv_cache_overflow":
@@ -230,6 +247,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
+        "llama31_8b_ucx":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
     }
 
     if test_desc not in config_map:
@@ -688,6 +707,66 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_benchmark_gen_only_insufficient_kv(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root):
+    """Test that gen-only benchmark mode raises an error when KV cache is too
+    small to hold all benchmark requests, instead of hanging forever."""
+    import openai
+
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
+
+    config_file = get_test_config("gen_only_insufficient_kv",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+    config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
+        setup_disagg_cluster(config_file,
+                             env=env,
+                             cwd=llm_venv.get_working_directory())
+
+    try:
+        client = openai.OpenAI(api_key="tensorrt_llm",
+                               base_url=f"http://localhost:{server_port}/v1")
+
+        # Send 64 concurrent requests to trigger the benchmark fill loop
+        # and the insufficient KV cache error.
+        import concurrent.futures
+
+        def send_request():
+            try:
+                stream = client.completions.create(
+                    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                    prompt="What is the capital of Germany?",
+                    max_tokens=10,
+                    temperature=0.0,
+                    stream=True)
+                # Must iterate the stream to receive SSE error chunks
+                chunks = []
+                for chunk in stream:
+                    chunks.append(chunk.choices[0].text)
+                return "".join(chunks)
+            except Exception as e:
+                return e
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+            futures = [pool.submit(send_request) for _ in range(64)]
+            results = [f.result(timeout=120) for f in futures]
+
+        errors = [r for r in results if isinstance(r, Exception)]
+        assert len(errors) > 0, \
+            "Expected at least one error due to insufficient KV cache"
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -782,9 +861,11 @@ def test_disaggregated_overlap_transceiver_runtime_python(
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
-                           env=llm_venv._new_env,
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1096,6 +1177,24 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(8)
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse",
+        env=llm_venv._new_env,
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @skip_arm
 @pytest.mark.skip_less_device(4)
@@ -1110,7 +1209,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
@@ -1131,7 +1230,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -1150,7 +1249,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_transceiver_runtime_python",
                            env=env,
@@ -1169,7 +1268,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
@@ -1413,7 +1512,7 @@ def run_disaggregated_benchmark(example_dir,
                                 cwd=None):
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -1551,7 +1650,7 @@ def run_disaggregated_aiperf(config_file,
 
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2025,7 +2124,7 @@ def run_disaggregated_cancel_test(example_dir,
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
@@ -2101,6 +2200,206 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
                                   requests_per_burst=32,
                                   model_path=deepseek_v3_model_root,
                                   cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
+                         indirect=True)
+def test_disaggregated_logprobs_serving(disaggregated_test_root,
+                                        disaggregated_example_root, llm_venv,
+                                        llama_model_root):
+    """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
+
+    Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
+    where the context worker returns prefill result (request_type=generation_only)
+    to the generation worker. Ensures LogProbStorage flows correctly across the
+    context/gen boundary without AttributeError on cum_log_probs.
+    """
+
+    async def iter_sse_chunks(resp):
+        """Yield parsed JSON chunks from an OpenAI SSE stream."""
+        async for line in resp.content:
+            decoded = line.decode("utf-8").strip()
+            if not decoded.startswith("data: "):
+                continue
+            data_str = decoded[len("data: "):]
+            if data_str == "[DONE]":
+                break
+            try:
+                yield json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+    async def collect_streaming_logprobs(resp, api_type):
+        """Parse SSE stream and return (tokens, logprobs) lists."""
+        tokens, logprobs = [], []
+        async for chunk in iter_sse_chunks(resp):
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            lp_data = choices[0].get("logprobs")
+            if not lp_data:
+                continue
+            if api_type == "completions":
+                tokens.extend(lp_data.get("tokens", []))
+                logprobs.extend(lp_data.get("token_logprobs", []))
+            else:
+                for item in lp_data.get("content", []):
+                    tokens.append(item.get("token"))
+                    logprobs.append(item.get("logprob"))
+        return tokens, logprobs
+
+    def extract_logprobs(result, api_type):
+        """Extract (tokens, logprobs) from non-streaming OpenAI response."""
+        choices = result.get("choices", [])
+        assert len(choices) > 0, "Response should have choices"
+        if api_type == "completions":
+            lp_data = choices[0].get("logprobs")
+            assert lp_data is not None, "Response should contain logprobs"
+            tokens = lp_data.get("tokens", [])
+            logprobs = lp_data.get("token_logprobs", [])
+            assert len(tokens) == len(logprobs), (
+                f"count mismatch: {len(logprobs)} logprobs "
+                f"for {len(tokens)} tokens")
+            return tokens, logprobs
+        lp_obj = choices[0].get("logprobs")
+        assert lp_obj is not None, "Response should contain logprobs"
+        content = lp_obj.get("content", [])
+        tokens = [item.get("token") for item in content]
+        logprobs = [item.get("logprob") for item in content]
+        return tokens, logprobs
+
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "llama-3.1-model/Llama-3.1-8B-Instruct")
+
+    config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = "^ib,gdr_copy"
+    ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
+    config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
+        setup_disagg_cluster(config_file, env=env,
+                             model_name=llama_model_root,
+                             cwd=llm_venv.get_working_directory(),
+                             server_start_timeout=600)
+
+    server_host = config.get("hostname", "localhost")
+    server_url = f"http://{server_host}:{server_port}"
+    model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    max_tokens = 20
+    timeout = aiohttp.ClientTimeout(total=120)
+    # Use emoji prompt to also stress-test multi-byte tokenizer handling
+    prompt = "I love coding 🚀 and AI."
+
+    async def check_logprobs():
+        async with aiohttp.ClientSession() as session:
+            for api_type in ("completions", "chat"):
+                url = (f"{server_url}/v1/completions"
+                       if api_type == "completions" else
+                       f"{server_url}/v1/chat/completions")
+
+                def make_payload(prompt, stream, _api_type=api_type):
+                    base = {
+                        "max_tokens": max_tokens,
+                        "logprobs": 1 if _api_type == "completions" else True,
+                        "stream": stream,
+                        "temperature": 0
+                    }
+                    if _api_type == "completions":
+                        return {"model": model_name, "prompt": prompt, **base}
+                    return {
+                        "model": model_name,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt
+                        }],
+                        **base
+                    }
+
+                # 1) Streaming vs non-streaming consistency check
+                async with session.post(url,
+                                        json=make_payload(prompt, False),
+                                        timeout=timeout) as resp:
+                    assert resp.status == 200, \
+                        f"[{api_type}] non-streaming: {await resp.text()}"
+                    ns_tokens, ns_logprobs = extract_logprobs(
+                        await resp.json(), api_type)
+
+                async with session.post(url,
+                                        json=make_payload(prompt, True),
+                                        timeout=timeout) as resp:
+                    assert resp.status == 200, \
+                        f"[{api_type}] streaming: {await resp.text()}"
+                    st_tokens, st_logprobs = \
+                        await collect_streaming_logprobs(resp, api_type)
+
+                assert ns_tokens == st_tokens, (
+                    f"[{api_type}] streaming vs non-streaming tokens mismatch")
+                assert len(ns_logprobs) == len(st_logprobs), (
+                    f"[{api_type}] logprobs length: "
+                    f"{len(ns_logprobs)} vs {len(st_logprobs)}")
+                # Skip position 0: the first token logprob can diverge
+                # between streaming and non-streaming in disaggregated mode
+                # due to the context/generation handoff boundary.
+                comparable = 0
+                for i, (n, s) in enumerate(
+                        zip(ns_logprobs, st_logprobs, strict=True)):
+                    if i == 0 or n is None or s is None:
+                        continue
+                    comparable += 1
+                    rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
+                                                                          1e-5)
+                    assert np.isclose(n, s, rtol=rtol, atol=atol), \
+                        f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
+                assert comparable > 0, (
+                    f"[{api_type}] no comparable post-handoff logprobs found")
+
+                # 2) Chat API with top_logprobs (requires gather_generation_logits)
+                if api_type == "chat":
+                    top_lp_payload = {
+                        "model": model_name,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt
+                        }],
+                        "max_tokens": max_tokens,
+                        "logprobs": True,
+                        "top_logprobs": 3,
+                        "stream": False,
+                        "temperature": 0,
+                    }
+                    async with session.post(f"{server_url}/v1/chat/completions",
+                                            json=top_lp_payload,
+                                            timeout=timeout) as resp:
+                        assert resp.status == 200, (
+                            f"[chat/top_logprobs] {resp.status}: "
+                            f"{await resp.text()}")
+                        result = await resp.json()
+                    lp_obj = result["choices"][0].get("logprobs")
+                    assert lp_obj is not None, "top_logprobs response should have logprobs"
+                    content = lp_obj.get("content", [])
+                    assert len(
+                        content) > 0, "top_logprobs content should be non-empty"
+                    for item in content:
+                        top_lps = item.get("top_logprobs")
+                        assert top_lps is not None and len(top_lps) > 0, (
+                            f"top_logprobs should be non-empty when requested: {item}"
+                        )
+                        for tl in top_lps:
+                            assert "token" in tl and "logprob" in tl, (
+                                f"top_logprob entry missing token/logprob: {tl}"
+                            )
+                            assert tl["logprob"] <= 0.0, (
+                                f"top_logprob {tl['logprob']} should be <= 0")
+
+    try:
+        asyncio.run(check_logprobs())
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.skip_less_device(8)

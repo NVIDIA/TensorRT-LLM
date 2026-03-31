@@ -21,7 +21,7 @@ Key differences from FLUX.1:
 import json
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -167,29 +167,32 @@ class Flux2Pipeline(BasePipeline):
         return torch.device("cuda:0")
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes (height, width, num_frames)."""
-        return [(1024, 1024, 1)]
+    def default_warmup_resolutions(self):
+        return [(1024, 1024)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [1]
+
+    def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
+        return (height, width)
 
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
         logger.info("Creating FLUX.2 transformer with quantization support...")
         self.transformer = Flux2Transformer2DModel(model_config=self.model_config)
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init."""
-        for height, width, _ in self.common_warmup_shapes:
-            logger.info(f"Warmup: FLUX.2 {height}x{width}, {warmup_steps} steps")
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    height=height,
-                    width=width,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=3.5,
-                    seed=0,
-                    max_sequence_length=512,
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=3.5,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def _detect_text_encoder_type(self, checkpoint_dir: str) -> str:
         """Detect text encoder class from model_index.json."""
@@ -331,7 +334,7 @@ class Flux2Pipeline(BasePipeline):
     @torch.inference_mode()
     def forward(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
@@ -339,21 +342,29 @@ class Flux2Pipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 512,
     ):
-        """Generate image from text prompt.
+        """Generate image(s) from text prompt(s).
 
         Args:
-            prompt: Text prompt for image generation
+            prompt: Text prompt or list of prompts for image generation.
+                When a list is provided, generates one image per prompt in a
+                single batched forward pass.
             height: Output image height (default: 1024)
             width: Output image width (default: 1024)
             num_inference_steps: Number of denoising steps
             guidance_scale: Embedded guidance scale
-            seed: Random seed for reproducibility
+            seed: Random seed for reproducibility.
             max_sequence_length: Maximum text sequence length
 
         Returns:
-            Dict with "image" key containing PIL.Image
+            MediaOutput with image tensor (B, H, W, C).
         """
         pipeline_start = time.time()
+
+        # Determine batch size
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        batch_size = len(prompt)
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Encode prompt using Mistral3 multi-layer extraction
@@ -362,8 +373,7 @@ class Flux2Pipeline(BasePipeline):
         prompt_embeds, text_ids = self._encode_prompt(prompt, max_sequence_length)
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
-        # Prepare latents
-        latents, latent_ids = self._prepare_latents(height, width, generator)
+        latents, latent_ids = self._prepare_latents(batch_size, height, width, generator)
         logger.info(f"Latents shape: {latents.shape}")
 
         # Prepare timesteps with dynamic shifting
@@ -427,19 +437,22 @@ class Flux2Pipeline(BasePipeline):
 
     def _encode_prompt(
         self,
-        prompt: str,
+        prompt: List[str],
         max_sequence_length: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode prompt using multi-layer hidden state extraction.
+        """Encode prompt(s) using multi-layer hidden state extraction.
 
         Supports both text encoder types:
         - Mistral3: system message + PixtralProcessor chat template
         - Qwen3: simple user message + Qwen2TokenizerFast chat template
 
+        Args:
+            prompt: List of prompts.
+            max_sequence_length: Maximum text sequence length.
+
         Returns:
-            Tuple of (prompt_embeds, text_ids)
+            Tuple of (prompt_embeds [B, seq, dim], text_ids [seq, 4])
         """
-        prompt = [prompt] if isinstance(prompt, str) else prompt
 
         # Tokenize (format depends on text encoder type)
         text_encoder_class = getattr(
@@ -565,19 +578,29 @@ class Flux2Pipeline(BasePipeline):
 
     def _prepare_latents(
         self,
+        batch_size: int,
         height: int,
         width: int,
         generator: torch.Generator,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Prepare random latents in FLUX.2 packed format and position IDs."""
+        """Prepare random latents in FLUX.2 packed format and position IDs.
+
+        Args:
+            batch_size: Number of images to generate.
+            height: Output image height.
+            width: Output image width.
+            generator: Random generator.
+
+        Returns:
+            Tuple of (latents [B, seq, C], latent_ids [seq, 4])
+        """
         # FLUX.2: in_channels=128, VAE scale=8, 2x2 packing
         latent_height = 2 * (height // (self.vae_scale_factor * 2))
         latent_width = 2 * (width // (self.vae_scale_factor * 2))
 
         in_channels = self.transformer.config.in_channels  # 128
+        latent_shape = (batch_size, in_channels, latent_height // 2, latent_width // 2)
 
-        # Create 4D latents then pack (matches HF for seed reproducibility)
-        latent_shape = (1, in_channels, latent_height // 2, latent_width // 2)
         latents_4d = randn_tensor(
             latent_shape, generator=generator, device=self.device, dtype=self.dtype
         )
@@ -585,7 +608,7 @@ class Flux2Pipeline(BasePipeline):
         # Pack latents: [B, C, H, W] -> [B, H*W, C]
         latents = self._pack_latents(latents_4d)
 
-        # Prepare position IDs
+        # Prepare position IDs (shared across batch)
         latent_ids = self._prepare_latent_ids(height, width)
 
         return latents, latent_ids
@@ -633,8 +656,20 @@ class Flux2Pipeline(BasePipeline):
 
         return latents
 
-    def _decode_latents(self, latents: torch.Tensor, latent_ids: torch.Tensor) -> torch.Tensor:
-        """Decode latents to image tensor."""
+    def _decode_latents(
+        self,
+        latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode latents to image tensor.
+
+        Args:
+            latents: Packed latents [B, seq, C].
+            latent_ids: Position IDs [seq, 4].
+
+        Returns:
+            Image tensor (B, H, W, C).
+        """
         # Unpack latents using position IDs
         latents = self._unpack_latents_with_ids(latents, latent_ids)
 
@@ -656,9 +691,9 @@ class Flux2Pipeline(BasePipeline):
         latents = latents.to(self.vae.dtype)
         image = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process to tensor (H, W, C) uint8
+        # Post-process to tensor uint8
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
         image = (image * 255).round().to(torch.uint8)
 
-        return image[0]  # Remove batch dimension
+        return image  # (B, H, W, C)

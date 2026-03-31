@@ -270,24 +270,39 @@ class LTX2Pipeline(BasePipeline):
         return self.model_config.torch_dtype
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes (height, width, num_frames)."""
-        return [(512, 768, 121)]
+    def default_warmup_resolutions(self):
+        return [(512, 768)]
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init."""
-        for height, width, num_frames in self.common_warmup_shapes:
-            logger.info(f"Warmup: LTX2 {height}x{width}, {num_frames} frames, {warmup_steps} steps")
-            self.forward(
-                prompt="warmup",
-                negative_prompt="",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                num_inference_steps=warmup_steps,
-                guidance_scale=4.0,
-                seed=0,
-            )
+    @property
+    def default_warmup_num_frames(self):
+        return [121]
+
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        # T2V warmup
+        self.forward(
+            prompt="warmup",
+            negative_prompt="",
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=4.0,
+            seed=42,
+        )
+        # I2V warmup — use a dummy image to compile the per-token timestep
+        # graph, preventing torch.compile recompilation on first I2V request.
+        dummy_image = torch.zeros(1, 3, height, width, device=self.device)
+        self.forward(
+            prompt="warmup",
+            negative_prompt="",
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=4.0,
+            seed=42,
+            image=dummy_image,
+        )
 
     # ------------------------------------------------------------------
     # Transformer weight loading
@@ -1402,7 +1417,7 @@ class LTX2Pipeline(BasePipeline):
                 )
             )
             video = torch.cat(chunks, dim=2)
-            video = postprocess_video_tensor(video, remove_batch_dim=True)
+            video = postprocess_video_tensor(video)
             return video
 
         def decode_audio_fn(aud_latents):

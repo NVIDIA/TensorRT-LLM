@@ -413,7 +413,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 // In both cases, the combine kernel reads from the workspace at 'combinePayloadOffset'.
 torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
-    int64_t combinePayloadOffset, bool payloadInWorkspace)
+    int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
@@ -453,6 +453,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     {
         TORCH_CHECK(false, "Unsupported data type for payload");
     }
+    // use_low_precision is passed through to the kernel via params.use_low_precision; dtype is not mutated.
 
     CHECK_CPU(metainfo);
     CHECK_TYPE(metainfo, torch::kInt64);
@@ -485,7 +486,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Create output tensor (local on current rank), no need for initialization
     // Typically, newly allocated GPU torch tensors are at least 16-byte aligned.
-    torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, payload.options());
+    // Output dtype always matches the payload dtype: low-precision accumulates FP8 back to payload dtype.
+    auto output_options = payload.options();
+    torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, output_options);
 
     // Setup combine parameters
     MoeA2ACombineParams params{};
@@ -504,6 +507,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.output_data = output.data_ptr();
     params.elements_per_token = static_cast<int>(elementsPerToken);
     params.dtype = nvDtype;
+    params.use_low_precision = useLowPrecision;
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
@@ -616,7 +620,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int combine_payload_offset, "
-        "bool payload_in_workspace) -> Tensor");
+        "bool payload_in_workspace, bool use_low_precision=False) -> Tensor");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
         "int? eplb_stats_num_experts=None) -> Tensor");

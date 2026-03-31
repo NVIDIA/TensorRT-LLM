@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import json
 import os
 import re
+import shutil
 from datetime import datetime
 
 import yaml
@@ -312,7 +315,9 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    if is_aggr:
+    if args.mpi_type:
+        lines.append(f"--mpi={args.mpi_type}")
+    elif is_aggr:
         lines.append("--mpi=pmi2")
 
     return lines
@@ -350,6 +355,26 @@ def generate_pytest_command(
     )
 
     return pytest_command, test_list_content, test_list_path
+
+
+def replace_env_in_file(work_dir: str, file_path: str, env_vars: dict) -> str:
+    """Read a file, replace env var placeholders, write to work_dir/lm_eval_configs/.
+
+    Returns the lm_eval_configs directory path (for use as --include_path).
+    Also copies utils.py from the same directory if present (needed for GPQA task).
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    for key, value in env_vars.items():
+        content = content.replace(key, value)
+    tmp_dir = os.path.join(work_dir, "lm_eval_configs")
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(os.path.join(tmp_dir, os.path.basename(file_path)), "w", encoding="utf-8") as f:
+        f.write(content)
+    utils_py = os.path.join(os.path.dirname(file_path), "utils.py")
+    if os.path.exists(utils_py):
+        shutil.copy(utils_py, tmp_dir)
+    return tmp_dir
 
 
 def remove_whitespace_lines(lines):
@@ -405,6 +430,11 @@ def main():
         choices=["source", "wheel"],
         help="Installation mode: source (pip install -e ., default) or wheel (pip install *.whl)",
     )
+    parser.add_argument(
+        "--wheel-path",
+        default="",
+        help="Path to a specific wheel file to install (used when INSTALL_MODE=wheel)",
+    )
     parser.add_argument("--capture-nsys", action="store_true", help="Capture nsys profile")
     parser.add_argument(
         "--nsys-start-stop",
@@ -422,6 +452,12 @@ def main():
         help="Nsys start-stop range for generation workers in disaggregated mode (default: 1-100)",
     )
     parser.add_argument("--test-prefix", default="", help="Test prefix")
+    parser.add_argument(
+        "--mpi-type",
+        default="",
+        help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
+        " --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
+    )
 
     args = parser.parse_args()
 
@@ -542,6 +578,7 @@ def main():
             f"export configYamlPath='{config_yaml}'",
             f"export BUILD_WHEEL={'true' if args.build_wheel else 'false'}",
             f"export INSTALL_MODE='{args.install_mode}'",
+            f"export WHEEL_PATH='{args.wheel_path}'",
         ]
     )
 
@@ -646,7 +683,10 @@ def main():
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
-                'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
+                (
+                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
+                ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",
                 f"export numGenServers={hardware_config.get('num_gen_servers', '')}",
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",
@@ -688,6 +728,22 @@ def main():
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
             ]
         )
+
+    # Export accuracy config to BENCHMARK node (disagg only)
+    if runtime_mode == "disaggregated":
+        acc_cfg = config.get("accuracy", {})
+        if acc_cfg.get("enable_accuracy_test"):
+            env_sub = {"LLM_MODELS_ROOT": args.llm_models_root}
+            processed = copy.deepcopy(acc_cfg)
+            for task_cfg in processed.get("tasks", {}).values():
+                extra = task_cfg.get("extra_kwargs", {})
+                if "custom_config" in extra:
+                    cfg_path = extra.pop("custom_config")
+                    if not os.path.isabs(cfg_path):
+                        cfg_path = os.path.join(llm_src, cfg_path)
+                    extra["include_path"] = replace_env_in_file(work_dir, cfg_path, env_sub)
+            script_prefix_lines.append(f"export ACCURACY_CONFIG_JSON='{json.dumps(processed)}'")
+            srun_args_lines.append("--container-env=ACCURACY_CONFIG_JSON")
 
     # Remove whitespace lines
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)

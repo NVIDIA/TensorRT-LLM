@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import List, Optional, Union
 
 import diffusers
 import torch
@@ -124,9 +124,28 @@ class WanPipeline(BasePipeline):
         return ["transformer"]
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes for the pipeline."""
-        return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
+    def default_warmup_resolutions(self):
+        return [(480, 832), (720, 1280)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [33, 81]
+
+    @property
+    def default_warmup_steps(self):
+        return 4 if self.is_wan22 else 2
+
+    @property
+    def resolution_multiple_of(self):
+        patch_size = (
+            self.transformer.config.patch_size
+            if self.transformer is not None
+            else self.transformer_2.config.patch_size
+        )
+        return (
+            self.vae_scale_factor_spatial * patch_size[1],
+            self.vae_scale_factor_spatial * patch_size[2],
+        )
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
@@ -268,31 +287,19 @@ class WanPipeline(BasePipeline):
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init.
-
-        Runs warmup inference with common shapes for Wan models.
-        """
-
-        if self.is_wan22:
-            # Double warmup steps to also warmup the 2nd transformer
-            warmup_steps = warmup_steps * 2
-
-        for height, width, num_frames in self.common_warmup_shapes:
-            logger.info(f"Warmup: Wan {height}x{width}, {num_frames} frames {warmup_steps} steps")
-
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    negative_prompt="",
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=5.0,
-                    seed=0,
-                    max_sequence_length=512,  # should match DiffusionRequest.max_sequence_length
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                negative_prompt="",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                num_inference_steps=steps,
+                guidance_scale=5.0,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def infer(self, req):
         """Run inference with request parameters."""
@@ -314,7 +321,7 @@ class WanPipeline(BasePipeline):
     @torch.no_grad()
     def forward(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
         height: int = 720,
         width: int = 1280,
@@ -327,7 +334,15 @@ class WanPipeline(BasePipeline):
         max_sequence_length: int = 512,
     ):
         pipeline_start = time.time()
+
+        # Determine batch size
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        batch_size = len(prompt)
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        self.validate_resolution(height, width, num_frames)
 
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
         boundary_ratio = boundary_ratio if boundary_ratio is not None else self.boundary_ratio
@@ -377,7 +392,7 @@ class WanPipeline(BasePipeline):
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
         # Prepare Latents
-        latents = self._prepare_latents(height, width, num_frames, generator)
+        latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
@@ -486,9 +501,12 @@ class WanPipeline(BasePipeline):
         return MediaOutput(video=video)
 
     @nvtx_range("_encode_prompt", color="blue")
-    def _encode_prompt(self, prompt, negative_prompt, max_sequence_length):
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
+    def _encode_prompt(
+        self,
+        prompt: List[str],
+        negative_prompt: Optional[str],
+        max_sequence_length: int,
+    ):
         def get_embeds(texts):
             text_inputs = self.tokenizer(
                 texts,
@@ -534,21 +552,31 @@ class WanPipeline(BasePipeline):
         return prompt_embeds, neg_embeds
 
     @nvtx_range("_prepare_latents", color="blue")
-    def _prepare_latents(self, height, width, num_frames, generator):
+    def _prepare_latents(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Prepare random latents for video generation."""
         num_channels_latents = 16
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
         shape = (
-            1,
+            batch_size,
             num_channels_latents,
             num_latent_frames,
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
+
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
     @nvtx_range("_decode_latents", color="blue")
-    def _decode_latents(self, latents):
+    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents to video tensor."""
         latents = latents.to(self.vae.dtype)
 
         # Denormalization
@@ -572,7 +600,7 @@ class WanPipeline(BasePipeline):
         # VAE decode: returns (B, C, T, H, W)
         video = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process video tensor: (B, C, T, H, W) -> (T, H, W, C) uint8
-        video = postprocess_video_tensor(video, remove_batch_dim=True)
+        # Post-process video tensor: (B, C, T, H, W) -> (B, T, H, W, C)
+        video = postprocess_video_tensor(video)
 
         return video

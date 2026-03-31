@@ -1,5 +1,6 @@
 """Tests for basic GEMM fusion."""
 
+import operator
 from abc import abstractmethod
 from typing import Callable, Tuple
 
@@ -442,6 +443,23 @@ class Qwen35GdnMixedQuantModel(TestModel):
         return qkv.sum(-1, keepdim=True) + z.sum(-1).sum(-1, keepdim=True) + a.sum(-1, keepdim=True)
 
 
+def _count_split_output_views(gm) -> int:
+    """Count output split views produced by fusion (torch.narrow or split_output+getitem)."""
+    count = 0
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and n.target is torch.narrow:
+            count += 1
+        elif (
+            n.op == "call_function"
+            and n.target is operator.getitem
+            and len(n.args) >= 1
+            and hasattr(n.args[0], "target")
+            and getattr(n.args[0].target, "__name__", "") == "split_output"
+        ):
+            count += 1
+    return count
+
+
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 @torch.inference_mode()
 def test_fuse_gemms_mixed_children_mixed_quant():
@@ -478,13 +496,9 @@ def test_fuse_gemms_mixed_children_mixed_quant():
     assert num_fp8_after == 1, f"Expected 1 fused FP8 linear, got {num_fp8_after}"
     assert num_bf16_after == 1, f"Expected 1 fused bf16 linear, got {num_bf16_after}"
 
-    # Verify 4 narrow nodes (2 from FP8 group + 2 from bf16 group)
-    narrow_count = sum(
-        1
-        for n in gm_transformed.graph.nodes
-        if n.op == "call_function" and n.target is torch.narrow
-    )
-    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
+    # Verify 4 split output views (2 from FP8 group + 2 from bf16 group)
+    split_view_count = _count_split_output_views(gm_transformed)
+    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
 
     # Numerical correctness
     y_transformed = gm_transformed(x)
@@ -530,13 +544,9 @@ def test_fuse_gemms_mixed_children_qwen35_like(dtype: str):
         test_load_hook=False,
     )
 
-    # Verify narrow nodes exist (zero-copy view splitting)
-    narrow_count = sum(
-        1
-        for n in gm_transformed.graph.nodes
-        if n.op == "call_function" and n.target is torch.narrow
-    )
-    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
+    # Verify split output views exist (contiguous splitting)
+    split_view_count = _count_split_output_views(gm_transformed)
+    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
 
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)
@@ -578,13 +588,9 @@ def test_fuse_gemms_mixed_children(dtype: str):
         test_load_hook=False,
     )
 
-    # Verify narrow nodes exist (zero-copy view splitting)
-    narrow_count = sum(
-        1
-        for n in gm_transformed.graph.nodes
-        if n.op == "call_function" and n.target is torch.narrow
-    )
-    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
+    # Verify split output views exist (contiguous splitting)
+    split_view_count = _count_split_output_views(gm_transformed)
+    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
 
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)

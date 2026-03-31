@@ -16,8 +16,8 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     DualModeCapturedGraph,
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
-    _submod_has_cuda_ops,
 )
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
@@ -173,7 +173,7 @@ def test_cudagraph_capture_replay(
 
 
 # ============================================================================
-# Helpers for piecewise / _submod_has_cuda_ops tests
+# Helpers for piecewise / submod_has_cuda_ops tests
 # ============================================================================
 
 
@@ -209,25 +209,25 @@ def _build_graphmodule_with_linear():
 
 
 # ============================================================================
-# Tests for _submod_has_cuda_ops
+# Tests for submod_has_cuda_ops
 # ============================================================================
 
 
 class TestSubmodHasCudaOps:
-    """Tests for _submod_has_cuda_ops."""
+    """Tests for submod_has_cuda_ops."""
 
     def test_trivial_graphmodule_returns_false(self):
         gm = _build_trivial_graphmodule()
-        assert _submod_has_cuda_ops(gm) is False
+        assert submod_has_cuda_ops(gm) is False
 
     def test_graphmodule_with_linear_returns_true(self):
         gm = _build_graphmodule_with_linear()
-        assert _submod_has_cuda_ops(gm) is True
+        assert submod_has_cuda_ops(gm) is True
 
     def test_non_graphmodule_returns_true(self):
         """Non-FX modules are conservatively treated as having CUDA ops."""
         module = nn.Linear(4, 4)
-        assert _submod_has_cuda_ops(module) is True
+        assert submod_has_cuda_ops(module) is True
 
     def test_graphmodule_with_nontrivial_call_function(self):
         """A graph with torch.add (non-trivial call_function) should return True."""
@@ -236,7 +236,7 @@ class TestSubmodHasCudaOps:
         y = graph.call_function(torch.add, args=(x, x))
         graph.output(y)
         gm = GraphModule(nn.Module(), graph)
-        assert _submod_has_cuda_ops(gm) is True
+        assert submod_has_cuda_ops(gm) is True
 
     def test_graphmodule_with_nontrivial_call_method(self):
         """A graph with 'matmul' method call should return True."""
@@ -245,7 +245,7 @@ class TestSubmodHasCudaOps:
         y = graph.call_method("matmul", args=(x, x))
         graph.output(y)
         gm = GraphModule(nn.Module(), graph)
-        assert _submod_has_cuda_ops(gm) is True
+        assert submod_has_cuda_ops(gm) is True
 
     def test_graphmodule_with_only_trivial_methods(self):
         """A graph with only trivial call_methods should return False."""
@@ -255,7 +255,7 @@ class TestSubmodHasCudaOps:
         z = graph.call_method("contiguous", args=(y,))
         graph.output(z)
         gm = GraphModule(nn.Module(), graph)
-        assert _submod_has_cuda_ops(gm) is False
+        assert submod_has_cuda_ops(gm) is False
 
 
 # ============================================================================

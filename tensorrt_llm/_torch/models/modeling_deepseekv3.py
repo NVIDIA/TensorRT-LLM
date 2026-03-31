@@ -414,7 +414,12 @@ class DeepseekV3WeightLoader:
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = self.model_config.get_quant_config(
                     ).layer_quant_mode.has_nvfp4() and weights[
-                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2 and weights[
+                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2
+                    # Non-lite models (V3, R1, V3.2) fuse q_a_proj into
+                    # kv_a_proj_with_mqa, so both must be NVFP4 for the fused
+                    # path. Lite models (V3-Lite) have no q_a_proj.
+                    if not is_lite:
+                        nvfp4_fused_a &= weights[
                             f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
                     if nvfp4_fused_a:
                         ########### input_scale
@@ -497,8 +502,6 @@ class DeepseekV3WeightLoader:
                         else:
                             fused_a = kv_a_proj_with_mqa
 
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
 
                         ########### fuse weight_scale
@@ -508,8 +511,6 @@ class DeepseekV3WeightLoader:
                                 dim=0)
                         else:
                             fused_a_scale = kv_a_proj_with_mqa_scale
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight_scale.data[0:fused_a_scale.
                                                  shape[0]].copy_(fused_a_scale)
                     else:
@@ -531,8 +532,6 @@ class DeepseekV3WeightLoader:
 
                             module.weight_scale.data[
                                 0:fused_a_scale.shape[0]].copy_(fused_a_scale)
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                     # Mark consumed kv_a_proj_with_mqa and q_a_proj weights
                     if can_mark_consumed:
@@ -796,46 +795,15 @@ class DeepseekV32Attention(MLA):
 
         self.indexer = self.mqa.indexer
 
-        # For DeepseekV32, the kv_a_proj_with_mqa includes:
-        # q_a_proj + kv_a_proj_with_mqa + indexer.wk
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank +
-            self.indexer.head_dim,
+            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,
             bias=False,
             dtype=config.torch_dtype,
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True)
-
-    def post_load_weights(self):
-        """
-        Concatenate indexer.wk weights into kv_a_proj_with_mqa's last dimension, to fuse indexer.wk projection with kv_a_proj_with_mqa GEMM.
-        """
-        assert self.kv_a_proj_with_mqa.weight.data.dtype == self.indexer.wk.weight.data.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
-        # Copy indexer weights into the fused kv_a_proj_with_mqa module
-        indexer_wk_weight = self.indexer.wk.weight.data
-        offset = self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank
-        self.kv_a_proj_with_mqa.weight.data[offset:offset +
-                                            self.indexer.head_dim].copy_(
-                                                indexer_wk_weight)
-
-        # Copy indexer scale data if it exists
-        if hasattr(self.indexer.wk,
-                   'weight_scale') and self.indexer.wk.weight_scale is not None:
-            indexer_wk_scale = self.indexer.wk.weight_scale.data
-            assert self.kv_a_proj_with_mqa.weight_scale.dim(
-            ) == 2, "weight_scale must be a 2D tensor"
-            group_size = self.kv_a_proj_with_mqa.weight.shape[
-                0] // self.kv_a_proj_with_mqa.weight_scale.shape[0]
-            scale_offset = offset // group_size
-            scale_size = indexer_wk_scale.shape[0]
-            # Copy indexer scale to the corresponding position in the fused module
-            self.kv_a_proj_with_mqa.weight_scale.data[
-                scale_offset:scale_offset + scale_size].copy_(indexer_wk_scale)
-
-        self.indexer.wk = None
 
 
 class DeepseekV3Gate(nn.Module):
@@ -1816,6 +1784,7 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
+@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
@@ -1850,6 +1819,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 quant_config_dict[key] = val
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
+            model_config._frozen = True
+
+        if model_config.pretrained_config.model_type == 'glm_moe_dsa':
+            model_config._frozen = False
+            model_config.pretrained_config.model_type = 'deepseek_v32'
             model_config._frozen = True
 
         super().__init__(model=DeepseekV3Model(

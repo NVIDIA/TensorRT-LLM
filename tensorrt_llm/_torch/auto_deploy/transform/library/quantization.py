@@ -16,6 +16,7 @@ from ...custom_ops.quantization.quant import (
 )
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
     extract_weight_nodes,
@@ -27,9 +28,12 @@ from ...utils.quantization_utils import (
     fp4_global_scale,
     fp8_scale,
     get_quantization_from_linear_node,
+    is_mixed_precision_config,
     is_quantized_graph,
     is_quantized_op,
+    mixed_precision_has_algo,
     remove_output_quantizers,
+    should_skip_mixed_precision_quantization,
     should_skip_quantization,
 )
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -112,19 +116,36 @@ class Quantization(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         with WeightBiasInfoCache():
             qcfg = factory.get_quant_config()
-            if not qcfg or (
+            if not qcfg:
+                return gm, TransformInfo(
+                    skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                )
+
+            is_mixed = is_mixed_precision_config(qcfg)
+            if is_mixed:
+                if not mixed_precision_has_algo(qcfg, self.algo_name):
+                    return gm, TransformInfo(
+                        skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                    )
+                quantized_layers = qcfg.get("quantized_layers", {})
+            elif (
                 qcfg.get("quant_algo", "").upper() != self.algo_name
                 and qcfg.get("quant_method", "").upper() != self.algo_name
             ):
                 return gm, TransformInfo(
                     skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
                 )
+
             excluded = qcfg.get("exclude_modules", [])
             cnt = 0
             for n in gm.graph.nodes:
                 if not is_linear_op(n):
                     continue
                 if should_skip_quantization(n, excluded):
+                    continue
+                if is_mixed and should_skip_mixed_precision_quantization(
+                    n, self.algo_name, quantized_layers
+                ):
                     continue
                 self._insert_quantized_linear(gm, n, is_quantized_graph=False)
                 cnt += 1
@@ -579,7 +600,20 @@ class FP8BMMQuantizationFromConfig(Quantization):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        if is_mixed_precision_config(qcfg):
+            ad_logger.warning(
+                "FP8 BMM quantization does not support MIXED_PRECISION checkpoints, skipping."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        if qcfg.get("quant_algo", "").upper() != self.algo_name:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -831,6 +865,15 @@ class FineGrainedFP8LinearQuantization(Quantization):
     ) -> Tuple[GraphModule, TransformInfo]:
         qcfg = factory.get_quant_config()
         if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        if is_mixed_precision_config(qcfg):
+            ad_logger.warning(
+                "FineGrained FP8 quantization does not support MIXED_PRECISION checkpoints, "
+                "skipping."
+            )
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

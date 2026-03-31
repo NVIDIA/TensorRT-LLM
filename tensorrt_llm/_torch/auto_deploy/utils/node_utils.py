@@ -472,6 +472,106 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     return is_match
 
 
+def is_trivial_passthrough_user(node: Node) -> bool:
+    """Check whether a node is a trivial layout/index passthrough op."""
+    if node.op == "call_method":
+        return node.target in {
+            "view",
+            "reshape",
+            "transpose",
+            "permute",
+            "contiguous",
+            "__getitem__",
+        }
+    if node.op == "call_function":
+        if node.target is operator.getitem:
+            return True
+        return (
+            is_op(node, torch.ops.aten.view)
+            or is_op(node, torch.ops.aten.reshape)
+            or is_op(node, torch.ops.aten.transpose)
+            or is_op(node, torch.ops.aten.permute)
+            or is_op(node, torch.ops.aten.contiguous)
+        )
+    return False
+
+
+def collect_terminal_users_through_passthrough(
+    source_node: Node,
+    *,
+    max_traversal_nodes: int = 256,
+) -> Tuple[List[Node], bool]:
+    """Collect terminal users while traversing trivial passthrough users.
+
+    Only follows passthrough nodes whose primary data argument (args[0])
+    comes from the source data path.  This prevents the traversal from
+    leaking into unrelated graph regions when the source node is referenced
+    as a non-data argument (e.g. shape) of a passthrough op.
+
+    Returns:
+        (terminal_users, traversal_ok)
+    """
+    terminal_users: List[Node] = []
+    data_nodes = {source_node}
+    stack = list(source_node.users)
+    seen = set()
+    while stack:
+        user = stack.pop()
+        if user in seen:
+            continue
+        seen.add(user)
+        if len(seen) > max_traversal_nodes:
+            return [], False
+        if is_trivial_passthrough_user(user):
+            if user.args and isinstance(user.args[0], Node) and user.args[0] in data_nodes:
+                data_nodes.add(user)
+                stack.extend(list(user.users))
+                continue
+        terminal_users.append(user)
+    return terminal_users, True
+
+
+def get_shared_input_scale_for_fp8_linears(
+    nodes: Iterable[Node],
+) -> Tuple[List[Node], Optional[Node]]:
+    """Return FP8 linear nodes and their shared input_scale if one exists."""
+    supported_fp8_linear_ops = (
+        torch.ops.auto_deploy.trtllm_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_quant_fp8_linear,
+    )
+    fp8_linear_nodes: List[Node] = [
+        node for node in nodes if any(is_op(node, op) for op in supported_fp8_linear_ops)
+    ]
+    if not fp8_linear_nodes:
+        return [], None
+
+    first_scale = extract_op_args(
+        fp8_linear_nodes[0], "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+    )[3]
+    if not isinstance(first_scale, Node):
+        return [], None
+
+    for node in fp8_linear_nodes[1:]:
+        scale = extract_op_args(node, "input", "weight_fp8", "bias", "input_scale", "weight_scale")[
+            3
+        ]
+        if not isinstance(scale, Node):
+            return [], None
+        if scale is first_scale:
+            continue
+
+        # Allow equivalent scale nodes only when both are stable get_attr reads
+        # of the same module attribute.
+        if not (
+            first_scale.op == "get_attr"
+            and scale.op == "get_attr"
+            and scale.target == first_scale.target
+        ):
+            return [], None
+
+    return fp8_linear_nodes, first_scale
+
+
 def filtered_nodes(
     nodes: Iterable[Node],
     target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
@@ -813,7 +913,9 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
+def get_all_layer_subgraphs(
+    gm: GraphModule, linear_nodes: Optional[List[Node]] = None
+) -> tuple[List[LayerSubgraph], set[Node]]:
     """
     Get subgraphs for all consecutive layers (attention, MLP, SSM, MoE) in the graph.
 
@@ -846,7 +948,8 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
 
     assert gm.graph.nodes, "Graph is empty"
     layer_subgraphs = []
-    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    if linear_nodes is None:
+        linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
 
     # get residual add nodes to correctly identify layer boundaries
     residuals = identify_regions_between_residuals(gm)

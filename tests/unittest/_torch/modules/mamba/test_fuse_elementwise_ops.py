@@ -111,3 +111,43 @@ def test_fused_split_rearrange_after_conv1d(
     torch.testing.assert_close(x_fused, x_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(B_fused, B_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(C_fused, C_ref, rtol=1e-3, atol=1e-3)
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_extract_transpose_large_input_no_overflow(dtype):
+    """
+    Test extract_transpose_xbc_prefill with large inputs that would overflow int32.
+
+    This test verifies the fix for integer overflow in Triton kernel offset calculations.
+    For NemotronH Nano 12B with max_num_tokens=131072:
+    - d_in_proj = 22656
+    - max_src_offset = (num_prefill_tokens - 1) * d_in_proj > INT32_MAX
+
+    We use smaller but still overflow-inducing parameters to keep the test memory-efficient.
+    """
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    # Parameters that would cause int32 overflow: 100000 * 22000 = 2.2B > INT32_MAX
+    num_prefill_tokens = 100000
+    d_in_proj = 22000
+    d_inner = 10000
+    conv_dim = 12000
+
+    # Check available GPU memory - skip if not enough
+    free_memory = torch.cuda.get_device_properties(
+        device
+    ).total_memory - torch.cuda.memory_allocated(device)
+    required_memory = num_prefill_tokens * d_in_proj * 2 * 3  # input + output + overhead
+    if free_memory < required_memory:
+        pytest.skip(
+            f"Insufficient GPU memory: {free_memory / 1e9:.1f}GB available, {required_memory / 1e9:.1f}GB required"
+        )
+
+    zxbcdt = torch.randn(num_prefill_tokens, d_in_proj, dtype=dtype, device=device)
+    out_ref = extract_transpose_xbc_prefill_ref(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+    out_fused = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+
+    assert out_fused.shape == out_ref.shape, f"Shape mismatch: {out_fused.shape} vs {out_ref.shape}"
+    torch.testing.assert_close(out_fused, out_ref, rtol=1e-3, atol=1e-3)

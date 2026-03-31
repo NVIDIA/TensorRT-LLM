@@ -53,6 +53,7 @@ from ...utils.node_utils import (
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
+    is_fake_quantized_linear_op,
     is_op,
     is_weight_node,
     num_users_of_weight_node,
@@ -75,6 +76,73 @@ from ..interface import (
 ########################################################
 #  Helper functions
 ########################################################
+
+
+########################################################
+#  Helper functions
+########################################################
+def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool:
+    """Check if a weight node is a scale tensor for a quantized linear op.
+
+    Scale tensors (e.g., weight_scale_inv for FineGrained FP8) are in "block space" and should
+    not be sharded with the same min_local_shape as the actual weight tensor.
+    They are handled separately by quantization_cb.
+
+    Args:
+        node: The linear operation node
+        weight_node_key: The parameter key of the weight node (e.g., "model.layers.0.self_attn.v_proj.weight_scale_inv")
+
+    Returns:
+        True if this is a scale tensor for a quantized linear op, False otherwise
+    """
+    return is_fake_quantized_linear_op(node) and "_scale" in weight_node_key
+
+
+def _make_tp_plan_regex(key: str) -> str:
+    pattern_string = ("*" + key + "*").replace("*", "@")
+    return re.escape(pattern_string).replace("@", ".*")
+
+
+def _matches_tp_plan(weight_name: str, tp_plan: Dict[str, str]) -> bool:
+    return any(re.match(_make_tp_plan_regex(key), weight_name) for key in tp_plan)
+
+
+def _is_unmatched_moe_aux_gate_linear(weight_name: str, tp_plan: Dict[str, str]) -> bool:
+    if _matches_tp_plan(weight_name, tp_plan):
+        return False
+
+    segments = weight_name.split(".")
+    if len(segments) < 2 or segments[-1] != "weight":
+        return False
+
+    # Router gates and shared-expert scalar gates are intentionally replicated in TP config.
+    return segments[-2] in {"gate", "shared_expert_gate"}
+
+
+def _get_config_layer_linear_nodes(gm: GraphModule, tp_plan: Dict[str, str]) -> List[Node]:
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    filtered_linear_nodes = []
+    num_skipped = 0
+
+    for lin_node in linear_nodes:
+        weight_name = extract_weight_name(lin_node)
+        if not weight_name:
+            filtered_linear_nodes.append(lin_node)
+            continue
+
+        if _is_unmatched_moe_aux_gate_linear(weight_name, tp_plan):
+            num_skipped += 1
+            continue
+
+        filtered_linear_nodes.append(lin_node)
+
+    if num_skipped > 0:
+        ad_logger.info(
+            f"Skipping {num_skipped} unmatched MoE auxiliary gate linear nodes during "
+            "config-driven TP layer recovery"
+        )
+
+    return filtered_linear_nodes
 
 
 ########################################################
@@ -154,6 +222,14 @@ class ShardingTransformConfig(TransformConfig):
         description="When True, apply simple shard (column split + all_gather) to "
         "'leftover' linear nodes that are not part of any layer subgraph.",
     )
+    simple_shard_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of substrings to filter which unprocessed linear "
+        "nodes are simple-sharded. A node is included if its name contains ANY of the "
+        "listed keywords. Example: 'lm_head,shared_expert'. "
+        "Only effective when shard_all_unprocessed is True. "
+        "When None, all unprocessed linear nodes are sharded.",
+    )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
         description="AllReduce strategy for distributed operations. "
@@ -205,11 +281,6 @@ class ShardingTransformConfig(TransformConfig):
                 moe_ep_size=self.world_size,
                 moe_cluster_size=1,
             )
-
-    enable_attention_dp: bool = Field(
-        default=False,
-        description="When True, skip TP sharding as attention data parallelism is enabled.",
-    )
 
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
         if sources is None:
@@ -1005,7 +1076,8 @@ class Sharding(BaseTransform):
             # Fallback to creating mapping from dist_mapping config if not provided
             config._init_mapping()
 
-        config.validate_config()
+        if world_size > 1:
+            config.validate_config()
 
         # Extract max_num_tokens from sequence info for MoE all-to-all workspace allocation
         if cm and cm.info:
@@ -1547,6 +1619,14 @@ def _shard_parameter_node(
     )
 
     for weight_node in weight_nodes.weights:
+        if is_quantized_linear_scale_tensor(node, weight_node.node_key):
+            # Scale tensors (e.g. weight_scale_inv) are sharded by
+            # quantization_cb (via QuantizationShardingMixin.shard_scales +
+            # shard_load_hook) when processing the main weight.  Calling
+            # shard_weight_tensor here would register a SECOND load hook
+            # that double-shards the scale during checkpoint loading.
+            continue
+
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
             weight_tensor=weight_node.tensor,
@@ -1808,9 +1888,10 @@ def _insert_sharded_moe(
             # Standard TP with all_reduce:
             # No attention-DP, so tokens are NOT distributed across ranks.
             # Just add all_reduce after MoE to sum TP partial results.
+            _, all_reduce_op = _get_dist_ops(config.dist_backend)
             with gm.graph.inserting_after(node):
                 dist_node = gm.graph.call_function(
-                    torch.ops.auto_deploy.torch_dist_all_reduce.default,
+                    all_reduce_op,
                     args=(node, allreduce_strategy),
                 )
                 node.replace_all_uses_with(dist_node)
@@ -1898,10 +1979,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
+    _, all_reduce_op = _get_dist_ops(config.dist_backend)
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node, config.allreduce_strategy.name)
-        )
+        red = gm.graph.call_function(all_reduce_op, args=(node, config.allreduce_strategy.name))
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)
@@ -1911,7 +1991,21 @@ def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
     layer_type: LayerType = LayerType.UNKNOWN,
+    key_filter: Optional[Callable[[Node], bool]] = None,
 ) -> int:
+    """
+
+    Args:
+        nodes_linear: A dictionary of nodes_linear, or a list of nodes_linear.
+        transform_container: The transform container.
+        layer_type: The layer type.
+        key_filter: A function to filter the nodes.
+    """
+    if key_filter is None:
+
+        def key_filter(n: Node) -> bool:
+            return True
+
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
     # if nodes_linear is a dict, flatten it to a 1D list of nodes
@@ -1921,6 +2015,8 @@ def _process_simple_shard(
 
     num_simple_shards = 0
     for n in nodes_linear:
+        if not key_filter(n):
+            continue
         num_simple_shards += int(
             transform_container.add(
                 WeightShardingInfo.from_node(
@@ -2854,7 +2950,9 @@ def detect_sharding_from_config(
 
     # use layer_subgraphs to determine the layer_type
     # and check the validity of the sharding transform
-    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(
+        gm, linear_nodes=_get_config_layer_linear_nodes(gm, tp_plan)
+    )
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
@@ -2879,12 +2977,7 @@ def detect_sharding_from_config(
 
         # use regex to find if module_name matches any of the keys in sharding_config
         for key in tp_plan.keys():
-            pattern_string = "*" + key + "*"
-            # convert it to regex. Escape dots, replace * with .*
-            # First, we substitute * with an unlikely character, e.g. @
-            # Then we escape dots, and finally we replace @ with .*
-            pattern_string = pattern_string.replace("*", "@")
-            pattern_regex = re.escape(pattern_string).replace("@", ".*")
+            pattern_regex = _make_tp_plan_regex(key)
             if re.match(pattern_regex, weight_name):
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
@@ -3149,7 +3242,16 @@ def detect_column_row_shard(
 
     # simple shard remaining linear nodes
     if config.shard_all_unprocessed:
-        num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
+        shard_filter = None
+        if config.simple_shard_filter is not None:
+            keywords = [k.strip() for k in config.simple_shard_filter.split(",")]
+
+            def shard_filter(n, _kw=keywords):
+                return any(kw in n.name for kw in _kw)
+
+        num_simple_shards += _process_simple_shard(
+            unprocessed_linear_nodes, transform_container, key_filter=shard_filter
+        )
     num_column_row_shards += num_ssm_shards + num_mla_shards
     num_shards = num_simple_shards + num_column_row_shards
     ad_logger.info(

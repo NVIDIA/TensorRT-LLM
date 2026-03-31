@@ -168,35 +168,6 @@ boolean enableUpdateGitlabStatus =
     testFilter[TEST_STAGE_LIST] == null &&
     testFilter[TEST_BACKEND] == null
 
-String getShortenedJobName(String path)
-{
-    static final nameMapping = [
-        "L0_MergeRequest": "l0-mr",
-        "L0_Custom": "l0-cus",
-        "L0_PostMerge": "l0-pm",
-        "L0_PostMergeDocker": "l0-pmd",
-        "L1_Custom": "l1-cus",
-        "L1_Nightly": "l1-nt",
-        "L1_Stable": "l1-stb",
-    ]
-    def parts = path.split('/')
-    // Apply nameMapping to the last part (jobName)
-    def jobName = parts[-1]
-    boolean replaced = false
-    nameMapping.each { key, value ->
-        if (jobName.contains(key)) {
-            jobName = jobName.replace(key, value)
-            replaced = true
-        }
-    }
-    if (!replaced) {
-        jobName = jobName.length() > 7 ? jobName.substring(0, 7) : jobName
-    }
-    // Replace the last part with the transformed jobName
-    parts[-1] = jobName
-    // Rejoin the parts with '-', convert to lowercase
-    return parts.join('-').toLowerCase()
-}
 
 def createKubernetesPodConfig(image, type, arch = "amd64")
 {
@@ -206,8 +177,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                   kubernetes.io/os: linux"""
     def containerConfig = ""
     def nodeLabelPrefix = ""
-    def jobName = getShortenedJobName(env.JOB_NAME)
-    def buildID = env.BUILD_ID
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -251,7 +220,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         nodeLabelPrefix = "cpu"
         break
     }
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
+    def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -396,7 +365,7 @@ def preparation(pipeline, testFilter, globalVars)
     })
 }
 
-def launchReleaseCheck(pipeline)
+def launchReleaseCheck(pipeline, globalVars)
 {
     stages = {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
@@ -417,7 +386,8 @@ def launchReleaseCheck(pipeline)
                     "*/3rdparty/*",
                     "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
                     "*/examples/scaffolding/contrib/mcp/weather/weather.py",
-                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz",
+                    "*/triton_kernels/*.py"
                 ]
                 sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
                 def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
@@ -433,7 +403,23 @@ def launchReleaseCheck(pipeline)
         }
 
         // Step 3: Run pre-commit checks
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
+        // Post-merge CI runs on all files; pre-merge CI runs only on changed files.
+        def precommitArgs = "-a"
+        if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || env.alternativeTRT)) {
+            // Use GitLab/GitHub API to get the exact list of changed files in this MR.
+            // This avoids git history depth issues with shallow clones.
+            def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+            if (changedFileList && !changedFileList.isEmpty()) {
+                def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
+                writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
+                // Script runs after "cd ${LLM_ROOT}", so use relative path
+                precommitArgs = "--files-from changed_files.txt"
+                echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
+            } else {
+                echo "Could not determine changed files, falling back to all files"
+            }
+        }
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
 
         // Step 4: Run license check
         withEnv(['GONOSUMDB=*.nvidia.com']) {
@@ -1058,7 +1044,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
                     return
                 }
-                launchReleaseCheck(this)
+                launchReleaseCheck(this, globalVars)
             }
         },
         "x86_64-Linux": {
@@ -1407,7 +1393,7 @@ pipeline {
                     if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
-                                launchReleaseCheck(this)
+                                launchReleaseCheck(this, globalVars)
                             }
                         }
                     } else {

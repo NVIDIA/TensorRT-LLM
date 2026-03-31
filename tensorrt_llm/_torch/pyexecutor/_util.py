@@ -14,9 +14,10 @@ from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, EagleDecodingConfig, KvCacheConfig,
-    MTPDecodingConfig, PeftCacheConfig, SamplerType, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
+    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
+    WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -28,7 +29,8 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
+from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid)
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -42,7 +44,7 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2DummyScheduler, SimpleScheduler,
+                        KVCacheV2Scheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -59,7 +61,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_nemotron_hybrid(config) or is_qwen3_next(config):
+    elif is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
         return MambaHybridCacheManager
     else:
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
@@ -128,6 +130,10 @@ class KvCacheCreator:
         self._draft_config = draft_config
         self._skip_est = skip_est
 
+    def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
+        return get_kv_cache_manager_cls(model_engine.model.model_config,
+                                        self._kv_cache_config)
+
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
@@ -135,17 +141,33 @@ class KvCacheCreator:
             model_config, mapping, tokens_per_block=self._tokens_per_block)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
-            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+            draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+                self._draft_model_engine)
+            kv_size_per_token += draft_kv_cache_manager_cls.get_cache_size_per_token(
                 draft_model_config,
                 mapping,
                 tokens_per_block=self._tokens_per_block)
         elif self._should_create_separate_draft_kv_cache():
-            # One-model draft with separate KV cache layout
+            # One-model draft with separate KV cache layout.
+            # Pass num_layers explicitly since the HF config may report a
+            # different layer count than what is actually used at runtime
+            # (e.g. EAGLE3: config says 1, runtime uses 4).
+            # For PP, draft layers are only on the last rank (see
+            # get_pp_layers), so only that rank should include draft cost.
             effective_draft_config = self._get_effective_draft_config()
-            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
-                effective_draft_config,
-                mapping,
-                tokens_per_block=self._tokens_per_block)
+            if self._speculative_config.spec_dec_mode.is_external_drafter():
+                # External drafter: layers start from 0, normal PP distribution
+                kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                    effective_draft_config,
+                    mapping,
+                    tokens_per_block=self._tokens_per_block)
+            elif mapping.is_last_pp_rank():
+                # EAGLE3/MTP: draft layers only on last PP rank
+                kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                    effective_draft_config,
+                    mapping,
+                    tokens_per_block=self._tokens_per_block,
+                    num_layers=self._get_num_draft_layers())
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -311,6 +333,14 @@ class KvCacheCreator:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += ceil_div(num_req_tokens, self._tokens_per_block)
+
+        # With ADP enabled, _create_dummy_context_requests produces tp_size
+        # copies so each rank gets work during the estimation warmup. But the
+        # scheduler distributes them evenly (1 per rank), so each rank's KV
+        # cache only needs capacity for its own share, not all of them.
+        if self._mapping.enable_attention_dp and self._mapping.tp_size > 1:
+            num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
+                                1) // self._mapping.tp_size
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
@@ -514,6 +544,8 @@ class KvCacheCreator:
             estimating_kv_cache: bool = False) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
+        kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+            model_engine)
 
         # When using separate draft KV cache in one-model speculative decoding,
         # use layer_mask to include only target layers. The draft layers should
@@ -527,7 +559,7 @@ class KvCacheCreator:
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
-            kv_cache_manager_cls=self._kv_cache_manager_cls,
+            kv_cache_manager_cls=kv_cache_manager_cls,
             mapping=mapping,
             kv_cache_config=self._kv_cache_config,
             tokens_per_block=self._tokens_per_block,
@@ -601,9 +633,21 @@ class KvCacheCreator:
         # layers as well.
         return self._model_engine.model.model_config
 
+    def _get_num_draft_layers(self) -> int:
+        """Return the actual number of draft KV cache layers.
+
+        This must stay in sync with the num_layers passed to the draft KV
+        cache manager constructor in _create_one_model_draft_kv_cache_manager.
+        """
+        if self._speculative_config.spec_dec_mode.is_external_drafter():
+            return self._draft_config.pretrained_config.num_hidden_layers
+        return get_num_spec_layers(self._speculative_config)
+
     def _create_one_model_draft_kv_cache_manager(
-            self,
-            estimating_kv_cache: bool = False) -> Optional[KVCacheManager]:
+        self,
+        estimating_kv_cache: bool = False,
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+    ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
         when target and draft have different KV cache layouts.
@@ -615,11 +659,10 @@ class KvCacheCreator:
 
         # PARD, External Drafter: draft is a separate model, layers start from 0.
         # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
+        num_draft_layers = self._get_num_draft_layers()
         if self._speculative_config.spec_dec_mode.is_external_drafter():
-            num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_draft_layers
         else:
-            num_draft_layers = get_num_spec_layers(self._speculative_config)
             spec_dec_layer_mask = [False] * target_num_layers + [
                 True
             ] * num_draft_layers
@@ -650,11 +693,12 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
+        draft_kv_config = kv_cache_config_override if kv_cache_config_override is not None else self._kv_cache_config
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
-            kv_cache_config=self._kv_cache_config,
+            kv_cache_config=draft_kv_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
@@ -673,12 +717,62 @@ class KvCacheCreator:
             num_layers=num_draft_layers,
         )
 
+    def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
+        """Split max_gpu_total_bytes between target and draft KV caches.
+
+        When using KVCacheManagerV2 with a separate draft KV cache,
+        max_gpu_total_bytes represents the total budget for both target and
+        draft combined.  This method splits the budget proportionally based
+        on their per-token KV cache sizes.
+
+        Returns a cloned KvCacheConfig for the draft, or None if no split is
+        needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
+        in-place for the target.
+        """
+        total_budget = self._kv_cache_config.max_gpu_total_bytes
+        if total_budget is None or total_budget <= 0:
+            return None
+
+        total_kv = self._get_kv_size_per_token()
+        target_kv = self._kv_cache_manager_cls.get_cache_size_per_token(
+            self._model_engine.model.model_config,
+            self._mapping,
+            tokens_per_block=self._tokens_per_block)
+        draft_kv = total_kv - target_kv
+        if total_kv <= 0 or draft_kv <= 0:
+            return None
+
+        draft_budget = int(total_budget * draft_kv / total_kv)
+        target_budget = total_budget - draft_budget
+
+        logger.info(
+            f"Splitting KV cache budget: total={total_budget / GB:.2f} GiB, "
+            f"target={target_budget / GB:.2f} GiB ({target_kv}B/tok), "
+            f"draft={draft_budget / GB:.2f} GiB ({draft_kv}B/tok)")
+
+        self._kv_cache_config.max_gpu_total_bytes = target_budget
+
+        draft_kv_cache_config = self._kv_cache_config.model_copy()
+        draft_kv_cache_config.max_gpu_total_bytes = draft_budget
+        return draft_kv_cache_config
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         if self._skip_est:
             self.configure_kv_cache_capacity()
+
+        # For V2 with separate one-model draft KV cache, split the total budget
+        # between target and draft before creating either manager.
+        # Only split for the final managers, not during estimation — estimation
+        # uses max_tokens-based logic and must not have its config mutated.
+        # Two-model draft is excluded: V2 does not support two-model mode.
+        draft_kv_cache_config = None
+        if (not estimating_kv_cache
+                and self._should_create_separate_draft_kv_cache()
+                and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
+            draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine, estimating_kv_cache)
@@ -691,12 +785,16 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
+            assert draft_kv_cache_config is None, (
+                "KVCacheManagerV2 does not support two-model speculative decoding "
+                "with separate draft KV cache budget splitting.")
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine, estimating_kv_cache)
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
-                estimating_kv_cache)
+                estimating_kv_cache,
+                kv_cache_config_override=draft_kv_cache_config)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
@@ -926,7 +1024,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
         )
-    elif is_qwen3_next(config):
+    elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -935,19 +1033,10 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-        mamba_layer_mask = [
-            True if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else False for i in range(num_hidden_layers)
-        ]
-        hybrid_layer_mask = [
-            False if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else True for i in range(num_hidden_layers)
-        ]
-        num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
-            config.full_attention_interval - 1)
-        num_layers = num_hidden_layers - num_mamba_layers
+        hybrid_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
+            config)
+        num_layers = sum(hybrid_layer_mask)
+        num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.linear_key_head_dim,
@@ -1187,9 +1276,26 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    use_python_scheduler = scheduler_config.use_python_scheduler if scheduler_config is not None else False
-    if use_python_scheduler and not isinstance(kv_cache_manager,
-                                               KVCacheManagerV2):
+    if isinstance(kv_cache_manager, KVCacheManagerV2):
+        # V2: interleaved scheduler handles both capacity and budget
+        draft_kv_cache_manager = resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        scheduler_policy = (scheduler_config.capacity_scheduler_policy
+                            if scheduler_config is not None else
+                            CapacitySchedulerPolicy.MAX_UTILIZATION)
+        scheduler = KVCacheV2Scheduler(
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=kv_cache_manager,
+            scheduler_policy=scheduler_policy,
+            ctx_chunk_config=ctx_chunk_config,
+            peft_cache_manager=peft_cache_manager.impl
+            if peft_cache_manager is not None else None,
+            scheduler_capacity=scheduler_capacity,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
+    elif (scheduler_config is not None
+          and scheduler_config.use_python_scheduler):
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1202,20 +1308,12 @@ def create_py_executor_instance(
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity)
     else:
-        if isinstance(kv_cache_manager, KVCacheManagerV2):
-            capacity_scheduler = KVCacheV2DummyScheduler(
-                scheduler_capacity,
-                kv_cache_manager if kv_cache_manager is not None else None,
-                peft_cache_manager.impl
-                if peft_cache_manager is not None else None)
-        else:
-            capacity_scheduler = BindCapacityScheduler(
-                scheduler_capacity,
-                kv_cache_manager.impl if kv_cache_manager is not None else None,
-                peft_cache_manager.impl
-                if peft_cache_manager is not None else None,
-                scheduler_config.capacity_scheduler_policy,
-                two_step_lookahead=mapping.has_pp())
+        capacity_scheduler = BindCapacityScheduler(
+            scheduler_capacity,
+            kv_cache_manager.impl if kv_cache_manager is not None else None,
+            peft_cache_manager.impl if peft_cache_manager is not None else None,
+            scheduler_config.capacity_scheduler_policy,
+            two_step_lookahead=mapping.has_pp())
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
@@ -1237,6 +1335,7 @@ def create_py_executor_instance(
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
+
     return PyExecutor(
         resource_manager,
         scheduler,

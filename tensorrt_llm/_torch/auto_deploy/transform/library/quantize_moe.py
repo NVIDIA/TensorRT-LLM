@@ -25,7 +25,12 @@ from tensorrt_llm._torch.utils import ActivationType
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
-from ...utils.quantization_utils import should_skip_quantization
+from ...utils.quantization_utils import (
+    is_mixed_precision_config,
+    mixed_precision_has_algo,
+    should_skip_mixed_precision_quantization,
+    should_skip_quantization,
+)
 from ..interface import SharedConfig, TransformInfo, TransformRegistry
 from .quantization import (
     FP8LinearQuantizationFromConfig,
@@ -187,9 +192,20 @@ class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Gate by algo in quant_config
         qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        is_mixed = is_mixed_precision_config(qcfg)
+        if is_mixed:
+            if not mixed_precision_has_algo(qcfg, self.algo_name):
+                return gm, TransformInfo(
+                    skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                )
+            quantized_layers = qcfg.get("quantized_layers", {})
+        elif qcfg.get("quant_algo", "").upper() != self.algo_name:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -201,11 +217,15 @@ class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
             if not is_op(node, torch.ops.auto_deploy.torch_moe):
                 continue
 
-            # Check experts are allowed (no excludes)
             w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
-            if any(
-                should_skip_quantization(n, excluded_patterns)
-                for n in (w1_names + w2_names + w3_names)
+            all_weight_names = w1_names + w2_names + w3_names
+
+            if any(should_skip_quantization(n, excluded_patterns) for n in all_weight_names):
+                continue
+
+            if is_mixed and any(
+                should_skip_mixed_precision_quantization(n, self.algo_name, quantized_layers)
+                for n in all_weight_names
             ):
                 continue
 
@@ -238,9 +258,20 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Gate by algo in quant_config
         qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        is_mixed = is_mixed_precision_config(qcfg)
+        if is_mixed:
+            if not mixed_precision_has_algo(qcfg, self.algo_name):
+                return gm, TransformInfo(
+                    skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                )
+            quantized_layers = qcfg.get("quantized_layers", {})
+        elif qcfg.get("quant_algo", "").upper() != self.algo_name:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -252,11 +283,15 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
             if not is_op(node, torch.ops.auto_deploy.torch_moe):
                 continue
 
-            # Check experts are allowed (no excludes)
             w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
-            if any(
-                should_skip_quantization(n, excluded_patterns)
-                for n in (w1_names + w2_names + w3_names)
+            all_weight_names = w1_names + w2_names + w3_names
+
+            if any(should_skip_quantization(n, excluded_patterns) for n in all_weight_names):
+                continue
+
+            if is_mixed and any(
+                should_skip_mixed_precision_quantization(n, self.algo_name, quantized_layers)
+                for n in all_weight_names
             ):
                 continue
 

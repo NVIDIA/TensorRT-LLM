@@ -21,7 +21,7 @@ class DiffusionRequest:
     """Request for diffusion inference with explicit model-specific parameters."""
 
     request_id: int
-    prompt: str
+    prompt: List[str]
     negative_prompt: Optional[str] = None
     height: int = 720
     width: int = 1280
@@ -184,15 +184,13 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
-        if (
-            self.pipeline.common_warmup_shapes
-            and (req.height, req.width, req.num_frames) not in self.pipeline.common_warmup_shapes
-        ):
+        cache_key = self.pipeline.warmup_cache_key(req.height, req.width, num_frames=req.num_frames)
+        if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
             logger.warning(
-                f"Requested shape (height={req.height}, width={req.width}, num_frames={req.num_frames}) "
-                f"was not warmed up. First request with this shape will be slower due to "
-                "torch.compile recompilation or CUDA graph capture."
-                f"Warmed-up shapes: {self.pipeline.common_warmup_shapes}"
+                f"Requested shape {cache_key} was not warmed up. "
+                f"First request with this shape will be slower due to "
+                f"torch.compile recompilation or CUDA graph capture. "
+                f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
             )
         try:
             output = self.pipeline.infer(req)

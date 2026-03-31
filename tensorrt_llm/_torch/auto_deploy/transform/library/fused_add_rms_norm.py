@@ -111,6 +111,9 @@ class FuseAddRMSNorm(BaseTransform):
                 )
                 norm_out = graph.call_function(operator.getitem, args=(fused_node, 0))
                 add_out = graph.call_function(operator.getitem, args=(fused_node, 1))
+                # Preserve metadata needed by downstream transforms.
+                norm_out.meta.update(norm_node.meta)
+                add_out.meta.update(add_node.meta)
 
             # Rewire all consumers of the original norm → norm_out
             norm_node.replace_all_uses_with(norm_out)

@@ -148,10 +148,10 @@ def test_add_resource_paged_handler(paged_kv_cache_config):
     )
 
     handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout="HND")
-    interface.add_resource("kv_cache_0", handler)
+    full_name = interface.add_resource("kv_cache_0", handler)
 
-    assert "kv_cache_0" in interface._resource_lookup
-    assert interface._resource_lookup["kv_cache_0"] is handler
+    assert full_name in interface._resource_lookup
+    assert interface._resource_lookup[full_name] is handler
 
 
 def test_add_resource_state_handler(paged_kv_cache_config):
@@ -164,9 +164,9 @@ def test_add_resource_state_handler(paged_kv_cache_config):
     )
 
     handler = SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16)
-    interface.add_resource("ssm_state_0", handler)
+    full_name = interface.add_resource("ssm_state_0", handler)
 
-    assert interface._resource_lookup["ssm_state_0"] is handler
+    assert interface._resource_lookup[full_name] is handler
 
 
 def test_add_resource_unpaged_handler(paged_kv_cache_config):
@@ -179,10 +179,10 @@ def test_add_resource_unpaged_handler(paged_kv_cache_config):
     )
 
     handler = UnpagedResourceHandler(8, 64, dtype=torch.float16)
-    interface.add_resource("unpaged_cache", handler)
+    full_name = interface.add_resource("unpaged_cache", handler)
 
-    assert "unpaged_cache" in interface._resource_lookup
-    assert interface._resource_lookup["unpaged_cache"] is handler
+    assert full_name in interface._resource_lookup
+    assert interface._resource_lookup[full_name] is handler
 
 
 def test_add_multiple_resources(paged_kv_cache_config):
@@ -265,7 +265,7 @@ def test_initialize_resources_creates_cache_views_with_correct_shape(paged_kv_ca
     num_kv_heads = 8
     head_dim = 64
     # Using HND layout (default)
-    interface.add_resource(
+    full_name = interface.add_resource(
         "kv_cache_0",
         KVPagedResourceHandler(num_kv_heads, head_dim, dtype=torch.float16, kv_layout="HND"),
     )
@@ -273,10 +273,10 @@ def test_initialize_resources_creates_cache_views_with_correct_shape(paged_kv_ca
     interface.initialize_resources()
 
     # Check cache view exists
-    assert "kv_cache_0" in interface._caches
+    assert full_name in interface._caches
 
     # Check shape for HND layout: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
-    kv_cache = interface._caches["kv_cache_0"]
+    kv_cache = interface._caches[full_name]
     assert kv_cache is not None
     assert kv_cache.shape[1] == 2  # K and V
     assert kv_cache.shape[2] == num_kv_heads
@@ -298,7 +298,7 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     head_dim = 64
     ssm_state_size = 16
     interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource(
+    ssm_name = interface.add_resource(
         "ssm_state_0",
         SSMResourceHandler(
             num_heads=num_heads, head_dim=head_dim, d_state=ssm_state_size, dtype=torch.bfloat16
@@ -308,7 +308,7 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     interface.initialize_resources()
 
     # Check state view exists
-    ssm_cache = interface._caches["ssm_state_0"]
+    ssm_cache = interface._caches[ssm_name]
     assert ssm_cache is not None
     # Shape: [num_states, num_heads, head_dim, ssm_state_size]
     assert ssm_cache.shape[1] == num_heads
@@ -328,15 +328,15 @@ def test_initialize_resources_unpaged_allocated_locally(paged_kv_cache_config):
 
     num_kv_heads = 8
     head_dim = 64
-    interface.add_resource(
+    full_name = interface.add_resource(
         "unpaged_cache", UnpagedResourceHandler(num_kv_heads, head_dim, dtype=torch.float16)
     )
 
     interface.initialize_resources()
 
     # Check unpaged cache was allocated
-    assert "unpaged_cache" in interface._caches
-    unpaged_cache = interface._caches["unpaged_cache"]
+    assert full_name in interface._caches
+    unpaged_cache = interface._caches[full_name]
     assert unpaged_cache is not None
     # Shape: [max_batch_size + 1, max_seq_len, num_kv_heads, head_dim]
     assert unpaged_cache.shape == (4 + 1, 128, num_kv_heads, head_dim)
@@ -547,7 +547,9 @@ def test_named_args_includes_sequence_info_and_caches(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    full_name = interface.add_resource(
+        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+    )
     interface.initialize_resources()
 
     named_args = interface.named_args
@@ -557,7 +559,7 @@ def test_named_args_includes_sequence_info_and_caches(paged_kv_cache_config):
     assert "position_ids" in named_args
 
     # Should contain cache
-    assert "kv_cache_0" in named_args
+    assert full_name in named_args
 
 
 def test_args_returns_tuple_of_tensors(paged_kv_cache_config):
@@ -789,17 +791,19 @@ def test_multiple_ssm_resources_contiguous_views(paged_kv_cache_config):
     )
 
     # Add 3 SSM resources with same parameters (compatible)
+    ssm_names = []
     for i in range(3):
-        interface.add_resource(
+        name = interface.add_resource(
             f"ssm_state_{i}",
             SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
         )
+        ssm_names.append(name)
 
     interface.initialize_resources()
 
     # Verify all SSM views are contiguous
-    for i in range(3):
-        ssm_cache = interface._caches[f"ssm_state_{i}"]
+    for i, name in enumerate(ssm_names):
+        ssm_cache = interface._caches[name]
         assert ssm_cache is not None
         assert ssm_cache.is_contiguous(), f"SSM view {i} is not contiguous"
 
@@ -814,17 +818,19 @@ def test_multiple_conv_resources_contiguous_views(paged_kv_cache_config):
     )
 
     # Add 3 Conv resources with same parameters (compatible)
+    conv_names = []
     for i in range(3):
-        interface.add_resource(
+        name = interface.add_resource(
             f"conv_state_{i}",
             CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32),
         )
+        conv_names.append(name)
 
     interface.initialize_resources()
 
     # Verify all Conv views are contiguous
-    for i in range(3):
-        conv_cache = interface._caches[f"conv_state_{i}"]
+    for i, name in enumerate(conv_names):
+        conv_cache = interface._caches[name]
         assert conv_cache is not None
         assert conv_cache.is_contiguous(), f"Conv view {i} is not contiguous"
 
@@ -849,19 +855,23 @@ def test_mixed_ssm_conv_resources_uses_min_layers(paged_kv_cache_config):
     conv_dim = head_dim * num_heads + 2 * n_groups * d_state
 
     # Add 3 SSM and 2 Conv resources
+    ssm_names = []
     for i in range(3):
-        interface.add_resource(
+        name = interface.add_resource(
             f"ssm_state_{i}",
             SSMResourceHandler(
                 num_heads=num_heads, head_dim=head_dim, d_state=d_state, dtype=torch.bfloat16
             ),
         )
+        ssm_names.append(name)
 
+    conv_names = []
     for i in range(2):
-        interface.add_resource(
+        name = interface.add_resource(
             f"conv_state_{i}",
             CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
         )
+        conv_names.append(name)
 
     interface.initialize_resources()
 
@@ -869,10 +879,10 @@ def test_mixed_ssm_conv_resources_uses_min_layers(paged_kv_cache_config):
     assert isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
 
     # All caches should exist
-    for i in range(3):
-        assert interface._caches[f"ssm_state_{i}"] is not None
-    for i in range(2):
-        assert interface._caches[f"conv_state_{i}"] is not None
+    for name in ssm_names:
+        assert interface._caches[name] is not None
+    for name in conv_names:
+        assert interface._caches[name] is not None
 
 
 def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
@@ -886,12 +896,12 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
 
     # Add a generic StateResourceHandler (not SSM or Conv)
     generic_handler = StateResourceHandler(10, 20, dtype=torch.float32)
-    interface.add_resource("generic_state", generic_handler)
+    full_name = interface.add_resource("generic_state", generic_handler)
 
     interface.initialize_resources()
 
     # Generic handler should be allocated but via local allocation (not MambaHybridCacheManager)
-    assert interface._caches["generic_state"] is not None
+    assert interface._caches[full_name] is not None
     # Without typed handlers, should use plain KVCacheManager
     assert isinstance(interface.kv_cache_manager, KVCacheManager)
 
@@ -934,7 +944,8 @@ def test_args_stored_to_input_buffer():
     """Verify that args are written to InputBuffer by nest_sequences."""
     seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
 
-    # nest_sequences should store token_gather_indices and tokens_gather_info
+    # nest_sequences computes token_gather_indices internally from gather_context_logits
+    # Default (gather_context_logits=False): 1 prefill seq of 3 tokens → gather last token only
     seq_info.nest_sequences(
         input_ids=[1, 2, 3],
         cu_seqlen=[0, 3],
@@ -943,12 +954,26 @@ def test_args_stored_to_input_buffer():
         cu_num_pages=[0, 1],
     )
 
-    # Should be accessible via get_arg (reads from InputBuffer)
     token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
     assert token_gather_indices is not None
+    assert token_gather_indices.tolist() == [2]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 1
+    assert seq_info.batch_info.is_gather_required() is True
 
-    tokens_gather_info = seq_info.get_arg("tokens_gather_info", truncate=True)
-    assert tokens_gather_info is not None
+    # With gather_context_logits=True: all tokens kept, no gather required
+    seq_info.nest_sequences(
+        input_ids=[1, 2, 3],
+        cu_seqlen=[0, 3],
+        input_pos=[0],
+        cache_loc=[0],
+        cu_num_pages=[0, 1],
+        gather_context_logits=True,
+    )
+
+    token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.tolist() == [0, 1, 2]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 3
+    assert seq_info.batch_info.is_gather_required() is False
 
 
 def test_register_host_prepare_populates_requires_copy():

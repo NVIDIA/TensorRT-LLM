@@ -305,7 +305,6 @@ def setup_llm(args, **kwargs):
         enable_iter_perf_stats=args.print_iter_log,
         torch_compile_config=TorchCompileConfig(
             enable_fullgraph=args.use_torch_compile,
-            enable_inductor=args.use_torch_compile,
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,

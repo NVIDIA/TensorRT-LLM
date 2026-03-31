@@ -4,6 +4,7 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek import (
     DeepSeekV3Attention,
     DeepSeekV3DecoderLayer,
@@ -442,7 +443,9 @@ class TestMLAOpRegistration:
             num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank, dtype=dtype, device=device
         )
 
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
+        _bi = BatchInfo()
+        _bi.update([0, 0, 0, 0, batch_size, batch_size])
+        batch_info_host = _bi.serialize()
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int32, device=device)
         input_pos = torch.tensor([0], dtype=torch.int32, device=device)
         cache_loc = torch.tensor([0], dtype=torch.int32, device=device)

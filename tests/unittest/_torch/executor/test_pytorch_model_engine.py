@@ -172,7 +172,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch = ScheduledRequests()
             batch.generation_requests = requests
             pages_before = kv_cache_manager.get_num_free_blocks()
-            new_dummy_block = 1 if model_engine.cuda_graph_runner.padding_dummy_request is None else 0
+            new_dummy_block = 1 if not model_engine.cuda_graph_runner.padding_dummy_requests else 0
             with model_engine.cuda_graph_runner.pad_batch(
                     batch, resource_manager) as padded_batch:
                 if batch_size < 8 and max_seq_len < 25:
@@ -472,6 +472,84 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                    'seq_lens') and attn_metadata.seq_lens is not None:
             actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
             self.assertEqual(actual_seq_lens, expected_seq_lens)
+
+    def test_prepare_tp_inputs_with_partial_mrope_segments(self) -> None:
+        """Test generation-only MRoPE assembly with a real multimodal span and a dummy padded request."""
+        llm_args = TorchLlmArgs(model="dummy")
+        model_engine = DummyModelEngine(llm_args, dtype=torch.half)
+        model_engine.model.model_config.pretrained_config.rope_scaling = {
+            "type": "mrope"
+        }
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_config = KvCacheConfig(max_tokens=32)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=16,
+            head_dim=16,
+            tokens_per_block=1,
+            max_seq_len=32,
+            max_batch_size=4,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.HALF,
+        )
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=32,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        model_engine.max_num_tokens = 32
+        model_engine.input_ids_cuda = torch.zeros(32,
+                                                  dtype=torch.int32,
+                                                  device='cuda')
+        model_engine.position_ids_cuda = torch.zeros(32,
+                                                     dtype=torch.int32,
+                                                     device='cuda')
+        model_engine.mrope_position_ids_cuda = torch.zeros((3, 1, 32),
+                                                           dtype=torch.int32,
+                                                           device='cuda')
+        model_engine.previous_batch_indices_cuda = torch.zeros(
+            32, dtype=torch.int32, device='cuda')
+
+        multimodal_request = _create_request(4, 1)
+        multimodal_request.py_prompt_len = 4
+        multimodal_request.py_batch_idx = None
+        multimodal_request.py_seq_slot = 0
+        multimodal_request.sampling_config.beam_width = 1
+        multimodal_request.py_multimodal_data = {
+            "mrope_config": {
+                "mrope_position_deltas": torch.tensor([[10]], dtype=torch.int32)
+            }
+        }
+
+        dummy_request = _create_request(6, 2)
+        dummy_request.py_prompt_len = 6
+        dummy_request.py_batch_idx = None
+        dummy_request.py_seq_slot = 1
+        dummy_request.sampling_config.beam_width = 1
+        dummy_request.py_multimodal_data = {}
+        dummy_request.is_cuda_graph_dummy = True
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = [
+            multimodal_request, dummy_request
+        ]
+
+        result, _ = model_engine._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata)
+
+        position_ids = result["position_ids"]
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 2))
+        expected = torch.tensor([[[13, 5]], [[13, 5]], [[13, 5]]],
+                                dtype=torch.int32,
+                                device='cuda')
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self):
         """Test that KVCacheManager uses the provided execution_stream.

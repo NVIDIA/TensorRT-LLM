@@ -233,6 +233,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             cache_loc=list(range(bs)),
             cu_num_pages=list(range(bs + 1)),
             slot_idx=list(range(bs)),
+            gather_context_logits=True,
         )
 
         # Use the cm.args as is - it already contains the correct position_ids
