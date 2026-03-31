@@ -86,7 +86,7 @@ The core algorithm (`topKPerRowJob`) uses a **radix-select** approach that is da
 3. **Find Threshold**: Identify which bucket contains the $K$-th element
 4. **Filter**: Retain candidates in the threshold bucket; emit elements in higher buckets directly
 
-The implementation follows a **half → 11 → 11 → 10** bit decomposition (4 iterations), with an optimization that exits early and switches to CUB radix sort or comparison-based ranking when the candidate set drops below 2048 elements. For very long sequences (N > 200K), the split-CTA path distributes work across 10 CTAs and merges results.
+The implementation follows a **half → 11 → 11 → 10** bit decomposition (4 iterations), with an optimization that exits early and switches to CUB radix sort or comparison-based ranking when the candidate set drops below 2048 elements. For very long sequences ($N > 200$K), the split-CTA path distributes work across 10 CTAs and merges results.
 
 ### Complexity of Classical Top-K Approaches
 
@@ -123,15 +123,15 @@ The three DSA decode-step components have fundamentally different scaling charac
 
 | Component | Scaling | Total Memory Traffic | Trend as $N$ Grows |
 |:-----------:|:---------:|:---------------------:|:-------------------:|
-| **Indexer MQA** | $O(N)$ | $N \cdot d_i \cdot 2$B | Linear growth |
-| **Top-K (radix-select)** | $O(R \cdot N)$ | $R \cdot N \cdot 4$B | Linear growth ($R$ passes) |
-| **Sparse MLA** | $O(K)$ | $K \cdot d \cdot 2$B | **Constant** ($K$ fixed) |
+| **Indexer MQA** | $O(N)$ | N·d_i·2B | Linear growth |
+| **Top-K (radix-select)** | $O(R \cdot N)$ | R·N·4B | Linear growth ($R$ passes) |
+| **Sparse MLA** | $O(K)$ | K·d·2B | **Constant** ($K$ fixed) |
 
 </div>
 
 <sub><em>N: sequence length. K = 2048: fixed Top-K count. R ≈ 3: radix-select passes. d<sub>i</sub> = 128: indexer head dimension. d = 192: MLA head dimension (128 non-PE + 64 PE).</em></sub>
 
-The Top-K memory traffic $R \cdot N \cdot 4$B grows linearly with $N$ while sparse MLA remains constant at $K \cdot d \cdot 2$B. This means the **Top-K fraction of DSA latency increases monotonically** with sequence length — from a minor component at short sequences to a dominant bottleneck at long sequences. The production radix-select kernel already achieves 7.4× over `torch.topk` (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), yet two factors limit its efficiency beyond the raw $O(R \cdot N)$ traffic:
+The Top-K memory traffic R·N·4B grows linearly with $N$ while sparse MLA remains constant at K·d·2B. This means the **Top-K fraction of DSA latency increases monotonically** with sequence length — from a minor component at short sequences to a dominant bottleneck at long sequences. The production radix-select kernel already achieves 7.4× over `torch.topk` (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), yet two factors limit its efficiency beyond the raw $O(R \cdot N)$ traffic:
 
 - **Multi-pass data re-reads**: each of the $R \approx 3$ radix-select steps performs two full scans of all $N$ elements (histogram build + filter/collect), totaling ~6 $N$-element scans per kernel invocation.
 - **Shared-memory atomic serialization**: the histogram phase uses `atomicAdd` on shared-memory bin counters (2048 bins, hot-bin contention), and the collect phase funnels all qualifying elements through a single `atomicAdd(&counter, 1)` — serializing threads that compete on the same address and reducing effective SIMT utilization well below the memory bandwidth ceiling.
@@ -186,7 +186,7 @@ An earlier approach considered using **peak indices** of $f(\Delta)$ (positions 
 
 This pre-computed index set captures the **structural prior** — the positions that RoPE frequency structure inherently favors. During inference, the actual Top-K indices for a query at position $n$ are the positions $m$ such that $n - m \in \mathcal{P}_{\text{static}}$, modulated by the data-dependent content of the actual Q/K tensors and the indexer weight $W^I$.
 
-In practice, we use the **previous step's Top-K result** as the prediction signal (`preIdx`), which captures both the structural RoPE prior and the data-dependent content correlation. For the majority of layers (L20–L60), this achieves prediction accuracy α ≈ 0.35–0.50 (35–50% of the previous Top-K indices remain in the current Top-K set), which is sufficient for the heuristic algorithm to converge in 1–2 interpolation iterations. Notably, Layers 0 and 1 exhibit near-zero temporal correlation (α ≈ 0.01), causing the heuristic kernel to fall back on more interpolation iterations for those layers — consistent with their lower speedup ratios in the benchmarks.
+In practice, we use the **previous step's Top-K result** as the prediction signal (`preIdx`), which captures both the structural RoPE prior and the data-dependent content correlation. For the majority of layers (L20–L60), this achieves prediction accuracy $\alpha \approx 0.35$–$0.50$ (35–50% of the previous Top-K indices remain in the current Top-K set), which is sufficient for the heuristic algorithm to converge in 1–2 interpolation iterations. Notably, Layers 0 and 1 exhibit near-zero temporal correlation ($\alpha \approx 0.01$), causing the heuristic kernel to fall back on more interpolation iterations for those layers — consistent with their lower speedup ratios in the benchmarks.
 
 ## Heuristic-Guided Top-K Algorithm
 
@@ -240,18 +240,18 @@ $$T_{\text{new}} = T_{\text{lo}} + \frac{f(T_{\text{lo}}) - f_{\text{target}}}{f
 
 with first-iteration damping ($\leq 0.5$) to prevent overshoot, and bisection fallback at float precision limits. For smooth CDFs, secant interpolation achieves superlinear convergence (order $\approx 1.618$).
 
-When Phase 2 converges cleanly (`done=1`), a **safety-net guard** skips the subsequent verification `blockCountGE` call that would otherwise be redundant, saving $\sim$4 µs per kernel invocation.
+When Phase 2 converges cleanly (`done=1`), a **safety-net guard** skips the subsequent verification `blockCountGE` call that would otherwise be redundant, saving ~4 µs per kernel invocation.
 
-**Cost**: $O(I \cdot N/P)$ where $I$ is the number of iterations. On real decoding data with good prediction: I ≈ 1–2. On synthetic data with poor prediction: I ≈ 4–6.
+**Cost**: $O(I \cdot N/P)$ where $I$ is the number of iterations. On real decoding data with good prediction: $I \approx 1$–$2$. On synthetic data with poor prediction: $I \approx 4$–$6$.
 
 #### Phase 3: Ballot-Free Candidate Collection
 
-Once a valid threshold is found, all elements $\geq T$ are collected into shared memory. This phase uses a **ballot-free** design with a key optimization: **Phase 3 sub-pass 1 (count) is eliminated** by reusing the per-thread counts cached by Phase 2's last `blockCountGE` call. Since the threshold has not changed between Phase 2's final count and Phase 3, the cached `smem->per_thread_counts[tid]` values are directly valid — saving an entire $N$-element rescan ($\sim$4 µs).
+Once a valid threshold is found, all elements $\geq T$ are collected into shared memory. This phase uses a **ballot-free** design with a key optimization: **Phase 3 sub-pass 1 (count) is eliminated** by reusing the per-thread counts cached by Phase 2's last `blockCountGE` call. Since the threshold has not changed between Phase 2's final count and Phase 3, the cached `smem->per_thread_counts[tid]` values are directly valid — saving an entire $N$-element rescan (~4 µs).
 
 - **Write-offset computation**: Read per-thread counts from cache → warp prefix sum → cross-warp prefix sum → pre-computed write offsets.
 - **Sub-pass 2 (Write)**: Each thread writes to its pre-allocated shared-memory range. No `__ballot_sync`, no `__shfl_sync`, no `atomicAdd`.
 
-The ballot-free design is critical: `__ballot_sync` acts as a compiler barrier that serializes L2 load pipelining. The original per-element ballot approach costs $\sim$30,000 cycles (5x the `blockCountGE` cost); the ballot-free approach costs $\sim$16,000 cycles.
+The ballot-free design is critical: `__ballot_sync` acts as a compiler barrier that serializes L2 load pipelining. The original per-element ballot approach costs ~30,000 cycles (5x the `blockCountGE` cost); the ballot-free approach costs ~16,000 cycles.
 
 **Cost**: $O(N/P)$ — one sub-pass scanning the full input (the count sub-pass is eliminated via caching).
 
@@ -267,11 +267,11 @@ The ballot-free design is critical: `__ballot_sync` acts as a compiler barrier t
 If the candidate count does not exactly equal $K$, a shared-memory refinement selects exactly $K$ elements:
 
 1. **Min/Max scan** over candidates for accurate histogram bins
-2. **2048-bin histogram** via `atomicAdd` over the candidate set, followed by a **warp-parallel K-th bin search**: each warp sums its `NUM_BINS / NUM_WARPS` bins (high-to-low), then `tid=0` scans `NUM_WARPS` warp-totals to find the target warp, and finally the target warp's `lane=0` locates the exact bin. This reduces serial scan steps from 2048 to 2 × NUM_WARPS + NUM_BINS / NUM_WARPS = 160 (12.8× fewer).
+2. **2048-bin histogram** via `atomicAdd` over the candidate set, followed by a **warp-parallel K-th bin search**: each warp sums its `NUM_BINS / NUM_WARPS` bins (high-to-low), then `tid=0` scans `NUM_WARPS` warp-totals to find the target warp, and finally the target warp's `lane=0` locates the exact bin. This reduces serial scan steps from 2048 to `2×NUM_WARPS + NUM_BINS/NUM_WARPS = 160` (12.8× fewer).
 3. **Snap iterations**: Refine the threshold to the exact $K$-th largest value by stepping through distinct data values. Each fused snap iteration computes `(count_ge, count_gt, snap_up, snap_down)` in one shared-memory scan. Convergence: when $n_{>}(T) < K \leq n_{\geq}(T)$. With 2048 bins, only **1–3** snap iterations are needed per kernel invocation.
 4. **Partition**: Emit elements $> T^*$ unconditionally, fill remaining slots with elements $= T^*$.
 
-**Cost**: $O(S \cdot C/P)$ where S ≈ 1–3 snap iterations, $C \leq 6144$ candidates. This is purely shared-memory work — no global memory access.
+**Cost**: $O(S \cdot C/P)$ where $S \approx 1$–$3$ snap iterations, $C \leq 6144$ candidates. This is purely shared-memory work — no global memory access.
 
 ### Complexity Analysis
 
@@ -287,7 +287,7 @@ If the candidate count does not exactly equal $K$, a shared-memory refinement se
 
 </div>
 
-For real decoding data ($I \approx 2$, $S \approx 2$, $P = 512$, $B = 2048$, $C \leq 6144$): approximately $3N/P + 2C/P$ memory accesses. The Phase 3 count-cache optimization eliminates one full N-scan (the count sub-pass), reducing the total from $(I+2)$ to $(I+1)$ global-memory passes. Compared to the radix-select baseline which requires $R \cdot N/P$ accesses with $R \approx 3$–$4$ passes (each pass includes histogram + prefix sum + filter), the heuristic approach has fewer global memory accesses and significantly less shared-memory synchronization overhead.
+For real decoding data ($I \approx 2$, $S \approx 2$, $P = 512$, $B = 2048$, $C \leq 6144$): approximately $3N/P + 2C/P$ memory accesses. The Phase 3 count-cache optimization eliminates one full $N$-scan (the count sub-pass), reducing the total from $(I+2)$ to $(I+1)$ global-memory passes. Compared to the radix-select baseline which requires $R \cdot N/P$ accesses with $R \approx 3\text{--}4$ passes (each pass includes histogram + prefix sum + filter), the heuristic approach has fewer global memory accesses and significantly less shared-memory synchronization overhead.
 
 ## GPU Kernel Implementation on Blackwell
 
@@ -351,8 +351,8 @@ The heuristic kernel uses ~2× the SMEM of radix-select because candidates colle
 
 The heuristic path requires two additional persistently pre-allocated HBM buffers (CUDA Graph compatible):
 
-- **`heuristic_scratch_values`** (B × K × 4 bytes): A write-only dummy buffer for the kernel's output-values path. The DSA pipeline only consumes the output indices, but the kernel unconditionally writes values alongside indices to preserve optimal SASS code generation quality. This buffer is never read downstream.
-- **`heuristic_prev_topk`** (L × B × K × 4 bytes, where L = number of local DSA layers): Stores the previous decode step's Top-K indices per layer as preIdx for the next step. A dedicated buffer is required because (1) `topk_indices_buffer` is overwritten in-place each step (read-after-write conflict), (2) each layer needs independent temporal state, and (3) CUDA Graph replay requires stable-address feedback buffers.
+- **`heuristic_scratch_values`** (`B × K × 4` bytes): A write-only dummy buffer for the kernel's output-values path. The DSA pipeline only consumes the output indices, but the kernel unconditionally writes values alongside indices to preserve optimal SASS code generation quality. This buffer is never read downstream.
+- **`heuristic_prev_topk`** (`L × B × K × 4` bytes, where L = number of local DSA layers): Stores the previous decode step's Top-K indices per layer as preIdx for the next step. A dedicated buffer is required because (1) `topk_indices_buffer` is overwritten in-place each step (read-after-write conflict), (2) each layer needs independent temporal state, and (3) CUDA Graph replay requires stable-address feedback buffers.
 
 ## Evaluation
 
@@ -444,7 +444,7 @@ The heuristic Top-K kernel produces **bit-exact** Top-K index sets compared to `
 
 <sub><em>Table 1. B200, synthetic input with norm/gamma/beta distribution. "Production Baseline" is the `topKPerRowDecode` kernel (insert sort for $N < 12{,}288$, radix sort for $N \geq 12{,}288$). "Speedup" = baseline time / heuristic time.</em></sub>
 
-At short sequences (N = 8,192), the overhead of Phase 1 (scattered preIdx reads) and Phase 2 (interpolation iterations) outweighs the savings, making the heuristic kernel ~32% slower. The heuristic kernel breaks even around N = 16,384 and increasingly outperforms the baseline as sequence length grows — reaching **1.75×** at N = 131,072. This scaling advantage arises because the heuristic kernel's global-memory pass count (I + 1 ≈ 3–4) grows slowly relative to the radix-select approach, whose multi-pass histogram + prefix-sum + filter pipeline incurs higher per-pass overhead at large $N$.
+At short sequences ($N = 8192$), the overhead of Phase 1 (scattered preIdx reads) and Phase 2 (interpolation iterations) outweighs the savings, making the heuristic kernel ~32% slower. The heuristic kernel breaks even around $N = 16384$ and increasingly outperforms the baseline as sequence length grows — reaching **1.75×** at $N = 131072$. This scaling advantage arises because the heuristic kernel's global-memory pass count ($I + 1 \approx 3$–$4$) grows slowly relative to the radix-select approach, whose multi-pass histogram + prefix-sum + filter pipeline incurs higher per-pass overhead at large $N$.
 
 **Key insight**: The static RoPE structural prior used as preIdx in the synthetic benchmark achieves substantial overlap with the true Top-K, enabling Phase 2 to converge in fewer iterations than a blind search. Combined with the efficient single-CTA design and ballot-free collection, this yields a consistent scaling advantage at longer sequence lengths.
 
@@ -567,7 +567,7 @@ bool const canUseHeuristic = preIdx != nullptr       // previous-step Top-K avai
     && heuristicScratch != nullptr;                  // scratch buffer allocated
 ```
 
-When any condition is not met (e.g., prefill phase, N ≥ 200K, first token without preIdx), the dispatch falls through to the original radix-select pipeline, ensuring no regression.
+When any condition is not met (e.g., prefill phase, $N \geq 200$K, first token without preIdx), the dispatch falls through to the original radix-select pipeline, ensuring no regression.
 
 **How to enable.** The heuristic Top-K is controlled by the `enable_heuristic_topk` field in `DeepSeekSparseAttentionConfig` (default: `false`). It can be enabled via the YAML config file passed to `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`:
 
@@ -633,7 +633,7 @@ The end-to-end improvement is modest (~0.5%) for two reasons: (1) the Top-K kern
 
 - **Longer sequence benchmarks**: Evaluate at ISL=32K and ISL=64K where the Top-K fraction is significantly larger, expecting more pronounced end-to-end gains.
 - **Adaptive prediction sources**: Explore using the static RoPE-based candidate set as a fallback when temporal correlation is low (e.g., the first token after a distribution shift), and dynamically blending static and temporal predictions.
-- **Multi-CTA heuristic**: Extend the heuristic approach to the multi-CTA split-work regime for very long sequences (N > 200K), where the current implementation falls back to radix-select.
+- **Multi-CTA heuristic**: Extend the heuristic approach to the multi-CTA split-work regime for very long sequences ($N > 200$K), where the current implementation falls back to radix-select.
 - **Prefill-phase heuristic**: Investigate whether the heuristic approach can benefit the prefill phase, where multiple query tokens share the same key set and inter-query prediction may be feasible.
 - **Cross-model generalization**: Apply the temporal-correlation-guided Top-K to other sparse attention methods that use Top-K selection, such as RocketKV's generation-phase dynamic Top-K.
 - **FP8 indexer score support**: As indexer MQA moves toward lower-precision outputs, adapt the histogram and threshold logic for FP8 or BF16 score distributions.
