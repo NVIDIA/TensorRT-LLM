@@ -1050,86 +1050,6 @@ def mla_dsa_attn_inplace(
                                output)
 
 
-@torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
-def mla_dsa_proj(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    """Token-wise projections for DSA MLA (CUDA-graph-capturable).
-
-    Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-    indexer.pre_indexer_proj (FP8 quantize, weight scaling).  Does NOT
-    update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
-    because the scatter kernel accesses batch-specific metadata.
-
-    Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
-    handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
-    k_fp8, k_scale, weights] when the indexer runs.  Under torch compile,
-    _should_use_short_mha returns False so the result is always length 8,
-    keeping control flow straight-line for CUDA graph capture.
-    """
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
-
-
-@mla_dsa_proj.register_fake
-def _mla_dsa_proj_fake(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    # Under torch compile _should_use_short_mha is False, so always 8 tensors.
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    num_tokens = hidden_states.shape[0]
-    indexer = mla_layer.mqa.indexer
-    q = hidden_states.new_empty(
-        [num_tokens, mla_layer.num_heads_tp * mla_layer.qk_head_dim])
-    compressed_kv = hidden_states.new_empty(
-        [num_tokens, mla_layer.kv_lora_rank])
-    k_pe = hidden_states.new_empty([num_tokens, mla_layer.qk_rope_head_dim])
-    latent_cache = hidden_states.new_empty(
-        [num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim])
-    # Indexer intermediates: q_fp8, k_fp8, k_scale, weights
-    q_fp8 = hidden_states.new_empty(
-        [num_tokens, indexer.n_heads, indexer.head_dim],
-        dtype=torch.float8_e4m3fn)
-    k_fp8 = hidden_states.new_empty([num_tokens, indexer.head_dim],
-                                    dtype=torch.float8_e4m3fn)
-    k_scale = hidden_states.new_empty([num_tokens, indexer.head_dim // 128],
-                                      dtype=torch.float32)
-    weights = hidden_states.new_empty([num_tokens, indexer.n_heads],
-                                      dtype=torch.float32)
-    return [
-        q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights
-    ]
-
-
-@torch.library.custom_op("trtllm::mla_dsa_attn_inplace",
-                         mutates_args=("output", ))
-def mla_dsa_attn_inplace(
-    q: torch.Tensor,
-    compressed_kv: torch.Tensor,
-    k_pe: torch.Tensor,
-    latent_cache: torch.Tensor,
-    indexer_intermediates: List[torch.Tensor],
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-    output: torch.Tensor,
-) -> None:
-    """Batch-structure-dependent attention dispatch for DSA MLA.
-
-    indexer_intermediates is [q_fp8, k_fp8, k_scale, weights] when the
-    indexer ran in Op 1, or [] when short-MHA handled all tokens.
-    Runs sparse_attn_indexer then dispatches context/generation attention.
-    This op is excluded from CUDA graph capture.
-    """
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    mla_layer.forward_dsa_attn(q, compressed_kv, k_pe, latent_cache,
-                               indexer_intermediates, position_ids, metadata,
-                               output)
-
-
 def fp8_block_scaling_bmm_out(
     mat1: torch.Tensor,
     mat2_fp8: torch.Tensor,
@@ -2861,10 +2781,7 @@ class MLA(nn.Module):
             if self.is_dsa:
                 proj_outputs = torch.ops.trtllm.mla_dsa_proj(
                     hidden_states, position_ids, self.layer_idx_str)
-                q, compressed_kv, k_pe, latent_cache = (proj_outputs[0],
-                                                        proj_outputs[1],
-                                                        proj_outputs[2],
-                                                        proj_outputs[3])
+                q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
                 indexer_intermediates = proj_outputs[4:]
                 torch.ops.trtllm.mla_dsa_attn_inplace(
                     q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
