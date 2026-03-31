@@ -1395,6 +1395,9 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
+        assert metadata.kv_cache_manager is None or \
+            metadata.kv_cache_manager.quant_block_size == 128, \
+            "Only support quant_block_size = 128 for now"
         # Update the indexer k cache before prefill chunks gather from it.
         self._update_k_cache(k_fp8, k_scale, metadata)
 
