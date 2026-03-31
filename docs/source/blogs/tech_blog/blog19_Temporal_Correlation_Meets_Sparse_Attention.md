@@ -366,8 +366,8 @@ The heuristic path requires two additional persistently pre-allocated HBM buffer
 
 | Category | Source | preIdx | Temporal Correlation |
 |:----------:|:--------:|:--------:|:---------------------:|
-| **Synthetic random** | Random Q/K ($1 + A_m \cdot \mathcal{N}(0,1)$) + YaRN-RoPE → single-head $q^T R_\Delta k$ | Static RoPE prior (all-ones Q/K → $f(\Delta)$ Top-K) | Moderate (~60%+ overlap, $A_m$-dependent) |
-| **Real decode** | DeepSeek-V3.2 SWE-Bench-64K indexer logits (multi-head MQA with $W^I$, ReLU) | Previous step's actual Top-K output | High (~35–50% overlap) |
+| **Synthetic random** | Random Q/K (1 + Aₘ · 𝒩(0,1)) + YaRN-RoPE → single-head qᵀR_Δk | Static RoPE prior (all-ones Q/K → f(Δ) Top-K) | Moderate (~60%+ overlap, Aₘ-dependent) |
+| **Real decode** | DeepSeek-V3.2 SWE-Bench-64K indexer logits (multi-head MQA with Wᴵ, ReLU) | Previous step's actual Top-K output | High (~35–50% overlap) |
 
 </div>
 
