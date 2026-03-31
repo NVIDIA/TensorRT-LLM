@@ -168,7 +168,9 @@ class HeadMismatchMapper(RegionMapperBase):
             peer_tp_per_dp,
             self_tp_rank,
             peer_tp_rank,
-            self._bytes_cont_heads,
+            self_kv_heads=self._ri.attention.kv_heads_per_rank,
+            peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
+            bytes_per_head=bytes_per_head,
         )
         self._layer_indices = np.arange(transfer_layers, dtype=np.int64)
         self._kv_indices = np.arange(kv_factor, dtype=np.int64)
@@ -213,15 +215,22 @@ class HeadMismatchMapper(RegionMapperBase):
         peer_tp_per_dp: int,
         self_tp_rank: int,
         peer_tp_rank: int,
-        bytes_cont_heads: int,
+        self_kv_heads: int,
+        peer_kv_heads: int,
+        bytes_per_head: int,
     ) -> tuple[int, int]:
         if self_tp_per_dp == peer_tp_per_dp:
             return 0, 0
-        ratio = max(self_tp_per_dp, peer_tp_per_dp) // min(self_tp_per_dp, peer_tp_per_dp)
+        # total_unique = total KV heads in model; head_idx via integer division
+        # handles head duplication (total_kv_heads < tp_per_dp) correctly.
         if self_tp_per_dp < peer_tp_per_dp:
-            return (peer_tp_rank % ratio) * bytes_cont_heads, 0
+            total_unique = self_kv_heads * self_tp_per_dp
+            src_head_idx = (peer_tp_rank * total_unique) // peer_tp_per_dp
+            return src_head_idx * bytes_per_head, 0
         else:
-            return 0, (self_tp_rank % ratio) * bytes_cont_heads
+            total_unique = peer_kv_heads * peer_tp_per_dp
+            dst_head_idx = (self_tp_rank * total_unique) // self_tp_per_dp
+            return 0, dst_head_idx * bytes_per_head
 
     @staticmethod
     def _get_layer_kv_num(ri: RankInfo) -> int:
@@ -340,10 +349,10 @@ class AttentionPolicy:
     def head_match(self, peer_ri: RankInfo) -> tuple[bool, bool]:
         factor_self, factor_peer = self._head_factors(peer_ri)
         is_dup_head = factor_self != factor_peer
+        # Slot layout is compatible if kv_heads_per_rank matches (same slot size).
         head_match = (
-            is_dup_head
-            or self._ri.attention.is_mla
-            or (self._tp_per_dp(self._ri) == self._tp_per_dp(peer_ri))
+            self._ri.attention.is_mla
+            or self._ri.attention.kv_heads_per_rank == peer_ri.attention.kv_heads_per_rank
         )
         return head_match, is_dup_head
 
