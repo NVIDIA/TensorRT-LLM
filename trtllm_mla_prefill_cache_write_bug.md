@@ -14,15 +14,20 @@ via side-by-side dump comparison). With `torch-simple` + `tokens_per_block=64`:
   results, possibly from weight transform differences in the `fuse_rope_into_trtllm_mla`
   graph transform or different weight loading for the FP8 model
 
-### Root Cause: Mixed Prefill+Decode Batches
-The crash occurs ONLY in mixed batches (prefill + decode sequences together).
-Pure prefill batches work correctly — verified by forcing all sequences to
-prefill at once via high `max_num_tokens`. The context wrapper receives
-metadata tensors that include decode sequences' entries, confusing the C++
-kernel's cache write path.
+### Root Cause: Mixed Batch Crash = Prior Decode Memory Corruption
+The "mixed batch" crash is NOT from the prefill kernel. It's the prefill's
+`thop.attention` detecting memory corruption from a PRIOR decode step.
+Evidence: 256 requests crash with 64 failures even with ALL context skipped.
 
-Fix: slice metadata to only include prefill sequences before passing to
-the context wrapper's plan/run.
+The PT backend also passes full batch metadata (including decode entries)
+to the context kernel — same as AD. The C++ kernel correctly handles
+`attention_input_type=context_only` with mixed `host_request_types`.
+
+Fix: SDPA fallback for mixed batches avoids the sensitive `thop.attention`
+call that triggers corruption detection. Pure prefill batches use C++ FMHA.
+
+Verified: 0 failures for 2, 4, 8, 16, 32, 64, 128 requests.
+The 64/256 failure with 256 requests is a separate decode path issue.
 
 ### Investigation: K/V Magnitude Difference
 The K/V expansion is `K,V = kv_b_proj(compressed_kv)` where `kv_b_proj_weight` has
