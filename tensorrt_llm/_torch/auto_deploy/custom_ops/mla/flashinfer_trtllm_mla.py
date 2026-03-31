@@ -47,6 +47,7 @@ from ..attention_interface import (
     ResourceHandlerDict,
     SequenceInfo,
 )
+from .triton_mla_cache_append import append_paged_mla_cache
 
 
 @dataclass
@@ -115,7 +116,6 @@ def _append_to_paged_cache(
     kv_lora_rank: int,
 ) -> None:
     num_seq = input_pos.shape[0]
-    page_size = kv_cache.shape[1]
     kpe = kpe.squeeze(1)
     cache_dtype = kv_cache.dtype
 
@@ -124,19 +124,24 @@ def _append_to_paged_cache(
     if kpe.dtype != cache_dtype:
         kpe = kpe.to(cache_dtype)
 
-    for seq_idx in range(num_seq):
-        seq_start = int(cu_seqlen_host[seq_idx].item())
-        seq_end = int(cu_seqlen_host[seq_idx + 1].item())
-        pos0 = int(input_pos[seq_idx].item())
-        page_start = int(cu_num_pages[seq_idx].item())
+    num_tokens = int(cu_seqlen_host[num_seq].item())
+    device = kv_cache.device
+    cu_seqlen_device = cu_seqlen_host[: num_seq + 1].to(device=device, dtype=torch.int32)
+    cu_pages_device = cu_num_pages[: num_seq + 1].to(device=device, dtype=torch.int32)
+    input_pos_device = input_pos.to(device=device, dtype=torch.int32)
 
-        for token_offset, src_idx in enumerate(range(seq_start, seq_end)):
-            abs_pos = pos0 + token_offset
-            page_offset = abs_pos // page_size
-            offset_in_page = abs_pos % page_size
-            page_idx = int(cache_loc[page_start + page_offset].item())
-            kv_cache[page_idx, offset_in_page, :kv_lora_rank] = compressed_kv[src_idx]
-            kv_cache[page_idx, offset_in_page, kv_lora_rank:] = kpe[src_idx]
+    append_paged_mla_cache(
+        compressed_kv,
+        kpe,
+        cu_seqlen_device,
+        cu_pages_device,
+        cache_loc,
+        input_pos_device,
+        kv_cache,
+        kv_lora_rank,
+        num_tokens,
+        num_seq,
+    )
 
 
 def _gather_seq_cache(
@@ -343,16 +348,15 @@ def flashinfer_trtllm_mla_with_cache(
         max_pages_per_seq = ((max_pages_per_seq + alignment - 1) // alignment) * alignment
         # Block tables are zero-padded for alignment. Padding entries point to page 0
         # but are never accessed because seq_lens constrains the kernel's read bounds.
-        block_tables = torch.zeros(
-            num_decode,
-            max_pages_per_seq,
-            dtype=torch.int32,
-            device=q_nope.device,
+        pages_per_seq = cu_num_pages_host[1 : num_decode + 1] - cu_num_pages_host[:num_decode]
+        seq_starts = cu_num_pages_host[:num_decode].to(device=q_nope.device)
+        page_slots = torch.arange(max_pages_per_seq, device=q_nope.device, dtype=torch.int32)
+        flat_idx = (seq_starts.unsqueeze(1) + page_slots.unsqueeze(0)).clamp(
+            max=cache_loc.shape[0] - 1
         )
-        for seq_idx in range(num_decode):
-            start = int(cu_num_pages_host[seq_idx].item())
-            end = int(cu_num_pages_host[seq_idx + 1].item())
-            block_tables[seq_idx, : end - start] = cache_loc[start:end]
+        block_tables = cache_loc[flat_idx.long()]
+        mask = page_slots.unsqueeze(0) < pages_per_seq.to(device=q_nope.device).unsqueeze(1)
+        block_tables = block_tables * mask.int()
 
         w_k_nope = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)[
             :, :qk_nope_head_dim, :
