@@ -26,7 +26,9 @@ If the request is adjacent but out of scope, provide a best-effort answer using 
 
 ## Response Format
 
-`Recommended config` → `Why this source` → `What is verified` → `What is unverified`
+For **exact matches**: `Config` → `Source` → `Launch command`
+
+For **interpolated configs**: `Config` → `Source used as starting point` → `What to benchmark` (single list of knobs worth sweeping, not per-field unverified tags)
 
 ## Step 0: Lock Objective and Decode Mode
 
@@ -70,12 +72,9 @@ Do not assume other fields are constant across models/GPUs. For tuning notes, re
 - [ ] **Speculative exclusion** satisfied per Constraint 1 (`speculative_config` absent unless DeepSeek-R1 MTP with block copied verbatim)
 - [ ] **Objective preservation** satisfied (match or mismatch called out)
 - [ ] No disaggregated-only settings present
-- [ ] `cuda_graph_config.max_batch_size` checked against source (not assumed equal to server `max_batch_size`)
-- [ ] `moe_expert_parallel_size` and `moe_config.backend` match checked-in source
 - [ ] `trust_remote_code: true` called out as trust boundary when present
-- [ ] OOM advice follows model guide first (levers: `max_batch_size`, `max_num_tokens`, `max_seq_len`, `free_gpu_memory_fraction`)
-- [ ] `max_num_tokens` >= ISL + chat template overhead (requests rejected if violated, per knob-heuristics.md)
-- [ ] Interpolation labeled as unverified per **source preference**
+- [ ] `max_num_tokens` >= ISL + chat template overhead (requests rejected if violated)
+- [ ] If interpolated: single "What to benchmark" section listing knobs to sweep, not per-field unverified tags
 
 ## Repo Resources
 
