@@ -90,7 +90,7 @@ def runPerfTriageBot() {
             "\"cd ${workspace} && (rm -rf trtllm-perf-triage-bot; git clone https://gitlab-master.nvidia.com/chenfeiz/trtllm-perf-triage-bot.git)\""),
             numRetries: 3)
         Utils.exec(this, script: Utils.sshUserCmd(remote,
-            "\"cd ${workspace} && (rm -rf trtllm-agent-toolkit; git clone ssh://git@gitlab-master.nvidia.com:12051/ftp/trtllm-agent-toolkit.git)\""),
+            "\"cd ${workspace} && (rm -rf trtllm-agent-toolkit; git clone https://gitlab-master.nvidia.com/ftp/trtllm-agent-toolkit.git)\""),
             numRetries: 3)
 
         // Install anthropic Python SDK on the login node
