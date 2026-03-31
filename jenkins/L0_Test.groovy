@@ -1780,7 +1780,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
         """
-    } elif (type.contains("6000")) {
+    } else if (type.contains("6000")) {
         // rtx-pro-6000 nodes are moved to PDX DC, we should use FlexCache in PDX
         llmModelVolume = """
                 - name: scratch-trt-llm-data
