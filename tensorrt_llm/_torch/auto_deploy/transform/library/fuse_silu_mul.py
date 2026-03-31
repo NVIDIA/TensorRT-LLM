@@ -114,8 +114,12 @@ def _check_narrow_constraints(match: Match) -> bool:
 
 
 # ---- Variant 2: getitem+silu+mul (graph walk) ---------------------------------------
-# The quantized GEMM fusion path splits via an opaque closure (split_output) + getitem.
-# The closure cannot be matched by the pattern matcher, so we use direct graph walking.
+# The quantized GEMM fusion path splits via a closure (split_output) + getitem.
+# The getitem+silu+mul structure IS matchable by the pattern matcher, but the
+# replacement needs the pre-split tensor (input to the split call), which is not
+# capturable as a pattern input: CallFunction requires a specific target, so the
+# split call (whose target varies per fusion site) cannot be included in the pattern.
+# We use direct graph walking to access split_node.args[0] for the replacement.
 
 
 def _match_getitem_silu_mul(mul_node: Node) -> Optional[Node]:
@@ -231,23 +235,30 @@ class FuseSiluMul(BaseTransform):
         if not self.config.enabled or not HAS_FUSED_SILU_AND_MUL:
             return gm, TransformInfo(skipped=True, num_matches=0)
 
-        # Variant 1: narrow+silu+mul (pattern matcher, requires shape metadata)
-        with lift_to_meta(gm) if placeholders_on_meta(gm) else nullcontext():
-            run_shape_prop(gm)
+        cnt = 0
 
-        patterns = ADPatternMatcherPass()
-        register_ad_pattern(
-            search_fn=_silu_mul_pattern,
-            replace_fn=_silu_mul_replacement,
-            patterns=patterns,
-            dummy_args=[torch.randn(2, _HALF_SIZE * 2, device="meta")],
-            trace_fn=_symbolic_trace_fn,
-            op_ignore_types={torch.narrow: (int,)},
-            extra_check=_check_narrow_constraints,
+        # Variant 1: narrow+silu+mul (pattern matcher, requires shape metadata).
+        # Only run if torch.narrow ops exist — avoids expensive run_shape_prop otherwise.
+        has_narrow_ops = any(
+            n.op == "call_function" and n.target == torch.narrow for n in gm.graph.nodes
         )
-        cnt = patterns.apply(gm.graph)
-        if cnt > 0:
-            gm.recompile()
+        if has_narrow_ops:
+            with lift_to_meta(gm) if placeholders_on_meta(gm) else nullcontext():
+                run_shape_prop(gm)
+
+            patterns = ADPatternMatcherPass()
+            register_ad_pattern(
+                search_fn=_silu_mul_pattern,
+                replace_fn=_silu_mul_replacement,
+                patterns=patterns,
+                dummy_args=[torch.randn(2, _HALF_SIZE * 2, device="meta")],
+                trace_fn=_symbolic_trace_fn,
+                op_ignore_types={torch.narrow: (int,)},
+                extra_check=_check_narrow_constraints,
+            )
+            cnt += patterns.apply(gm.graph)
+            if cnt > 0:
+                gm.recompile()
 
         # Variant 2: getitem+silu+mul (direct graph walk for opaque split closures)
         cnt += _fuse_getitem_silu_mul(gm)
