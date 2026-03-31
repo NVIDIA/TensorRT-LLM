@@ -57,6 +57,7 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
         mtp_layer_offset = config.num_hidden_layers
+        is_dense = (getattr(config, "num_experts", 0) or 0) == 0
 
         if self.config.mapping.enable_attention_dp:
             tp_size = 1
@@ -74,6 +75,12 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
             "mtp.pre_fc_norm_hidden": "pre_fc_norm_hidden",
         }
 
+        # Dense MLP weight names that need an extra 'mlp' prefix because
+        # _DenseMlpAdapter wraps GatedMLP as self.mlp, giving module paths
+        # like model.layers.X.mlp.mlp.gate_up_proj instead of
+        # model.layers.X.mlp.gate_proj used in the HF checkpoint.
+        _dense_mlp_names = {"gate_proj", "up_proj", "down_proj"}
+
         new_weights = {}
         for name, _ in weights.items():
             key = name
@@ -87,6 +94,18 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
                     if key.startswith(mtp_prefix):
                         suffix = key[len(mtp_prefix):]
                         key = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
+                        break
+
+            # For dense models, _DenseMlpAdapter adds an extra 'mlp' level.
+            # Remap model.layers.X.mlp.{gate,up,down}_proj to
+            # model.layers.X.mlp.mlp.{gate,up,down}_proj.
+            if is_dense and ".mlp." in key:
+                parts = key.split(".")
+                for i, part in enumerate(parts):
+                    if part == "mlp" and i + 1 < len(parts) and parts[
+                            i + 1] in _dense_mlp_names:
+                        parts.insert(i + 1, "mlp")
+                        key = ".".join(parts)
                         break
 
             if "A_log" in key:

@@ -42,6 +42,14 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     config.draft_vocab_size = config.vocab_size
 
 
+def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
+                             num_tokens: int) -> Optional[torch.Tensor]:
+    """Slice speculative position IDs along the token dimension."""
+    if position_ids is None:
+        return None
+    return position_ids[..., :num_tokens]
+
+
 class Eagle3Attention(Attention):
 
     def __init__(
@@ -807,7 +815,7 @@ class MTPForCausalLM(nn.Module):
             case "nemotron_h":
                 from .modeling_nemotron_h import NemotronHMTP
                 mtp_layer = NemotronHMTP
-            case "qwen3_next":
+            case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
             case _:
@@ -1138,9 +1146,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     # Slice along the first dimension
                     spec_input_ids = input_ids[:attn_metadata.num_tokens]
                 if position_ids is not None:
-                    # Slice along the last dimension
-                    spec_position_ids = position_ids[:, :attn_metadata.
-                                                     num_tokens]
+                    spec_position_ids = _slice_spec_position_ids(
+                        position_ids, attn_metadata.num_tokens)
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,

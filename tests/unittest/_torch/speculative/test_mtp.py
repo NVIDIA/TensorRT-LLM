@@ -7,7 +7,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.speculative.mtp import (MTPHiddenStatesManager,
-                                                 MTPSpecMetadata, MTPWorker)
+                                                 MTPSpecMetadata, MTPWorker,
+                                                 _select_mtp_position_ids)
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
@@ -1413,3 +1414,103 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
         torch.testing.assert_close(draft_inputs["input_ids"], ref_input_ids)
         torch.testing.assert_close(draft_inputs["hidden_states"],
                                    ref_previous_hidden_states)
+
+
+class TestMTPPositionIds(unittest.TestCase):
+
+    def setUp(self):
+        tensorrt_llm.logger.set_level('warning')
+
+    def test_select_mtp_position_ids_preserves_mrope_axes(self):
+        position_ids = torch.tensor(
+            [
+                [[10, 11, 12, 13, 14]],
+                [[20, 21, 22, 23, 24]],
+                [[30, 31, 32, 33, 34]],
+            ],
+            dtype=torch.int,
+            device="cuda",
+        )
+        gather_ids = torch.tensor([1, 4], dtype=torch.long, device="cuda")
+
+        selected = _select_mtp_position_ids(position_ids, gather_ids)
+
+        expected = torch.tensor(
+            [
+                [[11, 14]],
+                [[21, 24]],
+                [[31, 34]],
+            ],
+            dtype=torch.int,
+            device="cuda",
+        )
+        torch.testing.assert_close(selected, expected)
+
+    def test_prepare_drafter_inputs_supports_mrope_generation_position_ids(
+            self):
+        hidden_size = 4
+        spec_config = MTPDecodingConfig(num_nextn_predict_layers=1)
+        attn_metadata = TrtllmAttentionMetadata(max_num_requests=1,
+                                                max_num_tokens=16,
+                                                kv_cache_manager=None)
+        attn_metadata.seq_lens = torch.tensor([2],
+                                              dtype=torch.int,
+                                              device="cuda").cpu()
+        attn_metadata.num_contexts = 0
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=[8])
+
+        spec_manager = MTPHiddenStatesManager(config=spec_config,
+                                              dtype=torch.float32,
+                                              hidden_size=hidden_size,
+                                              max_num_requests=1)
+        spec_manager.slot_manager.add_slot(0)
+        spec_manager.mtp_past_hidden_states_pool[0] = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0]], device="cuda")
+        spec_manager.mtp_past_tokens_pool[0] = torch.tensor([42], device="cuda")
+
+        spec_metadata = MTPSpecMetadata(max_num_requests=1,
+                                        spec_dec_mode=spec_config.spec_dec_mode,
+                                        max_draft_len=1,
+                                        max_total_draft_tokens=1,
+                                        mtp_num_modules=1,
+                                        mtp_hidden_states_manager=spec_manager)
+        spec_metadata.request_ids = [0]
+        spec_metadata.prepare()
+
+        mtpworker = MTPWorker(spec_config)
+        mtpworker.is_thop = False
+        draft_inputs = mtpworker.prepare_drafter_inputs(
+            input_ids=torch.tensor([6, 42], dtype=torch.int, device="cuda"),
+            position_ids=torch.tensor(
+                [
+                    [[10, 11]],
+                    [[20, 21]],
+                    [[30, 31]],
+                ],
+                dtype=torch.int,
+                device="cuda",
+            ),
+            hidden_states=torch.randn((2, hidden_size),
+                                      dtype=torch.float32,
+                                      device="cuda"),
+            accepted_tokens=torch.tensor([[43, -1]],
+                                         dtype=torch.int,
+                                         device="cuda"),
+            num_accepted_tokens=torch.tensor([1],
+                                             dtype=torch.int,
+                                             device="cuda"),
+            spec_metadata=spec_metadata,
+            attn_metadata=attn_metadata)
+
+        expected_position_ids = torch.tensor(
+            [
+                [[10]],
+                [[20]],
+                [[30]],
+            ],
+            dtype=torch.int,
+            device="cuda",
+        )
+        torch.testing.assert_close(draft_inputs["position_ids"],
+                                   expected_position_ids)

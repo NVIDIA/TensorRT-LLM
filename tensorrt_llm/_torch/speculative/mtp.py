@@ -32,6 +32,21 @@ else:
 SampleStateMTP = SampleStateSpec
 
 
+def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    """Collapse plain [1, N] position IDs while preserving MRoPE axes."""
+    if position_ids.dim() > 0 and position_ids.shape[0] == 1:
+        return position_ids.squeeze(0)
+    return position_ids
+
+
+def _select_mtp_position_ids(position_ids: torch.Tensor,
+                             token_indices) -> torch.Tensor:
+    """Select tokens along the last dim for MRoPE and the only dim otherwise."""
+    if position_ids.dim() == 1:
+        return position_ids[token_indices]
+    return position_ids[..., token_indices]
+
+
 class MTPHiddenStatesManager(BaseResourceManager):
 
     def __init__(self,
@@ -410,7 +425,7 @@ class MTPWorker(SpecWorkerBase):
                                       attn_metadata=attn_metadata)
 
         # prepare draft layer inputs
-        position_ids = position_ids.squeeze(0)
+        position_ids = _normalize_mtp_position_ids(position_ids)
         draft_inputs = self.prepare_drafter_inputs(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -906,8 +921,8 @@ class MTPWorker(SpecWorkerBase):
                 num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
 
             position_ids: torch.IntTensor
-                [1][num_tokens]
-                The position id of all requests. Flattened.
+                [num_tokens] for RoPE models, or [3, 1, num_tokens] for MRoPE
+                models. Flattened over the token dimension.
 
             hidden_states: torch.Tensor
                 [num_tokens, hidden_size]
@@ -934,9 +949,8 @@ class MTPWorker(SpecWorkerBase):
                 num_tokens = sum(all prompts) + num_generation * (mtp_num_modules)
 
             position_ids: torch.Tensor
-                [1, num_tokens]
-                The new position ids of all requests. Flattened.
-                Directly use the input position ids.
+                [num_tokens] for RoPE models, or [3, 1, num_tokens] for MRoPE
+                models. Flattened over the token dimension.
 
             hidden_states: torch.Tensor
                 [num_tokens][hidden_size]
@@ -1017,14 +1031,30 @@ class MTPWorker(SpecWorkerBase):
         # update position_ids
         position_ids_list = []
         if num_contexts > 0:
-            position_ids_list.append(position_ids[:num_ctx_tokens])
+            position_ids_list.append(
+                _select_mtp_position_ids(position_ids, slice(0,
+                                                             num_ctx_tokens)))
         if num_gens > 0:
-            position_ids_gen = position_ids[num_ctx_tokens:].reshape(
-                num_gens, mtp_num_modules + 1)[:, -mtp_num_modules:]
-            position_ids_gen = position_ids_gen - (
-                1 + mtp_num_modules -
-                num_accepted_tokens[num_contexts:].unsqueeze(1))
-            position_ids_list.append(position_ids_gen.flatten())
+            position_ids_gen = _select_mtp_position_ids(
+                position_ids, slice(num_ctx_tokens, None))
+            if position_ids_gen.dim() == 1:
+                position_ids_gen = position_ids_gen.reshape(
+                    num_gens, mtp_num_modules + 1)[:, -mtp_num_modules:]
+                position_ids_gen = position_ids_gen - (
+                    1 + mtp_num_modules -
+                    num_accepted_tokens[num_contexts:].unsqueeze(1))
+                position_ids_list.append(position_ids_gen.flatten())
+            else:
+                leading_shape = position_ids_gen.shape[:-1]
+                position_ids_gen = position_ids_gen.reshape(
+                    *leading_shape, num_gens,
+                    mtp_num_modules + 1)[..., -mtp_num_modules:]
+                position_ids_delta = (1 + mtp_num_modules -
+                                      num_accepted_tokens[num_contexts:]).view(
+                                          *((1, ) * len(leading_shape)),
+                                          num_gens, 1)
+                position_ids_gen = position_ids_gen - position_ids_delta
+                position_ids_list.append(position_ids_gen.flatten(start_dim=-2))
         return_position_ids = torch.concat(position_ids_list, dim=-1)
 
         return {
@@ -1129,7 +1159,8 @@ class MTPEagleWorker(MTPWorker):
         next_draft_tokens.append(new_draft_token)
         # update inputs
         hidden_states = hidden_states[gather_ids]
-        position_ids = inputs["position_ids"][gather_ids] + 1
+        position_ids = (
+            _select_mtp_position_ids(inputs["position_ids"], gather_ids) + 1)
         return hidden_states, position_ids
 
     @torch.compile(options={"max-autotune": True})

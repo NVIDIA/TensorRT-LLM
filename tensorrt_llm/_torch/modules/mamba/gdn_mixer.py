@@ -362,15 +362,36 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         query = mixed_qkvz[..., :q_end]
         key = mixed_qkvz[..., q_end:k_end]
 
-        # Optimize: Use view (zero-copy) instead of reshape for contiguous slices
-        # Layout: [v_concat | z_concat], need to reshape each separately
-        value = mixed_qkvz[..., k_end:v_end].view(batch_size, num_v_heads_local, self.head_v_dim)
-        z = mixed_qkvz[..., v_end:z_end].view(batch_size, num_v_heads_local, self.head_v_dim)
+        # When heads_ratio == 1, ng == num_v_heads_local, so view works directly.
+        # When heads_ratio > 1 (dense models), the last-dim slice is
+        # [b, ng, ratio*hv] and we need [b, ng*ratio, hv].  A plain view
+        # fails because the slice is not contiguous in the packed qkvz
+        # tensor.  Adding .contiguous() before view is equivalent to
+        # reshape but makes the copy explicit and avoids a hidden perf
+        # drop.  An alternative zero-copy path would require changing
+        # the packing layout, which is a larger refactor.
+        if heads_ratio == 1:
+            value = mixed_qkvz[..., k_end:v_end]
+            z = mixed_qkvz[..., v_end:z_end]
+        else:
+            value = (
+                mixed_qkvz[..., k_end:v_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
+            z = (
+                mixed_qkvz[..., v_end:z_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
 
         # Slice ba components: [b, ng, 2*np/ng] -> [b, np] each
-        # Optimize: Use view instead of reshape (zero-copy for contiguous data)
-        b = mixed_ba[..., :heads_ratio].view(batch_size, num_v_heads_local)
-        a = mixed_ba[..., heads_ratio:].view(batch_size, num_v_heads_local)
+        if heads_ratio == 1:
+            b = mixed_ba[..., 0]
+            a = mixed_ba[..., 1]
+        else:
+            b = mixed_ba[..., :heads_ratio].contiguous().view(batch_size, num_v_heads_local)
+            a = mixed_ba[..., heads_ratio:].contiguous().view(batch_size, num_v_heads_local)
 
         return query, key, value, z, b, a
 
