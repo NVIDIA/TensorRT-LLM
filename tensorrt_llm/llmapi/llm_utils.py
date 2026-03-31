@@ -494,11 +494,10 @@ class ModelLoader:
                 group_size = hf_quant_config.get("group_size", 16)
                 assert group_size == 16, "NVFP4 only supports group_size=16"
                 quant_config.group_size = group_size
-                default_exclude = [
-                    '*.mlp.gate', 'lm_head'
-                ]
+                default_exclude = ['*.mlp.gate', 'lm_head']
 
-                hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
+                hf_exclude_modules = hf_quant_config.get(
+                    'modules_to_not_convert', None)
                 # Merge HF config's modules_to_not_convert with default exclude_modules
                 if hf_exclude_modules is not None:
                     quant_config.exclude_modules = list(

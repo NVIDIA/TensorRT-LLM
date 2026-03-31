@@ -2059,15 +2059,13 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 // ============================== Activation =================================
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
-    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, int kProcessRows,
-    bool DynamicFc2 = false>
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, int kProcessRows, bool DynamicFc2 = false>
 __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(T* output,
     GemmOutputType const* gemm_result, float const* fp8_quant, ScaleBiasType const* bias_ptr, bool bias_is_broadcast,
     int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t inter_size,
     float const* fc2_act_global_scale, bool use_per_expert_act_scale,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, ActivationParams activation_params,
-    GemmOutputType const* prequant_scale,
-    float* dynamic_fc2_amax = nullptr,
+    GemmOutputType const* prequant_scale, float* dynamic_fc2_amax = nullptr,
     GemmOutputType* bf16_intermediate_output = nullptr)
 {
 #ifdef ENABLE_FP4
@@ -2245,8 +2243,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
                 // Dynamic FC2 mode: output bf16 instead of FP4, and compute global amax
                 // for dynamic fc2 input scale computation.
                 using Bf16Elem = cutlass::Array<GemmOutputType, ACTIVATION_ELEM_PER_THREAD>;
-                auto* bf16_output_vec
-                    = reinterpret_cast<Bf16Elem*>(bf16_intermediate_output + output_offset);
+                auto* bf16_output_vec = reinterpret_cast<Bf16Elem*>(bf16_intermediate_output + output_offset);
                 storeVec(&bf16_output_vec[elem_index], arrayConvert<ComputeElem, Bf16Elem>(post_act_val));
 
                 // Compute local amax for dynamic fc2 scale
@@ -2368,16 +2365,14 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
 // =============================================================================
 template <class T, class GemmOutputType,
     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
-__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void dynamicFP4QuantizeKernel(
-    T* output,                                         // FP4 packed output
-    GemmOutputType const* bf16_input,                  // bf16 intermediate from doActivation (DynamicFc2 mode)
-    int64_t const* expert_first_token_offset,          // [num_experts + 1]
-    int num_experts_per_node,
-    int64_t inter_size,
-    float const* dynamic_amax,                         // [1] global amax from doActivation
-    float const* fc2_weight_scale_2,                   // [num_experts] per-expert weight_scale_2
+__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void dynamicFP4QuantizeKernel(T* output, // FP4 packed output
+    GemmOutputType const* bf16_input,         // bf16 intermediate from doActivation (DynamicFc2 mode)
+    int64_t const* expert_first_token_offset, // [num_experts + 1]
+    int num_experts_per_node, int64_t inter_size,
+    float const* dynamic_amax,                // [1] global amax from doActivation
+    float const* fc2_weight_scale_2,          // [num_experts] per-expert weight_scale_2
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, // block scale output
-    float* dynamic_fc2_alpha)                          // [num_experts] output: adjusted alpha
+    float* dynamic_fc2_alpha)                                       // [num_experts] output: adjusted alpha
 {
 #ifdef ENABLE_FP4
     constexpr bool IsNVFP4 = std::is_same_v<T, __nv_fp4_e2m1>
@@ -2526,8 +2521,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                 = [&](auto block_scaling_type) -> void (*)(T*, GemmOutputType const*, float const*,
                                                    ScaleBiasType const*, bool, int64_t const*, int, int64_t,
                                                    float const*, bool, TmaWarpSpecializedGroupedGemmInput::ElementSF*,
-                                                   ActivationParams, GemmOutputType const*,
-                                                   float*, GemmOutputType*)
+                                                   ActivationParams, GemmOutputType const*, float*, GemmOutputType*)
             {
                 switch (activation_type.activation_type)
                 {
@@ -2622,8 +2616,8 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         config.attrs = attrs;
         cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast,
             expert_first_token_offset, num_experts_per_node, inter_size, quant_params.fp4.fc2.act_global_scale,
-            use_per_expert_act_scale, fc2_act_sf_flat, activation_type, prequant_scale,
-            (float*) nullptr, (GemmOutputType*) nullptr);
+            use_per_expert_act_scale, fc2_act_sf_flat, activation_type, prequant_scale, (float*) nullptr,
+            (GemmOutputType*) nullptr);
     }; // end lambda doActivationKernelLauncher
 
     // 256 threads per block * 256 blocks / 1 rows per block can be handled by 1-2 waves depending on SM arch
@@ -2695,7 +2689,7 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
                 default:
                     TLLM_CHECK_WITH_INFO(false, "Unsupported activation type for dynamic fc2");
                     return decltype(&doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                        GLUAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>){nullptr};
+                                    GLUAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>){nullptr};
                 }
             };
 
@@ -2703,8 +2697,7 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
             static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
             int32_t const max_blocks_per_sm
                 = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, ACTIVATION_THREADS_PER_BLOCK, 0);
-            int32_t const grid_x
-                = std::min(sm_count * max_blocks_per_sm, static_cast<int32_t>(expanded_num_tokens));
+            int32_t const grid_x = std::min(sm_count * max_blocks_per_sm, static_cast<int32_t>(expanded_num_tokens));
             int32_t const grid_y = static_cast<int32_t>(
                 (num_elems_in_col + ACTIVATION_THREADS_PER_BLOCK - 1) / ACTIVATION_THREADS_PER_BLOCK);
 
@@ -4215,10 +4208,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     auto alpha_scale_flat2 = use_fp4
         ? (quant_params.use_dynamic_fc2_scale && quant_params.dynamic_fc2_alpha ? quant_params.dynamic_fc2_alpha
                                                                                 : quant_params.fp4.fc2.global_scale)
-        : use_w4afp8  ? quant_params.groupwise.fc2.alpha
+        : use_w4afp8   ? quant_params.groupwise.fc2.alpha
         : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.global_scale
-        : use_fp8    ? fp8_dequant2
-                     : nullptr;
+        : use_fp8      ? fp8_dequant2
+                       : nullptr;
     if (!alpha_scale_flat1 && !alpha_scale_flat2)
     {
         layout_info1.alpha_scale_ptr_array = nullptr;
