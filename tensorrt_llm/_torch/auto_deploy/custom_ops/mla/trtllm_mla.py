@@ -759,7 +759,6 @@ def _handle_prefill_thop(
     kpe_flat: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
     latent_cache: torch.Tensor,
-    kv_cache: torch.Tensor,
     num_tokens: int,
     num_heads: int,
     num_kv_heads: int,
@@ -859,96 +858,51 @@ def _handle_prefill_thop(
 
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
 
-    # Check for mixed batch (prefill + decode). The C++ MLA context kernel crashes
-    # in mixed batches. Use SDPA fallback for these rare cases; C++ FMHA for pure prefill.
+    # Slice metadata to context-only (matching PT backend which passes ONLY
+    # context sequences to the context kernel, never decode entries).
     num_prefill = int((host_request_types == 0).sum().item())
-    is_mixed_batch = num_prefill < host_request_types.shape[0]
+    pf = num_prefill
 
-    if not is_mixed_batch:
-        # Pure prefill batch: use C++ FMHA (fast path).
-        wrapper.plan(
-            layer_idx=layer_idx + 30,
-            tokens_per_block=tokens_per_block,
-            max_num_requests=max_num_requests,
-            max_sequence_length=max_context_length,
-            max_context_length=max_context_length - 1,
-            beam_width=1,
-            sequence_length=sequence_length,
-            context_lengths=context_lengths,
-            host_past_key_value_lengths=host_past_kv_lengths,
-            host_total_kv_lens=host_total_kv_lens.int(),
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            kv_cache_block_offsets=ctx_block_offsets,
-            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=planner.host_pool_mapping[:60],
-            block_ids_per_seq=planner.block_ids_per_seq,
-            flash_mla_tile_scheduler_metadata=planner.flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits=planner.flash_mla_num_splits,
-            latent_cache=latent_cache,
-            workspace=planner.workspace,
-            use_paged_context_fmha=False,
-            attention_input_type=AttentionInputType.context_only,
-            kv_scale_orig_quant=planner.kv_scale_orig_quant,
-            kv_scale_quant_orig=planner.kv_scale_quant_orig,
-            kv_cache_manager=planner.kv_cache_manager,
-        )
-        wrapper.run(
-            q=q,
-            k=k,
-            v=v,
-            output=output,
-            is_fused_qkv=False,
-            update_kv_cache=True,
-        )
-    else:
-        # Mixed batch: SDPA fallback + manual cache write (avoids C++ kernel crash).
-        q_3d = q.view(num_tokens, num_heads, qk_head_dim)
-        k_3d = k.view(num_tokens, num_heads, qk_head_dim)
-        v_3d = v.view(num_tokens, num_heads, v_head_dim)
-        ctx_lens = host_context_lengths[:num_prefill]
-        max_ctx = int(ctx_lens.max().item()) if num_prefill > 0 else 0
-        all_same = num_prefill > 0 and int(ctx_lens.min().item()) == max_ctx
-        if all_same and num_prefill > 0:
-            q4 = (
-                q_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, qk_head_dim).transpose(1, 2)
-            )
-            k4 = (
-                k_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, qk_head_dim).transpose(1, 2)
-            )
-            v4 = v_3d[:num_tokens].view(num_prefill, max_ctx, num_heads, v_head_dim).transpose(1, 2)
-            o4 = torch.nn.functional.scaled_dot_product_attention(
-                q4, k4, v4, is_causal=True, scale=1.0 / math.sqrt(qk_head_dim)
-            )
-            output[:num_tokens] = o4.transpose(1, 2).reshape(num_tokens, num_heads * v_head_dim)
-        elif num_prefill > 0:
-            ctx_list = ctx_lens.tolist()
-            off = 0
-            for i in range(num_prefill):
-                sl = ctx_list[i]
-                qi = q_3d[off : off + sl].transpose(0, 1).unsqueeze(0)
-                ki = k_3d[off : off + sl].transpose(0, 1).unsqueeze(0)
-                vi = v_3d[off : off + sl].transpose(0, 1).unsqueeze(0)
-                oi = torch.nn.functional.scaled_dot_product_attention(
-                    qi, ki, vi, is_causal=True, scale=1.0 / math.sqrt(qk_head_dim)
-                )
-                output[off : off + sl] = (
-                    oi.squeeze(0).transpose(0, 1).reshape(sl, num_heads * v_head_dim)
-                )
-                off += sl
-        # Manual cache write for mixed-batch SDPA fallback.
-        kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
-        ctx_list = host_context_lengths[:num_prefill].tolist()
-        off = 0
-        for i in range(num_prefill):
-            sl = ctx_list[i]
-            seq_lc = latent_cache[off : off + sl]
-            pos = torch.arange(sl, device=device)
-            pids = planner.block_ids_per_seq[i][(pos // tokens_per_block).long()]
-            idx = pids.long() * rpb + pos % tokens_per_block
-            src = seq_lc if seq_lc.dtype == kv_cache_2d.dtype else seq_lc.to(kv_cache_2d.dtype)
-            kv_cache_2d.index_copy_(0, idx, src)
-            off += sl
+    # Recompute host_total_kv_lens for prefill only
+    ctx_total_kv_lens = planner.host_total_kv_lens.clone()
+    ctx_total_kv_lens[0] = sequence_length[:pf].sum().item() if pf > 0 else 0
+    ctx_total_kv_lens[1] = 0  # no decode in context-only call
+
+    wrapper.plan(
+        layer_idx=layer_idx + 30,
+        tokens_per_block=tokens_per_block,
+        max_num_requests=max_num_requests,
+        max_sequence_length=max_context_length,
+        max_context_length=max_context_length - 1,
+        beam_width=1,
+        sequence_length=sequence_length[:pf],
+        context_lengths=context_lengths[:pf],
+        host_past_key_value_lengths=host_past_kv_lengths[:pf],
+        host_total_kv_lens=ctx_total_kv_lens.int(),
+        host_context_lengths=host_context_lengths[:pf],
+        host_request_types=host_request_types[:pf],
+        kv_cache_block_offsets=ctx_block_offsets,  # full-sized (like PT), kernel reads [:pf]
+        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=planner.host_pool_mapping[:60],
+        block_ids_per_seq=planner.block_ids_per_seq,  # full-sized (like PT)
+        flash_mla_tile_scheduler_metadata=planner.flash_mla_tile_scheduler_metadata,
+        flash_mla_num_splits=planner.flash_mla_num_splits,
+        latent_cache=latent_cache,
+        workspace=planner.workspace,
+        use_paged_context_fmha=False,
+        attention_input_type=AttentionInputType.context_only,
+        kv_scale_orig_quant=planner.kv_scale_orig_quant,
+        kv_scale_quant_orig=planner.kv_scale_quant_orig,
+        kv_cache_manager=planner.kv_cache_manager,
+    )
+    wrapper.run(
+        q=q,
+        k=k,
+        v=v,
+        output=output,
+        is_fused_qkv=False,
+        update_kv_cache=True,
+    )
 
     return output
 
@@ -1118,7 +1072,7 @@ def _handle_decode_impl(
     # Pre-create BOTH decode and context wrappers during warmup so they exist
     # for CUDA graph capture. TrtllmAttentionWrapper.__init__ allocates GPU tensors
     # (rotary_cos_sin, etc.) which is forbidden during capture.
-    planner.get_or_create_wrapper(
+    ctx_wrapper = planner.get_or_create_wrapper(
         layer_idx,
         num_heads,
         kv_lora_rank,
@@ -1127,6 +1081,61 @@ def _handle_decode_impl(
         v_head_dim,
         for_context=True,
     )
+    # Warm up the context C++ AttentionOp during decode warmup so its workspace
+    # is allocated BEFORE CUDA graph capture. Without this, the first real prefill
+    # call triggers cudaMalloc which invalidates the decode graph's captured addresses.
+    if cuda_graph_state.in_warm_up() and not hasattr(planner, "_ctx_op_warmed"):
+        ctx_wrapper.plan(
+            layer_idx=layer_idx + 30,
+            tokens_per_block=tokens_per_block,
+            max_num_requests=max_num_requests,
+            max_sequence_length=max_context_length,
+            max_context_length=max_context_length - 1,
+            beam_width=1,
+            sequence_length=sequence_length,
+            context_lengths=context_lengths,
+            host_past_key_value_lengths=host_past_kv_lengths,
+            host_total_kv_lens=host_total_kv_lens,
+            host_context_lengths=host_context_lengths,
+            host_request_types=host_request_types,
+            kv_cache_block_offsets=kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+            block_ids_per_seq=planner.block_ids_per_seq,
+            latent_cache=latent_cache,
+            workspace=planner.workspace,
+            use_paged_context_fmha=False,
+            attention_input_type=AttentionInputType.context_only,
+            kv_cache_manager=planner.kv_cache_manager,
+        )
+        dummy_q = torch.zeros(
+            num_tokens,
+            num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+            dtype=q_nope_flat.dtype,
+            device=q_nope_flat.device,
+        )
+        dummy_kv = torch.zeros(
+            num_tokens,
+            num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+            dtype=q_nope_flat.dtype,
+            device=q_nope_flat.device,
+        )
+        dummy_v = torch.zeros(
+            num_tokens, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device
+        )
+        dummy_out = torch.zeros(
+            num_tokens, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device
+        )
+        ctx_wrapper.run(
+            q=dummy_q,
+            k=dummy_kv,
+            v=dummy_v,
+            output=dummy_out,
+            is_fused_qkv=False,
+            update_kv_cache=True,
+        )
+        if layer_idx == 0:
+            planner._ctx_op_warmed = True
     wrapper = planner.get_or_create_wrapper(
         layer_idx,
         num_heads,
@@ -1447,7 +1456,6 @@ def _mla_with_cache_impl(
             kpe_pre,
             kv_b_proj_weight,
             lc,
-            kv_cache,
             n_tok,
             num_heads,
             num_kv_heads,
