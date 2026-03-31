@@ -94,8 +94,8 @@ private:
         return cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
     }
 
-    static BlockRange collectBlocks(BaseKVCacheManager const& cacheManager,
-        std::shared_ptr<KVCacheBlock> lastBlock, int32_t indexFromEnd, SizeType32 windowSize)
+    static BlockRange collectBlocks(BaseKVCacheManager const& cacheManager, std::shared_ptr<KVCacheBlock> lastBlock,
+        int32_t indexFromEnd, SizeType32 windowSize)
     {
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
         int32_t const numBlocksToCollect = indexFromEnd + 1;
@@ -121,7 +121,6 @@ private:
     }
 
 public:
-
     void setBlockIdsForWindow(SizeType32 windowSize, std::vector<SizeType32> blockIds)
     {
         TLLM_CHECK_WITH_INFO(mBlockIdsPerWindow.find(windowSize) != mBlockIdsPerWindow.end(),
