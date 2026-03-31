@@ -11,7 +11,6 @@ from typing import Dict
 
 import torch
 
-from ...utils.logger import ad_logger
 from ...utils.quantization_utils import FLOAT8_DTYPES
 
 
@@ -121,14 +120,9 @@ def _kv_b_proj_dequant_load_hook(
             continue
 
         if scale_key not in state_dict:
-            # No scale available; fall back to plain cast and warn.
-            ad_logger.warning_once(
-                f"kv_b_proj FP8 weight found at {w_key} but no scale at {scale_key}; "
-                "loading with raw dtype cast (weights will be incorrect).",
-                key=f"kv_b_proj_dequant_load_hook_{layer_idx}",
+            raise KeyError(
+                f"Missing {scale_key} for FP8 weight {w_key}; cannot dequantize kv_b_proj."
             )
-            state_dict[w_key] = w.to(torch.bfloat16)
-            continue
 
         scale = state_dict[scale_key]
 
