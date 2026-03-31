@@ -218,6 +218,8 @@ class OpenAIServer:
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            if self.metrics_collector:
+                self.metrics_collector.log_request_error(http_code=400)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:

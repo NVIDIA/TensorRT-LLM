@@ -12,6 +12,8 @@ from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
+
+MAX_SPEC_DECODE_POSITIONS = 16
 '''
 CONTEXT_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.CONTEXT_INIT: 2>
 ENCODER_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.ENCODER_INIT: 1>
@@ -673,6 +675,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_accepted_draft_tokens = 0
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
+        self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
+        self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False

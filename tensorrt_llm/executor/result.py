@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import json
+import math
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
+from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
@@ -173,6 +175,8 @@ class GenerationResultBase:
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
+        self.per_pos_drafted = None
+        self.per_pos_accepted = None
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
@@ -457,6 +461,10 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
+            self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
+                                           None)
+            self.per_pos_accepted = getattr(response_result,
+                                            'per_pos_accepted', None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
@@ -566,6 +574,83 @@ class GenerationResultBase:
             stats, len(output.token_ids), self.sampling_params.n > 1)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
+
+        prompt_token_ids = getattr(self, "prompt_token_ids", None)
+        if prompt_token_ids:
+            metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+        if self.cached_tokens > 0:
+            metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS] = \
+                self.cached_tokens
+
+        spec_dec_logged = False
+        if self.per_pos_drafted is not None and any(
+                d > 0 for d in self.per_pos_drafted):
+            metrics_stats[MetricNames.SPEC_DEC_ACCEPTED_PER_POS] = \
+                self.per_pos_accepted
+            metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
+                self.per_pos_drafted
+            spec_dec_logged = True
+        if not spec_dec_logged and output.request_perf_metrics is not None:
+            spec_dec = output.request_perf_metrics.speculative_decoding
+            if spec_dec is not None and spec_dec.total_draft_tokens > 0:
+                metrics_stats[MetricNames.SPEC_DEC_ACCEPTED_PER_POS] = \
+                    [spec_dec.total_accepted_draft_tokens]
+                metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
+                    [spec_dec.total_draft_tokens]
+
+        if output.prompt_logprobs and prompt_token_ids:
+            try:
+                prompt_lps = []
+                for i, entry in enumerate(output.prompt_logprobs):
+                    if i >= len(prompt_token_ids):
+                        break
+                    token_id = prompt_token_ids[i]
+                    if isinstance(entry, dict):
+                        if token_id in entry:
+                            lp_obj = entry[token_id]
+                            lp = lp_obj.logprob if hasattr(
+                                lp_obj, 'logprob') else float(lp_obj)
+                            prompt_lps.append(lp)
+                    elif isinstance(entry, (int, float)):
+                        prompt_lps.append(float(entry))
+                if prompt_lps:
+                    mean_lp = sum(prompt_lps) / len(prompt_lps)
+                    ppl = math.exp(-mean_lp)
+                    if math.isfinite(ppl):
+                        metrics_stats[MetricNames.PREFILL_PERPLEXITY] = ppl
+            except Exception:
+                logger.debug("Failed to compute prefill perplexity",
+                             exc_info=True)
+
+        num_gen_tokens = output.length
+        if num_gen_tokens > 0:
+            gen_ppl = None
+            if output.cumulative_logprob is not None:
+                gen_ppl = math.exp(
+                    -output.cumulative_logprob / num_gen_tokens)
+            elif output.logprobs:
+                try:
+                    gen_lps = []
+                    for i, entry in enumerate(output.logprobs):
+                        if isinstance(entry, dict):
+                            token_id = output.token_ids[
+                                i] if i < len(output.token_ids) else None
+                            if token_id is not None and token_id in entry:
+                                lp_obj = entry[token_id]
+                                lp = lp_obj.logprob if hasattr(
+                                    lp_obj, 'logprob') else float(lp_obj)
+                                gen_lps.append(lp)
+                        elif isinstance(entry, (int, float)):
+                            gen_lps.append(float(entry))
+                    if gen_lps:
+                        mean_lp = sum(gen_lps) / len(gen_lps)
+                        gen_ppl = math.exp(-mean_lp)
+                except Exception:
+                    logger.debug("Failed to compute generation perplexity",
+                                 exc_info=True)
+            if gen_ppl is not None and math.isfinite(gen_ppl):
+                metrics_stats[MetricNames.GENERATION_PERPLEXITY] = gen_ppl
+
         self.metrics_dict.update(metrics_stats)
 
     def do_tracing(
