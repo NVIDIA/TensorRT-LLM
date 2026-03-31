@@ -245,10 +245,6 @@ public:
         {
             options.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
-        if (isCgaSmemReduction(options.mMultiCtasKvMode))
-        {
-            options.mClusterDimX *= options.mMaxNumCtasKv;
-        }
     }
 
     void run(RunnerParams const& params)
@@ -341,7 +337,7 @@ public:
                 fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
                 options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
 
-            launchFmhaKernel(kernelParams, kernelMeta, func, grid, options.mClusterDimX, options, params.stream);
+            launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
             runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
         }
@@ -848,8 +844,14 @@ private:
     }
 
     void launchFmhaKernel(KernelParams const& kernelParams, KernelMeta const& kernelMeta, CUfunction const& func,
-        tg::CudaRunner::Grid const& grid, int clusterDimX, FmhaOptions const& options, CUstream stream) const
+        tg::CudaRunner::Grid const& grid, FmhaOptions const& options, CUstream stream) const
     {
+        int launchedClusterDimX = options.mClusterDimX;
+        if (isCgaSmemReduction(options.mMultiCtasKvMode))
+        {
+            launchedClusterDimX *= options.mMaxNumCtasKv;
+        }
+
         // Prepare kernel parameters list for cuLaunchKernelEx.
         void* kernelParamsList[] = {const_cast<void*>(static_cast<void const*>(&kernelParams))};
         CUlaunchConfig launch_config;
@@ -872,16 +874,16 @@ private:
             options.mMaxSeqLenQ, options.mMaxSeqLenKv, options.mNumHeadsQ, options.mNumHeadsKv, options.mBatchSize,
             static_cast<int>(options.mFmhaKernelType));
         TLLM_LOG_DEBUG("TRTLLM-Gen launch info: numCtasX = %d, numCtasY = %d, numCtasZ = %d, clusterDimX = %d",
-            launch_config.gridDimX, launch_config.gridDimY, launch_config.gridDimZ, clusterDimX);
+            launch_config.gridDimX, launch_config.gridDimY, launch_config.gridDimZ, launchedClusterDimX);
 
         CUlaunchAttribute launch_attribute[3];
         launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-        launch_attribute[0].value.clusterDim.x = clusterDimX;
+        launch_attribute[0].value.clusterDim.x = launchedClusterDimX;
         launch_attribute[0].value.clusterDim.y = 1;
         launch_attribute[0].value.clusterDim.z = 1;
         launch_attribute[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
         launch_attribute[1].value.clusterSchedulingPolicyPreference
-            = clusterDimX > 1 ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
+            = launchedClusterDimX > 1 ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
         launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
         launch_attribute[2].value.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
 
@@ -889,7 +891,7 @@ private:
         launch_config.numAttrs = 3;
 
         // Add setting for non-portable cluster size.
-        if (clusterDimX > 8)
+        if (launchedClusterDimX > 8)
         {
             TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
                 1 // Enable non-portable cluster sizes

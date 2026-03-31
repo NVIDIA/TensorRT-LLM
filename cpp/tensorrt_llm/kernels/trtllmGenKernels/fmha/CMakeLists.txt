@@ -23,8 +23,12 @@ if(DEFINED CUDAToolkit_INCLUDE_DIRS AND CUDAToolkit_INCLUDE_DIRS)
 else()
   get_filename_component(CUDA_BIN_PATH ${CMAKE_CUDA_COMPILER} DIRECTORY)
   get_filename_component(CUDA_TOOLKIT_ROOT ${CUDA_BIN_PATH} DIRECTORY)
+  set(cudaTargetsArch ${CMAKE_SYSTEM_PROCESSOR})
+  if(cudaTargetsArch STREQUAL "aarch64" OR cudaTargetsArch STREQUAL "arm64")
+    set(cudaTargetsArch sbsa)
+  endif()
   set(CUDA_TARGETS_INCLUDE_DIR
-      "${CUDA_TOOLKIT_ROOT}/targets/${CMAKE_SYSTEM_PROCESSOR}-linux/include")
+      "${CUDA_TOOLKIT_ROOT}/targets/${cudaTargetsArch}-linux/include")
 endif()
 file(CREATE_LINK ${CUDA_TARGETS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cuda
      SYMBOLIC)
@@ -36,10 +40,11 @@ file(CREATE_LINK ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export/trtllm/dev
      ${CMAKE_CURRENT_BINARY_DIR}/trtllm/dev SYMBOLIC)
 file(CREATE_LINK ${CMAKE_CURRENT_SOURCE_DIR}/cuda_ptx
      ${CMAKE_CURRENT_BINARY_DIR}/cuda_ptx SYMBOLIC)
-file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export/KernelParams.h
-     DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export/KernelParamsDecl.h
-     DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export/KernelParams.h
+               ${CMAKE_CURRENT_BINARY_DIR}/KernelParams.h COPYONLY)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export/KernelParamsDecl.h
+  ${CMAKE_CURRENT_BINARY_DIR}/KernelParamsDecl.h COPYONLY)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
