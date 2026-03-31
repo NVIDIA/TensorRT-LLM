@@ -119,6 +119,7 @@ def torch_attention(
     sliding_window: Optional[int] = None,
     logit_cap: Optional[float] = None,
     layout: str = "bnsd",  # "bnsd" or "bsnd"
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     SDPA attention (with optional GQA) that supports two memory layouts via `layout`:
@@ -128,6 +129,9 @@ def torch_attention(
     The `attn_mask` is always interpreted as [b, n, s_q, s_k].
 
     Returns a tensor in the SAME layout as inputs specified by `layout`.
+
+    ``layer_type`` is graph metadata for ``apply_sharding_hints`` and does not
+    affect the numeric result.
     """
     if layout not in ("bnsd", "bsnd"):
         raise ValueError(f"layout must be 'bnsd' or 'bsnd', got {layout!r}")
@@ -239,5 +243,6 @@ def torch_attention_fake(
     sliding_window=None,
     logit_cap=None,
     layout: str = "bnsd",
+    layer_type: str = "unknown",
 ):
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()

@@ -1,0 +1,36 @@
+# WARNING: tested only on up to 8 layers (8xH100 can't fit the full model,
+# output not fully verified). dsv3_router_gemm_op crashes on H100 (pre-existing bug).
+model: deepseek-ai/DeepSeek-R1
+args:
+  world_size: 2
+  runtime: trtllm
+  compile_backend: torch-simple
+  max_seq_len: 512
+  max_num_tokens: 512
+  max_batch_size: 8
+  enable_chunked_prefill: true
+  model_factory: AutoModelForCausalLM
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.95
+    tokens_per_block: 128
+  skip_loading_weights: false
+  model_kwargs:
+    torch_dtype: bfloat16
+    num_hidden_layers: 4
+  transforms:
+    export_to_gm:
+      num_moe_experts_for_export: 2
+    detect_sharding:
+      stage: sharding
+      enabled: false
+    sharding_transform_executor:
+      stage: sharding
+      enabled: false
+    apply_sharding_hints:
+      stage: sharding
+      enabled: true
+      run_shape_prop: true
+      allreduce_strategy: NCCL
+    gather_logits_before_lm_head:
+      enabled: true

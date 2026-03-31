@@ -22,6 +22,8 @@ def torch_mla(
     is_causal: bool = True,
     scale: Optional[float] = None,
     layout: str = "bsnd",
+    shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Multi-head Latent Attention (MLA) with FlashInfer-compatible compressed KV.
 
@@ -38,6 +40,8 @@ def torch_mla(
         is_causal: Whether to apply causal masking (default: True)
         scale: Softmax scale factor (default: 1/sqrt(qk_head_dim))
         layout: Input/output layout, either "bsnd" or "bnsd" (default: "bsnd")
+        shardable: Whether sharding transforms may rewrite this op.
+        layer_type: Layer id hint for selective sharding (e.g. ``shard_layers``).
 
     Returns:
         Attention output with shape [B, S, N, v_head_dim] (bsnd)
@@ -135,6 +139,8 @@ def torch_mla_fake(
     is_causal: bool = True,
     scale: Optional[float] = None,
     layout: str = "bsnd",
+    shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch_mla."""
     # Infer v_head_dim from kv_b_proj_weight

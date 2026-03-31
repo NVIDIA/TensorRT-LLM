@@ -778,7 +778,7 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
-                            layer_type=LayerType.ATTENTION,
+                            layer_type=LayerType.MHA,
                         )
                     )
         elif model_cls == MLP:

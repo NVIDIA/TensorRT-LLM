@@ -126,7 +126,8 @@ class SharedConfig(BaseModel):
     }
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    mapping: Any = Field(default=None)  # Mapping object from ad_executor
+    mapping: Any = Field(default=None)  # Legacy: tensorrt_llm.mapping.Mapping (deprecated)
+    dist_config: Any = Field(default=None)  # DistConfig from auto_deploy
 
 
 class TransformConfig(BaseModel):

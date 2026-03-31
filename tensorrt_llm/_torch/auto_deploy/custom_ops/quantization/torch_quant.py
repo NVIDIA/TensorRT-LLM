@@ -31,6 +31,11 @@ e2m1_values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -
 
 
 # ===== Helpers =====
+def cdiv(a: int, b: int) -> int:
+    """Compute ceiling division of two integers."""
+    return (a + b - 1) // b
+
+
 def _expect_single_scale(scales: List[Optional[torch.Tensor]], name: str) -> torch.Tensor:
     if len(scales) == 0 or scales[0] is None:
         raise ValueError(f"{name} must provide at least one scale tensor (scales[0]).")
@@ -182,6 +187,10 @@ def torch_fake_quant_fp8_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.
@@ -217,6 +226,10 @@ def torch_fake_quant_fp8_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     w = weight_quantized.to(input.dtype)
     return torch.ops.aten.linear(input, w, bias)
@@ -231,6 +244,10 @@ def torch_fake_quant_nvfp4_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.
@@ -293,6 +310,10 @@ def torch_fake_quant_nvfp4_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
 
@@ -306,6 +327,10 @@ def torch_fake_quant_int4_linear(
     weight_scale: List[torch.Tensor],  # [ weight_scale ]
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     BLOCK_SIZE = 128
     # activation pre-scale
@@ -321,7 +346,14 @@ def torch_fake_quant_int4_linear(
     # Dequantize
     w_deq = (q_int4.to(torch.float32) / scale_full).to(input.dtype)
 
-    return torch.ops.auto_deploy.torch_linear_simple.default(x_scaled, w_deq, bias)
+    return torch.ops.auto_deploy.torch_linear_simple.default(
+        x_scaled,
+        w_deq,
+        bias,
+        tp_mode=tp_mode,
+        output_sizes=output_sizes,
+        tp_min_local_shape=tp_min_local_shape,
+    )
 
 
 @torch_fake_quant_int4_linear.register_fake
@@ -333,6 +365,10 @@ def _fake(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     N_half = weight_quantized.shape[-2]
     N = N_half * 2
@@ -348,6 +384,10 @@ def torch_fake_quant_int4_gptq_linear(
     weight_scale: List[torch.Tensor],  # GPTQ scales [G, N]
     input_zp: List[torch.Tensor],  # unused for GPTQ
     weight_zp: List[torch.Tensor],  # GPTQ qzeros [G, N/8] int32
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     GPTQ INT4 linear with compatible signature to other quant ops.
@@ -429,6 +469,10 @@ def torch_fake_quant_int4_gptq_linear_fake(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     N = weight_quantized.size(1)
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
@@ -499,6 +543,10 @@ def torch_fake_quant_finegrained_fp8_linear(
     weight_scale: List[torch.Tensor],  # [weight_scale_inv]
     input_zp: List[torch.Tensor],  # unused
     weight_zp: List[torch.Tensor],  # unused
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FineGrainedFP8 linear operation.
     - weight_scale[0] = weight_scale_inv (per-block weight scale)
@@ -542,6 +590,10 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
@@ -554,6 +606,10 @@ def trtllm_finegrained_fp8_linear(
     weight: torch.Tensor,  # [N, K] float8_e4m3fn
     bias: Optional[torch.Tensor],  # [N] or None
     weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """TRT-LLM optimized FineGrainedFP8 linear operation.
 
@@ -583,8 +639,8 @@ def trtllm_finegrained_fp8_linear(
             f"(shape={weight_scale.shape}), weight shape={weight.shape}. "
             f"This usually means scale tensor sharding produced an empty tensor."
         )
-    block_n = N // scale_n
-    block_k = K // scale_k
+    block_n = cdiv(N, scale_n)
+    block_k = cdiv(K, scale_k)
 
     # TRT-LLM fp8_block_scaling_gemm requires exact 128x128 blocks.
     # For small layers where a dimension < 128 (e.g. N=64), the derived block
@@ -624,6 +680,10 @@ def _trtllm_finegrained_fp8_linear_fake(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     weight_scale: torch.Tensor,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight.shape[0]

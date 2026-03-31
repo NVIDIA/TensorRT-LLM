@@ -23,6 +23,18 @@ except ImportError:
     float4_sf_dtype = None
 
 
+FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype_name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, dtype_name, None)) is not None
+)
+
+
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
     """Converts the modelopt FP4 per-block weight scale to the cutlass format (padded and swizzled)."""
     m, n = modelopt_scale.shape

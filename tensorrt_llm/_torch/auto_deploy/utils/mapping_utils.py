@@ -17,18 +17,35 @@ import json
 
 from tensorrt_llm.mapping import Mapping
 
+from .dist_config import DistConfig
+
 
 def deserialize_mapping(mapping_config: str) -> Mapping:
-    return Mapping.from_dict(json.loads(mapping_config))
+    """Deserialize a Mapping from a serialized DistConfig JSON string.
+
+    The canonical serialization format for ``mapping_config`` is
+    ``DistConfig.serialize()``.  This helper round-trips through DistConfig
+    and converts to Mapping for callers that still need a Mapping object.
+    """
+    return DistConfig.deserialize(mapping_config).to_mapping()
 
 
 def serialize_mapping(mapping: Mapping) -> str:
+    """Serialize a Mapping to JSON string (legacy interface for MoE ops)."""
     return json.dumps(mapping.to_dict())
 
 
-def print_grid(mapping: Mapping) -> str:
-    return f"process grid: [TP, MoE_TP, MoE_EP] = [{mapping.tp_size}, {mapping.moe_tp_size}, {mapping.moe_ep_size}]"
+def serialize_dist_config(dist_config: DistConfig) -> str:
+    """Serialize a DistConfig to JSON string for MoE ops."""
+    return dist_config.serialize()
 
 
-def print_rank(mapping: Mapping) -> str:
-    return f"rank: [{mapping.rank}, {mapping.moe_tp_rank}, {mapping.moe_ep_rank}]"
+def print_grid(dist_config: DistConfig) -> str:
+    return (
+        f"process grid: [TP, MoE_TP, MoE_EP] = "
+        f"[{dist_config.tp_size}, {dist_config.moe_tp_size}, {dist_config.moe_ep_size}]"
+    )
+
+
+def print_rank(dist_config: DistConfig) -> str:
+    return f"rank: [{dist_config.rank}, {dist_config.moe_tp_rank}, {dist_config.moe_ep_rank}]"
