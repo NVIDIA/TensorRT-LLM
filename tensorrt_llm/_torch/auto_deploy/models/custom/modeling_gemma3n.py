@@ -384,7 +384,8 @@ class Gemma3nTextDecoderLayer(nn.Module):
         per_layer_input: torch.Tensor,
     ) -> torch.Tensor:
         predictions = self.altup.predict(hidden_states)
-        active_prediction = predictions[0]
+        active_idx = getattr(self.altup, "active_idx", self.altup.config.altup_active_idx)
+        active_prediction = predictions[active_idx]
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
@@ -404,7 +405,7 @@ class Gemma3nTextDecoderLayer(nn.Module):
         attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
         corrected_predictions = self.altup.correct(predictions, attn_laurel + attn_ffw_norm)
 
-        first_prediction = corrected_predictions[0].clone()
+        first_prediction = corrected_predictions[active_idx].clone()
         if self.altup.config.altup_correct_scale:
             first_prediction = self.altup.scale_corrected_output(first_prediction)
 
@@ -413,7 +414,9 @@ class Gemma3nTextDecoderLayer(nn.Module):
         first_prediction = torch.multiply(first_prediction, per_layer_input)
         first_prediction = self.per_layer_projection(first_prediction)
         first_prediction = self.post_per_layer_input_norm(first_prediction)
-        corrected_predictions[1:] += first_prediction
+        for idx in range(corrected_predictions.shape[0]):
+            if idx != active_idx:
+                corrected_predictions[idx] += first_prediction
         return corrected_predictions
 
 

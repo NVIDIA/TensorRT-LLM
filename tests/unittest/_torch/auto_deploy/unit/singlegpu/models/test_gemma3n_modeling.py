@@ -383,7 +383,7 @@ def test_gemma3n_shared_kv_layer_metadata_matches_config():
         (True, 3),
     ]
 
-    for layer, (is_shared, source_idx) in zip(model.model.layers, layer_expectations):
+    for layer, (is_shared, source_idx) in zip(model.model.layers, layer_expectations, strict=True):
         assert layer.self_attn.is_kv_shared_layer is is_shared
         assert layer.self_attn.kv_shared_layer_index == source_idx
 

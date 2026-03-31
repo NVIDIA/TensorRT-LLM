@@ -211,6 +211,11 @@ class _InsertCachedOperator(BaseTransform):
                 cache_in_nodes = cache_nodes_by_layer_idx[shared_kv_source_layer_idx]
             else:
                 # setup + store cache initializers and caches as input nodes
+                if layer_idx is not None and layer_idx in cache_nodes_by_layer_idx:
+                    raise RuntimeError(
+                        f"Duplicate KV cache owner detected for layer {layer_idx}. "
+                        "Each non-shared attention layer must own exactly one cache."
+                    )
                 cache_in_nodes = []
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config

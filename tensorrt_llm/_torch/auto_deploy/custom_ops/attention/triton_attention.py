@@ -388,7 +388,7 @@ class TritonAttention(AttentionDescriptor):
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # Sanity check: layout == "bsnd"
-        # Prefer kwargs; fall back to the final positional arg if it's a string.
+        # extract_op_args handles kwargs and positional arguments consistently.
         layout = extract_op_args(source_attn_node, "layout")[0]
         if layout != "bsnd":
             raise RuntimeError(

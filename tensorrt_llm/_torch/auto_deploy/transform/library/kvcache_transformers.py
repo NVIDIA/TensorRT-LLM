@@ -159,7 +159,10 @@ def get_cached_attn(
         elif attention_layout != "bnsd":
             raise ValueError(f"Unsupported attention layout: {attention_layout}")
 
-        attn_output = attn_descriptor.get_cached_attention_op()(
+        cached_attn_op = module._node_ref.meta.get(
+            "cached_attn_op", attn_descriptor.get_cached_attention_op()
+        )
+        attn_output = cached_attn_op(
             query,
             key,
             value,
@@ -247,6 +250,7 @@ class HFReplaceCachedAttn(_InsertCachedOperator):
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
         # store reference to metadata, caches, and constants for this attn node
+        attn_node.meta["cached_attn_op"] = cached_attn_op
         attn_node.meta["metadata_cache_keys"] = (*meta_nodes_std, *meta_nodes_extra, *cache_nodes)
         attn_node.meta["constants"] = constants
 

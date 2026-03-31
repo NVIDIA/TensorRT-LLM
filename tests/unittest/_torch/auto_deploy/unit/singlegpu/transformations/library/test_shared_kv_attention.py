@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
@@ -54,6 +55,18 @@ class _TinySharedKVModule(torch.nn.Module):
             0,
         )
         return regular + shared
+
+
+class _DuplicateLayerOwnerSharedKVModule(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        qkv = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], 2, 4)
+        first = torch.ops.auto_deploy.torch_attention(
+            qkv, qkv, qkv, None, 0.0, True, 1.0, None, None, None, "bsnd", 0
+        )
+        second = torch.ops.auto_deploy.torch_attention(
+            qkv, qkv, qkv, None, 0.0, True, 1.0, None, None, None, "bsnd", 0
+        )
+        return first + second
 
 
 def _context_meta(seq_len: int):
@@ -343,7 +356,7 @@ def test_torch_shared_kv_cached_attention_supports_out_buffer():
         q,
         k,
         v,
-        batch_info_host.data,
+        batch_info_host.serialize(),
         seq_len,
         input_pos,
         slot_idx,
@@ -358,7 +371,7 @@ def test_torch_shared_kv_cached_attention_supports_out_buffer():
         q,
         k,
         v,
-        batch_info_host.data,
+        batch_info_host.serialize(),
         seq_len,
         input_pos,
         slot_idx,
@@ -371,6 +384,33 @@ def test_torch_shared_kv_cached_attention_supports_out_buffer():
 
     assert ret.numel() == 0
     torch.testing.assert_close(out, expected)
+
+
+def test_torch_attention_shared_kv_requires_source_layer_idx():
+    qkv = torch.randn(1, 2, 2, 4)
+
+    with pytest.raises(ValueError, match="shared_kv_source_layer_idx"):
+        torch.ops.auto_deploy.torch_attention_shared_kv(
+            qkv, qkv, qkv, None, 0.0, True, 1.0, None, None, None, "bsnd", 1
+        )
+
+
+def test_duplicate_cache_owner_layer_idx_raises():
+    module = _DuplicateLayerOwnerSharedKVModule().eval()
+    gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
+
+    cm = CachedSequenceInterface(
+        max_seq_len=16,
+        max_batch_size=2,
+        max_num_tokens=16,
+        device="cpu",
+    )
+    transform = _InsertCachedOperator(
+        InsertCachedAttentionConfig(stage=Stages.CACHE_INIT, backend="torch")
+    )
+
+    with pytest.raises(RuntimeError, match="Duplicate KV cache owner"):
+        transform._apply(gm, cm, factory=None, shared_config=SharedConfig())
 
 
 @torch.no_grad()

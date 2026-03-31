@@ -120,6 +120,7 @@ def torch_attention(
     logit_cap: Optional[float] = None,
     layout: str = "bnsd",  # "bnsd" or "bsnd"
     layer_idx: Optional[int] = None,
+    shared_kv_source_layer_idx: Optional[int] = None,
 ) -> torch.Tensor:
     """
     SDPA attention (with optional GQA) that supports two memory layouts via `layout`:
@@ -130,8 +131,9 @@ def torch_attention(
 
     Returns a tensor in the SAME layout as inputs specified by `layout`.
     """
-    # `layer_idx` is graph metadata used by the KV-cache transform; the eager attention kernel
-    # itself does not need it.
+    # `layer_idx` and `shared_kv_source_layer_idx` are graph metadata used by the KV-cache
+    # transform; the eager attention kernel itself does not need them.
+    del shared_kv_source_layer_idx
     if layout not in ("bnsd", "bsnd"):
         raise ValueError(f"layout must be 'bnsd' or 'bsnd', got {layout!r}")
 
@@ -243,6 +245,7 @@ def torch_attention_fake(
     logit_cap=None,
     layout: str = "bnsd",
     layer_idx: Optional[int] = None,
+    shared_kv_source_layer_idx: Optional[int] = None,
 ):
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
@@ -264,6 +267,8 @@ def torch_attention_shared_kv(
     shared_kv_source_layer_idx: Optional[int] = None,
 ) -> torch.Tensor:
     """Source attention op variant that marks a layer as reusing another layer's KV cache."""
+    if shared_kv_source_layer_idx is None:
+        raise ValueError("torch_attention_shared_kv requires shared_kv_source_layer_idx")
     return torch_attention(
         query,
         key,
@@ -276,6 +281,8 @@ def torch_attention_shared_kv(
         sliding_window,
         logit_cap,
         layout,
+        layer_idx,
+        shared_kv_source_layer_idx,
     )
 
 
