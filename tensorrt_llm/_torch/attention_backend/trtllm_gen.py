@@ -1562,6 +1562,9 @@ def trtllm_gen_attention(
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
     global_layer_idx: Optional[int] = None,
+    num_contexts: int = 0,
+    num_generations: int = 0,
+    num_ctx_tokens: int = 0,
 ) -> None:
     """
     TrtLLM-Gen attention using flashinfer backend.
@@ -1691,9 +1694,6 @@ def trtllm_gen_attention(
     if attention_input_type is not None:
         attn_input_type = AttentionInputType(attention_input_type)
 
-    num_contexts, num_generations = _parse_request_types(host_request_types)
-
-    num_ctx_tokens = int(host_context_lengths[:num_contexts].sum()) if num_contexts > 0 else 0
     num_gen_tokens = num_tokens - num_ctx_tokens
 
     # Prepare Workspace
