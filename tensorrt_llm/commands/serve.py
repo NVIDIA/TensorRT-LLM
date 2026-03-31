@@ -1257,8 +1257,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
 
     else:
         # Common workers — redirect output to log file if configured
-        from tensorrt_llm.llmapi.mpi_session import (
-            TLLM_WORKER_LOG_FILE_ENV, redirect_output_to_file)
+        from tensorrt_llm.llmapi.mpi_session import (TLLM_WORKER_LOG_FILE_ENV,
+                                                     redirect_output_to_file)
         log_file = os.environ.get(TLLM_WORKER_LOG_FILE_ENV)
         if log_file:
             redirect_output_to_file(log_file)
