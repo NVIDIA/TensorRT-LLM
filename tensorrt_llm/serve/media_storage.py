@@ -601,6 +601,43 @@ class MediaStorage:
         return output_path
 
     @staticmethod
+    def _resolve_batch_paths(
+        output_paths: Union[str, List[str]],
+        batch_size: int,
+        ext: str,
+    ) -> List[str]:
+        """Build per-item output paths for a batch save operation.
+
+        Args:
+            output_paths: Either a single string prefix (generates
+                ``{prefix}_{i}{ext}``) or an explicit list of paths (one per
+                batch element).  When a list element lacks a file extension,
+                *ext* is appended automatically.
+            batch_size: Number of items in the batch.
+            ext: File extension including the leading dot (e.g. ``".png"``).
+
+        Returns:
+            List of resolved file paths with length *batch_size*.
+
+        Raises:
+            ValueError: If *output_paths* is a list whose length does not
+                match *batch_size*.
+        """
+        if isinstance(output_paths, list):
+            if len(output_paths) != batch_size:
+                raise ValueError(
+                    f"Length of output_paths ({len(output_paths)}) does not "
+                    f"match batch size ({batch_size})"
+                )
+            resolved = []
+            for p in output_paths:
+                if not os.path.splitext(p)[1]:
+                    p = p + ext
+                resolved.append(p)
+            return resolved
+        return [f"{output_paths}_{i}{ext}" for i in range(batch_size)]
+
+    @staticmethod
     def save_images(
         images: Any,
         output_paths: Union[str, List[str]],
@@ -640,20 +677,7 @@ class MediaStorage:
 
         batch_size = images.shape[0]
 
-        # Build per-image output paths
-        if isinstance(output_paths, list):
-            if len(output_paths) != batch_size:
-                raise ValueError(
-                    f"Length of output_paths ({len(output_paths)}) does not "
-                    f"match batch size ({batch_size})"
-                )
-            resolved = []
-            for p in output_paths:
-                if not os.path.splitext(p)[1]:
-                    p = p + ext
-                resolved.append(p)
-        else:
-            resolved = [f"{output_paths}_{i}{ext}" for i in range(batch_size)]
+        resolved = MediaStorage._resolve_batch_paths(output_paths, batch_size, ext)
 
         paths: List[str] = []
         for i in range(batch_size):
@@ -831,20 +855,7 @@ class MediaStorage:
 
         batch_size = videos.shape[0]
 
-        # Build per-video output paths
-        if isinstance(output_paths, list):
-            if len(output_paths) != batch_size:
-                raise ValueError(
-                    f"Length of output_paths ({len(output_paths)}) does not "
-                    f"match batch size ({batch_size})"
-                )
-            resolved = []
-            for p in output_paths:
-                if not os.path.splitext(p)[1]:
-                    p = p + ext
-                resolved.append(p)
-        else:
-            resolved = [f"{output_paths}_{i}{ext}" for i in range(batch_size)]
+        resolved = MediaStorage._resolve_batch_paths(output_paths, batch_size, ext)
 
         paths: List[str] = []
         for i in range(batch_size):
