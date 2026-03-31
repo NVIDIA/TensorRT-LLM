@@ -26,8 +26,16 @@ to the context kernel — same as AD. The C++ kernel correctly handles
 Fix: SDPA fallback for mixed batches avoids the sensitive `thop.attention`
 call that triggers corruption detection. Pure prefill batches use C++ FMHA.
 
-Verified: 0 failures for 2, 4, 8, 16, 32, 64, 128 requests.
-The 64/256 failure with 256 requests is a separate decode path issue.
+**256/256 pass** with `torch-simple` + `tokens_per_block=32` (AD default):
+- C++ FMHA for pure prefill batches (common/fast path)
+- SDPA fallback for mixed prefill+decode batches (rare, ~10% of iterations)
+- `tokens_per_block=64` (PT default) causes decode crashes at scale — use 32
+
+Two remaining issues for full C++ FMHA (no SDPA fallback):
+1. Mixed batch: `thop.attention` context_only crashes with `cudaStreamIsCapturing`
+   error — needs C++ kernel investigation
+2. FP8 weight: `kv_b_proj_weight` has unscaled values (max=448) — needs
+   FP8 block scale to be passed to the MLA custom op
 
 ### Investigation: K/V Magnitude Difference
 The K/V expansion is `K,V = kv_b_proj(compressed_kv)` where `kv_b_proj_weight` has
