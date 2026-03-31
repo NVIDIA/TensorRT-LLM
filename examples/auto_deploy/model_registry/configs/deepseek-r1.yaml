@@ -1,6 +1,5 @@
 # Conservative runtime settings for DeepSeek-R1 bring-up.
 compile_backend: torch-cudagraph
-world_size: 8
 max_batch_size: 64
 max_seq_len: 4096
 enable_chunked_prefill: true
