@@ -498,14 +498,17 @@ class ModelLoader:
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
         # Store allreduce pre-allocation config for AllReduce module access.
-        # VLM wrapper configs (e.g. NemotronH_Nano_VL_V2_Config, KimiK25Config)
-        # may not expose these attributes at the top level; skip pre-allocation
-        # gracefully in that case — the consumer in ops.py handles None for each.
+        # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
+        # KimiK25Config) that store the text config under .text_config are
+        # handled transparently.  For flat configs get_text_config() returns
+        # self, so this is safe for all config types.  Still guard with
+        # try/except for configs that lack hidden_size entirely.
         try:
             config.extra_attrs[
                 'allreduce_max_num_tokens'] = config.max_num_tokens
             config.extra_attrs[
-                'allreduce_hidden_size'] = config.pretrained_config.hidden_size
+                'allreduce_hidden_size'] = config.pretrained_config.get_text_config(
+                ).hidden_size
             config.extra_attrs[
                 'allreduce_dtype'] = config.pretrained_config.torch_dtype
         except AttributeError as e:
