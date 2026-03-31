@@ -1880,10 +1880,19 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("use_python_runtime", [True, False])
     def test_nixl_backend(self, use_python_runtime):
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("NIXL")
+        with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(8)
+    def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            "NIXL", use_python_runtime)
+            "NIXL", use_python_runtime=True)
+        ctx_cfg["tensor_parallel_size"] = 2
+        ctx_cfg["enable_attention_dp"] = True
+        gen_cfg["tensor_parallel_size"] = 4
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])

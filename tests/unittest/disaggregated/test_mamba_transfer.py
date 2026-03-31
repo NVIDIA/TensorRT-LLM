@@ -340,7 +340,7 @@ def run_mamba_transfer_test(ctx_tp: int, gen_tp: int):
     )
     ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
     gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)
-    ctx_endpoint = ctx_tcs[0].context_info_endpoint
+    ctx_endpoint = ctx_tcs[0]._context_info_endpoint
 
     # -- 3. Create requests --
     sampling_params = SamplingParams()
@@ -447,8 +447,7 @@ def run_mamba_transfer_test(ctx_tp: int, gen_tp: int):
     for mgr in ctx_mgrs + gen_mgrs:
         mgr.shutdown()
     for tc in ctx_tcs + gen_tcs:
-        if hasattr(tc, "transfer_worker") and tc.transfer_worker is not None:
-            tc.transfer_worker.shutdown()
+        tc.shutdown()
 
 
 # ---------------------------------------------------------------------------
