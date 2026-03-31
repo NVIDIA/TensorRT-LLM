@@ -115,22 +115,37 @@ def resmooth_to_fp8_e8m0(
     num_batches = w_view.shape[0]
     BLOCK_M, BLOCK_K = block_size
 
-    grid = (num_batches, triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_k = triton.cdiv(K, BLOCK_K)
+    blocks_per_batch = grid_m * grid_k
 
-    _resmooth_kernel[grid](
-        w_view,
-        s_view,
-        M,
-        K,
-        w_view.stride(0),
-        w_view.stride(1),
-        w_view.stride(2),
-        s_view.stride(0),
-        s_view.stride(1),
-        s_view.stride(2),
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
-    )
+    # Workaround for Triton compiler/runtime bug on SM100f (Blackwell):
+    # CUDA illegal memory access when total grid blocks exceed ~65K.
+    # Split launches along the batch dimension to stay under the limit.
+    MAX_GRID_BLOCKS = 65536
+    if blocks_per_batch > 0:
+        max_batches_per_launch = max(1, MAX_GRID_BLOCKS // blocks_per_batch)
+    else:
+        max_batches_per_launch = num_batches
+
+    for batch_offset in range(0, num_batches, max_batches_per_launch):
+        batch_count = min(max_batches_per_launch, num_batches - batch_offset)
+        grid = (batch_count, grid_m, grid_k)
+
+        _resmooth_kernel[grid](
+            w_view[batch_offset:],
+            s_view[batch_offset:],
+            M,
+            K,
+            w_view.stride(0),
+            w_view.stride(1),
+            w_view.stride(2),
+            s_view.stride(0),
+            s_view.stride(1),
+            s_view.stride(2),
+            BLOCK_M=BLOCK_M,
+            BLOCK_K=BLOCK_K,
+        )
     # this is an in-place operation, however, we return for simplicity
     return weight, weight_scale
 

@@ -282,6 +282,7 @@ class Eagle3DraftModel(DecoderModel):
         self.num_layers = model_config.pretrained_config.num_hidden_layers
         self._eh_proj_before_attn = eagle_config.get("eh_proj_before_attn",
                                                      False)
+        self._norm_before_fc = eagle_config.get("norm_before_fc", False)
         self._use_mla = use_mla
 
         if hasattr(config, "target_hidden_size"):
@@ -303,6 +304,15 @@ class Eagle3DraftModel(DecoderModel):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
             )
+        if self._norm_before_fc:
+            self.input_norm = RMSNorm(
+                hidden_size=self.hidden_size_in *
+                self.spec_config.num_capture_layers,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+        else:
+            self.input_norm = None
 
         if self.num_layers > 1:
             self.midlayer = nn.ModuleList([
@@ -552,6 +562,8 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
 
         expected_hidden_size = self.model.hidden_size
         if hidden_states.shape[-1] != expected_hidden_size:
+            if self.model._norm_before_fc:
+                hidden_states = self.model.input_norm(hidden_states)
             hidden_states = self.model.fc(hidden_states)
 
         return hidden_states
@@ -1024,7 +1036,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
-                        self.draft_config.extra_attrs = model_config.extra_attrs
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
@@ -1041,6 +1052,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         )
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                     model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
@@ -1054,6 +1066,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.extra_attrs = model_config.extra_attrs
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
@@ -1066,15 +1079,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if spec_config.spec_dec_mode.is_pard(
                 ) and self.draft_model is not None:
                     self.draft_model.logits_processor = self.logits_processor
-
-            # EAGLE3-specific logic: merge extra_attrs from draft model for Llama3
-            if (self.draft_config is not None and model_config.spec_config.
-                    spec_dec_mode.is_eagle3_one_model()
-                    and model_config.spec_config.eagle3_model_arch == "llama3"):
-                for key, value in self.draft_config.extra_attrs.items():
-                    assert key in ('attn_layers', 'mla_layers')
-                    assert key in model_config.extra_attrs
-                    model_config.extra_attrs[key].update(value)
 
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(
