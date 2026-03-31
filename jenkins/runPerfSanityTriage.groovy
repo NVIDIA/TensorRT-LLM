@@ -83,15 +83,19 @@ def runPerfTriageBot() {
         // Install SSH tools on the K8s pod
         Utils.exec(this, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
-        // Create workspace and clone the triage bot repo on the login node
-        def workspace = "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
+        // Create workspace on the login node
+        // GB200 clusters use svc_tensorrt's home; B200 clusters use the Jenkins agent workspace
+        def isGB200 = params.CLUSTER?.contains("gb200")
+        def workspace = isGB200
+            ? "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
+            : "/home/jenkins/agent/workspace/LLM/TRTLLM-Perf/PerfSanityTriage/perf-triage-bot-${env.BUILD_TAG}"
         Utils.exec(this, script: Utils.sshUserCmd(remote, "\"mkdir -p ${workspace}\""), numRetries: 3)
         Utils.exec(this, script: Utils.sshUserCmd(remote,
             "\"cd ${workspace} && (rm -rf trtllm-perf-triage-bot; git clone https://gitlab-master.nvidia.com/chenfeiz/trtllm-perf-triage-bot.git)\""),
             numRetries: 3)
-        withCredentials([string(credentialsId: 'svc_tensorrt_gitlab_api_token', variable: 'GIT_TOKEN')]) {
+        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
             Utils.exec(this, script: Utils.sshUserCmd(remote,
-                "\"cd ${workspace} && (rm -rf trtllm-agent-toolkit; git clone https://oauth2:${GIT_TOKEN}@gitlab-master.nvidia.com/ftp/trtllm-agent-toolkit.git)\""),
+                "\"cd ${workspace} && (rm -rf trtllm-agent-toolkit; git clone https://${GIT_USER}:${GIT_TOKEN}@gitlab-master.nvidia.com/ftp/trtllm-agent-toolkit.git)\""),
                 numRetries: 3)
         }
 
