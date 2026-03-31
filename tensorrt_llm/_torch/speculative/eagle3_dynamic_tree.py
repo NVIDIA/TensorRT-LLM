@@ -182,7 +182,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             (max_batch_size, K + K * K * (max_draft_len - 1)), dtype=torch.float32, device="cuda"
         )
         self.history_draft_tokens_parent_buffer = torch.zeros(
-            (max_batch_size, K * (max_draft_len - 1) + 1), dtype=torch.int64, device="cuda"
+            (max_batch_size, max(K * (max_draft_len - 1) + 1, K + 1)),
+            dtype=torch.int64,
+            device="cuda",
         )
         self.tree_mask_buffer = torch.zeros(
             (max_batch_size * loop_max_tokens * loop_max_tokens),
