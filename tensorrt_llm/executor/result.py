@@ -578,9 +578,8 @@ class GenerationResultBase:
         prompt_token_ids = getattr(self, "prompt_token_ids", None)
         if prompt_token_ids:
             metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
-        if self.cached_tokens > 0:
-            metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS] = \
-                self.cached_tokens
+        metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS] = \
+            self.cached_tokens
 
         spec_dec_logged = False
         if self.per_pos_drafted is not None and any(
@@ -618,7 +617,7 @@ class GenerationResultBase:
                     ppl = math.exp(-mean_lp)
                     if math.isfinite(ppl):
                         metrics_stats[MetricNames.PREFILL_PERPLEXITY] = ppl
-            except Exception:
+            except (ValueError, TypeError):
                 logger.debug("Failed to compute prefill perplexity",
                              exc_info=True)
 
@@ -645,7 +644,7 @@ class GenerationResultBase:
                     if gen_lps:
                         mean_lp = sum(gen_lps) / len(gen_lps)
                         gen_ppl = math.exp(-mean_lp)
-                except Exception:
+                except (ValueError, TypeError):
                     logger.debug("Failed to compute generation perplexity",
                                  exc_info=True)
             if gen_ppl is not None and math.isfinite(gen_ppl):

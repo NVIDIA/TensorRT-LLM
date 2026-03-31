@@ -276,10 +276,12 @@ class MetricsCollector:
             if prompt_tokens := metrics_dict.get(MetricNames.PROMPT_TOKENS, 0):
                 self._log_counter(self.counter_tokens_prompt, self.labels,
                                   prompt_tokens)
-            if cached_tokens := metrics_dict.get(
-                    MetricNames.PROMPT_CACHE_CACHED_TOKENS, 0):
-                self._log_counter(self.counter_tokens_cached_prompt,
-                                  self.labels, cached_tokens)
+            if MetricNames.PROMPT_CACHE_CACHED_TOKENS in metrics_dict:
+                cached_tokens = metrics_dict[
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS]
+                if cached_tokens > 0:
+                    self._log_counter(self.counter_tokens_cached_prompt,
+                                      self.labels, cached_tokens)
                 self._log_histogram(self.histogram_tokens_cached_prompt,
                                     cached_tokens)
 

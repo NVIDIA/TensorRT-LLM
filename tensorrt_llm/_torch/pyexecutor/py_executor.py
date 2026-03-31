@@ -3488,11 +3488,7 @@ class PyExecutor:
 
             py_num_accepted = getattr(request,
                                       'py_num_accepted_draft_tokens', 0)
-            draft_len = getattr(request, 'num_draft_tokens', 0)
-            if draft_len == 0:
-                py_draft = getattr(request, 'py_draft_tokens', None)
-                if py_draft is not None:
-                    draft_len = sum(1 for t in py_draft if t != 0)
+            draft_len = get_draft_token_length(request)
             if draft_len > 0:
                 for pos in range(
                         min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
