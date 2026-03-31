@@ -66,10 +66,11 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
 
+from tensorrt_llm.llmapi.sim_config import SimConfig
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.virtual_memory import \
         RestoreMode as _VirtualMemoryRestoreMode
-    from tensorrt_llm.llmapi.sim_config import SimConfig
 else:
     _VirtualMemoryRestoreMode = Enum
 
@@ -3485,7 +3486,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "None (default) disables EVS, values in [0, 1) enable pruning.",
         status="prototype")
 
-    sim_config: Optional["SimConfig"] = Field(
+    sim_config: Optional[SimConfig] = Field(
         default=None,
         description="Simulation mode config. When set, enables GPU-free "
         "simulation with predicted batch timing.",
