@@ -93,6 +93,7 @@ deepseek-ai/DeepSeek-V3-Lite:
     spec_dec_algo: MTP
     accuracy: 64.14
 deepseek-ai/DeepSeek-R1:
+  - accuracy: 73.730
   - quant_algo: NVFP4
     accuracy: 95.42
   - quant_algo: NVFP4

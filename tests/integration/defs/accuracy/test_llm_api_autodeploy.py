@@ -1018,6 +1018,17 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             marks=pytest.mark.skip_less_device_memory(80000),
             id="meta-llama_Llama-3.3-70B-Instruct",
         ),
+        pytest.param(
+            "deepseek-ai/DeepSeek-R1",
+            {},
+            [MMLU, GSM8K],
+            marks=(
+                skip_pre_blackwell,
+                pytest.mark.skip_less_device(8),
+                pytest.mark.skip_less_device_memory(120000),
+            ),
+            id="deepseek-ai_DeepSeek-R1",
+        ),
     ]
 
     def get_default_sampling_params(self):
