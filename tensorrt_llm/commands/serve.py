@@ -1256,7 +1256,13 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
                                      log_level)
 
     else:
-        # Common workers
+        # Common workers — redirect output to log file if configured
+        from tensorrt_llm.llmapi.mpi_session import (
+            TLLM_WORKER_LOG_FILE_ENV, redirect_output_to_file)
+        log_file = os.environ.get(TLLM_WORKER_LOG_FILE_ENV)
+        if log_file:
+            redirect_output_to_file(log_file)
+
         with MPICommExecutor(sub_comm) as executor:
             if not is_leader and executor is not None:
                 raise RuntimeError(
