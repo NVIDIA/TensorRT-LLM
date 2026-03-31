@@ -1,6 +1,10 @@
 import asyncio
+import hashlib
 import heapq
+import os
+import uuid
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
@@ -626,9 +630,38 @@ class KvCacheAwareRouter(Router):
         self._tokenizers = {}
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        env_tokens_per_block = os.environ.get(
+            "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
+        if env_tokens_per_block is not None:
+            tokens_per_block = int(env_tokens_per_block)
         self._tokens_per_block = tokens_per_block
+        logger.info(
+            f"KvCacheAwareRouter: tokens_per_block={self._tokens_per_block}")
+
+    def _get_tokenizer(self, model: str):
+        if model not in self._tokenizers:
+            self._tokenizers[model] = AutoTokenizer.from_pretrained(model)
+        return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
+        # Handle ChatCompletionRequest (has messages, not prompt)
+        if isinstance(request, ChatCompletionRequest):
+            if request.prompt_token_ids is not None:
+                return [request.prompt_token_ids]
+            tokenizer = self._get_tokenizer(request.model)
+            token_ids = tokenizer.apply_chat_template(
+                [
+                    msg if isinstance(msg, dict) else dict(msg)
+                    for msg in request.messages
+                ],
+                add_generation_prompt=request.add_generation_prompt,
+                tokenize=True,
+            )
+            # Set prompt_token_ids so the worker server skips re-tokenization
+            request.prompt_token_ids = token_ids
+            return [token_ids]
+
+        # Handle CompletionRequest (has prompt)
         prompts = request.prompt
         if isinstance(prompts, list) and isinstance(prompts[0], list):
             return prompts
@@ -639,12 +672,12 @@ class KvCacheAwareRouter(Router):
         else:
             assert isinstance(prompts, list) and isinstance(prompts[0], str)
 
-        # TODO: send tokenize-only request instead of tokenizing locally
-        if request.model not in self._tokenizers:
-            self._tokenizers[request.model] = AutoTokenizer.from_pretrained(
-                request.model)
-        tokenizer = self._tokenizers[request.model]
-        return [tokenizer(prompt)["input_ids"] for prompt in prompts]
+        tokenizer = self._get_tokenizer(request.model)
+        token_lists = [tokenizer(prompt)["input_ids"] for prompt in prompts]
+        # Replace string prompts with token IDs so the worker server
+        # skips re-tokenization
+        request.prompt = token_lists if len(token_lists) > 1 else token_lists[0]
+        return token_lists
 
     async def get_next_server(
             self,
@@ -714,6 +747,205 @@ class KvCacheAwareRouter(Router):
             self._server_state.pop(old_server, None)
 
 
+def text_block_hasher(text_block: str, parent_hash: int = 0) -> int:
+    """Hash a text block with parent-chaining, analogous to BlockKeyHasher for token IDs."""
+    data = parent_hash.to_bytes(8, 'little',
+                                signed=True) + text_block.encode('utf-8')
+    return int.from_bytes(
+        hashlib.blake2b(data, digest_size=8).digest(), 'little', signed=True)
+
+
+class ConversationRouter(Router):
+    """Router that tracks server affinity per conversation via text-hash
+    prefix matching. Multi-turn conversations route to the same server
+    (KV cache reuse) without tokenization. New/unknown conversations
+    fall back to least-loaded server."""
+
+    def __init__(self,
+                 server_role: ServerRole = None,
+                 servers: List[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
+                 chars_per_block: int = 128,
+                 max_conversations: int = 10000,
+                 **kwargs):
+        super().__init__(server_role, servers, metadata_server_cfg,
+                         metadata_server, **kwargs)
+        self._chars_per_block = chars_per_block
+        self._max_conversations = max_conversations
+        # Maps conversation_id -> (block_hashes, server)
+        self._conversations: OrderedDict[str, tuple[list[int],
+                                                     str]] = OrderedDict()
+        # Per-server load counter for fallback load balancing
+        self._server_loads: Dict[str, int] = {s: 0 for s in self._servers}
+        # Round-robin index for breaking ties among equally-loaded servers
+        self._rr_idx = 0
+        # Request → server tracking (same pattern as LoadBalancingRouter)
+        self._req_routing_table: Dict[int, str] = {}
+
+    def _on_servers_updated(self, old_servers, new_servers):
+        new_set = set(new_servers)
+        # Invalidate affinities for removed servers
+        to_remove = []
+        for conv_id, (hashes, server) in self._conversations.items():
+            if server not in new_set:
+                to_remove.append(conv_id)
+        for conv_id in to_remove:
+            del self._conversations[conv_id]
+        # Rebuild load counters keeping existing counts for surviving servers
+        new_loads = {}
+        for server in new_servers:
+            new_loads[server] = self._server_loads.get(server, 0)
+        self._server_loads = new_loads
+
+    def _extract_text(self, request: OpenAIRequest) -> str:
+        """Serialize request to raw text. Returns empty string for token-ID-only."""
+        if isinstance(request, ChatCompletionRequest):
+            parts = []
+            for msg in request.messages:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        parts.append(f"{role}:{content}")
+                    elif isinstance(content, list):
+                        # Multi-part content
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get(
+                                    "type") == "text":
+                                text_parts.append(part.get("text", ""))
+                        parts.append(f"{role}:{''.join(text_parts)}")
+            return "\n".join(parts)
+        elif isinstance(request, CompletionRequest):
+            prompt = request.prompt
+            if isinstance(prompt, str):
+                return prompt
+            elif isinstance(prompt, list):
+                if len(prompt) > 0 and isinstance(prompt[0], str):
+                    return "\n".join(prompt)
+                # Token-ID list — cannot hash without tokenizer
+                return ""
+            return ""
+        return ""
+
+    def _compute_block_hashes(self, text: str) -> list[int]:
+        """Split text into full-size blocks and compute chained hashes.
+
+        Only full blocks (exactly chars_per_block characters) are included.
+        The trailing partial block is excluded because its content changes
+        when the conversation grows — appending text fills into the partial
+        block, producing a different hash and breaking prefix matching.
+        """
+        if not text:
+            return []
+        hashes = []
+        parent = 0
+        for i in range(0, len(text), self._chars_per_block):
+            block = text[i:i + self._chars_per_block]
+            if len(block) < self._chars_per_block:
+                break  # Drop trailing partial block
+            h = text_block_hasher(block, parent)
+            hashes.append(h)
+            parent = h
+        return hashes
+
+    def _get_least_loaded_server(
+            self, exclude_server: Optional[str] = None) -> str:
+        """Pick the server with the fewest active requests.
+        Ties are broken round-robin to spread new conversations evenly."""
+        candidates = [
+            s for s in self._servers if s != exclude_server
+        ]
+        if not candidates:
+            return None
+        min_load = min(self._server_loads.get(s, 0) for s in candidates)
+        tied = [
+            s for s in candidates
+            if self._server_loads.get(s, 0) == min_load
+        ]
+        server = tied[self._rr_idx % len(tied)]
+        self._rr_idx += 1
+        return server
+
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        if not self._servers:
+            if self._metadata_server:
+                raise ValueError(
+                    f"No {self._server_role} servers available in metadata service"
+                )
+            else:
+                raise ValueError(f"No {self._server_role} servers available")
+
+        text = self._extract_text(request)
+        block_hashes = self._compute_block_hashes(text) if text else []
+
+        async with self._lock:
+            conversation_id = None
+            server = None
+
+            if block_hashes:
+                # Find longest matching prefix in conversation table
+                best_id: Optional[str] = None
+                best_match_len = 0
+
+                for conv_id, (conv_hashes,
+                              conv_server) in self._conversations.items():
+                    if conv_server == exclude_server:
+                        continue
+                    match_len = 0
+                    for i in range(min(len(block_hashes), len(conv_hashes))):
+                        if block_hashes[i] == conv_hashes[i]:
+                            match_len = i + 1
+                        else:
+                            break
+                    if match_len > best_match_len:
+                        best_match_len = match_len
+                        best_id = conv_id
+
+                if best_id is not None:
+                    # Route to the affiliated server
+                    conversation_id = best_id
+                    server = self._conversations[best_id][1]
+                    # Update hashes (conversation may have grown)
+                    self._conversations.move_to_end(best_id)
+                    self._conversations[best_id] = (block_hashes, server)
+
+            if server is None:
+                # No match — pick least-loaded server
+                server = self._get_least_loaded_server(exclude_server)
+                if server is None:
+                    raise ValueError(
+                        f"No available servers after excluding {exclude_server}"
+                    )
+                if block_hashes:
+                    # Create new conversation entry
+                    conversation_id = str(uuid.uuid4())
+                    self._conversations[conversation_id] = (block_hashes,
+                                                            server)
+                    # LRU eviction
+                    while len(self._conversations) > self._max_conversations:
+                        self._conversations.popitem(last=False)
+
+            self._server_loads[server] = self._server_loads.get(server, 0) + 1
+            self._req_routing_table[id(request)] = server
+
+        return server, {
+            "conversation_id": conversation_id,
+            "server_info": self._server_info.get(server, {}),
+        }
+
+    async def finish_request(self, request: OpenAIRequest):
+        async with self._lock:
+            server = self._req_routing_table.pop(id(request), None)
+            if server and server in self._server_loads:
+                self._server_loads[server] = max(
+                    0, self._server_loads[server] - 1)
+
+
 def create_router(
     router_config: Optional[RouterConfig],
     servers: Optional[List[str]],
@@ -741,6 +973,7 @@ def create_router(
         "round_robin": RoundRobinRouter,
         "load_balancing": LoadBalancingRouter,
         "kv_cache_aware": KvCacheAwareRouter,
+        "conversation": ConversationRouter,
     }
     router_type = router_config.type if router_config else "round_robin"
     router_class = router_map.get(router_type.lower())

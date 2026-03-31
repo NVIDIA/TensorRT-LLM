@@ -49,6 +49,13 @@ class ConditionalDisaggConfig():
 
 
 @dataclass
+class ConversationRouterConfig():
+    enabled: bool = False
+    chars_per_block: int = 128
+    max_conversations: int = 10000
+
+
+@dataclass
 class OtlpConfig():
     otlp_traces_endpoint: Optional[
         str] = None  # Target URL to which OpenTelemetry traces will be sent
@@ -84,6 +91,7 @@ class DisaggServerConfig():
     node_id: int = uuid.getnode(
     ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
     # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    conversation_router_config: Optional[ConversationRouterConfig] = None
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
 
@@ -131,6 +139,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        conditional_disagg_config: Optional[dict] = None,
                        otlp_config: Optional[dict] = None,
                        disagg_cluster: Optional[dict] = None,
+                       conversation_router_config: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -169,11 +178,15 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     otlp_config = OtlpConfig(**otlp_config) if otlp_config else None
 
+    conversation_router_config = ConversationRouterConfig(
+        **conversation_router_config) if conversation_router_config else None
+
     config = DisaggServerConfig(server_configs, hostname, port,
                                 ctx_router_config, gen_router_config,
                                 conditional_disagg_config, otlp_config,
                                 max_retries, perf_metrics_max_requests,
-                                disagg_cluster_config)
+                                disagg_cluster_config,
+                                conversation_router_config=conversation_router_config)
 
     return config
 

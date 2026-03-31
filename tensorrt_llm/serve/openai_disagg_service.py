@@ -119,6 +119,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
         if hooks:
             hooks.on_req_begin(request)
+
         # empty server means client decides which server to use
         ctx_server = None
         # reserve a gen_server if conditional disagg is needed
@@ -130,9 +131,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
-            ctx_server, _ = await self._ctx_router.get_next_server(
+            ctx_server, ctx_info = await self._ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
+            conversation_id = ctx_info.get("conversation_id")
+            if conversation_id and ctx_req.disaggregated_params:
+                ctx_req.disaggregated_params.conversation_id = conversation_id
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
@@ -359,6 +363,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     ) -> UCompletionResponse:
         if hooks:
             hooks.on_req_begin(request)
+
         # empty server means client decides which server to use
         need_ctx = not (await self._check_gen_only_disagg(request))
         ctx_server, gen_server = None, None
@@ -369,6 +374,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
+            conversation_id = ctx_server_info.get("conversation_id") if ctx_server_info else None
+            if conversation_id and ctx_req.disaggregated_params:
+                ctx_req.disaggregated_params.conversation_id = conversation_id
             tasks.append(
                 asyncio.create_task(
                     self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
