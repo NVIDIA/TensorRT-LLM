@@ -46,3 +46,5 @@ Qwen/Qwen3-VL-8B-Instruct:
   - accuracy: 55.11
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 57.0
+Qwen/Qwen3.5-35B-A3B:
+  - accuracy: 59.0

@@ -1,7 +1,26 @@
 import re
+from typing import Dict, List
 
+import torch
+from transformers import PretrainedConfig
+
+from ...inputs import (
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+    register_input_processor,
+    support_multimodal_disaggregated,
+)
+from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from .modeling_multimodal_utils import _is_disagg
 from .modeling_qwen3_next import Qwen3NextForCausalLM
-from .modeling_utils import register_auto_model
+from .modeling_qwen3vl import (
+    Qwen3VisionModel,
+    Qwen3VisionModelBase,
+    Qwen3VLInputProcessorBase,
+    Qwen3VLModelBase,
+)
+from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
 
 _LANG_PREFIX = "model.language_model."
 
@@ -32,6 +51,32 @@ def _normalize_qwen35_exclude_modules(model_config):
         normalized.add(name)
 
     qc.exclude_modules = sorted(normalized)
+
+
+def _ensure_qwen35_mrope_compat(text_config: PretrainedConfig) -> None:
+    """Normalize Qwen3.5 mRoPE fields for the shared Qwen3-VL wrapper.
+
+    Qwen3.5 stores RoPE metadata in ``rope_parameters``.  Some config classes
+    may also materialize default top-level ``rope_theta`` or
+    ``partial_rotary_factor`` values, so prefer the checkpoint-provided nested
+    values unconditionally here.
+    """
+    rope_parameters = getattr(text_config, "rope_parameters", None)
+    if not rope_parameters:
+        return
+
+    rope_params = dict(rope_parameters)
+    rope_theta = rope_params.pop("rope_theta", None)
+    if rope_theta is not None:
+        text_config.rope_theta = rope_theta
+
+    partial_rotary_factor = rope_params.pop("partial_rotary_factor", None)
+    if partial_rotary_factor is not None:
+        text_config.partial_rotary_factor = partial_rotary_factor
+
+    if not getattr(text_config, "rope_scaling", None):
+        rope_params.pop("rope_type", None)
+        text_config.rope_scaling = rope_params
 
 
 @register_auto_model("Qwen3_5MoeForCausalLM")
@@ -74,3 +119,49 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     def __init__(self, model_config):
         _normalize_qwen35_exclude_modules(model_config)
         super().__init__(model_config)
+
+
+@support_multimodal_disaggregated
+@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
+@register_auto_model("Qwen3_5MoeForConditionalGeneration")
+@register_input_processor(
+    Qwen3VLInputProcessorBase,
+    model_type="qwen3_5_moe",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|vision_start|><|image_pad|><|vision_end|>",
+            "video": "<|vision_start|><|video_pad|><|vision_end|>",
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        placeholders_separator="",
+    ),
+)
+class Qwen3_5MoeVLModel(Qwen3VLModelBase):
+    """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
+        _ensure_qwen35_mrope_compat(model_config.pretrained_config.text_config)
+
+        kwargs["vision_model_class"] = Qwen3VisionModel
+        kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
+        super().__init__(model_config, *args, **kwargs)
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return [
+            "image.pixel_values",
+            "video.pixel_values_videos",
+            "multimodal_embedding",
+        ]
+
+    def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
+        if not _is_disagg():
+            self.mm_encoder.load_weights(weights)
+
+        weight_mapper = Qwen3_5MoeHfWeightMapper()
+        weight_mapper.init_model_and_config(self.llm, self.model_config)
+        filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+        params_map = {
+            r"^model\.language_model\.(.*)$": r"model.\1",
+        }
+        self.llm.load_weights(filtered_weights, weight_mapper, params_map=params_map)

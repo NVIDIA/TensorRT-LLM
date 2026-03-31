@@ -929,6 +929,8 @@ class Qwen3VLModelBase(PreTrainedModel):
             llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
         elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":
             llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
+        elif self.original_arch == "Qwen3_5MoeForConditionalGeneration":
+            llm_model_config.pretrained_config.architectures = ["Qwen3_5MoeForCausalLM"]
         else:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
         # Qwen3ForCausalLM.
@@ -962,9 +964,12 @@ class Qwen3VLModelBase(PreTrainedModel):
             mrope_section=config.rope_scaling.get("mrope_section", None),
             mrope_interleaved=config.rope_scaling.get("mrope_interleaved", False),
         )
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
         self.rotary_emb = MRotaryEmbedding(
             pos_embd_params.rope,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            head_dim=head_dim,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,
