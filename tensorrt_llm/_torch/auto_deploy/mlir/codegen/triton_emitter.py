@@ -31,8 +31,8 @@ Supports two grid modes:
 All arithmetic is performed in f32 for numerical stability; loads upcast
 from the original dtype and stores downcast back.
 
-Generated kernels are cached by subgraph hash via ``KernelCache`` and an
-in-memory ``_generated_op_cache`` to avoid redundant compilation.
+Generated kernels are cached by subgraph hash via ``KernelCache`` to avoid
+redundant compilation.
 """
 
 import textwrap
@@ -44,10 +44,7 @@ from xdsl.ir import SSAValue
 
 from .kernel_cache import KernelCache
 
-# Cache for registered generated ops (module-level to survive across instances)
-_generated_op_cache: dict = {}
-
-# Module-level kernel cache shared across calls
+# Module-level kernel cache shared across calls (keyed by subgraph hash)
 _kernel_cache = KernelCache()
 
 # ---------------------------------------------------------------------------
@@ -194,9 +191,8 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     file (Triton's ``@jit`` requires ``inspect.getsourcelines``), imports it,
     and registers it as a ``torch.library.custom_op``.
 
-    Results are cached by subgraph hash (both on-disk via ``KernelCache`` and
-    in-memory via ``_generated_op_cache``) so repeated calls with the same
-    subgraph skip compilation entirely.
+    Results are cached by subgraph hash via ``KernelCache`` so repeated calls
+    with the same subgraph skip compilation entirely.
 
     Args:
         subgraph: A ``FusibleSubgraph`` with ops, inputs, and outputs.
@@ -212,11 +208,6 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     cached = _kernel_cache.get(sg_hash)
     if cached is not None:
         return cached
-
-    # Also check if the custom op was already registered in _generated_op_cache
-    cache_key = f"mlir_fused_{sg_hash}"
-    if cache_key in _generated_op_cache:
-        return _generated_op_cache[cache_key]
 
     n_inputs = len(subgraph.inputs)
     n_outputs = len(subgraph.outputs)
@@ -589,7 +580,6 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
 
     wrapper = make_wrapper(op_short_name)
 
-    _generated_op_cache[cache_key] = wrapper
     _kernel_cache.put(sg_hash, wrapper)
 
     return wrapper

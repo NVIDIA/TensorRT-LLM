@@ -21,6 +21,7 @@ xdsl = pytest.importorskip("xdsl")
 
 from xdsl.dialects.builtin import (  # noqa: E402
     BFloat16Type,
+    Float16Type,
     Float64Type,
     FloatAttr,
     IntegerType,
@@ -53,7 +54,7 @@ def test_torch_dtype_to_mlir():
     import torch
 
     assert isinstance(torch_dtype_to_mlir(torch.bfloat16), BFloat16Type)
-    assert isinstance(torch_dtype_to_mlir(torch.float16), type(torch_dtype_to_mlir(torch.float16)))
+    assert isinstance(torch_dtype_to_mlir(torch.float16), Float16Type)
     assert isinstance(torch_dtype_to_mlir(torch.float8_e4m3fn), Float8E4M3FNType)
     assert isinstance(torch_dtype_to_mlir(torch.float8_e5m2), Float8E5M2Type)
     assert isinstance(torch_dtype_to_mlir(torch.int32), IntegerType)
