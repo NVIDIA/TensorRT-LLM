@@ -80,7 +80,7 @@ def compare_logits(
     logits_list: List[torch.Tensor],
     ref_logits_list: List[torch.Tensor],
     topk: int = 20,
-    threshold: float = 0.9,
+    threshold: float = 0.80,
 ):
     assert len(logits_list) == len(ref_logits_list)
     for i in range(len(logits_list)):

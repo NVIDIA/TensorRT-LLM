@@ -17,7 +17,10 @@ from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import _quantize_nvfp4
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
+    _dequantize_nvfp4,
+    _quantize_nvfp4,
+)
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
@@ -162,13 +165,16 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
 
 
 class RefNVFP4ModelWithIPCHandles(RefHFModel):
-    """Reference model that loads bf16 weights from HuggingFace and quantizes
-    them to NVFP4 format for use in update_weights tests.
+    """Reference model that loads bf16 weights from HuggingFace, quantizes
+    them to NVFP4 format, and keeps a round-tripped bf16 model for reference
+    inference.
 
-    Since HuggingFace does not host NVFP4 checkpoints, this class:
+    Since HuggingFace cannot run NVFP4 inference natively, this class:
     1. Loads the bf16 model from HF
     2. Quantizes each linear weight to NVFP4 using _quantize_nvfp4
-    3. Provides IPC handles with NVFP4 weight keys (weight, weight_scale, weight_scale_2)
+    3. Dequantizes back to bf16 and replaces model parameters (round-trip),
+       so the HF model can serve as a reference for logits comparison
+    4. Provides IPC handles with NVFP4 weight keys (weight, weight_scale, weight_scale_2)
     """
 
     NVFP4_BLOCK_SIZE = 16
@@ -212,6 +218,7 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
             model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="eager"
         ).to(f"cuda:{device_id}")
         self.all_weights = {}
+        self._dequantized_weights = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
         self._quantize_and_replicate_weights()
 
@@ -256,8 +263,12 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
             if i != self.device_id:
                 self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
 
-        del self.model
-        torch.cuda.empty_cache()
+        with torch.no_grad():
+            param_dict = dict(self.model.named_parameters())
+            for name, dequant_weight in self._dequantized_weights.items():
+                if name in param_dict:
+                    param_dict[name].copy_(dequant_weight)
+        del self._dequantized_weights
 
     @classmethod
     def _should_quantize(cls, name: str) -> bool:
@@ -312,9 +323,20 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         packed_weight, block_scale = _quantize_nvfp4(
             weight_float, self.NVFP4_BLOCK_SIZE, weight_scale_2
         )
+        packed_uint8 = packed_weight.to(torch.uint8)
+        block_scale_fp8 = block_scale.to(torch.float8_e4m3fn)
+
+        self._dequantized_weights[name] = _dequantize_nvfp4(
+            packed_uint8,
+            block_scale_fp8,
+            weight_scale_2,
+            weight_float.shape,
+            torch.bfloat16,
+        )
+
         return [
-            (name, packed_weight.to(torch.uint8)),
-            (name + "_scale", block_scale.to(torch.float8_e4m3fn)),
+            (name, packed_uint8),
+            (name + "_scale", block_scale_fp8),
             (name + "_scale_2", weight_scale_2),
         ]
 
@@ -351,7 +373,8 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 )
 def test_llm_update_weights_nvfp4(model_dir):
     model_dir = str(llm_models_root() / model_dir)
-    hf_model = RefNVFP4ModelWithIPCHandles(model_dir)
+    num_hidden_layers = 1
+    hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
     llm = LLM(
@@ -363,6 +386,7 @@ def test_llm_update_weights_nvfp4(model_dir):
         kv_cache_config=kv_cache_config,
         force_dynamic_quantization=True,
         model_kwargs={
+            "num_hidden_layers": num_hidden_layers,
             "quantization_config": {
                 "quant_method": "nvfp4",
                 "group_size": 16,
@@ -384,12 +408,8 @@ def test_llm_update_weights_nvfp4(model_dir):
     llm._collective_rpc("update_weights", (ipc_handles,))
     llm._collective_rpc("update_weights", (None,))
 
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    sampling_params = SamplingParams(temperature=0, max_tokens=64)
-    outputs = llm.generate(prompts, sampling_params)
-    for i, output in enumerate(outputs):
-        text = tokenizer.decode(output.outputs[0].token_ids)
-        print(f"[NVFP4 update] Prompt {i}: {prompts_texts[i]!r} -> {text!r}")
+    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+    compare_logits(llm_logits, ref_logits)
 
 
 @skip_pre_blackwell
@@ -402,7 +422,8 @@ def test_llm_update_weights_nvfp4(model_dir):
 )
 def test_llm_partial_update_weights_nvfp4(model_dir):
     model_dir = str(llm_models_root() / model_dir)
-    hf_model = RefNVFP4ModelWithIPCHandles(model_dir)
+    num_hidden_layers = 1
+    hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
     llm = LLM(
@@ -414,6 +435,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir):
         kv_cache_config=kv_cache_config,
         force_dynamic_quantization=True,
         model_kwargs={
+            "num_hidden_layers": num_hidden_layers,
             "quantization_config": {
                 "quant_method": "nvfp4",
                 "group_size": 16,
@@ -428,8 +450,9 @@ def test_llm_partial_update_weights_nvfp4(model_dir):
         "The future of AI is",
     ]
     prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+    del tokenizer
 
-    sampling_params = SamplingParams(temperature=0, max_tokens=64)
+    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
 
     def common_filter(filter_name: str) -> Callable[[str], bool]:
         def filter_fn(name: str) -> bool:
@@ -453,7 +476,5 @@ def test_llm_partial_update_weights_nvfp4(model_dir):
         llm._collective_rpc("update_weights", (ipc_handles,))
     llm._collective_rpc("update_weights", (None,))
 
-    outputs = llm.generate(prompts, sampling_params)
-    for i, output in enumerate(outputs):
-        text = tokenizer.decode(output.outputs[0].token_ids)
-        print(f"[NVFP4 partial] Prompt {i}: {prompts_texts[i]!r} -> {text!r}")
+    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+    compare_logits(llm_logits, ref_logits)
