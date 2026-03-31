@@ -396,6 +396,7 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        self._overlap_needs_dummy = False
         # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
         # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
@@ -2145,6 +2146,33 @@ class PyExecutor:
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
+
+                # When the overlap scheduler produces an empty batch because
+                # some ranks have GENERATION_TO_COMPLETE requests (which the
+                # micro-batch scheduler skips), process the previous batch
+                # early so those requests get their final sampling applied,
+                # terminate, and free their slots.  Then re-schedule so a
+                # dummy or new real request fills the gap immediately.
+                if (not can_queue and not self.disable_overlap_scheduler
+                        and self.enable_attention_dp
+                        and self.previous_batch is not None):
+                    self._update_requests(self.previous_batch.sample_state)
+                    self.perf_manager.compute_batch_gpu_times(
+                        self.previous_batch.all_requests)
+                    self._send_kv_async(self.previous_batch.all_requests)
+                    if (self.drafter is not None and self.use_spec_decode):
+                        self.drafter.cleanup_previous_draft_resources()
+                    self._process_previous_batch()
+                    self.previous_batch = None
+                    # Re-schedule with freed slots.
+                    scheduled_batch, iter_stats = (
+                        self._prepare_and_schedule_batch())
+                    if scheduled_batch is None:
+                        break
+                    self._terminate_requests(scheduled_batch.paused_requests)
+                    can_queue, can_queue_this_rank = self._can_queue(
+                        scheduled_batch)
+
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -2853,7 +2881,12 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        # In overlap mode with attention_dp, a dummy may be injected via
+        # _overlap_needs_dummy even when expected_num_active_requests is 0
+        # (to bridge the gap after a real request terminates).  Exclude
+        # dummies from the assertion so the invariant remains valid.
+        assert self.expected_num_active_requests >= len(
+            [r for r in self.active_requests if not r.is_attention_dp_dummy])
         if self.kv_cache_transceiver is None:
             num_active_request = len(self.active_requests)
         else:
@@ -2874,7 +2907,17 @@ class PyExecutor:
             )
             return
 
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
+        overlap_needs_dummy = self._overlap_needs_dummy
+        self._overlap_needs_dummy = False  # always consume the one-shot flag
+        # Sync the flag across all ADP ranks so every rank adds a dummy
+        # when any rank's real request just finished (otherwise _can_queue
+        # would see 0 on non-flagged ranks and skip the forward on all).
+        if not self.disable_overlap_scheduler:
+            all_flags = self.dist.tp_allgather(int(overlap_needs_dummy))
+            overlap_needs_dummy = any(f > 0 for f in all_flags)
+        if num_active_request == 0 and (self.expected_num_active_requests -
+                                        num_active_request > 0
+                                        or overlap_needs_dummy):
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 is_gen=True,
@@ -3542,6 +3585,16 @@ class PyExecutor:
 
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
+
+        # When overlap scheduler + attention_dp: if all active requests are gone
+        # after a real request finished, set a one-shot flag so the next iteration
+        # injects a dummy to keep the GPU busy during the overlap gap.
+        if (not self.disable_overlap_scheduler and self.enable_attention_dp
+                and len(self.active_requests) == 0
+                and any(not req.is_attention_dp_dummy
+                        for req in requests_to_terminate)):
+            self._overlap_needs_dummy = True
+
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
