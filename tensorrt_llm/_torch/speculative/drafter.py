@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, final
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, get_draft_token_length
-from ..pyexecutor.resource_manager import ResourceManager
+from ..pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from ..pyexecutor.scheduler import ScheduledRequests
 
 
@@ -64,20 +64,44 @@ class Drafter(ABC):
         num_effective_requests = min(len(requests), max_batch_size, token_cap)
         return num_effective_requests <= self.max_concurrency
 
+    # Drafters that use TorchSampler (NGram, two-model) compute py_rewind_len
+    # from len(py_draft_tokens), which includes padding.  They must set this
+    # to True so that extend_capacity_for_tokens is called after padding.
+    # One-model drafters (MTP / Eagle3 / SA) use SpecSamplerBase which
+    # computes rewind from runtime_draft_len, so padding is harmless.
+    _needs_padding_kv_extension: bool = False
+
     @final
     def pad_draft_tokens_for_cuda_graph(
-            self, scheduled_requests: ScheduledRequests) -> None:
-        """
-        Pad draft tokens to the static max total draft tokens for CUDA graph compatibility.
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
+    ) -> None:
+        """Pad draft tokens to the static max for CUDA graph compatibility.
 
-        Args:
-            scheduled_requests: The scheduled requests to pad
+        When draft_len_schedule reduces draft length below the static max,
+        prepare_resources allocates KV cache capacity for the shorter length.
+        After padding restores py_draft_tokens to the static max, drafters
+        whose sampler uses the padded length for rewind need the KV cache
+        capacity extended to match.  The KV cache manager itself computes
+        the exact delta from its internal tracking.
         """
+        pad_to = self._static_max_total_draft_tokens
         for req in scheduled_requests.generation_requests:
             num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
-                0 for _ in range(self._static_max_total_draft_tokens -
-                                 num_draft_tokens))
+                0 for _ in range(pad_to - num_draft_tokens))
+
+        if self._needs_padding_kv_extension and resource_manager is not None:
+            kv_mgr = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            draft_kv_mgr = resource_manager.get_resource_manager(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            for req in scheduled_requests.generation_requests:
+                if kv_mgr is not None:
+                    kv_mgr.extend_capacity_for_tokens(req)
+                if draft_kv_mgr is not None:
+                    draft_kv_mgr.extend_capacity_for_tokens(req)
 
     def get_draft_len_for_batch_size(self, batch_size: int) -> int:
         """

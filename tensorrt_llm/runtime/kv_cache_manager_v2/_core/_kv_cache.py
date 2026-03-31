@@ -757,7 +757,7 @@ class _KVCache:
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
-        elif tree_block.is_full and self.manager.allow_seq_rebasing:
+        elif tree_block.is_full and self.manager.allow_seq_rebasing and is_full:
             # try to replace our pages with pages from the existing block.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
             for lc in typed_range(typed_len(beam_block)):

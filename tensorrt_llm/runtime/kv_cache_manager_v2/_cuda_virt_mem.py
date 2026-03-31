@@ -27,6 +27,7 @@ def _is_prop_supported(prop: drv.CUmemAllocationProp) -> bool:
         err == drv.CUresult.CUDA_ERROR_NOT_PERMITTED
         or err == drv.CUresult.CUDA_ERROR_NOT_SUPPORTED
         or err == drv.CUresult.CUDA_ERROR_INVALID_DEVICE
+        or err == drv.CUresult.CUDA_ERROR_INVALID_VALUE
     ):
         return False
     elif err == drv.CUresult.CUDA_SUCCESS:
