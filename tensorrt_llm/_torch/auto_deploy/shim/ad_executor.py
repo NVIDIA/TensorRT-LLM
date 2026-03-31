@@ -1090,7 +1090,6 @@ def instantiate_sampler(
             max_num_sequences=max_num_sequences,
             max_beam_width=ad_config.max_beam_width,
             disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
-            disable_flashinfer_sampling=ad_config.disable_flashinfer_sampling,
         )
         sampler = Eagle3OneModelSampler(sampler_args)
 
@@ -1103,7 +1102,6 @@ def instantiate_sampler(
             max_num_sequences=max_num_sequences,
             max_beam_width=ad_config.max_beam_width,
             disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
-            disable_flashinfer_sampling=ad_config.disable_flashinfer_sampling,
         )
         sampler = TorchSampler(sampler_args)
 

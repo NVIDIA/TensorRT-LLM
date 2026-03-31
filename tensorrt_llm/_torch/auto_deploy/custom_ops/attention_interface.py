@@ -1778,7 +1778,7 @@ class UnpagedResourceHandler(ResourceHandler):
 
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
         """Initialize the unpaged resource for the given sequence info."""
-        return torch.zeros(
+        return torch.empty(
             sequence_info.max_num_state_slots,
             sequence_info.max_seq_len,
             *self.token_shape,
