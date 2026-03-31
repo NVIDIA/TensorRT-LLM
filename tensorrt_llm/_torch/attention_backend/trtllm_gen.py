@@ -888,8 +888,6 @@ class FlashInferTrtllmGenAttention:
         self._layout = DEFAULT_KV_LAYOUT
         self._kv_cache_manager = kv_cache_manager
         self._quant_config = quant_config
-        self._kv_pool_cache = {}
-        self._pool_idx_cache = {}
 
     @property
     def layout(self) -> str:
@@ -937,12 +935,10 @@ class FlashInferTrtllmGenAttention:
         dtype: torch.dtype,
         is_mla_enable: bool = False,
     ):
-        """Get FlashInfer kv_cache (cached) and block_tables (per-call).
+        """Get FlashInfer kv_cache and block_tables.
 
         The kv_cache tensor is a flat-block view of the KV cache pool,
-        created once per layer via C++ op build_flashinfer_kv_cache() and
-        cached in self._kv_pool_cache. The pool pointer is stable for the
-        lifetime of the model, so the tensor never needs to be recreated.
+        created per layer via C++ op build_kv_cache_buffers().
 
         Shape: [total_blocks, num_kv_heads, tokens_per_block, head_dim]
         where each dim-0 element = one single K or V block.
@@ -962,43 +958,25 @@ class FlashInferTrtllmGenAttention:
         if kv_cache_block_offsets is None:
             return None, None
 
-        if layer_idx not in self._kv_pool_cache:
-            kv_factor = 1 if is_mla_enable else 2
-            # Exact pool size in flat blocks.
-            # V1: blocks_in_primary_pool * num_local_layers * kv_factor
-            #     (physical pages * layers_per_pool * K+V)
-            # V2: get_page_index_upper_bound gives total block indices
-            #     for a layer; all layers share the same contiguous pool.
-            if hasattr(self._kv_cache_manager, "blocks_in_primary_pool"):
-                total_num_blocks = (
-                    self._kv_cache_manager.blocks_in_primary_pool
-                    * self._kv_cache_manager.num_local_layers
-                    * kv_factor
-                )
-            else:
-                from tensorrt_llm._torch.pyexecutor.resource_manager import Role
-
-                layer_offset = self._kv_cache_manager.layer_offsets[global_layer_idx]
-                total_num_blocks = self._kv_cache_manager.impl.get_page_index_upper_bound(
-                    layer_offset, Role.KEY
-                )
-            kv_pool, kv_scale_pool = thop.build_kv_cache_buffers(
-                host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping,
-                layer_idx,
-                num_kv_heads,
-                tokens_per_block,
-                head_dim,
-                kv_factor,
-                total_num_blocks,
-                kv_cache_quant_mode,
-                dtype,
-            )
-            self._kv_pool_cache[layer_idx] = (kv_pool, kv_scale_pool)
-            self._pool_idx_cache[layer_idx] = int(host_kv_cache_pool_mapping[layer_idx, 0])
-
-        kv_pool, kv_scale_pool = self._kv_pool_cache[layer_idx]
-        pool_idx = self._pool_idx_cache[layer_idx]
+        kv_factor = 1 if is_mla_enable else 2
+        total_num_blocks = (
+            self._kv_cache_manager.blocks_in_primary_pool
+            * self._kv_cache_manager.num_local_layers
+            * kv_factor
+        )
+        kv_pool, _ = thop.build_kv_cache_buffers(
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            layer_idx,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            kv_factor,
+            total_num_blocks,
+            kv_cache_quant_mode,
+            dtype,
+        )
+        pool_idx = int(host_kv_cache_pool_mapping[layer_idx, 0])
 
         # block_tables: pure Python slice, no C++ op, no division
         block_tables = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size]
