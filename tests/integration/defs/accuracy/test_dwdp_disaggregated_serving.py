@@ -217,10 +217,9 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "CUTEDSL",
             },
             "dwdp_config": {
-                "enabled": True,
                 "dwdp_size": 2,
-                "num_group": 1,
-                "experts_per_worker": 36,
+                "num_groups": 1,
+                "num_experts_per_worker": 36,
                 "num_prefetch_experts": 36,
             },
         }

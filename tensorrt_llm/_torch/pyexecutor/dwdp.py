@@ -158,7 +158,7 @@ class DwdpPrefetchBuffer:
         self,
         dwdp_size: int,
         dwdp_rank: int,
-        experts_per_worker: int,
+        num_experts_per_worker: int,
         num_prefetch_experts: int,
         num_layers: int,
         first_moe_layer_idx: int,
@@ -167,7 +167,7 @@ class DwdpPrefetchBuffer:
     ):
         self.dwdp_size = dwdp_size
         self.num_prefetch_experts = num_prefetch_experts
-        self.experts_per_worker = experts_per_worker
+        self.num_experts_per_worker = num_experts_per_worker
         self.num_layers = num_layers
         self.first_moe_layer_idx = first_moe_layer_idx
         self.num_buffers = 2  # Ping-pong
@@ -257,8 +257,8 @@ class DwdpManager:
         self.config = config
         self.dist = dist
         self.dwdp_size = config.dwdp_size
-        self.experts_per_worker = config.experts_per_worker
-        self.num_group = config.num_group
+        self.num_experts_per_worker = config.num_experts_per_worker
+        self.num_groups = config.num_groups
 
         self._init_dwdp_group()
 
@@ -276,9 +276,16 @@ class DwdpManager:
         self.dwdp_rank = self.rank % self.dwdp_size
         self.num_prefetch_experts = config.num_prefetch_experts
         self.start_expert_id = self.num_prefetch_experts * self.dwdp_rank
-        self.end_expert_id = self.start_expert_id + self.experts_per_worker
+        self.end_expert_id = self.start_expert_id + self.num_experts_per_worker
 
+    def __enter__(self):
         set_global_dwdp_manager(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        set_global_dwdp_manager(None)
+        return False
 
     def _init_dwdp_group(self):
         if not isinstance(self.dist, MPIDist):
@@ -287,7 +294,7 @@ class DwdpManager:
         self.rank = global_mpi_rank()
 
         # Calculate which group this rank belongs to
-        # With num_group=2, dwdp_size=4:
+        # With num_groups=2, dwdp_size=4:
         #   Group 0: ranks [0, 1, 2, 3]
         #   Group 1: ranks [4, 5, 6, 7]
         self.group_id = self.rank // self.dwdp_size
@@ -298,7 +305,16 @@ class DwdpManager:
         self.dwdp_group = COMM_WORLD.Create_group(new_group)
 
     def is_enabled(self) -> bool:
-        return self.config.enabled and self.dwdp_size > 1
+        return self.dwdp_size > 1
+
+    def cleanup(self):
+        """Release all IPC handles and clean up resources."""
+        for collector in self.ipc_collectors:
+            collector.cleanup()
+        self.ipc_collectors.clear()
+        if self.dwdp_group is not None:
+            self.dwdp_group.Free()
+            self.dwdp_group = None
 
     def add_layer(
         self,
@@ -379,7 +395,7 @@ class DwdpManager:
         self.prefetch_buffer = DwdpPrefetchBuffer(
             dwdp_size=self.dwdp_size,
             dwdp_rank=self.dwdp_rank,
-            experts_per_worker=self.experts_per_worker,
+            num_experts_per_worker=self.num_experts_per_worker,
             num_prefetch_experts=self.num_prefetch_experts,
             num_layers=len(self.ipc_collectors),
             first_moe_layer_idx=self.first_moe_layer_idx,

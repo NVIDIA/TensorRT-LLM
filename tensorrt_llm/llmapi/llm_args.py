@@ -2398,14 +2398,13 @@ class DwdpConfig(StrictBaseModel):
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
     on NVLink-connected multi-GPU systems.
     """
-    enabled: bool = Field(default=False, description="Whether to enable DWDP.")
     dwdp_size: int = Field(default=1,
                            description="The number of GPUs per DWDP group.")
-    num_group: int = Field(
+    num_groups: int = Field(
         default=1,
         description=
-        "The number of DWDP groups. Total workers = num_group * dwdp_size.")
-    experts_per_worker: int = Field(
+        "The number of DWDP groups. Total workers = num_groups * dwdp_size.")
+    num_experts_per_worker: int = Field(
         default=0, description="The number of experts per worker.")
     num_prefetch_experts: int = Field(
         default=0, description="The number of prefetch experts per worker.")
@@ -3299,10 +3298,10 @@ class TorchLlmArgs(BaseLlmArgs):
         description="NVFP4 GEMM backend config.",
         status="beta")
 
-    dwdp_config: DwdpConfig = Field(
-        default_factory=DwdpConfig,
+    dwdp_config: Optional[DwdpConfig] = Field(
+        default=None,
         description="DWDP (Distributed Weight Data Parallelism) config.",
-        status="beta")
+        status="prototype")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",

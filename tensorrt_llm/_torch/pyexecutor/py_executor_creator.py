@@ -387,9 +387,10 @@ def create_py_executor(
 
     # Initialize DWDP Manager (only for context workers in disaggregated serving)
     dwdp_manager: Optional[DwdpManager] = None
-    if llm_args.dwdp_config is not None and llm_args.dwdp_config.enabled:
+    if llm_args.dwdp_config is not None:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
+        dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
     mem_monitor = _ExecutorMemoryMonitor()

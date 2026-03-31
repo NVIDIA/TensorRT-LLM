@@ -535,6 +535,11 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
+        if dwdp_manager is not None and not self.disable_overlap_scheduler:
+            raise ValueError(
+                "DWDP requires disable_overlap_scheduler=True. "
+                "Overlap scheduler is not yet supported with DWDP.")
+
         if self.drafter is not None:
             if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
@@ -767,6 +772,9 @@ class PyExecutor:
         if (isinstance(self.sampler, AsyncWorkerMixin)
                 and self.sampler.async_worker_enabled()):
             self.sampler.async_worker_stop()
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.__exit__(None, None, None)
+            self.dwdp_manager = None
 
     def can_enqueue_requests(self) -> bool:
         """
