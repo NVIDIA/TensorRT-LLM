@@ -57,6 +57,10 @@ class GlmMoeDsaTokenizer(TransformersTokenizer):
         self.tokenizer = tokenizer
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
 
+    @property
+    def vocab_size(self) -> int:
+        return self.tokenizer.vocab_size
+
     @classmethod
     def from_pretrained(
         cls,
