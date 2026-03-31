@@ -469,18 +469,18 @@ def test_logprobs_against_logits(
                     f"first entry of the generation logprob dict for token {sampled_token_id}"
                 ),
             )
-            for key, value in expected.items():
-                assert key in compare, (
-                    f"Token {key} is not a valid key in the other dict: {list(compare.keys())}"
+            for token_id, logprob_obj in expected.items():
+                assert token_id in compare, (
+                    f"Token {token_id} is not a valid key in the other dict: {list(compare.keys())}"
                 )
-                expected_logprob = value.logprob
-                compare_logprob = compare[key].logprob
+                expected_logprob = logprob_obj.logprob
+                compare_logprob = compare[token_id].logprob
                 torch.testing.assert_close(
                     expected_logprob,
                     compare_logprob,
                     msg=(
                         f"logprob {expected_logprob} does not match the corresponding "
-                        f"logprob {compare_logprob} in the other dict for token {key}"
+                        f"logprob {compare_logprob} in the other dict for token {token_id}"
                     ),
                 )
 
