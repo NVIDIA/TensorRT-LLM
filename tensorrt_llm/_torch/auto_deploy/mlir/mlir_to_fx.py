@@ -475,11 +475,13 @@ class MLIRToFXConverter:
     def _restore_meta_from_op(
         node: Node, mlir_op: Operation, metadata: Dict[str, Dict[str, Any]]
     ) -> None:
-        """Try to restore metadata using various key strategies."""
-        # For precisely-lowered ops, try the original node name from metadata
-        # We search metadata for an entry whose "val" shape matches
-        # For now, no metadata restoration for precisely-lowered ops
-        # (shape prop will recompute it)
+        """No-op: metadata for precisely-lowered ops is recomputed by shape propagation.
+
+        Precisely-lowered ops (ad.add, ad.mul, etc.) don't carry a node_key back
+        to the original FX metadata side-table, so there is no key to look up.
+        The transform framework runs shape_prop after MLIR→FX conversion, which
+        repopulates node.meta["val"] for all nodes.
+        """
         pass
 
     @staticmethod

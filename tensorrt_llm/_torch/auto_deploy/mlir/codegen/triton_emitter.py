@@ -35,6 +35,7 @@ Generated kernels are cached by subgraph hash via ``KernelCache`` to avoid
 redundant compilation.
 """
 
+import atexit
 import textwrap
 from typing import Callable, List
 
@@ -46,6 +47,25 @@ from .kernel_cache import KernelCache
 
 # Module-level kernel cache shared across calls (keyed by subgraph hash)
 _kernel_cache = KernelCache()
+
+# Track temp files so they can be cleaned up at process exit.
+# These files must persist while the process is alive because Triton's @jit
+# calls inspect.getsourcelines() lazily during kernel compilation.
+_temp_files: list[str] = []
+
+
+def _cleanup_temp_files():
+    import os
+
+    for path in _temp_files:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    _temp_files.clear()
+
+
+atexit.register(_cleanup_temp_files)
 
 # ---------------------------------------------------------------------------
 # Emission table: op name -> lambda producing Triton expression string
@@ -518,6 +538,7 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     ) as f:
         f.write(full_src)
         tmp_path = f.name
+    _temp_files.append(tmp_path)
 
     spec = importlib.util.spec_from_file_location(f"_triton_gen_{sg_hash}", tmp_path)
     mod = importlib.util.module_from_spec(spec)

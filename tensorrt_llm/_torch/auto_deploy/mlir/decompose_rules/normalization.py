@@ -149,7 +149,6 @@ def decompose_gated_rmsnorm(op: AdGatedRMSNorm):
     w = op.weight
     gate = op.gate
     eps_val = op.eps
-    group_size = op.group_size.value.data
     norm_before_gate = bool(op.norm_before_gate.value.data)
     t = op.output.type
 

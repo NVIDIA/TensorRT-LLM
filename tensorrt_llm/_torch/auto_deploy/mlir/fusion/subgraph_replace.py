@@ -118,10 +118,8 @@ def replace_subgraph_with_fused_op(
     for i, out_val in enumerate(subgraph.outputs):
         out_val.replace_by(fused_op.outputs[i])
 
-    # Erase the original subgraph ops (reverse order to handle dependencies)
+    # Erase the original subgraph ops in reverse order.
+    # safe_erase=False skips the use-check, which is needed because internal
+    # operand references between subgraph ops may still exist at erase time.
     for op in reversed(subgraph.ops):
-        # Detach remaining uses (internal to the subgraph, now dead)
-        for result in op.results:
-            if result.uses:
-                result.replace_by(result)  # no-op, but clears internal refs
         block.erase_op(op, safe_erase=False)
