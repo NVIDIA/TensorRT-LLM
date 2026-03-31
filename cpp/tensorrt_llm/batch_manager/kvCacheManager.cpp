@@ -89,6 +89,24 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
     return sequenceBlocks;
 }
 
+SizeType32 getMaterializedUniqueTokenCountForReuse(
+    VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
+{
+    auto const totalUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size());
+    if (llmRequest.getContextRemainingLength() > 0)
+    {
+        return std::min(totalUniqueTokenCount, llmRequest.getContextCurrentPosition());
+    }
+    return totalUniqueTokenCount;
+}
+
+SizeType32 getUsableUniqueTokenCountForReuse(
+    VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
+{
+    auto const materializedUniqueTokenCount = getMaterializedUniqueTokenCountForReuse(uniqueTokens, llmRequest);
+    return materializedUniqueTokenCount > 0 ? materializedUniqueTokenCount - 1 : 0;
+}
+
 } // namespace
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -822,8 +840,9 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
+        auto const usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, llmRequest);
         auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, getTokensPerBlock(), false);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
         (void) mWindowBlockManagers.at(windowSize).storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
     }
@@ -1923,11 +1942,9 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
     auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
 
-    // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
-    // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
-    // the last token's state is not filled yet.
-    auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
-    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
+    auto const usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
     auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], pinBlocks);
@@ -1960,11 +1977,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
                     sequence.getRequestId());
             }
             auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
-            // Only (length - 1) tokens of the sequence have their kv-state
-            // recorded in kv-cache. We assume the last token's state is not filled yet.
-            auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
-            auto blockedUniqueTokens
-                = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, /*allowPartial=*/true);
+            auto const usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
+            auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+                uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, /*allowPartial=*/true);
             auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
             std::vector<KVCacheBlock::IdType> cacheBlockIds(allocatedBlocks.size());

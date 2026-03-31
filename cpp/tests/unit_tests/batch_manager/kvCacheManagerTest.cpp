@@ -2647,6 +2647,95 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
 }
 
+TEST_F(KVCacheManagerTest, KVCacheManagerStoreContextBlocksUsesMaterializedContextExtent)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr onboardBlocks = true;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    auto constexpr kMaterializedContextLength = 5;
+    auto constexpr kReusableContextLength = 4;
+    SizeType32 constexpr maxNewTokens = 8;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        0, stream, maxSequenceLength, true, onboardBlocks);
+    kvCacheManager.allocatePools(false);
+
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(0, inputLength, beamWidth, llmRequest0);
+    llmRequest0->setContextCurrentPosition(kMaterializedContextLength);
+
+    kvCacheManager.storeContextBlocks(*llmRequest0);
+    (void) kvCacheManager.removeSequence(0, std::nullopt);
+
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(1, inputLength, beamWidth, llmRequest1);
+
+    EXPECT_EQ(llmRequest1->getContextCurrentPosition(), kReusableContextLength);
+}
+
+TEST_F(KVCacheManagerTest, KVCacheManagerReleaseBlocksUsesMaterializedContextExtent)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr onboardBlocks = true;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    auto constexpr kMaterializedContextLength = 5;
+    auto constexpr kReusableContextLength = 4;
+    SizeType32 constexpr maxNewTokens = 8;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        0, stream, maxSequenceLength, true, onboardBlocks);
+    kvCacheManager.allocatePools(false);
+
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(0, inputLength, beamWidth, llmRequest0);
+    llmRequest0->setContextCurrentPosition(kMaterializedContextLength);
+
+    (void) kvCacheManager.removeSequence(0, llmRequest0);
+
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(1, inputLength, beamWidth, llmRequest1);
+
+    EXPECT_EQ(llmRequest1->getContextCurrentPosition(), kReusableContextLength);
+}
+
 TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
 {
     auto constexpr numLayers = 12;
