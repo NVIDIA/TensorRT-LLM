@@ -5,6 +5,7 @@ import java.lang.InterruptedException
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
+import com.nvidia.bloom.CloudManager
 import com.nvidia.bloom.Utils
 
 DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
@@ -77,16 +78,7 @@ def runPerfTriageBot() {
     SlurmPartition partition = SlurmConfig.resolvePlatform(params.CLUSTER)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    withCredentials([
-        usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')
-    ]) {
-        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
-        def remote = [
-            ip: randomLoginNode, host: randomLoginNode,
-            port: cluster.sshPort ?: 22,
-            user: "${USERNAME}", passwd: "${PASSWORD}",
-            allowAnyHosts: true
-        ]
+    CloudManager.withSlurmSshCredentials(this, partition.clusterName, cluster) { remote ->
 
         // Install SSH tools on the K8s pod
         Utils.exec(this, script: "apt-get update && apt-get install -y sshpass openssh-client")
@@ -95,10 +87,10 @@ def runPerfTriageBot() {
         def workspace = "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
         Utils.exec(this, script: Utils.sshUserCmd(remote, "\"mkdir -p ${workspace}\""), numRetries: 3)
         Utils.exec(this, script: Utils.sshUserCmd(remote,
-            "\"cd ${workspace} && (rm -rf trtllm-perf-triage-bot; git clone ssh://git@gitlab-master.nvidia.com:12051/chenfeiz/trtllm-perf-triage-bot.git)\""),
+            "\"cd ${workspace} && (rm -rf trtllm-perf-triage-bot; git clone https://gitlab-master.nvidia.com/chenfeiz/trtllm-perf-triage-bot.git)\""),
             numRetries: 3)
         Utils.exec(this, script: Utils.sshUserCmd(remote,
-            "\"cd ${workspace} && (rm -rf trtllm-claude; git clone ssh://git@gitlab-master.nvidia.com:12051/kevxie/trtllm-claude.git)\""),
+            "\"cd ${workspace} && (rm -rf trtllm-agent-toolkit; git clone ssh://git@gitlab-master.nvidia.com:12051/ftp/trtllm-agent-toolkit.git)\""),
             numRetries: 3)
 
         // Install anthropic Python SDK on the login node
@@ -212,7 +204,7 @@ You have access to the following tools: bash, read_file, write_file, edit_file, 
 - The utils.py file in the triage bot repo provides helper functions for SLURM job management, git operations, performance evaluation, bisect algorithm, and artifactory acceleration
 - Import and use functions from utils.py when appropriate
 - Always check existing output directories before re-running expensive operations
-- The trtllm-claude repo is cloned in the same parent directory as trtllm-perf-triage-bot (i.e. ../trtllm-claude relative to this repo)
+- The trtllm-agent-toolkit repo is cloned in the same parent directory as trtllm-perf-triage-bot (i.e. ../trtllm-agent-toolkit relative to this repo)
 
 ## Skills Reference
 
