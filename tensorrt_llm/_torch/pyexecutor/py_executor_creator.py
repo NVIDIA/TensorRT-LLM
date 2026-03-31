@@ -354,6 +354,7 @@ def _create_sim_py_executor(
     if estimating_kv_cache:
         kv_cache_creator.configure_kv_cache_capacity(py_executor)
 
+    py_executor.start_worker()
     logger.info("[SimMode] PyExecutor created in simulation mode")
     return py_executor
 
