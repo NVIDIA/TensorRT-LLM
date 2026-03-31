@@ -1,6 +1,5 @@
 ---
 name: serve-config-guide
-disable-model-invocation: true
 description: Generate a source-backed starting `trtllm-serve --config` YAML for
   basic aggregate single-node PyTorch serving, aligned with checked-in TensorRT-LLM
   configs and deployment docs. Preserves explicit latency / balanced / throughput
@@ -14,11 +13,11 @@ description: Generate a source-backed starting `trtllm-serve --config` YAML for
 **Input:** model, GPU, ISL (input sequence length), OSL (output sequence length), concurrency, TP, performance objective (`Min Latency` | `Balanced` | `Max Throughput` | unspecified).
 **Output:** repo-grounded starting YAML for `trtllm-serve --config`.
 
-If the request is adjacent but out of scope, provide a best-effort answer using the nearest in-scope config as a starting point, clearly label inferred vs. verified fields, and point to the relevant feature doc (see Repo Resources table).
+If the request is adjacent but out of scope, provide a best-effort answer using the nearest in-scope config as a starting point, clearly label inferred vs. verified fields, and point to the relevant feature doc in `docs/source/features/` (e.g., speculative-decoding, disagg-serving, parallel-strategy) or `examples/llm-api/`.
 
 ## Constraints
 
-1. **Speculative exclusion:** Exclude configs containing `speculative_config` by default. Exception: exact checked-in DeepSeek-R1 MTP configs (see `references/architecture.md` for eligible models and rules). When including MTP, copy the full `speculative_config` block verbatim — never interpolate speculative fields.
+1. **Speculative exclusion:** Exclude configs containing `speculative_config` by default. Exception: exact checked-in DeepSeek-R1 MTP configs (models with `decoding_type: MTP` in `examples/configs/`). When including MTP, copy the full `speculative_config` block verbatim — never interpolate speculative fields.
 
 2. **Objective preservation:** Preserve the user's stated objective through config selection. Use `database.py` profile labels (`Min Latency`, `Balanced`, `Max Throughput`; plus `Low Latency`/`High Throughput` in smaller sets) as selection aids. If a config is unlabeled, treat it as a default starting point — do not claim it matches a specific objective. If the only match conflicts with the stated objective, call out the mismatch.
 
@@ -33,8 +32,6 @@ For **interpolated configs**: `Config` → `Source used as starting point` → `
 ## Step 0: Lock Objective and Decode Mode
 
 Identify the user's objective (`Min Latency` | `Balanced` | `Max Throughput` | unspecified) and decode mode (non-speculative or DeepSeek-R1 MTP per **Constraint 1**). Preserve both through the remaining steps.
-
-`examples/configs/database/database.py` labels recipes by profile — use as a selection aid, not a universal SLA classifier.
 
 ## Step 1: Exact Database Match
 
@@ -56,7 +53,11 @@ Apply the same constraints as Step 1. Additionally:
 
 ## Step 3: Read Model Docs
 
-Consult `references/architecture.md` for the model-to-source mapping table and model-specific caveats, then read the linked deployment guide and README before adjusting knobs.
+Search `docs/source/deployment-guide/` and `examples/models/core/` for the model's deployment guide and README. Read both before adjusting knobs.
+
+**Excluded sources:** Do NOT use `docs/source/legacy/` tuning values or benchmark numbers — those were measured on the TensorRT engine-building backend and do not transfer to PyTorch backend serving.
+
+**DeepSeek-V3 caveat:** For DeepSeek-V3/V3.2-Exp, use `examples/models/core/deepseek_v3/README.md`, not the R1 deployment guide.
 
 ## Step 4: Adjust Source-Backed Fields
 
@@ -68,24 +69,6 @@ Do not assume other fields are constant across models/GPUs. For tuning notes, re
 
 ## Validation Checklist
 
-- [ ] Config is basic aggregate, single-node
-- [ ] **Speculative exclusion** satisfied per Constraint 1 (`speculative_config` absent unless DeepSeek-R1 MTP with block copied verbatim)
-- [ ] **Objective preservation** satisfied (match or mismatch called out)
-- [ ] No disaggregated-only settings present
 - [ ] `trust_remote_code: true` called out as trust boundary when present
 - [ ] `max_num_tokens` >= ISL + chat template overhead (requests rejected if violated)
 - [ ] If interpolated: single "What to benchmark" section listing knobs to sweep, not per-field unverified tags
-
-## Repo Resources
-
-| Resource | Path |
-|---|---|
-| Scenario database | `examples/configs/database/lookup.yaml` |
-| Database loader/helper | `examples/configs/database/database.py` |
-| Curated configs | `examples/configs/curated/lookup.yaml` |
-| Deployment guides | `docs/source/deployment-guide/` |
-| Model READMEs | `examples/models/core/` |
-| Speculative decoding (out-of-scope, for adjacent requests) | `docs/source/features/speculative-decoding.md` |
-| Parallelism strategy (out-of-scope, for adjacent requests) | `docs/source/features/parallel-strategy.md` |
-| Disaggregated serving (out-of-scope, for adjacent requests) | `docs/source/features/disagg-serving.md` |
-| Multi-node launch skeleton (out-of-scope, for adjacent requests) | `examples/llm-api/llm_mgmn_trtllm_serve.sh` |
