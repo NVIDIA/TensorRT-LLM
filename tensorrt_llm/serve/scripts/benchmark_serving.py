@@ -787,7 +787,9 @@ def main(args: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id,
                               tokenizer_mode=tokenizer_mode,
-                              trust_remote_code=args.trust_remote_code)
+                              trust_remote_code=args.trust_remote_code,
+                              custom_tokenizer=getattr(args, 'custom_tokenizer',
+                                                       None))
 
     if args.dataset_name is None:
         raise ValueError(
@@ -1215,6 +1217,14 @@ if __name__ == "__main__":
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code from huggingface",
+    )
+    parser.add_argument(
+        "--custom-tokenizer",
+        type=str,
+        default=None,
+        help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+        "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+        "is incompatible with AutoTokenizer.",
     )
     parser.add_argument(
         "--disable-tqdm",
