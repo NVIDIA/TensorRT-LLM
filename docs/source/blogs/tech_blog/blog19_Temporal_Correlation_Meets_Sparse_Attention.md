@@ -192,9 +192,9 @@ In practice, we use the **previous step's Top-K result** as the prediction signa
 
 ### Core Idea
 
-Given input vector $\mathbf{x} = (x_0, x_1, \ldots, x_{N-1}) \in \mathbb{R}^N$ and a predicted index set $\mathcal{P} = \{p_0, p_1, \ldots, p_{M-1}\} \subset \{0, \ldots, N-1\}$ (where $M = 2048$), find index set $\mathcal{S}^*$ with $|\mathcal{S}^*| = K$ containing the indices of the $K$ largest values in $\mathbf{x}$.
+Given input vector $\mathbf{x} = (x_0, x_1, \ldots, x_{N-1}) \in \mathbb{R}^N$ and a predicted index set $\mathcal{P} = \{p_0, p_1, \ldots, p_{M-1}\} \subset \{0, \ldots, N-1\}$ (where $M = 2048$), find index set $\mathcal{S}^\ast$ with $|\mathcal{S}^\ast| = K$ containing the indices of the $K$ largest values in $\mathbf{x}$.
 
-**Core theorem**: If threshold $T$ satisfies $K \leq |\{i : x_i \geq T\}| \leq C$ (where $C$ = MAX\_CANDIDATES = 6144), then the candidate set $\mathcal{C} = \{i : x_i \geq T\}$ contains all Top-K elements, i.e., $\mathcal{S}^* \subseteq \mathcal{C}$.
+**Core theorem**: If threshold $T$ satisfies $K \leq |\{i : x_i \geq T\}| \leq C$ (where $C$ = MAX\_CANDIDATES = 6144), then the candidate set $\mathcal{C} = \{i : x_i \geq T\}$ contains all Top-K elements, i.e., $\mathcal{S}^\ast \subseteq \mathcal{C}$.
 
 The algorithm uses the predicted indices $\mathcal{P}$ to estimate a threshold $T$ that is close to the true $K$-th largest value $x_{(K)}$. With a good estimate, only 1–2 global passes over the data are needed (versus 3–4 in radix select), followed by in-shared-memory refinement on the small candidate set.
 
@@ -215,7 +215,7 @@ $$T_0 = \bar{x}_{\mathcal{P}} = \frac{1}{|\mathcal{P}|} \sum_{i \in \mathcal{P}}
 
 With prediction accuracy $\alpha \approx 0.5$, $T_0$ approximates:
 
-$$T_0 \approx \alpha \cdot \mathbb{E}[x_i \mid i \in \mathcal{S}^*] + (1 - \alpha) \cdot \mathbb{E}[x_i]$$
+$$T_0 \approx \alpha \cdot \mathbb{E}[x_i \mid i \in \mathcal{S}^\ast] + (1 - \alpha) \cdot \mathbb{E}[x_i]$$
 
 This is significantly closer to $x_{(K)}$ than the unconditional mean, enabling fast Phase 2 convergence. The phase uses scattered `__ldg` reads and `redux.sync` warp reductions (a single instruction on sm\_80+ replacing 5 shuffle operations).
 
@@ -230,7 +230,7 @@ This is significantly closer to $x_{(K)}$ than the unconditional mean, enabling 
 </div>
 <p align="center"><sub><em>Figure 5. Phase 2 interpolation-based threshold search. Starting from T₀ = pmean with bracket [pmin, pmax], the algorithm evaluates f(T₀): since f(T₀) > C, val_lo is set to T₀. Secant ① connects (val_lo, cnt_lo) and (val_hi, cnt_hi), crossing f_target to determine T₁. Since f(T₁) < K, val_hi is updated to T₁, narrowing the bracket. Secant ② connects the updated anchors and crosses f_target to produce T₂, which lands in the target zone [K, C] — convergence achieved. First-iteration damping (f ≤ 0.50) prevents overshoot. Note: the actual f(T) = count(input ≥ T) is a monotonically non-increasing step function; the smooth curve is shown here for illustration only.</em></sub></p>
 
-Define counting function $f(T) = |\{i : x_i \geq T\}|$, a monotonically non-increasing step function. The goal is to find $T^*$ such that $K \leq f(T^*) \leq C$.
+Define counting function $f(T) = |\{i : x_i \geq T\}|$, a monotonically non-increasing step function. The goal is to find $T^\ast$ such that $K \leq f(T^\ast) \leq C$.
 
 Each iteration computes an exact global count via `blockCountGE` — a bandwidth-bound loop using `float4` vectorized `__ldg` loads, pure register comparison and accumulation, and warp-level reduction. Critically, `blockCountGE` caches each thread's partial count into `smem->per_thread_counts[tid]` before the warp reduction — this cache is reused by Phase 3 to eliminate a redundant $N$-scan (see below).
 
@@ -269,7 +269,7 @@ If the candidate count does not exactly equal $K$, a shared-memory refinement se
 1. **Min/Max scan** over candidates for accurate histogram bins
 2. **2048-bin histogram** via `atomicAdd` over the candidate set, followed by a **warp-parallel K-th bin search**: each warp sums its `NUM_BINS / NUM_WARPS` bins (high-to-low), then `tid=0` scans `NUM_WARPS` warp-totals to find the target warp, and finally the target warp's `lane=0` locates the exact bin. This reduces serial scan steps from 2048 to `2×NUM_WARPS + NUM_BINS/NUM_WARPS = 160` (12.8× fewer).
 3. **Snap iterations**: Refine the threshold to the exact $K$-th largest value by stepping through distinct data values. Each fused snap iteration computes `(count_ge, count_gt, snap_up, snap_down)` in one shared-memory scan. Convergence: when $n_{>}(T) < K \leq n_{\geq}(T)$. With 2048 bins, only **1–3** snap iterations are needed per kernel invocation.
-4. **Partition**: Emit elements $> T^*$ unconditionally, fill remaining slots with elements $= T^*$.
+4. **Partition**: Emit elements $> T^\ast$ unconditionally, fill remaining slots with elements $= T^\ast$.
 
 **Cost**: $O(S \cdot C/P)$ where S ≈ 1–3 snap iterations, $C \leq 6144$ candidates. This is purely shared-memory work — no global memory access.
 
