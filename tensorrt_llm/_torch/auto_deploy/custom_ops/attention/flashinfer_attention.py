@@ -355,6 +355,7 @@ def flashinfer_mha_with_cache(
     sliding_window: Optional[int],
     k_scale: float,
     v_scale: float,
+    read_cache_only: bool = False,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -382,22 +383,23 @@ def flashinfer_mha_with_cache(
 
     # Assuming k_scale = v_scale = 1.0
     k_scale, v_scale = 1.0, 1.0
-    # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
-    if kv_cache.dtype == torch.float8_e4m3fn:
-        k = k.to(torch.float8_e4m3fn)
-        v = v.to(torch.float8_e4m3fn)
+    if not read_cache_only:
+        # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
+        if kv_cache.dtype == torch.float8_e4m3fn:
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
 
-    flashinfer.page.append_paged_kv_cache(
-        append_key=k[:num_total_tokens],
-        append_value=v[:num_total_tokens],
-        batch_indices=flashinfer_batch_indices[:num_total_tokens],
-        positions=flashinfer_positions[:num_total_tokens],
-        paged_kv_cache=kv_cache,
-        kv_indices=cache_loc,
-        kv_indptr=cu_num_pages[: num_seq + 1],
-        kv_last_page_len=last_page_len[:num_seq],
-        kv_layout=_GlobalFlashInferPlanner.kv_layout,
-    )
+        flashinfer.page.append_paged_kv_cache(
+            append_key=k[:num_total_tokens],
+            append_value=v[:num_total_tokens],
+            batch_indices=flashinfer_batch_indices[:num_total_tokens],
+            positions=flashinfer_positions[:num_total_tokens],
+            paged_kv_cache=kv_cache,
+            kv_indices=cache_loc,
+            kv_indptr=cu_num_pages[: num_seq + 1],
+            kv_last_page_len=last_page_len[:num_seq],
+            kv_layout=_GlobalFlashInferPlanner.kv_layout,
+        )
 
     bs = b * s
     if out is not None:
@@ -479,134 +481,6 @@ def flashinfer_mha_with_cache(
     return y.view(q_shape_og)
 
 
-@torch.library.custom_op(
-    "auto_deploy::flashinfer_attention_shared_kv_mha_with_cache", mutates_args=()
-)
-def flashinfer_shared_kv_mha_with_cache(
-    # Q, K, V
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    # STANDARD METADATA
-    batch_info_host: torch.Tensor,
-    cu_seqlen_host: torch.Tensor,
-    cu_num_pages: torch.Tensor,
-    cu_num_pages_host: torch.Tensor,
-    cache_loc: torch.Tensor,
-    last_page_len: torch.Tensor,
-    last_page_len_host: torch.Tensor,
-    seq_len_with_cache_host: torch.Tensor,
-    # EXTRA METADATA
-    flashinfer_batch_indices: torch.Tensor,
-    flashinfer_positions: torch.Tensor,
-    # CACHES - combined KV cache
-    kv_cache: torch.Tensor,
-    # CONSTANTS
-    scale: Optional[float],
-    sliding_window: Optional[int],
-    k_scale: float,
-    v_scale: float,
-    # OPTIONAL PRE-ALLOCATED OUTPUT
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    _GlobalFlashInferPlanner.reset(q.device)
-
-    del k, v, flashinfer_batch_indices, flashinfer_positions
-
-    head_dim = kv_cache.shape[-1]
-    page_size = kv_cache.shape[3]
-    q_shape_og = q.shape
-    b, s = q_shape_og[:2]
-
-    q = q.reshape(b * s, -1, head_dim).contiguous()
-
-    batch_info = BatchInfo(batch_info_host)
-    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
-    num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
-
-    n_heads = q.shape[1]
-    n_kv_heads = kv_cache.shape[2]
-    window_left = _to_flashinfer_window_left(sliding_window)
-
-    bs = b * s
-    if out is not None:
-        y = out.view(bs, n_heads, head_dim)
-    else:
-        y = torch.zeros((bs, n_heads, head_dim), dtype=q.dtype, device=q.device)
-
-    if num_prefill > 0:
-        q_prefill = q[:num_prefill_tokens]
-
-        pp_prefill = PlanParams(
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            head_dim=head_dim,
-            num_seq=num_prefill,
-            page_size=page_size,
-            q_dtype=q_prefill.dtype,
-            kv_dtype=kv_cache.dtype,
-            sm_scale=scale,
-            window_left=window_left,
-        )
-
-        wrapper_prefill = _GlobalFlashInferPlanner.plan_prefill(
-            qo_indptr_host=cu_seqlen_host[: num_prefill + 1],
-            kv_page_indptr_host=cu_num_pages_host[: num_prefill + 1],
-            kv_page_indices=cache_loc,
-            kv_last_page_len_host=last_page_len_host[:num_prefill],
-            kv_lens_arr_host=seq_len_with_cache_host[:num_prefill],
-            plan_params=pp_prefill,
-        )
-
-        y_prefill = wrapper_prefill.run(
-            q_prefill,
-            kv_cache,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            enable_pdl=get_env_enable_pdl(),
-        )
-        y[:num_prefill_tokens] = y_prefill
-
-    if num_decode > 0:
-        q_decode = q[num_prefill_tokens:num_total_tokens]
-
-        pp_decode = PlanParams(
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            head_dim=head_dim,
-            num_seq=num_decode,
-            page_size=page_size,
-            q_dtype=q_decode.dtype,
-            kv_dtype=kv_cache.dtype,
-            sm_scale=scale,
-            window_left=window_left,
-        )
-
-        wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
-            kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
-            kv_page_indices=cache_loc,
-            kv_last_page_len=last_page_len[num_prefill:num_seq],
-            plan_params=pp_decode,
-        )
-
-        y_decode = wrapper_decode.run(
-            q_decode,
-            kv_cache,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            enable_pdl=get_env_enable_pdl(),
-        )
-        y[num_prefill_tokens:num_total_tokens] = y_decode
-
-    if out is not None:
-        if num_total_tokens < bs:
-            y[num_total_tokens:].zero_()
-        return out.new_empty(0)
-
-    return y.view(q_shape_og)
-
-
 @flashinfer_mha_with_cache.register_fake
 def flashinfer_mha_with_cache_fake(
     # Q, K, V
@@ -632,33 +506,14 @@ def flashinfer_mha_with_cache_fake(
     sliding_window: Optional[int],
     k_scale: float,
     v_scale: float,
-) -> torch.Tensor:
-    return torch.empty_like(q.contiguous())
-
-
-@flashinfer_shared_kv_mha_with_cache.register_fake
-def flashinfer_shared_kv_mha_with_cache_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    batch_info_host: torch.Tensor,
-    cu_seqlen_host: torch.Tensor,
-    cu_num_pages: torch.Tensor,
-    cu_num_pages_host: torch.Tensor,
-    cache_loc: torch.Tensor,
-    last_page_len: torch.Tensor,
-    last_page_len_host: torch.Tensor,
-    seq_len_with_cache_host: torch.Tensor,
-    flashinfer_batch_indices: torch.Tensor,
-    flashinfer_positions: torch.Tensor,
-    kv_cache: torch.Tensor,
-    scale: Optional[float],
-    sliding_window: Optional[int],
-    k_scale: float,
-    v_scale: float,
+    read_cache_only: bool = False,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    del batch_info_host, cu_seqlen_host, cu_num_pages, cu_num_pages_host
+    del cache_loc, last_page_len, last_page_len_host, seq_len_with_cache_host
+    del flashinfer_batch_indices, flashinfer_positions, kv_cache
+    del scale, sliding_window, k_scale, v_scale, read_cache_only
     if out is not None:
         return out.new_empty(0)
     return torch.empty_like(q.contiguous())
@@ -686,21 +541,8 @@ class FlashInferAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_attention
 
     @classmethod
-    def get_source_attention_ops(cls) -> List[OpOverloadPacket]:
-        return [
-            torch.ops.auto_deploy.torch_attention,
-            torch.ops.auto_deploy.torch_attention_shared_kv,
-        ]
-
-    @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default
-
-    @classmethod
-    def get_cached_attention_op_for_source_node(cls, source_attn_node: Node) -> MHACallable:
-        if source_attn_node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default:
-            return torch.ops.auto_deploy.flashinfer_attention_shared_kv_mha_with_cache.default
-        return cls.get_cached_attention_op()
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
@@ -774,6 +616,7 @@ class FlashInferAttention(AttentionDescriptor):
             extract_op_args(source_attn_node, "sliding_window")[0],  # sliding window parameter
             1.0,  # k_scale
             1.0,  # v_scale
+            cls.get_shared_kv_source_layer_idx(source_attn_node) is not None,  # read_cache_only
         ]
 
     @classmethod
@@ -782,6 +625,4 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
-        if source_attn_node.target != torch.ops.auto_deploy.torch_attention_shared_kv.default:
-            return None
         return extract_op_args(source_attn_node, "shared_kv_source_layer_idx")[0]

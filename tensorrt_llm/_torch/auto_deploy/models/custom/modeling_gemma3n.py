@@ -316,37 +316,21 @@ class Gemma3nTextAttention(nn.Module):
             2,
         )
 
-        if self.is_kv_shared_layer:
-            attn_output = torch.ops.auto_deploy.torch_attention_shared_kv(
-                query_states,
-                key_states,
-                value_states,
-                None,
-                0.0,
-                True,
-                1.0,
-                None,
-                self.sliding_window,
-                None,
-                "bsnd",
-                self.layer_idx,
-                self.kv_shared_layer_index,
-            )
-        else:
-            attn_output = torch.ops.auto_deploy.torch_attention(
-                query_states,
-                key_states,
-                value_states,
-                None,
-                0.0,
-                True,
-                1.0,
-                None,
-                self.sliding_window,
-                None,
-                "bsnd",
-                self.layer_idx,
-            )
+        attn_output = torch.ops.auto_deploy.torch_attention(
+            query_states,
+            key_states,
+            value_states,
+            None,
+            0.0,
+            True,
+            1.0,
+            None,
+            self.sliding_window,
+            None,
+            "bsnd",
+            self.layer_idx,
+            self.kv_shared_layer_index if self.is_kv_shared_layer else None,
+        )
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
 

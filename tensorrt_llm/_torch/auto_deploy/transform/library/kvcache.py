@@ -169,13 +169,9 @@ class _InsertCachedOperator(BaseTransform):
         """Replace uncached source attention node with corresponding cached attn node."""
         attn_descriptor = self.attn_descriptor
 
-        # Get all attention nodes and their info objects
-        source_ops = attn_descriptor.get_source_attention_ops()
-
         # look for relevant source attention nodes
-        source_attn_nodes = [
-            n for n in gm.graph.nodes if any(is_op(n, source_op) for source_op in source_ops)
-        ]
+        source_op = attn_descriptor.get_source_attention_op()
+        source_attn_nodes = [n for n in gm.graph.nodes if is_op(n, source_op)]
 
         if not source_attn_nodes:
             # If there are no nodes for kv cache insertion found, return current graph
@@ -203,6 +199,15 @@ class _InsertCachedOperator(BaseTransform):
             shared_kv_source_layer_idx = attn_descriptor.get_shared_kv_source_layer_idx(attn_node)
 
             if shared_kv_source_layer_idx is not None:
+                if layer_idx is None:
+                    raise RuntimeError(
+                        "Shared-KV attention node is missing layer_idx metadata required for "
+                        "cache aliasing."
+                    )
+                if shared_kv_source_layer_idx == layer_idx:
+                    raise RuntimeError(
+                        f"Shared-KV attention node for layer {layer_idx} cannot alias its own cache."
+                    )
                 if shared_kv_source_layer_idx not in cache_nodes_by_layer_idx:
                     raise RuntimeError(
                         f"Shared-KV attention node requested source layer {shared_kv_source_layer_idx}, "
@@ -236,7 +241,7 @@ class _InsertCachedOperator(BaseTransform):
             self._insert_cached_attn_node(
                 gm,
                 attn_node,
-                attn_descriptor.get_cached_attention_op_for_source_node(attn_node),
+                attn_descriptor.get_cached_attention_op(),
                 qkv,
                 meta_nodes_std,
                 meta_nodes_extra,
