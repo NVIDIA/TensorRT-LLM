@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -685,10 +686,34 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
-        super().__init__(model_config, layer_idx,
+        # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the MTP layer entirely
+        # unquantized -- including its MoE experts (no weight_scale tensors).
+        # Most non-CUTLASS MoE backends (TRTLLMGen, CuteDsl, ...) reject
+        # unquantized / kv-cache-only quant_modes at create_weights or
+        # forward time (e.g. "TRTLLMGenFusedMoE doesn't support
+        # fp16/bf16/fp32 MoE", "CuteDslFusedMoE doesn't support quantization
+        # mode [128]" where bit 128 is FP8_KV_CACHE only).  CUTLASS MoE
+        # supports both BF16 and quantized MoE, so when the checkpoint marks
+        # MTP as excluded from quantization, fall back to CUTLASS *only* for
+        # the MTP layer.  Regular layers (0..num_hidden_layers-1) keep the
+        # user-selected backend.
+        mtp_model_config = model_config
+        if (model_config.moe_backend != "CUTLASS"
+                and Qwen3NextMTP._is_mtp_excluded_from_quant(model_config)):
+            original_backend = model_config.moe_backend
+            mtp_model_config = copy.copy(model_config)
+            mtp_model_config._frozen = False
+            mtp_model_config.moe_backend = "CUTLASS"
+            mtp_model_config._frozen = True
+            logger.warning(
+                "Qwen3Next MTP layer is unquantized in the checkpoint; "
+                "falling back to moe_backend=CUTLASS for the MTP layer "
+                f"(regular layers keep moe_backend={original_backend}).")
+
+        super().__init__(mtp_model_config, layer_idx,
                          aux_stream_dict[AuxStreamType.Attention])
-        config = model_config.pretrained_config
-        self.model_config = model_config
+        config = mtp_model_config.pretrained_config
+        self.model_config = mtp_model_config
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -708,13 +733,13 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
             use_gemma=True,
         )
 
-        if model_config.mapping.enable_attention_dp:
+        if mtp_model_config.mapping.enable_attention_dp:
             self.fc = Linear(
                 config.hidden_size * 2,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init=mtp_model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
@@ -725,13 +750,40 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                 bias=False,
                 dtype=config.torch_dtype,
                 tensor_parallel_mode=TensorParallelMode.ROW,
-                mapping=model_config.mapping,
+                mapping=mtp_model_config.mapping,
                 reduce_output=True,
-                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init=mtp_model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
-        self.shared_head = Qwen3NextMTPHead(model_config)
+        self.shared_head = Qwen3NextMTPHead(mtp_model_config)
+
+    @staticmethod
+    def _is_mtp_excluded_from_quant(
+            model_config: ModelConfig[Qwen3NextConfig]) -> bool:
+        """Heuristic: did the checkpoint mark MTP as excluded from quantization?
+
+        ``apply_quant_config_exclude_modules`` runs *after* this constructor.
+        For Qwen3.5 paths the exclude_modules list has already been
+        translated to ``model.layers.<n_hidden_layers>*`` by
+        ``_normalize_qwen35_exclude_modules`` -- detect that.  Raw HF
+        ``mtp.*`` patterns are also accepted (defensive: if some future
+        weight mapper does not translate them, this still triggers the
+        backend fallback so the MoE path doesn't crash).
+        """
+        qc = getattr(model_config, "quant_config", None)
+        if qc is None or not getattr(qc, "exclude_modules", None):
+            return False
+        n_layers = getattr(model_config.pretrained_config, "num_hidden_layers",
+                           None)
+        target_prefix = (f"model.layers.{n_layers}"
+                         if n_layers is not None else None)
+        for pat in qc.exclude_modules:
+            if pat.startswith("mtp."):
+                return True
+            if target_prefix is not None and pat.startswith(target_prefix):
+                return True
+        return False
 
     def forward(
         self,
