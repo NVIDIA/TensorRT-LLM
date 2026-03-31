@@ -1654,7 +1654,7 @@ SizeType32 WindowBlockManager::addSequence(
     bool shareLastContextBlockAmongBeams = sequence.getBeamWidth() == 1;
     if (isRecurrentState())
     {
-        shareLastContextBlockAmongBeams &= inputLength % mTokensPerBlock == 0;
+        shareLastContextBlockAmongBeams |= inputLength % mTokensPerBlock == 0;
     }
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, llmRequest,
         perBlockRetentions, shareLastContextBlockAmongBeams, mode, directory);
