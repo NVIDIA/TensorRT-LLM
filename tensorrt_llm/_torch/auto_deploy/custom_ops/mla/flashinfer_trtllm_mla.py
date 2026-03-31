@@ -69,6 +69,9 @@ class _CombinedMLAPagedResourceHandler(ResourceHandler):
         self.token_shape = token_shape
         self.dtype = dtype
 
+    def _get_bytes_per_token(self) -> int:
+        return math.prod(self.token_shape) * self.dtype.itemsize
+
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
         return torch.empty(
             sequence_info.num_blocks,

@@ -98,7 +98,8 @@ class FCFSWaitingQueue(deque, WaitingQueue):
 
     @staticmethod
     def _warn_if_priority_set(request: RequestQueueItem) -> None:
-        if request.request is not None and request.request.priority != DEFAULT_REQUEST_PRIORITY:
+        request_priority = getattr(request.request, "priority", DEFAULT_REQUEST_PRIORITY)
+        if request.request is not None and request_priority != DEFAULT_REQUEST_PRIORITY:
             logger.warning(
                 "A request has a non-default priority but the FCFS waiting "
                 "queue is in use; the priority value will be ignored. "
@@ -189,7 +190,7 @@ class PriorityWaitingQueue(WaitingQueue):
 
     def _get_priority(self, item: RequestQueueItem) -> float:
         if item.request is not None:
-            return item.request.priority
+            return getattr(item.request, "priority", DEFAULT_REQUEST_PRIORITY)
         return DEFAULT_REQUEST_PRIORITY
 
     def _push(self, item: RequestQueueItem) -> None:

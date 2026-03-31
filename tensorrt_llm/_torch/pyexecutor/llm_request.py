@@ -8,6 +8,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
 
@@ -1021,7 +1022,8 @@ def executor_request_to_llm_request(
         return_encoder_output=False,
         client_id=executor_request.client_id
         if executor_request.client_id is not None else req_id,
-        priority=executor_request.priority,
+        priority=getattr(executor_request, "priority",
+                         DEFAULT_REQUEST_PRIORITY),
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt_id=executor_request.cache_salt_id,
