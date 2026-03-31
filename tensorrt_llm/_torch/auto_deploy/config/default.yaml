@@ -216,7 +216,7 @@ transforms:
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
-    enabled: false
+    enabled: true
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
@@ -281,5 +281,5 @@ transforms:
     run_per_gm: false
     cuda_graph_batch_sizes: null
     backend: torch-compile
-    piecewise_enabled: false
+    piecewise_enabled: true
     piecewise_num_tokens: null
