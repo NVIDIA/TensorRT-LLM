@@ -3484,6 +3484,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "None (default) disables EVS, values in [0, 1) enable pruning.",
         status="prototype")
 
+    simulation_mode: bool = Field(
+        default=False,
+        description="Enable simulation mode. Skips model weight loading and "
+        "replaces model forward with dummy outputs. "
+        "The scheduler runs normally.",
+        status="prototype",
+    )
+
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
