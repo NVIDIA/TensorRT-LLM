@@ -11,6 +11,7 @@ from typing import Dict
 
 import torch
 
+from ...utils.logger import ad_logger
 from ...utils.quantization_utils import FLOAT8_DTYPES
 
 
@@ -90,7 +91,7 @@ def _kv_b_proj_dequant_load_hook(
     state_dict: Dict[str, torch.Tensor],
     prefix: str,
     *args,
-    num_layers: int = None,
+    num_layers: int,
 ):
     """Pre-load hook that dequantizes FP8 kv_b_proj weights using per-block scales.
 
@@ -100,20 +101,12 @@ def _kv_b_proj_dequant_load_hook(
     ignores weight_scale_inv, producing values ~1000x too large and NaN/Inf attention.
 
     This hook performs proper block-wise dequantization before weights are loaded.
+
+    Args:
+        num_layers: Must match ``config.num_hidden_layers`` for the decoder (same source
+            as :func:`_rope_deinterleave_load_hook`). Do not infer this from checkpoint
+            keys: layer count belongs to model config, not the state dict.
     """
-    import re as _re
-
-    # Auto-detect num_layers when not provided by scanning state_dict keys.
-    if num_layers is None:
-        _max_layer = -1
-        for _k in state_dict:
-            _m = _re.search(r"model\.layers\.(\d+)\.self_attn\.kv_b_proj\.weight$", _k)
-            if _m:
-                _max_layer = max(_max_layer, int(_m.group(1)))
-        if _max_layer < 0:
-            return  # No kv_b_proj weights found; nothing to do.
-        num_layers = _max_layer + 1
-
     for layer_idx in range(num_layers):
         layer_prefix = f"{prefix}model.layers.{layer_idx}.self_attn."
         w_key = layer_prefix + "kv_b_proj.weight"
@@ -129,11 +122,10 @@ def _kv_b_proj_dequant_load_hook(
 
         if scale_key not in state_dict:
             # No scale available; fall back to plain cast and warn.
-            import warnings
-
-            warnings.warn(
+            ad_logger.warning_once(
                 f"kv_b_proj FP8 weight found at {w_key} but no scale at {scale_key}; "
-                "loading with raw dtype cast (weights will be incorrect)."
+                "loading with raw dtype cast (weights will be incorrect).",
+                key=f"kv_b_proj_dequant_load_hook_{layer_idx}",
             )
             state_dict[w_key] = w.to(torch.bfloat16)
             continue
