@@ -403,16 +403,18 @@ class BatchInfo:
                 BatchInfo._NUM_ELEMENTS, dtype=torch.int, pin_memory=prefer_pinned()
             )
         self._batch_info_host = batch_info_host
-        self._batch_info_np = batch_info_host.numpy()  # same storage!
+        # Use the tensor view directly so fake tensors can flow through
+        # torch.compile metadata tracing without requiring a real .numpy() view.
+        self._batch_info = batch_info_host
 
     def serialize(self) -> torch.Tensor:
         return self._batch_info_host
 
     def update(self, batch_info: List[int]) -> None:
-        self._batch_info_np[:6] = batch_info
+        self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
 
     def is_generate_only(self) -> bool:
-        return self._batch_info_np[:4].sum().item() == 0
+        return self._batch_info[:4].sum().item() == 0
 
     def get_total_num_sequences(self) -> int:
         return sum(self.get_num_sequences())
@@ -429,14 +431,14 @@ class BatchInfo:
 
     def get_num_sequences(self) -> Tuple[int, int, int]:
         """Get the number of prefill, extend, and decode sequences."""
-        num_prefill, num_extend, num_decode = self._batch_info_np[:6:2].tolist()
+        num_prefill, num_extend, num_decode = self._batch_info[:6:2].tolist()
         return num_prefill, num_extend, num_decode
 
     def get_total_num_tokens(self) -> int:
         return sum(self.get_num_tokens())
 
     def get_num_tokens(self) -> Tuple[int, int, int]:
-        prefill_tokens, extend_tokens, decode_tokens = self._batch_info_np[1:6:2].tolist()
+        prefill_tokens, extend_tokens, decode_tokens = self._batch_info[1:6:2].tolist()
         return prefill_tokens, extend_tokens, decode_tokens
 
     # --- max sequence info (slots 6-9) writers ---
@@ -448,42 +450,48 @@ class BatchInfo:
         block_offset_multiplier: int,
         max_batch_size: int,
     ) -> None:
-        self._batch_info_np[6:10] = [
-            max_context_length,
-            max_blocks_per_seq,
-            block_offset_multiplier,
-            max_batch_size,
-        ]
+        self._batch_info[6:10] = torch.tensor(
+            [
+                max_context_length,
+                max_blocks_per_seq,
+                block_offset_multiplier,
+                max_batch_size,
+            ],
+            dtype=self._batch_info.dtype,
+        )
 
     # --- max sequence info (slots 6-9) readers ---
 
     def get_max_seq_info(self) -> Tuple[int, int, int, int]:
-        return tuple(self._batch_info_np[6:10].tolist())
+        return tuple(self._batch_info[6:10].tolist())
 
     def get_max_context_length(self) -> int:
-        return int(self._batch_info_np[6])
+        return int(self._batch_info[6])
 
     def get_max_blocks_per_seq(self) -> int:
-        return int(self._batch_info_np[7])
+        return int(self._batch_info[7])
 
     def get_block_offset_multiplier(self) -> int:
-        return int(self._batch_info_np[8])
+        return int(self._batch_info[8])
 
     def get_max_batch_size(self) -> int:
-        return int(self._batch_info_np[9])
+        return int(self._batch_info[9])
 
     # --- tokens gather info (slots 10-11) writers ---
 
     def update_tokens_gather_info(self, num_tokens_to_gather: int, gather_required: bool) -> None:
-        self._batch_info_np[10:12] = [num_tokens_to_gather, int(gather_required)]
+        self._batch_info[10:12] = torch.tensor(
+            [num_tokens_to_gather, int(gather_required)],
+            dtype=self._batch_info.dtype,
+        )
 
     # --- tokens gather info (slots 10-11) readers ---
 
     def get_num_tokens_to_gather(self) -> int:
-        return int(self._batch_info_np[10])
+        return int(self._batch_info[10])
 
     def is_gather_required(self) -> bool:
-        return bool(self._batch_info_np[11])
+        return bool(self._batch_info[11])
 
 
 class SequenceInfo:

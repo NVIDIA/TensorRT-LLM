@@ -253,6 +253,16 @@ _torch_attention_schema = defs.OpSchema(
 
 def register_onnx_schemas():
     """Register ONNX custom ops."""
-    defs.register_schema(_torch_rope_with_explicit_cos_sin_schema)
-    defs.register_schema(_torch_attention_schema)
-    defs.register_schema(_attention_plugin_schema)
+    registered = {
+        (schema.name, schema.domain, schema.since_version)
+        for schema in defs.get_all_schemas_with_history()
+    }
+
+    for schema in (
+        _torch_rope_with_explicit_cos_sin_schema,
+        _torch_attention_schema,
+        _attention_plugin_schema,
+    ):
+        key = (schema.name, schema.domain, schema.since_version)
+        if key not in registered:
+            defs.register_schema(schema)
