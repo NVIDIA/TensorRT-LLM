@@ -890,6 +890,19 @@ class Attention(nn.Module):
         else:
             q, k, v = qkv, None, None
 
+        # For dynamic tree spec decoding with Python RoPE, adjust position_ids
+        # to use tree offsets (same as C++ kernel: past_seq_len + offset).
+        if (not self.rope_fusion
+                and getattr(attn_metadata, 'is_spec_dec_dynamic_tree', False)
+                and getattr(attn_metadata, 'use_spec_decoding', False)
+                and getattr(attn_metadata, 'spec_decoding_position_offsets',
+                            None) is not None
+                and attn_metadata.spec_decoding_position_offsets.dim() ==
+                1  # 1D layout ⇒ dynamic tree
+                and position_ids is not None):
+            position_ids = self._adjust_position_ids_for_spec_dec(
+                position_ids, attn_metadata)
+
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -938,6 +951,25 @@ class Attention(nn.Module):
             q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
+
+    def _adjust_position_ids_for_spec_dec(self, position_ids, attn_metadata):
+        """Replicate C++ kernel's rotary_pos = past_seq_len + offset."""
+        num_contexts = attn_metadata.num_contexts
+        num_gens = attn_metadata.num_seqs - num_contexts
+        if num_gens <= 0:
+            return position_ids
+        gen_len = int(attn_metadata.seq_lens[num_contexts])
+        base_pos = attn_metadata.kv_lens_cuda[num_contexts:num_contexts +
+                                              num_gens] - gen_len
+        offsets = attn_metadata.spec_decoding_position_offsets[:num_gens *
+                                                               gen_len].view(
+                                                                   num_gens,
+                                                                   gen_len)
+        adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
+        start = attn_metadata.num_ctx_tokens
+        end = start + num_gens * gen_len
+        position_ids[0, start:end] = adjusted
+        return position_ids
 
     def apply_qk_norm(self, q, k):
         raise NotImplementedError(
