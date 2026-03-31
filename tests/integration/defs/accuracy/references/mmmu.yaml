@@ -68,3 +68,5 @@ moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 81.56
+Qwen/Qwen3.5-35B-A3B:
+  - accuracy: 59.0

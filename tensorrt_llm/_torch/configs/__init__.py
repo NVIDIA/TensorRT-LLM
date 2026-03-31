@@ -24,4 +24,7 @@ def _register_custom_configs_with_transformers() -> None:
 _register_custom_configs_with_transformers()
 del _register_custom_configs_with_transformers
 
-__all__ = ["DeepseekV3Config"]
+__all__ = [
+    "DeepseekV3Config",
+    "Qwen3_5MoeConfig",
+]
