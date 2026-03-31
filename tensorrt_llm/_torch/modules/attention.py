@@ -615,9 +615,7 @@ class Attention(nn.Module):
         # For mixed precision (e.g. nvfp4+fp8 autoquant): the attention
         # backend's has_nvfp4 is derived from q_proj's quant config (set via
         # apply_layerwise_quant_config), but NVFP4 attention output should
-        # only be enabled when o_proj can actually consume it.  If o_proj is
-        # FP8 (or another non-NVFP4 method), forcing NVFP4 output would pass
-        # an Fp4QuantizedTensor to a linear layer that cannot handle it.
+        # only be enabled when o_proj can actually consume it.
         if hasattr(self.attn, 'has_nvfp4'
                    ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
             self.attn.has_nvfp4 = False
@@ -730,9 +728,7 @@ class Attention(nn.Module):
         # For mixed precision (e.g. autoquant with BF16 q/k/v but FP8 o_proj): the FMHA kernel
         # only produces quantized (FP8/NVFP4) output when the QKV projections are also quantized
         # (has_fp8_qdq / has_nvfp4 etc.).  When q/k/v are BF16, the FMHA outputs BF16 even for
-        # FP8-KV-cache layers.  Passing out_scale in that case causes the legacy thop.attention
-        # kernel to multiply the BF16 output by inv_input_scale (~300x), which then saturates the
-        # FP8 quantisation inside o_proj, producing ~100x wrong values.
+        # FP8-KV-cache layers.
         _attn_will_quantize_output = (
             getattr(self.attn, 'has_fp8_qdq', False)
             or getattr(self.attn, 'has_fp8_block_wise', False)
