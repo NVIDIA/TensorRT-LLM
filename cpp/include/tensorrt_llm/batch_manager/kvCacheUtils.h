@@ -69,7 +69,7 @@ public:
         return BlockRange(cacheManager, requestId);
     }
 
-    static BlockRange fromReuseTree(
+    static std::optional<BlockRange> fromReuseTree(
         BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
     {
 
@@ -80,8 +80,12 @@ public:
         auto windowSize = cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
         // Find the last block in the reuse tree for the provided full sequence of block keys
         auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
-        // TODO: handle the case where the last block is not found
-        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
+        if (!lastBlock)
+        {
+            // Block not found in reuse tree (e.g., duplicate block IDs caused a partial store).
+            // Caller should fall back to fromAllBlockIds.
+            return std::nullopt;
+        }
         int32_t const numBlocksToCollect = indexFromEnd + 1;
 
         std::vector<SizeType32> blockIds;

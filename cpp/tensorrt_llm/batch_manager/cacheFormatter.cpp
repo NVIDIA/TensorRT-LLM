@@ -221,7 +221,15 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     }
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
-    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    auto reuseRange = BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    if (reuseRange.has_value())
+    {
+        return std::move(reuseRange.value());
+    }
+    // Reuse tree lookup failed (e.g., duplicate block IDs in the sequence prevented
+    // full tree insertion). Fall back to sending all blocks.
+    TLLM_LOG_WARNING("fromReuseTree failed for request %lu, falling back to fromAllBlockIds", llmRequest.mRequestId);
+    return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,

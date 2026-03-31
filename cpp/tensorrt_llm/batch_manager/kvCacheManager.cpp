@@ -344,13 +344,26 @@ void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
     }
     // Find existing child node or create a new one, then wire the block into it.
     auto childNode = mLookupNode->findOrInsertChild(blockKey, mLookupNode);
-    // Only attach if there is no block already stored for this window size (matches old
-    // behaviour: addNextBlock was a no-op when the key already existed in mNextBlocks).
     auto existing = childNode->getValue(mWindowSize);
-    if (!existing.has_value())
+    if (existing.has_value())
     {
-        block->attachToLookupNode(childNode, mWindowSize);
+        auto& existingBlock = existing.value();
+        if (existingBlock.get() == block.get())
+        {
+            // Same block already in the right slot — nothing to do.
+            return;
+        }
+        // The slot is occupied by a different block. Detach it so the new block
+        // can take its place. This keeps getPrevBlock() consistent for callers
+        // that rely on the tree link (e.g., storeBlocks during disagg transfers).
+        // detachFromLookupNode may cascade-prune the now-empty child node from
+        // the tree, so we must re-lookup/create the child afterwards.
+        TLLM_LOG_DEBUG("addNextBlock: evicting existing block %d from slot to insert block %d",
+            existingBlock->getBlockId(), block->getBlockId());
+        existingBlock->detachFromLookupNode();
+        childNode = mLookupNode->findOrInsertChild(blockKey, mLookupNode);
     }
+    block->attachToLookupNode(childNode, mWindowSize);
 }
 
 std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
@@ -1662,29 +1675,41 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
                 needMatch = false; // no matching needed for following blocks
 
-                if (block->getPrevBlock() != nullptr)
+                // Skip if this block is already the current searchRoot (duplicate block ID in
+                // the sequence's block list). Trying to insert a block as its own child would
+                // corrupt the lookup tree by moving it from parent to child position.
+                if (block.get() == searchRoot.get())
                 {
-                    block->getPrevBlock()->removeNextBlock(block->getBlockKey());
+                    TLLM_LOG_DEBUG("%s::storeBlocks - block %d is already searchRoot, skipping duplicate",
+                        mLogPrefix.c_str(), bid);
                 }
-                block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
-                block->setPrevBlockInSeq(searchRoot);
-                searchRoot->addNextBlock(blockKey, block);
-
-                // Sanity check. The list of stored blocks should be connected.
-                TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
-
-                storedBlocks.push_back(block);
-                TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
-                    || block->getPrevBlockInSeq()->getHash() == searchRoot->getHash());
-                auto oldHash = block->getHash();
-                auto newHash = BlockKeyHasher()(blockKey, searchRoot->getHash());
-                if (oldHash != newHash)
+                else
                 {
-                    TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
-                    block->setHash(newHash);
+                    if (block->getPrevBlock() != nullptr)
+                    {
+                        block->getPrevBlock()->removeNextBlock(block->getBlockKey());
+                    }
+                    block->setBlockKey(
+                        blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+                    block->setPrevBlockInSeq(searchRoot);
+                    searchRoot->addNextBlock(blockKey, block);
+
+                    // Sanity check. The list of stored blocks should be connected.
+                    TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
+
+                    storedBlocks.push_back(block);
+                    TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
+                        || block->getPrevBlockInSeq()->getHash() == searchRoot->getHash());
+                    auto oldHash = block->getHash();
+                    auto newHash = BlockKeyHasher()(blockKey, searchRoot->getHash());
+                    if (oldHash != newHash)
+                    {
+                        TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
+                        block->setHash(newHash);
+                    }
+                    searchRoot = block;
+                    numBlocksStoredForReuse++;
                 }
-                searchRoot = block;
-                numBlocksStoredForReuse++;
             }
             if (pinBlocks)
             {
