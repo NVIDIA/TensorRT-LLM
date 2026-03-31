@@ -658,6 +658,8 @@ class Glm4MoeLitePreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, Glm4MoeLiteMoEGate):
+            module.weight.data.normal_(mean=0.0, std=std)
 
 
 class Glm4MoeLiteModel(Glm4MoeLitePreTrainedModel):
