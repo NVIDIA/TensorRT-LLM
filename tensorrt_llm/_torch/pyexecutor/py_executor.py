@@ -2944,6 +2944,57 @@ class PyExecutor:
         self.kv_cache_transceiver.prepare_context_requests(
             gen_first_ctx_requests)
 
+    def _count_schedulable_active_requests(self) -> int:
+        """Count active requests that are ready for scheduling.
+
+        In non-disaggregated mode, all active requests are schedulable.
+        In disaggregated mode, requests still waiting for KV cache
+        transfer (in INIT or transmission-in-progress state) are
+        excluded because they cannot participate in the forward pass
+        until transfer completes.
+
+        Returns:
+            The number of active requests eligible for scheduling.
+        """
+        if self.kv_cache_transceiver is None:
+            return len(self.active_requests)
+
+        def _is_awaiting_kv_transfer(req) -> bool:
+            return (req.is_disagg_generation_init_state
+                    or req.is_disagg_generation_transmission_in_progress)
+
+        return sum(1 for req in self.active_requests
+                   if not _is_awaiting_kv_transfer(req))
+
+    def _should_skip_dummy_for_benchmark_disagg(
+            self, num_schedulable_requests: int) -> bool:
+        """Decide whether to skip ADP dummy insertion during benchmark disagg fill.
+
+        During the fill phase no requests are schedulable yet, but adding
+        dummies would occupy KV cache slots needed by real requests.
+        However, with ADP, ranks that have zero requests (not even INIT)
+        still need a dummy for collective operations.  Skipping is only
+        safe once every rank has at least one request routed to it
+        (``num_fetch_requests >= tp_size``).
+
+        Args:
+            num_schedulable_requests: Number of active requests that have
+                completed KV transfer and are ready for the forward pass.
+
+        Returns:
+            True if dummy insertion should be skipped for this iteration.
+        """
+        if not self.is_benchmark_disagg or self.is_warmup:
+            return False
+        if num_schedulable_requests > 0:
+            return False
+        if self.enable_attention_dp and self.num_fetch_requests < self.dist.tp_size:
+            return False
+        logger.info(f"Skipped adding dummy requests: "
+                    f"num_fetch_requests={self.num_fetch_requests}, "
+                    f"num_schedulable_requests={num_schedulable_requests}")
+        return True
+
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -2953,27 +3004,14 @@ class PyExecutor:
             return
 
         assert self.expected_num_active_requests >= len(self.active_requests)
-        if self.kv_cache_transceiver is None:
-            num_active_request = len(self.active_requests)
-        else:
-            num_active_request = len([
-                req for req in self.active_requests
-                if not (req.is_disagg_generation_init_state
-                        or req.is_disagg_generation_transmission_in_progress)
-            ])
+        num_active_request = self._count_schedulable_active_requests()
 
-        # In benchmark disagg mode, skip dummy addition while requests are
-        # still in INIT/transfer state (waiting for KV cache transfer).
-        # We also skip when active_requests is empty (early fill phase) to
-        # avoid occupying a KV cache slot that would block real requests.
-        if (self.is_benchmark_disagg and not self.is_warmup
-                and num_active_request == 0):
-            logger.info(
-                f"Skipped adding dummy requests: num_fetch_requests={self.num_fetch_requests}, {num_active_request=}"
-            )
+        if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
             return
 
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
+        # Other ranks have work but this rank is idle — insert a dummy so
+        # it can participate in collective operations during the forward pass.
+        if num_active_request == 0 and self.expected_num_active_requests > 0:
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 is_gen=True,
