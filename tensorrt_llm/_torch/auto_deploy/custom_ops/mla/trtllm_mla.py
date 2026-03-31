@@ -881,12 +881,14 @@ def _handle_prefill_thop(
         host_total_kv_lens=ctx_total_kv_lens.int(),
         host_context_lengths=host_context_lengths[:pf],
         host_request_types=host_request_types[:pf],
-        kv_cache_block_offsets=ctx_block_offsets,
+        kv_cache_block_offsets=ctx_block_offsets[:, :pf, :, :] if pf > 0 else ctx_block_offsets,
         host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping=planner.host_pool_mapping[:60],
-        block_ids_per_seq=planner.block_ids_per_seq,
+        block_ids_per_seq=planner.block_ids_per_seq[:pf] if pf > 0 else planner.block_ids_per_seq,
         flash_mla_tile_scheduler_metadata=planner.flash_mla_tile_scheduler_metadata,
-        flash_mla_num_splits=planner.flash_mla_num_splits,
+        flash_mla_num_splits=planner.flash_mla_num_splits[: pf + 1]
+        if pf > 0 and planner.flash_mla_num_splits is not None
+        else planner.flash_mla_num_splits,
         latent_cache=latent_cache,
         workspace=torch.empty(0, dtype=torch.int8, device=device),
         use_paged_context_fmha=False,
