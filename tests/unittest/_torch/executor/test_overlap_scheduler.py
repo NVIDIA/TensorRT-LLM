@@ -188,14 +188,14 @@ def test_overlap_scheduler_block_reuse_cache_hit(model_path, test_case,
                                      sampling_params=sampling_config,
                                      use_tqdm=True)
         for output in outputs_first:
-            assert output.outputs[0].cached_tokens == 0, (
+            assert output.cached_tokens == 0, (
                 "First pass should have no cached tokens (cold cache)")
 
         outputs_second = llm.generate(prompts,
                                       sampling_params=sampling_config,
                                       use_tqdm=True)
         for output in outputs_second:
-            assert output.outputs[0].cached_tokens > 0, (
+            assert output.cached_tokens > 0, (
                 "Second pass should reuse cached blocks")
 
 
