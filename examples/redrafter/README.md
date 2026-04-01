@@ -1,5 +1,11 @@
 # Recurrent Drafter (ReDrafter) Speculative Decoding
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document describes how to build and run a model using the ReDrafter speculative decoding technique ([`Github`](https://github.com/apple/ml-recurrent-drafter), [`Paper`](https://arxiv.org/abs/2403.09919)) in TensorRT LLM on single GPU, single node multiple GPU.
 
 ## Overview
