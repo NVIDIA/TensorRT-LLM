@@ -352,17 +352,18 @@ def test_lora_cuda_graph_params_filling_kernel_special_cases():
     compare_cuda_graph_lora_params_filler(test_params6)
 
 
-def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
+def llama_7b_lora_from_dir_test_harness(cuda_graph_config,
+                                        use_speculative) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
         max_lora_rank=8,
         max_loras=2,
         max_cpu_loras=2)
-    if "cuda_graph_config" not in llm_kwargs:
-        llm_kwargs["cuda_graph_config"] = None
     llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
-              **llm_kwargs)
+              speculative_config=NGramDecodingConfig(
+                  max_draft_len=5) if use_speculative else None,
+              cuda_graph_config=cuda_graph_config)
     try:
         prompts = [
             "美国的首都在哪里? \n答案:",
@@ -386,19 +387,25 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
 @skip_gpu_memory_less_than_40gb
 @pytest.mark.part0
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_lora(cuda_graph_config):
-    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config)
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_llama_7b_lora(cuda_graph_config, use_speculative):
+    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config,
+                                        use_speculative=use_speculative)
 
 
 @skip_gpu_memory_less_than_40gb
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_lora_default_modules(cuda_graph_config) -> None:
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_llama_7b_lora_default_modules(cuda_graph_config,
+                                       use_speculative) -> None:
     lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
     llm = LLM(model=hf_model_dir,
               lora_config=lora_config,
+              speculative_config=NGramDecodingConfig(
+                  max_draft_len=5) if use_speculative else None,
               cuda_graph_config=cuda_graph_config)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
