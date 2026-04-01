@@ -8,7 +8,4 @@ print_iter_log: true
 kv_cache_config:
   free_gpu_memory_fraction: 0.75
   dtype: fp8
-cache_transceiver_config:
-  backend: UCX
-  max_tokens_in_buffer: 8448
 trust_remote_code: true

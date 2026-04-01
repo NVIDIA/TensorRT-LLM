@@ -1,11 +1,14 @@
 from typing import List
 
+import numpy as np
+
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
     RegionMapperBase,
     SpecRegion,
     SpecRegionPair,
 )
+from tensorrt_llm._utils import nvtx_range
 
 
 class MambaHeadMatchMapper(RegionMapperBase):
@@ -34,6 +37,7 @@ class MambaHeadMatchMapper(RegionMapperBase):
         self._dst_layer_off = dst_layer_off
         self._block_bytes = block_bytes_per_layer
 
+    @nvtx_range("MambaHeadMatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -42,12 +46,12 @@ class MambaHeadMatchMapper(RegionMapperBase):
         src_ptrs = src_group.ptrs[self._src_layer_off : self._src_layer_off + self._transfer_layers]
         dst_ptrs = dst_group.ptrs[self._dst_layer_off : self._dst_layer_off + self._transfer_layers]
 
-        assert len(src_ptrs) == len(dst_ptrs), (
-            f"Number of regions of src({len(src_ptrs)}) and dst({len(dst_ptrs)}) must match"
+        assert src_ptrs.size == dst_ptrs.size, (
+            f"Number of regions of src({src_ptrs.size}) and dst({dst_ptrs.size}) must match"
         )
 
-        new_src = MemRegionGroup(ptrs=list(src_ptrs), bytes_per_region=self._block_bytes)
-        new_dst = MemRegionGroup(ptrs=list(dst_ptrs), bytes_per_region=self._block_bytes)
+        new_src = MemRegionGroup(ptrs=src_ptrs, bytes_per_region=self._block_bytes)
+        new_dst = MemRegionGroup(ptrs=dst_ptrs, bytes_per_region=self._block_bytes)
         return SpecRegionPair(
             src=SpecRegion(memory=new_src, spec=src_regions.spec),
             dst=SpecRegion(memory=new_dst, spec=dst_regions.spec),
@@ -103,6 +107,7 @@ class MambaHeadMismatchMapper(RegionMapperBase):
             self._bytes_cont_heads,
         )
 
+    @nvtx_range("MambaHeadMismatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -114,14 +119,14 @@ class MambaHeadMismatchMapper(RegionMapperBase):
         dst_layer_ptrs = dst_group.ptrs[
             self._dst_layer_off : self._dst_layer_off + self._transfer_layers
         ]
-        if len(src_layer_ptrs) != len(dst_layer_ptrs):
+        if src_layer_ptrs.size != dst_layer_ptrs.size:
             raise ValueError(
-                f"Number of layer ptrs mismatch: src={len(src_layer_ptrs)}, dst={len(dst_layer_ptrs)}"
+                f"Number of layer ptrs mismatch: src={src_layer_ptrs.size}, dst={dst_layer_ptrs.size}"
             )
 
-        # Apply head offset to each layer's address
-        new_src_ptrs = [ptr + self._src_head_off for ptr in src_layer_ptrs]
-        new_dst_ptrs = [ptr + self._dst_head_off for ptr in dst_layer_ptrs]
+        # Apply head offset to each layer's address (vectorized)
+        new_src_ptrs = src_layer_ptrs + self._src_head_off
+        new_dst_ptrs = dst_layer_ptrs + self._dst_head_off
 
         new_src = MemRegionGroup(ptrs=new_src_ptrs, bytes_per_region=self._bytes_cont_heads)
         new_dst = MemRegionGroup(ptrs=new_dst_ptrs, bytes_per_region=self._bytes_cont_heads)
@@ -180,7 +185,11 @@ class ConvStateMismatchMapper(RegionMapperBase):
             self_tp_rank,
             peer_tp_rank,
         )
+        # Pre-compute offset arrays for vectorized map()
+        self._section_src_offs = np.array([p[0] for p in self._section_plans], dtype=np.int64)
+        self._section_dst_offs = np.array([p[1] for p in self._section_plans], dtype=np.int64)
 
+    @nvtx_range("ConvStateMismatchMapper.map")
     def map(
         self,
         src_regions: SpecRegion,
@@ -198,26 +207,33 @@ class ConvStateMismatchMapper(RegionMapperBase):
             self._dst_layer_off : self._dst_layer_off + self._transfer_layers
         ]
 
-        assert len(src_layer_ptrs) == len(dst_layer_ptrs), (
-            f"Number of layer ptrs mismatch: src={len(src_layer_ptrs)}, dst={len(dst_layer_ptrs)}"
+        assert src_layer_ptrs.size == dst_layer_ptrs.size, (
+            f"Number of layer ptrs mismatch: src={src_layer_ptrs.size}, dst={dst_layer_ptrs.size}"
         )
 
+        # Vectorized: broadcast all section offsets at once
+        # _section_offsets shape: (num_sections, 3) with (src_off, dst_off, transfer_bytes)
+        src_offs = self._section_src_offs  # (num_sections,)
+        dst_offs = self._section_dst_offs  # (num_sections,)
+
+        # (num_sections, num_layers) = (num_sections, 1) + (1, num_layers)
+        all_src_ptrs = src_offs[:, None] + src_layer_ptrs[None, :]
+        all_dst_ptrs = dst_offs[:, None] + dst_layer_ptrs[None, :]
+
         results: List[SpecRegionPair] = []
-        for src_off, dst_off, transfer_bytes in self._section_plans:
-            sec_src_ptrs = [ptr + src_off for ptr in src_layer_ptrs]
-            sec_dst_ptrs = [ptr + dst_off for ptr in dst_layer_ptrs]
+        for i, (_, _, transfer_bytes) in enumerate(self._section_plans):
             results.append(
                 SpecRegionPair(
                     src=SpecRegion(
                         memory=MemRegionGroup(
-                            ptrs=sec_src_ptrs,
+                            ptrs=all_src_ptrs[i],
                             bytes_per_region=transfer_bytes,
                         ),
                         spec=src_regions.spec,
                     ),
                     dst=SpecRegion(
                         memory=MemRegionGroup(
-                            ptrs=sec_dst_ptrs,
+                            ptrs=all_dst_ptrs[i],
                             bytes_per_region=transfer_bytes,
                         ),
                         spec=dst_regions.spec,
