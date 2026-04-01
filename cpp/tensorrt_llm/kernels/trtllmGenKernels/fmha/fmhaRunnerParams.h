@@ -134,6 +134,37 @@ QKV_LAYOUT_FUNCTION(ContiguousKv)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Sparse attention types.
+enum class SparseType : int32_t
+{
+    None = 0,
+    SparseMla = 1,
+    Reserved = 2,     // Reserved for future sparse attention types. Do not use this value now.
+    SparseMqaGqa = 3, // TODO: change the order of the enum values.
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the sparse attention type.
+
+inline bool isSparseAttention(SparseType sparseType)
+{
+    return (sparseType != SparseType::None);
+}
+
+#define SPARSE_TYPE_FUNCTION(SparseTypeName)                                                                           \
+    inline bool is##SparseTypeName(SparseType sparseType)                                                              \
+    {                                                                                                                  \
+        return (sparseType == SparseType::SparseTypeName);                                                             \
+    }
+
+SPARSE_TYPE_FUNCTION(SparseMla)
+SPARSE_TYPE_FUNCTION(SparseMqaGqa)
+
+#undef SPARSE_TYPE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class TileScheduler
 {
     // Static scheduler (Non-persistent).
@@ -285,10 +316,10 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
-    // Whether to use sparse MLA.
-    bool mSparseMla;
-    // The top k value for sparse MLA.
-    int mSparseMlaTopK;
+    // Sparse attention type.
+    SparseType mSparseAttention;
+    // The top k value for sparse attention.
+    int mSparseTopK;
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.

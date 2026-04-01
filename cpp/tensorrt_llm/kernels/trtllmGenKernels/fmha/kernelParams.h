@@ -190,6 +190,8 @@ struct KernelParams
     int64_t mNumHiddenEltsO;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
+    // The sparse attention topK value.
+    int32_t mNumSparseTopk;
     // The number of tokensQ per CTA (used for groupsHeadsTokensQ generation kernel).
     int32_t mNumTokensPerCtaQ;
     // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
@@ -209,8 +211,6 @@ struct KernelParams
     int32_t mStartTokenIdx;
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-    // The top k value for sparse MLA.
-    int32_t mSparseMlaTopK;
     // The flag to use block sparse attention.
     bool mUseBlockSparseAttention;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
@@ -769,12 +769,14 @@ struct KernelParams
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
 
-        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
-        // headDimQk).
-        if (options.mSparseMla)
+        // If sparse attention is enabled, the shape and stride for KV need to be updated for 2D layout
+        // (numTokensKvInPagedKv, headDimQk).
+        if (isSparseAttention(options.mSparseAttention))
         {
             shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
             strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+            shapeV = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimV), static_cast<uint64_t>(INT_MAX)};
+            strideV = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimV)};
             tileShapeKv[1] = 1;
         }
 
@@ -900,10 +902,10 @@ struct KernelParams
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
-        // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
-        TLLM_CHECK_WITH_INFO(
-            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
-        params.mSparseMlaTopK = options.mSparseMlaTopK;
+        // The SparseTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
+        TLLM_CHECK_WITH_INFO(!isSparseAttention(options.mSparseAttention) || (options.mSparseTopK % 4) == 0,
+            "SparseTopK must be a multiple of 4");
+        params.mNumSparseTopk = options.mSparseTopK;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
         // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
         // Always false for TRTLLM paged kv cache layout.
