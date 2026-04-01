@@ -30,29 +30,31 @@ Architecture:
 from typing import Optional
 
 import torch
-import torch.nn as nn
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
-from .interface import AttentionTensorLayout
+from .interface import AttentionBackend, AttentionTensorLayout
 
 
-class UlyssesAttention(nn.Module):
+class UlyssesAttention(AttentionBackend):
     """
     Ulysses Sequence Parallelism wrapper.
 
     Wraps any attention backend with sequence parallelism via all-to-all.
-    Not a standalone backend — compose around a real backend (VANILLA/TRTLLM).
+    Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
+    Fully transparent to backend-specific kwargs: everything in ``**kwargs``
+    is forwarded to the inner backend unchanged (except ``seq_len`` which is
+    overridden with the post-all-to-all value).
 
-    Two modes:
-    - fuse_qkv_a2a=False (default): 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
-    - fuse_qkv_a2a=True: stacks Q/K/V into [B, S/P, 3, H, D], 1 fused 5D all-to-all
+    Two modes (auto-selected via ``inner_backend.support_fused_qkv()``):
+    - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
+    - Fused: stacks Q/K/V into [B, S/P, 3, H, D], 1 fused 5D all-to-all
       + 1 for output (2 collectives total)
     """
 
     def __init__(
         self,
-        inner_backend: nn.Module,
+        inner_backend: AttentionBackend,
         process_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__()
@@ -77,44 +79,33 @@ class UlyssesAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: int,
-        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass with Ulysses sequence parallelism.
 
-        q/k/v: [B, S/P, H, D] each.
-        When fuse_qkv_a2a=True: stacks Q/K/V → 1 fused 5D all-to-all (2 collectives)
-        When fuse_qkv_a2a=False: 3 separate 4D all-to-all (4 collectives)
+        q/k/v: [B, S/P, H, D] each.  All other arguments are forwarded
+        transparently to the inner backend via ``**kwargs``.
         """
         if self.inner_backend.support_fused_qkv():
-            # default to fused QKV A2A if backend supports it.
-            # This is more efficient than the unfused path.
-            return self._forward_fused(q, k, v, batch_size, attention_mask)
-        return self._forward_unfused(q, k, v, batch_size, attention_mask)
+            return self._forward_fused(q, k, v, **kwargs)
+        return self._forward_unfused(q, k, v, **kwargs)
 
     def _forward_fused(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: int,
-        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
-        # Stack Q/K/V → [B, S/P, 3, H, D], then fused 5D all-to-all
-        # 5D A2A is faster than 4D A2A with dim=0 or dim=-1 concat
+        batch_size = q.shape[0]
         qkv = torch.stack([q, k, v], dim=2)
         if self.world_size > 1:
-            # [B, S, 3, H/P, D]
             qkv = all_to_all_5d(qkv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
 
         B, seq_len, _, Hp, D = qkv.shape
 
-        # pass as fused QKV
-        output = self.inner_backend.forward(
-            q=qkv, k=None, v=None, batch_size=batch_size, seq_len=seq_len
-        )
+        output = self.inner_backend.forward(q=qkv, k=None, v=None, **kwargs)
 
         return self._output_a2a(output, batch_size, seq_len)
 
@@ -123,27 +114,22 @@ class UlyssesAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: int,
-        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
-        # [B, S/P, H, D] → 3 separate all-to-all → [B, S, H/P, D]
+        batch_size = q.shape[0]
         if self.world_size > 1:
             q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
             k = all_to_all_4d(k, scatter_dim=2, gather_dim=1, process_group=self.process_group)
             v = all_to_all_4d(v, scatter_dim=2, gather_dim=1, process_group=self.process_group)
 
         seq_len_full = q.shape[1]
-        inner_layout = self.inner_backend.preferred_layout
 
-        if inner_layout == AttentionTensorLayout.HND:
+        if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
 
-        inner_kwargs = dict(q=q, k=k, v=v, batch_size=batch_size, seq_len=seq_len_full)
-        if attention_mask is not None:
-            inner_kwargs["attention_mask"] = attention_mask
-        output = self.inner_backend.forward(**inner_kwargs)
+        output = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
 
         return self._output_a2a(output, batch_size, seq_len_full)
 

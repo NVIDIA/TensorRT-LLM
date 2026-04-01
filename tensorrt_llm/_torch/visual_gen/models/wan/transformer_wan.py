@@ -394,14 +394,7 @@ class WanBlock(nn.Module):
                 batch_size, encoder_hidden_states_img.shape[1], self.num_heads, self.head_dim
             )
 
-            attn_img_output = self.attn2._attn_impl(
-                query,
-                key_img,
-                value_img,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                kv_seq_len=encoder_hidden_states_img.shape[1],
-            )
+            attn_img_output = self.attn2._attn_impl(query, key_img, value_img)
 
             attn2_output = attn2_output + attn_img_output
 
