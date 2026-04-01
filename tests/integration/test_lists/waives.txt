@@ -371,8 +371,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughp
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_pp4_mtp] SKIP (https://nvbugs/6018046)
 unittest/disaggregated/test_py_cache_transceiver_mp.py::test_v2_transceiver_mp[ctx_first-v2_mp_tp2_pp1_to_tp2_pp1] SKIP (https://nvbugs/6018051)
 test_fmha.py::test_fmha SKIP (https://nvbugs/6018058)
-accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype SKIP (https://nvbugs/6027560)
-accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_nixl_backend SKIP (https://nvbugs/6027560)
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp1cp4] SKIP (https://nvbugs/6007201)
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2] SKIP (https://nvbugs/6007201)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/6029882)
