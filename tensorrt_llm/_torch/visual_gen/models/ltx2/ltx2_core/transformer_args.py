@@ -66,6 +66,7 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
+        self._freq_grid_cache: dict = {}
 
     def _prepare_timestep(
         self,
@@ -121,6 +122,7 @@ class TransformerArgsPreprocessor:
             num_attention_heads=num_attention_heads,
             rope_type=self.rope_type,
             freq_grid_generator=freq_grid_generator,
+            freq_grid_cache=self._freq_grid_cache,
         )
 
     def prepare(self, modality: Modality) -> TransformerArgs:

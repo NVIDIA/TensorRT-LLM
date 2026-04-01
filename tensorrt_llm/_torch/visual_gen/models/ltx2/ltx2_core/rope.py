@@ -146,7 +146,6 @@ def _generate_freqs(
         indices_grid = indices_grid[..., 0]
 
     fractional_positions = _get_fractional_positions(indices_grid, max_pos)
-    indices = indices.to(device=fractional_positions.device)
     freqs = (indices * (fractional_positions.unsqueeze(-1) * 2 - 1)).transpose(-1, -2).flatten(2)
     return freqs
 
@@ -190,6 +189,7 @@ def precompute_freqs_cis(
     num_attention_heads: int = 32,
     rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
     freq_grid_generator: Callable[[float, int, int], torch.Tensor] = _generate_freq_grid_pytorch,
+    freq_grid_cache: dict | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Precompute cos/sin RoPE embeddings for the given position indices.
 
@@ -203,6 +203,10 @@ def precompute_freqs_cis(
         num_attention_heads: Number of attention heads (for split mode reshaping).
         rope_type: INTERLEAVED or SPLIT.
         freq_grid_generator: Function to generate the frequency grid.
+        freq_grid_cache: Optional dict for caching GPU copies of frequency grids.
+            When provided, CPU→GPU transfers happen only once (first call) and
+            subsequent calls reuse the cached GPU tensor.  This avoids H2D
+            transfers that would block CUDA graph capture.
 
     Returns:
         Tuple of (cos_freq, sin_freq) tensors.
@@ -211,6 +215,19 @@ def precompute_freqs_cis(
         max_pos = [20, 2048, 2048]
 
     indices = freq_grid_generator(theta, indices_grid.shape[1], dim)
+    # When a cache is provided, move indices to the target device once and
+    # reuse.  The freq_grid_generator returns a CPU tensor (via lru_cache);
+    # repeated H2D transfers would block CUDA graph capture.
+    device = indices_grid.device
+    if freq_grid_cache is not None and indices.device != device:
+        cache_key = (freq_grid_generator, theta, indices_grid.shape[1], dim, device)
+        cached = freq_grid_cache.get(cache_key)
+        if cached is None:
+            cached = indices.to(device=device)
+            freq_grid_cache[cache_key] = cached
+        indices = cached
+    else:
+        indices = indices.to(device=device)
     freqs = _generate_freqs(indices, indices_grid, max_pos, use_middle_indices_grid)
 
     if rope_type == LTXRopeType.SPLIT:
