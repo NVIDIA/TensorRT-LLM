@@ -2261,6 +2261,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             // `addSequence()` ignores the last prompt token because its KV cannot be recovered.
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
             // all unique tokens can over-credit one extra shared block.
+            TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
             auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
             // Only subtract from shared blocks (reusable blocks are always shared)
             auto const reusableSharedBlocks
