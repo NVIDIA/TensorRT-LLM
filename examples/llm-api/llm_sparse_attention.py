@@ -132,10 +132,10 @@ def parse_arguments():
                         nargs='+',
                         type=int,
                         default=None)
-    parser.add_argument('--enable_chunked_prefill',
+    parser.add_argument('--disable_chunked_prefill',
                         default=False,
                         action='store_true',
-                        help='Enable chunked prefill')
+                        help='Disable chunked prefill (enabled by default)')
     args = parser.parse_args()
     return args
 
@@ -175,7 +175,7 @@ def run_llm(args, sparse_attention_config):
         print_iter_log=args.print_iter_log,
         enable_iter_perf_stats=args.print_iter_log,
         moe_config=MoeConfig(backend=args.moe_backend),
-        enable_chunked_prefill=args.enable_chunked_prefill,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
     )
 
     prompts = []

@@ -1744,6 +1744,24 @@ class PyExecutor:
 
         self._pad_attention_dp_dummy_request()
 
+        # For one-model speculative decoding (e.g., MTP), normalize C++
+        # draft_tokens before scheduling. The overlap extend path in
+        # _prepare_tp_inputs always materializes runtime_draft_len tokens,
+        # so the C++ scheduler must budget the same per generation request.
+        # This mirrors the two-model drafter normalization below (lines
+        # 1699-1707). Without this, the scheduler can under-budget newly
+        # promoted or fitDraftTokens-trimmed requests, causing the
+        # total_num_tokens > max_num_tokens assertion in model_engine.py.
+        if self.drafter is None and self.model_engine.enable_spec_decode:
+            max_draft = self.model_engine.max_total_draft_tokens
+            if max_draft > 0:
+                for request in self.active_requests:
+                    if request.state not in (
+                            LlmRequestState.GENERATION_IN_PROGRESS,
+                            LlmRequestState.DISAGG_GENERATION_INIT):
+                        continue
+                    request.draft_tokens = [0] * max_draft
+
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
             if self.drafter.draft_len_schedule is not None:

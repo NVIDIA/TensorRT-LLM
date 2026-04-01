@@ -25,7 +25,7 @@ RocketKV is integrated into TensorRT LLM as a specialized attention backend, acc
 
 **Note:** 
 1. RocketKV currently requires `enable_block_reuse=False` in the KV cache configuration, as the sparse eviction logic is incompatible with standard block reuse mechanisms. 
-2. RocketKV doesn't support `enable_chunked_prefill=True` for now.
+2. RocketKV doesn't support chunked prefill. Since chunked prefill is enabled by default, you must explicitly disable it via `enable_chunked_prefill=False` in the LLM API or `--disable_chunked_prefill` when using `trtllm-serve`.
 3. RocketKV doesn't support *disagg-serving* as well, since it needs the KV cache transmission from prefill engine to the decode engine. But currently RocketKV uses a python kt cache manager and it cannot support this transmission.
 
 ## Usage

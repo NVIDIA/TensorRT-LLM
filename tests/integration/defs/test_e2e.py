@@ -1857,7 +1857,6 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         }
         cmds = [
             str(example_root / "quickstart_advanced.py"),
-            "--enable_chunked_prefill",
             f"--model_dir={llm_models_root()}/{model_path}",
         ]
         if "Qwen3" in model_name:
@@ -2343,7 +2342,6 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
     }
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
-        "--enable_chunked_prefill",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         f"--tp_size={gpu_count}",
@@ -2370,7 +2368,6 @@ def test_ptp_quickstart_advanced_pp_enabled(llm_root, llm_venv, model_name,
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     cmd = [
         str(example_root / "quickstart_advanced.py"),
-        "--enable_chunked_prefill",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         f"--tp_size={tp_size}",
@@ -2404,7 +2401,6 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     cmd = [
         str(example_root / "quickstart_advanced.py"),
-        "--enable_chunked_prefill",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         "--tp_size=8",

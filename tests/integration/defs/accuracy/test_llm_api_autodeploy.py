@@ -189,6 +189,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             config["enable_chunked_prefill"] = True
             # NOTE: must be > max(tokens_per_block, max_batch_size)
             config["max_num_tokens"] = 512
+        else:
+            config["enable_chunked_prefill"] = False
         return config
 
     def get_default_sampling_params(self):
@@ -348,6 +350,8 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             config["enable_chunked_prefill"] = True
             config[
                 "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+        else:
+            config["enable_chunked_prefill"] = False
         return config
 
     def get_default_sampling_params(self):
@@ -393,6 +397,8 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
             config["enable_chunked_prefill"] = True
             # NOTE: must be > max(tokens_per_block, max_batch_size)
             config["max_num_tokens"] = 512
+        else:
+            config["enable_chunked_prefill"] = False
         return config
 
     def get_default_sampling_params(self):
@@ -624,6 +630,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             config["transforms"]["compile_model"] = {
                 "piecewise_enabled": True,
             }
+        else:
+            config["enable_chunked_prefill"] = False
         return config
 
     def get_default_sampling_params(self):

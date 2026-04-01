@@ -33,7 +33,6 @@ runtime: trtllm
 compile_backend: torch-cudagraph
 max_batch_size: 384
 max_seq_len: 65536
-enable_chunked_prefill: true
 attn_backend: flashinfer
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
@@ -168,7 +167,6 @@ model:
   nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3
 args:
   compile_backend: torch-cudagraph
-  enable_chunked_prefill: true
   kv_cache_config:
     # disable kv_cache reuse since not supported for hybrid/ssm models
     enable_block_reuse: false
@@ -183,7 +181,6 @@ The CLI can also be used to override certain config values:
 python examples/auto_deploy/build_and_run_ad.py \
   --model nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3 \
   --args.compile_backend torch-cudagraph \
-  --args.enable_chunked_prefill true \
   --args.kv_cache_config.enable_block_reuse false
 ```
 

@@ -134,9 +134,10 @@ def add_llm_args(parser):
     parser.add_argument('--disable_overlap_scheduler',
                         default=False,
                         action='store_true')
-    parser.add_argument('--enable_chunked_prefill',
+    parser.add_argument('--disable_chunked_prefill',
                         default=False,
-                        action='store_true')
+                        action='store_true',
+                        help='Disable chunked prefill (enabled by default)')
     parser.add_argument('--use_cuda_graph', default=False, action='store_true')
     parser.add_argument('--cuda_graph_padding_enabled',
                         default=False,
@@ -320,7 +321,7 @@ def setup_llm(args, **kwargs):
         moe_expert_parallel_size=args.moe_ep_size,
         moe_tensor_parallel_size=args.moe_tp_size,
         moe_cluster_parallel_size=args.moe_cluster_size,
-        enable_chunked_prefill=args.enable_chunked_prefill,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
