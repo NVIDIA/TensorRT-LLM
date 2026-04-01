@@ -127,6 +127,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
+    conversation_id: Optional[str] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
