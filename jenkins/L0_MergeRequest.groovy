@@ -325,17 +325,14 @@ def mergeWaiveList(pipeline, globalVars)
     def isGetTOTWaiveList = false
     try {
         withCredentials([usernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_PASSWORD')]) {
-            try {
-                def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
-                def connection = new URL(apiUrl).openConnection()
-                connection.setRequestProperty("Authorization", "Basic " + "${GITHUB_USER}:${GITHUB_PASSWORD}".bytes.encodeBase64().toString())
-                connection.setRequestMethod("GET")
-                def response = connection.inputStream.text
-                def json = new JsonSlurper().parseText(response)
-                targetBranchTOTCommit = json[0].sha
-            } catch (Exception e) {
-                echo "Could not get target branch commit from GitHub API: ${e.message}"
-            }
+            def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
+            // def connection = new URL(apiUrl).openConnection()
+            // connection.setRequestProperty("Authorization", "Basic " + "${GITHUB_USER}:${GITHUB_PASSWORD}".bytes.encodeBase64().toString())
+            // connection.setRequestMethod("GET")
+            // def response = connection.inputStream.text
+            // def json = new JsonSlurper().parseText(response)
+            // targetBranchTOTCommit = json[0].sha
+            throw new Exception("test")
         }
         echo "Target branch TOT commit: ${targetBranchTOTCommit}"
         sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
