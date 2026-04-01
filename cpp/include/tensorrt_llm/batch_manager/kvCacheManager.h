@@ -177,17 +177,6 @@ struct LinearAttentionMetadata
         return hasRecurrentStatesCache(encodedWindowSize);
     }
 
-    [[nodiscard]] SizeType32 calcMaxLookupBlocks(
-        WindowSizeType encodedWindowSize, SizeType32 tokensPerBlock, size_t memoryBudget, SizeType32 maxBatchSize) const
-    {
-        auto memoryBlocks = calcMaxMemoryBlocks(encodedWindowSize, tokensPerBlock, memoryBudget, maxBatchSize);
-        if (hasRecurrentStatesCache(encodedWindowSize))
-        {
-            return (memoryBlocks - maxBatchSize) * (statesSnapshotInterval / tokensPerBlock);
-        }
-        return memoryBlocks;
-    }
-
     [[nodiscard]] SizeType32 calcMaxMemoryBlocks(
         WindowSizeType encodedWindowSize, SizeType32 tokensPerBlock, size_t memoryBudget, SizeType32 numLayers) const
     {

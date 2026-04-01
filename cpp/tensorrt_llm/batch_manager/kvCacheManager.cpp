@@ -844,9 +844,9 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
             mAllPlaceholderBlocksById[static_cast<size_t>(-placeholderBlockId)] = block;
         }
 
-        auto policy = std::make_shared<MaybePlaceholderLRUEvictionPolicy>();
+        auto policy = std::make_shared<LRUEvictionPolicy>();
         policy->initialize(mAllBlocksById, {blocksInPrimaryPool, blocksInSecondaryPool}, secondaryOffloadMinPriority);
-        policy->initializePlaceholders(mAllPlaceholderBlocksById, numPlaceholderBlocks, secondaryOffloadMinPriority);
+        policy->initializePlaceholders(mAllPlaceholderBlocksById);
         mEvictionPolicy = policy;
     }
     else
