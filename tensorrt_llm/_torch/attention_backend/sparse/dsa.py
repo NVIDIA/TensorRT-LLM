@@ -80,10 +80,12 @@ def _compute_slot_mappings(
     block_indices_in_seq = global_positions // tokens_per_block
     pos_in_blocks = global_positions % tokens_per_block
 
-    # on_update_kv_lens() calls this during CUDA graph capture;
-    # .all()/.item() would trigger host-device sync and invalidate capture.
-    if not block_indices_in_seq.is_cuda:
-        max_blocks = block_offsets.shape[1]
+    max_blocks = block_offsets.shape[1]
+    if block_indices_in_seq.is_cuda:
+        # Clamp to prevent OOB from stale token-to-seq mappings during
+        # CUDA graph capture/replay with MTP + DSA.
+        block_indices_in_seq = block_indices_in_seq.clamp(0, max_blocks - 1)
+    else:
         assert (block_indices_in_seq < max_blocks).all(), \
             f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
 
