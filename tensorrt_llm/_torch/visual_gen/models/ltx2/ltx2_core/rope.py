@@ -118,6 +118,10 @@ def _generate_freq_grid_pytorch(
     return indices.to(dtype=torch.float32) * (math.pi / 2)
 
 
+
+# Cache for device-transferred frequency grids to avoid CPU->GPU during CUDA graph capture
+_freq_grid_device_cache: dict = {}
+
 def _get_fractional_positions(indices_grid: torch.Tensor, max_pos: list[int]) -> torch.Tensor:
     n_pos_dims = indices_grid.shape[1]
     assert n_pos_dims == len(max_pos), (
@@ -146,7 +150,12 @@ def _generate_freqs(
         indices_grid = indices_grid[..., 0]
 
     fractional_positions = _get_fractional_positions(indices_grid, max_pos)
-    indices = indices.to(device=fractional_positions.device)
+    target_device = fractional_positions.device
+    if not (indices.device == target_device):
+        _cache_key = (indices.data_ptr(), str(target_device))
+        if _cache_key not in _freq_grid_device_cache:
+            _freq_grid_device_cache[_cache_key] = indices.to(device=target_device)
+        indices = _freq_grid_device_cache[_cache_key]
     freqs = (indices * (fractional_positions.unsqueeze(-1) * 2 - 1)).transpose(-1, -2).flatten(2)
     return freqs
 
