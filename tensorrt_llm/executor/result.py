@@ -989,19 +989,21 @@ def compute_logprobs(
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
 
-        if tokens is not None and logits.size(0) > len(tokens):
-            # WAR for nvbug 5324291 where TRT backend might return more logits
-            # than output tokens.
-            logits = logits[:len(tokens)]
-
-        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32),
+                                 dim=-1)
 
         # only return sampled token
         if top_k == 0:
             results: TokenLogprobs = []
             if tokens is not None:
                 for t in range(logprobs.size(0)):
-                    token_id = tokens[t]
+                    if t < len(tokens):
+                        token_id = tokens[t]
+                    else:
+                        # No target token for this position (e.g. last
+                        # prompt position predicting the first generation
+                        # token). Return the most likely token.
+                        token_id = logprobs[t].argmax().item()
                     token_logprob = logprobs[t, token_id].item()
                     rank = (logprobs[t] > token_logprob).sum().item() + 1
                     token_dict = {
@@ -1021,8 +1023,8 @@ def compute_logprobs(
                         idx) in enumerate(zip(topk_vals[t], topk_indices[t]))
             }
 
-            # If we have the sampled token list and it's not in top-k, add it
-            if tokens is not None:
+            # If we have the target token and it's not in top-k, add it
+            if tokens is not None and t < len(tokens):
                 token_id = tokens[t]
                 if token_id not in token_dict:
                     token_logprob = logprobs[t, token_id].item()
@@ -1033,9 +1035,21 @@ def compute_logprobs(
             results.append(token_dict)
         return results
 
+    # For prompt logprobs, context_logits[t] predicts the token at position
+    # t+1 (the next token after the input at position t). Shift the token IDs
+    # by one so that the "target" token included in each position's logprobs
+    # is the actual next prompt token, not the current input token.
+    # The last position has no next prompt token, so only top-K is returned.
+    shifted_prompt_tokens = (
+        prompt_token_ids[1:] if prompt_token_ids else None)
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs, prompt_token_ids
+        context_logits, k_prompt_logprobs, shifted_prompt_tokens
     ) if k_prompt_logprobs is not None and context_logits is not None else None
+    # WAR for nvbug 5324291: TRT backend may return more generation logits
+    # than output tokens. Clip to match before computing logprobs.
+    if (generation_logits is not None and output_token_ids is not None
+            and generation_logits.squeeze(0).size(0) > len(output_token_ids)):
+        generation_logits = generation_logits[..., :len(output_token_ids), :]
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
     ) if k_logprobs is not None and generation_logits is not None else None
