@@ -254,6 +254,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         if not do_finalize:
             return final_hidden_states
@@ -808,6 +809,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.Attention],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         # Use fused kernel when possible to avoid elementwise ops
