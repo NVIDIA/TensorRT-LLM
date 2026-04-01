@@ -53,6 +53,7 @@ from .communication import (
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 
 
@@ -605,8 +606,8 @@ class ConfigurableMoE(MoE):
 
             assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
-            # CutlassFusedMoE expects float32, while TRTLLMGenFusedMoE uses bfloat16
-            if isinstance(self.backend, CutlassFusedMoE):
+            # CutlassFusedMoE and DenseGEMMFusedMoE expect float32, while TRTLLMGenFusedMoE uses bfloat16
+            if isinstance(self.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
                 assert token_final_scales.dtype == torch.float32
             assert token_selected_experts.dtype == torch.int32
 
@@ -1117,7 +1118,12 @@ class ConfigurableMoE(MoE):
         kwargs = {}
 
         # Common parameters for Cutlass and DeepGemm
-        if self.backend.__class__ in (CutlassFusedMoE, DeepGemmFusedMoE, CuteDslFusedMoE):
+        if self.backend.__class__ in (
+            CutlassFusedMoE,
+            DeepGemmFusedMoE,
+            CuteDslFusedMoE,
+            DenseGEMMFusedMoE,
+        ):
             pass
 
         # Cutlass-specific parameters
