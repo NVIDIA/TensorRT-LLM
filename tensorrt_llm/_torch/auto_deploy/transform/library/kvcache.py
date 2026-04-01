@@ -205,13 +205,10 @@ class _InsertCachedOperator(BaseTransform):
                         "cache aliasing."
                     )
                 if shared_kv_source_layer_idx == layer_idx:
-                    raise RuntimeError(
-                        f"Shared-KV attention node for layer {layer_idx} cannot alias its own cache."
-                    )
+                    raise RuntimeError(f"Layer {layer_idx} cannot share its own KV cache.")
                 if shared_kv_source_layer_idx not in cache_nodes_by_layer_idx:
                     raise RuntimeError(
-                        f"Shared-KV attention node requested source layer {shared_kv_source_layer_idx}, "
-                        "but no cache owner for that layer has been processed yet."
+                        f"Missing shared-KV source layer {shared_kv_source_layer_idx}."
                     )
                 cache_in_nodes = cache_nodes_by_layer_idx[shared_kv_source_layer_idx]
             else:

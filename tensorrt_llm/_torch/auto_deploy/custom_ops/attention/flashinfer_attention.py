@@ -510,10 +510,6 @@ def flashinfer_mha_with_cache_fake(
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    del batch_info_host, cu_seqlen_host, cu_num_pages, cu_num_pages_host
-    del cache_loc, last_page_len, last_page_len_host, seq_len_with_cache_host
-    del flashinfer_batch_indices, flashinfer_positions, kv_cache
-    del scale, sliding_window, k_scale, v_scale, read_cache_only
     if out is not None:
         return out.new_empty(0)
     return torch.empty_like(q.contiguous())
@@ -618,11 +614,3 @@ class FlashInferAttention(AttentionDescriptor):
             1.0,  # v_scale
             cls.get_shared_kv_source_layer_idx(source_attn_node) is not None,  # read_cache_only
         ]
-
-    @classmethod
-    def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
-        return extract_op_args(source_attn_node, "layer_idx")[0]
-
-    @classmethod
-    def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
-        return extract_op_args(source_attn_node, "shared_kv_source_layer_idx")[0]

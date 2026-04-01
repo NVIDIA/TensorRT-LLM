@@ -590,8 +590,6 @@ def torch_backend_mha_with_cache_fake(
     read_cache_only: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    del batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen, k_cache, v_cache
-    del scale, sinks, sliding_window_size, logit_cap, read_cache_only
     if out is not None:
         return out.new_empty(0)
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
@@ -688,11 +686,3 @@ class TorchBackendAttention(AttentionDescriptor):
             logit_cap,  # logit cap parameter
             cls.get_shared_kv_source_layer_idx(source_attn_node) is not None,  # read_cache_only
         ]
-
-    @classmethod
-    def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
-        return extract_op_args(source_attn_node, "layer_idx")[0]
-
-    @classmethod
-    def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
-        return extract_op_args(source_attn_node, "shared_kv_source_layer_idx")[0]
