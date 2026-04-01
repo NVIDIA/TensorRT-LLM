@@ -219,6 +219,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.is_spec_dec_dynamic_tree = False
 
     def prepare(self):
+        super().prepare()
         is_first_draft = self.eagle3_resource_manager.is_first_draft
         spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         # Update start indices
@@ -395,6 +396,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         return layer_id in self.layers_to_capture
 
     def prepare(self):
+        super().prepare()
         assert self.request_ids is not None
         # update batch indices
         num_seqs = len(self.request_ids)
@@ -466,6 +468,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
         self.use_dynamic_tree = getattr(spec_config, 'use_dynamic_tree', False)
         self.spec_tree_manager = None
+        self._d2t: Optional[torch.Tensor] = None
 
     @property
     def max_draft_len(self) -> int:
@@ -639,7 +642,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         """Original linear draft loop (1 token per layer)."""
         runtime_draft_len = spec_metadata.runtime_draft_len
         next_draft_tokens = []
+        draft_logits_list = []
         position_ids = inputs["position_ids"]
+        self._d2t = getattr(draft_model.model, "d2t", None)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
@@ -691,6 +696,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                             d2t,
                                                             draft_step=i)
 
+                # Capture draft logits for rejection sampling
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(logits.clone())
+
                 new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
                 # update inputs
@@ -732,6 +741,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
+        # Compute and store draft probs for next iteration's rejection sampling
+        if spec_metadata.use_rejection_sampling and draft_logits_list:
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size,
+                                                num_contexts)
+
         return next_draft_tokens
 
     def sample_and_accept_draft_tokens(
@@ -752,8 +767,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 spec_metadata.runtime_draft_len,
                 dtype=torch.int,
                 device=logits.device)
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
+        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
+                                         batch_size, spec_metadata)
 
     def draft_decoder(
         self,

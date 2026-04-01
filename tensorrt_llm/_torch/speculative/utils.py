@@ -82,6 +82,14 @@ def get_spec_metadata(spec_config,
             is_spec_dec_dynamic_tree=spec_config.use_dynamic_tree,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
+        # Memory optimization: dynamic-tree uses a per-depth logit buffer
+        # (_draft_depth_logits_cat in Eagle3OneModelDynamicTreeWorker) instead of
+        # the flat draft_probs buffer in spec_metadata. Setting vocab_size=0 skips
+        # the potentially large draft_probs allocation in SpecMetadata.prepare(),
+        # saving memory. Static-tree and chain paths use the standard draft_probs
+        # buffer, so we pass the real vocab_size for those cases.
+        vocab_size = (0 if spec_config.use_dynamic_tree else
+                      model_config.vocab_size)
         return Eagle3OneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -92,6 +100,8 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=spec_config.use_rejection_sampling,
+            vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=spec_config.use_dynamic_tree,
             eagle_choices=spec_config.eagle_choices,

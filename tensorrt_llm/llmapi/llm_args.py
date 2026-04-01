@@ -1054,6 +1054,27 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_model_arch: Literal["llama3", "mistral_large3"] = Field(
         default="llama3",
         description="The model architecture of the eagle3 model.")
+    # If true, uses rejection sampling for draft token acceptance instead of strict token equality.
+    # Rejection sampling provides lossless acceleration that exactly matches the target model's
+    # distribution. Requires allow_advanced_sampling=True. Only applicable to 1-model code paths.
+    use_rejection_sampling: bool = Field(
+        default=False,
+        description=
+        "If true, uses rejection sampling for draft token acceptance instead of "
+        "strict token equality. Rejection sampling provides lossless acceleration "
+        "that exactly matches the target model's distribution. Requires "
+        "allow_advanced_sampling=True. Only applicable to 1-model code paths. "
+        "PyTorch backend only.")
+
+    @field_validator('use_rejection_sampling')
+    @classmethod
+    def validate_use_rejection_sampling(cls, v, info):
+        if v and not info.data.get('allow_advanced_sampling', False):
+            raise ValueError(
+                "use_rejection_sampling=True requires allow_advanced_sampling=True. "
+                "Please set allow_advanced_sampling=True to enable rejection sampling."
+            )
+        return v
 
     @field_validator('eagle_choices', mode='before')
     @classmethod

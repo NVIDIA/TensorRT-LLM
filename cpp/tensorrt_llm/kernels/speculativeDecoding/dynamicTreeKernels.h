@@ -93,6 +93,31 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
     runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep,
     cudaStream_t stream);
 
+//! \brief Verify dynamic tree using rejection sampling.
+//! For each request, traverses the tree depth-by-depth. At each depth, siblings are tried
+//! in order; the first sibling accepted by rejection sampling (p_target/p_draft) continues
+//! the path. If all siblings are rejected, a correction token is sampled from (target-draft)_+.
+//! \param acceptIndex    output [batchSize, numSpecStep] int64 — tree positions of accepted tokens.
+//! \param acceptTokenNum output [batchSize] int64 — # accepted draft tokens (excl. root).
+//! \param acceptToken    output [batchSize, numSpecStep] int64 — accepted/correction token ids.
+//! \param candidates     [batchSize, numDraftTokens] int64; col 0 = root (target sample).
+//! \param draftProbs     [batchSize, numDraftTokens-1, vocabSize] float32; index 0 = tree pos 1.
+//! \param targetProbs    [batchSize, numDraftTokens, vocabSize] float32; index 0 = root.
+//! \param retrieveNextToken   [batchSize, numDraftTokens] int32 first-child pointer, -1=none.
+//! \param retrieveNextSibling [batchSize, numDraftTokens] int32 next-sibling pointer, -1=none.
+//! \param batchSize      runtime::SizeType32.
+//! \param numDraftTokens runtime::SizeType32. Total tree nodes per request (including root).
+//! \param numSpecStep    runtime::SizeType32. Second dim of acceptIndex/acceptToken.
+//! \param vocabSize      runtime::SizeType32. Vocabulary size.
+//! \param seed           uint64_t. Philox RNG seed.
+//! \param offset         uint64_t. Philox RNG offset.
+//! \param stream         cudaStream_t.
+void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
+    int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* retrieveNextToken,
+    int32_t const* retrieveNextSibling, runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens,
+    runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize, uint64_t seed, uint64_t offset,
+    cudaStream_t stream);
+
 } // namespace kernels::speculative_decoding
 
 TRTLLM_NAMESPACE_END

@@ -175,6 +175,54 @@ void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retri
         batchSize, numDraftTokens, numSpecStep, stream);
 }
 
+//! \brief In-place tree rejection sampling verify op.
+//! Accepts draft tokens by rejection sampling at each depth using pre-computed probabilities.
+void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& draftProbs, th::Tensor& targetProbs,
+    th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling, th::Tensor& acceptIndex, th::Tensor& acceptTokenNum,
+    th::Tensor& acceptToken, int64_t numSpecStep, int64_t seed, int64_t offset)
+{
+    TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
+    TORCH_CHECK(draftProbs.dim() == 3, "draftProbs must be 3D tensor");
+    TORCH_CHECK(targetProbs.dim() == 3, "targetProbs must be 3D tensor");
+    TORCH_CHECK(retrieveNextToken.dim() == 2, "retrieveNextToken must be 2D tensor");
+    TORCH_CHECK(retrieveNextSibling.dim() == 2, "retrieveNextSibling must be 2D tensor");
+    TORCH_CHECK(candidates.scalar_type() == torch::kInt64, "candidates must be int64 tensor");
+    TORCH_CHECK(draftProbs.scalar_type() == torch::kFloat32, "draftProbs must be float32 tensor");
+    TORCH_CHECK(targetProbs.scalar_type() == torch::kFloat32, "targetProbs must be float32 tensor");
+
+    int64_t batchSize = candidates.size(0);
+    int64_t numDraftTokens = candidates.size(1);
+    int64_t vocabSize = targetProbs.size(2);
+
+    TORCH_CHECK(draftProbs.size(0) == batchSize, "draftProbs batch size mismatch");
+    TORCH_CHECK(draftProbs.size(1) == numDraftTokens - 1, "draftProbs numDraftTokens-1 mismatch");
+    TORCH_CHECK(draftProbs.size(2) == vocabSize, "draftProbs vocabSize mismatch");
+    TORCH_CHECK(targetProbs.size(0) == batchSize, "targetProbs batch size mismatch");
+    TORCH_CHECK(targetProbs.size(1) == numDraftTokens, "targetProbs numDraftTokens mismatch");
+    TORCH_CHECK(retrieveNextToken.size(0) == batchSize, "retrieveNextToken batch size mismatch");
+    TORCH_CHECK(retrieveNextToken.size(1) == numDraftTokens, "retrieveNextToken size mismatch");
+    TORCH_CHECK(retrieveNextSibling.size(0) == batchSize, "retrieveNextSibling batch size mismatch");
+    TORCH_CHECK(retrieveNextSibling.size(1) == numDraftTokens, "retrieveNextSibling size mismatch");
+    TORCH_CHECK(acceptIndex.scalar_type() == torch::kInt64, "acceptIndex must be int64 tensor");
+    TORCH_CHECK(acceptTokenNum.scalar_type() == torch::kInt64, "acceptTokenNum must be int64 tensor");
+    TORCH_CHECK(acceptToken.scalar_type() == torch::kInt64, "acceptToken must be int64 tensor");
+    TORCH_CHECK(acceptIndex.size(0) >= batchSize && acceptIndex.size(1) >= numSpecStep, "acceptIndex buffer too small");
+    TORCH_CHECK(acceptTokenNum.size(0) >= batchSize, "acceptTokenNum buffer too small");
+    TORCH_CHECK(acceptToken.size(0) >= batchSize && acceptToken.size(1) >= numSpecStep, "acceptToken buffer too small");
+
+    auto stream = at::cuda::getCurrentCUDAStream(candidates.device().index());
+
+    acceptIndex.zero_();
+    acceptTokenNum.zero_();
+    acceptToken.zero_();
+
+    tk::invokeVerifyDynamicTreeRejection(acceptIndex.data_ptr<int64_t>(), acceptTokenNum.data_ptr<int64_t>(),
+        acceptToken.data_ptr<int64_t>(), candidates.data_ptr<int64_t>(), draftProbs.data_ptr<float>(),
+        targetProbs.data_ptr<float>(), retrieveNextToken.data_ptr<int32_t>(), retrieveNextSibling.data_ptr<int32_t>(),
+        batchSize, numDraftTokens, numSpecStep, vocabSize, static_cast<uint64_t>(seed), static_cast<uint64_t>(offset),
+        stream);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -226,4 +274,21 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("verify_dynamic_tree_greedy_out_op", &tensorrt_llm::torch_ext::verify_dynamic_tree_greedy_out_op);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "verify_dynamic_tree_rejection_out_op("
+        "Tensor candidates, Tensor draftProbs, Tensor targetProbs, "
+        "Tensor retrieveNextToken, Tensor retrieveNextSibling, "
+        "Tensor(a!) acceptIndex, Tensor(b!) acceptTokenNum, Tensor(c!) acceptToken, "
+        "int numSpecStep, int seed, int offset) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("verify_dynamic_tree_rejection_out_op", &tensorrt_llm::torch_ext::verify_dynamic_tree_rejection_out_op);
 }
