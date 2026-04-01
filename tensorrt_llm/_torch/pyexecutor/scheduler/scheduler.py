@@ -305,6 +305,7 @@ class SimpleScheduler(RequestScheduler):
 class ChunkingPolicy(Enum):
     EQUAL_PROGRESS = 1
     FIRST_COME_FIRST_SERVED = 2
+    FORCE_CHUNK = 3
 
 
 @dataclasses.dataclass
@@ -501,6 +502,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         ):
             all_context_requests_fit = False
 
+        if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
+            all_context_requests_fit = False
+
         # 3. Apply Chunking Strategy if needed
         if not all_context_requests_fit and contexts_to_be_chunked:
             assert ctx_chunk_config is not None, (
@@ -598,6 +602,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             self._chunk_equal_progress(requests, capacity, unit_size)
         elif policy == ChunkingPolicy.FIRST_COME_FIRST_SERVED:
             self._chunk_fcfs(requests, capacity, unit_size)
+        elif policy == ChunkingPolicy.FORCE_CHUNK:
+            self._chunk_forced(requests, capacity, unit_size)
         else:
             raise ValueError(f"Invalid chunking policy: {policy}")
 
@@ -715,6 +721,28 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             actual_model_cost = min(req.context_chunk_size, max(0, int(suggested_size) - reusable))
             if capacity is not None:
                 current_compute_capacity -= actual_model_cost
+
+    def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+        """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        Every request is assigned exactly min(context_remaining_length, unit_size) tokens.
+        Requests that would exceed the capacity budget are zeroed out.
+
+        This policy is designed for linear attention / Mamba2 state caching, which doesn't support
+        estimating reusable tokens, so we don't subtract them from the budget.
+        """
+        if self.max_context_length is not None and self.max_context_length < unit_size:
+            raise ValueError(
+                f"The forced chunk size ({unit_size}) exceeds the "
+                f"max context length ({self.max_context_length})"
+            )
+        total_tokens = 0
+        for req in requests:
+            req.context_chunk_size = min(req.context_remaining_length, unit_size)
+            if capacity is not None and total_tokens + req.context_chunk_size > capacity:
+                req.context_chunk_size = 0
+            total_tokens += req.context_chunk_size
+        assert capacity is None or total_tokens <= capacity
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         # capacity is a compute-token budget. Sum actual model tokens per request:
@@ -1441,6 +1469,8 @@ class SimpleUnifiedScheduler(RequestScheduler):
 
             if "EQUAL_PROGRESS" in str(input_policy):
                 policy_enum = ChunkingPolicy.EQUAL_PROGRESS
+            elif "FORCE_CHUNK" in str(input_policy):
+                policy_enum = ChunkingPolicy.FORCE_CHUNK
             else:
                 # Default to FCFS for FIRST_COME_FIRST_SERVED or others
                 policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED

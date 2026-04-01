@@ -40,6 +40,8 @@ class MetricsCollector:
         trtllm_time_per_output_token_seconds
         trtllm_request_queue_time_seconds
         trtllm_kv_cache_hit_rate
+        trtllm_kv_cache_reused_blocks_total
+        trtllm_kv_cache_missed_blocks_total
         trtllm_kv_cache_utilization
         trtllm_prompt_tokens_total
         trtllm_prompt_cached_tokens_total
@@ -118,10 +120,22 @@ class MetricsCollector:
                                        "kv_cache_hit_rate",
                                        documentation="KV cache hit rate",
                                        labelnames=self.labels.keys())
+        self.kv_cache_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_reused_blocks",
+            documentation=
+            "Cumulative number of KV cache blocks reused (cache hits)",
+            labelnames=self.labels.keys())
+        self.kv_cache_missed_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_missed_blocks",
+            documentation=
+            "Cumulative number of KV cache blocks missed (cache misses)",
+            labelnames=self.labels.keys())
         self.kv_cache_utilization = Gauge(name=self.metric_prefix +
                                           "kv_cache_utilization",
                                           documentation="KV cache utilization",
                                           labelnames=self.labels.keys())
+        self._prev_reused_blocks = 0
+        self._prev_missed_blocks = 0
 
         self.counter_tokens_prompt = Counter(
             name=self.metric_prefix + "prompt_tokens_total",
@@ -323,6 +337,8 @@ class MetricsCollector:
 
         This method updates Prometheus metrics including:
         - kv_cache_hit_rate
+        - kv_cache_reused_blocks
+        - kv_cache_missed_blocks
         - kv_cache_utilization
 
         Args:
@@ -331,6 +347,8 @@ class MetricsCollector:
                 - "kvCacheStats" (dict): KV cache statistics containing:
                     - "cacheHitRate" (float): Cache hit rate (0.0 to 1.0). If present (including zero),
                       the kv_cache_hit_rate gauge is updated.
+                    - "reusedBlocks" (int): Number of KV cache blocks reused (cache hits).
+                    - "missedBlocks" (int): Number of KV cache blocks missed (cache misses).
                     - "usedNumBlocks" (int): Number of KV cache blocks currently in use.
                     - "maxNumBlocks" (int): Maximum number of KV cache blocks available. Should always be
                       non-zero.
@@ -347,6 +365,18 @@ class MetricsCollector:
             cache_hit_rate = kv_stats.get("cacheHitRate")
             if cache_hit_rate is not None:
                 self._log_gauge(self.kv_cache_hit_rate, cache_hit_rate)
+            reused_blocks = kv_stats.get("reusedBlocks")
+            if reused_blocks is not None:
+                delta = reused_blocks - self._prev_reused_blocks
+                if delta > 0:
+                    self._log_counter(self.kv_cache_reused_blocks, None, delta)
+                self._prev_reused_blocks = reused_blocks
+            missed_blocks = kv_stats.get("missedBlocks")
+            if missed_blocks is not None:
+                delta = missed_blocks - self._prev_missed_blocks
+                if delta > 0:
+                    self._log_counter(self.kv_cache_missed_blocks, None, delta)
+                self._prev_missed_blocks = missed_blocks
             if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
                 max_num_blocks = kv_stats["maxNumBlocks"]
                 if max_num_blocks:
