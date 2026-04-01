@@ -15,7 +15,10 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
+                                            default_hasher,
+                                            find_mm_token_positions,
+                                            hexdigest_to_int32)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ExtraProcessedInputs,
@@ -254,13 +257,19 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         This method skips vision processing and works with externally provided embeddings.
         It replaces/expands image placeholders in the text with appropriate tokens and prepares
         the embeddings for model forward pass.
+
+        Also computes multimodal hashing metadata (multimodal_input) so that
+        KV cache block reuse can properly coordinate with find_input_mm_embeds
+        to slice embeddings when cached blocks cover the multimodal token span.
+
         Args:
             inputs: Text prompt containing image placeholders
             multimodal_embedding: Dictionary containing pre-processed image embedding data
         Returns:
             Tuple of (token_ids, extra_processed_inputs) where:
             - token_ids: List of processed token IDs with image placeholders
-            - extra_processed_inputs: Optional dictionary containing multimodal embeddings
+            - extra_processed_inputs: Dictionary containing multimodal embeddings and
+              multimodal_input for KV cache reuse support
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -277,11 +286,46 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         input_ids = self.tokenizer(text_prompt,
                                    return_tensors="pt").input_ids[0]
         mm_features = multimodal_embedding['image']
+
+        # Capture per-image token counts before _postprocess flattens the list
+        num_mm_tokens_per_image = []
+        for f in mm_features:
+            if f.dim() == 2:
+                num_mm_tokens_per_image.append(f.shape[0])
+            elif f.dim() == 3:
+                num_mm_tokens_per_image.append(f.shape[0] * f.shape[1])
+            else:
+                raise ValueError(f"Unexpected embedding dimension: {f.dim()}")
+
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        fused_token_ids = fused_input_ids.to(torch.int32).tolist()
+
+        # Compute multimodal hashes from embedding content for KV cache block matching
+        mm_hashes_int32 = []
+        for f in multimodal_embedding['image']:
+            raw = f.cpu().contiguous()
+            if raw.dtype == torch.bfloat16:
+                raw = raw.float()
+            h = default_hasher(raw.numpy().tobytes()).hexdigest()
+            mm_hashes_int32.append(hexdigest_to_int32(h))
+
+        start_positions, _ = find_mm_token_positions(
+            input_ids=fused_token_ids,
+            num_mm_tokens=num_mm_tokens_per_image,
+            vocab_size=self.vocab_size,
+        )
+
+        multimodal_input = MultimodalInput.from_components(
+            mm_hashes=mm_hashes_int32,
+            mm_positions=start_positions,
+            mm_lengths=num_mm_tokens_per_image,
+        )
+
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features
-        return fused_input_ids.to(torch.int32).tolist(), {
-            "multimodal_data": multimodal_data
+        return fused_token_ids, {
+            "multimodal_data": multimodal_data,
+            "multimodal_input": multimodal_input,
         }
 
     @torch.inference_mode()
