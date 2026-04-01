@@ -228,6 +228,12 @@ class TrtllmGenSupportChecker:
                     False,
                     f"[Generation] tokens_per_block ({tokens_per_block}) must be >= {cls.MIN_TOKENS_PER_BLOCK}.",
                 )
+            heads_ratio = num_heads // num_kv_heads
+            if not is_mla_enable and heads_ratio > cls.MAX_HEADS_RATIO_GENERATION:
+                return (
+                    False,
+                    f"[Generation] heads ratio ({heads_ratio}) exceeds maximum ({cls.MAX_HEADS_RATIO_GENERATION}).",
+                )
             if has_alibi:
                 return False, "[Generation] ALiBi is not supported."
             if (q_dtype, kv_cache_dtype, o_dtype) not in cls.SUPPORTED_DTYPE_COMBOS_GENERATION:
@@ -859,10 +865,6 @@ class EnqueueParams:
 class EnqueueContextParams(EnqueueParams):
     batch_size: int = 0
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
-    # MLA context: separate K, V inputs (non-absorption mode)
-    k_input: Optional[torch.Tensor] = None
-    v_input: Optional[torch.Tensor] = None
-    absorption_mode: bool = False
 
 
 @dataclass
@@ -1363,9 +1365,14 @@ class FlashInferTrtllmGenAttention:
                 q_len_per_req=params.input_seq_length,
             )
 
-    def run_mla_generation(self, params: EnqueueGenerationParams):
+    def run_mla_generation(self, params: EnqueueGenerationParams) -> None:
         """MLA generation decode using flashinfer MLA kernel."""
-        import math
+        if 0 < params.cyclic_attention_window_size < params.max_past_kv_length:
+            raise NotImplementedError(
+                "Sliding-window attention is not supported by MLA decode path."
+            )
+        if params.attention_chunk_size != 0:
+            raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * params.beam_width
         block_tables = self._build_block_tables(
@@ -1899,14 +1906,8 @@ def trtllm_gen_attention(
             input_seq_length=max_context_q_len,
             batch_size=num_seqs,
             mrope_rotary_cos_sin=mrope_rotary_cos_sin,
-            k_input=k[token_offset : token_offset + num_ctx_tokens] if k is not None else None,
-            v_input=v[token_offset : token_offset + num_ctx_tokens] if v is not None else None,
-            absorption_mode=False,
         )
-        if is_mla_enable and not is_fused_qkv:
-            backend.run_mla_context(ctx_params)
-        else:
-            backend.run_context(ctx_params)
+        backend.run_context(ctx_params)
 
     # Generation Phase
     if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
