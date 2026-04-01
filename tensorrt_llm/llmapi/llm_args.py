@@ -2238,7 +2238,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Whether this device has unified CPU-GPU memory (e.g. DGX Spark, Jetson). "
         "When None (default), auto-detects via is_device_integrated(). "
-        "When True, host_cache_size is forced to 0 since there is no separate "
+        "When True, the C++ runtime ignores host_cache_size since there is no separate "
         "host DRAM to offload to.")
 
     tokens_per_block: int = Field(default=32,
@@ -2337,30 +2337,29 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         return v
 
     @model_validator(mode='after')
-    def apply_unified_memory_defaults(self) -> 'KvCacheConfig':
-        """Auto-detect unified memory and adjust KV cache defaults.
+    def detect_unified_memory(self) -> 'KvCacheConfig':
+        """Auto-detect unified memory for informational purposes.
 
-        On unified memory systems (e.g. Grace Blackwell / DGX Spark), CPU and GPU
-        share the same physical LPDDR5x pool. KV cache offload is a no-op and the
-        host_cache_size budget should be folded into the primary GPU pool. The C++
-        runtime handles the actual optimization transparently; this validator logs
-        the detection and adjusts Python-level defaults for clarity.
+        On unified memory systems (e.g. DGX Spark, Jetson), CPU and GPU share
+        the same physical memory pool. The C++ runtime in calculateFreeMemBytes()
+        is the single source of truth: it detects unified memory at the correct
+        point in the device lifecycle and ignores host_cache_size accordingly.
+
+        Python does NOT rewrite host_cache_size here because:
+        - is_device_integrated() uses @lru_cache and may run before set_device()
+        - In mixed-device setups this would pin to the wrong GPU
+        - The C++ guard handles it correctly regardless of what Python passes
         """
         if self.unified_memory_detected is None:
             try:
                 unified = is_device_integrated()
             except RuntimeError:
-                logger.debug("Unified-memory auto-detection failed; "
-                             "defaulting to disabled")
                 unified = False
             object.__setattr__(self, 'unified_memory_detected', unified)
 
         if self.unified_memory_detected:
-            if self.host_cache_size and self.host_cache_size > 0:
-                logger.info(
-                    "Unified memory detected: setting host_cache_size to 0 "
-                    "(secondary pool is meaningless on unified memory)")
-                object.__setattr__(self, "host_cache_size", 0)
+            logger.info("Unified memory system detected. The C++ runtime will "
+                        "ignore host_cache_size on this device.")
         return self
 
 

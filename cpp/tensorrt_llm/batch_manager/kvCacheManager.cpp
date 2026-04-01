@@ -2799,11 +2799,11 @@ std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
     auto freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
     auto freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
 
-    // On unified memory systems (e.g. Grace Blackwell / DGX Spark), CPU and GPU share the same
-    // physical memory pool. The secondary (host) cache tier is redundant because there is no
-    // separate host DRAM to offload to -- all memory is equally accessible.
-    // Do NOT add host_cache_size to freePrimaryMemBytes: cudaMemGetInfo already reports the full
-    // unified pool, so adding host_cache_size would double-count and risk OOM.
+    // On unified memory systems (e.g. DGX Spark, Jetson), CPU and GPU share the same physical
+    // memory pool. The secondary (host) cache tier is redundant -- there is no separate host
+    // DRAM to offload to. We ignore (drop) host_cache_size rather than adding it to
+    // freePrimaryMemBytes because cudaMemGetInfo already reports the full unified pool;
+    // adding it would double-count and risk OOM.
     if (tc::isUnifiedMemorySystem() && freeSecondaryMemBytes > 0)
     {
         TLLM_LOG_INFO("Unified memory detected: ignoring host_cache_size (%" PRIu64
