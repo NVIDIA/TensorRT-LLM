@@ -1466,6 +1466,58 @@ TEST_F(CombinedSchedulerTest, NoReuseMicroBatchUnchanged)
     EXPECT_EQ(gen.size(), 0u);
 }
 
+TEST_F(CombinedSchedulerTest, GuaranteedNoEvictDoesNotCreditFreeReusableBlocks)
+{
+    // In GUARANTEED_NO_EVICT, free reusable blocks are not reserved across
+    // scheduling to addSequence. The token estimate must therefore stay
+    // conservative and avoid crediting those free blocks.
+    constexpr SizeType32 tokensPerBlock = 10;
+    constexpr SizeType32 kvCacheMaxNumTokens = 100;
+    constexpr SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    constexpr SizeType32 maxNumRequests = 4;
+    constexpr SizeType32 chunkUnitSize = 5;
+    constexpr SizeType32 maxNumTokensBudget = 15;
+    constexpr SizeType32 maxBatchSize = 4;
+
+    auto kvCacheManager = createKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, /*enableReuse=*/true);
+
+    auto microBatchScheduler = MicroBatchScheduler(
+        ContextChunkingConfig{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, chunkUnitSize}, std::nullopt);
+
+    constexpr int32_t promptLen = 30;
+    constexpr int32_t maxNewTokens = 5;
+    auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+    auto req0 = createRequestWithTokens(inputTokens, maxNewTokens, 0);
+    auto req1 = createRequestWithTokens(inputTokens, maxNewTokens, 1);
+
+    // Populate the reuse tree, then release the sequence so matching blocks are
+    // free rather than allocated.
+    kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
+    req0->moveToNextContextChunk();
+    kvCacheManager->storeContextBlocks(*req0);
+    kvCacheManager->removeSequence(req0->mRequestId, req0);
+
+    auto const onlyWindowSize = kvCacheMaxNumTokensPerSeq;
+    auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(*req1, onlyWindowSize);
+    EXPECT_EQ(remaining, 4) << "3 context blocks + 1 generation block should still be reserved";
+    EXPECT_EQ(req1->getEstimatedReusableTokens(), 0)
+        << "Free reusable blocks must not be credited in GUARANTEED_NO_EVICT token budgeting";
+
+    RequestVector microBatchActive;
+    microBatchActive.push_back(req1);
+
+    ReqIdsSet inflightReqIds;
+    auto [ctx, gen] = microBatchScheduler(microBatchActive, inflightReqIds, maxBatchSize, maxNumTokensBudget);
+
+    ASSERT_EQ(ctx.size(), 1u);
+    EXPECT_EQ(gen.size(), 0u);
+    EXPECT_EQ(ctx.at(0)->getContextChunkSize(), 15)
+        << "Without reserved reusable-token credit, the first context chunk must be bounded by the raw token budget";
+}
+
 class ContextChunkingTest : public MicroBatchSchedulerTest
 {
 protected:

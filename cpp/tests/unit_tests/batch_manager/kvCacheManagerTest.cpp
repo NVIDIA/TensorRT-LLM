@@ -5823,8 +5823,9 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     auto const remainingBeforeAdd = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remainingBeforeAdd, numContextBlocks + numGenBlocks);
 
-    // Verify estimatedReusableTokens is still set after getRemainingBlocksToCompletion
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+    // Free reusable blocks are not reserved by getRemainingBlocksToCompletion, so
+    // estimatedReusableTokens must stay conservative at 0.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
 
     // After addSequence, context blocks are allocated (reuse already applied during allocation)
     // Only generation blocks remain to be allocated
@@ -6010,11 +6011,9 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     auto const numGenBlocks = maxNewTokens / tokensPerBlock;     // 3 blocks
     EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);       // 5 context + 3 generation = 8
 
-    // storeContextBlocks stores (promptLength - 1) / tokensPerBlock = 4 full blocks.
-    // getRemainingBlocksToCompletion counts ALL reusable blocks (free or allocated) for the
-    // TOKEN budget, so estimatedReusableTokens = min(4, 5) * tokensPerBlock = 64.
-    auto const numStoredBlocks = (promptLength - 1) / tokensPerBlock; // 4
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), std::min(numStoredBlocks, numContextBlocks) * tokensPerBlock);
+    // Free reusable blocks are visible in the radix tree but are not reserved by
+    // getRemainingBlocksToCompletion, so estimatedReusableTokens must stay 0.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)

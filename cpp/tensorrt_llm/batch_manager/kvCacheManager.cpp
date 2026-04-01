@@ -2335,6 +2335,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     // comment in getNeededBlocksOneStep for the full rationale — free reusable blocks must
     // not be subtracted because they are already counted in the eviction policy's free count.
     SizeType32 numReusableContextBlocks = 0;
+    SizeType32 numReusableBlocksAllocated = 0;
+    SizeType32 numReusableBlocksAll = 0;
     if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && req.isContextInitState() && req.isFirstContextChunk()
         && numAllocBlocksPerBeam == 0)
     {
@@ -2342,18 +2344,13 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         // Block budget: only subtract blocks that are already allocated (have active refs).
         // Free cached blocks are already counted in the eviction policy's free pool and
         // must not be double-counted against the capacity estimate.
-        auto const numReusableBlocksAllocated = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
+        numReusableBlocksAllocated = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
         numReusableContextBlocks = std::min(numReusableBlocksAllocated, numContextBlocks);
-        // Token budget: count all reusable blocks (free or allocated). Cached tokens need
-        // not be recomputed regardless of whether their blocks currently have active refs.
-        auto const numReusableBlocksAll = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/false);
-        req.setEstimatedReusableTokens(std::min(numReusableBlocksAll, numContextBlocks) * getTokensPerBlock());
-        TLLM_LOG_DEBUG(
-            "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
-            "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
-            "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
-            req.mRequestId, numContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll,
-            numReusableContextBlocks, numGenBlocksPerBeam);
+        // Token budget must remain conservative with respect to what addSequence can
+        // realize later. Free reusable blocks are not reserved across scheduling, so
+        // only already-allocated reusable blocks are safe to credit here.
+        numReusableBlocksAll = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/false);
+        req.setEstimatedReusableTokens(numReusableContextBlocks * getTokensPerBlock());
     }
 
     // In case of sliding window attention, a new block is allocated when the
@@ -2372,14 +2369,31 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     // Adjust for reusable context blocks (only allocated ones)
     SizeType32 const effectiveContextBlocks = numContextBlocks - numReusableContextBlocks;
 
+    SizeType32 remainingBlocksToCompletion = 0;
     if (numAllocBlocksPerBeam < effectiveContextBlocks) // Still haven't allocated all context blocks
     {
-        return effectiveContextBlocks - numAllocBlocksPerBeam
+        remainingBlocksToCompletion = effectiveContextBlocks - numAllocBlocksPerBeam
             + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
     }
+    else
+    {
+        SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
+        remainingBlocksToCompletion
+            = (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    }
 
-    SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
-    return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    TLLM_LOG_DEBUG(
+        "getRemainingBlocksToCompletion: request ID %lu, windowSize=%d, promptLen=%d, "
+        "contextCurrentPosition=%d, estimatedReusableTokens=%d, numContextBlocks=%d, "
+        "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, numReusableContextBlocks=%d, "
+        "numAllocBlocksPerBeam=%d, effectiveContextBlocks=%d, numGenBlocksPerBeam=%d, "
+        "numExtraBlocksPerBeam=%d, remainingBlocksToCompletion=%d",
+        req.mRequestId, windowSize, req.mPromptLen, req.getContextCurrentPosition(), req.getEstimatedReusableTokens(),
+        numContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll, numReusableContextBlocks,
+        numAllocBlocksPerBeam, effectiveContextBlocks, numGenBlocksPerBeam, numExtraBlocksPerBeam,
+        remainingBlocksToCompletion);
+
+    return remainingBlocksToCompletion;
 }
 
 void BlockManager::updateSequenceCacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
