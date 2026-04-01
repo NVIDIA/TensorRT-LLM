@@ -72,68 +72,21 @@ def create_page_table(
 
 
 class TestTritonPagedDecodeKernel:
-    """Tests for the single-stage paged decode kernel."""
+    """Tests for the FlashDecoding paged decode kernel (stage1 + stage2)."""
 
     @pytest.mark.parametrize("batch_size", [1, 4, 8])
     @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
     @pytest.mark.parametrize("head_dim", [64, 128])
     @pytest.mark.parametrize("seq_len", [64, 256, 512])
-    def test_decode_kernel_basic(
+    def test_decode_kernel_vs_pytorch_reference(
         self, batch_size: int, n_heads: int, n_kv_heads: int, head_dim: int, seq_len: int
     ):
-        """Test decode kernel produces valid output shapes and no NaNs."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_decode,
-        )
-
-        page_size = 16
-        num_pages_per_seq = (seq_len + page_size - 1) // page_size
-        num_blocks = batch_size * num_pages_per_seq + 10
-
-        # Create inputs
-        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
-        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
-
-        # Fill cache with random data
-        kv_cache.normal_()
-
-        # Create page table
-        kv_indptr = torch.arange(
-            0,
-            (batch_size + 1) * num_pages_per_seq,
-            num_pages_per_seq,
-            dtype=torch.int32,
-            device="cuda",
-        )[: batch_size + 1]
-        kv_indices = torch.arange(
-            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
-        )
-        kv_last_page_len = torch.full(
-            (batch_size,), seq_len % page_size or page_size, dtype=torch.int32, device="cuda"
-        )
-
-        sm_scale = 1.0 / math.sqrt(head_dim)
-
-        # Run kernel
-        output = triton_paged_decode(q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale)
-
-        # Check output
-        assert output.shape == q.shape
-        assert not torch.isnan(output).any(), "Output contains NaN"
-        assert not torch.isinf(output).any(), "Output contains Inf"
-
-    def test_decode_kernel_vs_pytorch_reference(self):
         """Test decode kernel against PyTorch SDPA reference."""
         from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
             triton_paged_decode,
             update_paged_kv_cache,
         )
 
-        batch_size = 2
-        n_heads = 8
-        n_kv_heads = 8
-        head_dim = 64
-        seq_len = 32
         page_size = 16
 
         num_pages_per_seq = (seq_len + page_size - 1) // page_size
@@ -221,17 +174,18 @@ class TestTritonPagedContextKernel:
     """Tests for the context/prefill kernel."""
 
     @pytest.mark.parametrize("batch_size", [1, 2])
-    @pytest.mark.parametrize("seq_len", [32, 64, 128])
-    def test_context_kernel_basic(self, batch_size: int, seq_len: int):
-        """Test context kernel produces valid output."""
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [32, 64, 128, 512])
+    def test_context_kernel_vs_pytorch_reference(
+        self, batch_size: int, n_heads: int, n_kv_heads: int, head_dim: int, seq_len: int
+    ):
+        """Test context kernel against PyTorch SDPA reference."""
         from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
             triton_paged_context,
             update_paged_kv_cache,
         )
 
-        n_heads = 8
-        n_kv_heads = 8
-        head_dim = 64
         page_size = 16
 
         num_pages_per_seq = (seq_len + page_size - 1) // page_size
@@ -280,7 +234,6 @@ class TestTritonPagedContextKernel:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-        # Run kernel
         output = triton_paged_context(
             q,
             kv_cache,
@@ -292,10 +245,24 @@ class TestTritonPagedContextKernel:
             sm_scale,
         )
 
-        # Check output
         assert output.shape == q.shape
-        assert not torch.isnan(output).any(), "Output contains NaN"
-        assert not torch.isinf(output).any(), "Output contains Inf"
+
+        # PyTorch SDPA reference (causal)
+        q_ref = q.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        k_ref = k.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        v_ref = v.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+
+        head_ratio = n_heads // n_kv_heads
+        if head_ratio > 1:
+            k_ref = k_ref.repeat_interleave(head_ratio, dim=1)
+            v_ref = v_ref.repeat_interleave(head_ratio, dim=1)
+
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=sm_scale, is_causal=True
+        )
+        output_ref = output_ref.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
 
 class TestCacheUpdate:
@@ -500,9 +467,13 @@ class TestTritonPagedMHAIntegration:
 class TestFlashInferComparison:
     """Tests comparing Triton implementation against FlashInfer."""
 
-    @pytest.mark.parametrize("batch_size", [1, 4])
-    @pytest.mark.parametrize("seq_len", [64, 128])
-    def test_decode_vs_flashinfer(self, batch_size: int, seq_len: int):
+    @pytest.mark.parametrize("batch_size", [1, 4, 8])
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [64, 128, 512])
+    def test_decode_vs_flashinfer(
+        self, batch_size: int, n_heads: int, n_kv_heads: int, head_dim: int, seq_len: int
+    ):
         """Compare decode output against FlashInfer."""
         import flashinfer
 
@@ -511,9 +482,6 @@ class TestFlashInferComparison:
             update_paged_kv_cache,
         )
 
-        n_heads = 32
-        n_kv_heads = 8
-        head_dim = 128
         page_size = 16
 
         num_pages_per_seq = (seq_len + page_size - 1) // page_size
@@ -611,7 +579,13 @@ class TestFlashInferComparison:
         not pytest.importorskip("flashinfer", reason="FlashInfer not installed"),
         reason="FlashInfer not installed",
     )
-    def test_prefill_vs_flashinfer(self):
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [64, 128, 512])
+    def test_prefill_vs_flashinfer(
+        self, batch_size: int, n_heads: int, n_kv_heads: int, head_dim: int, seq_len: int
+    ):
         """Compare prefill output against FlashInfer."""
         import flashinfer
 
@@ -620,11 +594,6 @@ class TestFlashInferComparison:
             update_paged_kv_cache,
         )
 
-        batch_size = 2
-        seq_len = 64
-        n_heads = 32
-        n_kv_heads = 8
-        head_dim = 128
         page_size = 16
 
         num_pages_per_seq = (seq_len + page_size - 1) // page_size
