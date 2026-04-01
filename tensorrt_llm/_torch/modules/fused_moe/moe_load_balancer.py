@@ -1079,6 +1079,7 @@ moe_model_arch_list = [
     'GptOssForCausalLM',
     'MixtralForCausalLM',
     'Llama4ForConditionalGeneration',
+    'NemotronHForCausalLM',
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
 ]

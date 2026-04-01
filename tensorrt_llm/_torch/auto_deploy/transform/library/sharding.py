@@ -98,6 +98,53 @@ def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool
     return is_fake_quantized_linear_op(node) and "_scale" in weight_node_key
 
 
+def _make_tp_plan_regex(key: str) -> str:
+    pattern_string = ("*" + key + "*").replace("*", "@")
+    return re.escape(pattern_string).replace("@", ".*")
+
+
+def _matches_tp_plan(weight_name: str, tp_plan: Dict[str, str]) -> bool:
+    return any(re.match(_make_tp_plan_regex(key), weight_name) for key in tp_plan)
+
+
+def _is_unmatched_moe_aux_gate_linear(weight_name: str, tp_plan: Dict[str, str]) -> bool:
+    if _matches_tp_plan(weight_name, tp_plan):
+        return False
+
+    segments = weight_name.split(".")
+    if len(segments) < 2 or segments[-1] != "weight":
+        return False
+
+    # Router gates and shared-expert scalar gates are intentionally replicated in TP config.
+    return segments[-2] in {"gate", "shared_expert_gate"}
+
+
+def _get_config_layer_linear_nodes(gm: GraphModule, tp_plan: Dict[str, str]) -> List[Node]:
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    filtered_linear_nodes = []
+    num_skipped = 0
+
+    for lin_node in linear_nodes:
+        weight_name = extract_weight_name(lin_node)
+        if not weight_name:
+            filtered_linear_nodes.append(lin_node)
+            continue
+
+        if _is_unmatched_moe_aux_gate_linear(weight_name, tp_plan):
+            num_skipped += 1
+            continue
+
+        filtered_linear_nodes.append(lin_node)
+
+    if num_skipped > 0:
+        ad_logger.info(
+            f"Skipping {num_skipped} unmatched MoE auxiliary gate linear nodes during "
+            "config-driven TP layer recovery"
+        )
+
+    return filtered_linear_nodes
+
+
 ########################################################
 #  Helper enums
 ########################################################
@@ -2914,7 +2961,9 @@ def detect_sharding_from_config(
 
     # use layer_subgraphs to determine the layer_type
     # and check the validity of the sharding transform
-    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(
+        gm, linear_nodes=_get_config_layer_linear_nodes(gm, tp_plan)
+    )
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
@@ -2939,12 +2988,7 @@ def detect_sharding_from_config(
 
         # use regex to find if module_name matches any of the keys in sharding_config
         for key in tp_plan.keys():
-            pattern_string = "*" + key + "*"
-            # convert it to regex. Escape dots, replace * with .*
-            # First, we substitute * with an unlikely character, e.g. @
-            # Then we escape dots, and finally we replace @ with .*
-            pattern_string = pattern_string.replace("*", "@")
-            pattern_regex = re.escape(pattern_string).replace("@", ".*")
+            pattern_regex = _make_tp_plan_regex(key)
             if re.match(pattern_regex, weight_name):
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]

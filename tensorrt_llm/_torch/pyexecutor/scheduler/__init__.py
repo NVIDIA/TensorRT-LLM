@@ -17,11 +17,11 @@ Scheduler module for TensorRT-LLM PyExecutor.
 
 This module contains:
 - Request schedulers (capacity, micro-batch, unified)
-- Waiting queues (FCFS)
+- Waiting queues (FCFS, Priority)
 """
 
 # Re-export from scheduler.py
-from .adp_router import ADPRouter, DefaultADPRouter, RankState
+from .adp_router import ADPRouter, DefaultADPRouter, KVCacheAwareADPRouter, RankState
 from .scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -40,7 +40,12 @@ from .scheduler import (
 from .scheduler_v2 import KVCacheV2Scheduler
 
 # Re-export from waiting_queue.py
-from .waiting_queue import FCFSWaitingQueue, WaitingQueue, create_waiting_queue
+from .waiting_queue import (
+    FCFSWaitingQueue,
+    PriorityWaitingQueue,
+    WaitingQueue,
+    create_waiting_queue,
+)
 
 __all__ = [
     # Schedulers
@@ -61,9 +66,11 @@ __all__ = [
     # ADP
     "ADPRouter",
     "DefaultADPRouter",
+    "KVCacheAwareADPRouter",
     "RankState",
     # Waiting queues
     "FCFSWaitingQueue",
+    "PriorityWaitingQueue",
     "WaitingQueue",
     "create_waiting_queue",
 ]

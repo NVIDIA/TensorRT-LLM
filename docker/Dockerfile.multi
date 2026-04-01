@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=25.12-py3
-ARG TRITON_BASE_TAG=25.12-py3
+ARG BASE_TAG=26.02-py3
+ARG TRITON_BASE_TAG=26.02-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -52,7 +52,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --no-cache-dir -r /tmp/constraints.txt && \
+    pip3 install --ignore-installed --no-cache-dir -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt && \
     pip3 uninstall -y nbconvert || true
 
@@ -67,7 +67,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
-    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-0.45.1.dist-info
+    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
 # Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
@@ -103,6 +103,7 @@ COPY cpp cpp
 COPY docker docker
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
+COPY triton_kernels triton_kernels
 COPY 3rdparty 3rdparty
 COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
 

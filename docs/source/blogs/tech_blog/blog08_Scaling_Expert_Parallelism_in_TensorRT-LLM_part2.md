@@ -249,7 +249,7 @@ To address the increased host overhead when scaling parallelism in the system, w
 
 TensorRT LLM is designed to be composed of both C++ and Python code, so that C++ can handle the most performance-sensitive parts while Python handles higher-level logic. As we try to put more logic into Python to make the program easier to read and debug, there are still frequent conversations through binding interfaces between C++ and Python. Besides, since most of the logic is implemented in Python, there are several layers of implementation that communicate with each other through inter-process communication overhead. Frequent binding calls and serialization/deserialization introduced by inter-process communication slow down the core library.
 
-To improve program efficiency, we used environment variables introduced in the [performance analysis guidance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-analysis.md) to measure and profile CPU overhead, and improved performance by reducing and reusing different binding calls as much as possible, and delaying Python object deserialization to avoid duplicated serialization and reduce message size when doing inter-process communication. This optimization was added in [PR 5224](https://github.com/NVIDIA/TensorRT-LLM/pull/5224). We have also reduced Python garbage collection (GC) impacts in [PR 5141](https://github.com/NVIDIA/TensorRT-LLM/pull/5141).
+To improve program efficiency, we used environment variables introduced in the [performance analysis guidance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-analysis.md) to measure and profile CPU overhead, and improved performance by reducing and reusing different binding calls as much as possible, and delaying Python object deserialization to avoid duplicated serialization and reduce message size when doing inter-process communication. This optimization was added in [PR 5224](https://github.com/NVIDIA/TensorRT-LLM/pull/5224). We have also reduced Python garbage collection (GC) impacts in [PR 5141](https://github.com/NVIDIA/TensorRT-LLM/pull/5141).
 
 To enable powerful NVTX markers for easier analysis of host overheads, TensorRT LLM provides several useful environment variables:
 
@@ -307,7 +307,7 @@ When enabling MTP, there is an extra performance boost compared to the baseline.
 </div>
 <p align="center"><sub><em>Figure 8: DeepSeek R1 throughput on ISL/OSL 8k/1k with MTP enabled.</em></sub></p>
 
-To reproduce the numbers, refer to the [`examples/wide_ep/slurm_scripts`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts) directory. The scripts there demonstrate how to launch TensorRT LLM disaggregated serving with large-scale EP and other features enabled on a SLURM cluster.
+To reproduce the numbers, refer to the [`examples/wide_ep`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep) directory for wide EP examples. Note: the `slurm_scripts` subdirectory is not yet available in the public repository; SLURM-based launch scripts for disaggregated serving with large-scale EP will be added in a future update.
 
 ## Future Work
 

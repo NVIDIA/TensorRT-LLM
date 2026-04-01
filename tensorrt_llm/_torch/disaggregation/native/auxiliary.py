@@ -3,6 +3,7 @@ from collections import deque, namedtuple
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -10,25 +11,25 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 @dataclass
 class AuxBufferMeta:
-    ptrs: list[int]
-    size: list[int]
-    item_sizes: list[int] = field(default_factory=list)
+    ptrs: np.ndarray  # dtype=np.int64
+    size: np.ndarray  # dtype=np.int64
+    item_sizes: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     device: str = "cpu"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "ptrs": self.ptrs,
-            "size": self.size,
-            "item_sizes": self.item_sizes,
+            "ptrs": self.ptrs.tolist(),
+            "size": self.size.tolist(),
+            "item_sizes": self.item_sizes.tolist(),
             "device": self.device,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AuxBufferMeta":
         return cls(
-            ptrs=data["ptrs"],
-            size=data["size"],
-            item_sizes=data.get("item_sizes", []),
+            ptrs=np.array(data["ptrs"], dtype=np.int64),
+            size=np.array(data["size"], dtype=np.int64),
+            item_sizes=np.array(data.get("item_sizes", []), dtype=np.int64),
             device=data.get("device", "cpu"),
         )
 
@@ -109,21 +110,30 @@ class AuxBuffer(AuxBufferBase):
         )
 
         self._meta = AuxBufferMeta(
-            ptrs=[
-                self._first_tokens_buffer.data_ptr(),
-                self._draft_tokens_buffer.data_ptr(),
-                self._token_counts_buffer.data_ptr(),
-            ],
-            size=[
-                self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
-                self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
-                self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
-            ],
-            item_sizes=[
-                self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
-                self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
-                self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
-            ],
+            ptrs=np.array(
+                [
+                    self._first_tokens_buffer.data_ptr(),
+                    self._draft_tokens_buffer.data_ptr(),
+                    self._token_counts_buffer.data_ptr(),
+                ],
+                dtype=np.int64,
+            ),
+            size=np.array(
+                [
+                    self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
+                    self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
+                    self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
+                ],
+                dtype=np.int64,
+            ),
+            item_sizes=np.array(
+                [
+                    self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
+                    self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
+                    self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
+                ],
+                dtype=np.int64,
+            ),
             device=self._device,
         )
 

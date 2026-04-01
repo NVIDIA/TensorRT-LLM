@@ -73,22 +73,26 @@ def test_get_bindings_model_config_attention_dp_attn_tp_override(
     # bindings hidden_size is sharded by attn_tp_size and attn_cp_size.
     attn_tp_size = mapping.attn_tp_size if not mapping.enable_attention_dp else 1
     attn_cp_size = mapping.attn_cp_size
-    assert bindings_cfg.num_heads == cfg.num_attention_heads // (attn_tp_size * attn_cp_size)
+
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    assert bindings_cfg.num_heads == ceil_div(cfg.num_attention_heads, attn_tp_size * attn_cp_size)
     # bindings hidden_size is sharded by attn_tp_size.
-    assert bindings_cfg.hidden_size == cfg.hidden_size // attn_tp_size
+    assert bindings_cfg.hidden_size == ceil_div(cfg.hidden_size, attn_tp_size)
     if isinstance(cfg.num_key_value_heads, (list, tuple)):
         expected_num_kv_heads_per_layer = [
-            kv // (attn_tp_size * attn_cp_size) for kv in cfg.num_key_value_heads
+            ceil_div(kv, attn_tp_size * attn_cp_size) for kv in cfg.num_key_value_heads
         ]
         assert list(bindings_cfg.num_kv_heads_per_layer) == expected_num_kv_heads_per_layer
         assert bindings_cfg.num_kv_heads(0) == expected_num_kv_heads_per_layer[0]
     else:
-        assert bindings_cfg.num_kv_heads(0) == cfg.num_key_value_heads // (
-            attn_tp_size * attn_cp_size
+        assert bindings_cfg.num_kv_heads(0) == ceil_div(
+            cfg.num_key_value_heads, attn_tp_size * attn_cp_size
         )
 
     # tp_size-dependent value (uses mapping.tp_size, not attn_tp_size).
-    assert bindings_cfg.mlp_hidden_size == (cfg.intermediate_size // mapping.tp_size)
+    assert bindings_cfg.mlp_hidden_size == ceil_div(cfg.intermediate_size, mapping.tp_size)
     assert bindings_cfg.tokens_per_block == tokens_per_block
 
 

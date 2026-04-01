@@ -4,14 +4,9 @@ attn_backend: trtllm
 compile_backend: torch-cudagraph
 model_factory: Mistral3ForConditionalGeneration
 skip_loading_weights: false
-max_seq_len: 4096 # ISL=1000 + OSL=1000 + headroom
-max_batch_size: 64
-enable_chunked_prefill: true
-cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+max_seq_len: 512
 world_size: 8
 tokenizer: mistralai/Mistral-Small-4-119B-2603
-kv_cache_config:
-  free_gpu_memory_fraction: 0.8
 transforms:
   insert_cached_mla_attention:
     backend: triton_mla
