@@ -649,8 +649,7 @@ class KvCacheAwareRouter(Router):
             tokens_per_block = int(env_tokens_per_block)
         self._tokens_per_block = tokens_per_block
         logger.info(
-            f"KvCacheAwareRouter: tokens_per_block={self._tokens_per_block}"
-        )
+            f"KvCacheAwareRouter: tokens_per_block={self._tokens_per_block}")
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:

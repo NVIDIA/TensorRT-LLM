@@ -116,7 +116,8 @@ def allocate_gpus(
     return allocations
 
 
-def convert_allocations_to_server_config(allocations, server_port=8333,
+def convert_allocations_to_server_config(allocations,
+                                         server_port=8333,
                                          router_config=None):
     generation_servers = {}
     context_servers = {}
