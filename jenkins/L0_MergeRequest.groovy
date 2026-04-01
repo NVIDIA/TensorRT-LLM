@@ -380,7 +380,7 @@ def mergeWaiveList(pipeline, globalVars)
         sh """
             python3 mergeWaiveList.py \
             --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
-            --latest-waive-list=waives_TOT.txt \
+            --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
             --diff-file=diff_content.txt \
             --output-file=waives.txt
         """
