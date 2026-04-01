@@ -316,10 +316,8 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
 
         for token_idx, token_logprobs in enumerate(logprobs):
             # The target token for position t is the next prompt token
-            is_last_position = (token_idx == len(token_ids) - 1)
-            target_token_id = (
-                token_ids[token_idx + 1] if not is_last_position else None
-            )
+            is_last_position = token_idx == len(token_ids) - 1
+            target_token_id = token_ids[token_idx + 1] if not is_last_position else None
 
             print(
                 f"\n  Token {token_idx}: "
