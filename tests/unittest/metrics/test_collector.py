@@ -276,16 +276,16 @@ class TestConfigInfoMetrics:
         from prometheus_client import REGISTRY
         assert "trtllm_speculative_config_info" in REGISTRY._names_to_collectors
 
-    def test_cache_config_info(self, collector):
-        cache_config = {
+    def test_kv_cache_config_info(self, collector):
+        kv_cache_config = {
             "page_size": "64",
             "enable_block_reuse": "True",
             "cache_dtype": "auto",
         }
-        collector.log_config_info(cache_config=cache_config)
+        collector.log_config_info(kv_cache_config=kv_cache_config)
 
         from prometheus_client import REGISTRY
-        assert "trtllm_cache_config_info" in REGISTRY._names_to_collectors
+        assert "trtllm_kv_cache_config_info" in REGISTRY._names_to_collectors
 
     def test_no_config_no_error(self, collector):
         """No error when all configs are None."""

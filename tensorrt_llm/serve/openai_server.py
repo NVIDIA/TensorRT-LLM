@@ -405,16 +405,28 @@ class OpenAIServer:
         except (ImportError, RuntimeError) as e:
             logger.debug("Could not detect GPU type for config metrics: %s", e)
 
-        # Parallel config
-        tp_size = getattr(args, "tensor_parallel_size", 1) or 1
-        pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+        # Parallel config — prefer parallel_config from generator args
+        # for accurate values including cp_size and world_size.
+        par_cfg = getattr(args, "parallel_config", None)
+        if par_cfg is not None:
+            tp_size = getattr(par_cfg, "tp_size", 1) or 1
+            pp_size = getattr(par_cfg, "pp_size", 1) or 1
+            cp_size = getattr(par_cfg, "cp_size", 1) or 1
+            world_size = getattr(par_cfg, "world_size", tp_size * pp_size * cp_size)
+        else:
+            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
+            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+            cp_size = 1
+            world_size = tp_size * pp_size * cp_size
         parallel_config = {
             "tensor_parallel_size": str(tp_size),
             "pipeline_parallel_size": str(pp_size),
-            "gpu_count": str(tp_size * pp_size),
+            "context_parallel_size": str(cp_size),
+            "gpu_count": str(world_size),
         }
-        ep_size = getattr(args, "moe_expert_parallel_size", None)
-        if ep_size is not None:
+        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
+            getattr(args, "moe_expert_parallel_size", None)
+        if ep_size is not None and ep_size > 0:
             parallel_config["expert_parallel_size"] = str(ep_size)
 
         # Speculative decoding config
@@ -435,24 +447,24 @@ class OpenAIServer:
                 speculative_config["spec_draft_model"] = str(draft_model)
 
         # KV cache config
-        kv_cache_config = getattr(args, "kv_cache_config", None)
-        cache_config = None
-        if kv_cache_config is not None:
-            cache_config = {}
+        kv_cache_cfg = getattr(args, "kv_cache_config", None)
+        kv_cache_config = None
+        if kv_cache_cfg is not None:
+            kv_cache_config = {}
             for field in ("page_size", "enable_block_reuse",
                           "enable_partial_reuse", "free_gpu_memory_fraction"):
-                val = getattr(kv_cache_config, field, None)
+                val = getattr(kv_cache_cfg, field, None)
                 if val is not None:
-                    cache_config[field] = str(val)
-            kv_dtype = getattr(kv_cache_config, "dtype", None)
+                    kv_cache_config[field] = str(val)
+            kv_dtype = getattr(kv_cache_cfg, "dtype", None)
             if kv_dtype is not None:
-                cache_config["cache_dtype"] = str(kv_dtype)
+                kv_cache_config["cache_dtype"] = str(kv_dtype)
 
         self.metrics_collector.log_config_info(
             model_config=model_config,
             parallel_config=parallel_config,
             speculative_config=speculative_config,
-            cache_config=cache_config if cache_config else None,
+            kv_cache_config=kv_cache_config if kv_cache_config else None,
         )
 
     async def await_disconnected(self, raw_request: Request, promise):

@@ -78,7 +78,7 @@ class MetricsCollector:
             trtllm_model_config_info
             trtllm_parallel_config_info
             trtllm_speculative_config_info
-            trtllm_cache_config_info
+            trtllm_kv_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
 
@@ -332,7 +332,7 @@ class MetricsCollector:
                         model_config: Optional[Dict[str, str]] = None,
                         parallel_config: Optional[Dict[str, str]] = None,
                         speculative_config: Optional[Dict[str, str]] = None,
-                        cache_config: Optional[Dict[str, str]] = None) -> None:
+                        kv_cache_config: Optional[Dict[str, str]] = None) -> None:
         """
         Log static configuration as Prometheus info-style gauges (set to 1 with config labels).
 
@@ -343,7 +343,7 @@ class MetricsCollector:
             model_config: Model configuration labels (model, dtype, quantization, gpu_type, etc.)
             parallel_config: Parallelism configuration labels (tp_size, pp_size, etc.)
             speculative_config: Speculative decoding configuration labels (method, draft_model, etc.)
-            cache_config: KV cache configuration labels (page_size, enable_block_reuse, etc.)
+            kv_cache_config: KV cache configuration labels (page_size, enable_block_reuse, etc.)
         """
         from prometheus_client import Gauge
 
@@ -371,10 +371,10 @@ class MetricsCollector:
                 labelnames=info_labels.keys())
             gauge.labels(**info_labels).set(1)
 
-        if cache_config:
-            info_labels = {**self.labels, **cache_config}
+        if kv_cache_config:
+            info_labels = {**self.labels, **kv_cache_config}
             gauge = Gauge(
-                name=self.metric_prefix + "cache_config_info",
+                name=self.metric_prefix + "kv_cache_config_info",
                 documentation="KV cache configuration info",
                 labelnames=info_labels.keys())
             gauge.labels(**info_labels).set(1)
