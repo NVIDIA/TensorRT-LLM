@@ -730,7 +730,12 @@ class Qwen3_5MoeCausalLMOutput(ModelOutput):
 
 
 class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-    """Qwen3.5 MoE text model (embed + decoder layers + final norm)."""
+    """Qwen3.5 MoE text model (embed + decoder layers + final norm + lm_head).
+
+    lm_head is included so that the exported GraphModule contains it directly,
+    allowing sharding and gather_logits_before_lm_head transforms to see it
+    without post-export grafting.
+    """
 
     def __init__(self, config: Qwen3_5MoeTextConfig):
         super().__init__(config)
@@ -746,9 +751,14 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         )
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
+        self.lm_head = None  # set by parent model via set_lm_head()
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def set_lm_head(self, lm_head: nn.Module):
+        """Set the lm_head from the parent model."""
+        self.lm_head = lm_head
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -801,6 +811,9 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             hidden_states = decoder_layer(hidden_states, position_embeddings=position_embeddings)
 
         hidden_states = self.norm(hidden_states)
+        if self.lm_head is not None:
+            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+            return Qwen3_5MoeOutput(last_hidden_state=logits)
         return Qwen3_5MoeOutput(last_hidden_state=hidden_states)
 
 
@@ -814,6 +827,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         self.model = Qwen3_5MoeTextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.set_lm_head(self.lm_head)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -848,8 +862,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             rope_cos=rope_cos,
             rope_sin=rope_sin,
         )
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        # lm_head is inside the text model, outputs already contain logits
+        logits = outputs[0]
         return Qwen3_5MoeCausalLMOutput(logits=logits)
 
 
@@ -2565,6 +2579,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+        # Share lm_head with the text model so it's inside the exported graph
+        self.model.language_model.set_lm_head(self.lm_head)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2590,13 +2606,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
             video_grid_thw=video_grid_thw,
             **kwargs,
         )
-        hidden_states = outputs.last_hidden_state
-        # If lm_head was grafted into the exported graph, the language_model
-        # already produces logits — skip the redundant application.
-        if getattr(self.model.language_model, "_lm_head_grafted", False):
-            logits = hidden_states
-        else:
-            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        # lm_head is inside language_model, so outputs already contain logits
+        logits = outputs.last_hidden_state
         return Qwen3_5MoeConditionalOutput(logits=logits)
 
 
@@ -2616,9 +2627,8 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
     can see and optimize it.
     """
 
-    def __init__(self, submodule_name: str, lm_head: nn.Module | None = None):
+    def __init__(self, submodule_name: str):
         super().__init__(submodule_name)
-        self._lm_head = lm_head
 
     def _init_dynamic_shape_lookup(self):
         base = super()._init_dynamic_shape_lookup()
@@ -2626,56 +2636,6 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
         seq_len_dyn = Dim.DYNAMIC
         base["position_ids"] = {1: batch_size_dyn, 2: seq_len_dyn}
         return base
-
-    def post_process(self, sub_mod: nn.Module, sub_gm):
-        """Extend parent post_process to graft lm_head into the exported graph.
-
-        After grafting, the graph outputs logits directly.  We also set a flag
-        on the top-level model so that its ``forward()`` knows to skip the
-        redundant ``self.lm_head(...)`` call.
-        """
-        super().post_process(sub_mod, sub_gm)
-
-        if self._lm_head is None:
-            return
-
-        # 1. Attach lm_head as a submodule of the graph module
-        sub_gm.lm_head = self._lm_head
-
-        # 2. Graft lm_head into the computation graph:
-        #    old: output(hidden_states) -> new: output(lm_head(hidden_states).float())
-        graph = sub_gm.graph
-        output_node = next(n for n in graph.nodes if n.op == "output")
-        hidden_states = output_node.args[0]
-        if isinstance(hidden_states, (tuple, list)):
-            hidden_states = hidden_states[0]
-
-        with graph.inserting_before(output_node):
-            # lm_head linear using auto_deploy.torch_linear_simple so that
-            # the sharding transform and gather_logits_before_lm_head recognize
-            # it as a linear node.
-            lm_head_weight = graph.get_attr("lm_head.weight")
-            lm_head_weight.name = "lm_head_weight"
-            logits = graph.call_function(
-                torch.ops.auto_deploy.torch_linear_simple,
-                args=(hidden_states, lm_head_weight, None),
-            )
-            logits.name = "lm_head_torch_linear_simple"
-
-            # Cast to float32 using aten.to.dtype (not .float() which produces
-            # a call_method node that get_lm_head_node cannot see through).
-            logits_f32 = graph.call_function(
-                torch.ops.aten.to.dtype, args=(logits, torch.float32)
-            )
-
-        output_node.replace_input_with(hidden_states, logits_f32)
-        graph.lint()
-        sub_gm.recompile()
-
-        # 3. Mark that lm_head is now inside the graph so the parent forward
-        #    (Qwen3_5MoeForConditionalGeneration.forward) skips the redundant
-        #    lm_head application.
-        sub_gm._lm_head_grafted = True
 
     @classmethod
     def from_autoinferred(cls, model: nn.Module) -> "Qwen3_5MoeTextExportInfo":
@@ -2694,8 +2654,7 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
                 f"object of type {text_config_cls}."
             )
 
-        lm_head = getattr(model, "lm_head", None)
-        return cls(submodule_key, lm_head=lm_head)
+        return cls(submodule_key)
 
 
 class Qwen3_5MoeADInputProcessor:
