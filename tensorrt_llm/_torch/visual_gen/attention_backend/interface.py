@@ -47,7 +47,11 @@ class AttentionBackend(nn.Module, ABC):
 
     @abstractmethod
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor: ...
 
     @property
