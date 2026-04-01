@@ -3584,9 +3584,31 @@ class PyTorchModelEngine(ModelEngine):
                     current_lora_params['weight_pointers'])
 
         if lora_params:
-            lora_params['host_request_types'] = attn_metadata.host_request_types
-            lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
-            lora_params['num_seqs'] = attn_metadata.num_seqs
+            host_request_types = attn_metadata.host_request_types
+            prompt_lens_cpu = attn_metadata.prompt_lens_cpu
+            num_seqs = attn_metadata.num_seqs
+            num_contexts = attn_metadata.num_contexts
+            num_generations = attn_metadata.num_generations
+
+            # During spec decode verification (non-extend_ctx mode), each
+            # generation request processes (runtime_draft_len + 1) tokens at
+            # once. The LoRA op's C++ kernel only advances 1 token per
+            # kGENERATION request, so we re-label generation requests as
+            # kCONTEXT and set prompt_lens_cpu to the actual per-request token
+            # count so the kernel correctly expands LoRA weights for all tokens.
+            if (self.enable_spec_decode and self.runtime_draft_len > 0
+                    and self.spec_config.is_linear_tree
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend) and num_generations > 0):
+                tokens_per_req = self.runtime_draft_len + 1
+                host_request_types = host_request_types.clone()
+                host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT
+                prompt_lens_cpu = prompt_lens_cpu.clone()
+                prompt_lens_cpu[num_contexts:num_seqs].fill_(tokens_per_req)
+
+            lora_params['host_request_types'] = host_request_types
+            lora_params['prompt_lens_cpu'] = prompt_lens_cpu
+            lora_params['num_seqs'] = num_seqs
 
         return lora_params
 
