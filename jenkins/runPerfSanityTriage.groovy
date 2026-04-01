@@ -85,10 +85,12 @@ def runPerfTriageBot() {
 
         // Create workspace on the login node
         // GB200 clusters use svc_tensorrt's home; B200 clusters use the Jenkins agent workspace
-        def isGB200 = params.CLUSTER?.contains("gb200")
-        def workspace = isGB200
-            ? "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
-            : "/home/jenkins/agent/workspace/LLM/TRTLLM-Perf/PerfSanityTriage/perf-triage-bot-${env.BUILD_TAG}"
+        // def isGB200 = params.CLUSTER?.contains("gb200")
+        // def workspace = isGB200
+        //     ? "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
+        //     : "/home/jenkins/agent/workspace/LLM/TRTLLM-Perf/PerfSanityTriage/perf-triage-bot-${env.BUILD_TAG}"
+
+        def workspace = "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
         Utils.exec(this, script: Utils.sshUserCmd(remote, "\"mkdir -p ${workspace}\""), numRetries: 3)
         Utils.exec(this, script: Utils.sshUserCmd(remote,
             "\"cd ${workspace} && (rm -rf trtllm-perf-triage-bot; git clone https://gitlab-master.nvidia.com/chenfeiz/trtllm-perf-triage-bot.git)\""),
