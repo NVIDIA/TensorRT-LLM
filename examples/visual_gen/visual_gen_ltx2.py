@@ -148,6 +148,11 @@ def parse_args():
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
 
+    # CUDA graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
     # torch.compile
     parser.add_argument(
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
@@ -215,6 +220,7 @@ def _build_diffusion_args(args) -> VisualGenArgs:
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
+        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
         pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },

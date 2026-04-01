@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
 import copy
+import gc
 import json
 import time
 from pathlib import Path
@@ -13,7 +14,9 @@ import torch
 import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
+from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
@@ -182,6 +185,151 @@ class LTX2TeaCacheExtractor:
             run_transformer_blocks=run_blocks,
             postprocess=postprocess,
         )
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph runner for Modality-based transformer interface
+# ---------------------------------------------------------------------------
+
+
+class _LTX2CUDAGraphRunner(CUDAGraphRunner):
+    """CUDAGraphRunner extended for LTX-2's ``Modality``-based transformer.
+
+    The base runner derives graph keys from flat ``torch.Tensor`` args.
+    LTX-2's transformer takes ``Modality`` dataclasses (bundles of tensors)
+    and optional ``BatchedPerturbationConfig`` objects that affect control flow.
+
+    This subclass overrides key derivation, capture, and replay so that
+    ``Modality`` tensors are included in the graph key, cloned into static
+    buffers at capture time, and copied in-place at replay time.
+    """
+
+    @staticmethod
+    def _perturbation_fingerprint(perturbations):
+        """Return a hashable fingerprint of a ``BatchedPerturbationConfig``."""
+        parts = []
+        for pc in perturbations.perturbations:
+            if pc.perturbations is None:
+                parts.append(None)
+            else:
+                for p in pc.perturbations:
+                    blocks = tuple(p.blocks) if p.blocks is not None else None
+                    parts.append((p.type.value, blocks))
+        return tuple(parts)
+
+    # -- key derivation ------------------------------------------------------
+
+    def _key_parts_for(self, prefix, v):
+        """Yield ``(label, shape_or_tag)`` pairs for a single argument."""
+        if isinstance(v, torch.Tensor):
+            yield (prefix, tuple(v.shape))
+        elif isinstance(v, Modality):
+            yield (f"{prefix}.latent", tuple(v.latent.shape))
+            yield (f"{prefix}.timesteps", tuple(v.timesteps.shape))
+            yield (f"{prefix}.positions", tuple(v.positions.shape))
+            yield (f"{prefix}.context", tuple(v.context.shape))
+            if v.context_mask is not None:
+                yield (f"{prefix}.context_mask", tuple(v.context_mask.shape))
+        elif isinstance(v, BatchedPerturbationConfig):
+            fp = self._perturbation_fingerprint(v)
+            yield (prefix, f"perturbed:{fp}")
+        elif v is None:
+            yield (prefix, None)
+
+    def get_graph_key(self, *args, **kwargs):
+        parts = []
+        for i, arg in enumerate(args):
+            parts.extend(self._key_parts_for(f"a{i}", arg))
+        for k in sorted(kwargs.keys()):
+            parts.extend(self._key_parts_for(k, kwargs[k]))
+        return tuple(parts)
+
+    # -- clone / copy helpers ------------------------------------------------
+
+    @staticmethod
+    def _clone_value(v):
+        if isinstance(v, torch.Tensor):
+            return v.clone()
+        if isinstance(v, Modality):
+            # NOTE: must be kept in sync with Modality dataclass fields.
+            return Modality(
+                latent=v.latent.clone(),
+                timesteps=v.timesteps.clone(),
+                positions=v.positions.clone(),
+                context=v.context.clone(),
+                enabled=v.enabled,
+                context_mask=v.context_mask.clone() if v.context_mask is not None else None,
+            )
+        return v
+
+    @staticmethod
+    def _copy_value(dst, src):
+        """Copy data from *src* into *dst* static buffer in-place."""
+        if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
+            dst.copy_(src)
+            return dst
+        if isinstance(src, Modality) and isinstance(dst, Modality):
+            dst.latent.copy_(src.latent)
+            dst.timesteps.copy_(src.timesteps)
+            dst.positions.copy_(src.positions)
+            dst.context.copy_(src.context)
+            if src.context_mask is not None and dst.context_mask is not None:
+                dst.context_mask.copy_(src.context_mask)
+            return dst
+        return src
+
+    @staticmethod
+    def _make_output_ref(x):
+        """``make_weak_ref`` variant that tolerates ``None`` in tuples.
+
+        The LTX-2 transformer returns ``(video_vel, audio_vel)`` where
+        either element may be ``None`` for modality-isolated passes.
+        """
+        if x is None:
+            return None
+        if isinstance(x, tuple):
+            return tuple(_LTX2CUDAGraphRunner._make_output_ref(i) for i in x)
+        if isinstance(x, list):
+            return [_LTX2CUDAGraphRunner._make_output_ref(i) for i in x]
+        return make_weak_ref(x)
+
+    # -- capture / replay ----------------------------------------------------
+
+    def capture(self, key, fn, args, kwargs):
+        logger.info(
+            f"Capturing CUDA graph for LTX2 transformer (key hash={hash(key) & 0xFFFF:04x})"
+        )
+
+        static_args = [self._clone_value(arg) for arg in args]
+        static_kwargs = {k: self._clone_value(v) for k, v in kwargs.items()}
+
+        graph = torch.cuda.CUDAGraph()
+        for _ in range(self.WARMUP_STEPS):
+            fn(*static_args, **static_kwargs)
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        with torch.cuda.graph(graph, pool=self._get_pool()):
+            output = fn(*static_args, **static_kwargs)
+
+        self.graphs[key] = graph
+        self.static_inputs[key] = (static_args, static_kwargs)
+        self.graph_outputs[key] = self._make_output_ref(output)
+        self.memory_pool = graph.pool()
+
+        if self._shared_pool is not None and self._shared_pool.handle is None:
+            self._shared_pool.handle = self.memory_pool
+
+    def replay(self, key, args, kwargs):
+        static_args, static_kwargs = self.static_inputs[key]
+        for i, arg in enumerate(args):
+            static_args[i] = self._copy_value(static_args[i], arg)
+        for k, v in kwargs.items():
+            if k in static_kwargs:
+                static_kwargs[k] = self._copy_value(static_kwargs[k], v)
+        self.graphs[key].replay()
+        return self.graph_outputs[key]
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +548,41 @@ class LTX2Pipeline(BasePipeline):
             model_config=self.model_config,
         )
         self.transformer._transformer_config = vars(cfg)
+
+    # ------------------------------------------------------------------
+    # CUDA graph setup (Modality-aware override)
+    # ------------------------------------------------------------------
+
+    def _setup_cuda_graphs(self):
+        """Wrap the transformer with Modality-aware CUDA graph capture/replay.
+
+        Overrides the base implementation because LTX-2's transformer forward
+        takes ``Modality`` dataclass inputs and optional
+        ``BatchedPerturbationConfig``, neither of which the base
+        ``CUDAGraphRunner`` can handle (it only processes flat tensors).
+
+        Uses ``_LTX2CUDAGraphRunner`` which extends key derivation, cloning,
+        and in-place copy to support these types.
+
+        Compatible with torch.compile: when both are enabled, the CUDA graph
+        runner wraps the compiled transformer.  The graph capture happens
+        during warmup — by that time torch.compile's lazy compilation has
+        already been triggered by the CUDAGraphRunner's internal warmup
+        iterations (WARMUP_STEPS=2), so the captured graph contains the
+        optimized compiled kernels.
+        """
+        if not self.model_config.cuda_graph.enable_cuda_graph:
+            return
+
+        runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        compile_note = (
+            " (with torch.compile)" if self.model_config.torch_compile.enable_torch_compile else ""
+        )
+        logger.info(
+            f"CUDA graph runner: wrapping transformer.forward (Modality-aware){compile_note}"
+        )
+        self.transformer.forward = runner.wrap(self.transformer.forward)
+        self._cuda_graph_runners["transformer"] = runner
 
     # ------------------------------------------------------------------
     # Component loading
