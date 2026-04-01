@@ -221,12 +221,12 @@ echo "Start by reading PIPELINE.md to understand the overall workflow." >> ${sys
 # pipeline should still succeed so that context is preserved for
 # follow-up runs.
 set +e +o pipefail
-ANTHROPIC_BASE_URL=https://inference-api.nvidia.com ANTHROPIC_AUTH_TOKEN=${authToken} python3 claude_cli.py -p "${escapedPrompt}" --system-prompt-file ${systemPromptFile} --allowed-paths ${workspace} --model aws/anthropic/bedrock-claude-opus-4-6 --max-turns 500 --save-context ${contextFile} ${restoreContextArg} 2>${workspace}/claude-stderr.log | tee ${workspace}/claude-output.log
+ANTHROPIC_BASE_URL=https://inference-api.nvidia.com ANTHROPIC_AUTH_TOKEN=${authToken} python3 claude_cli.py -p "${escapedPrompt}" --system-prompt-file ${systemPromptFile} --allowed-paths ${workspace} --model aws/anthropic/bedrock-claude-opus-4-6 --max-turns 500 --save-context ${contextFile} ${restoreContextArg} 2>&1 | tee ${workspace}/claude-output.log
 CLAUDE_EXIT=\$?
 set -e -o pipefail
 
 if [ \$CLAUDE_EXIT -ne 0 ]; then
-    echo "WARNING: claude_cli.py exited with code \$CLAUDE_EXIT (see claude-stderr.log for details)"
+    echo "WARNING: claude_cli.py exited with code \$CLAUDE_EXIT"
 fi
 """
         def runScriptBase64 = runScriptContent.bytes.encodeBase64().toString()
@@ -252,28 +252,26 @@ pipeline {
         ANTHROPIC_AUTH_TOKEN=credentials("ANTHROPIC_AUTH_TOKEN")
     }
     parameters {
-        string(name: "OPERATION", defaultValue: "TRTLLM PERF TRIAGE BOT", description: "Operation to perform.")
-        string(name: "BRANCH", defaultValue: "main", description: "Branch to checkout. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        string(name: "OPEN_SEARCH_PROJECT_NAME", defaultValue: "swdl-trtllm-infra-ci-prod-perf_sanity_info", description: "OpenSearch project name. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        string(name: "QUERY_JOB_NUMBER", defaultValue: "1", description: "Number of latest jobs to query. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        string(name: "SLACK_CHANNEL_ID", defaultValue: "C0A7D0LCA1F", description: "Slack channel IDs to send messages to. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        string(name: "SLACK_BOT_TOKEN", defaultValue: "", description: "Slack bot token for authentication. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        choice(name: "CLUSTER", choices: ["auto:gb200-flex", "auto:dgx-b200-flex"], description: "Cluster to run perf triage bot on. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        choice(name: "BUG_TYPE", choices: ["Perf Regression", "Perf Improvement", "Perf Instability", "Functional Failure"], description: "Type of bug. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "PERF_METRIC", defaultValue: "", description: "Optional: the metric that regressed or fluctuates (e.g., output_token_throughput, total_token_throughput, e2e_latency, e2e_runtime). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "TEST_NAME", defaultValue: "", description: "Required: CI perf sanity test name (e.g., k2_thinking_fp4_tep8_32k8k-con2_iter10_32k8k) or full pytest ID. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "BAD_COMMIT", defaultValue: "", description: "Required: bad commit hash (e.g., def5678). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "BAD_BRANCH", defaultValue: "", description: "Optional: branch for bad commit (e.g., main). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "GOOD_COMMIT", defaultValue: "", description: "Optional: good commit hash (e.g., abc1234). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "GOOD_BRANCH", defaultValue: "", description: "Optional: branch for good commit (e.g., main). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "GOOD_PERF_VALUE", defaultValue: "", description: "Optional: good perf value (e.g., 1186.43). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "BAD_PERF_VALUE", defaultValue: "", description: "Optional: bad perf value (e.g., 1085.13). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        text(name: "ADDITIONAL_CONTEXT", defaultValue: "", description: "Optional: any extra context or notes for the agent. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "RESTORE_JOB_ID", defaultValue: "", description: "Build number of a previous PerfSanityTriage job to restore conversation context from. Leave empty for a fresh session. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        choice(name: "OPERATION", choices: ["Run Perf Triage Bot", "Update Perf Data"], description: "Operation to perform.")
+        string(name: "BRANCH", defaultValue: "main", description: "Branch to checkout. (Only used when OPERATION is Update Perf Data)")
+        choice(name: "OPEN_SEARCH_PROJECT_NAME", choices: ["swdl-trtllm-infra-ci-prod-perf_sanity_info"], description: "OpenSearch project name. (Only used when OPERATION is Update Perf Data)")
+        text(name: "COMMANDS", defaultValue: "", description: "UPDATE commands, one per line. Example: UPDATE SET field=value WHERE condition=value. (Only used when OPERATION is Update Perf Data)")
+        choice(name: "CLUSTER", choices: ["auto:gb200-flex", "auto:dgx-b200-flex"], description: "Cluster to run perf triage bot on. (Only used when OPERATION is Run Perf Triage Bot)")
+        choice(name: "BUG_TYPE", choices: ["Perf Regression", "Perf Improvement", "Perf Instability", "Functional Failure"], description: "Type of bug. (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "PERF_METRIC", defaultValue: "", description: "Optional: the metric that regressed or fluctuates (e.g., output_token_throughput, total_token_throughput, e2e_latency, e2e_runtime). (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "TEST_NAME", defaultValue: "", description: "Required: CI perf sanity test name (e.g., k2_thinking_fp4_tep8_32k8k-con2_iter10_32k8k) or full pytest ID. (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "BAD_COMMIT", defaultValue: "", description: "Required: bad commit hash (e.g., def5678). (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "BAD_BRANCH", defaultValue: "", description: "Optional: branch for bad commit (e.g., main). (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "GOOD_COMMIT", defaultValue: "", description: "Optional: good commit hash (e.g., abc1234). (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "GOOD_BRANCH", defaultValue: "", description: "Optional: branch for good commit (e.g., main). (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "GOOD_PERF_VALUE", defaultValue: "", description: "Optional: good perf value (e.g., 1186.43). (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "BAD_PERF_VALUE", defaultValue: "", description: "Optional: bad perf value (e.g., 1085.13). (Only used when OPERATION is Run Perf Triage Bot)")
+        text(name: "ADDITIONAL_CONTEXT", defaultValue: "", description: "Optional: any extra context or notes for the agent. (Only used when OPERATION is Run Perf Triage Bot)")
+        string(name: "RESTORE_JOB_ID", defaultValue: "", description: "Build number of a previous PerfSanityTriage job to restore conversation context from. Leave empty for a fresh session. (Only used when OPERATION is Run Perf Triage Bot)")
     }
     stages {
         stage("Run Perf Triage Bot") {
-            when { expression { params.OPERATION == "TRTLLM PERF TRIAGE BOT" } }
+            when { expression { params.OPERATION == "Run Perf Triage Bot" } }
             steps {
                 container("trt-llm") {
                     script {
@@ -285,26 +283,22 @@ pipeline {
                 }
             }
         } // stage Run Perf Triage Bot
-        stage("Run Perf Sanity Script") {
-            when { expression { params.OPERATION == "SLACK BOT SENDS MESSAGE" } }
+        stage("Update Perf Data") {
+            when { expression { params.OPERATION == "Update Perf Data" } }
             steps {
                 container("trt-llm") {
                     script {
                         sh "pwd && ls -alh"
-                        sh "env | sort"
                         trtllm_utils.checkoutSource(LLM_REPO, params.BRANCH, LLM_ROOT, false, false)
-                        sh "pip install slack_sdk"
+                        def commandsBase64 = params.COMMANDS.bytes.encodeBase64().toString()
                         sh """
-                            cd ${LLM_ROOT}/jenkins/scripts/perf && ls -alh && python3 perf_sanity_triage.py \
+                            cd ${LLM_ROOT}/jenkins/scripts/perf && python3 perf_sanity_triage.py \
                             --project_name "${params.OPEN_SEARCH_PROJECT_NAME}" \
-                            --operation "${params.OPERATION}" \
-                            --channel_id "${params.SLACK_CHANNEL_ID}" \
-                            --bot_token "${params.SLACK_BOT_TOKEN}" \
-                            --query_job_number "${params.QUERY_JOB_NUMBER}"
+                            --commands "\$(echo '${commandsBase64}' | base64 -d)"
                         """
                     }
                 }
             }
-        } // stage Run Perf Sanity Script
+        } // stage Update Perf Data
     } // stages
 } // pipeline
