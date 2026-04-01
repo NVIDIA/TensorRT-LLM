@@ -179,23 +179,11 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
     - unittest/_torch/executor
-    - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py::TestCacheTransceiverComm::test_cache_transceiver_comm
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py::test_llm_sleep
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py::test_llm_sleep_discard_weights
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights[llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights[Qwen2.5-0.5B-Instruct]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights[Qwen3/Qwen3-8B]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights[Qwen3/Qwen3-30B-A3B]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights[Qwen3/Qwen3-8B-FP8]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights[Qwen3/Qwen3-30B-A3B-FP8]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen2.5-0.5B-Instruct]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen3/Qwen3-8B]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen3/Qwen3-30B-A3B]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen3/Qwen3-8B-FP8]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen3/Qwen3-30B-A3B-FP8]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights_with_quant_config[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8]
-    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights_with_quant_config[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B-FP8]
+    - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
+    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
+    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part0"
+    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part1"
+    - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part0"
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
