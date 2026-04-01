@@ -1133,10 +1133,10 @@ class MTPEagleWorker(MTPWorker):
         return hidden_states, position_ids
 
     @torch.compile(options={"max-autotune": True})
-    def prepare_position_ids_and_last_tokens(self, position_ids, attn_metadata):
+    def prepare_position_ids_and_last_tokens(self, position_ids, seq_lens_cuda):
         position_ids = position_ids.squeeze(0)
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        last_tokens_idx = torch.cumsum(seq_lens_cuda, dim=0,
+                                       dtype=torch.long) - 1
         return position_ids, last_tokens_idx
 
     def forward(
@@ -1175,7 +1175,7 @@ class MTPEagleWorker(MTPWorker):
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
         position_ids, last_tokens_idx = self.prepare_position_ids_and_last_tokens(
-            position_ids, attn_metadata)
+            position_ids, attn_metadata.seq_lens_cuda)
         inputs = self.prepare_drafter_inputs(input_ids=input_ids,
                                              position_ids=position_ids,
                                              last_tokens_idx=last_tokens_idx,

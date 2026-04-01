@@ -614,7 +614,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._pool_cache_valid = True
 
     @maybe_compile(dynamic=True)
-    def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens, device):
+    def _get_dense_topk_indices(self, seq_lens, kv_lens, num_tokens):
         device = kv_lens.device
         past_kv_lens = kv_lens - seq_lens
         # get position ids
@@ -642,15 +642,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.topk_indices_buffer[ctx_range, :].copy_(
                     self._get_dense_topk_indices(
                         self.seq_lens_cuda[:self.num_contexts],
-                        kv_lens[:self.num_contexts], self.num_ctx_tokens,
-                        device),
+                        kv_lens[:self.num_contexts], self.num_ctx_tokens),
                     non_blocking=True)
             else:
                 self.host_topk_indices_buffer[
                     ctx_range, :] = self._get_dense_topk_indices(
                         self.seq_lens[:self.num_contexts],
-                        kv_lens[:self.num_contexts], self.num_ctx_tokens,
-                        device)
+                        kv_lens[:self.num_contexts], self.num_ctx_tokens)
                 self.topk_indices_buffer[ctx_range, :].copy_(
                     self.host_topk_indices_buffer[ctx_range, :],
                     non_blocking=True)
@@ -662,14 +660,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     self._get_dense_topk_indices(
                         self.seq_lens_cuda[self.num_contexts:self.num_seqs],
                         kv_lens[self.num_contexts:self.num_seqs],
-                        self.num_tokens - self.num_ctx_tokens, device),
+                        self.num_tokens - self.num_ctx_tokens),
                     non_blocking=True)
             else:
                 self.host_topk_indices_buffer[
                     gen_range, :] = self._get_dense_topk_indices(
                         self.seq_lens[self.num_contexts:self.num_seqs],
                         kv_lens[self.num_contexts:self.num_seqs],
-                        self.num_tokens - self.num_ctx_tokens, device)
+                        self.num_tokens - self.num_ctx_tokens)
                 self.topk_indices_buffer[gen_range, :].copy_(
                     self.host_topk_indices_buffer[gen_range, :],
                     non_blocking=True)

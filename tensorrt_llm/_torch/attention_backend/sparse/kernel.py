@@ -1890,6 +1890,13 @@ def triton_convert_req_index_to_global_index(
     """
     if stride_factor is None:
         stride_factor = BLOCK_SIZE
+    assert req_id.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+    assert token_indices.dtype == torch.int32
+    assert token_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by" \
+        f"BLOCK_N ({BLOCK_N})"
 
     num_tokens = req_id.shape[0]
     num_requests, max_num_blocks_per_req = block_table.shape
