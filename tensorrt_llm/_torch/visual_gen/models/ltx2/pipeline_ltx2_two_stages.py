@@ -236,10 +236,16 @@ def _dequantize_fp8_weight(
     packed: bool = False,
     block_size: int = 128,
 ) -> torch.Tensor:
-    """Dequantize FP8 E4M3 weight with per-block scales back to BF16.
+    """Dequantize FP8 E4M3 weight back to BF16.
 
-    Handles both the standard float32 grid and the packed int32 layout.
+    Handles per-tensor scales (scalar), standard float32 block-scale grids,
+    and the packed int32 layout.
     """
+    bf16 = fp8_weight.to(torch.bfloat16)
+
+    if weight_scale.numel() == 1:
+        return bf16 * weight_scale.float().item()
+
     out_features, in_features = fp8_weight.shape
 
     if packed:
@@ -252,7 +258,6 @@ def _dequantize_fp8_weight(
     else:
         block_scale = weight_scale
 
-    bf16 = fp8_weight.to(torch.bfloat16)
     scale = block_scale.repeat_interleave(block_size, dim=0)[:out_features]
     scale = scale.repeat_interleave(block_size, dim=1)[:, :in_features]
     return bf16 * scale.to(bf16.device)
@@ -262,15 +267,29 @@ def _requantize_fp8_weight(
     bf16_weight: torch.Tensor,
     repack: bool = False,
     block_size: int = 128,
+    per_tensor: bool = False,
 ) -> tuple:
-    """Quantize BF16 weight to FP8 E4M3 with 128x128 block scales.
+    """Quantize BF16 weight to FP8 E4M3.
 
-    When *repack* is True the returned weight/scale pair is post-processed
-    through ``resmooth_to_fp8_e8m0`` + ``transform_sf_into_required_layout``
-    so they match the packed layout expected by SM100f / SM120 GEMM kernels.
+    When *per_tensor* is True, a single scalar scale is computed from the
+    tensor-wide absmax.  Otherwise 128x128 block scales are used.
 
-    Returns ``(qweight, block_scales)``.
+    When *repack* is True (block-scale only) the returned weight/scale pair
+    is post-processed through ``resmooth_to_fp8_e8m0`` +
+    ``transform_sf_into_required_layout`` so they match the packed layout
+    expected by SM100f / SM120 GEMM kernels.
+
+    Returns ``(qweight, scale)``.
     """
+    if per_tensor:
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        amax = bf16_weight.float().abs().max().clamp(min=1e-12)
+        scale = amax / fp8_max
+        qw = (bf16_weight.float() / scale).clamp(
+            -fp8_max, fp8_max
+        ).to(torch.float8_e4m3fn)
+        return qw, scale.to(bf16_weight.device)
+
     qw, scale = quantize_fp8_blockwise(bf16_weight, block_size)
 
     if repack:
@@ -328,7 +347,7 @@ def _apply_lora_deltas(
         # --- same shape ---------------------------------------------------
         if param.shape == delta.shape:
             if param.dtype in _FP8_DTYPES:
-                # FP8 block-scale: dequant → apply → requant
+                # FP8: dequant → apply → requant
                 scale_key = f"{base}.weight_scale"
                 if scale_key not in state:
                     raise RuntimeError(
@@ -336,10 +355,10 @@ def _apply_lora_deltas(
                     )
                 ws_param = state[scale_key]
                 out_f, in_f = delta.shape
-                is_packed = _is_fp8_scale_packed(
-                    ws_param.data,
-                    out_f,
-                    in_f,
+                is_per_tensor = ws_param.data.numel() == 1
+                is_packed = (
+                    not is_per_tensor
+                    and _is_fp8_scale_packed(ws_param.data, out_f, in_f)
                 )
 
                 saved_state[param_name] = param.data.clone()
@@ -355,6 +374,7 @@ def _apply_lora_deltas(
                 qw, new_scale = _requantize_fp8_weight(
                     bf16,
                     repack=is_packed,
+                    per_tensor=is_per_tensor,
                 )
                 param.data.copy_(qw)
                 ws_param.data.copy_(new_scale)
