@@ -612,7 +612,12 @@ class Llama4MinLatencyMoE(Llama4MoE):
         fn1 = lambda: self.compute_routed_output(
             hidden_states, all_rank_num_tokens, hidden_states_high)
         shared_output, routed_output = maybe_execute_in_parallel(
-            fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
+            fn0,
+            fn1,
+            self.moe_event[0],
+            self.moe_event[1],
+            self.aux_stream,
+            disable_on_compile=True)
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
