@@ -62,6 +62,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
 
     // Create queues for all levels: primary, secondary, and placeholder (initially empty).
     mFreeQueues.resize(kPlaceholderLevel + 1, std::vector<FreeBlocksQueue>(kNumPriorities));
+    mFreeBlockIterators.positive.resize(mAllBlocksById.size());
     mNumFreeBlocksPerLevel.resize(kPlaceholderLevel + 1, 0);
 
     for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
@@ -71,8 +72,8 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
         for (SizeType32 blockId = 0; blockId < sizes[cacheLevel]; blockId++)
         {
             // Initialize all blocks to be the default priority level
-            mFreeBlockIterators.positive.emplace_back(
-                freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]));
+            mFreeBlockIterators[startIdx + blockId]
+                = freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]);
         }
 
         mNumFreeBlocksPerLevel[cacheLevel] = sizes[cacheLevel];
@@ -88,7 +89,7 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
 
     // Placeholder IDs -2, -3, ... map to indices 2, 3, ... via abs(id).
     // Indices 0 and 1 are unused (0 is invalid, 1 corresponds to kCachedBlocksRootId).
-    mFreeBlockIterators.negative.resize(len, std::nullopt);
+    mFreeBlockIterators.negative.resize(len);
 
     auto& freeQueue = mFreeQueues[kPlaceholderLevel][defaultPriorityIdx];
 
