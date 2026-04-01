@@ -132,16 +132,13 @@ def transform_local_topk_and_prepare_pool_view(
         block_table = attn_metadata._cached_block_table_ctx
         req_idx = attn_metadata._cached_req_idx_ctx
 
-    stride_factor = attn_metadata._cached_stride_factor
-    if stride_factor is None:
-        stride_factor = attn_metadata._cached_tokens_per_block
     global_indices = torch.ops.trtllm.convert_req_index_to_global(
         req_idx,
         block_table,
         topk_indices,
         attn_metadata._cached_tokens_per_block,
         topk_indices.shape[1],
-        stride_factor,
+        attn_metadata._cached_stride_factor,
         layer_idx,
     )
 
