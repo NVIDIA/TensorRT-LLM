@@ -1,4 +1,4 @@
-"""Unit tests for autotuner bounds checking (SM121 fix).
+"""Unit tests for autotuner bounds checking.
 
 These tests verify that _find_nearest_profile and _optimization_profiles
 gracefully handle DynamicTensorSpec / ConstraintSpec entries whose
