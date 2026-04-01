@@ -705,6 +705,7 @@ def _triton_mla_prefill(
     qk_nope_head_dim: int,
     v_head_dim: int,
     out: torch.Tensor,  # [total_padded, N, v_head_dim]
+    total_num_tokens: int = 0,
 ) -> None:
     """Triton-accelerated MLA prefill with weight absorption.
 
@@ -803,7 +804,7 @@ def _triton_mla_prefill(
     # =====================================================================
     seq_lengths = seq_len.long()
     seq_start_l = seq_start.long()
-    total_tokens = seq_lengths.sum().item()
+    total_tokens = total_num_tokens
 
     if total_tokens == 0:
         out.zero_()
@@ -866,7 +867,7 @@ def _triton_mla_prefill(
     out.index_copy_(0, token_input_idx, attn_out)
 
 
-@torch.library.custom_op("auto_deploy::triton_cached_mla_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_cached_mla_with_cache", mutates_args=("mla_cache",))
 def triton_cached_mla_with_cache(
     # 5 tensor args (get_num_qkv_args = 5)
     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
@@ -978,6 +979,7 @@ def triton_cached_mla_with_cache(
             qk_nope_head_dim,
             v_head_dim,
             y,
+            total_num_tokens=num_prefill_tokens + num_decode,
         )
 
         return y.view(*output_shape)
