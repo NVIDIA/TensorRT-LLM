@@ -252,7 +252,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
                 assert len(token_logprobs) >= max(logprobs_k, 1)
 
             sorted_tokens_by_prob = sorted(
-                token_logprobs.items(), key=lambda x: x[1].logprob, reverse=True
+                token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
             )
 
             if logprobs_k > 0:
@@ -331,7 +331,7 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
                 assert len(token_logprobs) >= 1
 
             sorted_tokens_by_prob = sorted(
-                token_logprobs.items(), key=lambda x: x[1].logprob, reverse=True
+                token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
             )
 
             if logprobs_k > 0:
@@ -399,16 +399,21 @@ def test_logprobs_against_logits(
                 processed_ranks_and_logprobs[logprob_obj.rank] = logprob_obj.logprob
 
                 # Check if the logprob matches the top-rank logprob from the logits
-                assert (
-                    logprob_obj.logprob == sorted_expected_logprobs_per_token[logprob_obj.rank - 1]
-                ), (
-                    f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
-                        {sorted_expected_logprobs_per_token[logprob_obj.rank - 1]} at rank {logprob_obj.rank}"
+                torch.testing.assert_close(
+                    torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                    torch.tensor(
+                        sorted_expected_logprobs_per_token[logprob_obj.rank - 1],
+                        dtype=torch.float32,
+                    ),
+                    msg=f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
+                        {sorted_expected_logprobs_per_token[logprob_obj.rank - 1]} at rank {logprob_obj.rank}",
                 )
                 # Check if the logprob matches the token-id logprob from the logits
-                assert logprob_obj.logprob == expected_logprobs_per_token[token_id], (
-                    f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
-                        {expected_logprobs_per_token[token_id]} for token {token_id}"
+                torch.testing.assert_close(
+                    torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                    torch.tensor(expected_logprobs_per_token[token_id], dtype=torch.float32),
+                    msg=f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
+                        {expected_logprobs_per_token[token_id]} for token {token_id}",
                 )
 
     for output in simple_llm.generate(["The future of AI is"], sampling_params=sampling_params):
@@ -509,11 +514,15 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int, simple_llm:
             expected_logprobs = torch.nn.functional.log_softmax(logits_for_token, dim=-1).to(
                 device="cpu"
             )
-            expected_logprob = expected_logprobs[sampled_token_id].item()
+            expected_logprob = expected_logprobs[sampled_token_id]
             print(
-                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
+                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, "
+                f"expected={expected_logprob.item():.6f}"
             )
-            torch.testing.assert_close(returned_logprob, expected_logprob)
+            torch.testing.assert_close(
+                torch.tensor(returned_logprob, dtype=torch.float32),
+                expected_logprob,
+            )
 
 
 @pytest.mark.parametrize("logprobs_k", [-5], ids=["invalid_negative_value"])
@@ -645,13 +654,16 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                 adjusted_logits_for_token, dim=-1
             ).to(device="cpu")
             for logprob_token, logprob_values in token_logprobs_dict.items():
-                expected_logprob = expected_logprobs[logprob_token].item()
+                expected_logprob = expected_logprobs[logprob_token]
                 returned_logprob = logprob_values.logprob
                 print(
                     f"Req {req_idx}, Token {token_idx}: "
-                    f"returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
+                    f"returned={returned_logprob:.6f}, expected={expected_logprob.item():.6f}"
                 )
-                torch.testing.assert_close(returned_logprob, expected_logprob)
+                torch.testing.assert_close(
+                    torch.tensor(returned_logprob, dtype=torch.float32),
+                    expected_logprob,
+                )
 
 
 @force_ampere

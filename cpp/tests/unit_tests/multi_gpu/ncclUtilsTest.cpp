@@ -225,11 +225,10 @@ protected:
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         }
 
-        // Check if NCCL symmetric is supported
-        auto& ncclHelper = nccl_util::NCCLHelper::getInstance();
-        if (!ncclHelper.isLoaded())
+        // Check if NCCL window buffer support is available
+        if (!nccl_util::isNcclWindowSupported())
         {
-            GTEST_SKIP() << "NCCL library with symmetric memory support is not available";
+            GTEST_SKIP() << "NCCL window buffer support is not available";
         }
 
         std::set<int> group;
@@ -420,7 +419,7 @@ TEST_F(NCCLWindowAllocatorTest, ScopedBuffer)
     const size_t bufferSize = 16 * 1024;
 
     {
-        nccl_util::ScopedNCCLWindowBuffer scopedBuffer(*mComm, bufferSize);
+        nccl_util::ScopedNCCLWindowBuffer scopedBuffer(mComm, bufferSize);
         EXPECT_TRUE(scopedBuffer.getBuffer().isValid());
         EXPECT_NE(scopedBuffer.getPtr(), nullptr);
         // Compare against actual allocated size (ncclMemAlloc may allocate more than requested)
@@ -553,11 +552,10 @@ protected:
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         }
 
-        // Check if NCCL symmetric is supported
-        auto& ncclHelper = nccl_util::NCCLHelper::getInstance();
-        if (!ncclHelper.isLoaded())
+        // Check if NCCL window buffer support is available
+        if (!nccl_util::isNcclWindowSupported())
         {
-            GTEST_SKIP() << "NCCL library with symmetric memory support is not available";
+            GTEST_SKIP() << "NCCL window buffer support is not available";
         }
 
         std::set<int> group;
@@ -584,7 +582,7 @@ TEST_F(CreateNCCLWindowTensorTest, BasicTensorCreation)
 
     // Create a tensor with shape [4, 8] and float32 dtype
     std::vector<int64_t> shape = {4, 8};
-    auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+    auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
 
     // Verify tensor properties
     EXPECT_TRUE(tensor.defined());
@@ -618,7 +616,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
 
     // Test float32
     {
-        auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+        auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
         EXPECT_EQ(tensor.dtype(), torch::kFloat32);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 10 * sizeof(float));
@@ -627,7 +625,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
 
     // Test float16
     {
-        auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat16);
+        auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat16);
         EXPECT_EQ(tensor.dtype(), torch::kFloat16);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 10 * sizeof(at::Half));
@@ -636,7 +634,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)
 
     // Test int32
     {
-        auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kInt32);
+        auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kInt32);
         EXPECT_EQ(tensor.dtype(), torch::kInt32);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
         EXPECT_GE(buffer.size, 10 * sizeof(int32_t));
@@ -651,7 +649,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
     // 1D tensor
     {
         std::vector<int64_t> shape = {100};
-        auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+        auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
         EXPECT_EQ(tensor.dim(), 1);
         EXPECT_EQ(tensor.size(0), 100);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
@@ -661,7 +659,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
     // 3D tensor
     {
         std::vector<int64_t> shape = {2, 3, 4};
-        auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+        auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
         EXPECT_EQ(tensor.dim(), 3);
         EXPECT_EQ(tensor.size(0), 2);
         EXPECT_EQ(tensor.size(1), 3);
@@ -673,7 +671,7 @@ TEST_F(CreateNCCLWindowTensorTest, DifferentShapes)
     // 4D tensor
     {
         std::vector<int64_t> shape = {1, 2, 3, 4};
-        auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+        auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
         EXPECT_EQ(tensor.dim(), 4);
         EXPECT_EQ(tensor.numel(), 1 * 2 * 3 * 4);
         // ncclMemAlloc may allocate more than requested, so check at least the requested size
@@ -689,7 +687,7 @@ TEST_F(CreateNCCLWindowTensorTest, TensorDeleterReleasesBuffer)
 
     {
         std::vector<int64_t> shape = {16, 16};
-        auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+        auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
 
         EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
         EXPECT_TRUE(buffer.isValid());
@@ -712,9 +710,9 @@ TEST_F(CreateNCCLWindowTensorTest, MultipleTensors)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     std::vector<int64_t> shape = {8, 8};
-    auto [tensor1, buffer1] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
-    auto [tensor2, buffer2] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
-    auto [tensor3, buffer3] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+    auto [tensor1, buffer1] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    auto [tensor2, buffer2] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    auto [tensor3, buffer3] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
 
     EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 3);
     EXPECT_NE(buffer1.ptr, buffer2.ptr);
@@ -732,7 +730,7 @@ TEST_F(CreateNCCLWindowTensorTest, TensorStrides)
     using nccl_util::createNCCLWindowTensor;
 
     std::vector<int64_t> shape = {3, 4, 5};
-    auto [tensor, buffer] = createNCCLWindowTensor(*mComm, shape, torch::kFloat32);
+    auto [tensor, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
 
     // Verify strides are correct (row-major order)
     EXPECT_EQ(tensor.stride(0), 4 * 5); // stride for first dimension

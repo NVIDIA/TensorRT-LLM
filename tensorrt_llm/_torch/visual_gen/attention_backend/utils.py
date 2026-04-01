@@ -28,11 +28,12 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Lazy imports to avoid circular dependency
 if TYPE_CHECKING:
+    from .flash_attn4 import FlashAttn4Attention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
     # Type alias for diffusion attention backends
-    DiffusionAttentionBackend = Union[TrtllmAttention, VanillaAttention]
+    DiffusionAttentionBackend = Union[TrtllmAttention, VanillaAttention, FlashAttn4Attention]
 
 
 def get_visual_gen_attention_backend(
@@ -42,7 +43,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4")
 
     Returns:
         Diffusion attention backend class
@@ -52,8 +53,11 @@ def get_visual_gen_attention_backend(
                      Uses torch SDPA backend
         - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths)
                     Better performance but requires fused QKV
+        - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
+                         Requires flash-attn package with cute interface
     """
     # Lazy imports to avoid circular dependency
+    from .flash_attn4 import FlashAttn4Attention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
@@ -63,6 +67,8 @@ def get_visual_gen_attention_backend(
         return VanillaAttention
     elif backend_name == "TRTLLM":
         return TrtllmAttention
+    elif backend_name == "FA4":
+        return FlashAttn4Attention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention

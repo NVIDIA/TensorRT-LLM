@@ -22,7 +22,8 @@ from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
     INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
     W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
@@ -76,14 +77,17 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("min", 89),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # FP8_BLOCK_SCALES: SM == 90 only
+        # FP8_BLOCK_SCALES: SM in {90, 120}
         QuantAlgo.FP8_BLOCK_SCALES: {
-            "sm_constraint": ("exact", 90),
-            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+            "sm_constraint": ("in", {90, 120}),
+            "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103}
+        # NVFP4: SM in {100, 103, 120, 121}
+        # SM 120 = desktop Blackwell (e.g. RTX 5090 / GB202)
+        # SM 121 = GB10 / DGX Spark
+        # C++ kernel: isValidSM120MOESpecialisation() supports FP4xFP4 and FP8xFP4
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A8_AWQ: SM in {89, 90} only
@@ -129,8 +133,8 @@ class CutlassFusedMoE(MoE):
         CutlassFusedMoE supports:
         - Unquantized (FP16/BF16): SM >= 80
         - FP8 per-tensor (QDQ): SM >= 89
-        - FP8_BLOCK_SCALES: SM == 90 only
-        - NVFP4: SM in {100, 103}
+        - FP8_BLOCK_SCALES: SM in {90, 120}
+        - NVFP4: SM in {100, 103, 120, 121}
         - W4A8_AWQ: SM in {89, 90} only
         - W8A16: SM >= 80
         - W4A16_MXFP4: SM == 90 only
@@ -514,7 +518,10 @@ class CutlassFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                if get_sm_version() == 120:
+                    return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+                else:
+                    return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(

@@ -42,6 +42,7 @@ Before running these examples, ensure you have:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
+   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml > /tmp/serve.log 2>&1 &
@@ -50,6 +51,7 @@ Before running these examples, ensure you have:
    tail -f /tmp/serve.log
 
    ```
+   For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
 
 ## Examples
 
@@ -58,6 +60,7 @@ Current supported & tested models:
 1. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
 2. FLUX.1 for image generation (t2i)
 3. FLUX.2 for image generation (t2i)
+4. LTX-2 for video generation with audio (t2v, ti2v)
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
@@ -118,6 +121,19 @@ python sync_video_gen.py --mode t2v \
     --prompt "A serene sunset over the ocean" \
     --duration 5.0 --fps 30 --size 512x512 \
     --output my_video.mp4
+
+# LTX-2: Text-to-Video (generates video with audio)
+python sync_video_gen.py --mode t2v \
+    --model ltx2 \
+    --prompt "A cute cat playing with a ball in the park" \
+    --duration 5.0 --fps 24 --size 1280x720
+
+# LTX-2: Image-to-Video
+python sync_video_gen.py --mode ti2v \
+    --model ltx2 \
+    --prompt "She turns around and smiles, then slowly walks out of the frame" \
+    --image ./media/woman_skyline_original_720p.jpeg \
+    --duration 5.0 --fps 24 --size 1280x720
 ```
 
 **Command-Line Arguments:**
@@ -125,7 +141,7 @@ python sync_video_gen.py --mode t2v \
 - `--prompt` - Text prompt for video generation (required)
 - `--image` - Path to reference image (required for ti2v mode)
 - `--base-url` - API server URL (default: http://localhost:8000/v1)
-- `--model` - Model name (default: wan)
+- `--model` - Model name (default: wan). Use `ltx2` for LTX-2.
 - `--duration` - Video duration in seconds (default: 4.0)
 - `--fps` - Frames per second (default: 24)
 - `--size` - Video resolution in WxH format (default: 256x256)
@@ -171,6 +187,19 @@ python async_video_gen.py --mode t2v \
     --prompt "A serene sunset over the ocean" \
     --duration 5.0 --fps 30 --size 512x512 \
     --output my_video.mp4
+
+# LTX-2: Async Text-to-Video (generates video with audio)
+python async_video_gen.py --mode t2v \
+    --model ltx2 \
+    --prompt "A cool cat on a motorcycle in the night" \
+    --duration 5.0 --fps 24 --size 1280x720
+
+# LTX-2: Async Image-to-Video
+python async_video_gen.py --mode ti2v \
+    --model ltx2 \
+    --prompt "She turns around and smiles, then slowly walks out of the frame" \
+    --image ./media/woman_skyline_original_720p.jpeg \
+    --duration 5.0 --fps 24 --size 1280x720
 ```
 
 **Command-Line Arguments:**
@@ -178,7 +207,7 @@ python async_video_gen.py --mode t2v \
 - `--prompt` - Text prompt for video generation (required)
 - `--image` - Path to reference image (required for ti2v mode)
 - `--base-url` - API server URL (default: http://localhost:8000/v1)
-- `--model` - Model name (default: wan)
+- `--model` - Model name (default: wan). Use `ltx2` for LTX-2.
 - `--duration` - Video duration in seconds (default: 4.0)
 - `--fps` - Frames per second (default: 24)
 - `--size` - Video resolution in WxH format (default: 256x256)
@@ -249,12 +278,15 @@ You can customize these by:
 - `response_format`: "b64_json" or "url"
 
 ### Video Generation
-- `model`: Model identifier (e.g., "wan")
+- `model`: Model identifier (e.g., "wan", "ltx2")
 - `prompt`: Text description
-- `size`: Video resolution (e.g., "256x256", "512x512")
+- `size`: Video resolution (e.g., "256x256", "512x512", "1280x720")
 - `seconds`: Duration in seconds
 - `fps`: Frames per second
 - `input_reference`: Reference image file (for TI2V mode)
+
+> **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
+> `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
 
 ## Quick Reference - curl Examples
 
@@ -267,6 +299,19 @@ curl -X POST "http://localhost:8000/v1/videos" \
     "seconds": 4.0,
     "fps": 24,
     "size": "256x256"
+  }'
+```
+
+### Text-to-Video with LTX-2 (JSON, generates video with audio)
+```bash
+curl -X POST "http://localhost:8000/v1/videos" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ltx2",
+    "prompt": "A cool cat on a motorcycle",
+    "seconds": 5.0,
+    "fps": 24,
+    "size": "1280x720"
   }'
 ```
 

@@ -1,0 +1,118 @@
+import pytest
+import torch
+
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import FP8_MAX
+from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
+from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
+    FP8LinearQuantizationFromConfig,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _shard_fp4_weight_scale
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    fp4_global_scale,
+    modelopt_fp4_scale_to_cutlass_fp4_scale,
+)
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_fp4_scale_sharding(dim):
+    weight = torch.rand(130, 64, dtype=torch.half, device="cuda")
+    weight_scale_2 = fp4_global_scale(weight)
+
+    weight_scale_modelopt = (
+        torch.max(weight.reshape(weight.shape[0], -1, 16), dim=-1).values.to(torch.float)
+        / (6.0 * weight_scale_2)
+    ).to(torch.float8_e4m3fn)
+
+    weight_scale_cutlass = modelopt_fp4_scale_to_cutlass_fp4_scale(weight_scale_modelopt)
+
+    # Original uint8 weight shape (FP4 packs 2 elements per byte, so last dim is halved)
+    original_uint8_weight_shape = (130, 32)
+
+    if dim == 0:
+        expected_sharded_weight_scale_shape = 128 * 4
+    elif dim == 1:
+        expected_sharded_weight_scale_shape = 256 * 4
+
+    fp4_scale_rank_0 = _shard_fp4_weight_scale(
+        weight_scale_cutlass,
+        original_uint8_weight_shape,
+        dim,
+        0,
+        world_size=2,
+    )
+    fp4_scale_rank_1 = _shard_fp4_weight_scale(
+        weight_scale_cutlass,
+        original_uint8_weight_shape,
+        dim,
+        1,
+        world_size=2,
+    )
+    assert (
+        tuple(fp4_scale_rank_0.shape)
+        == tuple(fp4_scale_rank_1.shape)
+        == (expected_sharded_weight_scale_shape,)
+    )
+
+
+def test_fp4_global_scale():
+    input = torch.rand(3, 64, dtype=torch.half, device="cuda")
+    input[-1][-1] = 448 * 6
+    input_scale = fp4_global_scale(input)
+    assert input_scale.dtype == torch.float
+    assert input_scale == torch.tensor(1.0, dtype=torch.float)
+
+
+@pytest.mark.parametrize("amax, expected_scale", [(FP8_MAX, 1.0), (FP8_MAX / 2.0, 0.5)])
+def test_fp8_convert_amax_hook(amax, expected_scale):
+    config = TransformConfig(stage="pattern_matcher")
+    fp8_imp = FP8LinearQuantizationFromConfig(config)
+
+    mock_state_dict = {"amax": amax}
+
+    fp8_imp.convert_amax_hook(mock_state_dict, None, None, scale_name="scale", amax_name="amax")
+
+    assert "scale" in mock_state_dict
+    assert mock_state_dict["scale"] == expected_scale
+
+
+def test_fp8_load_hook_maps_prequantized_scales():
+    config = TransformConfig(stage="pattern_matcher")
+    fp8_imp = FP8LinearQuantizationFromConfig(config)
+
+    weight_name = "layer.proj.weight"
+    mock_state_dict = {
+        weight_name: torch.ones(4, 4, dtype=torch.float8_e4m3fn),
+        "layer.proj.activation_scale": torch.tensor(0.125, dtype=torch.float32),
+        "layer.proj.weight_scale_inv": torch.tensor(0.25, dtype=torch.float32),
+    }
+
+    fp8_imp.load_hook(mock_state_dict, None, None, weight_name=weight_name)
+
+    assert mock_state_dict["layer.proj.input_scale"] == torch.tensor(0.125, dtype=torch.float32)
+    assert mock_state_dict["layer.proj.weight_scale"] == torch.tensor(0.25, dtype=torch.float32)
+    assert "layer.proj.activation_scale" not in mock_state_dict
+    assert "layer.proj.weight_scale_inv" not in mock_state_dict
+
+
+def test_fp8_load_hook_maps_prequantized_scales_with_prefix():
+    config = TransformConfig(stage="pattern_matcher")
+    fp8_imp = FP8LinearQuantizationFromConfig(config)
+
+    weight_name = "layer.proj.weight"
+    prefix = "nested."
+    mock_state_dict = {
+        prefix + weight_name: torch.ones(4, 4, dtype=torch.float8_e4m3fn),
+        prefix + "layer.proj.activation_scale": torch.tensor(0.125, dtype=torch.float32),
+        prefix + "layer.proj.weight_scale_inv": torch.tensor(0.25, dtype=torch.float32),
+    }
+
+    fp8_imp.load_hook(mock_state_dict, prefix, None, weight_name=weight_name)
+
+    assert mock_state_dict[prefix + "layer.proj.input_scale"] == torch.tensor(
+        0.125, dtype=torch.float32
+    )
+    assert mock_state_dict[prefix + "layer.proj.weight_scale"] == torch.tensor(
+        0.25, dtype=torch.float32
+    )
+    assert prefix + "layer.proj.activation_scale" not in mock_state_dict
+    assert prefix + "layer.proj.weight_scale_inv" not in mock_state_dict

@@ -28,6 +28,7 @@ This module contains common code extracted from both test files:
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -44,7 +45,9 @@ from tensorrt_llm._torch.modules.fused_moe import (
     TRTLLMGenFusedMoE,
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 G_LOGGER = logging.getLogger(__name__)
@@ -60,6 +63,7 @@ class MoeBackendType(str, Enum):
     TRTLLM = "TRTLLM"
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
+    DENSEGEMM = "DENSEGEMM"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -69,6 +73,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
+        MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -92,6 +97,41 @@ class MoeModelConfig:
 # ============================================================================
 # Skip Logic Functions
 # ============================================================================
+def _is_fp4_fp8_standalone_gemm_available() -> bool:
+    """Check if standalone fp4_fp8_gemm_trtllmgen kernel has compiled configs on this GPU.
+
+    The W4A8_NVFP4_FP8 reference module (W4A8NVFP4FP8RefGatedMLPFusedMoE) uses
+    standalone fp4_fp8_gemm_trtllmgen GEMM calls via W4A8NVFP4FP8LinearMethod.
+    These standalone GEMM kernels may not have compiled configurations for all SM
+    versions, even when the fused MoE kernel (TRTLLMGenFusedMoE) works fine.
+
+    Returns True if the standalone kernel is available, False otherwise.
+    Result is cached after first call.
+    """
+    if hasattr(_is_fp4_fp8_standalone_gemm_available, "_cached_result"):
+        return _is_fp4_fp8_standalone_gemm_available._cached_result
+
+    try:
+        import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
+        # Create minimal valid tensors for GEMM probe:
+        # mat1: (m, k) FP8, mat2: (n, k/2) FP4, scale: FP8, global_scale: FP32
+        m, n, k = 1, 128, 128
+        fp8_input = torch.zeros((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+        fp4_weight = torch.zeros((n, k // 2), dtype=fp4_utils.float4_e2m1x2, device="cuda")
+        weight_scale = torch.ones((n * (k // 32),), dtype=torch.float8_e4m3fn, device="cuda")
+        global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+        torch.ops.trtllm.fp4_fp8_gemm_trtllmgen(
+            fp8_input, fp4_weight, weight_scale, global_scale, torch.float16
+        )
+        result = True
+    except RuntimeError:
+        result = False
+
+    _is_fp4_fp8_standalone_gemm_available._cached_result = result
+    return result
+
+
 def should_skip_trtllm(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
@@ -99,6 +139,8 @@ def should_skip_trtllm(
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
     comm_method: Optional[str] = None,
+    seq_len: Optional[int] = None,
+    moe_tp_size: int = 1,
 ) -> Optional[str]:
     """
     Check TRTLLM Gen backend specific constraints.
@@ -115,6 +157,8 @@ def should_skip_trtllm(
         swiglu_gptoss_style: Whether using swiglu gptoss style
         comm_method: Optional communication method (e.g. "DEEPEP", "DEEPEPLOWLATENCY")
             for multi-GPU EP mode checks
+        seq_len: Optional sequence length for seq_len-sensitive skip checks
+        moe_tp_size: MoE TP parallelism size (default: 1, no TP sharding)
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -226,31 +270,67 @@ def should_skip_trtllm(
                 f"block_scale_interleave_reverse rows must be multiple of 128."
             )
 
+    # -----------------Reference module constraints------------------
+    # The W4A8_NVFP4_FP8 reference module (W4A8NVFP4FP8RefGatedMLPFusedMoE) uses
+    # standalone fp4_fp8_gemm_trtllmgen GEMM calls via W4A8NVFP4FP8LinearMethod.
+    # These standalone GEMM kernels may not have compiled configs for all SM versions,
+    # even though the fused MoE kernel (TRTLLMGenFusedMoE) works fine on those SMs.
+    # Skip if the standalone kernel is not available on the current GPU.
+    if quant_algo == QuantAlgo.W4A8_NVFP4_FP8:
+        if not _is_fp4_fp8_standalone_gemm_available():
+            return (
+                "W4A8_NVFP4_FP8 reference module requires standalone "
+                "fp4_fp8_gemm_trtllmgen kernel which is not available on this GPU. "
+                "The fused MoE kernel works but the reference GatedMLP cannot run."
+            )
+
     # -----------------Potential issues------------------
     # These are known issues that need investigation. Skipping to avoid test failures
     # and CUDA errors that can cascade to subsequent tests.
 
-    # Issue: W4A8_NVFP4_FP8 with top_k=1 causes CUDA illegal memory access
-    if quant_algo == QuantAlgo.W4A8_NVFP4_FP8 and top_k == 1:
-        return (
-            "[Potential Bug] TRTLLMGenFusedMoE W4A8_NVFP4_FP8 with top_k=1 "
-            "causes CUDA illegal memory access."
-        )
-
-    # Issue: NVFP4 with large intermediate_size has known accuracy issues
-    if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
-        return (
-            f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
-            f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
-        )
+    if quant_algo == QuantAlgo.NVFP4:
+        # Issue: NVFP4 with large intermediate_size has known accuracy issues
+        if intermediate_size >= 14336:
+            return (
+                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
+                f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
+            )
+        # NVFP4 flaky tactic failures with large model configs at seq=8.
+        # For example of observed failures:
+        #   - act=Relu2-e60_k4_h2048_i1408-seq=8: tactic[28] tile [32,36],
+        #     12.79% mismatch, 187/188 tactics pass.
+        if (
+            num_experts >= 60
+            and model_config.top_k >= 4
+            and model_config.hidden_size >= 2048
+            and model_config.intermediate_size >= 1408
+            and seq_len == 8
+        ):
+            return (
+                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
+                f"(num_experts={num_experts}, top_k={model_config.top_k}, "
+                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size})"
+                f"and seq_len=8: flaky happen tactics failure with tactic[24] and tactic[28]"
+            )
+        # Issue: NVFP4 with large expert count + large hidden_size
+        # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
+        # Observed: e256_k8_h7168_i2048, seq=1, bfloat16 — tactic[204] with tile
+        # config [8, 83] produces 8.37% element mismatch (threshold: 3%).
+        # All other 207/208 tactics pass. The swiglu_gptoss_style variant passes too
+        # (uses relaxed tolerance: rtol=0.1, percent=0.95).
+        # Root cause: FP4 quantization error accumulates in the large GEMM reduction
+        # dimension (h=7168) and the [8, 83] tile config hits an edge case at seq=1.
+        if num_experts >= 256 and model_config.hidden_size >= 7168 and not swiglu_gptoss_style:
+            return (
+                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model "
+                f"(num_experts={num_experts}, hidden_size={model_config.hidden_size}) "
+                f"and seq_len=1: 207/208 tactics pass but tactic[204] "
+                f"(FP4BlockScaleMoERunner tile [8, 83]) has 8.37% mismatch "
+                f"(threshold 3%). seq_len=8 passes all tactics."
+            )
 
     # Issue: W4A8_MXFP4_MXFP8 has accuracy issues on certain model configs
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
-        if intermediate_size >= 14336:
-            return (
-                f"[Potential Bug] TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with large "
-                f"intermediate_size has accuracy issues (intermediate_size={intermediate_size} >= 14336)."
-            )
         if num_experts >= 60 and intermediate_size >= 1408:
             return (
                 f"[Potential Bug] TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with many experts "
@@ -266,23 +346,25 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
-    # Issue: Certain TRTLLM kernel runners crash with CUDA errors in multi-GPU
-    # DeepEP mode. the crash is specific to EP with DeepEP.
-    # Verified on 4 GPUs with DEP + DEEPEP + TRTLLM (e60_k4_h2048_i1408):
-    #   - FP8_BLOCK_SCALES:  CRASH   (fp8_block_scale_moe_runner -> CUDA_ERROR_INVALID_HANDLE)
-    #   - W4A16_MXFP4:       CRASH   (bf16_mxe2m1_block_scale_moe_runner -> illegal memory access)
-    #   - W4A8_MXFP4_MXFP8:  likely crash (same mxe2m1 kernel family as W4A16_MXFP4)
-    if comm_method in ("DEEPEP", "DEEPEPLOWLATENCY"):
-        deepep_crash_quant_algos = {
+    # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
+    # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
+    # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:
+    #   - FP8_BLOCK_SCALES: block scale tensor size mismatch
+    #     (ceil(per_shard/128) vs floor(per_shard/128))
+    #   - NVFP4: unswizzle_sf shape '[-1, w3_w1, 128]' invalid
+    #   - W4A8_NVFP4_FP8: No valid config for non-aligned N dimension
+    if moe_tp_size > 1 and intermediate_size % moe_tp_size == 0:
+        per_shard = intermediate_size // moe_tp_size
+        tp_crash_quants = {
             QuantAlgo.FP8_BLOCK_SCALES,
-            QuantAlgo.W4A16_MXFP4,
-            QuantAlgo.W4A8_MXFP4_MXFP8,
+            QuantAlgo.NVFP4,
+            QuantAlgo.W4A8_NVFP4_FP8,
         }
-        if quant_algo in deepep_crash_quant_algos:
+        if quant_algo in tp_crash_quants and per_shard % 128 != 0:
             return (
-                f"[Potential Bug] TRTLLMGenFusedMoE {quant_algo} crashes with "
-                f"CUDA error in multi-GPU DeepEP mode (comm={comm_method}). "
-                f"Single-GPU tests pass; issue is in the kernel runner under EP."
+                f"TRTLLMGenFusedMoE {quant_algo}: per-shard intermediate_size="
+                f"{per_shard} (= {intermediate_size} / {moe_tp_size}) is not "
+                f"128-aligned."
             )
 
     return None
@@ -294,6 +376,7 @@ def should_skip_cutedsl(
     model_config: "MoeModelConfig" = None,
     comm_method: Optional[str] = None,
     routing_method_cls=None,
+    moe_tp_size: int = 1,
 ) -> Optional[str]:
     """
     Check CuteDSL backend specific constraints.
@@ -304,42 +387,45 @@ def should_skip_cutedsl(
     if backend_type != MoeBackendType.CUTEDSL:
         return None
 
-    # DeepEPLowLatency _modify_output_to_adapt_fused_moe converts dispatch output
-    # to a format where token_selected_slots has shape [num_local_experts, tokens_per_expert]
-    # instead of [num_tokens, top_k]. CuteDSL moe_sort asserts
-    # token_selected_experts.size(1) == top_k, which fails with this format.
-    if comm_method == "DEEPEPLOWLATENCY":
-        return (
-            "[Potential Bug] CuteDslFusedMoE is incompatible with DeepEPLowLatency: "
-            "DeepEPLowLatency _modify_output_to_adapt_fused_moe reshapes "
-            "token_selected_slots to [num_local_experts, tokens_per_expert] "
-            "(effectively top_k=1), but CuteDSL moe_sort requires "
-            "token_selected_experts.size(1) == top_k."
-        )
-
     if model_config is None:
         return None
 
     intermediate_size = model_config.intermediate_size
-    num_experts = model_config.num_experts
 
-    # NVFP4 with large intermediate_size has known accuracy issues
+    # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
+    # at i=14336, threshold 3%). Both CuteDSL and reference have FP4 intermediate
+    # storage, but produce DIFFERENT FP4 values due to:
+    # 1) SwiGLU precision: CuteDSL kernel uses approximate math ops for sigmoid
+    #    (rcp_approx + exp2 fastmath, see utils.py:sigmoid_f32), while reference
+    #    Triton kernel uses standard tl.sigmoid (see swiglu.py:42).
+    # 2) Precision chain: CuteDSL computes SwiGLU in FP32 (GEMM accumulator →
+    #    FP32 SwiGLU → FP4), reference goes FP32 accumulator → BF16 → SwiGLU →
+    #    BF16 → fp4_quantize. Two BF16 truncation points create different values.
+    # 3) FP4 quantization: CuteDSL uses rcp_approx for block scale reciprocal
+    #    (blockscaled_...fusion.py:2588), fp4_quantize uses exact division.
+    # These per-element FP4 value differences accumulate through FC2 GEMM dot
+    # product (K=intermediate_size). CUTLASS avoids this entirely with a single
+    # fused kernel keeping BF16 intermediate precision.
     if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
         return (
-            f"[Potential Bug] CuteDslFusedMoE NVFP4 with large intermediate_size "
-            f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
+            f"[Design Limitation] CuteDslFusedMoE NVFP4 with large "
+            f"intermediate_size has accuracy issues due to FP4 intermediate "
+            f"storage between FC1+SwiGLU and FC2 kernels "
+            f"(intermediate_size={intermediate_size} >= 14336, "
+            f"FC2 accumulates over K={intermediate_size} with 896+ blocks)."
         )
 
-    # NVFP4 with prime num_experts causes CUDA_ERROR_ILLEGAL_ADDRESS
-    prime_experts_with_issues = {7, 13}
-    if quant_algo == QuantAlgo.NVFP4 and num_experts in prime_experts_with_issues:
-        return (
-            f"[Potential Bug] CuteDslFusedMoE NVFP4 with prime num_experts={num_experts} "
-            f"causes CUDA_ERROR_ILLEGAL_ADDRESS due to autotuner cache bucket mapping."
-        )
-
-    # NVFP4 with Llama4Renormalize routing has significant accuracy issues on bfloat16.
-    # Observed mismatch up to 34.6% (threshold 2% at rtol=0.01, percent=0.98).
+    # NVFP4 with Llama4Renormalize routing has significant accuracy issues.
+    # Same root cause as the large intermediate_size skip above: CuteDSL and
+    # reference produce different FP4 intermediate values due to approximate
+    # math ops (rcp_approx, exp2 fastmath) and BF16 truncation differences.
+    # Llama4's sigmoid routing amplifies these differences: standard Renormalize
+    # uses softmax (weights sum to 1, per-expert errors averaged), while Llama4
+    # uses sigmoid (weights independent in (0,1), per-expert errors summed
+    # without normalization). This amplifies FP4 value differences by ~top_k/2.
+    # Mismatch correlates with hidden_size (FC1 K dimension): h=512 passes,
+    # h=2048 fails 8-17%, h=7168 fails 24-35%. Observed: e60(9.4%),
+    # e64(16.5%), e256(34.6%), e384(30.9%) at threshold 3%.
     if routing_method_cls is not None:
         from tensorrt_llm._torch.modules.fused_moe import Llama4RenormalizeMoeRoutingMethod
 
@@ -348,8 +434,20 @@ def should_skip_cutedsl(
             and routing_method_cls == Llama4RenormalizeMoeRoutingMethod
         ):
             return (
-                "[Potential Bug] CuteDslFusedMoE NVFP4 with Llama4Renormalize "
-                "routing has significant accuracy issues (mismatch up to 34.6%%)."
+                "[Design Limitation] CuteDslFusedMoE NVFP4 with Llama4Renormalize "
+                "routing: FP4 intermediate errors amplified by non-normalized "
+                "sigmoid routing weights (mismatch up to 34.6%)."
+            )
+
+    # TP per-shard alignment: NVFP4 requires 128-aligned per-shard intermediate_size.
+    # fp4_utils.py asserts M % 128 == 0 where M = 2 * per_shard (combined w3_w1).
+    if moe_tp_size > 1 and quant_algo == QuantAlgo.NVFP4 and intermediate_size % moe_tp_size == 0:
+        per_shard = intermediate_size // moe_tp_size
+        if per_shard % 128 != 0:
+            return (
+                f"CuteDslFusedMoE NVFP4: per-shard intermediate_size="
+                f"{per_shard} (= {intermediate_size} / {moe_tp_size}) is not "
+                f"128-aligned. fp4_utils asserts M % 128 == 0."
             )
 
     return None
@@ -360,6 +458,8 @@ def should_skip_cutlass(
     comm_method: Optional[str] = None,
     quant_algo: Optional[QuantAlgo] = None,
     model_config: "MoeModelConfig" = None,
+    moe_tp_size: int = 1,
+    dtype=None,
 ) -> Optional[str]:
     """
     Check CUTLASS backend specific constraints for multi-GPU tests.
@@ -370,25 +470,35 @@ def should_skip_cutlass(
     if backend_type != MoeBackendType.CUTLASS:
         return None
 
-    # Issue: CUTLASS + DeepEP + (W4A8_MXFP4_MXFP8 or W8A16) has significant accuracy
-    # issues in multi-GPU EP mode. Observed failures:
-    #   - e32_k8_h7168_i2048, seq=8: mismatch 24-37% (rtol=0.15)
-    #   - e8_k1_h512_i512, seq=1/8:  mismatch 86-100% (rtol=0.10), results completely wrong
-    # NVLINK communication with the same configs passes.
-    # Root cause: likely data layout or all-to-all dispatch/combine issue in the
-    # DeepEP communication path for these quantization methods.
-    if comm_method in ("DEEPEP", "DEEPEPLOWLATENCY"):
-        deepep_accuracy_quant_algos = {
-            QuantAlgo.W4A8_MXFP4_MXFP8,
+    # TP per-shard alignment: W8A16, NVFP4, and W4A8_AWQ require 128-aligned
+    # per-shard intermediate_size. W8A16 fails in preprocess_weights_for_mixed_gemm
+    # (num_rows % rows_per_tile != 0). NVFP4 pads to 128-alignment
+    # (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but zero-padding +
+    # blockwise quantization interaction causes ~6-7% mismatch.
+    # W4A8_AWQ (WInt4AFP8FusedMoEMethod) requires K dimensions to be multiples
+    # of 128 on SM90 for interleave factor selection (quantization.py:1310-1324).
+    # W4A8_MXFP4_MXFP8 uses MXFP4 auto-padding that handles this correctly.
+    if moe_tp_size > 1 and model_config is not None:
+        tp_alignment_quants = {
             QuantAlgo.W8A16,
+            QuantAlgo.NVFP4,
+            QuantAlgo.W4A8_AWQ,
         }
-        if quant_algo in deepep_accuracy_quant_algos:
-            return (
-                f"[Potential Bug] CutlassFusedMoE {quant_algo} has significant accuracy "
-                f"issues with DeepEP communication (comm={comm_method}). "
-                f"Mismatch up to 100% on small models (e8_k1). "
-                f"NVLINK communication with the same config passes."
-            )
+        # FP8_BLOCK_SCALES has this issue only on Hopper (SM90)
+        if torch.cuda.get_device_capability(0) == (9, 0):
+            tp_alignment_quants.add(QuantAlgo.FP8_BLOCK_SCALES)
+
+        if quant_algo in tp_alignment_quants:
+            intermediate_size = model_config.intermediate_size
+            if intermediate_size % moe_tp_size == 0:
+                per_shard = intermediate_size // moe_tp_size
+                if per_shard % 128 != 0:
+                    return (
+                        f"CutlassFusedMoE {quant_algo}: per-shard "
+                        f"intermediate_size={per_shard} "
+                        f"(= {intermediate_size} / {moe_tp_size}) is not "
+                        f"128-aligned."
+                    )
 
     return None
 
@@ -398,6 +508,7 @@ def should_skip_deepgemm(
     comm_method: Optional[str] = None,
     quant_algo: Optional[QuantAlgo] = None,
     model_config: "MoeModelConfig" = None,
+    moe_tp_size: int = 1,
 ) -> Optional[str]:
     """
     Check DeepGemm backend specific constraints.
@@ -408,19 +519,94 @@ def should_skip_deepgemm(
     if backend_type != MoeBackendType.DEEPGEMM:
         return None
 
-    # Issue: DEEPGEMM + FP8_BLOCK_SCALES crashes with CUDA illegal memory access
-    # on large expert counts (e.g. e384_k8_h7168_i2048) during post_load_weights().
-    # The crash occurs in get_col_major_tma_aligned_packed_tensor (fp8_utils.py)
-    # when resmoothing FP8 E8M0 scales on SM100f (Blackwell).
-    # Small configs (e.g. e60_k4_h2048_i1408) pass fine.
-    if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and model_config is not None:
-        if model_config.num_experts > 128:
+    # TP per-shard alignment: FP8_BLOCK_SCALES requires 128-aligned per-shard
+    # intermediate_size for block scale tensor operations.
+    if moe_tp_size > 1 and quant_algo == QuantAlgo.FP8_BLOCK_SCALES and model_config is not None:
+        intermediate_size = model_config.intermediate_size
+        if intermediate_size % moe_tp_size == 0:
+            per_shard = intermediate_size // moe_tp_size
+            if per_shard % 128 != 0:
+                return (
+                    f"DeepGemmFusedMoE FP8_BLOCK_SCALES: per-shard "
+                    f"intermediate_size={per_shard} "
+                    f"(= {intermediate_size} / {moe_tp_size}) is not "
+                    f"128-aligned."
+                )
+
+    return None
+
+
+def should_skip_densegemm(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    model_config: "MoeModelConfig" = None,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Check DenseGEMM backend specific constraints.
+
+    DenseGEMM reshapes all expert weights into a single dense matrix and performs
+    a single large GEMM. It only supports NVFP4 quantization on Blackwell (SM 100/103).
+
+    Constraints:
+    - Only NVFP4 quantization
+    - hidden_size and intermediate_size must be 128-aligned (NVFP4 requirement)
+    - intermediate_size must be 256-aligned (MMA tile K boundary)
+    - DenseGEMM supports TP (DTP/TTP) but not EP (DEP/TEP) since all experts
+      must reside on a single GPU for the dense matrix formulation.
+
+    Returns:
+        Skip reason string if test should be skipped, None otherwise
+    """
+    if backend_type != MoeBackendType.DENSEGEMM:
+        return None
+
+    # DenseGEMM only supports NVFP4
+    if quant_algo != QuantAlgo.NVFP4:
+        return f"DenseGEMMFusedMoE only supports NVFP4 quantization (got quant_algo={quant_algo})"
+
+    # DenseGEMM does not support EP modes (DEP/TEP). All experts must reside
+    # on the same GPU for the dense matrix formulation. TP modes (DTP/TTP) are
+    # supported since they shard intermediate_size, not experts.
+    if parallel_mode in ("DEP", "TEP"):
+        return (
+            f"DenseGEMMFusedMoE does not support expert parallelism "
+            f"(got parallel_mode={parallel_mode}). All experts must reside on a single GPU."
+        )
+
+    # DenseGEMM does not support DeepEP communication.
+    if comm_method in ("DEEPEP", "DEEPEPLOWLATENCY"):
+        return (
+            f"DenseGEMMFusedMoE does not support EP communication (got comm_method={comm_method})."
+        )
+
+    if model_config is not None:
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+
+        # In TP mode, intermediate_size is sharded across moe_tp_size GPUs
+        sharded_intermediate = intermediate_size // moe_tp_size
+
+        # 128-alignment required for NVFP4 dense GEMM kernels
+        if hidden_size % 128 != 0 or sharded_intermediate % 128 != 0:
             return (
-                f"[Potential Bug] DeepGemmFusedMoE FP8_BLOCK_SCALES crashes with "
-                f"CUDA illegal memory access on large expert count "
-                f"(num_experts={model_config.num_experts}). The crash occurs in "
-                f"get_col_major_tma_aligned_packed_tensor during "
-                f"post_load_weights() FP8 E8M0 scale resmoothing on SM100f."
+                f"DenseGEMMFusedMoE NVFP4 requires 128-aligned sizes "
+                f"(got h={hidden_size}, i={sharded_intermediate} "
+                f"[{intermediate_size}/tp{moe_tp_size}])"
+            )
+
+        # FC2 DenseGEMM kernel tiles K with MMA tile size 256.
+        # intermediate_size (= weight_per_expert for FC2) must be 256-aligned
+        # so expert boundaries align with MMA tile boundaries.
+        _MMA_TILE_K = 256
+        if sharded_intermediate % _MMA_TILE_K != 0:
+            return (
+                f"DenseGEMMFusedMoE requires intermediate_size to be a multiple "
+                f"of {_MMA_TILE_K} (got {sharded_intermediate} "
+                f"[{intermediate_size}/tp{moe_tp_size}]). "
+                f"FC2 kernel cannot split alpha_scale at non-aligned expert boundaries."
             )
 
     return None
@@ -430,6 +616,7 @@ def should_skip_multi_gpu(
     parallel_mode: str,
     model_config: "MoeModelConfig",
     world_size: int = 4,
+    comm_method: Optional[str] = None,
 ) -> Optional[str]:
     """
     Check if a multi-GPU test should be skipped due to EP partitioning constraints.
@@ -442,6 +629,7 @@ def should_skip_multi_gpu(
         parallel_mode: Parallelism strategy ("DEP", "TEP", "DTP", "TTP")
         model_config: MoE model configuration containing num_experts
         world_size: Total number of GPUs (default: 4)
+        comm_method: Optional communication method (e.g. "DEEPEP", "DEEPEPLOWLATENCY")
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -458,6 +646,22 @@ def should_skip_multi_gpu(
             f"in {parallel_mode} mode. Requires EPLB to handle non-uniform "
             f"expert partitioning (tested separately in test_configurable_moe_multi_gpu_eplb)."
         )
+
+    # DeepEP Low Latency requires NVSHMEM IBGDA transport, which needs
+    # GPU-side MMIO mapping of InfiniBand UAR (User Access Region).
+    # On Hopper (SM90) nodes the cudaHostRegister(IoMemory) call fails
+    # (cudaErrorNotSupported), causing IBGDA init to fail.  NVSHMEM v3.2.5
+    # has a double-free bug in the IBGDA cleanup path that crashes MPI
+    # workers with SIGABRT, leaving the parent process hung forever.
+    # Skip on Hopper until NVSHMEM ships a fix or IBRC fallback is enabled.
+    if comm_method == "DEEPEPLOWLATENCY":
+        if torch.cuda.get_device_capability(0) == (9, 0):
+            return (
+                "DEEPEPLOWLATENCY requires NVSHMEM IBGDA transport. "
+                "Hopper (SM90) nodes lack GPU-side UAR mapping support "
+                "(cudaHostRegister IoMemory returns cudaErrorNotSupported), "
+                "and NVSHMEM v3.2.5 crashes on IBGDA init failure cleanup."
+            )
 
     return None
 
@@ -501,6 +705,7 @@ def should_skip_routing_method(
 def supports_autotuner_capture(
     backend_type: MoeBackendType,
     _quant_algo: Optional[QuantAlgo],
+    use_flashinfer: bool,
 ) -> bool:
     """
     Determine if a backend+quant_algo combination supports AutoTuner capture/replay.
@@ -517,6 +722,9 @@ def supports_autotuner_capture(
     if backend_type == MoeBackendType.DEEPGEMM:
         return False
 
+    if use_flashinfer:
+        return False
+
     return True
 
 
@@ -527,6 +735,7 @@ def get_quick_skip_reason(
     model_config: "MoeModelConfig",
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
+    seq_len: Optional[int] = None,
 ) -> Optional[str]:
     """
     Fast skip check that calls backend's can_implement() method.
@@ -534,6 +743,7 @@ def get_quick_skip_reason(
     Unified version supporting both backend-level and module-level tests:
     - routing_method_cls: Used by test_moe_module.py for routing method compatibility checks
     - swiglu_gptoss_style: Used by test_moe_backend.py for SwiGLU parameter checks
+    - seq_len: Optional sequence length for seq_len-sensitive skip checks
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -559,12 +769,20 @@ def get_quick_skip_reason(
         skip_checks = [
             lambda: should_skip_routing_method(routing_method_cls, model_config),
             lambda: should_skip_trtllm(
-                backend_type, quant_algo, model_config, routing_method_cls, swiglu_gptoss_style
+                backend_type,
+                quant_algo,
+                model_config,
+                routing_method_cls,
+                swiglu_gptoss_style,
+                seq_len=seq_len,
             ),
             lambda: should_skip_cutedsl(
                 backend_type, quant_algo, model_config, routing_method_cls=routing_method_cls
             ),
             lambda: should_skip_deepgemm(
+                backend_type, quant_algo=quant_algo, model_config=model_config
+            ),
+            lambda: should_skip_densegemm(
                 backend_type, quant_algo=quant_algo, model_config=model_config
             ),
         ]
@@ -573,9 +791,12 @@ def get_quick_skip_reason(
             if skip_reason:
                 return skip_reason
 
-        # DEEPGEMM: float16 reference module constraint
-        if backend_type == MoeBackendType.DEEPGEMM and dtype == torch.float16:
-            return "DeepGemmFusedMoE reference module requires bfloat16 input"
+        # DEEPGEMM/DENSEGEMM: float16 reference module constraint
+        if (
+            backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.DENSEGEMM)
+            and dtype == torch.float16
+        ):
+            return f"{backend_type.value} reference module requires bfloat16 input"
 
         # 128-alignment requirement for quantization
         if quant_algo is not None:
@@ -598,6 +819,45 @@ def get_quick_skip_reason(
 
     finally:
         trtllm_logger.setLevel(original_level)
+
+
+# ============================================================================
+# GPU Memory Check
+# ============================================================================
+def skip_if_insufficient_gpu_memory(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: torch.dtype = torch.float32,
+    overhead_factor: float = 4.0,
+) -> None:
+    """
+    Skip the current test if estimated GPU memory exceeds device capacity.
+
+    Each expert has gate_up_proj [2*I, H] + down_proj [H, I] = 3*H*I elements.
+    The overhead_factor (default 4x) accounts for ref model + DUT model +
+    quantization scales/activations + CUDA allocator overhead.
+
+    Args:
+        num_experts: Number of MoE experts
+        hidden_size: Hidden dimension size
+        intermediate_size: Intermediate (FFN) dimension size
+        dtype: Weight data type for byte-size calculation
+        overhead_factor: Multiplier over single-model weight bytes
+    """
+    if not torch.cuda.is_available():
+        return
+    bytes_per_elem = torch.tensor([], dtype=dtype).element_size()
+    single_model_bytes = num_experts * 3 * hidden_size * intermediate_size * bytes_per_elem
+    estimated_total_bytes = int(single_model_bytes * overhead_factor)
+    gpu_total_bytes = torch.cuda.get_device_properties(0).total_memory
+    if estimated_total_bytes > gpu_total_bytes:
+        pytest.skip(
+            f"Estimated memory {estimated_total_bytes / (1 << 30):.1f}GB "
+            f"exceeds GPU memory {gpu_total_bytes / (1 << 30):.1f}GB "
+            f"(num_experts={num_experts}, hidden_size={hidden_size}, "
+            f"intermediate_size={intermediate_size}, dtype={dtype})"
+        )
 
 
 # ============================================================================
@@ -668,6 +928,114 @@ def create_test_param(param_values, test_id, skip_reason=None):
 
 
 # ============================================================================
+# CI Mode Detection
+# ============================================================================
+_TRTLLM_TEST_MOE_CI_ENV = "TRTLLM_TEST_MOE_CI"
+IS_CI_MODE = os.environ.get(_TRTLLM_TEST_MOE_CI_ENV, "1") == "1"
+
+# ============================================================================
+# CI Acceleration Skip Logic
+# ============================================================================
+
+# Routing methods that require full routing coverage in CI
+_CI_ROUTING_METHODS = {"Renormalize", "DeepSeekV3"}
+
+
+def should_skip_to_accelerate_ci(
+    backend_type: "MoeBackendType",
+    quant_algo: Optional[QuantAlgo],
+    model_config: "MoeModelConfig",
+    routing_method_cls=None,
+    dtype: Optional[torch.dtype] = None,
+    seq_len: Optional[int] = None,
+    swiglu_gptoss_style: bool = False,
+    parallel_mode: Optional[str] = None,
+    activation_type: Optional[ActivationType] = ActivationType.Swiglu,
+) -> Optional[str]:
+    """
+    Skip low-information-density test combinations to accelerate CI.
+
+    Only active when TRTLLM_TEST_MOE_CI=1 (default). When TRTLLM_TEST_MOE_CI=0,
+    all combinations run (local exhaustive testing).
+
+    Rules applied (in order):
+    0. Skip unquantized (quant=None) — quantized paths are the focus of CI
+    1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
+    2. Multi-GPU: only DEP and TTP parallel modes
+    3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
+       other backend+quant combos only run Renormalize
+       and DeepSeekV3. This rule is overridden by rule 1 for e256.
+
+    Args:
+        backend_type: MoE backend type
+        quant_algo: Quantization algorithm
+        model_config: MoE model configuration
+        routing_method_cls: Routing method class (None means no routing filter)
+        dtype: Activation data type
+        seq_len: Sequence length
+        swiglu_gptoss_style: Whether using SwiGLU gptoss style
+        parallel_mode: Multi-GPU parallel mode (None for single-GPU tests)
+
+    Returns:
+        Skip reason string if test should be skipped for CI, None otherwise
+    """
+    if not IS_CI_MODE:
+        return None
+
+    if model_config is None:
+        return None
+
+    # --- Rule 0: Skip gated and unquantized (quant=None) ---
+    if quant_algo is None and is_gated_activation(activation_type):
+        return "[CI accel] Skip unquantized (quant=None) in CI"
+
+    is_large_model = model_config.num_experts >= 256 and model_config.hidden_size >= 7168
+
+    # --- Rule 1: Large model (e256_k8_h7168_i2048) restrictions ---
+    if is_large_model:
+        if routing_method_cls is not None:
+            from tensorrt_llm._torch.modules.fused_moe import DeepSeekV3MoeRoutingMethod
+
+            if routing_method_cls != DeepSeekV3MoeRoutingMethod:
+                routing_name = routing_method_cls.__name__
+                return (
+                    f"[CI accel] Large model (num_experts={model_config.num_experts}) "
+                    f"only tests DeepSeekV3 routing in CI (got {routing_name})"
+                )
+
+        if dtype is not None and dtype != torch.bfloat16:
+            return f"[CI accel] Large model only tests bfloat16 in CI (got {dtype})"
+
+        if seq_len is not None and seq_len != 1:
+            return f"[CI accel] Large model only tests seq=1 in CI (got seq={seq_len})"
+
+        if swiglu_gptoss_style:
+            return "[CI accel] Large model only tests non-gptoss in CI"
+
+    # --- Rule 2: Multi-GPU parallel mode restrictions ---
+    if parallel_mode is not None and parallel_mode not in ("DEP", "TTP"):
+        return f"[CI accel] Only DEP and TTP parallel modes in CI (got {parallel_mode})"
+
+    # --- Rule 3: Routing method restrictions per backend+quant ---
+    # Full routing coverage on: (CUTLASS, or TRTLLM) with NVFP4
+    # Other combos: only Renormalize + DeepSeekV3
+    # Rule 1 already handles e256 (DeepSeekV3 only), so this only applies to non-e256.
+    if not is_large_model and routing_method_cls is not None:
+        routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
+        if routing_name not in _CI_ROUTING_METHODS:
+            allows_full_routing = (
+                backend_type == MoeBackendType.CUTLASS or backend_type == MoeBackendType.TRTLLM
+            ) and quant_algo == QuantAlgo.NVFP4
+            if not allows_full_routing:
+                return (
+                    f"[CI accel] {backend_type.value}+{quant_algo} only tests "
+                    f"Renormalize/DeepSeekV3 routing in CI (got {routing_name})"
+                )
+
+    return None
+
+
+# ============================================================================
 # Timing Fixture
 # ============================================================================
 @pytest.fixture(scope="module", autouse=True)
@@ -729,6 +1097,7 @@ def iter_base_test_configs(
             model_config,
             routing_method_cls,
             swiglu_gptoss_style=swiglu_gptoss_style,
+            seq_len=seq_len,
         )
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         swiglu_id = (

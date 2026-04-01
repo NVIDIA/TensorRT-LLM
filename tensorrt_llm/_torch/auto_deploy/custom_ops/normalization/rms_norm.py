@@ -235,7 +235,7 @@ def _triton_rmsnorm_gated_meta(
     if gate is not None:
         assert gate.shape == x.shape, "gate must match x shape"
 
-    return x.new_empty(x.shape, dtype=torch.float32)
+    return x.new_empty(x.shape, dtype=x.dtype)
 
 
 # Forked from:

@@ -508,7 +508,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    top_logprobs: List[ChatCompletionLogProb] = None
+    top_logprobs: Optional[List[ChatCompletionLogProb]] = None
 
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
@@ -547,6 +547,9 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     """Assistant message that includes reasoning tokens."""
     reasoning: Optional[str]
+    # NOTE: some older benchmarks and chat templates assume the below, which has been deprecated
+    # in other inference frameworks in favor of the above `reasoning` field.
+    reasoning_content: Optional[str]
 
 
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
@@ -615,6 +618,7 @@ class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):

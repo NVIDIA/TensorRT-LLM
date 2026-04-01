@@ -230,9 +230,9 @@ class ConfigLoader:
         if gpu_type is None:
             gpu_type = EnvManager.get_gpu_type()
 
-        # GB200_LYRIS in also in the GB200 family
-        if gpu_type.startswith("GB200_"):
-            gpu_type = "GB200"
+        # Normalize GPU type by extracting base name before any variant suffix
+        # e.g., GB200-LYRIS -> GB200, GB300-LYRIS -> GB300, GB200-OCI -> GB200
+        gpu_type = gpu_type.split("-")[0]
         configs = []
 
         if not self.base_dir.exists():

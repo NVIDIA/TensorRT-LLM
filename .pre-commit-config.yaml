@@ -1367,8 +1367,19 @@ common-files: &common_files |
         triton_backend/tools/whisper/client.py |
     )$
 
+# Files to be subjected to static analysis
+static-analysis-files: &static_analysis_files |
+    (?x)^(
+        tensorrt_llm/_torch/pyexecutor/sampler.py |
+        tensorrt_llm/_torch/pyexecutor/sampling_utils.py |
+        tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py |
+        tests/unittest/_torch/sampler/test_torch_sampler.py |
+        tests/unittest/_torch/sampler/test_beam_search.py |
+        tests/unittest/_torch/sampler/test_beam_search_util.py |
+    )$
+
 # Global exclude pattern for vendored third-party code
-exclude: '^triton_kernels/'
+exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1390,14 +1401,10 @@ repos:
     rev: v6.0.0
     hooks:
     -   id: check-added-large-files
-        exclude: |
-            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer
-        exclude: |
-            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-yaml
         args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
@@ -1429,8 +1436,6 @@ repos:
     hooks:
     -   id: clang-format
         types_or: [c++, c, cuda]
-        exclude: |
-            (?x)^(.*cubin.cpp$ | .*_cubin.h)$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:
@@ -1442,7 +1447,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
         exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
@@ -1459,6 +1464,14 @@ repos:
         files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
+    -   id: model-registry-check
+        name: Validate AutoDeploy model registry
+        entry: python scripts/check_model_registry.py
+        language: python
+        additional_dependencies:
+        - PyYAML
+        files: ^examples/auto_deploy/model_registry/models\.yaml$
+        pass_filenames: false
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py
@@ -1479,3 +1492,10 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
+    -   id:  type-check
+        name: Run static analysis of type correctness using mypy
+        entry: scripts/run_mypy.sh
+        language: script
+        verbose: true
+        require_serial: true  # because of install_types=true
+        files: *static_analysis_files

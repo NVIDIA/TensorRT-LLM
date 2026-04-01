@@ -17,8 +17,8 @@ import math
 import pytest
 import torch
 from parameterized import parameterized
-from utils.util import (getSMVersion, skip_pre_blackwell_unittest,
-                        unittest_name_func)
+from utils.util import (getSMVersion, isSM100Family,
+                        skip_pre_blackwell_unittest, unittest_name_func)
 
 from tensorrt_llm.quantization.utils.fp8_utils import \
     per_token_quant_and_transform
@@ -273,3 +273,103 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
         atol=1e-10,
         rtol=0.01,
         msg=f"UE8M0 decoded scales mismatch for shape ({m}, {k})")
+
+
+# ---------------------------------------------------------------------------
+# Tests for triton_fp8_quantize_1x128 (library Triton quant kernel)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="Triton-vs-CUDA scale layout comparison requires SM100+. "
+    "Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize("use_ue8m0", [True, False])
+@pytest.mark.parametrize("k", [128, 256, 512, 576, 1024, 5120])
+@pytest.mark.parametrize("m", [4, 16, 64, 256, 1024, 4096])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_triton_fp8_quantize_1x128_vs_cuda(dtype, m, k, use_ue8m0):
+    """Validate triton_fp8_quantize_1x128 matches CUDA fp8_quantize_1x128.
+
+    Both kernels perform 1x128 block-scale FP8 E4M3 quantization.  We compare:
+      1. FP8 quantized values  (< 1% byte-level mismatch)
+      2. Float32 scale tensors (match within FP tolerance)
+
+    Tested with both use_ue8m0=True (power-of-2 scales) and False (raw scales).
+    """
+    from tensorrt_llm.quantization.utils.fp8_quantize import \
+        triton_fp8_quantize_1x128
+
+    torch.random.manual_seed(42)
+    input_tensor = torch.randn((m, k), device='cuda', dtype=dtype)
+
+    cuda_fp8, cuda_scale = torch.ops.trtllm.fp8_quantize_1x128(
+        input_tensor, use_ue8m0=use_ue8m0)
+
+    triton_fp8, triton_scale = triton_fp8_quantize_1x128(input_tensor,
+                                                         use_ue8m0=use_ue8m0)
+
+    # --- FP8 values ---
+    cuda_u8 = cuda_fp8.view(torch.uint8)[:m, :k]
+    triton_u8 = triton_fp8.view(torch.uint8)
+    fp8_mismatch = torch.sum(cuda_u8 != triton_u8).item()
+    fp8_total = cuda_u8.numel()
+    fp8_mismatch_pct = fp8_mismatch / fp8_total * 100
+    assert fp8_mismatch_pct < 1.0, (
+        f"FP8 byte mismatch {fp8_mismatch_pct:.2f}% >= 1.0% "
+        f"for shape ({m}, {k}) use_ue8m0={use_ue8m0}")
+
+    # --- Scale values ---
+    assert cuda_scale.shape == triton_scale.shape, (
+        f"Scale shape mismatch: CUDA {cuda_scale.shape} vs "
+        f"Triton {triton_scale.shape}")
+    torch.testing.assert_close(
+        triton_scale,
+        cuda_scale,
+        atol=1e-6,
+        rtol=1e-3,
+        msg=f"Scale mismatch for shape ({m}, {k}) use_ue8m0={use_ue8m0}")
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="Triton-vs-CUDA scale layout comparison requires SM100+. "
+    "Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize("use_ue8m0", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_triton_fp8_quantize_1x128_large_m(dtype, use_ue8m0):
+    """Stress-test with large M values typical of visual-gen / long-prefill.
+
+    These are the shapes where the Triton kernel is expected to outperform
+    CUDA by ~3x.  We still validate correctness here, not performance.
+    """
+    from tensorrt_llm.quantization.utils.fp8_quantize import \
+        triton_fp8_quantize_1x128
+
+    torch.random.manual_seed(42)
+
+    for m, k in [(8192, 5120), (16384, 5120), (4096, 13824)]:
+        input_tensor = torch.randn((m, k), device='cuda', dtype=dtype)
+
+        cuda_fp8, cuda_scale = torch.ops.trtllm.fp8_quantize_1x128(
+            input_tensor, use_ue8m0=use_ue8m0)
+        triton_fp8, triton_scale = triton_fp8_quantize_1x128(
+            input_tensor, use_ue8m0=use_ue8m0)
+
+        cuda_u8 = cuda_fp8.view(torch.uint8)[:m, :k]
+        triton_u8 = triton_fp8.view(torch.uint8)
+        fp8_mismatch_pct = (torch.sum(cuda_u8 != triton_u8).item() /
+                            cuda_u8.numel() * 100)
+        assert fp8_mismatch_pct < 1.0, (
+            f"FP8 mismatch {fp8_mismatch_pct:.2f}% for ({m}, {k}) "
+            f"use_ue8m0={use_ue8m0}")
+
+        assert cuda_scale.shape == triton_scale.shape
+        torch.testing.assert_close(triton_scale,
+                                   cuda_scale,
+                                   atol=1e-6,
+                                   rtol=1e-3,
+                                   msg=f"Scale mismatch for shape ({m}, {k}) "
+                                   f"use_ue8m0={use_ue8m0}")

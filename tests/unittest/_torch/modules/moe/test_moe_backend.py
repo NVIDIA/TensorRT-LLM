@@ -28,18 +28,20 @@ Design Goals:
 
 import itertools
 import logging
-import os
 from typing import List, Optional
 
 import pytest
 import torch
 from _torch.modules.moe.moe_test_utils import (
+    IS_CI_MODE,
     MoeBackendType,
     MoeModelConfig,
     create_test_param,
     get_backend_class,
     iter_base_test_configs,
     replay_tactics_and_check,
+    should_skip_to_accelerate_ci,
+    skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -49,7 +51,8 @@ from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
+from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -103,6 +106,8 @@ def create_test_backend(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -134,6 +139,8 @@ def create_test_backend(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        weight_loading_mode=weight_loading_mode,
+        activation_type=activation_type,
     )
 
 
@@ -213,6 +220,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.TRTLLM,
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
+    MoeBackendType.DENSEGEMM,
 ]
 
 # Data types to test
@@ -226,30 +234,28 @@ DTYPES_TO_TEST = [
 # Default runs the CI subset (TRTLLM_TEST_MOE_CI=1).
 # Set TRTLLM_TEST_MOE_CI=0 for the full local config matrix.
 CI_MOE_MODEL_CONFIGS = [
+    # Real models (small/medium — tactic replay is model-size-independent,
+    # e256 is covered by test_moe_module integration tests)
     MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
-    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
-]
-
-LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
-    MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
-    MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
-    MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
-    # === Boundary Tests: num_experts / top_k ===
+    # Boundary tests for tactic correctness
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
     MoeModelConfig(7, 2, 256, 512),  # prime num_experts
     MoeModelConfig(13, 3, 256, 512),  # prime num_experts, odd top_k
+]
+
+LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
+    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
+    MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
+    MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
+    MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
     # === Boundary Tests: small sizes ===
     MoeModelConfig(4, 2, 64, 128),  # very small hidden_size
     MoeModelConfig(4, 2, 128, 64),  # intermediate < hidden
 ]
 
-MOE_MODEL_CONFIGS = (
-    CI_MOE_MODEL_CONFIGS
-    if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1"
-    else LOCAL_MOE_MODEL_CONFIGS
-)
+MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS if IS_CI_MODE else LOCAL_MOE_MODEL_CONFIGS
 
 # Sequence lengths to test
 SEQ_LENS_TO_TEST = [1, 8]
@@ -270,9 +276,7 @@ CI_SWIGLU_COMBOS = [
     (1.702, 1.0, 7.0),  # gptoss style (GPT-OSS real values)
 ]
 
-SWIGLU_COMBOS = (
-    CI_SWIGLU_COMBOS if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1" else LOCAL_SWIGLU_COMBOS
-)
+SWIGLU_COMBOS = CI_SWIGLU_COMBOS if IS_CI_MODE else LOCAL_SWIGLU_COMBOS
 
 
 def generate_test_params() -> List:
@@ -315,6 +319,7 @@ def generate_test_params() -> List:
             seq_len,
             model_config,
             routing_method_cls,
+            ActivationType.Swiglu,
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
@@ -326,6 +331,55 @@ def generate_test_params() -> List:
 
 # Pre-generate test parameters at module load time
 TEST_PARAMS = generate_test_params()
+
+
+def generate_element_wise_test_params() -> List:
+    params: List = []
+    for activation_type in [ActivationType.Silu, ActivationType.Relu2]:
+        for (
+            _,  # swiglu_alpha  (ignored)
+            _,  # swiglu_beta   (ignored)
+            _,  # swiglu_limit  (ignored)
+            model_config,
+            seq_len,
+            dtype,
+            backend_type,
+            quant_algo,
+            routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],  # swiglu parameters are irrelevant
+            MOE_MODEL_CONFIGS,
+            SEQ_LENS_TO_TEST,
+            DTYPES_TO_TEST,
+            [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
+            [None, QuantAlgo.NVFP4],
+        ):
+            if skip_reason:
+                continue
+            if backend_type == MoeBackendType.CUTLASS and activation_type == ActivationType.Silu:
+                continue
+            if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
+                continue
+            test_id = f"act={activation_type.name}-{base_test_id}"
+            param_values = (
+                dtype,
+                backend_type,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                activation_type,
+                None,
+                None,
+                None,
+            )
+            params.append(create_test_param(param_values, test_id))
+    return params
+
+
+TEST_PARAMS += generate_element_wise_test_params()
 
 
 # ============================================================================
@@ -346,13 +400,19 @@ TEST_PARAMS = generate_test_params()
 # Test Coverage Matrix
 # =============================================================================
 # 1. BACKENDS: CUTLASS, TRTLLM, CUTEDSL, DEEPGEMM
+#    - When using element wise activations (Relu2, Silu), only CUTLASS and TRTLLM
+#      are supported
 #
 # 2. QUANTIZATION ALGORITHMS:
-#    - Unquantized (None)
-#    - FP8, FP8_BLOCK_SCALES
-#    - NVFP4, W4A8_NVFP4_FP8
-#    - W4A16_MXFP4, W4A8_MXFP4_MXFP8
-#    - W8A16, W4A8_AWQ
+#    - When using Swiglu:
+#      - Unquantized (None)
+#      - FP8, FP8_BLOCK_SCALES
+#      - NVFP4, W4A8_NVFP4_FP8
+#      - W4A16_MXFP4, W4A8_MXFP4_MXFP8
+#      - W8A16, W4A8_AWQ
+#    - When using element-wise activations
+#      - Unquantized (CUTLASS)
+#      - NVFP4 (TRTLLM, CUTLASS)
 #
 # 3. ACTIVATION DTYPES: float16, bfloat16
 #
@@ -381,10 +441,9 @@ TEST_PARAMS = generate_test_params()
 # - 128-alignment requirements for quantization
 #
 # =============================================================================
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,"
-    "routing_method_cls,swiglu_alpha,swiglu_beta,swiglu_limit",
+    "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit",
     TEST_PARAMS,
 )
 def test_moe_backend(
@@ -394,9 +453,11 @@ def test_moe_backend(
     seq_len: int,
     model_config: MoeModelConfig,
     routing_method_cls,
-    swiglu_alpha: float,
-    swiglu_beta: float,
-    swiglu_limit: float,
+    activation_type: ActivationType,
+    swiglu_alpha: Optional[float],
+    swiglu_beta: Optional[float],
+    swiglu_limit: Optional[float],
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """
     Test MoE backend with autotune to capture all tactics.
@@ -407,21 +468,38 @@ def test_moe_backend(
     3. Different sequence lengths use appropriate tactics
     4. swiglu_gptoss_style (SwiGlu with custom parameters) works correctly
     """
-    # Determine swiglu_gptoss_style based on swiglu parameters
-    # swiglu_gptoss_style is True when any swiglu parameter deviates from default
-    # Default values: alpha=1, beta=0, limit=inf
-    swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    # DENSEGEMM: disable fused fc2_alpha path for backend-level testing.
+    if backend_type == MoeBackendType.DENSEGEMM:
+        monkeypatch.setenv("TRTLLM_MOE_FUSED_FC2_ALPHA", "0")
 
-    # Note: Skip logic is now handled at parametrize level via get_quick_skip_reason()
-    # which calls backend's can_implement() and should_skip_* functions.
-    # This avoids entering test function for invalid combinations, significantly
-    # reducing test collection time (from ~17 min to ~5 sec for 3400+ skipped tests).
+    is_gated = is_gated_activation(activation_type)
+    swiglu_gptoss_style = False
+    if is_gated:
+        # Determine swiglu_gptoss_style based on swiglu parameters
+        # swiglu_gptoss_style is True when any swiglu parameter deviates from default
+        # Default values: alpha=1, beta=0, limit=inf
+        swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+
+    ci_skip = should_skip_to_accelerate_ci(
+        backend_type=backend_type,
+        quant_algo=quant_algo,
+        model_config=model_config,
+        routing_method_cls=routing_method_cls,
+        dtype=dtype_activation,
+        seq_len=seq_len,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+        activation_type=activation_type,
+    )
+    if ci_skip:
+        pytest.skip(ci_skip)
 
     # Extract model parameters
     num_experts = model_config.num_experts
     top_k = model_config.top_k
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
 
     # Create mapping
     mapping = Mapping()
@@ -459,10 +537,16 @@ def test_moe_backend(
             swiglu_alpha=swiglu_alpha if swiglu_gptoss_style else None,
             swiglu_beta=swiglu_beta if swiglu_gptoss_style else None,
             swiglu_limit=swiglu_limit if swiglu_gptoss_style else None,
+            activation_type=activation_type,
         )
 
         # Get swiglu tensors if swiglu_gptoss_style is enabled
         swiglu_tensors = quantize_util.get_swiglu_tensors()
+
+        # Determine weight loading mode based on quantization algorithm
+        weight_loading_mode = MoEWeightLoadingMode.VANILLA
+        if hasattr(quantize_util, "weight_loading_mode"):
+            weight_loading_mode = quantize_util.weight_loading_mode
 
         # Create backend first (needed for MXFP4_MXFP8 to get shapes)
         backend = create_test_backend(
@@ -478,6 +562,8 @@ def test_moe_backend(
             swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
             swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+            weight_loading_mode=weight_loading_mode,
+            activation_type=activation_type,
         )
 
         # W4A8_MXFP4_MXFP8 requires different weights for backend and reference
@@ -539,8 +625,11 @@ def test_moe_backend(
         with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
             _ = run_moe()
 
+        # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
+        use_flashinfer = getattr(backend, "use_flashinfer", False)
+
         # Check if this backend+quant_algo combination supports autotuner capture/replay
-        if supports_autotuner_capture(backend_type, quant_algo):
+        if supports_autotuner_capture(backend_type, quant_algo, use_flashinfer):
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()

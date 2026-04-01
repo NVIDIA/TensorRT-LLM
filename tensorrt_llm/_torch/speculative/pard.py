@@ -9,7 +9,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.resource_manager import BaseResourceManager
 from .interface import SpecMetadata, SpecWorkerBase
+from .sa_enhancer import SADraftEnhancer
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import PARDDecodingConfig
@@ -20,6 +22,8 @@ class PARDSpecMetadata(SpecMetadata):
     """Metadata for PARD speculative decoding."""
 
     batch_indices_cuda: Optional[torch.Tensor] = None
+    # Optional resource manager (used to access SA manager for PARD+SA)
+    spec_resource_manager: Optional[BaseResourceManager] = None
 
     def __post_init__(self):
         self.batch_indices_cuda = torch.empty(
@@ -39,6 +43,27 @@ class PARDSpecMetadata(SpecMetadata):
             num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
+
+        sa_manager = self._get_sa_manager()
+        if sa_manager is not None:
+            gen_request_ids = self.request_ids[num_seqs - self.num_generations :]
+            if gen_request_ids:
+                sa_manager.prepare(gen_request_ids, self.max_draft_len)
+
+    def _get_sa_manager(self):
+        """Get SA manager from spec_resource_manager.
+
+        For PARD+SA the resource manager IS the SuffixAutomatonManager,
+        while for other techniques it's accessed via a .sa_manager attribute.
+        """
+        from .suffix_automaton import SuffixAutomatonManager
+
+        rm = self.spec_resource_manager
+        if rm is None:
+            return None
+        if isinstance(rm, SuffixAutomatonManager):
+            return rm
+        return getattr(rm, "sa_manager", None)
 
 
 class PARDWorker(SpecWorkerBase):
@@ -63,6 +88,9 @@ class PARDWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if getattr(spec_config, "use_sa_spec", False):
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
         logger.info(
             f"PARDWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
@@ -193,6 +221,18 @@ class PARDWorker(SpecWorkerBase):
             )
             accepted_tokens = torch.cat([accepted_tokens, acc_padding], dim=1)
 
+        sa_manager = spec_metadata._get_sa_manager() if self.sa_enhancer else None
+        if self.sa_enhancer is not None and sa_manager is not None:
+            self.sa_enhancer.extend_and_prepare(
+                sa_manager=sa_manager,
+                request_ids=spec_metadata.request_ids,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                num_gens=num_gens,
+                num_contexts=num_contexts,
+                max_draft_len=K,
+            )
+
         self._prepare_attn_metadata_for_pard(attn_metadata, spec_metadata)
         self._prepare_kv_for_draft_forward(
             attn_metadata, num_accepted_tokens, num_contexts, batch_size
@@ -251,6 +291,11 @@ class PARDWorker(SpecWorkerBase):
                     gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
 
                 gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+
+                if self.sa_enhancer is not None and sa_manager is not None:
+                    gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                        gen_draft_tokens
+                    )
 
                 # Pad from (num_gens, K) to (num_gens, 2K-1).
                 if K > 1:

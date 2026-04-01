@@ -1,17 +1,17 @@
-# CPU Affinity configuration in TensorRT-LLM
+# CPU Affinity configuration in TensorRT LLM
 
-## NUMA-aware affinity in TensorRT-LLM
+## NUMA-aware affinity in TensorRT LLM
 
-TensorRT-LLM is frequently deployed on
+TensorRT LLM is frequently deployed on
 [NUMA](https://en.wikipedia.org/wiki/Non-uniform_memory_access) systems. In
 order to ensure consistent and optimal performance on these systems, it is
 critical to set the CPU affinity of the workers/tasks launched as part of a
-particular TRT-LLM instance so as to minimize latency and maximize bandwidth of
+particular TensorRT LLM instance so as to minimize latency and maximize bandwidth of
 CPU&harr;GPU and CPU&harr;DRAM communication.
 
-Because TensorRT-LLM does the work of allocating GPU/CUDA devices to ranks, it
+Because TensorRT LLM does the work of allocating GPU/CUDA devices to ranks, it
 is logically the ideal place for the CPU affinity to be determined and set. For
-this reason, TensorRT-LLM provides a mechanism to automatically set CPU
+this reason, TensorRT LLM provides a mechanism to automatically set CPU
 affinity according to NUMA topology. In some situations/deployments, the user
 may wish to configure CPU affinity manually (i.e. using
 [numactl](https://github.com/numactl/numactl), [wrappers around the
@@ -32,7 +32,7 @@ environment variable as follows:
 ## Other environmental considerations
 
 Whether or not the user chooses to manually configure CPU affinity or have
-TensorRT-LLM configure it automatically, the environment can also constrain the
+TensorRT LLM configure it automatically, the environment can also constrain the
 CPU affinity in a way that subverts the user's intent. Both OpenMPI and Slurm
 may configure CPU affinity, so the following additional configuration is
 recommended to avoid this.
@@ -41,7 +41,7 @@ recommended to avoid this.
 
 By default, OpenMPI chooses a rank-wise CPU affinity that is not sensitized to
 the NUMA-topology of the system. Because it does not know which GPU a
-particular rank will be communicating with (this is determined by TRT-LLM at
+particular rank will be communicating with (this is determined by TensorRT LLM at
 runtime), it cannot set the CPU affinity accordingly. For this reason, it is
 recommended that OpenMPI's default binding policy be disabled as follows:
 
@@ -54,7 +54,7 @@ The first environment variable ensures that OpenMPI will not attempt to bind or
 set the affinity of the ranks that are created at launch.
 
 The second ensures that OpenMPI's binding policy will propagate to MPI workers
-that are spawned by `mpi4py`'s `MPIPoolExecutor` class within TensorRT-LLM
+that are spawned by `mpi4py`'s `MPIPoolExecutor` class within TensorRT LLM
 (when using mpirun).
 
 ### Slurm
@@ -86,7 +86,7 @@ Note: if this environment variable is set, it is not necessary to supply the
 
 ### Using NUMA-aware autoconfiguration
 
-To explicitly enable the NUMA-aware autoconfiguration feature in TensorRT-LLM,
+To explicitly enable the NUMA-aware autoconfiguration feature in TensorRT LLM,
 simply set `TLLM_NUMA_AWARE_WORKER_AFFINITY` in the launch script (prior to
 `trtllm-bench` or `trtllm-serve`) as follows:
 
@@ -94,7 +94,7 @@ simply set `TLLM_NUMA_AWARE_WORKER_AFFINITY` in the launch script (prior to
 export TLLM_NUMA_AWARE_WORKER_AFFINITY=1
 ```
 
-Because autoconfiguration happens within TensorRT-LLM itself, it will override
+Because autoconfiguration happens within TensorRT LLM itself, it will override
 any CPU affinity or binding that has been previously set by OpenMPI or Slurm.
 
 ### NUMA-aware CPU affinity using [bindpcie](https://github.com/NVIDIA/mlperf-common/blob/main/client/bindpcie)
@@ -103,9 +103,9 @@ The bindpcie script is designed to set a per-rank CPU affinity that is ideal
 for NUMA topology. While setting `TLLM_NUMA_AWARE_WORKER_AFFINITY=1` usually
 achieves the same result in terms of the CPU affinity that is set, this
 approach has the distinct advantage that the optimal CPU affinity gets set
-_upon launching_ TensorRT-LLM, guaranteeing that each worker/rank executes on
+_upon launching_ TensorRT LLM, guaranteeing that each worker/rank executes on
 the optimal NUMA node from inception. The NUMA-aware CPU affinity
-autoconfiguration mechanism in TensorRT-LLM, on the other hand, is triggered by
+autoconfiguration mechanism in TensorRT LLM, on the other hand, is triggered by
 each worker/rank upon its own PID _after_ it has already launched. If the
 worker/rank executes on a NUMA node other than the optimal NUMA node at some
 point between the launch of the process and the NUMA-aware autoconfiguration,
@@ -120,7 +120,7 @@ The `bindpcie` script can only be applied to deployments that make use of
 bindpcie to `trtllm-serve` in an sbatch script is as follows:
 
 ```bash
-# Prevent TensorRT-LLM from autoconfiguring or clearing CPU affinity
+# Prevent TensorRT LLM from autoconfiguring or clearing CPU affinity
 export TLLM_NUMA_AWARE_WORKER_AFFINITY=0
 
 # Prevent OpenMPI from overriding affinity set by bindpcie
@@ -157,7 +157,7 @@ srun -l \
 ### Using [numactl](https://github.com/numactl/numactl)
 
 ```bash
-# Prevent TensorRT-LLM from autoconfiguring or clearing CPU affinity
+# Prevent TensorRT LLM from autoconfiguring or clearing CPU affinity
 export TLLM_NUMA_AWARE_WORKER_AFFINITY=0
 
 # Prevent OpenMPI from overriding affinity set by numactl
@@ -180,7 +180,7 @@ rankfile. The following is an example of how a rankfile can be used to
 arbitrarily map each of 4 MPI ranks to a distinct set of 4 cores:
 
 ```bash
-# Prevent TensorRT-LLM from autoconfiguring or clearing CPU affinity
+# Prevent TensorRT LLM from autoconfiguring or clearing CPU affinity
 export TLLM_NUMA_AWARE_WORKER_AFFINITY=0
 
 # Not strictly needed here, since we are overriding with explicit bindings from

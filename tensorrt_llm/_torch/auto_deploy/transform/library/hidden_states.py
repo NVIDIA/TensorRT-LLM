@@ -76,9 +76,6 @@ def cached_residual_add_fake(
 class DetectHiddenStatesForCaptureConfig(TransformConfig):
     """Configuration for the hidden states detection transform."""
 
-    # Whether to capture hidden states at all. If False we will not capture any layers.
-    capture_hidden_states: bool = False
-
     # TODO: figure out how to get layers to capture.
     # We should consider if we can use the layer indices stored in eagle checkpoints, e.g.
     # https://huggingface.co/nvidia/gpt-oss-120b-Eagle3/blob/main/config.json#L9-L14
@@ -153,15 +150,23 @@ class DetectHiddenStatesForCapture(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        if not self.config.capture_hidden_states:
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+        """Apply the hidden states capture transform to a single graph module.
 
+        Returns:
+            The transformed graph module and transform info.
+        """
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Skip if already processed
         if gm.graph.find_nodes(
             op="call_function", target=torch.ops.auto_deploy.residual_add_for_capture.default
         ):
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         residual_add_nodes = self.collect_residual_add_nodes(gm)
 
@@ -174,11 +179,11 @@ class DetectHiddenStatesForCapture(BaseTransform):
         }
 
         assert residual_add_nodes.keys() == self.config.eagle3_layers_to_capture, (
-            f"Unable to find residual add nodes for layers. Expected: {self.config.eagle3_layers_to_capture}, \
-            Found: {residual_add_nodes.keys()}"
+            f"Unable to find residual add nodes for layers. "
+            f"Expected: {self.config.eagle3_layers_to_capture}, Found: {residual_add_nodes.keys()}"
         )
 
-        # replace residual add nodes with special placeholder nodes
+        # Replace residual add nodes with special placeholder nodes
         for layer_number, res_node in residual_add_nodes.items():
             with gm.graph.inserting_before(res_node):
                 new_node = gm.graph.call_function(
@@ -190,10 +195,9 @@ class DetectHiddenStatesForCapture(BaseTransform):
             gm.graph.erase_node(res_node)
 
         cnt = len(residual_add_nodes)
-        info = TransformInfo(
+        return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=(cnt == 0), has_valid_shapes=(cnt == 0)
         )
-        return gm, info
 
 
 class HiddenStatesResourceHandler(ResourceHandler):

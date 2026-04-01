@@ -18,6 +18,16 @@ from ..utils.logger import ad_logger
 
 _MASTER_ADDR = "127.0.0.1"
 
+# Sentinel exit code used by init_and_run_process to signal a port conflict
+# (DistNetworkError during init_process_group).  spawn_multiprocess_job detects
+# this code and retries with a fresh port, recovering from the TOCTOU race
+# between _is_port_available() and dist.init_process_group().
+_PORT_CONFLICT_EXIT_CODE = 2
+
+
+class _PortConflictError(RuntimeError):
+    """Raised internally when a spawned process exits due to a port conflict."""
+
 
 class _DistGroup:
     """Global instance to set/get the default process group for distributed ops."""
@@ -133,10 +143,13 @@ def _set_distributed_env_vars(local_rank: int, world_size: int, port: int) -> No
 
 
 def _is_port_available(port: int) -> bool:
-    """Lightweight check: try to bind to the port and release immediately."""
+    """Lightweight check: try to bind to the port and release immediately.
+
+    Does NOT set SO_REUSEADDR so that ports in TIME_WAIT (from recently
+    terminated processes) are correctly rejected.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((_MASTER_ADDR, port))
             return True
     except OSError:
@@ -248,9 +261,15 @@ def init_and_run_process(
     job, rank, size, port, port_recv_conn=None, port_send_conns=None, **kwargs
 ):
     try:
-        initialize_or_skip(
-            rank, size, port, port_recv_conn=port_recv_conn, port_send_conns=port_send_conns
-        )
+        try:
+            initialize_or_skip(
+                rank, size, port, port_recv_conn=port_recv_conn, port_send_conns=port_send_conns
+            )
+        except dist.DistNetworkError:
+            # Port conflict: init_process_group failed to bind (EADDRINUSE).
+            # Exit with a sentinel code so spawn_multiprocess_job can retry
+            # with a fresh port rather than treating this as a test failure.
+            sys.exit(_PORT_CONFLICT_EXIT_CODE)
         job(rank, size, **kwargs)
     except Exception as e:
         # Close the input and output queues to parent process can exit.
@@ -351,13 +370,39 @@ def _join_multiprocess_job(processes):
         # Check exitcode via hasattr rather than isinstance(p, mp.Process), because
         # spawn-context processes (SpawnProcess) don't inherit from mp.Process.
         if hasattr(p, "exitcode"):
+            if p.exitcode == _PORT_CONFLICT_EXIT_CODE:
+                raise _PortConflictError(
+                    f"Process {p.pid} exited with port conflict code {p.exitcode}"
+                )
             assert p.exitcode == 0, f"Process {p.pid} exited with code {p.exitcode}"
 
 
-def spawn_multiprocess_job(job: Callable[[int, int], None], size: Optional[int] = None):
-    processes = _start_multiprocess_job(job, size)
-    if processes:
-        _join_multiprocess_job(processes)
+def spawn_multiprocess_job(
+    job: Callable[[int, int], None], size: Optional[int] = None, max_retries: int = 5
+):
+    for attempt in range(max_retries):
+        processes = _start_multiprocess_job(job, size)
+        if not processes:
+            break
+        try:
+            _join_multiprocess_job(processes)
+            break  # success
+        except _PortConflictError:
+            # Kill any surviving sibling processes and retry with a fresh port.
+            # This recovers from the TOCTOU race between _is_port_available() and
+            # dist.init_process_group() where an external process grabbed the port.
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=5)
+            if attempt == max_retries - 1:
+                raise RuntimeError(
+                    f"Failed to initialize distributed group after {max_retries} "
+                    "attempts due to repeated port conflicts"
+                )
+            ad_logger.warning(
+                f"Port conflict on attempt {attempt + 1}/{max_retries}, retrying with new port..."
+            )
     cleanup()
 
 

@@ -9,27 +9,22 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-0.6B
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
-# DISABLED: TorchDynamo compilation error - fake tensor dispatch failure
-# - name: apple/OpenELM-270M-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# DISABLED: TorchDynamo compilation error - fake tensor dispatch failure
-# - name: apple/OpenELM-1_1B-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# DISABLED: TorchDynamo compilation error - fake tensor dispatch failure
-# - name: apple/OpenELM-3B-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: microsoft/Phi-4-mini-instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: apple/OpenELM-270M-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-1_1B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-3B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: microsoft/Phi-4-mini-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: microsoft/Phi-4-mini-reasoning
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/gemma-3-1b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3_1b.yaml']
 - name: meta-llama/Llama-3.1-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10363
-# - name: casperhansen/llama-3-8b-instruct-awq
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: casperhansen/llama-3-8b-instruct-awq
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-1B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-3B-Instruct
@@ -40,9 +35,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen2.5-7B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10363
-# - name: Qwen/Qwen2.5-7B-Instruct-AWQ
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen2.5-7B-Instruct-AWQ
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-4B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-8B
@@ -97,9 +91,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-2-7b-chat-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: FakeTensorMode error in unified_attn export
-# - name: nvidia/Llama-3.1-8B-Instruct-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Llama-3.1-8B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
+- name: nvidia/Llama-3.1-8B-Instruct-NVFP4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base
@@ -116,18 +111,16 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: NVFP4 quantization not supported for pre BLW - CW has only Hopper
-# - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: google/gemma-3-27b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: deepseek-ai/DeepSeek-V2.5
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: Network timeout downloading from Hugging Face
-# - name: ai21labs/AI21-Jamba-1.5-Mini
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ai21labs/AI21-Jamba-1.5-Mini
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-11B-Vision-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: meta-llama/Llama-3.3-70B-Instruct
@@ -160,8 +153,6 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: Qwen/Qwen3-235B-A22B-Instruct-2507
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-- name: ai21labs/AI21-Jamba-1.5-Large
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: nvidia/OpenReasoning-Nemotron-32B
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: mistralai/Mistral-Large-Instruct-2407
@@ -170,47 +161,34 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: stuck in graph capturing
-# - name: mistralai/Mixtral-8x22B-Instruct-v0.1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: FakeTensorMode error in unified_attn export
-# - name: nvidia/Llama-3.1-70B-Instruct-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: FakeTensorMode error in unified_attn export
-# - name: nvidia/Llama-3.1-405B-Instruct-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: mistralai/Mixtral-8x22B-Instruct-v0.1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-70B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-405B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: nvidia/Llama-3.1-Nemotron-70B-Instruct-HF
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: Model loading failure - dynamic module registry issue
-# - name: nvidia/Llama-3_1-Nemotron-51B-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-51B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-30B-A3B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-235B-A22B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: Auto-deploy compilation error - shape mismatch - https://github.com/NVIDIA/TensorRT-LLM/issues/10978
-# - name: deepseek-ai/DeepSeek-R1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
-# DISABLED: Auto-deploy compilation error - shape mismatch - https://github.com/NVIDIA/TensorRT-LLM/issues/10978
-# - name: deepseek-ai/DeepSeek-V3
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
-# DISABLED: Auto-deploy compilation error - shape mismatch - https://github.com/NVIDIA/TensorRT-LLM/issues/10978
-# - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: deepseek-ai/DeepSeek-R1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+- name: deepseek-ai/DeepSeek-Coder-V2-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: Qwen/Qwen3-VL-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10363
-# - name: Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int4
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+- name: Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
 - name: codellama/CodeLlama-70b-Instruct-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: meta-llama/Llama-3.2-90B-Vision-Instruct
@@ -225,3 +203,293 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
 - name: zai-org/GLM-4.7-Flash
   yaml_extra: ['glm-4.7-flash.yaml']
+- name: Nanbeige/Nanbeige4.1-3B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# =============================================================================
+# Model list for sprint
+# =============================================================================
+# --- Qwen3.5 dense (Feb 2026) ---
+- name: Qwen/Qwen3.5-0.8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: Qwen/Qwen3.5-27B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Qwen3.5 MoE (Feb 2026) ---
+- name: Qwen/Qwen3.5-35B-A3B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml']
+- name: Qwen/Qwen3.5-397B-A17B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml']
+# --- GLM-5 (Feb 2026) ---
+- name: zai-org/GLM-5
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: zai-org/GLM-5-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- MiniMax-M2.5 (Feb 2026) ---
+- name: MiniMaxAI/MiniMax-M2.5
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- MiMo-V2-Flash (Feb 2026) ---
+- name: XiaomiMiMo/MiMo-V2-Flash
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- Kimi-K2.5 (Jan 2026) ---
+- name: moonshotai/Kimi-K2.5
+  yaml_extra: ['kimi_k2.yaml']
+# --- GLM-4.7 (Dec 2025) ---
+- name: zai-org/GLM-4.7
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- DeepSeek V3.2 (Dec 2025) ---
+- name: deepseek-ai/DeepSeek-V3.2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+- name: deepseek-ai/DeepSeek-V3.2-Speciale
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+- name: nvidia/DeepSeek-V3.2-NVFP4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+# --- GLM-4.6 (Sep 2025) ---
+- name: zai-org/GLM-4.6
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- Qwen3-Next (Sep 2025) ---
+- name: Qwen/Qwen3-Next-80B-A3B-Instruct
+  yaml_extra: ['qwen3Next.yaml']
+# --- OLMo 3 (Nov 2025) ---
+- name: allenai/Olmo-3-7B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: allenai/Olmo-3.1-32B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Command A (2025) ---
+- name: CohereLabs/c4ai-command-a-03-2025
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: CohereLabs/command-a-vision-07-2025
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+# --- Aya Expanse (2025) - multilingual ---
+- name: CohereForAI/aya-expanse-8b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: CohereForAI/aya-expanse-32b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Tencent Hunyuan (2025) ---
+- name: tencent/Hunyuan-A13B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: tencent/Hunyuan-7B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Nemotron-H (2025) - hybrid Mamba-Transformer ---
+- name: nvidia/Nemotron-H-8B-Base-8K
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Nemotron-H-47B-Reasoning-128K
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- Granite 4.0 (2025) - hybrid Mamba/Transformer ---
+- name: ibm-granite/granite-4.0-micro
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ibm-granite/granite-4.0-h-small
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- AI21 Jamba (2025) - hybrid SSM-Transformer ---
+- name: ai21labs/AI21-Jamba-Large-1.7
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: ai21labs/AI21-Jamba-Reasoning-3B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Skywork (2025) ---
+- name: Skywork/Skywork-R1V2-38B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: Skywork/Skywork-SWE-32B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Seed (2025) ---
+- name: ByteDance-Seed/Seed-Coder-8B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ByteDance-Seed/Seed-OSS-36B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Qwen3 Instruct 2507 update ---
+- name: Qwen/Qwen3-4B-Instruct-2507
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- SmolLM3 (Jul 2025) ---
+- name: HuggingFaceTB/SmolLM3-3B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: HuggingFaceTB/SmolLM3-3B-Base
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Gemma 3n (Jun 2025) - on-device VLM ---
+- name: google/gemma-3n-E2B-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml']
+- name: google/gemma-3n-E4B-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# --- JetBrains Mellum (Apr 2025) - code specialist ---
+- name: JetBrains/Mellum-4b-sft-all
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Qwen3 missing sizes (May 2025) ---
+- name: Qwen/Qwen3-1.7B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen3-32B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- DeepSeek R1-0528 (May 2025) ---
+- name: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Llama 4 base models (Apr 2025) ---
+- name: meta-llama/Llama-4-Scout-17B-16E
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
+- name: meta-llama/Llama-4-Maverick-17B-128E
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
+# --- Phi-4 variants (2025) ---
+- name: microsoft/Phi-4-multimodal-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: microsoft/Phi-4-reasoning-vision-15B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+# --- MiniMax M2 (2025) ---
+- name: MiniMaxAI/MiniMax-M2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- Tencent Hunyuan small (2025) ---
+- name: tencent/Hunyuan-1.8B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: tencent/Hunyuan-MT-7B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- UI-TARS (2025) - GUI agent VLM ---
+- name: ByteDance-Seed/UI-TARS-1.5-7B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# --- Nvidia Nemotron Flash (2025) ---
+- name: nvidia/Nemotron-Flash-3B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- InternLM3 (Jan 2025) ---
+- name: internlm/internlm3-8b-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Gemma 3 missing sizes (Mar 2025) ---
+- name: google/gemma-3-4b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: google/gemma-3-12b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+# --- Mistral Small (2025) ---
+- name: mistralai/Mistral-Small-24B-Instruct-2501
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: mistralai/Mistral-Small-3.1-24B-Instruct-2503
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+- name: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+- name: mistralai/Mistral-Small-4-119B-2603
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'mistral_small_4_119b.yaml']
+# --- DeepSeek R1 distills (Jan 2025) ---
+- name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- DeepSeek Prover V2 671B (2025) ---
+- name: deepseek-ai/DeepSeek-Prover-V2-671B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+# --- OLMo 2 (Mar 2025) ---
+- name: allenai/OLMo-2-0325-32B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: allenai/OLMo-2-0325-32B-DPO
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Command A variants (2025) ---
+- name: CohereLabs/command-a-translate-08-2025
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: CohereLabs/command-a-reasoning-08-2025
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- Falcon3 (Dec 2024) ---
+- name: tiiuae/Falcon3-1B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: tiiuae/Falcon3-10B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- EXAONE 3.5 (Dec 2024) ---
+- name: LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: LGAI-EXAONE/EXAONE-3.5-32B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- SmolLM2 (Nov 2024) ---
+- name: HuggingFaceTB/SmolLM2-135M-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: HuggingFaceTB/SmolLM2-1.7B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Qwen2.5-Coder (Nov 2024) ---
+- name: Qwen/Qwen2.5-Coder-1.5B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen2.5-Coder-32B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- OLMo 3 Think (Nov 2025) ---
+- name: allenai/Olmo-3-32B-Think
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Qwen3-14B (May 2025) ---
+- name: Qwen/Qwen3-14B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- DeepSeek V3 (Jan 2025) ---
+- name: deepseek-ai/DeepSeek-V3
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+# --- Qwen2.5 larger sizes ---
+- name: Qwen/Qwen2.5-14B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: Qwen/Qwen2.5-72B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- Qwen2.5-Math ---
+- name: Qwen/Qwen2.5-Math-7B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Nvidia Nemotron 3 Nano (2025) ---
+- name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Perplexity R1-1776 distill Qwen (2025) ---
+- name: perplexity-ai/r1-1776-distill-qwen-32b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Nanbeige 8B (2025) ---
+- name: Nanbeige/Nanbeige4.1-8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Qwen3 MoE updates (2025) ---
+- name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: Qwen/Qwen3-0.6B-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+# --- Mistral updates (2025) ---
+- name: mistralai/Codestral-25.01
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: mistralai/Mistral-Large-Instruct-2501
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- Qwen3-VL 2B (2025) ---
+- name: Qwen/Qwen3-VL-2B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
+# --- Granite 4.0 tiny (2025) ---
+- name: ibm-granite/granite-4.0-tiny-preview
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- OLMo 3 Think 7B (2025) ---
+- name: allenai/Olmo-3-7B-Think
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Nemotron-H reasoning 8B (2025) ---
+- name: nvidia/Nemotron-H-8B-Reasoning-128K
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Pixtral (2025) - VLM ---
+- name: mistralai/Pixtral-12B-2409
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+# --- DeepSeek Coder V2 Lite (2025) ---
+- name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Seed-Coder reasoning (2025) ---
+- name: ByteDance-Seed/Seed-Coder-8B-Reasoning
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Tencent Hunyuan translation (2025) ---
+- name: tencent/Hunyuan-MT-Chimera-7B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# --- Phi-4-mini flash reasoning (2025) ---
+- name: microsoft/Phi-4-mini-flash-reasoning
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+# --- Qwen2.5-VL (2025) - top VLM family ---
+- name: Qwen/Qwen2.5-VL-7B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: Qwen/Qwen2.5-VL-72B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+# --- Qwen3-VL MoE (2025) - flagship VLM ---
+- name: Qwen/Qwen3-VL-30B-A3B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
+# --- InternVL3 (Apr 2025) - #1 open-source VLM ---
+- name: OpenGVLab/InternVL3-8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: OpenGVLab/InternVL3-78B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+# --- InternVL3.5 (2025) - latest gen ---
+- name: OpenGVLab/InternVL3_5-8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# --- SmolVLM2 (2025) - tiny VLM ---
+- name: HuggingFaceTB/SmolVLM2-2.2B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# --- Molmo2 (2025) - fully open VLM ---
+- name: allenai/Molmo2-8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# --- DeepSeek-VL2 (2025) - MoE VLM ---
+- name: deepseek-ai/deepseek-vl2-small
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# --- Aya Vision (2025) - multilingual VLM ---
+- name: CohereLabs/aya-vision-8b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: CohereLabs/aya-vision-32b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']

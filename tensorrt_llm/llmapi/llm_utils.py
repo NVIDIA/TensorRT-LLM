@@ -387,7 +387,17 @@ class ModelLoader:
                         f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                     )
 
+            # quantized_layers is handled separately (e.g. via LayerQuantConfig
+            # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
+            hf_quant_config.pop("quantized_layers", None)
+
+            quant_config_fields = set(quant_config.model_fields.keys())
             for key, value in hf_quant_config.items():
+                if key not in quant_config_fields:
+                    logger.warning(
+                        f"Ignoring unknown field '{key}' from HF quant config (not a QuantConfig field)."
+                    )
+                    continue
                 logger.info(
                     f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
                 )

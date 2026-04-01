@@ -81,7 +81,6 @@ class SASpecMetadata(SpecMetadata):
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
-        # Prepare SA manager (copies pending states to GPU)
         if self.sa_manager is not None:
             self.sa_manager.prepare(self.request_ids, self.max_draft_len)
         else:

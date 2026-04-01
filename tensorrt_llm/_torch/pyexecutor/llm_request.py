@@ -1,6 +1,6 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
@@ -39,6 +39,9 @@ REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_GENERATION_ONLY:
     LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
 }
+
+if TYPE_CHECKING:
+    from .sampling_utils import Strategy
 
 
 @dataclass(slots=True)
@@ -234,6 +237,8 @@ class LogProbStorage:
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             else:
+                # FIXME: This relies on the ordering of LogProb's in the dictionary. TorchSampler ensures
+                #        that the sampled logprob is in the first position.
                 self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
@@ -625,6 +630,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             **kwargs):
+        self.py_sampling_strategy: "Strategy | None" = None
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -710,6 +716,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+
+        self.py_num_connector_matched_tokens = 0
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -1013,7 +1021,7 @@ def executor_request_to_llm_request(
         return_encoder_output=False,
         client_id=executor_request.client_id
         if executor_request.client_id is not None else req_id,
-        priority=0.5,
+        priority=executor_request.priority,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt_id=executor_request.cache_salt_id,

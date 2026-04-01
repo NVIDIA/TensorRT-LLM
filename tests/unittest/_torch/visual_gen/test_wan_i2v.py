@@ -33,10 +33,11 @@ from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
-    DiffusionArgs,
     DiffusionModelConfig,
     ParallelConfig,
     TeaCacheConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -103,7 +104,7 @@ def wan21_i2v_pipeline_bf16():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -123,7 +124,7 @@ def wan21_i2v_pipeline_fp8():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -144,7 +145,7 @@ def wan21_i2v_pipeline_fp8_blockwise():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -165,7 +166,7 @@ def wan21_i2v_pipeline_with_image_encoder():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -185,7 +186,7 @@ def wan22_i2v_pipeline_bf16():
     if not is_wan22_checkpoint():
         pytest.skip("This fixture requires Wan 2.2 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -205,7 +206,7 @@ def wan22_i2v_pipeline_fp8():
     if not is_wan22_checkpoint():
         pytest.skip("This fixture requires Wan 2.2 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -269,11 +270,11 @@ def _run_cfg_worker_i2v(rank, world_size, checkpoint_path, inputs_list, return_d
     try:
         setup_distributed(rank, world_size)
 
-        from tensorrt_llm._torch.visual_gen.config import DiffusionArgs, ParallelConfig
+        from tensorrt_llm._torch.visual_gen.config import ParallelConfig, VisualGenArgs
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
         # Load I2V pipeline with CFG parallel
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -376,7 +377,7 @@ def _run_all_optimizations_worker_i2v(rank, world_size, checkpoint_path, inputs_
         setup_distributed(rank, world_size)
 
         # Load I2V pipeline with ALL optimizations
-        args_full = DiffusionArgs(
+        args_full = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -641,7 +642,7 @@ class TestWanI2VIntegration:
         if not is_wan21_checkpoint():
             pytest.skip("This test requires Wan 2.1 checkpoint")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -693,7 +694,7 @@ class TestWanI2VIntegration:
         if not is_wan21_checkpoint():
             pytest.skip("This test requires Wan 2.1 checkpoint")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -738,7 +739,7 @@ class TestWanI2VIntegration:
         if not is_wan21_checkpoint():
             pytest.skip("This test requires Wan 2.1 checkpoint")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -965,7 +966,7 @@ class TestWanI2VTwoStage:
         print("✓ forward() accepts boundary_ratio parameter for runtime override")
 
     def test_two_stage_with_all_optimizations(self, wan22_i2v_pipeline_fp8):
-        """Test Wan 2.2 with FP8, TeaCache, and TRTLLM attention."""
+        """Test Wan 2.2 with FP8 and TRTLLM attention (TeaCache not supported for Wan 2.2)."""
         # Skip if not two-stage
         if (
             wan22_i2v_pipeline_fp8.boundary_ratio is None
@@ -974,18 +975,13 @@ class TestWanI2VTwoStage:
             pytest.skip("Not a two-stage checkpoint")
 
         # Load pipeline with all optimizations
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             attention=AttentionConfig(backend="TRTLLM"),
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
-                teacache_thresh=0.2,
-                use_ret_steps=True,
-            ),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
 
@@ -999,18 +995,6 @@ class TestWanI2VTwoStage:
             )
             print(f"✓ FP8: transformer={fp8_t1}, transformer_2={fp8_t2}")
             assert fp8_t1 and fp8_t2
-
-            # Check TeaCache on both transformers
-            has_cache_t1 = (
-                hasattr(pipeline, "transformer_cache_backend")
-                and pipeline.transformer_cache_backend
-            )
-            has_cache_t2 = (
-                hasattr(pipeline, "transformer_2_cache_backend")
-                and pipeline.transformer_2_cache_backend
-            )
-            print(f"✓ TeaCache: transformer={has_cache_t1}, transformer_2={has_cache_t2}")
-            assert has_cache_t1 and has_cache_t2
 
             # Check TRTLLM attention
             attn1_backend = pipeline.transformer.blocks[0].attn1.attn_backend
@@ -1038,7 +1022,7 @@ class TestWanI2VRobustness:
     def test_invalid_quant_config(self):
         """Test that invalid quantization config raises appropriate error."""
         with pytest.raises((ValueError, KeyError)):
-            args = DiffusionArgs(
+            args = VisualGenArgs(
                 checkpoint_path=CHECKPOINT_PATH,
                 device="cuda",
                 dtype="bfloat16",
@@ -1053,7 +1037,7 @@ class TestWanI2VRobustness:
         if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
             pytest.skip("DIFFUSION_MODEL_PATH not set")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1084,6 +1068,76 @@ class TestWanI2VRobustness:
         finally:
             del pipeline
             torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Batch Generation Tests (I2V)
+# =============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.i2v
+class TestWanI2VBatchGeneration:
+    """Batch generation tests for WAN I2V pipeline (Wan 2.1 and Wan 2.2).
+
+    Tests that passing a list of prompts produces batched output
+    and matches sequential generation with the same seeds.
+    """
+
+    @pytest.fixture(scope="class")
+    def i2v_full_pipeline(self):
+        """Load full I2V pipeline (all components) for batch tests."""
+        if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
+            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH.")
+
+        args = VisualGenArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        yield pipeline
+        del pipeline
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_single_prompt_backward_compat(self, i2v_full_pipeline, test_image):
+        """Single prompt returns (T, H, W, C) for backward compatibility."""
+        result = i2v_full_pipeline.forward(
+            prompt="a cat walking",
+            image=test_image,
+            height=480,
+            width=832,
+            num_frames=9,
+            num_inference_steps=4,
+            guidance_scale=5.0,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 1 and H == 480 and W == 832 and C == 3
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_batch_prompt_shape(self, i2v_full_pipeline, test_image):
+        """List of prompts returns (B, T, H, W, C)."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+        result = i2v_full_pipeline.forward(
+            prompt=prompts,
+            image=test_image,
+            height=480,
+            width=832,
+            num_frames=9,
+            num_inference_steps=4,
+            guidance_scale=5.0,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 2 and H == 480 and W == 832 and C == 3
 
 
 # ============================================================================
@@ -1132,7 +1186,7 @@ class TestWanI2VParallelism(unittest.TestCase):
 
         # Load standard CFG baseline on GPU 0
         print("\n[1/3] Loading standard CFG I2V baseline (cfg_size=1) on GPU 0...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
@@ -1343,7 +1397,7 @@ class TestWanI2VCombinedOptimizations(unittest.TestCase):
 
         # Load baseline on GPU 0 (no optimizations, standard CFG)
         print("\n[1/3] Loading I2V baseline on GPU 0 (standard CFG, no optimizations)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",

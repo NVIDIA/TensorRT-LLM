@@ -28,6 +28,17 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 InputDimT = Union[int, Tuple[int, int]]
 
 
+def calc_seq_len(size: Tuple[int, int], patch_size: int) -> int:
+    """Calculate the number of patches for a given image size."""
+    h, w = size
+    return (h // patch_size) * (w // patch_size)
+
+
+def calc_seq_lens(sizes: List[Tuple[int, int]], patch_size: int) -> List[int]:
+    """Calculate per-image patch counts."""
+    return [calc_seq_len(size, patch_size) for size in sizes]
+
+
 class VITTIMMConfig(NamedTuple):
     embed_dim: int
     depth: int
@@ -145,12 +156,70 @@ class ViTPatchGenerator(nn.Module):
         self.patch_normalizer = nn.LayerNorm(
             embed_dim) if normalize_patches else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        patches = self.embed_patches(x)
-        patches, pos_enc = self.apply_pos_enc(patches, input_size=x.shape[2:])
-        patches = self.cls_token(patches)
+    def forward(
+            self,
+            x: torch.Tensor,
+            image_sizes: Optional[List[Tuple[int,
+                                             int]]] = None) -> torch.Tensor:
+        if image_sizes is not None:
+            # Dynamic resolution: x is pre-rearranged patches [1, total_patches, C*P*P]
+            patches = self.embedder(x)
+            patches, _ = self.apply_pos_enc_dynamic(patches, image_sizes)
+            patches = self.cls_token_dynamic(patches, image_sizes)
+        else:
+            patches = self.embed_patches(x)
+            patches, pos_enc = self.apply_pos_enc(patches,
+                                                  input_size=x.shape[2:])
+            patches = self.cls_token(patches)
         patches = self.patch_normalizer(patches)
         return patches
+
+    def apply_pos_enc_dynamic(
+        self, patches: torch.Tensor, image_sizes: List[Tuple[int, int]]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Add per-image position encodings for variable-size images."""
+        if not self.abs_pos:
+            return patches, None
+
+        current_length = 0
+        pos_enc_list = []
+
+        for size in image_sizes:
+            seq_length = calc_seq_len(size, self.patch_size)
+            img_patches = patches[:,
+                                  current_length:current_length + seq_length, :]
+            pos_enc = self.get_pos_enc(input_size=size)
+            img_patches_with_pos = img_patches + pos_enc
+
+            patches = torch.cat([
+                patches[:, :current_length, :],
+                img_patches_with_pos,
+                patches[:, current_length + seq_length:, :],
+            ],
+                                dim=1)
+            pos_enc_list.append(pos_enc)
+            current_length += seq_length
+
+        full_pos_enc = torch.cat(pos_enc_list, dim=1) if pos_enc_list else None
+        return patches, full_pos_enc
+
+    def cls_token_dynamic(self, patches: torch.Tensor,
+                          image_sizes: List[Tuple[int, int]]) -> torch.Tensor:
+        """Insert CLS + register tokens before each image's patches."""
+        if not self.cls_token.enabled:
+            return patches
+
+        out = []
+        current_length = 0
+
+        for seq_len in calc_seq_lens(image_sizes, self.patch_size):
+            class_token = self.cls_token.token.unsqueeze(0).expand(
+                patches.shape[0], -1, -1)
+            out.append(class_token)
+            out.append(patches[:, current_length:current_length + seq_len, :])
+            current_length += seq_len
+
+        return torch.cat(out, dim=1)
 
     @property
     def num_cls_tokens(self):
@@ -580,6 +649,14 @@ class VisionTransformer(nn.Module):
         self.num_cls_tokens = num_cls_tokens
         self.num_registers = self.patch_generator.num_registers
 
+        # Compute the max possible per-image sequence length (patches + CLS/registers).
+        # This is used as a fixed max_seq_len for attention metadata so the C++ attention
+        # op cache key stays stable across forward passes with different image resolutions.
+        # Without this, each unique max_seq_len creates a new AttentionOp (with its own
+        # GPU semaphore allocation), causing a memory leak over many inference steps.
+        max_patches_per_image = (max_img_size // patch_size)**2
+        self._fixed_max_seq_len = max_patches_per_image + self.patch_generator.num_skip
+
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
         self.attn_metadata = self.metadata_cls(
@@ -604,24 +681,46 @@ class VisionTransformer(nn.Module):
         attn_metadata.num_contexts = batch_size
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lens
-        attn_metadata.max_seq_len = seq_lens.max().item()
+        # Use fixed max_seq_len to keep the C++ attention op cache key stable.
+        # The actual per-sequence lengths are passed separately and used for computation.
+        attn_metadata.max_seq_len = self._fixed_max_seq_len
 
         attn_metadata.prepare()
         return attn_metadata
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(
+            self,
+            x: torch.Tensor,
+            image_sizes: Optional[List[Tuple[int,
+                                             int]]] = None) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
-        x = self.patch_generator(x)
+        x = self.patch_generator(x, image_sizes=image_sizes)
 
-        batch_size, seq_len, hidden_size = x.shape
-        seq_lengths = [seq_len] * batch_size
+        if image_sizes is not None:
+            # Dynamic resolution: each image is a separate "context".
+            num_skip = self.patch_generator.num_skip
+            seq_lengths = [
+                calc_seq_len(size, self.patch_size) + num_skip
+                for size in image_sizes
+            ]
+            batch_size = len(image_sizes)
+        else:
+            batch_size, seq_len, _ = x.shape
+            seq_lengths = [seq_len] * batch_size
+
         attn_metadata = self.prepare_attn_metadata(batch_size, seq_lengths,
                                                    self.attn_metadata)
+
+        hidden_size = x.shape[-1]
         # Need flatten batch/seq_len for trtllm attention.
-        x = x.reshape(batch_size * seq_len, hidden_size)
+        x = x.reshape(-1, hidden_size)
         for block in self.blocks:
             x = block(x, attn_metadata=attn_metadata)
-        x = x.reshape(batch_size, seq_len, hidden_size)
+
+        if image_sizes is not None:
+            x = x.reshape(1, -1, hidden_size)
+        else:
+            x = x.reshape(batch_size, seq_lengths[0], hidden_size)
 
         x = self.norm(x)
         return x
@@ -725,30 +824,56 @@ class RADIOVisionModelBase(nn.Module):
         width = max(width, self.min_resolution_step)
         return Resolution(height=height, width=width)
 
-    def forward(self,
-                x: torch.Tensor,
-                feature_fmt: str = 'NLC') -> torch.Tensor:
-        res_step = self.min_resolution_step
-        if res_step is not None and (x.shape[-2] % res_step != 0
-                                     or x.shape[-1] % res_step != 0):
-            raise ValueError(
-                'The input resolution must be a multiple of `self.min_resolution_step`. '
-                '`self.get_nearest_supported_resolution(<height>, <width>) is provided as a convenience API. '
-                f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
-            )
-        x = self.input_conditioner(x)
-        y = self.model.forward_features(x)
-        ret = self._extract_final(x, y, feature_fmt=feature_fmt)
+    def forward(
+            self,
+            x: torch.Tensor,
+            feature_fmt: str = 'NLC',
+            image_sizes: Optional[List[Tuple[int,
+                                             int]]] = None) -> torch.Tensor:
+        if image_sizes is None:
+            res_step = self.min_resolution_step
+            if res_step is not None and (x.shape[-2] % res_step != 0
+                                         or x.shape[-1] % res_step != 0):
+                raise ValueError(
+                    'The input resolution must be a multiple of `self.min_resolution_step`. '
+                    '`self.get_nearest_supported_resolution(<height>, <width>) is provided as a convenience API. '
+                    f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
+                )
+            x = self.input_conditioner(x)
+        y = self.model.forward_features(x, image_sizes=image_sizes)
+        ret = self._extract_final(x,
+                                  y,
+                                  feature_fmt=feature_fmt,
+                                  image_sizes=image_sizes)
         return ret
 
     def _extract_final(self,
                        x: torch.Tensor,
                        y: torch.Tensor,
-                       feature_fmt: str = 'NLC'):
+                       feature_fmt: str = 'NLC',
+                       image_sizes: Optional[List[Tuple[int, int]]] = None):
+        # TODO: remove dead `feature_fmt` code.
+        if image_sizes is not None and feature_fmt == 'NCHW':
+            raise ValueError(
+                f"{feature_fmt=} is not supported when `image_sizes` is provided."
+            )
         if isinstance(self.model, VisionTransformer):
             patch_gen = getattr(self.model, "patch_generator", None)
             if patch_gen is not None:
-                all_feat = y[:, patch_gen.num_skip:]
+                if image_sizes is not None:
+                    # Dynamic resolution: strip CLS/register per image
+                    num_skip = patch_gen.num_skip
+                    patch_size = patch_gen.patch_size
+                    all_patches = []
+                    current_pos = 0
+                    for num_patches in calc_seq_lens(image_sizes, patch_size):
+                        patches = y[:, current_pos + num_skip:current_pos +
+                                    num_skip + num_patches, :]
+                        all_patches.append(patches)
+                        current_pos += num_skip + num_patches
+                    all_feat = torch.cat(all_patches, dim=1)
+                else:
+                    all_feat = y[:, patch_gen.num_skip:]
             elif self.model.global_pool == "avg":
                 all_feat = y
             else:
@@ -887,7 +1012,9 @@ class RADIOVisionModel(PreTrainedModel):
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
-            if not u.startswith('model.blocks.'):
+            # TODO(TRTLLM-11269): Add support for the conv3d layer.
+            if not u.startswith(
+                ('model.blocks.', 'model.patch_generator.video_embedder')):
                 raise ValueError(f"Unexpected key: {u}")
 
         # Load weights for vision transformer module.
@@ -918,5 +1045,7 @@ class RADIOVisionModel(PreTrainedModel):
                                           converted_weights,
                                           params_map=pattern_mapping)
 
-    def forward(self, x: torch.Tensor):
-        return self.radio_model.forward(x)
+    def forward(self,
+                x: torch.Tensor,
+                image_sizes: Optional[List[Tuple[int, int]]] = None):
+        return self.radio_model.forward(x, image_sizes=image_sizes)

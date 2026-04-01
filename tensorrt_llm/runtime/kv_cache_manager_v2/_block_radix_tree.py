@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
 
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
-from ._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
+from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
 from ._utils import TypedIndexList, chunked, filled_list, unwrap_rawref
 
 if TYPE_CHECKING:
@@ -321,6 +321,7 @@ class Block:
             return
         ordinal = self.ordinal
         self.storage[lc_idx] = None
+        assert type(lc) is AttnLifeCycle, "Reuse for SSM layers is not supported yet"
         if lc.window_size is None or ordinal < lc.num_sink_blocks:
             pages = remove_subtree(self)
             for r in pages:

@@ -266,6 +266,94 @@ class FuseRMSNorm(BaseTransform):
         target_op = _BACKEND_OPS[backend]
         cnt = 0
 
+        # First, fuse the norm-before-gate decomposition:
+        # torch_rmsnorm(x, w, eps) * silu(gate.to(fp32)) -> triton_rmsnorm_gated(x, w, gate, ...)
+        # This avoids a separate fp32 mul + cast before downstream GEMM.
+        for node in list(graph.nodes):
+            if not is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
+                continue
+
+            # torch_rmsnorm output should only feed the mul in this pattern.
+            if len(node.users) != 1:
+                continue
+            mul_node = next(iter(node.users))
+            if not is_op(mul_node, torch.ops.aten.mul.Tensor):
+                continue
+
+            lhs, rhs = mul_node.args
+            if lhs is node:
+                other = rhs
+            elif rhs is node:
+                other = lhs
+            else:
+                continue
+
+            if not isinstance(other, Node) or not is_op(other, torch.ops.aten.silu.default):
+                continue
+
+            gate_input = other.args[0]
+            if isinstance(gate_input, Node) and is_op(gate_input, torch.ops.aten.to.dtype):
+                if len(gate_input.args) < 2 or gate_input.args[1] != torch.float32:
+                    continue
+                gate = gate_input.args[0]
+                gate_cast_node = gate_input
+            else:
+                gate = gate_input
+                gate_cast_node = None
+
+            # Optional trailing cast back to bf16/fp16.
+            output_node = mul_node
+            trailing_cast_node = None
+            if len(mul_node.users) == 1:
+                only_user = next(iter(mul_node.users))
+                if (
+                    is_op(only_user, torch.ops.aten.to.dtype)
+                    and len(only_user.args) >= 2
+                    and only_user.args[0] is mul_node
+                    and only_user.args[1] in (torch.bfloat16, torch.float16)
+                ):
+                    output_node = only_user
+                    trailing_cast_node = only_user
+
+            # Infer group_size from normalized dimension (fallback-safe).
+            x, weight, eps = node.args
+            group_size = None
+            if isinstance(weight, Node):
+                w_meta = weight.meta.get("val") if hasattr(weight, "meta") else None
+                if w_meta is not None and hasattr(w_meta, "numel"):
+                    group_size = int(w_meta.numel())
+            if group_size is None and isinstance(x, Node):
+                x_meta = x.meta.get("val") if hasattr(x, "meta") else None
+                if x_meta is not None and hasattr(x_meta, "shape"):
+                    group_size = int(x_meta.shape[-1])
+            if group_size is None:
+                continue
+
+            with graph.inserting_after(output_node):
+                fused_node: Node = graph.call_function(
+                    torch.ops.auto_deploy.triton_rmsnorm_gated,
+                    args=(x, weight, gate, eps, group_size, True),
+                )
+
+            output_node.replace_all_uses_with(fused_node)
+            graph.erase_node(output_node)
+            cnt += 1
+
+            if (
+                trailing_cast_node is not None
+                and trailing_cast_node is not output_node
+                and len(trailing_cast_node.users) == 0
+            ):
+                graph.erase_node(trailing_cast_node)
+            if mul_node is not output_node and len(mul_node.users) == 0:
+                graph.erase_node(mul_node)
+            if len(other.users) == 0:
+                graph.erase_node(other)
+            if gate_cast_node is not None and len(gate_cast_node.users) == 0:
+                graph.erase_node(gate_cast_node)
+            if len(node.users) == 0:
+                graph.erase_node(node)
+
         # Replace torch_rmsnorm ops with the selected backend
         for node in list(graph.nodes):
             if is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
@@ -276,6 +364,8 @@ class FuseRMSNorm(BaseTransform):
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    # Preserve metadata (including val/tensor_meta) for downstream transforms.
+                    new_node.meta.update(node.meta)
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1
@@ -290,6 +380,7 @@ class FuseRMSNorm(BaseTransform):
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    new_node.meta.update(node.meta)
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1

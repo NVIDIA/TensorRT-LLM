@@ -23,6 +23,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,6 +39,13 @@ class FabricMemory;
 namespace tensorrt_llm::batch_manager
 {
 
+enum class BufferKind : uint8_t
+{
+    kKV = 0,
+    kKV_INDEXER = 1,
+    kRNN = 2
+};
+
 /// @brief Base class for cache transfer buffer management.
 /// Handles buffer pool allocation, index assignment, and slicing.
 /// Derived classes provide cache-specific size calculations.
@@ -45,6 +53,8 @@ class BaseTransBufferManager
 {
 public:
     virtual ~BaseTransBufferManager() = default;
+
+    [[nodiscard]] virtual BufferKind getBufferKind() const = 0;
 
     /// @brief Assign a buffer index for sending.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.

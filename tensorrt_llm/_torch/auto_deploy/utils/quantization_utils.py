@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 from fnmatch import fnmatch
 from typing import Dict, Optional, Tuple, Union
 
@@ -21,6 +23,18 @@ try:
     from ....quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
+
+
+FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype_name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, dtype_name, None)) is not None
+)
 
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
@@ -102,16 +116,29 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
             return "NVFP4"
         else:
             ad_logger.info("Found unsupported quantized nodes. Performance will be sub-optimal.")
-            print(input_params, weight_params)
 
     return ""
+
+
+def _pattern_matches(modname: str, pattern: str) -> bool:
+    """Check if an exclude pattern matches the module name.
+
+    Keep behavior aligned with upstream: evaluate exclude entries via fnmatch.
+    This preserves exact module-path excludes (for example:
+    ``model.layers.0.self_attn.q_a_proj``) and wildcard entries.
+    """
+    return fnmatch(modname, pattern)
 
 
 def should_skip_quantization(
     node_or_name: Union[Node, str],
     excluded_patterns: list[str],
 ) -> bool:
-    """Check if a node or parameter name should be skipped based on excluded patterns."""
+    """Check if a node or parameter name should be skipped based on excluded patterns.
+
+    Supports both glob patterns (e.g., "*gate*") and simple substring patterns
+    (e.g., "gate" matches "model.layers.0.block_sparse_moe.gate").
+    """
     if isinstance(node_or_name, str):
         modname, _, _ = node_or_name.rpartition(".")
     else:
@@ -124,7 +151,62 @@ def should_skip_quantization(
             return True
         modname = weight_name.rpartition(".")[0]
 
-    return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
+    return any(_pattern_matches(modname, pattern) for pattern in excluded_patterns)
+
+
+def _extract_modname(node_or_name: Union[Node, str]) -> Optional[str]:
+    """Extract the module name from a graph node or parameter name string.
+
+    Returns None if the module name cannot be determined.
+    """
+    if isinstance(node_or_name, str):
+        modname, _, _ = node_or_name.rpartition(".")
+        return modname
+
+    if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
+        return None
+    weight_name = extract_weight_name(node_or_name)
+    if weight_name is False or not isinstance(weight_name, str):
+        return None
+    return weight_name.rpartition(".")[0]
+
+
+def should_skip_mixed_precision_quantization(
+    node_or_name: Union[Node, str],
+    algo_name: str,
+    quantized_layers: Dict[str, Dict],
+) -> bool:
+    """For MIXED_PRECISION configs, check whether this node's per-layer algo matches.
+
+    Returns True (skip) if the layer is absent from quantized_layers or its
+    per-layer quant_algo doesn't match ``algo_name``.
+    """
+    modname = _extract_modname(node_or_name)
+    if modname is None:
+        return True
+
+    layer_info = quantized_layers.get(modname)
+    if layer_info is None:
+        return True
+
+    layer_algo = layer_info.get("quant_algo", "").upper()
+    if layer_algo != algo_name.upper():
+        return True
+
+    return False
+
+
+def is_mixed_precision_config(qcfg: Dict) -> bool:
+    """Return True if the quantization config uses MIXED_PRECISION."""
+    return qcfg.get("quant_algo", "").upper() == "MIXED_PRECISION"
+
+
+def mixed_precision_has_algo(qcfg: Dict, algo_name: str) -> bool:
+    """Return True if the MIXED_PRECISION config contains any layer with the given algo."""
+    for layer_info in qcfg.get("quantized_layers", {}).values():
+        if layer_info.get("quant_algo", "").upper() == algo_name.upper():
+            return True
+    return False
 
 
 def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Optional[Node]]:

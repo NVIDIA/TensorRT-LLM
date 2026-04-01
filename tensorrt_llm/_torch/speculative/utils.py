@@ -1,5 +1,6 @@
+from bisect import bisect_left
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
@@ -10,6 +11,9 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
+from .draft_target import (DraftTargetOneModelSampler,
+                           DraftTargetOneModelSpecMetadata,
+                           DraftTargetOneModelWorker)
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
@@ -32,11 +36,6 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False,
                       max_seq_len=262144):
     if spec_config.spec_dec_mode.is_mtp_one_model():
-        # Get SA manager from spec_resource_manager if MTP+SA mode
-        sa_manager = None
-        if spec_resource_manager is not None and hasattr(
-                spec_resource_manager, 'sa_manager'):
-            sa_manager = spec_resource_manager.sa_manager
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -44,7 +43,6 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.num_nextn_predict_layers,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
-            sa_manager=sa_manager,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
@@ -92,6 +90,7 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
@@ -99,6 +98,16 @@ def get_spec_metadata(spec_config,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            spec_resource_manager=spec_resource_manager,
+        )
+    if spec_config.spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
@@ -171,6 +180,22 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             sa_manager=sa_manager,
         )
+    if spec_dec_mode.is_eagle3_one_model():
+        sa_manager = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+                                                max_seq_len)
+        if sa_manager is not None:
+            return Eagle3ResourceManager(
+                spec_config,
+                model_config.torch_dtype,
+                model_config.hidden_size,
+                max_num_requests,
+                max_seq_len,
+                max_num_tokens,
+                sa_manager=sa_manager,
+            )
+        return None
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
         return Eagle3ResourceManager(
@@ -189,6 +214,11 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             max_num_tokens,
         )
+    if spec_dec_mode.is_pard():
+        if getattr(spec_config, 'use_sa_spec', False):
+            return SuffixAutomatonManager(spec_config, max_num_requests,
+                                          max_seq_len)
+        return None
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_sa():
@@ -217,6 +247,8 @@ def get_spec_decoder(
                           nextn=spec_config.tokens_per_gen_step - 1)
     if spec_config.spec_dec_mode.is_sa():
         return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
+    if spec_config.spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelSampler(sampler_args)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -278,6 +310,9 @@ def get_spec_worker(spec_config,
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
+    if spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelWorker(spec_config, mapping,
+                                         use_separate_draft_kv_cache)
     return None
 
 
@@ -329,3 +364,45 @@ class SpecDecodingTensor:
     position_offsets: torch.Tensor
     packed_mask: torch.Tensor
     generation_lengths: Optional[torch.Tensor] = None
+
+
+def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
+                                 batch_size: int, max_draft_len: int) -> int:
+    """
+    Get the appropriate draft length for the given batch size using binary search.
+
+    This is a standalone function that can be used by both the drafter (two-model path)
+    and the model engine / spec workers (one-model path).
+
+    New semantics: Keys represent specific batch sizes (transition points).
+    Values represent draft_len to use for batch sizes UP TO that key.
+
+    Args:
+        draft_len_schedule: Mapping from batch size thresholds to draft lengths.
+                            Example: {4: 4, 8: 2, 32: 1} means:
+                            - batch size 1-4:   use draft_len=4 (up to key 4)
+                            - batch size 5-8:   use draft_len=2 (up to key 8)
+                            - batch size 9-32:  use draft_len=1 (up to key 32)
+                            - batch size 33+:   use draft_len=0 (speculation disabled, implicit)
+        batch_size: Current batch size.
+        max_draft_len: Maximum draft length to use if no schedule is provided.
+
+    Returns:
+        The draft length to use for this batch size.
+    """
+    if draft_len_schedule is None:
+        return max_draft_len
+
+    # Binary search to find the first threshold >= batch_size
+    # draft_len_schedule is already sorted by config validator
+    schedule_batch_sizes = list(draft_len_schedule.keys())
+
+    # bisect_left finds where to insert batch_size to keep list sorted
+    # This gives us the index of the first key >= batch_size
+    idx = bisect_left(schedule_batch_sizes, batch_size)
+
+    if idx < len(schedule_batch_sizes):
+        return draft_len_schedule[schedule_batch_sizes[idx]]
+
+    # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
+    return 0

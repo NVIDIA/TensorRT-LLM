@@ -139,9 +139,9 @@ class CudaGraphLoraManager:
         Returns:
             LoRA parameters dictionary.
         """
-        assert len(scheduled_requests.context_requests) == 0, (
+        assert scheduled_requests.num_context_requests == 0, (
             "Context requests are not supported with LoRA CUDA Graph path. "
-            f"Have {len(scheduled_requests.context_requests)} context requests"
+            f"Have {scheduled_requests.num_context_requests} context requests"
         )
         request_list = scheduled_requests.generation_requests
 

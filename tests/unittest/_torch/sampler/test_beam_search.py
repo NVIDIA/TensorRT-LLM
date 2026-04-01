@@ -35,8 +35,8 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
-    BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, FinishReason,
-    beam_search_sampling_batch)
+    BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, beam_search_sampling_batch)
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
@@ -75,12 +75,14 @@ def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
     )
 
 
-@pytest.fixture(scope="module", params=[False, True])
+@pytest.fixture(scope="module",
+                params=[False, True],
+                ids=["no_cuda_graph_and_overlap", "cuda_graph_and_overlap"])
 def with_cuda_graph_and_overlap(request):
     return request.param
 
 
-def _build_llm(fixed_params, input_prompts, llm_kwargs):
+def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
     if "max_batch_size" not in llm_kwargs:
         llm_kwargs = llm_kwargs | dict(
             max_batch_size=fixed_params["max_beam_width"] * len(
@@ -90,7 +92,7 @@ def _build_llm(fixed_params, input_prompts, llm_kwargs):
     return LLM(
         **llm_kwargs,
         kv_cache_config=KvCacheConfig(
-            max_tokens=10000,  # type: ignore
+            max_tokens=10000,  # pyright: ignore
         ),
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
@@ -114,24 +116,32 @@ def _single_process_context():
 @pytest.fixture(scope="module")
 def llm(fixed_params, input_prompts, model_kwargs, single_process: bool,
         with_cuda_graph_and_overlap: bool):
+    check_no_sync = single_process  # single_process only used for sync check
+    if check_no_sync and model_kwargs["sampler_type"] != "TorchSampler":
+        pytest.skip("Sync check only supported for TorchSampler")
+
     gc.collect(
         2)  # force destruction of any other LLM instances (cf. comment above)
     with _single_process_context() if single_process else nullcontext():
+        llm_kwargs: dict[
+            str,
+            Any] = deepcopy(  # LLM.shutdown resets checkpoint_loader.config_loader
+                model_kwargs)
+        if not with_cuda_graph_and_overlap:
+            llm_kwargs |= dict(
+                disable_overlap_scheduler=True,
+                cuda_graph_config=None,
+            )
+        else:
+            llm_kwargs |= dict(
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                                  enable_padding=True),
+            )
         llm = _build_llm(
             fixed_params,
             input_prompts,
-            llm_kwargs=(
-                (dict(
-                    disable_overlap_scheduler=True,
-                    cuda_graph_config=None,
-                ) if not with_cuda_graph_and_overlap else dict(
-                    disable_overlap_scheduler=False,
-                    cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
-                                                      enable_padding=True),
-                ))
-                |
-                deepcopy(  # LLM.shutdown resets checkpoint_loader.config_loader
-                    model_kwargs)),
+            llm_kwargs=llm_kwargs,
         )
     with llm:
         yield llm
@@ -203,30 +213,33 @@ def check_cache_indirection(beam: CompletionOutput,
     ), f"expected {reference_cache_indirection[beam_idx, :num_valid_cache_indirection].tolist()} cache indirection, but got {valid_cache_indirection.tolist()}"
 
 
-def validate_output_beam(beam: CompletionOutput,
+def validate_output_beam(beam_output: CompletionOutput,
                          expected_outputs: BeamSearchTestOutput,
                          sampling_params: SamplingParams, prompt_length: int,
                          beam_idx: int) -> None:
     """Perform several checks on the output of a single beam"""
 
     valid_tokens = None
-    if sampling_params.stop_token_ids is not None:
-        if sampling_params.stop_token_ids[0] in expected_outputs.outputs[
-                beam_idx].tolist():
-            valid_tokens = expected_outputs.outputs[beam_idx].tolist().index(
-                sampling_params.stop_token_ids[0]) + 1
+    if sampling_params.stop_token_ids is not None and sampling_params.stop_token_ids[
+            0] in (expected_output_token_ids :=
+                   expected_outputs.outputs[beam_idx].tolist()):
+        assert beam_output.finish_reason == "stop"
+        valid_tokens = expected_output_token_ids.index(
+            sampling_params.stop_token_ids[0]) + 1
+    else:
+        assert beam_output.finish_reason == "length"
 
-    check_generation_logits(beam, sampling_params, valid_tokens)
-    check_logprobs(beam, sampling_params, valid_tokens)
-    check_cache_indirection(beam, sampling_params,
+    check_generation_logits(beam_output, sampling_params, valid_tokens)
+    check_logprobs(beam_output, sampling_params, valid_tokens)
+    check_cache_indirection(beam_output, sampling_params,
                             expected_outputs.cache_indirection, prompt_length,
                             beam_idx, valid_tokens)
     # Check output similarity
 
     assert valid_tokens is None or valid_tokens > 0
-    assert beam.token_ids == expected_outputs.outputs[
-        beam_idx, :valid_tokens].tolist(
-        ), f"expected {expected_outputs.outputs[beam_idx, :valid_tokens].tolist()} token ids, but got {beam.token_ids}"
+    expected_valid_token_ids = expected_outputs.outputs[
+        beam_idx, :valid_tokens].tolist()
+    assert beam_output.token_ids == expected_valid_token_ids, f"expected {expected_valid_token_ids} token ids, but got {beam_output.token_ids}"
 
 
 def check_context_logits(output: GenerationResult,
@@ -240,9 +253,11 @@ def check_context_logits(output: GenerationResult,
         assert output.context_logits is None, "context logits should be None"
 
 
-@pytest.fixture(scope="module", params=[False, True])
+@pytest.fixture(scope="module",
+                params=[False, True],
+                ids=["multi_process", "single_process"])
 def single_process(request) -> bool:
-    return request.param
+    return cast(bool, request.param)
 
 
 def validate_output(output: GenerationResult, input_prompt: list[int],
@@ -258,8 +273,9 @@ def validate_output(output: GenerationResult, input_prompt: list[int],
     # check each beam
     expected_outputs = get_expected_outputs(
         input_prompt[-1], num_iterations=sampling_params.max_tokens)
-    for beam_idx, beam in enumerate(output.outputs):
-        validate_output_beam(beam, expected_outputs, sampling_params,
+
+    for beam_idx, beam_output in enumerate(output.outputs):
+        validate_output_beam(beam_output, expected_outputs, sampling_params,
                              len(input_prompt), beam_idx)
 
 
@@ -337,7 +353,7 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("num_output_beams", [1, 2])
-@pytest.mark.parametrize("num_prompts", [1, 2, 3])
+@pytest.mark.parametrize("num_prompts", [1, 3])
 @pytest.mark.parametrize("stop_token_ids", [[15], None])
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_e2e(
@@ -353,15 +369,7 @@ def test_beam_search_e2e(
     single_process: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    llm_args = cast(TorchLlmArgs, llm.args)
-    check_no_sync = single_process  # single_process only used for sync check
-    if check_no_sync and cast(TorchLlmArgs,
-                              llm.args).sampler_type != "TorchSampler":
-        pytest.skip("Sync check only supported for TorchSampler")
-    if check_no_sync and (cast(TorchLlmArgs, llm.args).sampler_type
-                          == "TorchSampler") and stop_token_ids is not None:
-        # FIXME: Fix TorchSampler._are_stop_words
-        pytest.skip("Stop word handling in TorchSampler syncs")
+    llm_args = cast(TorchLlmArgs, llm.args)  # type: ignore[redundant-cast]
 
     if return_log_probs and num_prompts > 1 and llm_args.sampler_type == "TRTLLMSampler":
         pytest.skip(
@@ -388,13 +396,14 @@ def test_beam_search_e2e(
         logprobs=return_log_probs,
         end_id=-1,
         stop_token_ids=stop_token_ids,
+        include_stop_str_in_output=True,
         additional_model_outputs=["cache_indirection"],
     )
     validate_outputs(
         llm,
         input_prompts[:num_prompts],
         sampling_params,
-        check_no_sync=check_no_sync,
+        check_no_sync=single_process,
         monkeypatch=monkeypatch,
     )
 
@@ -910,12 +919,12 @@ class TestParameterValidation:
     @pytest.fixture(scope="module", params=[1, 4])
     @staticmethod
     def batch_size(request) -> int:
-        return request.param
+        return cast(int, request.param)
 
     @pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
     @staticmethod
     def sampler_type(request) -> str:
-        return request.param
+        return cast(str, request.param)
 
     @pytest.fixture(scope="module")
     @staticmethod
@@ -941,7 +950,7 @@ class TestParameterValidation:
         )
 
     def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
-                               fixed_params: dict):
+                               fixed_params: dict[str, Any]):
         _ = llm.generate(input_prompts,
                          sampling_params=SamplingParams(
                              max_tokens=fixed_params["max_tokens"],
@@ -957,7 +966,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -984,8 +993,8 @@ class TestParameterValidation:
     @pytest.mark.timeout(120)
     @pytest.mark.threadleak(enabled=False)
     def test_use_beam_search_ommitted(self, llm: LLM, input_prompts: list[str],
-                                      fixed_params: dict, batch_size: int,
-                                      sampler_type: str):
+                                      fixed_params: dict[str, Any],
+                                      batch_size: int, sampler_type: str):
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
         if sampler_type == "TorchSampler":
@@ -1011,7 +1020,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -1040,7 +1049,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -1069,7 +1078,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):

@@ -91,7 +91,9 @@ class _StrategyImpls:
             return False
 
         @staticmethod
-        def _make_tensor(data: list, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        def _make_tensor(
+            data: list[float] | list[int], dtype: torch.dtype, device: torch.device
+        ) -> torch.Tensor:
             return torch.tensor(data, dtype=dtype, pin_memory=prefer_pinned()).to(
                 device=device, non_blocking=True
             )
@@ -118,7 +120,7 @@ class _StrategyImpls:
         ) -> torch.Tensor:
             if group_logit_indices is not None:
                 logits = logits[group_logit_indices]
-            probs = flashinfer.sampling.softmax(
+            probs: torch.Tensor = flashinfer.sampling.softmax(
                 logits,
                 temperature,
                 enable_pdl=get_env_enable_pdl(),
@@ -131,7 +133,7 @@ class _StrategyImpls:
             probs: torch.Tensor,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            new_tokens = flashinfer.sampling.sampling_from_probs(
+            new_tokens: torch.Tensor = flashinfer.sampling.sampling_from_probs(
                 probs,
                 deterministic=True,
                 generator=generator,
@@ -234,7 +236,9 @@ class _StrategyImpls:
             return True
 
     class GreedyWithProbs(StrategyImplWithProbs):
-        def __init__(self):
+        def __init__(
+            self,
+        ) -> None:  # https://github.com/python/mypy/issues/604#issuecomment-83901869
             self._temperature = None
 
         @override
@@ -422,7 +426,9 @@ class _StrategyImpls:
             return False
 
     class GreedySampleOnly(StrategyImplSampleOnly):
-        def __init__(self):
+        def __init__(
+            self,
+        ) -> None:  # https://github.com/python/mypy/issues/604#issuecomment-83901869
             self._temperature = None
 
         @override
@@ -659,9 +665,13 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
                 | ("temperature", _)
                 | ("greedy", None)
             ):
-                return strategy[0]
+                return cast(
+                    _STRATEGY_KEY_TYPE, strategy[0]
+                )  # https://github.com/python/mypy/issues/19081
             case ("beam_search", beam_width_in, beam_width_out, _):
-                return (strategy[0], beam_width_in, beam_width_out)
+                return cast(
+                    _STRATEGY_KEY_TYPE, (strategy[0], beam_width_in, beam_width_out)
+                )  # https://github.com/python/mypy/issues/19081
             case _:
                 raise NotImplementedError("Unsupported strategy encountered")
 
@@ -689,6 +699,7 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
         group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         beam_width_in = 1
+        strategy_impl_cls: Type[_StrategyImpls.StrategyImpl]
         if return_probs:
             match group_key:
                 case "top_k":

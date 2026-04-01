@@ -1,8 +1,6 @@
-linear:
-  type: default
 teacache:
-   enable_teacache: false
-   teacache_thresh: 0.2
+   enable_teacache: true
+   teacache_thresh: 0.6
 attention:
    backend: VANILLA
 parallel:

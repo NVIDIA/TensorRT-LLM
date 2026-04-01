@@ -782,6 +782,10 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
                 "DType=float!");                                                                                       \
         }                                                                                                              \
     }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARRMSNorm)                                                     \
+    {                                                                                                                  \
+        DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARRMSNorm, NRanks);                                          \
+    }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");                                  \

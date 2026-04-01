@@ -96,7 +96,18 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
             raise ValueError(f"Expected producer 'modelopt', got '{producer}'")
 
         quant_config = config.get("quantization", {})
-        # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
+
+        quant_algo = quant_config.get("quant_algo", "").upper()
+
+        if quant_algo == "MIXED_PRECISION":
+            self._read_mixed_precision_config(quant_config)
+        else:
+            self._read_single_algo_config(quant_config)
+
+        return {}
+
+    def _read_single_algo_config(self, quant_config: Dict) -> None:
+        """Parse a single-algorithm quantization config (e.g. NVFP4, FP8)."""
         excludes = quant_config.get("exclude_modules", [])
         quant_config["exclude_modules"] = excludes + [
             n for n in self._ALWAYS_EXCLUDE if n not in excludes
@@ -107,16 +118,45 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
                 f"torch_dtype not found in quant_config, using default {self.DEFAULT_TORCH_DTYPE}"
             )
             quant_config["torch_dtype"] = self.DEFAULT_TORCH_DTYPE
-        # Handle kv cache
+
+        self._handle_kv_cache(quant_config)
+        self._quant_config = quant_config
+
+    def _read_mixed_precision_config(self, quant_config: Dict) -> None:
+        """Parse a MIXED_PRECISION quantization config with per-layer algo assignments."""
+        quantized_layers = quant_config.get("quantized_layers", {})
+        if not quantized_layers:
+            raise ValueError(
+                "MIXED_PRECISION quant_algo requires a non-empty 'quantized_layers' mapping."
+            )
+
+        unique_algos = {v.get("quant_algo", "").upper() for v in quantized_layers.values()}
+        algo_counts = {}
+        for v in quantized_layers.values():
+            algo = v.get("quant_algo", "UNKNOWN").upper()
+            algo_counts[algo] = algo_counts.get(algo, 0) + 1
+        ad_logger.info(
+            f"Mixed precision checkpoint detected: {len(quantized_layers)} layers, "
+            f"algos: {unique_algos}, per-algo counts: {algo_counts}"
+        )
+
+        quant_config["exclude_modules"] = list(self._ALWAYS_EXCLUDE)
+
+        if "torch_dtype" not in quant_config:
+            ad_logger.warning(
+                f"torch_dtype not found in quant_config, using default {self.DEFAULT_TORCH_DTYPE}"
+            )
+            quant_config["torch_dtype"] = self.DEFAULT_TORCH_DTYPE
+
+        self._handle_kv_cache(quant_config)
+        self._quant_config = quant_config
+
+    def _handle_kv_cache(self, quant_config: Dict) -> None:
         kv_algo = quant_config.get("kv_cache_quant_algo")
         if kv_algo:
             if kv_algo != "FP8":
                 raise ValueError(f"KV cache quantization format {kv_algo} not supported.")
             quant_config["kv_cache_dtype"] = "fp8"
-
-        self._quant_config = quant_config
-
-        return {}
 
     @classmethod
     def from_file(
@@ -149,6 +189,7 @@ class HFQuantConfigReader(QuantConfigReader):
     """
 
     _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens")
+    _SUPPORTED_QUANT_METHODS = ("mxfp4", "gptq", "fp8")
 
     def __init__(self):
         super().__init__()
@@ -188,7 +229,7 @@ class HFQuantConfigReader(QuantConfigReader):
         # TODO(Fridah-nv):this class is only verified with GPT-OSS MXFP4 and INT4-GPTQ, other hf quantizers
         # should have similar workflow and will be added to the pipeline
         quant_method = str(qconf.get("quant_method", "")).lower()
-        if quant_method not in ["mxfp4", "gptq"]:
+        if quant_method not in cls._SUPPORTED_QUANT_METHODS:
             return None
 
         # Validate GPTQ config: currently only INT4 with group_size=128 is supported

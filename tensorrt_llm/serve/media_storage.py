@@ -502,15 +502,8 @@ def get_video_encoder() -> Optional["VideoEncoder"]:
     """
     global _VIDEO_ENCODER
     if _VIDEO_ENCODER is None:
-        if _check_ffmpeg_available():
-            logger.info("Using ffmpeg CLI for video encoding")
-            _VIDEO_ENCODER = FfmpegCliEncoder()
-        else:
-            logger.warning(
-                "FFmpeg is unavailable so no MP4 generation support."
-                "Using pure Python MJPEG/AVI encoder (no audio support)"
-            )
-            _VIDEO_ENCODER = PurePythonEncoder()
+        _VIDEO_ENCODER = FfmpegCliEncoder() if _check_ffmpeg_available() else PurePythonEncoder()
+        logger.info(f"Using {_VIDEO_ENCODER.__class__.__name__} for video encoding")
     return _VIDEO_ENCODER
 
 
@@ -524,7 +517,7 @@ class MediaStorage:
         """Save image to file.
 
         Args:
-            image: torch.Tensor (H, W, C) uint8
+            image: torch.Tensor (B, H, W, C) or (H, W, C) uint8
             output_path: Path to save the image
             format: Image format (png, jpg, webp). If None, infer from extension
             quality: Quality for lossy formats (1-100, higher is better)
@@ -532,6 +525,9 @@ class MediaStorage:
         Returns:
             Path where the image was saved
         """
+        # Extract first image from batch if needed
+        if hasattr(image, "dim") and image.dim() == 4:
+            image = image[0]
         # Ensure output directory exists
         output_dir = os.path.dirname(output_path)
         if output_dir:
@@ -585,13 +581,18 @@ class MediaStorage:
         """Convert torch.Tensor to PIL Image.
 
         Args:
-            image: torch.Tensor (H, W, C) uint8
+            image: torch.Tensor (H, W, C) or (B, H, W, C) uint8.
+                   If a batch dimension is present, the first image is extracted.
 
         Returns:
             PIL Image
         """
         if not isinstance(image, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor, got {type(image)}")
+
+        # Squeeze batch dimension if present: (B, H, W, C) -> (H, W, C)
+        if image.dim() == 4:
+            image = image[0]
 
         # Convert to numpy for PIL
         image_np = image.cpu().numpy()
@@ -641,7 +642,7 @@ class MediaStorage:
         """Save video to file with optional audio.
 
         Args:
-            video: Video frames as torch.Tensor (T, H, W, C) uint8
+            video: Video frames as torch.Tensor (B, T, H, W, C) or (T, H, W, C) uint8
             output_path: Path to save the video
             audio: Optional audio as torch.Tensor
             frame_rate: Frames per second (default: 24.0)
@@ -650,6 +651,9 @@ class MediaStorage:
         Returns:
             Path where the video was saved
         """
+        # Extract first video from batch if needed
+        if hasattr(video, "dim") and video.dim() == 5:
+            video = video[0]
         # Ensure output directory exists
         if isinstance(output_path, Path):
             output_path = str(output_path)

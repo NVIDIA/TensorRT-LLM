@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
-from torch.fx import Node
+from torch.fx import GraphModule, Node
 
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
@@ -45,6 +45,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     KVPagedResourceHandler,
     MHACallable,
@@ -207,6 +208,21 @@ class _TrtllmPlanner:
 
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
+_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
+_TRTLLM_ATTN_OUT_SCALE_KEY = "trtllm_attention_out_scale"
+
+
+def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
+    attn_node.meta[_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY] = input_scale
+
+
+def get_trtllm_attention_fp8_input_scale(attn_node: Node) -> Optional[Node]:
+    scale = attn_node.meta.get(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY)
+    return scale if isinstance(scale, Node) else None
+
+
+def clear_trtllm_attention_fp8_input_scale(attn_node: Node) -> None:
+    attn_node.meta.pop(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY, None)
 
 
 # =============================================================================
@@ -216,7 +232,6 @@ _GlobalTrtllmPlanner = _TrtllmPlanner()
 
 def prepare_trtllm_metadata_host(
     batch_info_host: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     seq_len_with_cache_host: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_host: torch.Tensor,
@@ -227,14 +242,16 @@ def prepare_trtllm_metadata_host(
     Handles host_request_types, host_total_kv_lens, host_past_kv_lengths,
     host_context_lengths.
     """
-    num_prefill, _, num_decode = batch_info_host.tolist()
-    max_context_length, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, _, num_decode = batch_info.get_absorbed_info()
 
-    _GlobalTrtllmPlanner.reset(torch.device("cuda"), max_batch_size, max_blocks_per_seq)
+    _GlobalTrtllmPlanner.reset(
+        torch.device("cuda"), batch_info.get_max_batch_size(), batch_info.get_max_blocks_per_seq()
+    )
     _GlobalTrtllmPlanner.plan_host(
         num_prefill=num_prefill,
         num_decode=num_decode,
-        max_context_length=max_context_length,
+        max_context_length=batch_info.get_max_context_length(),
         seq_len_with_cache_host=seq_len_with_cache_host,
         input_pos_host=input_pos_host,
         seq_len_host=seq_len_host,
@@ -250,7 +267,6 @@ def prepare_trtllm_metadata_host(
 @torch.library.custom_op("auto_deploy::trtllm_attention_prepare_metadata", mutates_args=())
 def prepare_trtllm_metadata(
     batch_info_host: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
 ) -> List[torch.Tensor]:
@@ -262,12 +278,11 @@ def prepare_trtllm_metadata(
     Returns ``block_offsets`` which flows through the graph to each attention op,
     creating an explicit data dependency.
     """
-    num_prefill, _, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
-    _, _, block_offset_multiplier, _ = max_seq_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
     _GlobalTrtllmPlanner.plan_device(
-        num_seq=num_seq,
+        num_seq=batch_info.get_total_num_sequences(),
         block_offset_multiplier=block_offset_multiplier,
         cu_num_pages=cu_num_pages,
         cache_loc=cache_loc,
@@ -279,12 +294,13 @@ def prepare_trtllm_metadata(
 @prepare_trtllm_metadata.register_fake
 def prepare_trtllm_metadata_fake(
     batch_info_host: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
-    _, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    max_blocks_per_seq = batch_info.get_max_blocks_per_seq()
+    max_batch_size = batch_info.get_max_batch_size()
     return [
         torch.empty(
             1, max_batch_size, 2, max_blocks_per_seq, dtype=torch.int32, device=cache_loc.device
@@ -307,7 +323,6 @@ def trtllm_mha_with_cache(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     # EXTRA METADATA (from prepare_trtllm_metadata device-side op)
     kv_cache_block_offsets: torch.Tensor,
     # CACHE
@@ -317,12 +332,15 @@ def trtllm_mha_with_cache(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
     Infers num_heads, num_kv_heads, head_dim, and tokens_per_block from tensor shapes.
     All max-size constants (max_num_requests, max_context_length) are read from
-    ``max_seq_info_host`` which is set once via ``SequenceInfo.update_cache_information()``.
+    ``batch_info_host`` via ``BatchInfo`` which is set once via
+    ``SequenceInfo.update_cache_information()``.
 
     ``kv_cache_block_offsets`` is computed by the ``prepare_trtllm_metadata`` device-side
     op and flows through the graph to create an explicit data dependency.
@@ -339,11 +357,11 @@ def trtllm_mha_with_cache(
     tokens_per_block = kv_cache.shape[3]  # HND: [blocks, 2, heads, tpb, head_dim]
 
     # Get batch dimensions and model-level constants from host tensors (no device sync)
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
-    num_tokens = num_prefill_tokens + num_decode
-    max_context_length = int(max_seq_info_host[0])
-    max_num_requests = int(max_seq_info_host[3])
+    batch_info = BatchInfo(batch_info_host)
+    num_seq = batch_info.get_total_num_sequences()
+    num_tokens = batch_info.get_total_num_tokens()
+    max_context_length = batch_info.get_max_context_length()
+    max_num_requests = batch_info.get_max_batch_size()
     # Use sliding_window for attention_window_size if provided, else full context length
     attention_window_size = (
         sliding_window
@@ -357,18 +375,27 @@ def trtllm_mha_with_cache(
         _GlobalTrtllmPlanner.get_layer_tensors(kv_cache, kv_scale_orig_quant, kv_scale_quant_orig)
     )
 
-    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse
-    # Input is always [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed),
-    # so b * s == num_tokens always holds.
+    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse.
+    # Input is [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
+    # With piecewise CUDA graphs the tensor may be padded to a bucket size
+    # (b*s > num_tokens), so flatten first and slice to the real token count.
     q_shape_og = q.shape
-    q_flat = q.reshape(num_tokens, num_heads * head_dim)
-    k_flat = k.reshape(num_tokens, num_kv_heads * head_dim)
-    v_flat = v.reshape(num_tokens, num_kv_heads * head_dim)
+    q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
+    k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+    v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
-    # Prepare output
-    output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
-
+    # Prepare output: if caller provided an `out` buffer, write directly into it
+    total_padded_tokens = q_shape_og[0] * q_shape_og[1]
+    # If out_scale is set, attention quantizes output to FP8.
+    out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    if out is not None:
+        out_flat = out.view(-1, num_heads * head_dim)
+        output = out_flat[:num_tokens]
+    else:
+        output = torch.zeros(
+            total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
+        )
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
     context_lengths = seq_len[:num_seq]  # device
@@ -398,7 +425,7 @@ def trtllm_mha_with_cache(
         qkv_fused,  # q (actually fused QKV)
         None,  # k (None when using fused QKV)
         None,  # v (None when using fused QKV)
-        output,  # output
+        output[:num_tokens],  # output
         None,  # output_sf (NVFP4)
         _GlobalTrtllmPlanner.workspace,  # workspace (module-level, like flashinfer)
         sequence_length,  # sequence_length
@@ -413,7 +440,7 @@ def trtllm_mha_with_cache(
         None,  # cache_indirection (beam search)
         kv_scale_oq,  # kv_scale_orig_quant
         kv_scale_qo,  # kv_scale_quant_orig
-        None,  # out_scale
+        out_scale,  # out_scale
         None,  # rotary_inv_freq
         None,  # rotary_cos_sin
         None,  # latent_cache (MLA)
@@ -475,6 +502,11 @@ def trtllm_mha_with_cache(
         None,  # quant_q_buffer
     )
 
+    if out is not None:
+        if total_padded_tokens > num_tokens:
+            out_flat[num_tokens:].zero_()
+        return out.new_empty(0)
+
     return output.view(*q_shape_og)
 
 
@@ -488,7 +520,6 @@ def trtllm_mha_with_cache_fake(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
-    max_seq_info_host: torch.Tensor,
     # EXTRA METADATA (from prepare_trtllm_metadata device-side op)
     kv_cache_block_offsets: torch.Tensor,
     # CACHE
@@ -498,9 +529,14 @@ def trtllm_mha_with_cache_fake(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
-    return torch.empty_like(q.contiguous())
+    if out is not None:
+        return out.new_empty(0)
+    out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    return torch.empty_like(q.contiguous(), dtype=out_dtype)
 
 
 # =============================================================================
@@ -542,7 +578,6 @@ class TrtllmAttention(AttentionDescriptor):
             "batch_info_host",
             "seq_len",
             "seq_len_with_cache",
-            "max_seq_info_host",
         ]
 
     @classmethod
@@ -577,10 +612,29 @@ class TrtllmAttention(AttentionDescriptor):
         return prepare_trtllm_metadata_host
 
     @classmethod
+    def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
+        """Materialize optional out_scale node for FP8 output path if contract exists."""
+        input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
+        if input_scale is None:
+            attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
+            return
+
+        existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+        if isinstance(existing_out_scale, Node):
+            return
+
+        with gm.graph.inserting_before(attn_node):
+            out_scale = gm.graph.call_function(
+                torch.ops.aten.reciprocal.default, args=(input_scale,)
+            )
+        attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
+
+    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Extract constants from the source attention node.
 
-        Returns scale, sliding_window, kv_scale_orig_quant, and kv_scale_quant_orig.
+        Returns scale, sliding_window, kv_scale_orig_quant, kv_scale_quant_orig,
+        and optional output quant scale for FP8 linear consumers.
         Everything else (num_heads, head_dim, max_context_length, etc.) is inferred
         from tensor shapes or SequenceInfo metadata at runtime.
         """
@@ -616,9 +670,15 @@ class TrtllmAttention(AttentionDescriptor):
         # Get sliding_window from source attention node
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
+        # Optional out_scale is injected by prepare_node_for_cache_insertion when available.
+        out_scale = source_attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+        if not isinstance(out_scale, Node):
+            out_scale = None
+
         return [
             scale,
             sliding_window,
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
+            out_scale,
         ]

@@ -113,14 +113,16 @@ l0_dgx_h100:
   - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
   # ------------- Disaggregated serving tests ---------------
   - unittest/disaggregated/test_py_cache_transceiver_mp.py
-  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp1pp2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp2pp1]
@@ -131,8 +133,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[GSM8K]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
-  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill_ctx_pp2
-  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap]
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first[ctx_tp1pp1-gen_tp1pp1]
   - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
   - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing]
   - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
@@ -155,17 +156,35 @@ l0_dgx_h100:
     terms:
       stage: pre_merge
       backend: pytorch
+      auto_trigger: others
+      orchestrator: mpi
+  tests:
+  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
+  # Only CUTLASS backend runs on H100 (SM90). TRTLLM/CUTEDSL/DEEPGEMM require SM100+.
+  # --- CUTLASS ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not MXFP8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
+  # ------------- MoE: test_multi_gpu_eplb ---------------
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
       auto_trigger: deepseek
       orchestrator: mpi
   tests:
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp1-bf16-trtllm-deepseekv3_lite]
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp4-bf16-trtllm-deepseekv3_lite]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEP]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[NVLinkTwoSided]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.VANILLA-dtype0]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.VANILLA-dtype1]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.W4A8_CUSTOM-dtype0]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.W4A8_CUSTOM-dtype1]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-sampler_async_worker=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[ep4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-sampler_async_worker=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[ep4-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-sampler_async_worker=False]
@@ -228,6 +247,7 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-triton-auto]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache_no_reuse-tp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
 - condition:
     ranges:
@@ -340,7 +360,9 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
-  - unittest/_torch/auto_deploy/unit/multigpu
+  - unittest/auto_deploy/multigpu/custom_ops
+  - unittest/auto_deploy/multigpu/smoke
+  - unittest/auto_deploy/multigpu/transformations
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-trtllm]
@@ -372,3 +394,4 @@ l0_dgx_h100:
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Codestral-22B-v0.1-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[Qwen_QwQ-32B-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.3-70B-Instruct-False]
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-FP8-True]

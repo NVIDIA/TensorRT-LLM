@@ -1,7 +1,7 @@
 -r requirements.txt
 einops
 graphviz
-mypy
+mypy==1.19.1
 mako
 oyaml
 parameterized
@@ -21,7 +21,8 @@ pytest-mock
 pytest-threadleak
 rouge_score
 cloudpickle
-typing-extensions==4.12.2
+typeguard==4.4.4
+typing-extensions==4.15.0
 bandit==1.7.7
 jsonlines==4.0.0
 jieba==0.42.1
@@ -36,8 +37,11 @@ opentelemetry-api>=1.26.0
 opentelemetry-exporter-otlp>=1.26.0
 opentelemetry-semantic-conventions-ai>=0.4.1
 fuzzywuzzy==0.18.0
-aiperf==0.3.0
+aiperf==0.6.0
 nanobind>=2.9.0
 nixl==0.8.0
+cupti-python>=13.0,<13.2
+nvidia-cuda-cupti>=13.0,<13.2
+cxxfilt
 hf-transfer==0.1.9
 line_profiler
