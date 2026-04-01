@@ -37,7 +37,7 @@ By NVIDIA TensorRT LLM team
     - [Real Decoding Data](#real-decoding-data)
   - [Integration and Activation](#integration-and-activation)
   - [End-to-End Accuracy](#end-to-end-accuracy)
-  - [End-to-End Throughput](#end-to-end-throughput)
+  - [End-to-End Min-Latency Benchmark on B200](#end-to-end-min-latency-benchmark-on-b200)
 - [Future Work](#future-work)
 - [Acknowledgement](#acknowledgement)
 
@@ -47,7 +47,7 @@ The rise of agentic AI workloads — where LLMs autonomously browse, plan, write
 
 **GPU Top-K: Prior Art.** Efficient Top-K selection on GPUs has been studied extensively. On the exact side, [RadiK](https://dl.acm.org/doi/10.1145/3650200.3656601) (Li et al., ICS 2024) presents a scalable radix-based GPU Top-K achieving state-of-the-art throughput on Ampere and Hopper GPUs. [Zois et al.](https://adms-conf.org/2019-camera-ready/ADMS19_GPU_TopK.pdf) (ADMS 2019) propose GPU-parallel Top-K with early stopping that terminates redundant work once the K-th element is identified. [Zhang et al.](https://doi.org/10.1145/3581784.3607062) (SC 2023) provide the most comprehensive study to date, benchmarking radix, sampling, bucket-sort, and bitonic-sort GPU Top-K variants across a wide (N, K) parameter space on A100 and H100, and introducing fused filter-and-histogram kernels — their key finding that optimal algorithm choice depends on (N, K) regime, data distribution, and GPU microarchitecture directly motivates our workload-adaptive approach. On the approximate side, [Key et al.](https://arxiv.org/abs/2412.04358) (2024) study bucketed approximate Top-K that trades exactness for parallelism — attractive for sparsity-in-training but unsuitable for inference where exact Top-K is required to preserve model accuracy. All these prior works optimize Top-K as a *distribution-agnostic* primitive; our contribution is orthogonal: we exploit the *temporal correlation* inherent in autoregressive LLM decoding to provide a data-dependent warm-start, reducing global-memory passes from 3–4 to 1–2 while retaining **exact** correctness.
 
-This blog focuses on DeepSeek Sparse Attention (DSA) as a concrete case study. DSA selects the top-2048 tokens from potentially tens or hundreds of thousands of indexer scores via a lightweight **lightning indexer** and **Top-K selector**. While the sparse MLA kernel and indexer MQA kernel have been heavily optimized (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), the Top-K selection becomes an increasingly significant fraction of the DSA module latency as sequences grow longer. We introduce a **Guess-Verify-Refine (GVR) Top-K algorithm** that exploits a fundamental property of autoregressive LLM decoding: the set of important key-value tokens changes slowly between consecutive steps. By leveraging the previous step's Top-K results as a prediction signal, the algorithm can estimate a tight threshold in as few as 1–2 global passes over the data, then collect and refine candidates using ballot-free shared-memory techniques. On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, this data-aware approach achieves an average **1.81×** single-operator speedup over the production radix-select kernel — an evolution of [Zhang et al. (SC23)](https://doi.org/10.1145/3581784.3607062) optimized for Blackwell by the same team — with up to **2.36×** per layer per step and no loss in output accuracy. While demonstrated on DSA, the approach generalizes to any sparse attention method whose decode-phase Top-K exhibits temporal correlation.
+This blog focuses on DeepSeek Sparse Attention (DSA) as a concrete case study. DSA selects the top-2048 tokens from potentially tens or hundreds of thousands of indexer scores via a lightweight **lightning indexer** and **Top-K selector**. While the sparse MLA kernel and indexer MQA kernel have been heavily optimized (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), the Top-K selection becomes an increasingly significant fraction of the DSA module latency as sequences grow longer. We introduce a **Guess-Verify-Refine (GVR) Top-K algorithm** — a heuristic-guided approach that exploits a fundamental property of autoregressive LLM decoding: the set of important key-value tokens changes slowly between consecutive steps. By leveraging the previous step's Top-K results as a prediction signal, the algorithm can estimate a tight threshold in as few as 1–2 global passes over the data, then collect and refine candidates using ballot-free shared-memory techniques. On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, this data-aware approach achieves an average **1.81×** single-operator speedup over the production radix-select kernel — an evolution of [Zhang et al. (SC23)](https://doi.org/10.1145/3581784.3607062) optimized for Blackwell by the same team — with up to **2.36×** per layer per step and no loss in output accuracy. While demonstrated on DSA, the approach generalizes to any sparse attention method whose decode-phase Top-K exhibits temporal correlation.
 
 We present the theoretical foundation rooted in RoPE frequency structure, the four-phase algorithm with per-phase complexity analysis, correctness verification against `torch.topk`, single-operator and end-to-end benchmarks, and the integration path into TensorRT-LLM.
 
@@ -613,17 +613,15 @@ We validated end-to-end model accuracy using `trtllm-eval` on five benchmarks wi
 **Reproduction.** All accuracy experiments use the same YAML config (key fields shown below) passed to `trtllm-eval`. To switch between heuristic and baseline, set `enable_heuristic_topk` to `true` or `false`:
 
 
-### End-to-End Throughput
+### End-to-End Min-Latency Benchmark on B200
 
-We benchmarked end-to-end min-latency inference on B200 ×8 with DeepSeek-V3.2 NVFP4 (EP8, MTP-1, NVFP4 quantization, FP8 KV cache), using `trtllm-bench` with a **long-context synthetic dataset** (ISL=16K, OSL=131K, batch=1, concurrency=1). This workload stress-tests the decode phase where the heuristic Top-K is most active — generating 131K output tokens with a sequence length growing from 16K to ~147K.
+We benchmarked end-to-end min-latency inference on B200 ×8 with DeepSeek-V3.2 NVFP4 (EP8, MTP-1, NVFP4 quantization, FP8 KV cache), using `trtllm-bench` with a **long-context synthetic dataset** (ISL=16K, OSL=131K, batch=1, concurrency=1). This workload stress-tests the decode phase where the GVR Top-K is most active — generating 131K output tokens with a sequence length growing from 16K to ~147K.
 
 <div align="center">
 
-| Metric | Baseline | Heuristic | Delta |
-|:--------:|:----------:|:-----------:|:-------:|
+| Metric | Baseline | GVR | Delta |
+|:--------:|:----------:|:-----:|:-------:|
 | **TPOT** (ms) | 9.456 | 9.410 | **−0.49%** |
-| **Output Throughput** (tps) | 105.66 | 106.18 | **+0.49%** |
-| **Per GPU Output** (tps/gpu) | 13.21 | 13.27 | **+0.49%** |
 | **TTFT** (ms) | 1051.19 | 1051.01 | −0.02% |
 | **Total Latency** (s) | 1240.5 | 1234.5 | **−0.48%** |
 
@@ -631,7 +629,7 @@ We benchmarked end-to-end min-latency inference on B200 ×8 with DeepSeek-V3.2 N
 
 <sub><em>Table 5. Min-latency scenario on B200 ×8, Batch=1, ISL=16K, OSL=131K, EP8+DP8, MTP-1. Synthetic random dataset (generated via `prepare_dataset.py` with fixed ISL/OSL).</em></sub>
 
-The end-to-end improvement is modest (~0.5%) for two reasons: (1) the Top-K kernel is only one component among MoE, attention, MLP, and communication in each decode step, and (2) the synthetic dataset has weaker temporal correlation in the indexer scores compared to real inference data (e.g., SWE-Bench), which limits the heuristic kernel's advantage. On real agentic workloads with stronger temporal correlation and longer effective context, the per-step Top-K savings accumulate over 100K+ decode steps — the ~6 µs saving per step × 65K decode iterations translates to ~0.4 s of total wall-time reduction, consistent with the observed 6 s latency drop (1240.5 → 1234.5 s).
+The end-to-end latency reduction is modest (~0.5%) for two reasons: (1) the Top-K kernel is only one component among MoE, attention, MLP, and communication in each decode step, and (2) the synthetic dataset has weaker temporal correlation in the indexer scores compared to real inference data (e.g., SWE-Bench), which limits the GVR kernel's advantage. On real agentic workloads with stronger temporal correlation and longer effective context, the per-step Top-K savings accumulate over 100K+ decode steps — the ~6 µs saving per step × 65K decode iterations translates to ~0.4 s of total wall-time reduction, consistent with the observed 6 s latency drop (1240.5 → 1234.5 s).
 
 ## Future Work
 
