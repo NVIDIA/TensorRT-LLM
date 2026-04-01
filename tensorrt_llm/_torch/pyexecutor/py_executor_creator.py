@@ -293,8 +293,11 @@ def _create_sim_py_executor(
     else:
         raise ValueError(f"Unknown predictor name: {pc.name}")
 
+    from .sim_clock import SimClock
+    clock = SimClock()
+
     model_engine = SimModelEngine(llm_args, vocab_size, max_num_sequences,
-                                   time_predictor=predictor)
+                                   time_predictor=predictor, clock=clock)
     sampler = SimSampler()
 
     # We need a minimal model shim so KvCacheCreator can read model_config
@@ -374,9 +377,17 @@ def _create_sim_py_executor(
 
     if estimating_kv_cache:
         kv_cache_creator.configure_kv_cache_capacity(py_executor)
+        # configure_kv_cache_capacity shuts down the executor after warmup,
+        # setting is_shutdown=True and deactivating the request queue. Reset
+        # both so start_worker can re-launch the loop. (The real path in
+        # create_py_executor recreates the executor; we reuse it.)
+        py_executor.is_shutdown = False
+        py_executor.executor_request_queue.active = True
+        py_executor.shutdown_event.clear()
 
     py_executor.start_worker()
-    logger.info("[SimMode] PyExecutor created in simulation mode")
+    sim_config._clock = clock
+    logger.info("[SimMode] PyExecutor created in simulation mode (clock enabled)")
     return py_executor
 
 

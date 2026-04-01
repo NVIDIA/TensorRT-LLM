@@ -126,3 +126,14 @@ class TestAIConfiguratorConfig:
         config = PredictorConfig(name="constant")
         assert config.device_name is None
         assert config.backend_version is None
+
+
+class TestSimConfigClock:
+
+    def test_sim_config_clock_field_default_none(self):
+        """SimConfig._clock defaults to None and is excluded from serialization."""
+        config = SimConfig()
+        assert config._clock is None
+        dumped = config.model_dump()
+        assert '_clock' not in dumped
+        assert 'clock' not in dumped

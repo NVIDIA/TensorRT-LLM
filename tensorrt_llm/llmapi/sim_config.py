@@ -14,9 +14,9 @@
 # limitations under the License.
 """Simulation mode configuration."""
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import Field, NonNegativeFloat, model_validator
+from pydantic import Field, NonNegativeFloat, PrivateAttr, model_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
@@ -86,3 +86,5 @@ class SimConfig(StrictBaseModel):
     predictor: PredictorConfig = Field(
         default_factory=PredictorConfig,
         description="Time predictor configuration.")
+
+    _clock: Any = PrivateAttr(default=None)
