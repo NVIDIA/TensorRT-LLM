@@ -38,7 +38,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
-from ..utils.node_utils import extract_op_args
+from ..utils.node_utils import extract_op_args, get_op_schema
 
 Constant = Union[int, float, str, None]
 
@@ -68,7 +68,7 @@ def _list_to_tensor(data: list, dtype: torch.dtype) -> torch.Tensor:
 
 def _extract_optional_op_arg(node: Node, arg_name: str):
     """Return an op argument if it exists in the schema, otherwise ``None``."""
-    schema_arg_names = {arg.name for arg in node.target._schema.arguments}
+    schema_arg_names = {arg.name for arg in get_op_schema(node.target).arguments}
     if arg_name not in schema_arg_names:
         return None
     return extract_op_args(node, arg_name)[0]

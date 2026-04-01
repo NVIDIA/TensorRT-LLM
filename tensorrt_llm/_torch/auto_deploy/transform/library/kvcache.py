@@ -35,7 +35,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
-from ...utils.node_utils import is_op
+from ...utils.node_utils import get_op_schema, is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -108,7 +108,7 @@ class _InsertCachedOperator(BaseTransform):
         # check what inputs the extra metadata op expects
         inputs_for_prep_meta = [
             self._add_or_retrieve_input(gm, cm, arg.name)
-            for arg in prep_meta_op._schema.arguments
+            for arg in get_op_schema(prep_meta_op).arguments
             if arg.name in cm.info.available_args
         ]
 
