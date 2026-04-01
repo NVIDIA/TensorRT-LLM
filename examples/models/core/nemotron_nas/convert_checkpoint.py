@@ -4,6 +4,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import DeciLMForCausalLM
@@ -138,6 +139,7 @@ def execute(workers, func, args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     tik = time.time()
 

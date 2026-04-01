@@ -18,6 +18,7 @@ from transformers import AutoTokenizer, MptConfig, MptForCausalLM
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import (generate_int8, get_weight,
                                                load_calib_dataset, smooth_gemm,
@@ -766,6 +767,7 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
