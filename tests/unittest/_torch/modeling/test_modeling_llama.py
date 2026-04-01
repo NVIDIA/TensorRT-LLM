@@ -611,13 +611,12 @@ class TestLlama(unittest.TestCase):
         spec_metadata_phase1 = None
         if is_tree_phase1:
             max_draft_1 = gen_input_ids_1.size(-1) - 1
-            eagle_choices_phase1 = [[i] for i in range(max_draft_1)]
             spec_tree_mgr_phase1 = SpecTreeManager(
                 max_num_requests=1,
-                use_dynamic_tree=False,
+                use_dynamic_tree=True,
                 max_total_draft_tokens=max_draft_1,
                 max_draft_len=max_draft_1,
-                eagle_choices=eagle_choices_phase1,
+                eagle_choices=None,
                 dynamic_tree_max_topK=10,
             )
             spec_metadata_phase1 = SpecMetadata(
@@ -630,7 +629,7 @@ class TestLlama(unittest.TestCase):
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_tree=is_tree_phase1,
-            is_spec_dec_dynamic_tree=False,
+            is_spec_dec_dynamic_tree=is_tree_phase1,
             max_draft_len=gen_input_ids_1.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
             model_is_wrapped=False,
@@ -687,13 +686,12 @@ class TestLlama(unittest.TestCase):
         spec_metadata_ref = None
         if is_tree_ref:
             max_draft_ref = gen_input_ids_ref.size(-1) - 1
-            eagle_choices_ref = [[i] for i in range(max_draft_ref)]
             spec_tree_mgr_ref = SpecTreeManager(
                 max_num_requests=1,
-                use_dynamic_tree=False,
+                use_dynamic_tree=True,
                 max_total_draft_tokens=max_draft_ref,
                 max_draft_len=max_draft_ref,
-                eagle_choices=eagle_choices_ref,
+                eagle_choices=None,
                 dynamic_tree_max_topK=10,
             )
             spec_metadata_ref = SpecMetadata(
@@ -706,7 +704,7 @@ class TestLlama(unittest.TestCase):
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_tree=is_tree_ref,
-            is_spec_dec_dynamic_tree=False,
+            is_spec_dec_dynamic_tree=is_tree_ref,
             max_draft_len=gen_input_ids_ref.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
             model_is_wrapped=False,
