@@ -538,13 +538,18 @@ class PyTorchModelEngine(ModelEngine):
             max_lora_size = lora_config.max_loras or 8  # Default fallback
             max_batch_size = self.batch_size  # Use engine's max batch size
 
+            # For spec decode, each generation request contributes
+            # max_draft_len + 1 tokens per forward pass.
+            max_tokens_per_seq = (self.original_max_draft_len +
+                                  1) if self.is_spec_decode else 1
             self.cuda_graph_lora_manager = CudaGraphLoraManager(
                 max_lora_size=max_lora_size,
                 max_batch_size=max_batch_size,
                 max_lora_rank=lora_config.max_lora_rank,
                 model=self.model,
                 lora_model_config=self.lora_model_config,
-                device='cuda')
+                device='cuda',
+                max_tokens_per_seq=max_tokens_per_seq)
 
             logger.info(
                 f"Initialized CUDA Graph LoRA manager, "
@@ -3482,8 +3487,17 @@ class PyTorchModelEngine(ModelEngine):
         use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:
+            # For spec decode verification (non-extend_ctx), each sequence has
+            # runtime_draft_len + 1 tokens in the forward pass.
+            tokens_per_seq = 1
+            if (self.enable_spec_decode and self.runtime_draft_len > 0
+                    and self.spec_config.is_linear_tree
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend)):
+                tokens_per_seq = self.runtime_draft_len + 1
             return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
-                scheduled_requests, attn_metadata, peft_cache_manager)
+                scheduled_requests, attn_metadata, peft_cache_manager,
+                tokens_per_seq)
         else:
             if self.cuda_graph_lora_manager is not None:
                 self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(

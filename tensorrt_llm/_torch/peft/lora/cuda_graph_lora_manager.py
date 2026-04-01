@@ -30,6 +30,7 @@ class CudaGraphLoraManager:
         model: torch.nn.Module,
         lora_model_config: Optional[LoraModelConfig],
         device: str = "cuda",
+        max_tokens_per_seq: int = 1,
     ):
         """
         Initialize the CUDA Graph LoRA manager.
@@ -47,6 +48,7 @@ class CudaGraphLoraManager:
         self.max_lora_rank = max_lora_rank
         self.device = device
 
+        self.max_tokens_per_seq = max_tokens_per_seq
         self.adapter_slot_manager = AdapterSlotManager(max_lora_size)
         self.lora_model_config = lora_model_config
         lora_target_modules = lora_model_config.lora_target_modules
@@ -74,6 +76,7 @@ class CudaGraphLoraManager:
             max_rank=self.max_lora_rank,
             layer_info=self.layer_info,
             device=self.device,
+            max_tokens_per_seq=self.max_tokens_per_seq,
         )
 
     def _initialize_from_model(self, model: torch.nn.Module):
@@ -127,6 +130,7 @@ class CudaGraphLoraManager:
         scheduled_requests: "ScheduledRequests",
         attn_metadata: "AttentionMetadata",
         peft_cache_manager: PeftCacheManager,
+        tokens_per_seq: int = 1,
     ) -> Optional[Dict]:
         """
         Prepare LoRA parameters from scheduled requests.
@@ -151,7 +155,7 @@ class CudaGraphLoraManager:
         request_slot_ids = self.adapter_slot_manager.update_slots(request_list, peft_cache_manager)
 
         cuda_graph_lora_params = self.cuda_graph_lora_params
-        cuda_graph_lora_params.update_sorted_indices(request_slot_ids)
+        cuda_graph_lora_params.update_sorted_indices(request_slot_ids, tokens_per_seq)
 
         # Get current slot to task mapping
         slot2task = self.adapter_slot_manager.get_slot_to_task_mapping()
@@ -162,7 +166,9 @@ class CudaGraphLoraManager:
             self.adapter_slot_manager.reset_slots_changed()
 
         # Update GEMM sizes and prefix sums using batch
-        cuda_graph_lora_params.update_slots_params(batch_slot_ids=request_slot_ids)
+        cuda_graph_lora_params.update_slots_params(
+            batch_slot_ids=request_slot_ids, tokens_per_seq=tokens_per_seq
+        )
 
         lora_params = {
             "cuda_graph_params": cuda_graph_lora_params,

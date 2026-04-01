@@ -57,6 +57,7 @@ class CudaGraphLoraParams:
         max_rank: int,
         layer_info: Dict[LoraLayerKey, LoraLayerInfo],
         device: str = "cuda",
+        max_tokens_per_seq: int = 1,
     ):
         """
         Initialize CUDA Graph compatible LoRA parameters.
@@ -68,6 +69,7 @@ class CudaGraphLoraParams:
             layers_info: Layer information for each layer
             device: Device to allocate tensors on
             dtype: Data type for size and offset tensors
+            max_tokens_per_seq: Maximum tokens per sequence (>1 for spec decode)
         """
         self.max_batch_size = max_batch_size
         self.max_lora_size = max_lora_size
@@ -75,11 +77,16 @@ class CudaGraphLoraParams:
         self.layer_info = layer_info
         self.layer_module2key = self._calculate_layer_module2key()
         self.device = device
+        self.max_tokens_per_seq = max_tokens_per_seq
 
         self.layer_params: Dict[self.LoraLayerKey, LoraLayerParams] = dict()
 
-        # sorted indices using slot ids as keys, mainly to group requests with the same slot id together in a batch
-        self.sorted_ids = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
+        # sorted indices using token ids as keys, grouping tokens by their slot id.
+        # For spec decode with tokens_per_seq > 1, this is per-token (size =
+        # max_batch_size * max_tokens_per_seq) so all tokens of a sequence stay
+        # together when sorted by slot.
+        max_num_tokens = max_batch_size * max_tokens_per_seq
+        self.sorted_ids = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
         self.sorted_ids_host = torch.zeros_like(
             self.sorted_ids, device="cpu", pin_memory=prefer_pinned()
         )
@@ -173,33 +180,38 @@ class CudaGraphLoraParams:
         sorted_slot_ids, sorted_indices = torch.sort(slot_ids, stable=True)
         return sorted_indices
 
-    def update_sorted_indices(self, slot_ids: List[int]):
+    def update_sorted_indices(self, slot_ids: List[int], tokens_per_seq: int = 1):
         """
         Update slot IDs for the current batch and compute sorted indices.
 
         Args:
-            slot_ids: List of slot IDs for each token in the batch
-            actual_batch_size: Actual batch size (may be less than max_batch_size)
+            slot_ids: List of slot IDs, one per sequence in the batch.
+            tokens_per_seq: Number of tokens per sequence (>1 for spec decode
+                verification where each sequence contributes multiple tokens).
         """
         actual_batch_size = len(slot_ids)
         assert actual_batch_size <= self.max_batch_size, (
-            f"Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}"
+            f"CudaGraphLoraParams: Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}!"
         )
         sorted_indices = self.get_sorted_indices(slot_ids)
 
-        # Update sorted_ids tensor with the computed indices
-        assert actual_batch_size <= self.max_batch_size, (
-            f"CudaGraphLoraParams: Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}!"
-        )
-        if actual_batch_size <= self.max_batch_size:
-            # if can fit in persistent, use it
-            self.sorted_ids = self.persistent_sorted_ids
-            sorted_ids_host = self.sorted_ids_host[:actual_batch_size]
-            sorted_ids_host.copy_(sorted_indices)
-            self.sorted_ids[:actual_batch_size].copy_(sorted_ids_host, non_blocking=True)
+        # For spec decode, expand from per-sequence to per-token sorted indices.
+        # Sequence at sorted position k contributes tokens at positions
+        # k*tokens_per_seq .. (k+1)*tokens_per_seq-1 in the slot-sorted tensor.
+        # The original token positions are sorted_indices[k]*tokens_per_seq + j.
+        if tokens_per_seq > 1:
+            token_sorted_ids = (
+                sorted_indices.unsqueeze(1) * tokens_per_seq
+                + torch.arange(tokens_per_seq, dtype=sorted_indices.dtype)
+            ).flatten()
         else:
-            # otherwise not an gen-only batch, use new allocated sorted_ids
-            self.sorted_ids = sorted_indices.to(device=self.device)
+            token_sorted_ids = sorted_indices
+
+        num_tokens = actual_batch_size * tokens_per_seq
+        self.sorted_ids = self.persistent_sorted_ids
+        sorted_ids_host = self.sorted_ids_host[:num_tokens]
+        sorted_ids_host.copy_(token_sorted_ids)
+        self.sorted_ids[:num_tokens].copy_(sorted_ids_host, non_blocking=True)
 
     def update_weight_pointers(
         self, peft_table: Dict[int, List], slot_to_task_mapping: tuple[Optional[int], ...]
@@ -307,14 +319,15 @@ class CudaGraphLoraParams:
         slot_counts = slot_counts[:max_lora_size]
         return slot_counts
 
-    def update_slots_params(self, batch_slot_ids: List[int]):
+    def update_slots_params(self, batch_slot_ids: List[int], tokens_per_seq: int = 1):
         """
         Update GEMM sizes and buffer offsets based on current batch composition.
 
         Args:
-            batch_slot_ids: Slot IDs for each token in the batch
+            batch_slot_ids: Slot IDs, one per sequence in the batch.
+            tokens_per_seq: Number of tokens per sequence (>1 for spec decode).
         """
-        slot_counts = self.get_slot_counts(batch_slot_ids, self.max_lora_size)
+        slot_counts = self.get_slot_counts(batch_slot_ids, self.max_lora_size) * tokens_per_seq
         self.slot_counts_host.copy_(slot_counts)
         self.get_offset_from_counts(slot_counts, full=True, out=self.slot_offsets_full_host)
         self.slot_counts.copy_(self.slot_counts_host, non_blocking=True)
