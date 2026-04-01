@@ -1,5 +1,11 @@
 # Deepseek-v1
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run [deepseek-v1](https://arxiv.org/pdf/2401.06066) model in TensorRT-LLM.
 
 - [Deepseek-v1](#deepseek-v1)

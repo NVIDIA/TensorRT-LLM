@@ -322,6 +322,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+    use_cute_dsl_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
+    )
     q_split_threshold: int = Field(
         default=8192,
         description=
@@ -352,6 +357,11 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
+    target_sparsity: Optional[Union[float, Dict[str, float]]] = Field(
+        default=None,
+        description="Target sparsity for prefill and/or decode phases. "
+        "Requires formula coefficients in the model's config.json. "
+        "Ignored if threshold_scale_factor is also set.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -367,6 +377,56 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if isinstance(self.threshold_scale_factor, dict):
             return self.threshold_scale_factor.get('decode', None)
         return self.threshold_scale_factor
+
+    @property
+    def target_sparsity_prefill(self) -> Optional[float]:
+        if isinstance(self.target_sparsity, dict):
+            return self.target_sparsity.get('prefill', None)
+        return self.target_sparsity
+
+    @property
+    def target_sparsity_decode(self) -> Optional[float]:
+        if isinstance(self.target_sparsity, dict):
+            return self.target_sparsity.get('decode', None)
+        return self.target_sparsity
+
+    def resolve_for_target_sparsity(
+            self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
+        """
+        Given formula coefficients from HF config.json (dict with 'prefill' and
+        'decode' keys, each containing 'a' and 'b'), compute threshold_scale_factor
+        and return a new SkipSoftmaxAttentionConfig with it set.
+
+        formula example:
+          {"prefill": {"a": 7e-5, "b": 7.929109},
+           "decode":  {"a": 7e-5, "b": 16.9025}}
+
+        If threshold_scale_factor is already set, it takes precedence and
+        this method returns self unchanged.
+        """
+        if self.threshold_scale_factor is not None:
+            return self
+
+        import math
+
+        def _compute(phase: str, sparsity: Optional[float]) -> Optional[float]:
+            if sparsity is None:
+                return None
+            coeffs = formula.get(phase)
+            if not coeffs or 'a' not in coeffs or 'b' not in coeffs:
+                raise ValueError(
+                    f"SkipSoftmaxAttentionConfig: config.json is missing formula "
+                    f"coefficients for phase '{phase}' needed to compute "
+                    f"threshold_scale_factor from target_sparsity.")
+            return coeffs['a'] * math.exp(coeffs['b'] * sparsity)
+
+        return SkipSoftmaxAttentionConfig(
+            algorithm=self.algorithm,
+            target_sparsity=self.target_sparsity,
+            threshold_scale_factor={
+                'prefill': _compute('prefill', self.target_sparsity_prefill),
+                'decode': _compute('decode', self.target_sparsity_decode),
+            })
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -477,8 +537,8 @@ class MoeConfig(StrictBaseModel):
     Configuration for MoE.
     """
     backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
-        "TRITON"] = Field(
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
+        "DENSEGEMM", "VANILLA", "TRITON"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -535,6 +595,18 @@ class AttentionDpConfig(StrictBaseModel):
     batching_wait_iters: int = Field(
         default=10,
         description="The number of iterations to wait for batching.")
+    enable_kv_cache_aware_routing: bool = Field(
+        default=False,
+        description="Enable internal KV cache-aware routing for attention DP. "
+        "When enabled, distributes requests among ranks within a single "
+        "instance's attention DP group, routing them to the rank with the "
+        "matching prefix KV cache to reduce redundant prefill computation.")
+    kv_cache_routing_load_balance_weight: float = Field(
+        default=1.0,
+        description=
+        "Weight (beta) for the load-balance term in KV cache-aware routing. "
+        "Higher values prioritize load balance over cache affinity. "
+        "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -1843,6 +1915,7 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     ''' Context chunking policy. '''
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
+    FORCE_CHUNK = "FORCE_CHUNK"
 
     def _to_pybind(self):
         return getattr(_ContextChunkingPolicy, self.value)
@@ -1852,6 +1925,7 @@ class WaitingQueuePolicy(StrEnum):
     """Waiting queue scheduling policy for managing pending requests."""
 
     FCFS = "fcfs"  # First-Come-First-Served
+    PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
@@ -2308,7 +2382,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         description="The max number of tokens the transfer buffer can fit.")
 
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
-        default=None,
+        default=60000,
         description=
         "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
     )
@@ -3263,8 +3337,12 @@ class TorchLlmArgs(BaseLlmArgs):
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
         description=
-        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
-        status="beta")
+        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. "
+        "TRTLLMSampler is deprecated and will be removed in release 1.4.",
+        status="deprecated",
+        deprecated=
+        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler."
+    )
 
     sampler_force_async_worker: bool = Field(
         default=False,
@@ -3702,6 +3780,9 @@ def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
+
+    if 'hf_revision' in llm_args_dict:
+        llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:

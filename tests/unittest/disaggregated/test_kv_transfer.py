@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
+import numpy as np
 import pytest
 import torch
 
@@ -14,9 +15,13 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.base.transfer import (
+    KVSlice,
+    LayerRange,
+    SessionStatus,
+    TokenRange,
+)
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
@@ -49,6 +54,83 @@ class KvCacheConfigV2:
     dtype: str = "auto"
     # V2 specific field
     max_util_for_resume: float = 0.95
+
+
+def test_token_range_valid():
+    tr = TokenRange(start=0, end=10)
+    assert tr.start == 0
+    assert tr.end == 10
+
+
+def test_token_range_invalid_negative():
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenRange(start=-1, end=5)
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenRange(start=0, end=-1)
+
+
+def test_token_range_invalid_start_ge_end():
+    with pytest.raises(ValueError, match="Invalid range"):
+        TokenRange(start=5, end=5)
+    with pytest.raises(ValueError, match="Invalid range"):
+        TokenRange(start=10, end=3)
+
+
+def test_layer_range_valid():
+    lr = LayerRange(start=0, end=32)
+    assert lr.start == 0
+    assert lr.end == 32
+
+
+def test_layer_range_invalid_negative():
+    with pytest.raises(ValueError, match="non-negative"):
+        LayerRange(start=-1, end=5)
+    with pytest.raises(ValueError, match="non-negative"):
+        LayerRange(start=0, end=-1)
+
+
+def test_layer_range_invalid_start_ge_end():
+    with pytest.raises(ValueError, match="Invalid range"):
+        LayerRange(start=5, end=5)
+    with pytest.raises(ValueError, match="Invalid range"):
+        LayerRange(start=10, end=3)
+
+
+def test_kv_slice_construction():
+    tr = TokenRange(0, 128)
+    lr = LayerRange(0, 32)
+    s = KVSlice(
+        token_range=tr,
+        layer_range=lr,
+        block_ids_per_layer_groups=[[1, 2, 3]],
+        is_last_slice=True,
+    )
+    assert s.token_range == tr
+    assert s.layer_range == lr
+    assert s.block_ids_per_layer_groups == [[1, 2, 3]]
+    assert s.is_last_slice is True
+
+    # Test defaults
+    s2 = KVSlice()
+    assert s2.token_range is None
+    assert s2.layer_range is None
+    assert s2.block_ids_per_layer_groups == []
+    assert s2.is_last_slice is False
+
+
+def test_session_status_enum():
+    expected = [
+        "INIT",
+        "READY",
+        "TRANSFERRING",
+        "KV_TRANSFERRED",
+        "FULLY_TRANSFERRED",
+        "ERROR",
+    ]
+    for name in expected:
+        assert hasattr(SessionStatus, name)
+        assert SessionStatus[name].value == name
+    assert len(SessionStatus) == 6
 
 
 def create_transfer_worker_setup(
@@ -93,10 +175,6 @@ def create_transfer_worker_setup(
                 )
             )
 
-    meta_max_batch_size = 32
-    beam_width = 1
-    max_draft_len = 4
-
     ctx_instance_num = ctx_tp * ctx_pp
     gen_instance_num = gen_tp * gen_pp
     num_layers = 4
@@ -120,7 +198,6 @@ def create_transfer_worker_setup(
     request_len = 16
 
     for i in range(ctx_instance_num):
-        ctx_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         cache_type = (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             if not is_mla
@@ -238,11 +315,13 @@ def create_transfer_worker_setup(
         ctx_kv_cache_managers.append(ctx_kv_cache_manager)
         ctx_transfer_workers.append(
             TransferWorker(
-                kv_cache_manager=ctx_kv_cache_manager,
-                mapping=ctx_mappings[i],
-                device_id=device_id,
-                instance_name=ctx_instance_name,
-                aux_buffer=ctx_aux_buffer,
+                TransferWorkerConfig(
+                    kv_cache_manager=ctx_kv_cache_manager,
+                    device_id=device_id,
+                    instance_name=ctx_instance_name,
+                    max_concurrent_sessions=max_batch_size * 2,
+                    max_draft_len=4,
+                )
             )
         )
 
@@ -252,9 +331,7 @@ def create_transfer_worker_setup(
     ]
     ctx_layer_num_per_pp = []
     for pp_rank in range(ctx_pp):
-        ctx_layer_num_per_pp.append(
-            len(ctx_transfer_workers[pp_rank * ctx_tp]._kv_cache_manager.pp_layers)
-        )
+        ctx_layer_num_per_pp.append(len(ctx_kv_cache_managers[pp_rank * ctx_tp].pp_layers))
 
     for ctx_transfer_worker in ctx_transfer_workers:
         ctx_transfer_worker.populate_instance_and_rank_info(
@@ -264,7 +341,6 @@ def create_transfer_worker_setup(
     gen_transfer_workers = []
     gen_kv_cache_managers = []
     for i in range(gen_instance_num):
-        gen_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         cache_type = (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             if not is_mla
@@ -355,11 +431,13 @@ def create_transfer_worker_setup(
         gen_kv_cache_managers.append(gen_kv_cache_manager)
         gen_transfer_workers.append(
             TransferWorker(
-                kv_cache_manager=gen_kv_cache_manager,
-                mapping=gen_mappings[i],
-                device_id=device_id,
-                instance_name=gen_instance_name,
-                aux_buffer=gen_aux_buffer,
+                TransferWorkerConfig(
+                    kv_cache_manager=gen_kv_cache_manager,
+                    device_id=device_id,
+                    instance_name=gen_instance_name,
+                    max_concurrent_sessions=max_batch_size * 2,
+                    max_draft_len=4,
+                )
             )
         )
     _ = gen_transfer_workers[0]._rank_info_server.endpoint  # noqa: F841
@@ -368,9 +446,7 @@ def create_transfer_worker_setup(
     ]
     gen_layer_num_per_pp = []
     for pp_rank in range(gen_pp):
-        gen_layer_num_per_pp.append(
-            len(gen_transfer_workers[pp_rank * gen_tp]._kv_cache_manager.pp_layers)
-        )
+        gen_layer_num_per_pp.append(len(gen_kv_cache_managers[pp_rank * gen_tp].pp_layers))
     for gen_transfer_worker in gen_transfer_workers:
         gen_transfer_worker.populate_instance_and_rank_info(
             endpoints=gen_endpoints, layer_num_per_pp=gen_layer_num_per_pp
@@ -467,7 +543,7 @@ def get_block_ids_per_layer_groups(
             if len(block_ids) > max_blocks_in_window:
                 block_ids = block_ids[-max_blocks_in_window:]
 
-        block_ids_per_layer_groups.append(list(block_ids))
+        block_ids_per_layer_groups.append(np.asarray(block_ids, dtype=np.int64))
 
     return block_ids_per_layer_groups
 
@@ -625,13 +701,13 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_tasks = [
-            sender_session._kv_tasks[sender_session.send(send_kv_slice)]
+        send_slice_futures = [
+            sender_session.send(send_kv_slice)
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
 
         for sender_session in sender_sessions:
-            assert sender_session.state.status == SessionStatus.INIT
+            assert sender_session.status == SessionStatus.INIT
 
         receiver_sessions = [
             gen_transfer_worker.create_rx_session(gen_request)
@@ -641,8 +717,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_tasks = [
-            receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
+        recv_slice_futures = [
+            receiver_session.receive(recv_kv_slice)
             for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
         ]
 
@@ -655,8 +731,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_tasks = [
-            receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
+        recv_slice_futures = [
+            receiver_session.receive(recv_kv_slice)
             for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
         ]
 
@@ -670,37 +746,39 @@ def add_and_verify_request(
         time.sleep(0.1)
 
         for sender_session in sender_sessions:
-            assert sender_session.state.status != SessionStatus.INIT
+            assert sender_session.status != SessionStatus.INIT
 
         send_kv_slices = [
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_tasks = [
-            sender_session._kv_tasks[sender_session.send(send_kv_slice)]
+        send_slice_futures = [
+            sender_session.send(send_kv_slice)
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
         send_aux_tasks = []
         for sender_session in sender_sessions:
-            sender_session.pack_aux()
+            sender_session.pack_aux(ctx_request)
             send_aux_tasks.append(sender_session.send_aux())
 
-    for send_slice_task in send_slice_tasks:
-        send_slice_task.future.result()
-    for recv_slice_task in recv_slice_tasks:
-        recv_slice_task.future.result()
+    for future in send_slice_futures:
+        future.result()
+    for future in recv_slice_futures:
+        future.result()
     if not send_first:
         for send_aux_task in send_aux_tasks:
             send_aux_task.future.result()
 
-    sync_session_status = SessionStatus.TRANSFERRED if send_first else SessionStatus.AUX_TRANSFERRED
+    sync_session_status = (
+        SessionStatus.KV_TRANSFERRED if send_first else SessionStatus.FULLY_TRANSFERRED
+    )
     for sender_session in sender_sessions:
-        assert sender_session.state.status == sync_session_status
+        assert sender_session.status == sync_session_status
     if not send_first:
         time.sleep(0.1)
     for receiver_session in receiver_sessions:
-        assert receiver_session.state.status == sync_session_status, (
-            f"receiver_session.state.status={receiver_session.state.status}, "
+        assert receiver_session.status == sync_session_status, (
+            f"receiver_session.status={receiver_session.status}, "
             f"sync_session_status={sync_session_status} send_first={send_first}"
         )
 
@@ -815,21 +893,20 @@ def add_and_verify_request(
     if not send_first:
         for pp_rank in range(gen_pp):
             for tp_rank in range(valid_gen_tp):
-                transfer_worker = valid_gen_transfer_workers[pp_rank * valid_gen_tp + tp_rank]
                 recv_session = receiver_sessions[pp_rank * valid_gen_tp + tp_rank]
-                recv_session.unpack_aux()
+                recv_session.unpack_aux(gen_request)
 
-                assert gen_request.context_phase_params.first_gen_tokens == [8 + ctx_request_id]
+                assert gen_request.py_first_gen_tokens == [8 + ctx_request_id]
                 assert gen_request.py_draft_tokens == [
                     9 + ctx_request_id,
                     10 + ctx_request_id,
                     11 + ctx_request_id,
                     12 + ctx_request_id,
                 ]
-    for transfer_worker, receiver_session in zip(valid_gen_transfer_workers, receiver_sessions):
-        transfer_worker.clear_session(receiver_session)
-    for transfer_worker, sender_session in zip(valid_ctx_transfer_workers, sender_sessions):
-        transfer_worker.clear_session(sender_session)
+    for receiver_session in receiver_sessions:
+        receiver_session.close()
+    for sender_session in sender_sessions:
+        sender_session.close()
 
     # V2: Close kv_caches to release slots
     if use_v2:

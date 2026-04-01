@@ -422,7 +422,9 @@ class FuseGemmsMixedChildren(BaseTransform):
                 if len(lin_children) < 2:
                     continue
                 if is_linear_op(lin_children[0]):
-                    if _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children):
+                    if _insert_fused_gemm(
+                        gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
+                    ):
                         num_matches += 1
                 else:
                     fuser = _get_quant_fuser(op_key)
@@ -432,7 +434,7 @@ class FuseGemmsMixedChildren(BaseTransform):
                         )
                         continue
                     if fuser._insert_fused_quant_gemm(
-                        gm, idx := idx + 1, parent_node, lin_children
+                        gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
                     ):
                         num_matches += 1
 

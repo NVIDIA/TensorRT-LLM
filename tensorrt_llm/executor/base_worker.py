@@ -563,7 +563,8 @@ class BaseWorker(GenerationExecutor):
                 context_phase_params=context_phase_params,
                 type=request_type,
                 cache_salt_id=request.cache_salt_id,
-                disagg_request_id=disagg_request_id)
+                disagg_request_id=disagg_request_id,
+                priority=request.priority)
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode

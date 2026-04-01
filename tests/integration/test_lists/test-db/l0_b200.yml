@@ -21,9 +21,12 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=True-attn_backend=TRTLLM-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=True-v2_kv_cache=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=True-v2_kv_cache=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=True]
@@ -69,6 +72,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.5]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass]
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] # nvbugs 5300551
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
@@ -106,11 +111,13 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
@@ -129,6 +136,26 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/_torch/modeling/test_modeling_exaone4.py::TestEXAONE4::test_llm_load_1_FP8
   - unittest/kv_cache_manager_v2_tests/
+  # ------------- KV Cache V2 Scheduler IT ---------------
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_v2_vs_v1_basic
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_token_budget_limited
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_multi_request
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction[cuda_graph]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction[no_cuda_graph]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_batch_size_limited
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_overlap_scheduler[non_overlap]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_overlap_scheduler[overlap]
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_partial_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_with_eviction
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_with_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_eviction_block_reuse
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_overlap
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_v2
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_teacache.py
@@ -255,3 +282,22 @@ l0_b200:
   - unittest/auto_deploy/singlegpu/smoke
   - unittest/auto_deploy/singlegpu/transformations
   - unittest/auto_deploy/singlegpu/utils
+  # ------------- AutoDeploy Perf Sanity ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*b100*'
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: autodeploy
+  tests:
+  # ------------- AutoDeploy Perf Sanity ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)

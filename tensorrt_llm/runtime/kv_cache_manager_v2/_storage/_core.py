@@ -644,7 +644,7 @@ class CacheLevelStorage:
     # _ratio_list: TypedIndexList[PoolGroupIndex, float]
     _pool_groups: TypedIndexList[PoolGroupIndex, PoolGroupBase]
 
-    def __init__(self, total_quota: int, ratio_list: TypedIndexList[PoolGroupIndex, float]) -> None:
+    def __init__(self) -> None:
         if not hasattr(self.__class__, "TIER"):
             raise ValueError(f"{self.__class__.__name__} must define 'TIER' as a class variable")
 
@@ -733,66 +733,151 @@ class CacheLevelStorage:
         return self._pool_groups[pool_group_index]._pools[pool_index]
 
     # Calculate how many slots will there be in each pool group with the given total_quota and
-    # ratio_list. Use _ratio_to_slot_count_list for initialization.
-    def _compute_slot_count_list(
+    # ratio_list. Use ratio_to_slot_count_list for initialization.
+    def compute_slot_count_list(
         self,
+        ratio_list: TypedIndexList[PoolGroupIndex, float],
+        min_slots: TypedIndexList[PoolGroupIndex, int],
         total_quota: int | None = None,
-        ratio_list: TypedIndexList[PoolGroupIndex, float] | None = None,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         if total_quota is None:
             total_quota = self.total_quota
-        if ratio_list is None:
-            ratio_list = self.ratio_list
         assert len(ratio_list) == len(self._pool_groups), (
             f"Wrong ratio_list length. Expected {len(self._pool_groups)}, got {len(ratio_list)}"
         )
-        return self._ratio_to_slot_count_list(
-            total_quota, self.slot_size_lists, ratio_list, self.pool_size_granularity
+        return self.ratio_to_slot_count_list(
+            total_quota, self.slot_size_lists, ratio_list, self.pool_size_granularity, min_slots
         )
 
     @staticmethod
-    def _ratio_to_slot_count_list(
+    def _grains_to_slots(
+        pg_grains: int,
+        slot_size_list: TypedIndexList[PoolIndex, int],
+        granularity: int,
+    ) -> tuple[int, int]:
+        """Distribute grains among pools within a pool group.
+
+        Returns (num_slots, grains_consumed).
+        """
+        num_pools = typed_len(slot_size_list)
+        min_pool_grains = typed_map(slot_size_list, lambda s: div_up(s, granularity))
+        if pg_grains < sum(min_pool_grains):
+            return (0, 0)
+        num_slots: int = 1 << 63
+        remaining_pg_grains = pg_grains
+        pool_idx_lst = sorted(typed_range(num_pools), key=lambda i: slot_size_list[i])
+        for j, pool in enumerate(pool_idx_lst):
+            slot_size = slot_size_list[pool]
+            pool_grains = max(
+                min_pool_grains[pool],
+                round(
+                    remaining_pg_grains
+                    * (slot_size / sum(slot_size_list[k] for k in pool_idx_lst[j:]))
+                ),
+            )
+            num_slots = min(num_slots, pool_grains * granularity // slot_size)
+            remaining_pg_grains -= pool_grains
+        assert remaining_pg_grains == 0
+        assert num_slots > 0
+        return num_slots, CacheLevelStorage._grains_for_slots(
+            num_slots, slot_size_list, granularity
+        )
+
+    @staticmethod
+    def _grains_for_slots(
+        num_slots: int,
+        slot_size_list: TypedIndexList[PoolIndex, int],
+        granularity: int,
+    ) -> int:
+        """Compute the minimum grains needed for num_slots in a pool group."""
+        return sum(div_up(num_slots * s, granularity) for s in slot_size_list)
+
+    @staticmethod
+    def ratio_to_slot_count_list(
         total_quota: int,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         ratio_list: TypedIndexList[PoolGroupIndex, float],
         pool_size_granularity: int,
+        min_slots: TypedIndexList[PoolGroupIndex, int],
     ) -> TypedIndexList[PoolGroupIndex, int]:
         num_pool_groups = typed_len(ratio_list)
+        assert all(x > 0 for x in ratio_list)
         assert num_pool_groups == typed_len(slot_size_lists)
         assert total_quota % pool_size_granularity == 0
         total_grains = total_quota // pool_size_granularity
         assert total_grains >= sum(len(sizes) for sizes in slot_size_lists)
-        remaining_grains = total_grains
-        granularity = pool_size_granularity
+        g = pool_size_granularity
+        _g2s = CacheLevelStorage._grains_to_slots
+        _s2g = CacheLevelStorage._grains_for_slots
+
         slot_cnt_list = filled_list(0, num_pool_groups)
-        # divide total_quota into pool groups based on init_ratio, then divide quote for each pool_group
-        # into pools based on slot_size.
-        pg_idx_lst = sorted(typed_range(num_pool_groups), key=lambda i: ratio_list[i])
-        for i, pg in enumerate(pg_idx_lst):
-            slot_size_list = slot_size_lists[pg]
-            num_pools = typed_len(slot_size_list)
-            min_pool_grains = typed_map(slot_size_list, lambda s: div_up(s, granularity))
-            pct: float = ratio_list[pg] / sum(ratio_list[j] for j in pg_idx_lst[i:])
-            pg_grains = max(round(remaining_grains * pct), sum(min_pool_grains))
-            num_slots: int = 1 << 63
-            remaining_pg_grains = pg_grains
-            pool_idx_lst = sorted(typed_range(num_pools), key=lambda i: slot_size_list[i])
-            for j, pool in enumerate(pool_idx_lst):
-                slot_size = slot_size_list[pool]
-                pool_grains = max(
-                    min_pool_grains[pool],
-                    round(
-                        remaining_pg_grains
-                        * (slot_size / sum(slot_size_list[k] for k in pool_idx_lst[j:]))
-                    ),
-                )
-                num_slots = min(num_slots, pool_grains * granularity // slot_size)
-                remaining_pg_grains -= pool_grains
-            assert remaining_pg_grains == 0
-            assert num_slots > 0
-            slot_cnt_list[pg] = num_slots
-            remaining_grains -= pg_grains
-        assert remaining_grains == 0
+        remaining_grains = total_grains
+        active_pgs = list(typed_range(num_pool_groups))
+
+        # Iteratively peel off constrained PGs until all active PGs are
+        # unconstrained:
+        #   1. Distribute remaining quota among active PGs by ratio.
+        #   2. Any PG with slots <= min_slots is constrained — pin it to
+        #      min_slots and subtract its grains from the budget.
+        #   3. Repeat with the remaining PGs and re-normalized ratios.
+        # Each iteration removes at least one PG, so this terminates.
+        while active_pgs:
+            # Distribute remaining_grains among active PGs by ratio.
+            active_ratio = [ratio_list[pg] for pg in active_pgs]
+            slots_for_active = filled_list(0, len(active_pgs))
+            grains_for_active = filled_list(0, len(active_pgs))
+            budget = remaining_grains
+            idx_lst = sorted(range(len(active_pgs)), key=lambda i: active_ratio[i])
+            for i, idx in enumerate(idx_lst):
+                pct = active_ratio[idx] / sum(active_ratio[j] for j in idx_lst[i:])
+                slots, used = _g2s(round(budget * pct), slot_size_lists[active_pgs[idx]], g)
+                slots_for_active[idx] = slots
+                grains_for_active[idx] = used
+                budget -= used
+            assert budget >= 0
+
+            # Identify constrained PGs (slots <= min_slots).
+            constrained = []
+            unconstrained = []
+            for idx in range(len(active_pgs)):
+                pg = active_pgs[idx]
+                if slots_for_active[idx] <= min_slots[pg]:
+                    constrained.append(idx)
+                else:
+                    unconstrained.append(idx)
+
+            if not constrained:
+                # All active PGs are unconstrained — accept their allocations.
+                for idx in range(len(active_pgs)):
+                    slot_cnt_list[active_pgs[idx]] = slots_for_active[idx]
+                break
+
+            # Pin constrained PGs to min_slots and subtract from budget.
+            for idx in constrained:
+                pg = active_pgs[idx]
+                min_grains = _s2g(min_slots[pg], slot_size_lists[pg], g)
+                slots, used = _g2s(min_grains, slot_size_lists[pg], g)
+                slot_cnt_list[pg] = slots
+                remaining_grains -= used
+
+            if not unconstrained:
+                # All PGs are constrained — nothing left to redistribute.
+                break
+
+            if remaining_grains <= 0:
+                raise ValueError("Insufficient quota to satisfy min_slots constraints")
+
+            # Continue with unconstrained PGs only.
+            active_pgs = [active_pgs[idx] for idx in unconstrained]
+
+        # _g2s may under-count slots due to imperfect grain distribution
+        # across pools. Try bumping each PG's slot count while it still fits
+        # within the same grain budget.
+        for pg in typed_range(num_pool_groups):
+            grains_now = _s2g(slot_cnt_list[pg], slot_size_lists[pg], g)
+            while _s2g(slot_cnt_list[pg] + 1, slot_size_lists[pg], g) <= grains_now:
+                slot_cnt_list[pg] += 1
+
         return slot_cnt_list
 
     @property
@@ -807,19 +892,15 @@ class GpuCacheLevelStorage(CacheLevelStorage):
 
     def __init__(
         self,
-        total_quota: int,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
-        init_ratio: TypedIndexList[PoolGroupIndex, float],
+        slot_count_list: TypedIndexList[PoolGroupIndex, int],
         phys_mem_size: int,
     ):
         num_pool_groups = typed_len(slot_size_lists)
-        assert num_pool_groups == typed_len(init_ratio), (
-            "slot_size_lists and init_ratio must have the same length"
+        assert num_pool_groups == typed_len(slot_count_list), (
+            "slot_size_lists and slot_count_list must have the same length"
         )
-        super().__init__(total_quota, init_ratio)
-        slot_count_list = self._ratio_to_slot_count_list(
-            total_quota, slot_size_lists, init_ratio, phys_mem_size
-        )
+        super().__init__()
         self.shared_phys_mem_pool = PooledPhysMemAllocator(phys_mem_size)
         self._pool_groups = make_typed(
             lambda pg_idx: GpuPoolGroup(
@@ -850,18 +931,14 @@ class HostCacheLevelStorage(CacheLevelStorage):
 
     def __init__(
         self,
-        total_quota: int,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
-        init_ratio: TypedIndexList[PoolGroupIndex, float],
+        slot_count_list: TypedIndexList[PoolGroupIndex, int],
     ):
         num_pool_groups = typed_len(slot_size_lists)
-        assert num_pool_groups == typed_len(init_ratio), (
-            "slot_size_lists and init_ratio must have the same length"
+        assert num_pool_groups == typed_len(slot_count_list), (
+            "slot_size_lists and slot_count_list must have the same length"
         )
-        super().__init__(total_quota, init_ratio)
-        slot_count_list = self._ratio_to_slot_count_list(
-            total_quota, slot_size_lists, init_ratio, self.pool_size_granularity
-        )
+        super().__init__()
         self._pool_groups = make_typed(
             lambda pg_idx: HostPoolGroup(slot_count_list[pg_idx], slot_size_lists[pg_idx]),
             num_pool_groups,
@@ -879,19 +956,15 @@ class DiskCacheLevelStorage(CacheLevelStorage):
 
     def __init__(
         self,
-        total_quota: int,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
-        init_ratio: TypedIndexList[PoolGroupIndex, float],
+        slot_count_list: TypedIndexList[PoolGroupIndex, int],
         filename_template: str,
     ):
         num_pool_groups = typed_len(slot_size_lists)
-        assert num_pool_groups == typed_len(init_ratio), (
-            "slot_size_lists and init_ratio must have the same length"
+        assert num_pool_groups == typed_len(slot_count_list), (
+            "slot_size_lists and slot_count_list must have the same length"
         )
-        super().__init__(total_quota, init_ratio)
-        slot_count_list = self._ratio_to_slot_count_list(
-            total_quota, slot_size_lists, init_ratio, self.pool_size_granularity
-        )
+        super().__init__()
         self._pool_groups = make_typed(
             lambda pg_idx: DiskPoolGroup(
                 slot_count_list[pg_idx],

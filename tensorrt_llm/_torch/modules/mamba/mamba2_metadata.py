@@ -187,6 +187,9 @@ class Mamba2Metadata:
         self.seq_idx: torch.Tensor = None
 
         # helper tensors for chunked prefill
+        self.has_initial_states_cpu = torch.zeros(max_batch_size,
+                                                  dtype=torch.bool,
+                                                  pin_memory=prefer_pinned())
         self.has_initial_states = torch.zeros(max_batch_size,
                                               dtype=torch.bool,
                                               device="cuda")
@@ -253,13 +256,31 @@ class Mamba2Metadata:
                 repeats=context_lens,
                 output_size=num_ctx_tokens).unsqueeze(0)
 
+            # Build "has initial state" flags on CPU first, then issue a
+            # single async H2D copy from the pinned staging buffer.
             num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-            initial_states = [
-                num_cached_tokens_per_seq[i] > 0 for i in range(num_contexts)
-            ]
-            self.has_initial_states[:num_contexts] = torch.tensor(
-                initial_states, dtype=torch.bool)
-            self.use_initial_states = any(initial_states)
+            if isinstance(num_cached_tokens_per_seq, torch.Tensor):
+                # Keep this as a CPU bool view/tensor to avoid introducing an
+                # implicit sync point while reading per-sequence cache status.
+                initial_states_cpu = num_cached_tokens_per_seq[:num_contexts].to(
+                    dtype=torch.bool, device='cpu')
+            else:
+                # Fallback when cache metadata is provided as a Python sequence.
+                initial_states_cpu = torch.tensor([
+                    num_cached_tokens_per_seq[i] > 0
+                    for i in range(num_contexts)
+                ],
+                                                  dtype=torch.bool,
+                                                  device='cpu')
+
+            self.has_initial_states_cpu[:num_contexts].copy_(initial_states_cpu)
+            # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
+            self.has_initial_states[:num_contexts].copy_(
+                self.has_initial_states_cpu[:num_contexts], non_blocking=True)
+            # Keep a host boolean gate for chunk metadata construction.
+            self.use_initial_states = bool(
+                self.has_initial_states_cpu[:num_contexts].any())
+
             if self.use_initial_states:
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
                     self.cu_seqlens[:num_contexts + 1], self.chunk_size)

@@ -14,9 +14,10 @@ from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, EagleDecodingConfig, KvCacheConfig,
-    MTPDecodingConfig, PeftCacheConfig, SamplerType, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
+    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
+    WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -28,7 +29,8 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
+from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid)
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -42,7 +44,7 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2DummyScheduler, SimpleScheduler,
+                        KVCacheV2Scheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -59,7 +61,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_nemotron_hybrid(config) or is_qwen3_next(config):
+    elif is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
         return MambaHybridCacheManager
     else:
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
@@ -128,6 +130,10 @@ class KvCacheCreator:
         self._draft_config = draft_config
         self._skip_est = skip_est
 
+    def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
+        return get_kv_cache_manager_cls(model_engine.model.model_config,
+                                        self._kv_cache_config)
+
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
@@ -135,7 +141,9 @@ class KvCacheCreator:
             model_config, mapping, tokens_per_block=self._tokens_per_block)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
-            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+            draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+                self._draft_model_engine)
+            kv_size_per_token += draft_kv_cache_manager_cls.get_cache_size_per_token(
                 draft_model_config,
                 mapping,
                 tokens_per_block=self._tokens_per_block)
@@ -325,6 +333,14 @@ class KvCacheCreator:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += ceil_div(num_req_tokens, self._tokens_per_block)
+
+        # With ADP enabled, _create_dummy_context_requests produces tp_size
+        # copies so each rank gets work during the estimation warmup. But the
+        # scheduler distributes them evenly (1 per rank), so each rank's KV
+        # cache only needs capacity for its own share, not all of them.
+        if self._mapping.enable_attention_dp and self._mapping.tp_size > 1:
+            num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
+                                1) // self._mapping.tp_size
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
@@ -528,6 +544,8 @@ class KvCacheCreator:
             estimating_kv_cache: bool = False) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
+        kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+            model_engine)
 
         # When using separate draft KV cache in one-model speculative decoding,
         # use layer_mask to include only target layers. The draft layers should
@@ -541,7 +559,7 @@ class KvCacheCreator:
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
-            kv_cache_manager_cls=self._kv_cache_manager_cls,
+            kv_cache_manager_cls=kv_cache_manager_cls,
             mapping=mapping,
             kv_cache_config=self._kv_cache_config,
             tokens_per_block=self._tokens_per_block,
@@ -1006,7 +1024,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
         )
-    elif is_qwen3_next(config):
+    elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -1015,19 +1033,10 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-        mamba_layer_mask = [
-            True if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else False for i in range(num_hidden_layers)
-        ]
-        hybrid_layer_mask = [
-            False if i %
-            config.full_attention_interval != config.full_attention_interval -
-            1 else True for i in range(num_hidden_layers)
-        ]
-        num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
-            config.full_attention_interval - 1)
-        num_layers = num_hidden_layers - num_mamba_layers
+        hybrid_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
+            config)
+        num_layers = sum(hybrid_layer_mask)
+        num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.linear_key_head_dim,
@@ -1267,9 +1276,26 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    use_python_scheduler = scheduler_config.use_python_scheduler if scheduler_config is not None else False
-    if use_python_scheduler and not isinstance(kv_cache_manager,
-                                               KVCacheManagerV2):
+    if isinstance(kv_cache_manager, KVCacheManagerV2):
+        # V2: interleaved scheduler handles both capacity and budget
+        draft_kv_cache_manager = resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        scheduler_policy = (scheduler_config.capacity_scheduler_policy
+                            if scheduler_config is not None else
+                            CapacitySchedulerPolicy.MAX_UTILIZATION)
+        scheduler = KVCacheV2Scheduler(
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=kv_cache_manager,
+            scheduler_policy=scheduler_policy,
+            ctx_chunk_config=ctx_chunk_config,
+            peft_cache_manager=peft_cache_manager.impl
+            if peft_cache_manager is not None else None,
+            scheduler_capacity=scheduler_capacity,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
+    elif (scheduler_config is not None
+          and scheduler_config.use_python_scheduler):
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1282,20 +1308,12 @@ def create_py_executor_instance(
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity)
     else:
-        if isinstance(kv_cache_manager, KVCacheManagerV2):
-            capacity_scheduler = KVCacheV2DummyScheduler(
-                scheduler_capacity,
-                kv_cache_manager if kv_cache_manager is not None else None,
-                peft_cache_manager.impl
-                if peft_cache_manager is not None else None)
-        else:
-            capacity_scheduler = BindCapacityScheduler(
-                scheduler_capacity,
-                kv_cache_manager.impl if kv_cache_manager is not None else None,
-                peft_cache_manager.impl
-                if peft_cache_manager is not None else None,
-                scheduler_config.capacity_scheduler_policy,
-                two_step_lookahead=mapping.has_pp())
+        capacity_scheduler = BindCapacityScheduler(
+            scheduler_capacity,
+            kv_cache_manager.impl if kv_cache_manager is not None else None,
+            peft_cache_manager.impl if peft_cache_manager is not None else None,
+            scheduler_config.capacity_scheduler_policy,
+            two_step_lookahead=mapping.has_pp())
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
@@ -1317,6 +1335,7 @@ def create_py_executor_instance(
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
+
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -1411,9 +1430,10 @@ def instantiate_sampler(
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if llm_args.sampler_type == SamplerType.TRTLLMSampler or (
-            llm_args.sampler_type == SamplerType.auto
-            and decoding_mode.isBeamSearch()):
+    if llm_args.sampler_type == SamplerType.TRTLLMSampler:
+        logger.warning(
+            "TRTLLMSampler is deprecated and will be removed in release 1.4. Please use TorchSampler instead."
+        )
         logger.debug(f"DecodingMode: {decoding_mode.name}")
         return TRTLLMSampler(engine.model,
                              engine.dtype,

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,16 +27,38 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root, skip_pre_blackwell
-from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
+                            LlmapiAccuracyTestHarness)
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
+_AD_MODEL_REGISTRY_DIR = Path(
+    get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
 
 
 def _load_ad_config(config_name):
     """Load a YAML config from the AutoDeploy model registry configs directory."""
     with open(_AD_CONFIGS_DIR / config_name) as f:
         return yaml.safe_load(f)
+
+
+def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
+    """Return (yaml_extra paths, world_size) from the AutoDeploy model registry."""
+    with open(_AD_MODEL_REGISTRY_DIR / "models.yaml") as f:
+        registry = yaml.safe_load(f)
+    for entry in registry["models"]:
+        if entry["name"] != model_name:
+            continue
+        config_dir = _AD_MODEL_REGISTRY_DIR / "configs"
+        paths = [str(config_dir / cfg) for cfg in entry["yaml_extra"]]
+        world_size = 1
+        for cfg in entry["yaml_extra"]:
+            cfg_name = str(cfg)
+            if "world_size_" in cfg_name and cfg_name.endswith(".yaml"):
+                world_size = int(
+                    cfg_name.replace("world_size_", "").replace(".yaml", ""))
+        return paths, world_size
+    raise ValueError(f"Model '{model_name}' not found in model registry")
 
 
 def _set_quant_config(llm, model_id: str) -> None:
@@ -429,14 +451,17 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nemotron-MOE"
+    MODEL_NAME = "nvidia/Nemotron-3-Nano"
 
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
     MODEL_PATHS = {
-        "bf16": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024",
-        "fp8": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
-        "nvfp4": f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+        "bf16":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
+        "fp8":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"),
+        "nvfp4":
+        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -478,19 +503,19 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
     MODEL_PATHS = {
         "bf16":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"),
         "fp8":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"),
         "nvfp4":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
@@ -520,10 +545,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         if model_id == "bf16":
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
-        if enable_attention_dp:
-            kwargs.setdefault("transforms", {})["detect_sharding"] = {
-                "enable_attention_dp": True
-            }
+        kwargs.setdefault("transforms", {}).setdefault(
+            "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
@@ -533,7 +556,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            trust_remote_code=True,
                            **kwargs) as llm:
             _set_quant_config(llm, model_id)
-
+            # the nvfp4 model is mixed precision, should be tested against higher thresholds
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             print_memory_usage("after engine build")
 
             sampling_params = self.get_default_sampling_params()
@@ -700,7 +725,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
+class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for Qwen3.5-397B-A17B via AutoDeploy.
 
     Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
@@ -709,18 +734,14 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
-    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
 
-    def _load_config(self):
-        """Load config from qwen3.5_moe_400b.yaml with test-specific overrides."""
-        config = _load_ad_config('qwen3.5_moe_400b.yaml')
-        config.pop('world_size', None)
-        config['max_seq_len'] = self.MAX_SEQ_LEN
-        config['max_num_tokens'] = self.MAX_SEQ_LEN
-        config.setdefault('skip_tokenizer_init', False)
-        config.setdefault('trust_remote_code', True)
-        return config
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+        }
 
     def get_default_sampling_params(self):
         eos_id = -1
@@ -735,12 +756,17 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     def test_bf16(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
-        kwargs = self._load_config()
+        kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        assert registry_world_size == world_size
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            dtype="bfloat16",
                            world_size=world_size,
+                           yaml_extra=yaml_paths,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -754,8 +780,9 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
         return config, world_size
 
     @pytest.mark.skip_less_device_memory(80000)
-    def test_bf16_small(self):
-        config, world_size = self._load_small_config()
+    @pytest.mark.parametrize("world_size", [8])
+    def test_bf16_small(self, world_size):
+        config, _ = self._load_small_config()
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
@@ -768,6 +795,12 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME_SMALL)
             task.evaluate(llm)
+            task = MMMU(self.MODEL_NAME_SMALL)
+            task.EVALUATE_KWARGS = dict(MMMU.EVALUATE_KWARGS,
+                                        model_type="qwen3_vl",
+                                        is_force_single_image=False)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
@@ -881,11 +914,21 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     Config = yaml_extra (merged) + config_overrides.
     Model paths are resolved via hf_id_to_local_model_dir.
     """
+    # Aliases for models that have different names in the registry and the reference accuracy files.
+    MODEL_REFERENCE_ALIASES = {
+        "nvidia/Llama-3.1-8B-Instruct-FP8": "meta-llama/Llama-3.1-8B-Instruct",
+        "nvidia/Llama-3.1-8B-Instruct-NVFP4":
+        "meta-llama/Llama-3.1-8B-Instruct",
+    }
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
         pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
                      id="meta-llama_Llama-3.1-8B-Instruct"),
+        pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
+                     id="nvidia_Llama-3.1-8B-Instruct-FP8"),
+        pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
+                     id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
         pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),
         pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
@@ -910,27 +953,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         ),
     ]
 
-    @staticmethod
-    def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
-        """Return (yaml_extra paths, world_size) from model registry."""
-        registry_path = (Path(__file__).resolve().parents[4] /
-                         "examples/auto_deploy/model_registry")
-        with open(registry_path / "models.yaml") as f:
-            registry = yaml.safe_load(f)
-        for entry in registry["models"]:
-            if entry["name"] == model_name:
-                config_dir = registry_path / "configs"
-                paths = [str(config_dir / f) for f in entry["yaml_extra"]]
-                # world_size from world_size_N.yaml (last match wins)
-                world_size = 1
-                for f in entry["yaml_extra"]:
-                    s = str(f)
-                    if "world_size_" in s and s.endswith(".yaml"):
-                        world_size = int(
-                            s.replace("world_size_", "").replace(".yaml", ""))
-                return paths, world_size
-        raise ValueError(f"Model '{model_name}' not found in model registry")
-
     def get_default_sampling_params(self):
         # Use end_id=None so _setup runs and tokenizes stop sequences (e.g. GSM8K).
         return SamplingParams(end_id=None,
@@ -939,14 +961,13 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                               use_beam_search=False)
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.parametrize("accuracy_check", [False])
+    @pytest.mark.parametrize("accuracy_check", [False, True])
     @pytest.mark.parametrize("model_name,config_overrides,tasks",
                              MODEL_REGISTRY_ACCURACY_PARAMS)
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
                                       accuracy_check):
         model_path = hf_id_to_local_model_dir(model_name)
-        yaml_paths, registry_world_size = self._get_registry_yaml_extra(
-            model_name)
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
         effective_world_size = config_overrides.get("world_size",
                                                     registry_world_size)
         if get_device_count() < effective_world_size:
@@ -958,9 +979,18 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                            yaml_extra=yaml_paths,
                            **config_overrides) as llm:
             if accuracy_check:
+                if "NVFP4" in model_name:
+                    _set_quant_config(llm, "nvfp4")
+                elif "FP8" in model_name:
+                    _set_quant_config(llm, "fp8")
+                reference_model_name = self.MODEL_REFERENCE_ALIASES.get(
+                    model_name, model_name)
                 for task_cls in tasks:
-                    task = task_cls(model_name)
+                    task = task_cls(reference_model_name)
                     try:
-                        task.evaluate(llm, sampling_params=sampling_params)
+                        evaluate_kwargs = {
+                            "sampling_params": sampling_params
+                        } if task_cls is MMLU else {}
+                        task.evaluate(llm, **evaluate_kwargs)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
