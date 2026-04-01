@@ -1,7 +1,7 @@
 -r requirements.txt
 einops
 graphviz
-mypy
+mypy<1.20.0
 mako
 oyaml
 parameterized
