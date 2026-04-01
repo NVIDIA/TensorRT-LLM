@@ -507,8 +507,9 @@ class TestTwoStageLoRAHelpers:
 
         applied, _ = _apply_lora_deltas(linear, deltas, sign=1.0)
         assert applied == 1, "Expected one parameter to be modified"
-        assert not torch.allclose(linear.weight.data, original_weight), \
+        assert not torch.allclose(linear.weight.data, original_weight), (
             "Weights should have changed after applying delta"
+        )
 
         _apply_lora_deltas(linear, deltas, sign=-1.0)
         drift = (linear.weight.data.float() - original_weight.float()).abs().max().item()
@@ -547,9 +548,7 @@ class TestTwoStageLoRAHelpers:
             _apply_lora_deltas(model, deltas, sign=-1.0)
 
         drift = (model.weight.data.float() - original.float()).abs().max().item()
-        assert drift < 0.1, (
-            f"bf16 drift after {rounds} rounds too large: {drift:.2e}"
-        )
+        assert drift < 0.1, f"bf16 drift after {rounds} rounds too large: {drift:.2e}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_restore_lora_state_exact(self):
@@ -569,8 +568,9 @@ class TestTwoStageLoRAHelpers:
         assert not torch.allclose(linear.weight.data, original_weight)
 
         _restore_lora_state(linear, saved_state)
-        assert torch.allclose(linear.weight.data, original_weight), \
+        assert torch.allclose(linear.weight.data, original_weight), (
             "_restore_lora_state should restore weights exactly"
+        )
 
 
 class TestTwoStageLoRAFileLoading:
@@ -639,8 +639,9 @@ class TestTwoStageLoRAFileLoading:
             deltas = _load_lora_deltas(tmp_path, module, strength=1.0)
             expected_scale = 1.0 * alpha_val / rank
             expected_delta = (B.float() @ A.float()) * expected_scale
-            assert torch.allclose(deltas["w"], expected_delta, atol=1e-5), \
+            assert torch.allclose(deltas["w"], expected_delta, atol=1e-5), (
                 "LoRA alpha scaling mismatch"
+            )
         finally:
             os.unlink(tmp_path)
 
@@ -675,8 +676,9 @@ class TestTwoStageLoRAFileLoading:
             deltas_s05 = _load_lora_deltas(tmp_path, module, strength=0.5)
 
             ratio = deltas_s1["w"] / deltas_s05["w"]
-            assert torch.allclose(ratio, torch.full_like(ratio, 2.0), atol=1e-5), \
+            assert torch.allclose(ratio, torch.full_like(ratio, 2.0), atol=1e-5), (
                 "strength=1.0 should produce 2x the delta of strength=0.5"
+            )
         finally:
             os.unlink(tmp_path)
 
@@ -736,15 +738,21 @@ class TestTwoStageUpsamplerBuildingBlocks:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_latent_upsampler_spatial_2x(self):
         """LatentUpsampler doubles spatial dims while preserving temporal."""
-        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.upsampler import (
-            LatentUpsampler,
-        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.upsampler import LatentUpsampler
 
         device = "cuda"
-        model = LatentUpsampler(
-            in_channels=16, mid_channels=32, num_blocks_per_stage=1,
-            dims=3, spatial_upsample=True, temporal_upsample=False,
-        ).to(device).to(torch.bfloat16)
+        model = (
+            LatentUpsampler(
+                in_channels=16,
+                mid_channels=32,
+                num_blocks_per_stage=1,
+                dims=3,
+                spatial_upsample=True,
+                temporal_upsample=False,
+            )
+            .to(device)
+            .to(torch.bfloat16)
+        )
 
         x = torch.randn(1, 16, 4, 8, 8, device=device, dtype=torch.bfloat16)
         with torch.no_grad():
@@ -780,10 +788,17 @@ class TestTwoStageUpsamplerBuildingBlocks:
 
         device = "cuda"
         ch = 16
-        upsampler = LatentUpsampler(
-            in_channels=ch, mid_channels=32, num_blocks_per_stage=1,
-            dims=3, spatial_upsample=True,
-        ).to(device).to(torch.bfloat16)
+        upsampler = (
+            LatentUpsampler(
+                in_channels=ch,
+                mid_channels=32,
+                num_blocks_per_stage=1,
+                dims=3,
+                spatial_upsample=True,
+            )
+            .to(device)
+            .to(torch.bfloat16)
+        )
 
         # Minimal mock of per-channel stats
         stats = torch.nn.Module()
@@ -801,6 +816,7 @@ class TestTwoStageUpsamplerBuildingBlocks:
             return (x - mean) / std
 
         import types
+
         stats.un_normalize = types.MethodType(_un_normalize, stats)
         stats.normalize = types.MethodType(_normalize, stats)
 
@@ -895,10 +911,10 @@ class TestLTX2TwoStagePipelineLoading:
             assert isinstance(pipeline, LTX2TwoStagesPipeline), (
                 f"Expected LTX2TwoStagesPipeline, got {type(pipeline).__name__}"
             )
-            assert pipeline.spatial_upsampler is not None, \
-                "Spatial upsampler should be loaded"
-            assert len(pipeline._distilled_lora_deltas) > 0, \
+            assert pipeline.spatial_upsampler is not None, "Spatial upsampler should be loaded"
+            assert len(pipeline._distilled_lora_deltas) > 0, (
                 "Distilled LoRA deltas should be loaded"
+            )
 
             print(f"\n[Two-Stage] Loaded {len(pipeline._distilled_lora_deltas)} LoRA deltas")
             print(f"[Two-Stage] Upsampler type: {type(pipeline.spatial_upsampler).__name__}")
@@ -934,9 +950,7 @@ class TestLTX2TwoStagePipelineLoading:
             match_rate = applied / total * 100
 
             print(f"\n[Two-Stage] LoRA apply rate: {match_rate:.1f}% ({applied}/{total})")
-            assert match_rate > 99.0, (
-                f"Expected >99% LoRA match rate, got {match_rate:.1f}%"
-            )
+            assert match_rate > 99.0, f"Expected >99% LoRA match rate, got {match_rate:.1f}%"
 
             # Verify unmerge
             removed, _ = _apply_lora_deltas(
@@ -976,7 +990,8 @@ class TestLTX2TwoStagePipelineLoading:
             assert pipeline.model_config.quant_config.quant_algo is not None
 
             quant_count = sum(
-                1 for _, m in pipeline.transformer.named_modules()
+                1
+                for _, m in pipeline.transformer.named_modules()
                 if isinstance(m, Linear) and m.quant_config and m.quant_config.quant_algo
             )
             print(f"\n[Two-Stage {quant_algo}] Quantized {quant_count} Linear layers")

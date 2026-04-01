@@ -12,10 +12,7 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.quantization.ops import (
-    quantize_fp8_blockwise,
-    quantize_nvfp4,
-)
+from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils.fp8_utils import (
@@ -285,9 +282,7 @@ def _requantize_fp8_weight(
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         amax = bf16_weight.float().abs().max().clamp(min=1e-12)
         scale = amax / fp8_max
-        qw = (bf16_weight.float() / scale).clamp(
-            -fp8_max, fp8_max
-        ).to(torch.float8_e4m3fn)
+        qw = (bf16_weight.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
         return qw, scale.to(bf16_weight.device)
 
     qw, scale = quantize_fp8_blockwise(bf16_weight, block_size)
@@ -356,10 +351,7 @@ def _apply_lora_deltas(
                 ws_param = state[scale_key]
                 out_f, in_f = delta.shape
                 is_per_tensor = ws_param.data.numel() == 1
-                is_packed = (
-                    not is_per_tensor
-                    and _is_fp8_scale_packed(ws_param.data, out_f, in_f)
-                )
+                is_packed = not is_per_tensor and _is_fp8_scale_packed(ws_param.data, out_f, in_f)
 
                 saved_state[param_name] = param.data.clone()
                 saved_state[scale_key] = ws_param.data.clone()
