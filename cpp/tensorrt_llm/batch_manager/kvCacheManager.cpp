@@ -1688,8 +1688,8 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             }
             if (pinBlocks)
             {
-                searchRoot->incRefCount();
-                pinnedBlockIds.push_back(searchRoot->getBlockId());
+                block->incRefCount();
+                pinnedBlockIds.push_back(block->getBlockId());
             }
         }
         catch (std::out_of_range const& ex)
