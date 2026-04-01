@@ -2164,15 +2164,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled."
     )
 
-    enable_unified_memory_optimization: Optional[bool] = Field(
+    unified_memory_detected: Optional[bool] = Field(
         default=None,
         description=
-        "Informational flag indicating unified memory system detection. "
+        "Whether this device has unified CPU-GPU memory (e.g. DGX Spark, Jetson). "
         "When None (default), auto-detects via is_device_integrated(). "
-        "The C++ runtime independently detects unified memory and applies optimizations "
-        "(skipping offload memcpy, ignoring host_cache_size). This field provides "
-        "visibility into the detection result but does not control C++ behavior."
-    )
+        "When True, host_cache_size is forced to 0 since there is no separate "
+        "host DRAM to offload to.")
 
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
@@ -2279,17 +2277,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         runtime handles the actual optimization transparently; this validator logs
         the detection and adjusts Python-level defaults for clarity.
         """
-        if self.enable_unified_memory_optimization is None:
+        if self.unified_memory_detected is None:
             try:
                 unified = is_device_integrated()
             except RuntimeError:
                 logger.debug("Unified-memory auto-detection failed; "
                              "defaulting to disabled")
                 unified = False
-            object.__setattr__(self, 'enable_unified_memory_optimization',
-                               unified)
+            object.__setattr__(self, 'unified_memory_detected', unified)
 
-        if self.enable_unified_memory_optimization:
+        if self.unified_memory_detected:
             if self.host_cache_size and self.host_cache_size > 0:
                 logger.info(
                     "Unified memory detected: setting host_cache_size to 0 "

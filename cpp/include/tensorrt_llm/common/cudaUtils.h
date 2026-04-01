@@ -319,15 +319,11 @@ inline bool isSM100Family()
 /// @return true if the device is integrated (physically shared CPU-GPU memory).
 inline bool isUnifiedMemorySystem()
 {
-    static bool const sIsUnified = []()
-    {
-        int device{-1};
-        check_cuda_error(cudaGetDevice(&device));
-        int integrated{0};
-        check_cuda_error(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device));
-        return integrated != 0;
-    }();
-    return sIsUnified;
+    int device{-1};
+    check_cuda_error(cudaGetDevice(&device));
+    int integrated{0};
+    check_cuda_error(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device));
+    return integrated != 0;
 }
 
 inline int getDevice()
