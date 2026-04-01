@@ -169,10 +169,10 @@ def test_shared_kv_transform_aliases_source_cache_placeholders():
     assert info.num_matches == 2
 
     placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
-    assert placeholder_names.count("r0_k_cache_0") == 1
-    assert placeholder_names.count("r1_v_cache_0") == 1
-    assert "r2_k_cache_1" not in placeholder_names
-    assert "r3_v_cache_1" not in placeholder_names
+    assert placeholder_names.count("r0_k_cache") == 1
+    assert placeholder_names.count("r1_v_cache") == 1
+    assert "r2_k_cache" not in placeholder_names
+    assert "r3_v_cache" not in placeholder_names
     assert set(cm._resource_lookup).issubset(set(placeholder_names))
 
     cached_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
@@ -309,8 +309,8 @@ def test_shared_kv_transform_aliases_source_cache_placeholders_for_flashinfer():
     assert info.num_matches == 2
 
     placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
-    assert placeholder_names.count("r0_kv_cache_0") == 1
-    assert "r1_kv_cache_1" not in placeholder_names
+    assert placeholder_names.count("r0_kv_cache") == 1
+    assert "r1_kv_cache" not in placeholder_names
     assert set(cm._resource_lookup).issubset(set(placeholder_names))
 
     cached_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
@@ -420,7 +420,7 @@ def test_shared_kv_self_alias_raises():
         InsertCachedAttentionConfig(stage=Stages.CACHE_INIT, backend="torch")
     )
 
-    with pytest.raises(RuntimeError, match="cannot alias its own cache"):
+    with pytest.raises(RuntimeError, match="cannot share its own KV cache"):
         transform._apply(gm, cm, factory=None, shared_config=SharedConfig())
 
 
