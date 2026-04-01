@@ -98,12 +98,17 @@ def _import_mamba_kernels():
 incremental_selective_state_update, selective_state_update = _import_mamba_kernels()
 
 # ---------------------------------------------------------------------------
-# Fixed model config (Nemotron-3-Super-120B @ TP=8)
+# Model config defaults (Nemotron-3-Super-120B full model)
+# --tp-size divides nheads and ngroups to get the per-GPU slice.
+#   TP=1: nheads=128, ngroups=8
+#   TP=4: nheads=32,  ngroups=2
+#   TP=8: nheads=16,  ngroups=1  (default)
 # ---------------------------------------------------------------------------
-NHEADS = 16
+NHEADS = 128
 HEAD_DIM = 64
 D_STATE = 128
-NGROUPS = 1
+NGROUPS = 8
+TP_SIZE = 8  # default; overridden by --tp-size
 
 # L2 flush buffer: ~128 MB — larger than L2 on A100/H100/B200
 _L2_FLUSH_SIZE = 32 * 1024 * 1024  # float32 elements → 128 MB
@@ -127,9 +132,12 @@ def _flush_l2() -> None:
 # ---------------------------------------------------------------------------
 
 def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
-                   act_dtype: torch.dtype):
+                   act_dtype: torch.dtype,
+                   nheads: int, head_dim: int, d_state: int, ngroups: int):
     """
     Build all tensors for one benchmark configuration.
+
+    nheads/ngroups are already TP-split (i.e. full_nheads // tp_size).
 
     Returns:
       state0                   : (batch, nheads, head_dim, d_state) – initial SSM state
@@ -143,7 +151,6 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
       intermediate_states_buffer: for baseline kernel (batch, mtp_len, nheads, head_dim, d_state)
     """
     device = "cuda"
-    nheads, head_dim, d_state, ngroups = NHEADS, HEAD_DIM, D_STATE, NGROUPS
 
     torch.manual_seed(42)
 
@@ -341,7 +348,8 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
      x, dt, B, C,
      A, dt_bias, D, prev_tokens,
      out_incr, out_base, intermediate_states_buffer,
-    ) = _build_tensors(batch, mtp_len, state_dtype, act_dtype)
+    ) = _build_tensors(batch, mtp_len, state_dtype, act_dtype,
+                       args.tp_nheads, args.head_dim, args.d_state, args.tp_ngroups)
 
     state_work = state0.clone()
     interm_work = intermediate_update_inputs.clone()
@@ -459,6 +467,13 @@ def _print_row(show_kernel_col, kernel_name, batch, mtp_len, prev_k,
 # ---------------------------------------------------------------------------
 
 def _run_benchmark(args) -> None:
+    assert args.nheads % args.tp_size == 0, \
+        f"nheads ({args.nheads}) must be divisible by tp_size ({args.tp_size})"
+    assert args.ngroups % args.tp_size == 0, \
+        f"ngroups ({args.ngroups}) must be divisible by tp_size ({args.tp_size})"
+    args.tp_nheads = args.nheads // args.tp_size
+    args.tp_ngroups = args.ngroups // args.tp_size
+
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     mtp_lengths = [int(x) for x in args.mtp_lengths.split(",")]
 
@@ -518,6 +533,16 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark incremental_selective_state_update Triton kernel",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--nheads", type=int, default=NHEADS,
+                        help="Full-model nheads (divided by --tp-size for per-GPU slice)")
+    parser.add_argument("--ngroups", type=int, default=NGROUPS,
+                        help="Full-model ngroups (divided by --tp-size for per-GPU slice)")
+    parser.add_argument("--head-dim", type=int, default=HEAD_DIM,
+                        help="Head dimension (not TP-split)")
+    parser.add_argument("--d-state", type=int, default=D_STATE,
+                        help="SSM state dimension (not TP-split)")
+    parser.add_argument("--tp-size", type=int, default=TP_SIZE,
+                        help="Tensor parallel size; divides nheads and ngroups")
     parser.add_argument("--batch-sizes", default="1,2,4,8",
                         help="Comma-separated decode batch sizes")
     parser.add_argument("--mtp-lengths", default="1,2,4,8",
