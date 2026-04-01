@@ -998,7 +998,11 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
 
 def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
-    String globalVarsJson = writeJSON returnText: true, json: globalVars
+    // Build a local copy to avoid racey growth from shared parallel mutations.
+    // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
+    // trigger "Argument list too long" when passed to downstream jobs.
+    def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
+    String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
     parameters += [
         'enableFailFast': enableFailFast,
         'globalVars': globalVarsJson,
