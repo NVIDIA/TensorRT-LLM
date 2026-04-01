@@ -159,10 +159,6 @@ class TrtllmGenSupportChecker:
         has_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel() > 0
         if has_sparse_kv or has_sparse_attn:
             return False, "Sparse attention is not supported by trtllm-gen backend."
-        if is_mla_enable:
-            return False, "MLA is not supported by trtllm-gen backend."
-        if not is_fused_qkv:
-            return False, "Only fused QKV is supported by trtllm-gen backend."
         if not update_kv_cache:
             return False, "KV cache update cannot be disabled now."
         if cross_attention:
@@ -194,7 +190,6 @@ class TrtllmGenSupportChecker:
             )
 
         o_dtype = out_dtype if out_dtype is not None else q_dtype
-        heads_ratio = num_heads // num_kv_heads if num_kv_heads > 0 else 1
 
         if phase in ("context", "both"):
             if head_size in cls.UNSUPPORTED_HEAD_SIZES_CONTEXT:
@@ -231,13 +226,6 @@ class TrtllmGenSupportChecker:
                     False,
                     f"[Generation] tokens_per_block ({tokens_per_block}) must be >= {cls.MIN_TOKENS_PER_BLOCK}.",
                 )
-            if heads_ratio > cls.MAX_HEADS_RATIO_GENERATION:
-                max_ratio = cls.MAX_HEADS_RATIO_GENERATION
-                return (
-                    False,
-                    f"[Generation] num_heads/num_kv_heads ratio "
-                    f"({heads_ratio}) must be <= {max_ratio}.",
-                )
             if has_alibi:
                 return False, "[Generation] ALiBi is not supported."
             if (q_dtype, kv_cache_dtype, o_dtype) not in cls.SUPPORTED_DTYPE_COMBOS_GENERATION:
@@ -261,7 +249,7 @@ class TrtllmGenSupportChecker:
         return True, ""
 
 
-@dataclass
+@dataclass(slots=True)
 class ContextWorkspaceBuffers:
     """
     Workspace buffers for context phase.
@@ -292,7 +280,7 @@ class ContextWorkspaceBuffers:
     fmha_bmm2_scale: Optional[torch.Tensor] = None
 
 
-@dataclass
+@dataclass(slots=True)
 class GenerationWorkspaceBuffers:
     """
     Workspace buffers for generation phase.
@@ -855,12 +843,26 @@ class EnqueueParams:
     paged_context_fmha: bool = False
     attention_sinks: Optional[torch.Tensor] = None
     is_mla_enable: bool = False
+    # MLA parameters
+    kv_lora_rank: int = 0
+    qk_nope_head_dim: int = 0
+    qk_rope_head_dim: int = 0
+    v_head_dim: int = 0
+    q_scaling: float = 1.0
+    latent_cache: Optional[torch.Tensor] = None
+    num_layers: int = 0
 
 
 @dataclass
 class EnqueueContextParams(EnqueueParams):
     batch_size: int = 0
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
+    # MLA context: separate K, V inputs (non-absorption mode)
+    k_input: Optional[torch.Tensor] = None
+    v_input: Optional[torch.Tensor] = None
+    absorption_mode: bool = False
+    # Chunked prefill: softmax stats for incremental merge
+    softmax_stats_tensor: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -1149,6 +1151,209 @@ class FlashInferTrtllmGenAttention:
 
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
 
+    def run_mla_context(self, params: EnqueueContextParams):
+        """
+        Non-absorption MLA context attention.
+
+          1. build_decoder_info  -- compute cu_seqlens, rotary inv_freq, etc.
+          2. mla_rope_context    -- apply RoPE to Q/K, write latent KV to paged cache
+          3. FMHA (SeparateQkv)  -- ragged Q/K/V attention via trtllm-gen kernel
+
+        TODO: Support absorption MLA context attention.
+        """
+        head_dim_qk = params.qk_nope_head_dim + params.qk_rope_head_dim
+        head_dim_v = params.qk_nope_head_dim
+
+        window_left = self._compute_window_left(
+            params.cyclic_attention_window_size,
+            params.max_past_kv_length,
+            params.attention_chunk_size,
+        )
+
+        ctx_ws = WorkspaceManager.split_context_workspace(
+            workspace=params.workspace,
+            dtype=params.attention_input.dtype,
+            batch_size=params.batch_size,
+            num_tokens=params.num_tokens,
+            num_heads=params.num_heads,
+            head_size=params.head_size,
+            rotary_embedding_dim=params.rotary_embedding_dim,
+            separate_q_kv_input=True,
+            fp8_context_fmha=False,
+        )
+
+        mla_bmm1_scale = 1.0 / (params.q_scaling * math.sqrt(float(head_dim_qk)))
+
+        torch.ops.trtllm.build_decoder_info(
+            seq_q_offsets=ctx_ws.cu_q_seqlens,
+            seq_kv_offsets=ctx_ws.cu_kv_seqlens,
+            padding_offsets=None,
+            tokens_info=ctx_ws.tokens_info,
+            encoder_padding_offsets=None,
+            packed_mask_row_offsets=ctx_ws.cu_mask_rows,
+            seq_cp_partial_offsets=None,
+            attention_mask=None,
+            seq_q_lengths=params.context_lengths,
+            seq_kv_lengths=params.sequence_lengths,
+            fmha_tile_counter=ctx_ws.fmha_tile_counter,
+            dequant_scale_qkv=params.kv_scale_quant_orig,
+            quant_scale_o=params.attention_output_orig_quant,
+            fmha_bmm1_scale=ctx_ws.fmha_bmm1_scale,
+            fmha_bmm2_scale=ctx_ws.fmha_bmm2_scale,
+            rotary_embedding_inv_freq=ctx_ws.rotary_inv_freq_buf,
+            rotary_embedding_inv_freq_cache=params.rotary_inv_freq,
+            cp_size=1,
+            separate_qkv_scales=False,
+            fmha_host_bmm1_scale=mla_bmm1_scale,
+            batch_size=params.batch_size,
+            max_q_seq_length=params.input_seq_length,
+            max_encoder_q_seq_length=0,
+            attention_window_size=params.cyclic_attention_window_size,
+            sink_token_length=params.sink_token_length,
+            num_tokens=params.num_tokens,
+            remove_padding=params.remove_padding,
+            attention_mask_type=params.mask_type,
+            rotary_embedding_scale=params.rotary_embedding_scale,
+            rotary_embedding_base=params.rotary_embedding_base,
+            rotary_embedding_dim=params.rotary_embedding_dim,
+            rotary_scaling_type=params.rotary_embedding_scale_type,
+            rotary_embedding_max_positions=params.rotary_embedding_max_positions,
+        )
+
+        # Step 2: MLA RoPE -- apply RoPE to Q rope-part and K rope-part,
+        # and write latent KV (c_kv + k_pe) into paged KV cache.
+        # Only invoke MLA RoPE when latent_cache is provided.
+        # When latent_cache is None (e.g. forward_context_with_cached_kv path),
+        # RoPE and KV cache writes were already done upstream; skip this step.
+        # Aligns with C++ attentionOp.cpp guard: if (params.mla_param->latent_cache != nullptr)
+        if params.latent_cache is not None:
+            torch.ops.trtllm.mla_rope_context(
+                latent_cache=params.latent_cache,
+                q_buf=params.qkv_input,
+                k_buf=params.k_input,
+                v_buf=params.v_input,
+                quant_q_buf=None,
+                quant_k_buf=None,
+                quant_v_buf=None,
+                context_buf=params.context_buf,
+                q_pe=None,
+                cos_sin_cache=params.rotary_cos_sin,
+                workspace=None,
+                cache_seq_lens=params.sequence_lengths,
+                seq_q_offset=None,
+                fmha_tile_counter=ctx_ws.fmha_tile_counter,
+                cu_q_seqlens=ctx_ws.cu_q_seqlens,
+                cu_kv_seqlens=ctx_ws.cu_kv_seqlens,
+                block_ids_per_seq=None,
+                bmm1_scale=ctx_ws.fmha_bmm1_scale,
+                bmm2_scale=ctx_ws.fmha_bmm2_scale,
+                quant_scale_o=params.attention_output_orig_quant,
+                quant_scale_q=params.kv_scale_orig_quant,
+                quant_scale_kv=params.kv_scale_orig_quant,
+                dequant_scale_q=params.kv_scale_quant_orig,
+                dequant_scale_kv=params.kv_scale_quant_orig,
+                quant_scale_qkv=None,
+                helix_position_offsets=None,
+                helix_is_inactive_rank=None,
+                batch_size=params.batch_size,
+                acc_q_len=params.num_tokens,
+                head_num=params.num_heads,
+                max_input_seq_len=params.input_seq_length,
+                q_pe_ld=0,
+                q_pe_stride=0,
+                q_lora_rank=0,
+                kv_lora_rank=params.kv_lora_rank,
+                qk_nope_head_dim=params.qk_nope_head_dim,
+                qk_rope_head_dim=params.qk_rope_head_dim,
+                v_head_dim=params.v_head_dim,
+                predicted_tokens_per_seq=1,
+                num_layers=params.num_layers,
+                host_bmm1_scale=mla_bmm1_scale,
+                absorption_mode=False,
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                layer_idx=params.layer_idx,
+                tokens_per_block=params.tokens_per_block,
+                kv_head_num=1,
+                size_per_head=params.kv_lora_rank + params.qk_rope_head_dim,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                cyclic_attention_window_size=params.cyclic_attention_window_size,
+                max_attention_window_size=params.max_attention_window_size,
+                sink_token_length=params.sink_token_length,
+                beam_width=0,
+                seq_offset=params.seq_offset,
+            )
+
+        out = params.context_buf
+        if out.dim() == 2:
+            out = out.view(params.num_tokens, params.num_heads, head_dim_v)
+
+        ctx_ws.trtllm_gen_workspace.zero_()
+
+        # mask_type=0 (padding/FULL) for chunked prefill intermediate chunks,
+        # mask_type=1 (causal) for normal context and final chunk.
+        is_causal = params.mask_type != 0
+        return_lse = params.softmax_stats_tensor is not None
+
+        import os
+
+        use_ragged = os.environ.get("TRTLLM_MLA_CONTEXT_USE_RAGGED", "0") == "1"
+
+        if use_ragged:
+            q_3d = params.qkv_input.view(-1, params.num_heads, head_dim_qk)
+            k_3d = params.k_input.view(-1, params.num_heads, head_dim_qk)
+            v_3d = params.v_input.contiguous().view(-1, params.num_heads, head_dim_v)
+            flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q_3d,
+                key=k_3d,
+                value=v_3d,
+                workspace_buffer=ctx_ws.trtllm_gen_workspace,
+                seq_lens=params.sequence_lengths,
+                max_q_len=params.input_seq_length,
+                max_kv_len=params.max_past_kv_length,
+                bmm1_scale=mla_bmm1_scale,
+                bmm2_scale=1.0,
+                o_sf_scale=0.0,
+                batch_size=params.batch_size,
+                window_left=window_left,
+                cum_seq_lens_q=ctx_ws.cu_q_seqlens,
+                cum_seq_lens_kv=ctx_ws.cu_kv_seqlens,
+                enable_pdl=None,
+                is_causal=is_causal,
+                return_lse=return_lse,
+                attention_sinks=params.attention_sinks,
+                out=out,
+                lse=params.softmax_stats_tensor,
+            )
+        else:
+            flashinfer.prefill.trtllm_batch_context_with_kv_cache_mla(
+                query=params.qkv_input,
+                key=params.k_input,
+                value=params.v_input,
+                workspace_buffer=ctx_ws.trtllm_gen_workspace,
+                seq_lens=params.sequence_lengths,
+                max_q_len=params.input_seq_length,
+                max_kv_len=params.max_past_kv_length,
+                bmm1_scale=mla_bmm1_scale,
+                bmm2_scale=1.0,
+                batch_size=params.batch_size,
+                cum_seq_lens_q=ctx_ws.cu_q_seqlens,
+                cum_seq_lens_kv=ctx_ws.cu_kv_seqlens,
+                num_qo_heads=params.num_heads,
+                num_kv_heads=params.num_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_v=head_dim_v,
+                head_dim_qk_nope=params.qk_nope_head_dim,
+                scale_q=params.q_scaling,
+                window_left=window_left,
+                is_causal=is_causal,
+                out=out,
+                sinks=params.attention_sinks,
+                return_lse=return_lse,
+                lse=params.softmax_stats_tensor,
+            )
+
     def run_generation(self, params: EnqueueGenerationParams):
         batch_beam = params.num_requests * params.beam_width
         block_tables = self._build_block_tables(
@@ -1360,6 +1565,69 @@ class FlashInferTrtllmGenAttention:
                 sinks=params.attention_sinks,
                 q_len_per_req=params.input_seq_length,
             )
+
+    def run_mla_generation(self, params: EnqueueGenerationParams):
+        """MLA generation decode using flashinfer MLA kernel."""
+        import math
+
+        batch_beam = params.num_requests * params.beam_width
+        block_tables = self._build_block_tables(
+            params.kv_cache_block_offsets,
+            params.host_kv_cache_pool_mapping,
+            params.layer_idx,
+            params.global_layer_idx,
+            params.seq_offset,
+            batch_beam,
+        )
+
+        pages_per_superblock = 128 // params.tokens_per_block
+        if pages_per_superblock > 1:
+            num_blocks = block_tables.size(-1)
+            remainder = num_blocks % pages_per_superblock
+            if remainder != 0:
+                pad = pages_per_superblock - remainder
+                block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
+
+        mla_head_dim_qk = params.kv_lora_rank + params.qk_rope_head_dim
+        q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
+
+        query = params.qkv_input.view(batch_beam, q_len_per_req, params.num_heads, mla_head_dim_qk)
+
+        kv_cache = self._kv_cache_manager.get_buffers(
+            params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
+        )
+        if kv_cache.ndim == 5:
+            kv_cache = kv_cache.squeeze(2)
+
+        bmm1_scale = 1.0 / (
+            params.q_scaling * math.sqrt(params.qk_nope_head_dim + params.qk_rope_head_dim)
+        )
+        bmm2_scale = 1.0
+
+        # context_buf: [B*q_len, H, kv_lora_rank]
+        # flashinfer MLA decode out check only accepts [B, H, D] (3D),
+        # but kernel outputs [B, q_len, H, D] when q_len > 1.
+        # For q_len=1: pass context_buf directly (in-place, zero copy).
+        # For q_len>1: let flashinfer allocate, then copy back.
+        out_buf = params.context_buf if q_len_per_req == 1 else None
+
+        mla_out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=params.workspace.view(-1, 4),
+            qk_nope_head_dim=params.qk_nope_head_dim,
+            kv_lora_rank=params.kv_lora_rank,
+            qk_rope_head_dim=params.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_seq_len=params.max_past_kv_length,
+            out=out_buf,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=params.attention_sinks,
+        )
+        if q_len_per_req > 1:
+            params.context_buf.copy_(mla_out.reshape_as(params.context_buf))
 
 
 def _parse_request_types(host_request_types: torch.Tensor) -> Tuple[int, int]:
@@ -1693,8 +1961,18 @@ def trtllm_gen_attention(
 
     num_contexts, num_generations = _parse_request_types(host_request_types)
 
-    num_ctx_tokens = int(host_context_lengths[:num_contexts].sum()) if num_contexts > 0 else 0
-    num_gen_tokens = num_tokens - num_ctx_tokens
+    is_gen_only = attn_input_type == AttentionInputType.generation_only
+    is_ctx_only = attn_input_type == AttentionInputType.context_only
+
+    if is_gen_only:
+        num_ctx_tokens = 0
+        num_gen_tokens = num_tokens
+    elif is_ctx_only:
+        num_ctx_tokens = num_tokens
+        num_gen_tokens = 0
+    else:
+        num_ctx_tokens = int(host_context_lengths[:num_contexts].sum()) if num_contexts > 0 else 0
+        num_gen_tokens = num_tokens - num_ctx_tokens
 
     # Prepare Workspace
     # Use upper-bound token counts for workspace sizing to avoid repeated
@@ -1732,7 +2010,13 @@ def trtllm_gen_attention(
             workspace.resize_(required_workspace_size)
             workspace.zero_()
 
-    out_tensor = output.view(num_tokens, num_heads, head_size)
+    if is_mla_enable and is_gen_only and kv_lora_rank:
+        out_head_size = kv_lora_rank
+    elif is_mla_enable and v_head_dim:
+        out_head_size = v_head_dim
+    else:
+        out_head_size = head_size
+    out_tensor = output.view(num_tokens, num_heads, out_head_size)
 
     max_attn_window_size = (
         attention_window_size
@@ -1740,8 +2024,6 @@ def trtllm_gen_attention(
         else (cache_indirection.size(2) if cache_indirection is not None else attention_window_size)
     )
     cyclic_attn_window_size = attention_window_size
-
-    is_gen_only = attn_input_type == AttentionInputType.generation_only
 
     common_params = dict(
         workspace=workspace,
@@ -1784,6 +2066,15 @@ def trtllm_gen_attention(
         paged_context_fmha=use_paged_context_fmha,
         attention_sinks=attention_sinks,
         is_mla_enable=is_mla_enable,
+        kv_lora_rank=kv_lora_rank or 0,
+        qk_nope_head_dim=qk_nope_head_dim or 0,
+        qk_rope_head_dim=qk_rope_head_dim or 0,
+        v_head_dim=v_head_dim or 0,
+        q_scaling=q_scaling,
+        latent_cache=latent_cache,
+        num_layers=host_kv_cache_pool_mapping.size(0)
+        if host_kv_cache_pool_mapping is not None
+        else 0,
     )
 
     # Context Phase
@@ -1808,8 +2099,15 @@ def trtllm_gen_attention(
             input_seq_length=max_context_q_len,
             batch_size=num_seqs,
             mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+            k_input=k if k is not None else None,
+            v_input=v if v is not None else None,
+            absorption_mode=False,
+            softmax_stats_tensor=softmax_stats_tensor,
         )
-        backend.run_context(ctx_params)
+        if is_mla_enable and not is_fused_qkv:
+            backend.run_mla_context(ctx_params)
+        else:
+            backend.run_context(ctx_params)
 
     # Generation Phase
     if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
@@ -1853,6 +2151,9 @@ def trtllm_gen_attention(
             spec_decoding_position_offsets=spec_pos_offsets,
             spec_decoding_packed_mask=spec_packed_mask,
         )
-        backend.run_generation(gen_params)
+        if is_mla_enable:
+            backend.run_mla_generation(gen_params)
+        else:
+            backend.run_generation(gen_params)
 
     logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")
