@@ -2554,12 +2554,15 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         # Store raw shards in tmp. Cat + pad + interleave always done in
         # process_weights_after_loading() because padding the whole buffer
         # differs from padding each half independently.
-        # Use expert_idx as stable key (not id(tensor_view) which changes across partial loads).
+        # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
+        # since both use local_slot_id starting from 0 but point to different dst buffers.
         if not hasattr(module, '_tmp_cutlass_w3_w1_weight_scales'):
             module._tmp_cutlass_w3_w1_weight_scales = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
+        dst_base = dst_w3_w1_weight_scale.storage().data_ptr()
+        dict_key = (dst_base, expert_idx)
         expert_entry = module._tmp_cutlass_w3_w1_weight_scales.setdefault(
-            expert_idx, {})
+            dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight_scale
         if w3_weight_scale is not None:
             expert_entry['w3'] = w3_weight_scale.contiguous().view(
@@ -2642,12 +2645,15 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         # Store raw shards in tmp. Cat + pad always done in process_weights_after_loading()
         # because padding the whole buffer differs from padding each half independently.
-        # Use expert_idx as stable key (not id(tensor_view) which changes across partial loads).
+        # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
+        # since both use local_slot_id starting from 0 but point to different dst buffers.
         if not hasattr(module, '_tmp_cutlass_w3_w1_weights'):
             module._tmp_cutlass_w3_w1_weights = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
+        dst_base = dst_w3_w1_weight.storage().data_ptr()
+        dict_key = (dst_base, expert_idx)
         expert_entry = module._tmp_cutlass_w3_w1_weights.setdefault(
-            expert_idx, {})
+            dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight
         if w1_weight_shard is not None:
             expert_entry['w1'] = w1_weight_shard.contiguous().view(
@@ -2718,11 +2724,18 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                     self._interleave_w3_w1_weight_scale(dst)
             delattr(module, '_tmp_cutlass_w3_w1_weight_scales')
 
-        # Finalize w2 weight scales: interleave
+        # Finalize w2 weight scales: interleave (regular experts)
         num_experts = module.w2_weight_scale.data.shape[0]
         for expert_idx in range(num_experts):
             self._interleave_w2_weight_scale(
                 module.w2_weight_scale.data[expert_idx])
+
+        # Finalize w2 weight scales: interleave (shared experts for online EPLB)
+        if hasattr(module, 'local_shared_w2_scale_tensors'):
+            num_shared = module.local_shared_w2_scale_tensors.shape[0]
+            for expert_idx in range(num_shared):
+                self._interleave_w2_weight_scale(
+                    module.local_shared_w2_scale_tensors[expert_idx])
 
         super().process_weights_after_loading(module)
 
@@ -3111,14 +3124,44 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 ignore_weight_scale=True)
 
     def process_weights_after_loading(self, module: torch.nn.Module):
+        # Shuffle/interleave shared expert tensors BEFORE super() call,
+        # because super().process_weights_after_loading() will delattr these tensors
+        # after registering them with EPLB.
+        self._shuffle_shared_expert_tensors(module)
+
         # Call parent to compute global input scales and main alphas first
         super().process_weights_after_loading(module)
 
-        # Apply shuffle/interleave to all expert weights and weight scales.
+        # Apply shuffle/interleave to all regular expert weights and weight scales.
         self._shuffle_all_experts(module)
 
+    def _shuffle_shared_expert_tensors(self, module: torch.nn.Module):
+        """Shuffle/interleave shared expert tensors for online EPLB.
+
+        Must be called BEFORE super().process_weights_after_loading() which
+        delattrs these tensors after registering them with EPLB.
+        These are CPU tensors - must move to GPU for CUDA shuffle ops, then copy back.
+        """
+        shared_tensor_attrs = [
+            ('local_shared_w3_w1_tensors',
+             lambda t: self._shuffle_w3_w1_weight(module, t)),
+            ('local_shared_w2_tensors', self._shuffle_w2_weight),
+            ('local_shared_w3_w1_scale_tensors',
+             self._shuffle_and_interleave_w3_w1_weight_scale),
+            ('local_shared_w2_scale_tensors',
+             self._shuffle_and_interleave_w2_weight_scale),
+        ]
+        for attr_name, shuffle_fn in shared_tensor_attrs:
+            shared_tensors = getattr(module, attr_name, None)
+            if shared_tensors is None:
+                continue
+            for i in range(shared_tensors.shape[0]):
+                gpu_tensor = shared_tensors[i].cuda()
+                shuffle_fn(gpu_tensor)
+                shared_tensors[i].copy_(gpu_tensor.cpu())
+
     def _shuffle_all_experts(self, module: torch.nn.Module):
-        """Apply shuffle/interleave to all experts' weights and weight scales."""
+        """Apply shuffle/interleave to all regular experts' weights and weight scales."""
         num_experts = module.w3_w1_weight.data.shape[0]
         for expert_idx in range(num_experts):
             self._shuffle_w3_w1_weight(module,
