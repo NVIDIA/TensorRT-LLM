@@ -541,6 +541,10 @@ class FlashInferAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default
 
     @classmethod
+    def supports_shared_kv(cls) -> bool:
+        return True
+
+    @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
         return [
             "batch_info_host",
