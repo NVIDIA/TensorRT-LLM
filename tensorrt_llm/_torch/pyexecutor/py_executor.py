@@ -453,6 +453,11 @@ class PyExecutor:
         torch.cuda.current_stream().wait_stream(self.execution_stream)
         self.is_warmup = False
 
+        # Snapshot some cumulative KV cache counters so that stats reported to
+        # users exclude blocks reused and missed during warmup dummy requests.
+        if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
+            self.kv_cache_manager.snapshot_warmup_baseline()
+
         self.is_shutdown = False
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
