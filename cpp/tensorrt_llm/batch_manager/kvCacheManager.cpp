@@ -1686,6 +1686,15 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             }
             if (pinBlocks)
             {
+                // If the block has no refs it sits in the eviction policy's free
+                // queue. Claim it first so that the later unpinBlocksById /
+                // releaseBlock cycle does not create a duplicate queue entry.
+                // Pass the block's existing priority and duration so that
+                // claimBlock does not clear its retention/expiry metadata.
+                if (!searchRoot->hasRefs())
+                {
+                    mEvictionPolicy->claimBlock(searchRoot, searchRoot->getPriority(), searchRoot->getDurationMs());
+                }
                 searchRoot->incRefCount();
                 pinnedBlockIds.push_back(searchRoot->getBlockId());
             }
