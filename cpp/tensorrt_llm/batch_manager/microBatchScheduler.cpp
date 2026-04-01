@@ -24,6 +24,25 @@ namespace tensorrt_llm::batch_manager
 
 using SizeType32 = MicroBatchScheduler::SizeType32;
 
+/// Return the forward-pass token cost for a context chunk with KV cache reuse.
+///
+/// setPrepopulatedPromptLen shifts the chunk window right by the prepopulated
+/// amount rather than shrinking it.  For non-last chunks the model still
+/// processes approximately @p chunkSize tokens; only for the last chunk is the
+/// cost @p contextRemaining - @p reusable.
+static SizeType32 reuse_adjusted_compute(SizeType32 chunkSize, SizeType32 reusable, SizeType32 contextRemaining)
+{
+    if (reusable <= 0)
+    {
+        return chunkSize;
+    }
+    if (reusable + chunkSize < contextRemaining)
+    {
+        return chunkSize;
+    }
+    return std::max<SizeType32>(0, contextRemaining - reusable);
+}
+
 MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig,
     std::optional<SizeType32> maxContextLength, LlmRequestState noScheduleUntilState,
     LlmRequestState noScheduleAfterState)
@@ -38,16 +57,15 @@ void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
     std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
     std::optional<SizeType32> const& maxContextLength)
 {
-    // How many compute tokens (chunk - reusable) are in this batch already?
+    // How many compute tokens are in this batch already?
     SizeType32 numCtxTokens{0};
     for (auto const& llmReq : contextsToBeChunked)
     {
         SizeType32 const chunkSize = llmReq->getContextChunkSize();
-        // contextRemaining = P for first chunk; used to compute actual model token count.
         SizeType32 const contextRemaining = llmReq->getContextRemainingLength();
         SizeType32 const reusable
             = llmReq->isFirstContextChunk() ? std::min(llmReq->getEstimatedReusableTokens(), contextRemaining) : 0;
-        numCtxTokens += std::min(chunkSize, std::max<SizeType32>(0, contextRemaining - reusable));
+        numCtxTokens += reuse_adjusted_compute(chunkSize, reusable, contextRemaining);
     }
 
     // Discard draft tokens that won't fit into the existing chunk unit, max
@@ -125,14 +143,14 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
             SizeType32 actualChunkSize = llmReq->getContextChunkSize();
             SizeType32 actualIncrement = actualChunkSize - pastChunkSize;
 
-            // Compute-aware budget: reusable tokens are served from cache and do not
-            // consume forward-pass capacity. Only the tokens beyond the reusable prefix count.
+            // Compute-aware budget accounting for setPrepopulatedPromptLen's
+            // chunk-shift behaviour (non-last chunks keep their full size).
+            SizeType32 const contextRemaining = llmReq->getContextRemainingLength();
             SizeType32 const reusable = llmReq->isFirstContextChunk()
-                ? std::min(llmReq->getEstimatedReusableTokens(), llmReq->getContextRemainingLength())
+                ? std::min(llmReq->getEstimatedReusableTokens(), contextRemaining)
                 : 0;
-            SizeType32 const pastCompute = std::max<SizeType32>(0, pastChunkSize - std::min(reusable, pastChunkSize));
-            SizeType32 const actualCompute
-                = std::max<SizeType32>(0, actualChunkSize - std::min(reusable, actualChunkSize));
+            SizeType32 const pastCompute = reuse_adjusted_compute(pastChunkSize, reusable, contextRemaining);
+            SizeType32 const actualCompute = reuse_adjusted_compute(actualChunkSize, reusable, contextRemaining);
             SizeType32 const computeIncrement = actualCompute - pastCompute;
 
             if ((ctxTokensCapacity && numCtxTokens + computeIncrement > ctxTokensCapacity.value())
@@ -181,24 +199,22 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
     for (auto& llmReq : contextsToBeChunked)
     {
         SizeType32 const suggestedChunkSize = llmReq->getContextRemainingLength();
-        // Reusable tokens are "free" — they don't consume forward-pass compute budget.
         SizeType32 const reusable
             = llmReq->isFirstContextChunk() ? std::min(llmReq->getEstimatedReusableTokens(), suggestedChunkSize) : 0;
-        SizeType32 const computeCost = suggestedChunkSize - reusable;
+        SizeType32 const computeCost = reuse_adjusted_compute(suggestedChunkSize, reusable, suggestedChunkSize);
         SizeType32 actualChunkSize = suggestedChunkSize;
         if (ctxTokensCapacity && computeCost > ctxTokensCapacity.value())
         {
-            // Model processes min(chunk_size, P - reusable) tokens starting from position reusable.
-            // To keep model tokens within budget: chunk_size <= capacity (not reusable + capacity).
             actualChunkSize = ctxTokensCapacity.value();
         }
         if (maxContextLength)
         {
-            // maxContextLength limits compute tokens, not total tokens.
-            SizeType32 const actualCompute = std::max<SizeType32>(0, actualChunkSize - reusable);
+            SizeType32 const actualCompute
+                = reuse_adjusted_compute(actualChunkSize, reusable, suggestedChunkSize);
             if (actualCompute > maxContextLength.value())
             {
-                actualChunkSize = std::min<SizeType32>(reusable + maxContextLength.value(), suggestedChunkSize);
+                actualChunkSize = maxContextLength.value();
+                actualChunkSize = std::min(actualChunkSize, suggestedChunkSize);
             }
         }
         if (actualChunkSize != suggestedChunkSize)
@@ -208,10 +224,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
         llmReq->setContextChunkSize(actualChunkSize);
         if (ctxTokensCapacity)
         {
-            // Decrement by actual model token count: min(chunk_size, P - reusable).
-            // This equals min(actualChunkSize, computeCost) since computeCost = suggestedChunkSize - reusable.
             SizeType32 const modelCost
-                = std::min(actualChunkSize, std::max<SizeType32>(0, suggestedChunkSize - reusable));
+                = reuse_adjusted_compute(actualChunkSize, reusable, suggestedChunkSize);
             ctxTokensCapacity = ctxTokensCapacity.value() - modelCost;
         }
     }
@@ -309,10 +323,13 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
             if (!mCtxChunkConfig) // skip chunking
             {
                 constexpr SizeType32 beam{0};
-                reqNumTokens
-                    = llmReq->getNumTokens(beam) + (llmReq->hasDraftTokens() ? llmReq->getNumDraftTokens() : 0);
-                // Compute tokens = total - reusable (at least 1 to make progress)
-                SizeType32 const computeTokens = std::max(1, reqNumTokens - reusable);
+                SizeType32 const contextTokens = llmReq->getNumTokens(beam);
+                SizeType32 const draftTokens
+                    = llmReq->hasDraftTokens() ? llmReq->getNumDraftTokens() : 0;
+                reqNumTokens = contextTokens + draftTokens;
+                SizeType32 const contextCompute
+                    = reuse_adjusted_compute(contextTokens, reusable, llmReq->getContextRemainingLength());
+                SizeType32 const computeTokens = std::max(1, contextCompute + draftTokens);
                 TLLM_CHECK_WITH_INFO(!mMaxContextLength || computeTokens <= mMaxContextLength.value(),
                     "Context compute tokens (%d) exceeds the limit value (%d)", computeTokens,
                     mMaxContextLength.value());
@@ -329,9 +346,8 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                 llmReq->setContextChunkSize(llmReq->getContextRemainingLength());
                 auto const draftTokens
                     = (llmReq->isLastContextChunk() && llmReq->hasDraftTokens()) ? llmReq->getNumDraftTokens() : 0;
-                // Compute cost: context compute + draft tokens
-                // (reusable tokens only offset context tokens, not draft tokens)
-                SizeType32 const contextCompute = std::max(0, llmReq->getContextChunkSize() - reusable);
+                SizeType32 const contextCompute = reuse_adjusted_compute(
+                    llmReq->getContextChunkSize(), reusable, llmReq->getContextRemainingLength());
                 SizeType32 computeTokens = contextCompute + draftTokens;
 
                 if (mMaxContextLength)
@@ -398,10 +414,9 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         if (llmReq->getContextChunkSize() > 0)
         {
             contextRequests.emplace_back(llmReq);
-            // Only count compute tokens (total - reusable).
-            // Reusable credit only applies to the first context chunk.
             SizeType32 const reusable = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
-            SizeType32 const computeTokens = std::max(0, llmReq->getContextChunkSize() - reusable);
+            SizeType32 const computeTokens
+                = reuse_adjusted_compute(llmReq->getContextChunkSize(), reusable, llmReq->getContextRemainingLength());
             batchNumTokens += computeTokens;
             TLLM_LOG_DEBUG("context request scheduled: ID %lu, chunk size %d%s", llmReq->mRequestId,
                 llmReq->getContextChunkSize(), reusable > 0 ? (", reusable " + std::to_string(reusable)).c_str() : "");
