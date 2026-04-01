@@ -1864,6 +1864,11 @@ class AttentionDescriptor(ABC):
         raise NotImplementedError
 
     @classmethod
+    def supports_shared_kv(cls) -> bool:
+        """Whether this backend supports shared-KV cache aliasing."""
+        return False
+
+    @classmethod
     @abstractmethod
     def get_standard_metadata_args(cls) -> List[str]:
         """Get the list of standard metadata arguments that are expected by the attention op."""

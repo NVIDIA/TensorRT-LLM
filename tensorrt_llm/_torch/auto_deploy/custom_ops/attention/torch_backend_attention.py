@@ -546,7 +546,7 @@ def torch_backend_mha_with_cache(
                 sinks,
             )
 
-    num_total_tokens = int(seq_len.sum().item()) if s > 1 else num_prefill_tokens + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
     bs = b * s
 
     if out is not None:
@@ -614,6 +614,10 @@ class TorchBackendAttention(AttentionDescriptor):
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.torch_cached_attention_with_cache.default
+
+    @classmethod
+    def supports_shared_kv(cls) -> bool:
+        return True
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:

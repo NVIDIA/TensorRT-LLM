@@ -199,6 +199,10 @@ class _InsertCachedOperator(BaseTransform):
             shared_kv_source_layer_idx = attn_descriptor.get_shared_kv_source_layer_idx(attn_node)
 
             if shared_kv_source_layer_idx is not None:
+                if not attn_descriptor.supports_shared_kv():
+                    raise RuntimeError(
+                        f"Backend '{self.config.backend}' does not support shared-KV attention."
+                    )
                 if layer_idx is None:
                     raise RuntimeError(
                         "Shared-KV attention node is missing layer_idx metadata required for "
@@ -222,8 +226,7 @@ class _InsertCachedOperator(BaseTransform):
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
-                    k_indexed = f"{k}_{idx}"
-                    resource_name = cm.add_resource(k_indexed, resource_handler)
+                    resource_name = cm.add_resource(k, resource_handler)
                     cache_in_nodes.append(self._process_cache_node(gm, resource_name))
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
