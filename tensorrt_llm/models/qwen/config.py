@@ -149,7 +149,11 @@ class QWenConfig(PretrainedConfig):
         moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", 0)
         moe_shared_expert_intermediate_size = getattr(
             hf_config, "shared_expert_intermediate_size", 0)
-        moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.NONE
+        moe_normalization_mode = (
+            MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
+            if getattr(hf_config, "norm_topk_prob", False)
+            else MoeConfig.ExpertScaleNormalizationMode.NONE
+        )
 
         # Add support for mlp_only_layers and decoder_sparse_step (Qwen3 MoE)
         mlp_only_layers = getattr(hf_config, "mlp_only_layers", [])
