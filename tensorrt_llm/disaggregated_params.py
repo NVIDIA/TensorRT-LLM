@@ -67,8 +67,10 @@ class DisaggregatedParams:
         request_id = (
             self.disagg_request_id if self.disagg_request_id is not None else self.ctx_request_id
         )
+        # `first_gen_tokens` is now required by bindings and cannot be None.
+        first_gen_tokens = self.first_gen_tokens if self.first_gen_tokens is not None else []
         return tllme.ContextPhaseParams(
-            self.first_gen_tokens,
+            first_gen_tokens,
             request_id,
             self.opaque_state,
             self.draft_tokens,

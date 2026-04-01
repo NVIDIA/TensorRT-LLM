@@ -206,7 +206,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         return self.impl.cancel_request(req)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
-        raise NotImplementedError
+        # not implemented, an empty placeholder to allow being invoked unconditionally
+        ...
 
     def get_disaggregated_params(self):
         # Cpp kv cache transceiver will set the disaggregated params to context response

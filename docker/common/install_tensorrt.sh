@@ -40,6 +40,11 @@ install_ubuntu_requirements() {
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
+    # this file exists in cuda base image, and has conflicts with cuda-keyring with the following error, so we need to remove it first:
+    # E: Conflicting values set for option Signed-By regarding
+    # source https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/ /: /usr/share/keyrings/cuda-archive-keyring.gpg !=
+    rm -f /etc/apt/sources.list.d/cuda.list
+
     curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH}/cuda-keyring_1.1-1_all.deb
     dpkg -i cuda-keyring_1.1-1_all.deb
     rm cuda-keyring_1.1-1_all.deb

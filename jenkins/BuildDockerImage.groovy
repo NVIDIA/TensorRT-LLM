@@ -306,6 +306,8 @@ def buildImage(config, imageKeyToTag)
 
         if (target == "rockylinux8") {
             BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        } else if (target =~ /^ubuntu\d+$/) {
+            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^${target}_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
 
         // Replace the base image and triton image with the internal mirror
@@ -449,6 +451,12 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         ],
         "Build CI Image (RockyLinux8 Python312)": [
             target: "rockylinux8",
+            args: "PYTHON_VERSION=3.12.3",
+            postTag: "-py312",
+        ],
+        "Build CI Image (SBSA Ubuntu24.04 Python312)": [
+            arch: "arm64",
+            target: "ubuntu24",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],

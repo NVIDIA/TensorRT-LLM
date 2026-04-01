@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional, Type
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.gemma.config import GEMMA_ARCHITECTURE, GemmaConfig
@@ -197,6 +198,7 @@ def create_quant_config(args: argparse.Namespace) -> QuantConfig:
 
 
 def main() -> None:
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     tik = time.time()
     quant_config = create_quant_config(args)
