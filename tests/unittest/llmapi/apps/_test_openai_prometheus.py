@@ -65,6 +65,31 @@ def server(model_name: str,
         logger.info("Tests completed, shutting down server")
 
 
+def test_kv_cache_metrics_available_before_first_request(
+        server: RemoteOpenAIServer):
+    """Verify that KV cache metrics are available at startup, before any
+    inference request.  External scrapers (e.g. the Kubernetes Inference
+    Gateway EPP) rely on these metrics for routing decisions."""
+    metric_prefix = "trtllm_"
+    max_wait_time = 10.0
+    poll_interval = 0.5
+    start_time = time.time()
+    metrics_found = False
+
+    while time.time() - start_time < max_wait_time:
+        response = urlopen(f'{server.url_root}/prometheus/metrics')
+        assert response.status == 200
+        data = response.read().decode("utf-8")
+        if metric_prefix + "kv_cache_utilization" in data:
+            metrics_found = True
+            break
+        time.sleep(poll_interval)
+
+    assert metrics_found, \
+        (f"{metric_prefix}kv_cache_utilization not found in /prometheus/metrics "
+         f"after {max_wait_time}s — it should be available before any request")
+
+
 def test_metrics_endpoint(server: RemoteOpenAIServer):
     metric_prefix = "trtllm_"
 

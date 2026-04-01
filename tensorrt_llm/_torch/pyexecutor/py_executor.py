@@ -508,6 +508,7 @@ class PyExecutor:
 
         self.stats_lock = threading.Lock()
         self.stats = []
+        self._emit_initial_stats()
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1858,6 +1859,25 @@ class PyExecutor:
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
+
+    def _emit_initial_stats(self) -> None:
+        """Emit a startup stats snapshot so that cache_config_info is
+        immediately available to external metric scrapers (e.g. the
+        Kubernetes Inference Gateway EPP) before any inference request."""
+        if not self.enable_iter_perf_stats:
+            return
+        stats = self._get_init_iter_stats(0, 0)
+        kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is not None:
+            kv_stats = kv_cache_manager.get_kv_cache_stats()
+            kv_stats_to_save = KvCacheStats()
+            kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
+            kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
+            kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
+            kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
+            stats.kv_cache_stats = kv_stats_to_save
+        self._append_iter_stats(stats)
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)

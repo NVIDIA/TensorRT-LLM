@@ -1,5 +1,6 @@
 """Test the metrics endpoint when using OpenAI API to send requests"""
 
+import time
 from unittest.mock import patch
 
 import pytest
@@ -49,6 +50,34 @@ def test_health(client, llm, is_healthy, response_code):
 def test_version(client):
     response = client.get("/version")
     assert response.status_code == 200
+
+
+def test_metrics_available_before_first_request(client):
+    """Verify that KV cache config stats are available at startup,
+    before any inference request is sent.  This is critical for external
+    metric scrapers (e.g. the Kubernetes Inference Gateway EPP) that need
+    cache_config_info immediately to make routing decisions."""
+    # Poll until the background stats collector processes the initial stats
+    deadline = time.time() + 5.0
+    stats = []
+    while time.time() < deadline:
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        stats = response.json()
+        if stats:
+            break
+        time.sleep(0.1)
+    assert stats, "Expected initial stats before first request"
+    response_dict = stats[0]
+    assert "kvCacheStats" in response_dict, \
+        "kvCacheStats should be present before first request"
+    kv_stats = response_dict["kvCacheStats"]
+    assert "maxNumBlocks" in kv_stats
+    assert "tokensPerBlock" in kv_stats
+    assert kv_stats["maxNumBlocks"] > 0, \
+        "maxNumBlocks should be positive at startup"
+    assert kv_stats["tokensPerBlock"] > 0, \
+        "tokensPerBlock should be positive at startup"
 
 
 def test_metrics(client):

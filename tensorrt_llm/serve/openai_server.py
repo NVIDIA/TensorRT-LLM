@@ -192,6 +192,10 @@ class OpenAIServer:
                         self.generator.args, "enable_iter_perf_stats", True):
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
+                    # Wake up the collector immediately so it processes the
+                    # initial stats emitted by the executor at startup (e.g.
+                    # cache_config_info).
+                    self._iteration_stats_wakeup_event.set()
                     logger.info(
                         "Started background iteration stats collector task")
 
