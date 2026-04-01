@@ -24,6 +24,7 @@ import tensorrt as trt
 import torch
 
 from .. import profiler
+from .._deprecation import emit_engine_arch_deprecation
 from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
 from ..bindings import MpiComm
 from ..bindings.executor import Executor
@@ -549,6 +550,7 @@ class ModelRunner(ModelRunnerMixin):
             lora_manager (LoraManager):
                 The LoRA manager to handle LoRA weights.
         """
+        emit_engine_arch_deprecation("ModelRunner")
         self.session = session
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len

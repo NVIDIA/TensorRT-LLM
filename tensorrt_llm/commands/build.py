@@ -24,6 +24,7 @@ from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import (local_mpi_rank, local_mpi_size, mpi_barrier,
                                  mpi_comm, mpi_rank, mpi_world_size)
 from tensorrt_llm.builder import BuildConfig, Engine, build
@@ -420,6 +421,8 @@ def parallel_build(model_config: PretrainedConfig,
 
 
 def main():
+    emit_engine_arch_deprecation("trtllm-build")
+
     parser = parse_arguments()
     args = parser.parse_args()
 
