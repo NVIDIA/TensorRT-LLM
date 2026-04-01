@@ -989,8 +989,7 @@ def compute_logprobs(
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
 
-        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32),
-                                 dim=-1)
+        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
 
         # only return sampled token
         if top_k == 0:
@@ -1040,8 +1039,7 @@ def compute_logprobs(
     # by one so that the "target" token included in each position's logprobs
     # is the actual next prompt token, not the current input token.
     # The last position has no next prompt token, so only top-K is returned.
-    shifted_prompt_tokens = (
-        prompt_token_ids[1:] if prompt_token_ids else None)
+    shifted_prompt_tokens = (prompt_token_ids[1:] if prompt_token_ids else None)
     prompt_logprobs = _topk_logprobs(
         context_logits, k_prompt_logprobs, shifted_prompt_tokens
     ) if k_prompt_logprobs is not None and context_logits is not None else None
