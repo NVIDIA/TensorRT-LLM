@@ -20,6 +20,7 @@ def test_initialize_mrope_delta_cache_registers_state_resource():
     cm = CachedSequenceInterface(
         max_seq_len=8,
         max_batch_size=2,
+        max_num_tokens=18,
         device="cpu",
     )
     transform = InitializeMropeDeltaCache.from_kwargs(stage="cache_init")
