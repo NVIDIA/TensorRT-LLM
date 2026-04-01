@@ -1561,10 +1561,10 @@ def trtllm_gen_attention(
     quant_q_buffer: Optional[torch.Tensor],
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
+    num_contexts: int,
+    num_generations: int,
+    num_ctx_tokens: int,
     global_layer_idx: Optional[int] = None,
-    num_contexts: int = 0,
-    num_generations: int = 0,
-    num_ctx_tokens: int = 0,
 ) -> None:
     """
     TrtLLM-Gen attention using flashinfer backend.
