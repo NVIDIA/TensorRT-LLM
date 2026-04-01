@@ -310,9 +310,11 @@ class ServerConfig:
             # cache_transceiver_config
             "s_cache_transceiver_backend",
             # speculative_config
+            # Keep baseline matching on the legacy key during DB migration.
+            # l_max_draft_len is written to DB but not used for matching until
+            # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
-            "l_max_draft_len",
         ]
 
     def to_db_data(self) -> dict:
