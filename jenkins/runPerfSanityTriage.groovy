@@ -101,10 +101,13 @@ def runPerfTriageBot() {
                 numRetries: 3)
         }
 
-        // Install anthropic Python SDK on the login node
-        def installScriptContent = '''#!/bin/bash
-pip install --user anthropic
-'''
+        // Install anthropic Python SDK on the login node in a venv
+        def venvDir = "${workspace}/.venv"
+        def installScriptContent = """#!/bin/bash
+python3 -m venv ${venvDir}
+source ${venvDir}/bin/activate
+pip install anthropic
+"""
         def installScriptBase64 = installScriptContent.bytes.encodeBase64().toString()
         Utils.exec(this, script: Utils.sshUserCmd(remote,
             "\"echo '${installScriptBase64}' | base64 -d | bash\""),
@@ -179,6 +182,7 @@ pip install --user anthropic
         def systemPromptFile = "${workspace}/system-prompt.txt"
         def runScriptContent = """#!/bin/bash
 set -e -o pipefail
+source ${venvDir}/bin/activate
 cd ${botDir}
 
 # Generate system prompt with dynamic skills listing
