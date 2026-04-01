@@ -645,10 +645,10 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.quant_config,
                 self.kv_cache_manager,
+                num_contexts,
+                num_generations,
+                num_ctx_tokens,
                 global_layer_idx=self.global_layer_idx,
-                num_contexts=num_contexts,
-                num_generations=num_generations,
-                num_ctx_tokens=num_ctx_tokens,
             )
         else:
             thop.attention(
