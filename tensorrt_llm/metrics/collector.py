@@ -15,7 +15,7 @@
 """Utilities for Prometheus Metrics Collection."""
 
 import time
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 from .enums import MetricNames
 
@@ -329,10 +329,10 @@ class MetricsCollector:
             labelnames=self.labels.keys())
 
     def log_config_info(self,
-                        model_config: Dict[str, str] = None,
-                        parallel_config: Dict[str, str] = None,
-                        speculative_config: Dict[str, str] = None,
-                        cache_config: Dict[str, str] = None) -> None:
+                        model_config: Optional[Dict[str, str]] = None,
+                        parallel_config: Optional[Dict[str, str]] = None,
+                        speculative_config: Optional[Dict[str, str]] = None,
+                        cache_config: Optional[Dict[str, str]] = None) -> None:
         """
         Log static configuration as Prometheus info-style gauges (set to 1 with config labels).
 
