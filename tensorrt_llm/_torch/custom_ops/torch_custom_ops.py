@@ -20,7 +20,8 @@ from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, fp4_scale_infer_shape,
+from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+                     fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -1449,14 +1450,7 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-def deep_gemm_gen_tuning_buckets(x: int):
-    buckets = tuple(range(8, 128, 8))
-    # Clamp x to be between 4096 and 8192.
-    if x >= 128:
-        x = min(x, 8192)
-        x = max(x, 4096)
-        buckets += tuple(range(128, x, 128))
-    return buckets
+# deep_gemm_gen_tuning_buckets is imported from ..utils
 
 
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
