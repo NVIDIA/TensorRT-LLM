@@ -11,7 +11,6 @@ install_triton_deps() {
       libxml2-dev \
       libre2-dev \
       libnuma-dev \
-      python3-build \
       libb64-dev \
       libarchive-dev \
       datacenter-gpu-manager-4-cuda${CUDA_VER} \

@@ -1,5 +1,11 @@
 # Arctic
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a [Arctic](https://huggingface.co/Snowflake/snowflake-arctic-instruct) model in TensorRT-LLM.
 
 The TensorRT LLM Arctic implementation is based on the LLaMA model, with Mixture of Experts (MoE) enabled. The implementation can
