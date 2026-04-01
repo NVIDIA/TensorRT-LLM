@@ -2854,7 +2854,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                                   enable_padding=True, max_batch_size=1024),
                               moe_config=MoeConfig(backend="TRTLLM"))
 
-        mtp_config = MTPDecodingConfig()
+        mtp_config = MTPDecodingConfig(max_draft_len=1)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
                  tensor_parallel_size=8,
                  pipeline_parallel_size=1,
@@ -6596,7 +6596,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="CUTLASS"),
-                decoding_config=mtp_config,
+                speculative_config=mtp_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,

@@ -226,7 +226,9 @@ class ServerConfig:
         # MTP user config migrated from num_nextn_predict_layers to max_draft_len.
         # Keep both DB field names populated for perf/baseline compatibility while
         # the surrounding reporting pipeline transitions to l_max_draft_len.
-        self.max_draft_len = speculative_config.get("max_draft_len", 0)
+        self.max_draft_len = speculative_config.get(
+            "max_draft_len", speculative_config.get("num_nextn_predict_layers", 0)
+        )
         eagle3_value = speculative_config.get("eagle3_layers_to_capture", [])
         if isinstance(eagle3_value, int):
             self.eagle3_layers_to_capture = [eagle3_value]

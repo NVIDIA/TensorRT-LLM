@@ -1449,6 +1449,8 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # with the actual num_nextn_predict_layers from the model.
         if self.max_draft_len is None:
             self.max_draft_len = 1
+        elif self.max_draft_len <= 0:
+            raise ValueError("max_draft_len must be > 0 for MTP")
         self.max_total_draft_tokens = self.max_draft_len  # Current MTP only supports linear tree
         return self
 
@@ -1463,11 +1465,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
-    @functools.cached_property
+    @property
     def num_capture_layers(self) -> int:
-        if not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
-            return 1
-        return 0
+        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
 
     @property
     def spec_dec_mode(self):
