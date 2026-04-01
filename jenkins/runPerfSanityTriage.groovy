@@ -84,12 +84,6 @@ def runPerfTriageBot() {
         Utils.exec(this, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
         // Create workspace on the login node
-        // GB200 clusters use svc_tensorrt's home; B200 clusters use the Jenkins agent workspace
-        // def isGB200 = params.CLUSTER?.contains("gb200")
-        // def workspace = isGB200
-        //     ? "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
-        //     : "/home/jenkins/agent/workspace/LLM/TRTLLM-Perf/PerfSanityTriage/perf-triage-bot-${env.BUILD_TAG}"
-
         def workspace = "/home/svc_tensorrt/bloom/agent-run/perf-triage-bot-${env.BUILD_TAG}"
         Utils.exec(this, script: Utils.sshUserCmd(remote, "\"mkdir -p ${workspace}\""), numRetries: 3)
         Utils.exec(this, script: Utils.sshUserCmd(remote,
@@ -221,7 +215,19 @@ echo "\${SKILLS_LIST}" >> ${systemPromptFile}
 echo "" >> ${systemPromptFile}
 echo "Start by reading PIPELINE.md to understand the overall workflow." >> ${systemPromptFile}
 
+# Run claude_cli.py — do not let its exit code fail the pipeline.
+# The agent may encounter errors (e.g. SLURM failures) that it should
+# handle and retry autonomously. Even if it ultimately fails, the
+# pipeline should still succeed so that context is preserved for
+# follow-up runs.
+set +e +o pipefail
 ANTHROPIC_BASE_URL=https://inference-api.nvidia.com ANTHROPIC_AUTH_TOKEN=${authToken} python3 claude_cli.py -p "${escapedPrompt}" --system-prompt-file ${systemPromptFile} --allowed-paths ${workspace} --model aws/anthropic/bedrock-claude-opus-4-6 --max-turns 500 --save-context ${contextFile} ${restoreContextArg} 2>${workspace}/claude-stderr.log | tee ${workspace}/claude-output.log
+CLAUDE_EXIT=\$?
+set -e -o pipefail
+
+if [ \$CLAUDE_EXIT -ne 0 ]; then
+    echo "WARNING: claude_cli.py exited with code \$CLAUDE_EXIT (see claude-stderr.log for details)"
+fi
 """
         def runScriptBase64 = runScriptContent.bytes.encodeBase64().toString()
         Utils.exec(this, timeout: false, script: Utils.sshUserCmd(remote,
