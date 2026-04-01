@@ -133,39 +133,30 @@ pip install anthropic
             restoreContextArg = "--restore-context ${contextFile}"
         }
 
-        // Validate required structured parameters
-        if (!params.TEST_NAME?.trim()) {
-            error("TEST_NAME is required.")
-        }
-        if (!params.GOOD_COMMIT?.trim() || !params.GOOD_COMMIT.contains("@")) {
-            error("GOOD_COMMIT is required and must be in format branch@hash (e.g., main@abc1234).")
-        }
-        if (!params.BAD_COMMIT?.trim() || !params.BAD_COMMIT.contains("@")) {
-            error("BAD_COMMIT is required and must be in format branch@hash (e.g., main@def5678).")
-        }
-
-        // Parse commit parameters
-        def goodParts = params.GOOD_COMMIT.split("@", 2)
-        def badParts = params.BAD_COMMIT.split("@", 2)
-        def goodBranch = goodParts[0]
-        def goodHash = goodParts[1]
-        def badBranch = badParts[0]
-        def badHash = badParts[1]
-
         // Construct structured agent prompt from typed parameters
         def promptLines = [
             "Bug Type: ${params.BUG_TYPE}",
             "GPU & Cluster: ${params.CLUSTER}",
-            "Metric: ${params.PERF_METRIC}",
-            "",
-            "Good commit: ${goodHash} (branch: ${goodBranch})",
         ]
-        if (params.GOOD_PERF_VALUE?.trim()) {
-            promptLines << "  Reported perf: ${params.GOOD_PERF_VALUE}"
+        if (params.PERF_METRIC?.trim()) {
+            promptLines << "Metric: ${params.PERF_METRIC}"
         }
-        promptLines << "Bad commit: ${badHash} (branch: ${badBranch})"
+        promptLines << ""
+        promptLines << "Bad commit: ${params.BAD_COMMIT}"
+        if (params.BAD_BRANCH?.trim()) {
+            promptLines << "  Branch: ${params.BAD_BRANCH}"
+        }
         if (params.BAD_PERF_VALUE?.trim()) {
             promptLines << "  Reported perf: ${params.BAD_PERF_VALUE}"
+        }
+        if (params.GOOD_COMMIT?.trim()) {
+            promptLines << "Good commit: ${params.GOOD_COMMIT}"
+            if (params.GOOD_BRANCH?.trim()) {
+                promptLines << "  Branch: ${params.GOOD_BRANCH}"
+            }
+            if (params.GOOD_PERF_VALUE?.trim()) {
+                promptLines << "  Reported perf: ${params.GOOD_PERF_VALUE}"
+            }
         }
         promptLines << ""
         promptLines << "Test name: ${params.TEST_NAME}"
@@ -188,7 +179,7 @@ cd ${botDir}
 # Generate system prompt with dynamic skills listing
 SKILLS_LIST=\$(ls -1 ${skillsDir}/*.md 2>/dev/null | xargs -I{} basename {} | sed 's/^/  - /' || echo "  (none)")
 cat > ${systemPromptFile} <<'SYSPROMPT_HEADER'
-You are an autonomous AI agent for triaging TensorRT-LLM performance regressions.
+You are an autonomous AI agent for triaging TRTLLM Perf or Functional Issue.
 You have access to the following tools: bash, read_file, write_file, edit_file, glob_files, grep_search.
 
 ## Tool Usage Guidelines
@@ -261,12 +252,14 @@ pipeline {
         string(name: "QUERY_JOB_NUMBER", defaultValue: "1", description: "Number of latest jobs to query. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
         string(name: "SLACK_CHANNEL_ID", defaultValue: "C0A7D0LCA1F", description: "Slack channel IDs to send messages to. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
         string(name: "SLACK_BOT_TOKEN", defaultValue: "", description: "Slack bot token for authentication. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        string(name: "CLUSTER", defaultValue: "auto:gb200-flex", description: "Cluster to run perf triage bot on: auto:gb200-flex or auto:dgx-b200-flex. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        choice(name: "BUG_TYPE", choices: ["Perf Regression", "Perf Improvement", "Perf Instability"], description: "Type of performance bug. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        choice(name: "PERF_METRIC", choices: ["output_token_throughput", "total_token_throughput", "e2e_latency", "e2e_runtime"], description: "The metric that regressed or fluctuates. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "TEST_NAME", defaultValue: "", description: "CI perf sanity test name (e.g., k2_thinking_fp4_tep8_32k8k-con2_iter10_32k8k) or full pytest ID. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "GOOD_COMMIT", defaultValue: "", description: "Good perf commit in format branch@hash (e.g., main@abc1234). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
-        string(name: "BAD_COMMIT", defaultValue: "", description: "Bad perf commit in format branch@hash (e.g., main@def5678). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        choice(name: "CLUSTER", choices: ["auto:gb200-flex", "auto:dgx-b200-flex"], description: "Cluster to run perf triage bot on. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        choice(name: "BUG_TYPE", choices: ["Perf Regression", "Perf Improvement", "Perf Instability", "Functional Failure"], description: "Type of bug. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        string(name: "PERF_METRIC", defaultValue: "", description: "Optional: the metric that regressed or fluctuates (e.g., output_token_throughput, total_token_throughput, e2e_latency, e2e_runtime). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        string(name: "TEST_NAME", defaultValue: "", description: "Required: CI perf sanity test name (e.g., k2_thinking_fp4_tep8_32k8k-con2_iter10_32k8k) or full pytest ID. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        string(name: "BAD_COMMIT", defaultValue: "", description: "Required: bad commit hash (e.g., def5678). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        string(name: "BAD_BRANCH", defaultValue: "", description: "Optional: branch for bad commit (e.g., main). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        string(name: "GOOD_COMMIT", defaultValue: "", description: "Optional: good commit hash (e.g., abc1234). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
+        string(name: "GOOD_BRANCH", defaultValue: "", description: "Optional: branch for good commit (e.g., main). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
         string(name: "GOOD_PERF_VALUE", defaultValue: "", description: "Optional: good perf value (e.g., 1186.43). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
         string(name: "BAD_PERF_VALUE", defaultValue: "", description: "Optional: bad perf value (e.g., 1085.13). (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
         text(name: "ADDITIONAL_CONTEXT", defaultValue: "", description: "Optional: any extra context or notes for the agent. (Only used when OPERATION is TRTLLM PERF TRIAGE BOT)")
