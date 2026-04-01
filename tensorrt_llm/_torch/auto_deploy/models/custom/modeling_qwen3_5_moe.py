@@ -2915,4 +2915,7 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
 AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
+AutoModelForCausalLMFactory.register_custom_model_cls(
+    "Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration
+)
 Qwen3_5MoeFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration)
