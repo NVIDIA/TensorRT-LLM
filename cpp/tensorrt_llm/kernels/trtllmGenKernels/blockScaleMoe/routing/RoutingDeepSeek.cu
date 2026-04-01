@@ -48,7 +48,9 @@ namespace routingDeepSeek
 static constexpr int NumNemotronExperts = 512;
 static constexpr int NumKimiK2Experts = 384;
 static constexpr int NumDeepseekExperts = 256;
-static constexpr int MaxSupportedExpertCount = std::max({NumNemotronExperts, NumKimiK2Experts, NumDeepseekExperts});
+static constexpr int NumExperts1024Experts = 1024;
+static constexpr int MaxSupportedExpertCount
+    = std::max({NumExperts1024Experts, NumNemotronExperts, NumKimiK2Experts, NumDeepseekExperts});
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopGroups = 4;
 static constexpr int MaxNumGroups = 8;
@@ -76,6 +78,10 @@ int constexpr getMaxNumExperts(int32_t numExperts)
     else if (numExperts <= NumNemotronExperts)
     {
         return NumNemotronExperts;
+    }
+    else if (numExperts <= NumExperts1024Experts)
+    {
+        return NumExperts1024Experts;
     }
     else
     {
@@ -125,6 +131,11 @@ int constexpr getMaxNumExperts(int32_t numExperts)
     {                                                                                                                  \
         LAUNCH_DEEPSEEK_WITH_TOPK(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1,       \
             forceFloatInput, NumNemotronExperts);                                                                      \
+    }                                                                                                                  \
+    else if (data.mNumExperts <= NumExperts1024Experts)                                                                \
+    {                                                                                                                  \
+        LAUNCH_DEEPSEEK_WITH_TOPK(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1,       \
+            forceFloatInput, NumExperts1024Experts);                                                                   \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \

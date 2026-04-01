@@ -691,7 +691,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params)
 
 void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream)
 {
-    int32_t const maxExperts = getMaxNumExperts(data.mNumExperts);
+    int32_t const maxExperts = queryDispatchedMaxExperts(data);
     int const numSlots = data.mNumTokens * maxExperts;
     int const smemSize
         = numSlots + numSlots * 2 + 128 + 2 * (maxExperts / WarpSize) * static_cast<int>(sizeof(int32_t));
