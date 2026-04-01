@@ -147,12 +147,7 @@ class ModelFactory(ABC):
     @property
     @abstractmethod
     def max_seq_len(self) -> int:
-        """The maximum sequence length.
-
-        Subclasses must implement this property. When `max_seq_len` was not explicitly provided
-        at construction time, the implementation should attempt to infer the value from the model
-        configuration and raise `ValueError` if that is not possible.
-        """
+        """The maximum sequence length."""
 
     @property
     def vocab_size_padded(self) -> Optional[int]:

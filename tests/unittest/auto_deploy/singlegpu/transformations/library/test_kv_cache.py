@@ -44,6 +44,10 @@ class DummyFactory(ModelFactory):
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
 
+    @property
+    def max_seq_len(self) -> int:
+        return 512
+
 
 # Class that uses SDPA directly instead of the regular attention mechanism
 class GQAWithSdpaAndEmbedding(GQA):

@@ -4,11 +4,30 @@ import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
+    _GlobalFlashInferPlanner,
+)
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
 # When a run uses FP8 block scaling GEMM on a GPU that doesn't support it, skip only that run.
 _FP8_BLOCK_SCALING_GEMM_ERR = "Unsupported SM version for FP8 block scaling GEMM"
+
+
+@pytest.fixture(autouse=True)
+def _reset_flashinfer_planner():
+    """Reset the global FlashInfer planner between tests.
+
+    The planner is a module-level singleton whose CUDA graph decode wrappers persist across
+    tests. Without this reset, stale wrappers from a previous test (with different KV cache
+    sizes) can cause buffer-size mismatches in subsequent tests.
+
+    Setting workspace_buffer to None forces a full re-init (including clearing
+    cached_cuda_graph_decode_wrappers) on the next reset() call.
+    """
+    _GlobalFlashInferPlanner.workspace_buffer = None
+    _GlobalFlashInferPlanner.cached_cuda_graph_decode_wrappers = {}
+    yield
 
 
 def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):

@@ -300,18 +300,26 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def max_batch_size_must_be_at_least_that_of_cuda_graph_config(self):
-        """If provided, the top-level `max_batch_size` must be at least that of cuda graph config."""
-        if (
-            self.cuda_graph_config is not None
-            and (cg_mbs := self.cuda_graph_config.max_batch_size)
-            and "compile_model" in self.transforms
-        ):
-            if self.max_batch_size < cg_mbs:
-                raise ValueError(
-                    f"The top-level `max_batch_size` ({self.max_batch_size}) must be greater than "
-                    f"or equal to `cuda_graph_config.max_batch_size` ({cg_mbs})."
-                )
+    def sync_cuda_graph_batch_sizes_to_compile_config(self):
+        """Propagate cuda_graph_config.batch_sizes into compile_model transform config.
+
+        The parent class CudaGraphConfig computes batch_sizes (with heuristic if needed),
+        but the compile_model transform has its own cuda_graph_batch_sizes field that must
+        be kept in sync.
+        """
+        cg = self.cuda_graph_config
+        if cg is None or "compile_model" not in self.transforms:
+            return self
+
+        if cg.max_batch_size > self.max_batch_size:
+            raise ValueError(
+                f"The top-level `max_batch_size` ({self.max_batch_size}) must be greater than "
+                f"or equal to `cuda_graph_config.max_batch_size` ({cg.max_batch_size})."
+            )
+
+        if cg.batch_sizes:
+            self.transforms["compile_model"]["cuda_graph_batch_sizes"] = cg.batch_sizes
+
         return self
 
     @model_validator(mode="after")
