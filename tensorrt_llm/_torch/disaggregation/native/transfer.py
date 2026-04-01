@@ -623,6 +623,8 @@ class Sender(SenderBase):
         self._messenger.start_listener(handle_message)
 
     def _register_peer_rank(self, _send_id: bytes, message: list[bytes]):
+        torch.cuda.set_device(self._device_id)
+        CUASSERT(cudart.cudaSetDevice(self._device_id))
         ri: RankInfo = RankInfo.from_bytes(message[1])
 
         self._registrar.register(ri.instance_name, ri.instance_rank, ri)
@@ -1401,6 +1403,8 @@ class TransferWorker:
         if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
             nixl_agent_kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
 
+        torch.cuda.set_device(device_id)
+        CUASSERT(cudart.cudaSetDevice(device_id))
         self._agent = NixlTransferAgent(
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             True,
