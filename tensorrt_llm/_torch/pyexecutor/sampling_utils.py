@@ -477,52 +477,64 @@ def sample(
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
     softmax: torch.Tensor | None
-    # 'cast' needed b/c of https://github.com/python/mypy/issues/19081
-    match strategy:
-        case ("top_k", top_k, temperature):
-            tokens, softmax = top_k_sampling_batch(
-                logits,
-                top_k=cast(int, top_k),
-                temperature=cast(float, temperature),
-                generator=generator,
-            )
-        case ("top_p", top_p, temperature):
-            tokens, softmax = top_p_sampling_batch(
-                logits,
-                top_p=cast(float, top_p),
-                generator=generator,
-                temperature=cast(float, temperature),
-            )
-        case ("top_k_top_p", top_k, top_p, temperature):
-            tokens, softmax = top_k_top_p_sampling_batch(
-                logits,
-                top_k=cast(int, top_k),
-                top_p=cast(float, top_p),
-                temperature=cast(float, temperature),
-                generator=generator,
-            )
-        case ("temperature", temperature):
-            tokens, softmax = temperature_sampling_batch(
-                logits,
-                temperature=cast(float, temperature),
-                generator=generator,
-            )
-        case ("greedy", None):
-            tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
-            temperature = None
-        case ("beam_search", beam_width_in, beam_width_out, temperature):
-            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
-                "BeamSearchMetadata is required for beam_search_sampling_batch"
-            )
-            tokens, softmax = beam_search_sampling_batch(
-                logits,
-                beam_width_in=cast(int, beam_width_in),
-                beam_width_out=cast(int, beam_width_out),
-                beam_search_args=group_metadata,
-                temperature=cast(float, temperature),
-                return_probs=return_probs,
-            )
-    return tokens, softmax, cast(float, temperature)
+    temperature_out: float | None = None
+    tag = strategy[0]
+    if tag == "top_k":
+        sk = cast(TopK, strategy)
+        tokens, softmax = top_k_sampling_batch(
+            logits,
+            top_k=sk[1],
+            temperature=sk[2],
+            generator=generator,
+        )
+        temperature_out = sk[2]
+    elif tag == "top_p":
+        sp = cast(TopP, strategy)
+        tokens, softmax = top_p_sampling_batch(
+            logits,
+            top_p=sp[1],
+            generator=generator,
+            temperature=sp[2],
+        )
+        temperature_out = sp[2]
+    elif tag == "top_k_top_p":
+        skp = cast(TopKTopP, strategy)
+        tokens, softmax = top_k_top_p_sampling_batch(
+            logits,
+            top_k=skp[1],
+            top_p=skp[2],
+            temperature=skp[3],
+            generator=generator,
+        )
+        temperature_out = skp[3]
+    elif tag == "temperature":
+        st = cast(TemperatureOnly, strategy)
+        tokens, softmax = temperature_sampling_batch(
+            logits,
+            temperature=st[1],
+            generator=generator,
+        )
+        temperature_out = st[1]
+    elif tag == "greedy":
+        tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
+        temperature_out = None
+    elif tag == "beam_search":
+        sb = cast(BeamSearch, strategy)
+        assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
+            "BeamSearchMetadata is required for beam_search_sampling_batch"
+        )
+        tokens, softmax = beam_search_sampling_batch(
+            logits,
+            beam_width_in=sb[1],
+            beam_width_out=sb[2],
+            beam_search_args=group_metadata,
+            temperature=sb[3],
+            return_probs=return_probs,
+        )
+        temperature_out = sb[3]
+    else:
+        raise ValueError(f"Unknown sampling strategy: {tag}")
+    return tokens, softmax, temperature_out
 
 
 GenericStrategyKeyType = TypeVar("GenericStrategyKeyType", bound=Hashable)

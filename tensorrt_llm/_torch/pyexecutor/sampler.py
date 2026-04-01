@@ -289,8 +289,8 @@ class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors
     data: MultimodalResult
 
 
-@dataclass(kw_only=True, frozen=True, slots=True)
-class RequestGroupKey(Generic[GenericStrategyKeyType]):  # type: ignore[misc]
+@dataclass(kw_only=True, frozen=True)
+class RequestGroupKey(Generic[GenericStrategyKeyType]):
     strategy_key: GenericStrategyKeyType
     needs_probs: bool
 
