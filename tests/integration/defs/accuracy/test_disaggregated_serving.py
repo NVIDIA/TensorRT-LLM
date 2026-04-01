@@ -778,54 +778,61 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_eagle3(self, backend: str,
                                          eagle3_one_model: bool, mocker):
-        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        speculative_decoding_config = {
-            "decoding_type": "Eagle",
-            "max_draft_len": 3,
-            "speculative_model":
-            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": eagle3_one_model
-        }
+        import gc
 
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-            "guided_decoding_backend": backend,
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
+        import torch
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        try:
+            speculative_decoding_config = {
+                "decoding_type": "Eagle",
+                "max_draft_len": 3,
+                "speculative_model":
+                f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+                "eagle3_one_model": eagle3_one_model
             }
-        }
-        gen_server_config = {
-            # Two-model eagle3 does not support overlap scheduler
-            "disable_overlap_scheduler": not eagle3_one_model,
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-            "guided_decoding_backend": backend,
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
+
+            ctx_server_config = {
+                "disable_overlap_scheduler": True,
+                "speculative_config": speculative_decoding_config,
+                "kv_cache_config": {
+                    "free_gpu_memory_fraction": 0.8,
+                },
+                "guided_decoding_backend": backend,
+                "cache_transceiver_config": {
+                    "backend": "DEFAULT",
+                    "max_tokens_in_buffer": 4096
+                }
             }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
+            gen_server_config = {
+                # Two-model eagle3 does not support overlap scheduler
+                "disable_overlap_scheduler": not eagle3_one_model,
+                "speculative_config": speculative_decoding_config,
+                "kv_cache_config": {
+                    "free_gpu_memory_fraction": 0.8,
+                },
+                "guided_decoding_backend": backend,
+                "cache_transceiver_config": {
+                    "backend": "DEFAULT",
+                    "max_tokens_in_buffer": 4096
+                }
             }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["JsonModeEval"])
+            disaggregated_server_config = {
+                "hostname": "localhost",
+                "backend": "pytorch",
+                "context_servers": {
+                    "num_instances": 1
+                },
+                "generation_servers": {
+                    "num_instances": 1
+                }
+            }
+            with launch_disaggregated_llm(disaggregated_server_config,
+                                          ctx_server_config, gen_server_config,
+                                          self.MODEL_PATH) as llm:
+                run_accuracy_test(llm, self.MODEL_NAME, ["JsonModeEval"])
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
 
     @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
                              ids=["tp1pp2", "tp2pp1", "tp2pp2"])
