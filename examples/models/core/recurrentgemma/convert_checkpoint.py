@@ -19,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import (numpy_to_torch, str_dtype_to_torch,
                                  torch_to_numpy)
 
@@ -454,6 +455,7 @@ def convert(worker_rank, args, convert_kwargs):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
 
     args = parse_arguments()

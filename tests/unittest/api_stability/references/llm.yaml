@@ -122,7 +122,7 @@ methods:
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
-        status: beta
+        status: deprecated
       sampler_force_async_worker:
         annotation: bool
         default: False
@@ -266,6 +266,10 @@ methods:
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
+      priority:
+        annotation: Union[float, List[float]]
+        default: 0.5
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -285,6 +289,10 @@ methods:
       trace_headers:
         annotation: Optional[Mapping[str, str]]
         default: null
+        status: prototype
+      priority:
+        annotation: float
+        default: 0.5
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   preprocess:
