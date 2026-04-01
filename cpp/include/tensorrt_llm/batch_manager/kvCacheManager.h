@@ -986,6 +986,16 @@ private:
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
+    //! \brief Phase 1 (lock-free): Walk radix tree and claim matching blocks.
+    //! \details Caller must hold mCachedBlocksRootMutex.
+    [[nodiscard]] ClaimResult claimMatchingBlocks(
+        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
+
+    //! \brief Phase 2 (lock-free): Onboard claimed host blocks and allocate non-matching blocks.
+    //! \details Caller must hold mCachedBlocksRootMutex.
+    [[nodiscard]] SizeType32 onboardAndAllocateBlocks(
+        GenerationRequest& sequence, LlmRequest& llmRequest, ClaimResult& claimResult);
+
     //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
     void freeChildren(BlockPtr const& block);
 
