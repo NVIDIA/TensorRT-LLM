@@ -35,12 +35,19 @@ gantt
 | **0** | Minimal POC | `simulation_mode=True` -> TinyLlama completes with dummy tokens | **Done** |
 | **1** | Config + predictor interface | `SimConfig` Pydantic model, `InferTimePredictor` ABC, constant predictor | **Done** |
 | **2** | AIConfigurator integration | Real batch time predictions via AIC SDK | **Done** |
-| **3** | Simulated clock | `StateManager`, no `time.sleep()`, accumulate predicted times | Planned |
+| **3** | Simulated clock | `SimClock`, no `time.sleep()`, accumulate predicted times | **Done** |
+| **3.5** | Single-process mode | Force single-process executor for sim, fix clock visibility | Planned |
 | **4** | Metrics output | `metrics.json`, `request.jsonl`, `iteration.jsonl` from simulated clock | Planned |
 | **5** | CLI integration | `trtllm-bench --mode sim` and/or `trtllm-serve --sim` | Planned |
 | **6** | Multi-GPU / distributed | TP/EP/PP support via config | Planned |
 
 **Dropped**: Mock KV cache manager (GPU for KV cache is acceptable).
+
+**Long-term vision**: Deep-Sim (`slop/specs/2026-04-01-deep-sim-vision.md`) —
+replace AIC batch predictor with per-op timing hooks embedded in TRT-LLM ops.
+v1 (AIC-Sim) builds the serving sim infrastructure; Deep-Sim replaces only the
+prediction layer. Components designed for reusability: `SimClock`, `SimConfig`,
+`SimSampler`, single-process mode, metrics output, CLI integration.
 
 **Reordering rationale** (2026-03-31): Phases 3-6 were reordered from the original plan.
 Simulated clock (originally Phase 6) was pulled forward because `time.sleep()` pollutes
