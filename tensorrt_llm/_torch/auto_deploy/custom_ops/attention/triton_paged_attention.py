@@ -680,9 +680,10 @@ def _paged_context_kernel(
     for page_idx in range(num_full_pages):
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
 
-        # Use block pointer for potential TMA acceleration on H100
+        # Use int64 to avoid overflow when physical_page * stride > 2^31
+        page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
         k_block_ptr = tl.make_block_ptr(
-            base=kv_cache_ptr + physical_page * cache_stride_block + kv_head_offset,
+            base=kv_cache_ptr + page_base,
             shape=(PAGE_SIZE, HEAD_DIM),
             strides=(cache_stride_token, 1),
             offsets=(0, 0),
@@ -690,10 +691,7 @@ def _paged_context_kernel(
             order=(1, 0),
         )
         v_block_ptr = tl.make_block_ptr(
-            base=kv_cache_ptr
-            + physical_page * cache_stride_block
-            + kv_head_offset
-            + cache_stride_kv,
+            base=kv_cache_ptr + page_base + cache_stride_kv,
             shape=(PAGE_SIZE, HEAD_DIM),
             strides=(cache_stride_token, 1),
             offsets=(0, 0),
@@ -729,7 +727,8 @@ def _paged_context_kernel(
             valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
             page_mask = page_offsets < valid_tokens
 
-            page_base = physical_page * cache_stride_block + kv_head_offset
+            # Use int64 to avoid overflow when physical_page * stride > 2^31
+            page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
             page_mask_2d = page_mask[:, None]
             k = tl.load(kv_cache_ptr + page_base + local_kv, mask=page_mask_2d, other=0.0)
             v = tl.load(
@@ -980,7 +979,7 @@ def prepare_triton_paged_metadata_fake(
     )
 
 
-@torch.library.custom_op("auto_deploy::triton_paged_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_paged_mha_with_cache", mutates_args=("kv_cache",))
 def triton_paged_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
