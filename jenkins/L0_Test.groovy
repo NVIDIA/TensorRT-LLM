@@ -1072,7 +1072,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     envVarsToExport[varName] = env."${varName}"
                 }
 
-                srunArgs = [
+                def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
                     "--container-workdir=$jobWorkspace",
