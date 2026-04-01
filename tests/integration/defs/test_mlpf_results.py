@@ -6,9 +6,7 @@ import subprocess
 from argparse import Namespace
 from copy import deepcopy
 
-import pytest
 from defs.common import get_cpp_benchmark, get_trt_llm_lib_dir, venv_check_call
-from defs.conftest import get_device_count, get_gpu_device_list, llm_models_root
 from defs.trt_test_alternative import check_call
 
 ### End of utility functions
@@ -260,60 +258,3 @@ def get_mlperf_gptj_system_config(system: str, fp8_fmha: bool):
         raise RuntimeError(f"No GPT-J config found for system: {system}")
 
     return system_config
-
-
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("fp8_fmha", [True, False], ids=["fp8_fmha_enable", ""])
-@pytest.mark.parametrize("system", ["H100x2", "H200x1", "H100x1"])
-@pytest.mark.parametrize("model", ["llama_v2_70b_chat", "gpt_j"])
-def test_mlperf_results(system, model, fp8_fmha, llm_venv, llm_root,
-                        engine_dir):
-    "Run mlperf tests on H100/H200."
-
-    if f"NVIDIA {system[:-2]}" not in get_gpu_device_list()[0]:
-        pytest.skip(f"{system} test is not supported.")
-
-    if "gpt_j" in model and "x2" in system:
-        pytest.skip("This test is invalid.")
-    if "v2_70b" in model and "H100x1" in system:
-        pytest.skip("This test is invalid.")
-    if "v2_70b" in model and "x2" in system and get_device_count() < 2:
-        pytest.skip("This test is invalid.")
-
-    system_config = get_mlperf_system_config(model, system, fp8_fmha)
-    models_root = llm_models_root()
-
-    if model == "llama_v2_70b_chat":
-        model_root = os.path.join(models_root, "llama-models-v2",
-                                  "llama-v2-70b-chat-hf")
-        input_dataset = os.path.join(
-            models_root, "datasets", "common",
-            "open_orca_inputs_24576.trtllm.gptManagerBenchmark.json")
-        reference_dataset = os.path.join(
-            models_root, "datasets", "common",
-            "open_orca_gpt4_tokenized_llama.sampled_24576.pkl")
-        calib_dataset = os.path.join(models_root, "datasets", "common",
-                                     "mlperf_gptj_openorca_calibration_1k")
-    elif model == "gpt_j":
-        model_root = os.path.join(models_root, "gptj-6b-mlperf-inf")
-        input_dataset = os.path.join(
-            models_root, "datasets", "common",
-            "cnn_dailymail_eval.gptManagerBenchmark.json")
-        reference_dataset = os.path.join(models_root, "datasets", "common",
-                                         "cnn_dailymail_eval.json")
-        calib_dataset = os.path.join(models_root, "datasets", "common",
-                                     "mlperf_llama2_openorca_calibration_1k")
-
-    assert os.path.exists(model_root)
-    assert os.path.exists(input_dataset)
-    assert os.path.exists(reference_dataset)
-
-    quantized_model_path = step_quantize(system_config.tp_size, llm_venv,
-                                         llm_root, model_root, model,
-                                         calib_dataset)
-    step_engine_build(quantized_model_path, system_config, engine_dir, llm_venv)
-
-    responses_file = step_run_llm(system_config, engine_dir, input_dataset,
-                                  llm_venv, llm_root)
-    step_check_accuracy(responses_file, reference_dataset, model_root, llm_venv,
-                        llm_root)

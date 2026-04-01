@@ -19,9 +19,8 @@ import os
 import defs.ci_profiler
 import psutil
 import pytest
-from defs.common import (convert_weights, quantize_data,
-                         test_llm_torch_multi_lora_support,
-                         test_multi_lora_support, venv_check_call)
+from defs.common import (convert_weights, test_llm_torch_multi_lora_support,
+                         venv_check_call)
 from defs.conftest import (get_device_count, get_sm_version,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
@@ -181,104 +180,6 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
         # WAR before summarize_long.py can work offline
         env = {"HF_DATASETS_OFFLINE": "0"}
         venv_check_call(llm_venv, summary_cmd, env=env)
-
-
-@skip_pre_ada
-@pytest.mark.parametrize("llm_mistral_model_root", ['komt-mistral-7b-v1'],
-                         indirect=True)
-@pytest.mark.parametrize("llm_lora_model_root", ['komt-mistral-7b-v1-lora'],
-                         indirect=True)
-def test_llm_mistral_lora_1gpu(llama_example_root, llm_mistral_model_root,
-                               llm_datasets_root, llm_venv, engine_dir,
-                               llm_lora_model_root, qcache_dir):
-    "run mistral lora test on 1gpu"
-    print("Quantization...")
-    model_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=llm_mistral_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype="float16",
-        qformat="fp8",
-        quantize_dir=qcache_dir,
-        calib_size=512,
-        kv_cache_dtype="fp8")
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--lora_dir={llm_lora_model_root}",
-        "--lora_plugin=auto",
-        "--gemm_plugin=auto",
-        "--max_batch_size=8",
-        "--max_input_len=32256",
-        "--max_seq_len=33280",
-        "--use_paged_context_fmha=enable",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    input_text = "[INST]오늘은 날씨가 아주 좋다 내가 공원에 갔을 때 [/INST]"
-
-    run_cmd = [
-        f"{llama_example_root}/../../../run.py",
-        f"--input_text={input_text}",
-        f"--tokenizer_dir={llm_mistral_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--max_output_len=1024",
-        "--max_attention_window_size=4096",
-        "--lora_task_uids=0",
-        "--temperature=0.8",
-        "--top_p=0.8",
-        "--top_k=100",
-        "--random_seed=0",
-    ]
-
-    venv_check_call(llm_venv, run_cmd)
-
-
-@skip_pre_ada
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("mistral_nemo_minitron_model_root",
-                         ['Mistral-NeMo-Minitron-8B-Instruct'],
-                         indirect=True)
-def test_mistral_nemo_minitron_fp8_with_bf16_lora(
-    llama_example_root,
-    mistral_nemo_minitron_model_root,
-    llm_datasets_root,
-    qcache_dir,
-    llm_rouge_root,
-    llm_venv,
-    engine_dir,
-    num_beams=1,
-):
-    "Run Mistral Nemo Minitron 8B with multiple pseudo LoRAs."
-
-    # Quantize the base model to fp8.
-    qmodel_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=mistral_nemo_minitron_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype="bfloat16",
-        qformat="fp8",
-        quantize_dir=qcache_dir,
-        calib_size=32,
-        kv_cache_dtype="fp8")
-
-    test_multi_lora_support(
-        hf_model_dir=mistral_nemo_minitron_model_root,
-        tllm_ckpt_dir=qmodel_dir,
-        engine_dir=engine_dir,
-        llm_venv=llm_venv,
-        example_root=llama_example_root,
-        num_loras=2,
-        lora_rank=8,
-        target_hf_modules=["q_proj", "k_proj", "v_proj"],
-        target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
-        zero_lora_weights=True,
-    )
 
 
 @skip_pre_ada

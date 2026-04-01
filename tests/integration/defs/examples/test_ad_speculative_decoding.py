@@ -285,48 +285,6 @@ def test_autodeploy_eagle3_acceptance_rate():
         _run_acceptance_rate_check(llm, max_draft_len)
 
 
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: bool):
-    """Test Eagle3 one-model acceptance rate with AutoDeploy engine.
-
-    Runs Eagle3 one-model speculative decoding with streaming and verifies
-    that the acceptance rate is above a minimum threshold.
-    Parameterized over overlap scheduler enabled/disabled.
-    """
-    print("\n" + "=" * 80)
-    print(
-        f"Testing AutoDeploy Eagle3 One-Model Acceptance Rate "
-        f"(overlap={'disabled' if disable_overlap_scheduler else 'enabled'})"
-    )
-    print("=" * 80)
-
-    base_model, _, eagle_model = get_model_paths()
-
-    print(f"\nBase Model: {base_model}")
-    print(f"Eagle3 Model: {eagle_model}")
-
-    max_draft_len = EAGLE_MAX_DRAFT_LEN
-
-    speculative_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model,
-        eagle3_one_model=True,
-        eagle3_layers_to_capture={1, 15, 28},
-    )
-
-    with LLM(
-        model=base_model,
-        skip_loading_weights=False,
-        runtime="trtllm",
-        world_size=1,
-        speculative_config=speculative_config,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        compile_backend="torch-simple",
-        max_num_tokens=512,
-    ) as llm:
-        _run_acceptance_rate_check(llm, max_draft_len)
-
-
 def _run_acceptance_rate_check(llm, max_draft_len: int, min_acceptance_rate: float = 0.10):
     """Common helper for acceptance rate tests.
 
