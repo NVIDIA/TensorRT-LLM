@@ -13,7 +13,8 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor)
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import AlltoallMethodType, MoE
 from .ops import MoEOp, MoEOpSelector
@@ -61,6 +62,7 @@ class WideEPMoE(MoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
         super().__init__(
@@ -74,6 +76,7 @@ class WideEPMoE(MoE):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
+            activation_type=activation_type,
         )
 
         assert self.use_dp, "Attention DP should be used with WideEP."

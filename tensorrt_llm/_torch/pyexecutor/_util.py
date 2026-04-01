@@ -1430,9 +1430,10 @@ def instantiate_sampler(
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if llm_args.sampler_type == SamplerType.TRTLLMSampler or (
-            llm_args.sampler_type == SamplerType.auto
-            and decoding_mode.isBeamSearch()):
+    if llm_args.sampler_type == SamplerType.TRTLLMSampler:
+        logger.warning(
+            "TRTLLMSampler is deprecated and will be removed in release 1.4. Please use TorchSampler instead."
+        )
         logger.debug(f"DecodingMode: {decoding_mode.name}")
         return TRTLLMSampler(engine.model,
                              engine.dtype,

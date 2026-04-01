@@ -18,6 +18,7 @@ from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
                           Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
@@ -1840,6 +1841,7 @@ def convert(worker_rank, world_size, args, model_config, convert_args,
 
 
 if __name__ == "__main__":
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument(
