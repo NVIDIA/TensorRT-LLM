@@ -20,7 +20,7 @@ With these two goals in mind, the following sections are organized as follows. F
 **Open Deep Research** is an open-source deep research agent built on a multi-agent Planner-Executor architecture. The **Supervisor** serves as the Planner: it accepts user input, generates a research brief, and delegates tasks to the **Researcher**, which functions as an Executor. The Researcher receives a research topic, conducts multiple rounds of interaction with external search tools, then summarizes and compresses the findings before returning results. Once the Supervisor determines that sufficient information has been gathered, it synthesizes everything into a final report.
 
 <div align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog17_open_deep_research_workflow.png" alt="Workflow of Open Deep Research" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_open_deep_research_workflow.png" alt="Workflow of Open Deep Research" width="900px">
 </div>
 <p align="center"><sub><em>Figure 1. Workflow of Open Deep Research</em></sub></p>
 
@@ -48,7 +48,7 @@ class Supervisor(Controller):
                 break
             
             # Reflect or spawn sub-agents
-            research_tasks_list = [make_research_task(tool_call) for tool_call in research_planning_task.messages[-1].tool_calls:]
+            research_tasks_list = [make_research_task(tool_call) for tool_call in research_planning_task.messages[-1].tool_calls]
             
             yield ParallelProcess(researcher_controllers, research_tasks_list, kwargs_list)
 ```
@@ -209,7 +209,7 @@ We consider a serving instance with 32 concurrent agent jobs and 32 chatbot requ
 The average E2E latencies of normal agents, burst agents and chatbots are presented in the table below. 
 
 
-|              | **TRT-LLM**     | **TRT-LLM w/ AT** |
+|              | **TRT-LLM**     | **TRT-LLM w/ Agent Tree** |
 | ------------ | --------------- | ----------------- |
 | Normal Agent | 298.68 ± 19.79s | 344.70 ± 12.93s   |
 | Burst Agent  | 367.54 ± 24.61s | 407.12 ± 73.31s   |
@@ -221,7 +221,7 @@ When agent tree is enabled, the E2E latencies of chatbots are reduced by 28.2% a
 The effectiveness of agent tree in achieving performance isolation between chat tasks and agent tasks is demonstrated by the queuing delays during the agent burst period in the following figure. During the agent burst, agent tree reduces the average queuing delay of chat tasks from 18.3s to 1.3s, by 92.6%, to a similar level as prior to the agent burst (avg. 1.2s). Meanwhile, the average queuing delay of agents increases from 6.7s before the burst to 16.4s during the burst when agent tree is enabled, which is within our expectations since agent tree poses constraints on agent traffic in favor of performance isolation for chat tasks. 
 
 <div align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog17_queuing_delays.png" alt="Queuing Delays of Agent and Chatbot Tasks" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_queuing_delays.png" alt="Queuing Delays of Agent and Chatbot Tasks" width="900px">
 </div>
 <p align="center"><sub><em>Figure 2. Queuing Delays of Agent and Chatbot Tasks </em></sub></p>
 

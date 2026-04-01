@@ -22,6 +22,9 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 ## Tech Blogs
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
+* [04/01] Joint Optimization of Agent Applications and TensorRT-LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.md)
+
 * [03/16] Optimizing MoE Communication with One-Sided AlltoAll Over NVLink
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.md)
 
