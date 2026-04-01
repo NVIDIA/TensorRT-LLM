@@ -238,12 +238,18 @@ def _create_sim_py_executor(
     """
     from ._util import KvCacheCreator, create_py_executor_instance
     from ..attention_backend.interface import AttentionRuntimeFeatures
-    from ..distributed import Distributed
+    from .sim_distributed import SimDistributed
 
-    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    # Sim mode always skips KV cache estimation — we don't need precise
+    # sizing, and the estimation warmup triggers an executor shutdown/restart
+    # cycle that is unnecessary overhead for simulation.
+    skip_est = True
 
-    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    dist = Distributed.get(mapping)
+    # Use the mapping from config but force rank=0. In sim mode we run
+    # single-process; TP/PP are config parameters, not distributed runtime.
+    mapping = copy.deepcopy(llm_args.parallel_config.to_mapping())
+    mapping.rank = 0
+    dist = SimDistributed(mapping)
 
     # Load model config to get vocab_size and model-specific params
     config_kwargs = {
@@ -376,14 +382,8 @@ def _create_sim_py_executor(
     )
 
     if estimating_kv_cache:
-        kv_cache_creator.configure_kv_cache_capacity(py_executor)
-        # configure_kv_cache_capacity shuts down the executor after warmup,
-        # setting is_shutdown=True and deactivating the request queue. Reset
-        # both so start_worker can re-launch the loop. (The real path in
-        # create_py_executor recreates the executor; we reuse it.)
-        py_executor.is_shutdown = False
-        py_executor.executor_request_queue.active = True
-        py_executor.shutdown_event.clear()
+        logger.warning("[SimMode] KV cache estimation requested but skipped "
+                       "in sim mode")
 
     py_executor.start_worker()
     sim_config._clock = clock
