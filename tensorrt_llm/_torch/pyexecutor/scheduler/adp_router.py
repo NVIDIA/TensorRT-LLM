@@ -8,6 +8,11 @@ Protocol:
     1. Each rank builds its local RankState
     2. All ranks exchange RankState via allgather
     3. ADPRouter.route_requests() distributes new requests
+
+Includes:
+    - DefaultADPRouter: load-balanced min-heap routing
+    - KVCacheAwareADPRouter: cache-aware routing that factors in
+      prefix match length from the KV cache radix tree
 """
 
 from __future__ import annotations
@@ -53,13 +58,54 @@ class RankState:
 class ADPRouter(ABC):
     """Abstract interface for distributing new requests across ADP ranks.
 
+    This is an **instance-level** router: it distributes requests across the
+    DP ranks within a single instance (e.g., one mpirun job controlling 8 GPUs
+    that together form a single logical server).
+
+    In disaggregated serving architectures, a separate higher-level router
+    orchestrates traffic across multiple instances (e.g., routing between
+    prefill and decode instances). That cross-instance routing is outside
+    the scope of this class.
+
     Interface:
         Input:  list[RankState], list[Request]
         Output: dict[rank, list[Request]]
     """
 
+    needs_prefix_matches: bool = False
+
     def __init__(self, dist: Distributed):
         self.dist = dist
+
+    @classmethod
+    def create(
+        cls, dist: "Distributed", kv_cache_manager=None, attention_dp_config=None
+    ) -> "ADPRouter":
+        """Factory method to create the appropriate ADP router.
+
+        Args:
+            dist: Distributed communicator.
+            kv_cache_manager: KV cache manager instance (may be None).
+            attention_dp_config: AttentionDpConfig instance (may be None).
+
+        Returns:
+            A KVCacheAwareADPRouter if config requests it and the
+            kv_cache_manager has block reuse enabled; DefaultADPRouter
+            otherwise.
+        """
+        if (
+            attention_dp_config is not None
+            and attention_dp_config.enable_kv_cache_aware_routing
+            and kv_cache_manager is not None
+            and kv_cache_manager.enable_block_reuse
+        ):
+            return KVCacheAwareADPRouter(
+                dist=dist,
+                kv_cache_manager=kv_cache_manager,
+                load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
+            )
+
+        return DefaultADPRouter(dist=dist)
 
     @abstractmethod
     def create_rank_state(
@@ -272,3 +318,226 @@ class DefaultADPRouter(ADPRouter):
             all_ranks_new_requests[rank].extend(reqs)
 
         return all_ranks_new_requests
+
+
+class KVCacheAwareADPRouter(ADPRouter):
+    """KV cache-aware request router for attention data parallelism.
+
+    Routes requests considering both load balance and KV cache prefix match
+    length on each rank. When a request's prefix is already cached on a rank,
+    that rank is preferred to avoid redundant prefill computation.
+
+    Scoring: score(rank, request) = effective_tokens + β * normalized_load
+    where:
+        effective_tokens  = input_tokens - prefix_match_length
+        normalized_load   = rank_active_tokens / max(total_active_tokens, req_tokens) * req_tokens
+    Lower score = better rank.
+
+    The load term is normalized by the total active tokens across eligible
+    ranks (floored at req_tokens) so that both terms remain on the same
+    scale regardless of absolute load levels.
+
+    Requires a KV cache manager with enable_block_reuse=True.
+    Falls back to load-based routing when no cache hits exist.
+    """
+
+    needs_prefix_matches: bool = True
+
+    def __init__(self, dist: "Distributed", kv_cache_manager, load_balance_weight: float = 1.0):
+        super().__init__(dist)
+        self.kv_cache_manager = kv_cache_manager
+        self.load_balance_weight = load_balance_weight
+        self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+
+    def create_rank_state(
+        self,
+        active_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem],
+    ) -> RankState:
+        if self.dist.has_cp_helix:
+            num_active_tokens = sum(req.total_input_len_cp for req in active_requests)
+        else:
+            num_active_tokens = sum(req.py_orig_prompt_len for req in active_requests)
+        return RankState(
+            rank=self.dist.tp_rank,
+            num_active_requests=len(active_requests),
+            num_active_tokens=num_active_tokens,
+        )
+
+    def gather_prefix_matches(
+        self,
+        new_requests: list[RequestQueueItem],
+    ) -> None:
+        """Probe local radix tree for each new request, allgather across ranks.
+
+        Populates self._all_ranks_prefix_matches for use by route_requests.
+        Must be called after new_requests are available and before route_requests.
+        """
+        local_matches: list[int] = []
+        for req_item in new_requests:
+            req = req_item.request
+            if req is None:
+                local_matches.extend([req_item.id, 0])
+                continue
+            input_tokens = getattr(req, "input_token_ids", None) or []
+            probe_tokens = input_tokens[:-1] if len(input_tokens) > 1 else []
+            lora_config = getattr(req, "lora_config", None)
+            lora_task_id = lora_config.task_id if lora_config is not None else None
+            match_len = self.kv_cache_manager.probe_prefix_match_length(probe_tokens, lora_task_id)
+            local_matches.extend([req_item.id, match_len])
+
+        all_data = self.dist.tp_allgather(local_matches)
+
+        self._all_ranks_prefix_matches = []
+        for rank_data in all_data:
+            matches: Dict[int, int] = {}
+            for i in range(0, len(rank_data), 2):
+                req_id = rank_data[i]
+                matches[req_id] = rank_data[i + 1]
+            self._all_ranks_prefix_matches.append(matches)
+
+    def _score_rank(
+        self,
+        req_tokens: int,
+        match_len: int,
+        rank_active_tokens: float,
+        load_denom: float,
+    ) -> float:
+        """Score a candidate rank for a request (lower is better).
+
+        Args:
+            req_tokens: Total input tokens of the request.
+            match_len: Prefix match length on this rank's radix tree.
+            rank_active_tokens: Active tokens currently on this rank.
+            load_denom: Normalization denominator for the load term.
+
+        Returns:
+            Score combining cache miss cost and load penalty.
+        """
+        effective = req_tokens - match_len
+        normalized_load = rank_active_tokens / load_denom * req_tokens
+        return effective + self.load_balance_weight * normalized_load
+
+    @staticmethod
+    def _prefix_fingerprint(token_ids, num_tokens: int = 64) -> tuple:
+        """Return a hashable fingerprint from the first num_tokens tokens.
+
+        Requests sharing the same fingerprint likely belong to the same
+        conversation / prefix group and benefit from being routed to the
+        same rank.
+        """
+        if not token_ids:
+            return ()
+        return tuple(token_ids[:num_tokens])
+
+    def route_requests(
+        self,
+        all_rank_states: list[RankState],
+        new_requests: list[RequestQueueItem],
+        max_num_active_requests: int,
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        tp_size = len(all_rank_states)
+        all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
+            s.rank: [] for s in all_rank_states
+        }
+        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        all_ranks_num_active_tokens = [float(s.num_active_tokens) for s in all_rank_states]
+
+        def get_relax_value(req_item):
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            if scheduling_params is None:
+                return True
+            return scheduling_params.attention_dp_relax
+
+        sorted_requests = sorted(new_requests, key=get_relax_value)
+
+        remaining_unscheduled = []
+        for req_item in sorted_requests:
+            scheduled = False
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            if scheduling_params is not None:
+                target_dp_rank = scheduling_params.attention_dp_rank
+                if (
+                    target_dp_rank is not None
+                    and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+                ):
+                    all_ranks_num_active_requests[target_dp_rank] += 1
+                    scheduled = True
+                    all_ranks_new_requests[target_dp_rank].append(req_item)
+
+            if not scheduled:
+                remaining_unscheduled.append(req_item)
+
+        num_new_requests_all_ranks = len(remaining_unscheduled)
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        expected_num_active_requests = max(
+            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+            max(all_ranks_num_active_requests),
+        )
+
+        # --- Prefix-affinity sorting ---
+        # Sort by prefix fingerprint first (group related requests together),
+        # then by ISL descending within each group.  This ensures that when
+        # request A (conv X, turn 5) is routed to rank R, request B (conv X,
+        # turn 3) is processed next and the load tracker still favours rank R.
+        def _sort_key(req_item):
+            tokens = getattr(req_item.request, "input_token_ids", []) if req_item.request else []
+            fp = self._prefix_fingerprint(tokens)
+            # Negate length so longer requests come first within each group
+            return (fp, -len(tokens))
+
+        remaining_unscheduled = sorted(remaining_unscheduled, key=_sort_key)
+
+        eligible_ranks = [
+            rank
+            for rank in range(tp_size)
+            if all_ranks_num_active_requests[rank] < expected_num_active_requests
+        ]
+
+        prefix_matches = self._all_ranks_prefix_matches
+
+        for req_item in remaining_unscheduled:
+            if not eligible_ranks:
+                break
+
+            req_tokens = (
+                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
+            )
+            req_id = req_item.id
+
+            best_rank = eligible_ranks[0]
+            best_score = float("inf")
+
+            # --- Normalize load term ---
+            # Normalize each rank's active_tokens by the total load across all
+            # eligible ranks (floored to req_tokens to avoid dividing by ~0).
+            # This makes the load term scale-invariant: a rank carrying 2x the
+            # average load gets a normalized penalty of ~req_tokens regardless
+            # of whether total load is 100 tokens or 100 000 tokens.
+            # Using load_range (max-min) instead caused the penalty to blow up
+            # when all ranks were near-idle (small range, large relative fraction).
+            total_load = sum(all_ranks_num_active_tokens[r] for r in eligible_ranks)
+            load_denom = max(total_load, float(req_tokens))
+
+            for rank in eligible_ranks:
+                match_len = prefix_matches[rank].get(req_id, 0) if rank < len(prefix_matches) else 0
+                score = self._score_rank(
+                    req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
+                )
+                if score < best_score:
+                    best_score = score
+                    best_rank = rank
+
+            all_ranks_new_requests[best_rank].append(req_item)
+            all_ranks_num_active_requests[best_rank] += 1
+
+            match_len = (
+                prefix_matches[best_rank].get(req_id, 0) if best_rank < len(prefix_matches) else 0
+            )
+            effective_added = req_tokens - match_len
+            all_ranks_num_active_tokens[best_rank] += effective_added
+
+            if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
+                eligible_ranks.remove(best_rank)
+
+        return all_ranks_new_requests, expected_num_active_requests

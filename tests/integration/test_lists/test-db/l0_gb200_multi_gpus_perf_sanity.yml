@@ -21,8 +21,7 @@ l0_gb200_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_8k1k] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tep4_mtp3_8k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_8k1k]
-  # super-nvfp4 (AutoDeploy backend)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws4_1k1k] TIMEOUT (120)
+
 - condition:
     ranges:
       system_gpu_count:
@@ -95,5 +94,3 @@ l0_gb200_multi_gpus_perf_sanity:
   # qwen3-235b-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con1024_ctx1_tp1_gen1_dep8_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
-  # super-nvfp4 (AutoDeploy backend)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws4_1k1k] TIMEOUT (120)

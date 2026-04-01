@@ -1,5 +1,11 @@
 # Phi
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document explains how to build Phi-2, Phi-3 and Phi-3.5 family of models using TensorRT LLM and run on a single or multiple GPUs.
 For multimodal models (Phi-3-vision-128k-instruct and Phi-3.5-vision-instruct), see `../multimodal/README.md`.
 

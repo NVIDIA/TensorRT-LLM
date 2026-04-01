@@ -163,6 +163,30 @@ def get_device_pointer(
 
 
 # -------------------------------------------------------------------------
+# NIXL memory registration helpers
+# -------------------------------------------------------------------------
+
+
+def get_unique_pool_memory_descs(
+    page_table: KVCachePageTable, device_id: int
+) -> list[tuple[int, int, int, str]]:
+    """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools."""
+    unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
+    pool_counter = 0
+    for lg_idx, lg in enumerate(page_table.layer_groups):
+        for pv in lg.pool_views:
+            pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+            pool_key = (pool.base_address, get_pool_bytes(pool))
+            if pool_key not in unique_pools:
+                unique_pools[pool_key] = pool_counter
+                pool_counter += 1
+    return [
+        (pool_ptr, pool_size, device_id, f"kv_cache_memory_pool{idx}")
+        for (pool_ptr, pool_size), idx in unique_pools.items()
+    ]
+
+
+# -------------------------------------------------------------------------
 # KVCachePageTable aggregate helpers
 # -------------------------------------------------------------------------
 

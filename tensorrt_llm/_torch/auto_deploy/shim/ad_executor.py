@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     EagleDecodingConfig,
@@ -73,6 +74,10 @@ from ..transform.optimizer import InferenceOptimizer
 from ..utils._graph import get_input_embeddings, get_lm_head_weights
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
+
+# `layout_metadata` is a reserved multimodal payload used to carry request-level
+# layout semantics that the wrapper reconstructs into tensor kwargs separately.
+_RESERVED_MM_DATA_KEYS = frozenset({"layout_metadata"})
 
 
 @dataclass
@@ -513,11 +518,13 @@ class ADEngine(ModelEngine):
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
             self.llm_args.max_stats_len = ad_config.max_stats_len
+            self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
             self.llm_args.max_stats_len = 1000
+            self._enable_chunked_prefill = False
 
         # check for max total draft tokens
         if self.spec_config is not None:
@@ -554,6 +561,137 @@ class ADEngine(ModelEngine):
         self._execute_logit_post_processors = types.MethodType(
             PyTorchModelEngine._execute_logit_post_processors, self
         )
+
+    def _store_prefill_multimodal_metadata(
+        self,
+        ordered_requests: RequestList,
+        input_pos: List[int],
+        cu_seqlen: List[int],
+        num_prefill_seqs: int,
+        extra_args: Dict[str, List[torch.Tensor]],
+    ) -> None:
+        """Stage per-request multimodal layout metadata needed by the VLM wrapper.
+
+        The standard attention metadata captures request geometry (batch_info, cu_seqlen,
+        seq_len_with_cache, input_pos), but not the original per-request multimodal span layout
+        or multimodal special-token offsets needed to rebuild chunk-aware mRoPE positions.
+
+        This tensorization happens in the executor because it still has the scheduled request
+        list, per-request chunk boundaries, input_pos, cu_seqlen, and access to the raw
+        request-side multimodal fields (multimodal_positions, multimodal_lengths, and
+        py_multimodal_data["layout_metadata"]). By the time control reaches the exported
+        wrapper/modeling path, Python request objects are gone and the model call can only
+        consume concrete tensor kwargs.
+        """
+        if num_prefill_seqs == 0:
+            return
+
+        prefill_requests = ordered_requests[:num_prefill_seqs]
+        if not any(getattr(req, "multimodal_positions", None) for req in prefill_requests):
+            return
+
+        mm_item_cu_seqlen: List[int] = [0]
+        mm_item_types_flat: List[int] = []
+        mm_token_positions_flat: List[int] = []
+        mm_token_lengths_flat: List[int] = []
+        mm_special_offsets_cu_seqlen: List[int] = [0]
+        mm_special_offsets_flat: List[int] = []
+        flat_start_list: List[int] = []
+        count_list: List[int] = []
+        cumsum_total_mm = 0
+
+        for i, req in enumerate(prefill_requests):
+            begin_compute = input_pos[i]
+            end_compute = begin_compute + (cu_seqlen[i + 1] - cu_seqlen[i])
+            mm_pos = getattr(req, "multimodal_positions", None)
+            mm_len = getattr(req, "multimodal_lengths", None)
+            layout_metadata = {}
+            if req.py_multimodal_data:
+                layout_metadata = req.py_multimodal_data.get(
+                    "layout_metadata", req.py_multimodal_data
+                )
+            mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
+            special_offsets = (
+                layout_metadata.get("special_token_offsets", []) if layout_metadata else []
+            )
+            mm_pos_list = list(mm_pos) if mm_pos is not None else []
+            mm_len_list = list(mm_len) if mm_len is not None else []
+            mm_item_types_list = list(mm_item_types)
+            if len(mm_pos_list) != len(mm_len_list):
+                raise ValueError(
+                    "Mismatch between multimodal_positions and multimodal_lengths in "
+                    f"request {i}: positions={len(mm_pos_list)}, lengths={len(mm_len_list)}"
+                )
+            if mm_item_types_list and len(mm_item_types_list) != len(mm_pos_list):
+                raise ValueError(
+                    "Mismatch between multimodal item_types and multimodal span arrays in "
+                    f"request {i}: item_types={len(mm_item_types_list)}, "
+                    f"positions={len(mm_pos_list)}, lengths={len(mm_len_list)}"
+                )
+            mm_item_cu_seqlen.append(mm_item_cu_seqlen[-1] + len(mm_pos_list))
+            mm_item_types_flat.extend(mm_item_types_list)
+            mm_token_positions_flat.extend(mm_pos_list)
+            mm_token_lengths_flat.extend(mm_len_list)
+            mm_special_offsets_cu_seqlen.append(
+                mm_special_offsets_cu_seqlen[-1] + len(special_offsets)
+            )
+            mm_special_offsets_flat.extend(list(special_offsets))
+            if not mm_pos or not mm_len:
+                flat_start_list.append(0)
+                count_list.append(0)
+                continue
+
+            runtime = MultimodalRuntimeData(
+                past_seen_token_num=begin_compute,
+                mm_token_positions=list(mm_pos),
+                mm_token_lengths=list(mm_len),
+                chunk_end_pos=end_compute,
+                special_token_offsets=list(special_offsets),
+            )
+            num_unseen = runtime.num_unseen_mm_tokens
+            num_in_chunk = runtime.num_mm_tokens_in_chunk
+            num_unseen_special = runtime.num_unseen_special_tokens
+            num_special_in_chunk = runtime.num_special_tokens_in_chunk
+            total_mm_i = runtime.total_mm_tokens_in_request
+            total_special_i = runtime.total_special_tokens_in_request
+            flat_start_i = cumsum_total_mm + num_unseen - num_unseen_special
+            flat_start_list.append(flat_start_i)
+            count_list.append(num_in_chunk - num_special_in_chunk)
+            cumsum_total_mm += total_mm_i - total_special_i
+
+        extra_args["mm_item_cu_seqlen"] = [
+            torch.tensor(mm_item_cu_seqlen, dtype=torch.int32, device="cpu")
+        ]
+        extra_args["mm_item_types"] = [
+            torch.tensor(mm_item_types_flat, dtype=torch.int32, device="cpu")
+        ]
+        extra_args["mm_token_positions"] = [
+            torch.tensor(mm_token_positions_flat, dtype=torch.int32, device="cpu")
+        ]
+        extra_args["mm_token_lengths"] = [
+            torch.tensor(mm_token_lengths_flat, dtype=torch.int32, device="cpu")
+        ]
+        extra_args["mm_special_offsets_cu_seqlen"] = [
+            torch.tensor(mm_special_offsets_cu_seqlen, dtype=torch.int32, device="cpu")
+        ]
+        extra_args["mm_special_offsets"] = [
+            torch.tensor(mm_special_offsets_flat, dtype=torch.int32, device="cpu")
+        ]
+        # Export multimodal slice bounds whenever the current prefill step only needs a
+        # subset of the request's multimodal embeddings. This is required for regular
+        # chunked prefill, but also for KV-cache reuse where begin_compute > 0 even when
+        # chunked prefill is disabled in the config.
+        needs_mm_chunk_bounds = self._enable_chunked_prefill or any(
+            int(input_pos[i]) > 0 and getattr(req, "multimodal_positions", None)
+            for i, req in enumerate(prefill_requests)
+        )
+        if needs_mm_chunk_bounds:
+            extra_args["mm_chunk_flat_start"] = [
+                torch.tensor(flat_start_list, dtype=torch.int64, device="cpu")
+            ]
+            extra_args["mm_chunk_count"] = [
+                torch.tensor(count_list, dtype=torch.int64, device="cpu")
+            ]
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
@@ -622,6 +760,8 @@ class ADEngine(ModelEngine):
             # store extra arguments
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
+                    if k in _RESERVED_MM_DATA_KEYS:
+                        continue
                     extra_args[k].append(v)
 
         # store num_prefill and num_prefill_tokens
@@ -698,7 +838,15 @@ class ADEngine(ModelEngine):
         batch_info.extend([num_extend, num_extend_tokens])
         batch_info.extend([num_decode, num_decode_tokens])
 
-        # update the sequence info object now
+        self._store_prefill_multimodal_metadata(
+            ordered_requests=ordered_requests,
+            input_pos=input_pos,
+            cu_seqlen=cu_seqlen,
+            num_prefill_seqs=num_prefill,
+            extra_args=extra_args,
+        )
+
+        # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
             cu_seqlen=cu_seqlen,

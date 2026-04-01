@@ -11,6 +11,7 @@ When piecewise_enabled=True, a DualModeCapturedGraph is returned that dispatches
 
 import copy  # noqa: I001
 import gc
+from collections import abc
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -608,6 +609,14 @@ class DualModeCapturedGraph(nn.Module):
             result = self.piecewise(*args, num_tokens=bucket, **kwargs)
             ADPiecewiseRunner.set_current_num_tokens(None)
             if bucket > num_tokens:
+                # HF ModelOutput iterates over field names (e.g. "logits"), not
+                # tensor values. Normalize to the payload tuple before slicing.
+                if hasattr(result, "to_tuple"):
+                    result = result.to_tuple()
+                elif isinstance(result, abc.Mapping):
+                    result = tuple(result.values())
+                else:
+                    result = tuple(result)
                 result = tuple(r[:, :num_tokens] if r.ndim >= 2 else r for r in result)
             return result
 

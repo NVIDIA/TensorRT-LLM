@@ -968,7 +968,9 @@ def serve(
         launch_visual_gen_server(host, port, model, diffusion_args,
                                  metadata_server_cfg)
 
-    if get_is_diffusion_model(model):
+    is_visual_gen = extra_visual_gen_options is not None or get_is_diffusion_model(
+        model)
+    if is_visual_gen:
         _serve_visual_gen()
     else:
         _serve_llm()

@@ -20,7 +20,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
 
 
@@ -44,9 +44,10 @@ class KVRegionExtractorV1(RegionExtractorBase):
     def page_table(self) -> KVCachePageTable:
         return self._page_table
 
+    @nvtx_range("KVRegionExtractorV1.extract")
     def extract(
         self,
-        region_ids: List[int],
+        region_ids: np.ndarray,
         layer_group_id: int = 0,
         pool_idx: int = 0,
     ) -> SpecRegion:
@@ -71,7 +72,8 @@ class KVRegionExtractorV1(RegionExtractorBase):
         block_size = pool.slot_bytes
 
         # KV cache: filter out invalid block_ids (BAD_PAGE_INDEX = -1)
-        ptrs = [base_ptr + block_size * int(bid) for bid in region_ids if bid >= 0]
+        valid = region_ids >= 0
+        ptrs = base_ptr + block_size * region_ids[valid]
         memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=block_size)
         return SpecRegion(memory=memory)
 

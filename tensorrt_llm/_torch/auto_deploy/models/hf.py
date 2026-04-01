@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Interface to initialize and load HF models."""
 
 import json
+import operator
 import os
 import re
 import types
@@ -663,10 +667,23 @@ class TextModelExportInfo(SubModuleExportInfo):
         # won't be deleted from the graph during cleanup and this way we ensure that the embedding
         # module is not deleted from the GraphModule either.
         # TODO (lucaslie): is there a better way to make the embedding module "sticky"?
-        n_embed_tokens = sub_gm.graph.get_attr(f"{embed_name}.weight")
-        sub_gm.graph.call_function(
-            torch._assert, args=(n_embed_tokens, "Avoid embedding getting deleted from graph.")
-        )
+        output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
+        with sub_gm.graph.inserting_before(output_node):
+            n_embed_tokens = sub_gm.graph.get_attr(f"{embed_name}.weight")
+            # Assert on a scalar shape-derived condition instead of the weight tensor itself so the
+            # sentinel remains valid under fake-tensor shape propagation.
+            n_embed_rows = sub_gm.graph.call_function(
+                torch.ops.aten.sym_size.int,
+                args=(n_embed_tokens, 0),
+            )
+            has_nonnegative_rows = sub_gm.graph.call_function(
+                operator.ge,
+                args=(n_embed_rows, 0),
+            )
+            sub_gm.graph.call_function(
+                torch._assert,
+                args=(has_nonnegative_rows, "Avoid embedding getting deleted from graph."),
+            )
 
     def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
         batch_size_dynamic = Dim.DYNAMIC

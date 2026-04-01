@@ -1,5 +1,11 @@
 # Smaug
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document elaborates how to build the [Smaug-72B-v0.1](https://huggingface.co/abacusai/Smaug-72B-v0.1) model to runnable engines on multi-GPU node and perform a summarization task using these engines.
 
 ## Overview

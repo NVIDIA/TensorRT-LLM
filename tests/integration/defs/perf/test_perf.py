@@ -26,7 +26,8 @@ import yaml
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
-from ..conftest import get_llm_root, llm_models_root, trt_environment
+from ..conftest import (get_device_count, get_llm_root, llm_models_root,
+                        trt_environment)
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
@@ -973,6 +974,15 @@ class PerfTestConfig:
                 assert all(
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
+
+        try:
+            available_gpus = get_device_count()
+        except Exception:
+            available_gpus = None
+        if available_gpus is not None and self.num_gpus > available_gpus:
+            pytest.skip(
+                f"Test requires {self.num_gpus} GPUs but only {available_gpus} available"
+            )
 
     def get_model_family(self) -> str:
         """

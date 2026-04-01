@@ -112,7 +112,7 @@ std::tuple<Tensor, Tensor> e4m3_quantize_helper(Tensor input, at::optional<Tenso
     if (scales.has_value())
     {
         // static quantization will use float scales by default.
-        scales_ = scales.value();
+        scales_ = scales.value().clone();
         CHECK_TH_CUDA(scales_);
         CHECK_TYPE(scales_, torch::kFloat32);
         e4m3_static_quantize(input, quantized_input, scales_, stream, quantize_mode);

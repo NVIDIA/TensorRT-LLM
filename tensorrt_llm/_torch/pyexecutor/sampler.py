@@ -2376,8 +2376,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             finish_reasons_list[request.py_seq_slot],
         )
 
-    @nvtx_range("update_original_tokens")
     @staticmethod
+    @nvtx_range("update_original_tokens")
     def _update_original_tokens(
         original_tokens: torch.Tensor,
         seq_slots: torch.Tensor,

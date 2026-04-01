@@ -8,6 +8,7 @@ from tqdm import tqdm
 from transformers import LlamaConfig
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.eagle.config import EagleConfig
 from tensorrt_llm.models.eagle.model import EagleForCausalLM
@@ -262,6 +263,7 @@ def convert_and_save_hf(config, args):
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert

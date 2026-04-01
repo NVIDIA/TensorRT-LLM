@@ -1395,6 +1395,12 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
+        assert metadata.kv_cache_manager is None or \
+            metadata.kv_cache_manager.quant_block_size == 128, \
+            "Only support quant_block_size = 128 for now"
+        # Update the indexer k cache before prefill chunks gather from it.
+        self._update_k_cache(k_fp8, k_scale, metadata)
+
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -1669,15 +1675,18 @@ class Indexer(nn.Module):
             qk_pe, qk_nope, self.scale_fmt == "ue8m0")
         return fp8_out, scale
 
-    @torch.inference_mode()
-    def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
-                metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor):
-        quant_block_size = metadata.kv_cache_manager.quant_block_size
-        assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
+    def pre_indexer_proj(
+        self, qr: torch.Tensor, hidden_states: torch.Tensor,
+        position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure token-wise projections (CUDA-graph-capturable).
 
-        # Single fused FP32 cuBLAS GEMM (TF32 on Ampere+): wk + weights_proj
-        # hidden_states (FP32) @ fused_weight^T -> [N, head_dim + n_heads]
+        Runs cublas_mm, qk_projection_and_rope, FP8 quantize, and weight
+        scaling.  Does NOT touch the k cache or any batch-specific metadata,
+        so this can safely run inside a captured CUDA graph partition.
+
+        Returns (q_fp8, k_fp8, k_scale, weights).
+        """
         assert self._fused_wk_wp_weight is not None, \
             "post_load_weights() must be called before forward()"
         hidden_float = _to_float(hidden_states)
@@ -1704,14 +1713,16 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights, _ = maybe_execute_in_parallel(
-            lambda: self._weight_scale(weights, q_scale),
-            lambda: self._update_k_cache(
-                k_fp8, k_scale, metadata),  # store k_fp8 and k_scale in k cache
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        weights = self._weight_scale(weights, q_scale)
+
+        return q_fp8, k_fp8, k_scale, weights
+
+    @torch.inference_mode()
+    def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
+                metadata: DSAtrtllmAttentionMetadata,
+                position_ids: torch.Tensor):
+        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(
+            qr, hidden_states, position_ids)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
@@ -1920,7 +1931,9 @@ class DSACacheManager(KVCacheManager):
         super().shutdown()
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+    def get_cache_size_per_token(model_config: ModelConfig,
+                                 mapping: Mapping,
+                                 num_layers: Optional[int] = None,
                                  **kwargs):
         config = model_config.pretrained_config
         sparse_attn_config = model_config.sparse_attention_config
@@ -1937,9 +1950,8 @@ class DSACacheManager(KVCacheManager):
         # get head dim
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+            model_config, mapping, num_layers)
         mem_per_token *= num_attention_layers * head_dim
 
         # 1 for K, others for indexer K cache
