@@ -284,7 +284,7 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
-        tllmRunnerParams.mMultiCtasKvMode = !tllmRunnerParams.mIsSpecDecTree;
+        tllmRunnerParams.mMultiCtasKvMode = true;
         // Assume same head size for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSize;
@@ -368,9 +368,7 @@ void XqaDispatcher::runImpl(
         // Use the nullptr for cu_seqlens when it is not computed.
         int const* cu_seqlens{nullptr};
         int const* cu_kv_seqlens{nullptr};
-        bool const needDecoderInfo
-            = decoder_params.isBuildDecoderInfoKernelNeeded() || (params.is_spec_dec_tree && params.multi_query_tokens);
-        if (needDecoderInfo)
+        if (decoder_params.isBuildDecoderInfoKernelNeeded())
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             cu_seqlens = launchParams.cu_seq_lens;

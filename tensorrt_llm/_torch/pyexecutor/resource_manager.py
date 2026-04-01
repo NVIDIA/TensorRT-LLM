@@ -231,6 +231,9 @@ def _update_kv_cache_draft_token_location(cache_manager,
     ) == 1, "Currently, only one max attention window size is supported."
 
     if use_paged_kv_cache:
+        assert len(set(cache_manager.num_kv_heads_per_layer)) == 1, \
+            "update_kv_cache_draft_token_location requires uniform num_kv_heads across all layers, " \
+            f"but got {cache_manager.num_kv_heads_per_layer}"
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
             accepted_draft_token_offsets,
             packed_accepted_draft_tokens_indices,

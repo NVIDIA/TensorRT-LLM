@@ -371,6 +371,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         if cache_mgr is None:
             return
 
+        assert len(set(cache_mgr.num_kv_heads_per_layer)) == 1, (
+            "update_kv_cache_draft_token_location_2d requires uniform num_kv_heads across all layers, "
+            f"but got {cache_mgr.num_kv_heads_per_layer}"
+        )
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
             self._accepted_draft_indices_tensor[:batch_size],
             self._num_accepted_tokens_buf[:batch_size],
