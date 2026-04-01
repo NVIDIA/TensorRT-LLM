@@ -18,6 +18,7 @@ import copy
 import io
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -142,7 +143,8 @@ _FATAL_PATTERNS = [
 ]
 
 
-def _run_command_with_captured_output(cmd, env=None):
+def _run_command_with_captured_output(cmd: list[str],
+                                      env: dict[str, str] | None = None) -> str:
     """Run a command, reading stdout line-by-line in a background thread.
 
     Compared to subprocess.check_output() this has two advantages:
@@ -162,7 +164,8 @@ def _run_command_with_captured_output(cmd, env=None):
     proc = subprocess.Popen(cmd,
                             env=env,
                             stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT)
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True)
 
     output_lines: list = []
     lock = threading.Lock()
@@ -190,6 +193,14 @@ def _run_command_with_captured_output(cmd, env=None):
     thread = threading.Thread(target=_reader, daemon=True)
     thread.start()
 
+    def _cleanup_after_abort():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        thread.join(timeout=10)
+
     try:
         while proc.poll() is None:
             time.sleep(10)
@@ -203,7 +214,7 @@ def _run_command_with_captured_output(cmd, env=None):
                 tag = "errored and stalled" if errored else "stalled"
                 print_info(f"Process {tag} with no output for {idle:.0f}s "
                            f"(limit={limit}s), killing")
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
                 break
 
         thread.join(timeout=30)
@@ -223,13 +234,8 @@ def _run_command_with_captured_output(cmd, env=None):
     except subprocess.CalledProcessError:
         raise
 
-    except BaseException as exc:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        proc.wait()
-        thread.join(timeout=10)
+    except Exception as exc:
+        _cleanup_after_abort()
         with lock:
             partial = ''.join(output_lines)
         if partial:
@@ -238,6 +244,10 @@ def _run_command_with_captured_output(cmd, env=None):
             err.stdout = partial.encode()
             err.stderr = None
             raise err from exc
+        raise
+
+    except BaseException:
+        _cleanup_after_abort()
         raise
 
 
@@ -621,12 +631,15 @@ class AbstractPerfScriptTestClass(abc.ABC):
             partial_output = None
             if isinstance(e, subprocess.CalledProcessError):
                 if e.stdout:
-                    partial_output = clean_myelin_time(e.stdout.decode())
+                    partial_output = clean_myelin_time(
+                        e.stdout.decode("utf-8", errors="replace"))
                 print_error("--- stdout ---")
                 print_error(partial_output if partial_output else "<empty>")
                 print_error("--------------")
                 print_error("--- stderr ---")
-                print_error(e.stderr.decode() if e.stderr else "<empty>")
+                print_error(
+                    e.stderr.decode("utf-8", errors="replace") if e.
+                    stderr else "<empty>")
                 print_error("--------------")
             if partial_output and cmd_idx not in outputs:
                 outputs[cmd_idx] = partial_output
