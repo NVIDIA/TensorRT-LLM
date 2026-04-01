@@ -998,8 +998,6 @@ class _TrtLLM(BaseLLM):
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
-        # TODO: deprecate backend in LLM kwargs
-
         super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
                          trust_remote_code, tensor_parallel_size, dtype,
                          revision, tokenizer_revision, **kwargs)
@@ -1183,7 +1181,6 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
-        # TODO: deprecate backend in LLM kwargs
         backend = kwargs.pop("backend", "pytorch")
 
         # Validate that users don't pass TrtLlmArgs-specific arguments

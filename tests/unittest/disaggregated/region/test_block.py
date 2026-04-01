@@ -1,3 +1,5 @@
+import numpy as np
+
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
     SpecRegion,
@@ -57,38 +59,38 @@ def make_rankinfo(
 
 
 def test_mem_region_group():
-    ptrs = [11, 22, 33]
+    ptrs = np.array([11, 22, 33], dtype=np.int64)
     bytes_per_region = 16
     region = MemRegionGroup(ptrs=ptrs, bytes_per_region=bytes_per_region)
-    assert list(region.ptrs) == ptrs
+    np.testing.assert_array_equal(region.ptrs, ptrs)
     assert region.bytes_per_region == bytes_per_region
 
 
 def test_spec_region_and_spec_region_pair():
-    group_src = MemRegionGroup(ptrs=[101, 202], bytes_per_region=8)
-    group_dst = MemRegionGroup(ptrs=[303, 404], bytes_per_region=8)
+    group_src = MemRegionGroup(ptrs=np.array([101, 202], dtype=np.int64), bytes_per_region=8)
+    group_dst = MemRegionGroup(ptrs=np.array([303, 404], dtype=np.int64), bytes_per_region=8)
     spec_src = SpecRegion(memory=group_src, spec="spec_src")
     spec_dst = SpecRegion(memory=group_dst, spec="spec_dst")
     assert isinstance(spec_src, SpecRegion)
     assert isinstance(spec_dst, SpecRegion)
     pair = SpecRegionPair(src=spec_src, dst=spec_dst)
     assert isinstance(pair, SpecRegionPair)
-    assert pair.src.memory.ptrs == [101, 202]
-    assert pair.dst.memory.ptrs == [303, 404]
+    np.testing.assert_array_equal(pair.src.memory.ptrs, [101, 202])
+    np.testing.assert_array_equal(pair.dst.memory.ptrs, [303, 404])
     assert pair.src.spec == "spec_src"
     assert pair.dst.spec == "spec_dst"
 
 
 def test_identity_mapper():
-    src_group = MemRegionGroup(ptrs=[100, 200], bytes_per_region=32)
-    dst_group = MemRegionGroup(ptrs=[300, 400], bytes_per_region=32)
+    src_group = MemRegionGroup(ptrs=np.array([100, 200], dtype=np.int64), bytes_per_region=32)
+    dst_group = MemRegionGroup(ptrs=np.array([300, 400], dtype=np.int64), bytes_per_region=32)
     src_spec = SpecRegion(memory=src_group, spec="a")
     dst_spec = SpecRegion(memory=dst_group, spec="b")
     mapper = IdentityMapper()
     result = mapper.map(src_spec, dst_spec)
     assert isinstance(result, SpecRegionPair)
-    assert list(result.src.memory.ptrs) == [100, 200]
-    assert list(result.dst.memory.ptrs) == [300, 400]
+    np.testing.assert_array_equal(result.src.memory.ptrs, [100, 200])
+    np.testing.assert_array_equal(result.dst.memory.ptrs, [300, 400])
     assert result.src.memory.bytes_per_region == 32
     assert result.dst.memory.bytes_per_region == 32
 
@@ -107,8 +109,8 @@ def test_head_match_mapper():
         * self_ri.attention.dims_per_head
         * self_ri.attention.element_bytes
     )
-    src_group = MemRegionGroup(ptrs=[10, 20], bytes_per_region=1)
-    dst_group = MemRegionGroup(ptrs=[30, 40], bytes_per_region=1)
+    src_group = MemRegionGroup(ptrs=np.array([10, 20], dtype=np.int64), bytes_per_region=1)
+    dst_group = MemRegionGroup(ptrs=np.array([30, 40], dtype=np.int64), bytes_per_region=1)
     src_spec = SpecRegion(memory=src_group, spec="srcspec")
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
     mapper = HeadMatchMapper(
@@ -121,8 +123,12 @@ def test_head_match_mapper():
     )
     result = mapper.map(src_spec, dst_spec)
     expected_off = transfer_layers * slot_size_per_layer
-    assert list(result.src.memory.ptrs) == [10 + mapper._src_block_off, 20 + mapper._src_block_off]
-    assert list(result.dst.memory.ptrs) == [30 + mapper._dst_block_off, 40 + mapper._dst_block_off]
+    np.testing.assert_array_equal(
+        result.src.memory.ptrs, [10 + mapper._src_block_off, 20 + mapper._src_block_off]
+    )
+    np.testing.assert_array_equal(
+        result.dst.memory.ptrs, [30 + mapper._dst_block_off, 40 + mapper._dst_block_off]
+    )
     assert result.src.memory.bytes_per_region == expected_off
     assert result.dst.memory.bytes_per_region == expected_off
 
@@ -133,8 +139,8 @@ def test_head_mismatch_mapper():
     transfer_layers = 1
     src_layer_off = 0
     peer_layer_off = 1
-    src_group = MemRegionGroup(ptrs=[111], bytes_per_region=32)
-    dst_group = MemRegionGroup(ptrs=[222], bytes_per_region=32)
+    src_group = MemRegionGroup(ptrs=np.array([111], dtype=np.int64), bytes_per_region=32)
+    dst_group = MemRegionGroup(ptrs=np.array([222], dtype=np.int64), bytes_per_region=32)
     src_spec = SpecRegion(memory=src_group, spec="srcspec")
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
     mapper = HeadMismatchMapper(transfer_layers, src_layer_off, peer_layer_off, self_ri, peer_ri)
@@ -143,8 +149,8 @@ def test_head_mismatch_mapper():
     assert isinstance(result, SpecRegionPair)
     assert len(result.src.memory.ptrs) == expected_frag_count
     assert len(result.dst.memory.ptrs) == expected_frag_count
-    assert all(isinstance(x, int) for x in result.src.memory.ptrs)
-    assert all(isinstance(x, int) for x in result.dst.memory.ptrs)
+    assert isinstance(result.src.memory.ptrs, np.ndarray)
+    assert isinstance(result.dst.memory.ptrs, np.ndarray)
     assert result.src.memory.bytes_per_region == mapper._bytes_cont_heads
     assert result.dst.memory.bytes_per_region == mapper._bytes_cont_heads
 
