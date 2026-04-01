@@ -986,3 +986,169 @@ def test_global_timer_vs_cuda_event(use_cuda_graph, monkeypatch):
               f"{event_ms:>16.4f} {gt_ms:>17.4f} "
               f"{abs_diff:>14.4f} {rel_diff * 100:>13.2f}")
     print("-" * 102)
+
+
+# ---------------------------------------------------------------------------
+# Bounds-checking tests (from PR #12310)
+# ---------------------------------------------------------------------------
+
+
+def _make_shapes(*sizes):
+    """Convert size-tuples into Tuple[torch.Size, ...] for _find_nearest_profile."""
+    return tuple(torch.Size(s) for s in sizes)
+
+
+@pytest.fixture()
+def _capture_trtllm_logs(caplog):
+    """Attach caplog handler to the TRT-LLM logger (propagate=False)."""
+    import logging
+    trtllm_logger = logging.getLogger("TRT-LLM")
+    trtllm_logger.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG)
+    yield
+    trtllm_logger.removeHandler(caplog.handler)
+
+
+class TestFindNearestProfileBounds:
+    """Bounds-checking in AutoTuner._find_nearest_profile."""
+
+    def setup_method(self):
+        AutoTuner._find_nearest_profile.cache_clear()
+
+    def test_dynamic_spec_input_idx_out_of_range(self, caplog,
+                                                 _capture_trtllm_logs):
+        shapes = _make_shapes([4, 8])
+        spec = DynamicTensorSpec(input_idx=5,
+                                 dim_idx=0,
+                                 gen_tuning_buckets=(1, ))
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(spec, ),
+                                                 constraint_specs=())
+        assert result == ((4, 8), )
+        assert any("Skipping DynamicTensorSpec with input_idx=5" in m
+                   for m in caplog.messages)
+
+    def test_dynamic_spec_dim_idx_out_of_range(self, caplog,
+                                               _capture_trtllm_logs):
+        shapes = _make_shapes([4, 8])
+        spec = DynamicTensorSpec(input_idx=0,
+                                 dim_idx=10,
+                                 gen_tuning_buckets=(1, ))
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(spec, ),
+                                                 constraint_specs=())
+        assert result == ((4, 8), )
+        assert any("Skipping DynamicTensorSpec with dim_idx=10" in m
+                   for m in caplog.messages)
+
+    def test_constraint_spec_input_idx_out_of_range(self, caplog,
+                                                    _capture_trtllm_logs):
+        from tensorrt_llm._torch.autotuner import ConstraintSpec
+        shapes = _make_shapes([4, 8])
+        spec = ConstraintSpec(input_idx=3,
+                              dim_idx=0,
+                              infer_shape=lambda shapes: 1)
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(),
+                                                 constraint_specs=(spec, ))
+        assert result == ((4, 8), )
+        assert any("Skipping ConstraintSpec with input_idx=3" in m
+                   for m in caplog.messages)
+
+    def test_constraint_spec_dim_idx_out_of_range(self, caplog,
+                                                  _capture_trtllm_logs):
+        from tensorrt_llm._torch.autotuner import ConstraintSpec
+        shapes = _make_shapes([4, 8])
+        spec = ConstraintSpec(input_idx=0,
+                              dim_idx=7,
+                              infer_shape=lambda shapes: 1)
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(),
+                                                 constraint_specs=(spec, ))
+        assert result == ((4, 8), )
+        assert any("Skipping ConstraintSpec with dim_idx=7" in m
+                   for m in caplog.messages)
+
+    def test_dynamic_spec_negative_input_idx(self, caplog,
+                                             _capture_trtllm_logs):
+        shapes = _make_shapes([4, 8])
+        spec = DynamicTensorSpec(input_idx=-1,
+                                 dim_idx=0,
+                                 gen_tuning_buckets=(1, ))
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(spec, ),
+                                                 constraint_specs=())
+        assert result == ((4, 8), )
+        assert any("Skipping DynamicTensorSpec with input_idx=-1" in m
+                   for m in caplog.messages)
+
+    def test_dynamic_spec_negative_dim_idx(self, caplog, _capture_trtllm_logs):
+        shapes = _make_shapes([4, 8])
+        spec = DynamicTensorSpec(input_idx=0,
+                                 dim_idx=-1,
+                                 gen_tuning_buckets=(1, ))
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(spec, ),
+                                                 constraint_specs=())
+        assert result == ((4, 8), )
+        assert any("Skipping DynamicTensorSpec with dim_idx=-1" in m
+                   for m in caplog.messages)
+
+    def test_constraint_spec_negative_input_idx(self, caplog,
+                                                _capture_trtllm_logs):
+        from tensorrt_llm._torch.autotuner import ConstraintSpec
+        shapes = _make_shapes([4, 8])
+        spec = ConstraintSpec(input_idx=-1,
+                              dim_idx=0,
+                              infer_shape=lambda shapes: 1)
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(),
+                                                 constraint_specs=(spec, ))
+        assert result == ((4, 8), )
+        assert any("Skipping ConstraintSpec with input_idx=-1" in m
+                   for m in caplog.messages)
+
+    def test_valid_specs_unaffected(self):
+        from tensorrt_llm._torch.autotuner import ConstraintSpec
+        shapes = _make_shapes([4, 8], [2, 3])
+        dyn = DynamicTensorSpec(input_idx=0, dim_idx=1)
+        con = ConstraintSpec(input_idx=1,
+                             dim_idx=0,
+                             infer_shape=lambda shapes: 1)
+        result = AutoTuner._find_nearest_profile(shapes,
+                                                 dynamic_tensor_specs=(dyn, ),
+                                                 constraint_specs=(con, ))
+        assert result == ((4, 8), (-1, 3))
+
+
+class TestOptimizationProfilesBounds:
+    """Bounds-checking in AutoTuner._optimization_profiles."""
+
+    def test_dynamic_spec_input_idx_oob_skipped(self, caplog,
+                                                _capture_trtllm_logs):
+        tuner = AutoTuner()
+        x = torch.rand([4, 8])
+        config = TuningConfig(dynamic_tensor_specs=(
+            DynamicTensorSpec(input_idx=5, dim_idx=0, gen_tuning_buckets=(
+                1, 2)), ))
+        profiles = tuner._optimization_profiles(config, [x])
+        assert len(profiles) == 1
+        assert profiles[0].get_opt_shapes() == ((4, 8), )
+
+    def test_constraint_spec_dim_idx_oob_skipped(self, caplog,
+                                                 _capture_trtllm_logs):
+        from tensorrt_llm._torch.autotuner import ConstraintSpec
+        tuner = AutoTuner()
+        x = torch.rand([4, 8])
+        config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(input_idx=0,
+                                                    dim_idx=0,
+                                                    gen_tuning_buckets=(2,
+                                                                        4)), ),
+            constraint_specs=(ConstraintSpec(input_idx=0,
+                                             dim_idx=9,
+                                             infer_shape=lambda shapes: 1), ))
+        profiles = tuner._optimization_profiles(config, [x])
+        assert len(profiles) > 0
+        assert any("Skipping ConstraintSpec with dim_idx=9" in m
+                   for m in caplog.messages)

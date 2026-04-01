@@ -1301,12 +1301,13 @@ class AutoTuner:
         for spec in tuning_config.dynamic_tensor_specs:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if spec.input_idx >= len(base_profile.shapes):
+            if spec.input_idx < 0 or spec.input_idx >= len(base_profile.shapes):
                 logger.warning(
                     f"[Autotuner] Skipping DynamicTensorSpec with input_idx={spec.input_idx}: "
                     f"only {len(base_profile.shapes)} inputs available.")
                 continue
-            if spec.dim_idx >= len(base_profile.shapes[spec.input_idx]):
+            if spec.dim_idx < 0 or spec.dim_idx >= len(
+                    base_profile.shapes[spec.input_idx]):
                 logger.warning(
                     f"[Autotuner] Skipping DynamicTensorSpec with dim_idx={spec.dim_idx} for "
                     f"input {spec.input_idx}: shape has only "
@@ -1369,14 +1370,15 @@ class AutoTuner:
 
             # Adjust the profile to satisfy the constraints
             for spec in tuning_config.constraint_specs:
-                if spec.input_idx >= len(p.shapes):
+                if spec.input_idx < 0 or spec.input_idx >= len(p.shapes):
                     logger.warning(
                         f"[Autotuner] Skipping ConstraintSpec with input_idx={spec.input_idx}: "
                         f"only {len(p.shapes)} inputs available.")
                     continue
                 if p.shapes[spec.input_idx] == [StaticDim(0)]:
                     continue
-                if spec.dim_idx >= len(p.shapes[spec.input_idx]):
+                if spec.dim_idx < 0 or spec.dim_idx >= len(
+                        p.shapes[spec.input_idx]):
                     logger.warning(
                         f"[Autotuner] Skipping ConstraintSpec with dim_idx={spec.dim_idx} for "
                         f"input {spec.input_idx}: shape has only "
@@ -1420,12 +1422,13 @@ class AutoTuner:
             # Bounds check: skip specs that reference inputs or dimensions not present in the
             # current shapes tuple. This can happen on hardware (e.g. SM121 / DGX Spark) where
             # ops produce fewer or differently-shaped tensors than the specs were authored for.
-            if spec.input_idx >= len(base_profile):
+            if spec.input_idx < 0 or spec.input_idx >= len(base_profile):
                 logger.warning(
                     f"[Autotuner] Skipping DynamicTensorSpec with input_idx={spec.input_idx}: "
                     f"only {len(base_profile)} inputs available.")
                 continue
-            if spec.dim_idx >= len(base_profile[spec.input_idx]):
+            if spec.dim_idx < 0 or spec.dim_idx >= len(
+                    base_profile[spec.input_idx]):
                 logger.warning(
                     f"[Autotuner] Skipping DynamicTensorSpec with dim_idx={spec.dim_idx} for "
                     f"input {spec.input_idx}: shape has only {len(base_profile[spec.input_idx])} dims."
@@ -1447,14 +1450,15 @@ class AutoTuner:
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for spec in constraint_specs:
             # Bounds check: same defensive guard as above for constraint specs.
-            if spec.input_idx >= len(base_profile):
+            if spec.input_idx < 0 or spec.input_idx >= len(base_profile):
                 logger.warning(
                     f"[Autotuner] Skipping ConstraintSpec with input_idx={spec.input_idx}: "
                     f"only {len(base_profile)} inputs available.")
                 continue
             if base_profile[spec.input_idx] == [0]:
                 continue
-            if spec.dim_idx >= len(base_profile[spec.input_idx]):
+            if spec.dim_idx < 0 or spec.dim_idx >= len(
+                    base_profile[spec.input_idx]):
                 logger.warning(
                     f"[Autotuner] Skipping ConstraintSpec with dim_idx={spec.dim_idx} for "
                     f"input {spec.input_idx}: shape has only {len(base_profile[spec.input_idx])} dims."
