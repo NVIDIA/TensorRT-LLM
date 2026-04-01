@@ -70,6 +70,24 @@ def _apply_logit_softcapping(attn_scores: torch.Tensor, logit_cap: Optional[floa
     return attn_scores
 
 
+def _write_generate_kv_cache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+):
+    """Write single-token decode K/V into the cache."""
+    b, s = k.shape[:2]
+    assert s == 1, f"Expected sequence length 1 for generate phase, got {s}"
+    for i in range(b):
+        cache_idx = slot_idx[i].item()
+        pos = input_pos[i].item()
+        k_cache[cache_idx, pos] = k[i, 0]  # Remove sequence dim
+        v_cache[cache_idx, pos] = v[i, 0]  # Remove sequence dim
+
+
 def _torch_generate_mha(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -89,12 +107,7 @@ def _torch_generate_mha(
     assert s == 1, f"Expected sequence length 1 for generate phase, got {s}"
     n_kv_heads = k.shape[2]  # k has shape (b, 1, n_kv_heads, head_dim)
 
-    # Update KV cache for single token
-    for i in range(b):
-        cache_idx = slot_idx[i].item()
-        pos = input_pos[i].item()
-        k_cache[cache_idx, pos] = k[i, 0]  # Remove sequence dim
-        v_cache[cache_idx, pos] = v[i, 0]  # Remove sequence dim
+    _write_generate_kv_cache(k, v, k_cache, v_cache, slot_idx, input_pos)
 
     # Compute attention for each sequence using manual computation
     for i in range(b):
@@ -227,7 +240,6 @@ def _torch_context_mha(
     sinks: Optional[torch.Tensor] = None,
 ) -> None:
     """Context attention (multiple tokens, potentially multiple sequences) using existing torch functions."""
-    # Update KV cache first using existing function
     _update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
 
     # Compute attention for each sequence
@@ -481,70 +493,40 @@ def torch_backend_mha_with_cache(
     y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
 
     # Compute attention
-    if read_cache_only:
+    if not read_cache_only:
         if s == 1:
-            _torch_generate_mha_readonly(
-                q,
-                k_cache,
-                v_cache,
-                slot_idx,
-                input_pos,
-                scale,
-                y,
-                logit_cap,
-                sliding_window_size,
-                sinks,
-            )
+            _write_generate_kv_cache(k, v, k_cache, v_cache, slot_idx, input_pos)
         else:
-            _torch_context_mha_readonly(
-                q,
-                input_pos,
-                slot_idx,
-                k_cache,
-                v_cache,
-                seq_len,
-                seq_start,
-                scale,
-                y,
-                logit_cap,
-                sliding_window_size,
-                sinks,
-            )
+            _update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
+
+    if s == 1:
+        _torch_generate_mha_readonly(
+            q,
+            k_cache,
+            v_cache,
+            slot_idx,
+            input_pos,
+            scale,
+            y,
+            logit_cap,
+            sliding_window_size,
+            sinks,
+        )
     else:
-        if s == 1:
-            # Generate-only phase
-            _torch_generate_mha(
-                q,
-                k,
-                v,
-                k_cache,
-                v_cache,
-                slot_idx,
-                input_pos,
-                scale,
-                y,
-                logit_cap,
-                sliding_window_size,
-                sinks,
-            )
-        else:
-            # Context phase
-            _torch_context_mha(
-                q,
-                k,
-                v,
-                input_pos,
-                slot_idx,
-                k_cache,
-                v_cache,
-                seq_len,
-                seq_start,
-                scale,
-                y,
-                logit_cap,
-                sliding_window_size,
-                sinks,
-            )
+        _torch_context_mha_readonly(
+            q,
+            input_pos,
+            slot_idx,
+            k_cache,
+            v_cache,
+            seq_len,
+            seq_start,
+            scale,
+            y,
+            logit_cap,
+            sliding_window_size,
+            sinks,
+        )
 
     num_total_tokens = num_prefill_tokens + num_decode
     bs = b * s
