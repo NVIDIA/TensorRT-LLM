@@ -19,11 +19,39 @@ Tests triton_cached_mla_with_cache against the torch_cached_mla_with_cache
 reference implementation, covering decode and prefill phases.
 """
 
+import math
+
 import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401 — triggers op registration
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+
+RTOL = 5e-2
+ATOL = 5e-2
+
+
+def _run_both_ops(data, mla_cache_torch, mla_cache_triton, scale=None):
+    """Run both torch and triton cached MLA ops and return outputs."""
+    args = (
+        data["q_nope"],
+        data["q_pe"],
+        data["compressed_kv"],
+        data["kpe"],
+        data["kv_b_proj_weight"],
+        data["batch_info_host"],
+        data["seq_len"],
+        data["input_pos"],
+        data["slot_idx"],
+        data["cu_seqlen"],
+    )
+    out_torch = torch.ops.auto_deploy.torch_cached_mla_with_cache(
+        *args, mla_cache_torch, scale, data["kv_lora_rank"]
+    )
+    out_triton = torch.ops.auto_deploy.triton_cached_mla_with_cache(
+        *args, mla_cache_triton, scale, data["kv_lora_rank"]
+    )
+    return out_torch, out_triton
 
 
 class TestTritonMLADecode:
@@ -32,8 +60,6 @@ class TestTritonMLADecode:
     @pytest.fixture(autouse=True)
     def setup_method(self):
         self.device = "cuda"
-        self.atol = 5e-2
-        self.rtol = 5e-2
         torch.cuda.empty_cache()
         torch.manual_seed(42)
 
@@ -49,7 +75,7 @@ class TestTritonMLADecode:
         cache_offset: int,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        """Create test data for decode phase (seq_len=1)."""
+        """Create test data and MLA cache for decode phase (seq_len=1)."""
         kv_head_dim = qk_nope_head_dim + v_head_dim
 
         q_nope = torch.randn(
@@ -62,9 +88,8 @@ class TestTritonMLADecode:
         kpe = torch.randn(batch_size, 1, 1, qk_rope_head_dim, dtype=dtype, device=self.device)
         kv_b_proj_weight = torch.randn(
             num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=self.device
-        )
+        ) * math.sqrt(1.0 / kv_lora_rank)
 
-        # Create MLA cache and pre-fill with random data up to cache_offset
         mla_cache = torch.zeros(
             batch_size,
             max_seq_len,
@@ -81,7 +106,6 @@ class TestTritonMLADecode:
                 device=self.device,
             )
 
-        # Metadata
         seq_len_tensor = torch.ones(batch_size, device=self.device, dtype=torch.int32)
         input_pos = torch.full((batch_size,), cache_offset, device=self.device, dtype=torch.int32)
         slot_idx = torch.arange(batch_size, device=self.device, dtype=torch.int32)
@@ -91,7 +115,7 @@ class TestTritonMLADecode:
         _bi.update([0, 0, 0, 0, batch_size, batch_size])
         batch_info_host = _bi.serialize()
 
-        return {
+        data = {
             "q_nope": q_nope,
             "q_pe": q_pe,
             "compressed_kv": compressed_kv,
@@ -104,142 +128,52 @@ class TestTritonMLADecode:
             "cu_seqlen": cu_seqlen,
             "kv_lora_rank": kv_lora_rank,
         }
+        return data, mla_cache
 
-    def _run_both(self, data, mla_cache_torch, mla_cache_triton, scale=None):
-        """Run both torch and triton ops and return outputs."""
-        out_torch = torch.ops.auto_deploy.torch_cached_mla_with_cache(
-            data["q_nope"],
-            data["q_pe"],
-            data["compressed_kv"],
-            data["kpe"],
-            data["kv_b_proj_weight"],
-            data["batch_info_host"],
-            data["seq_len"],
-            data["input_pos"],
-            data["slot_idx"],
-            data["cu_seqlen"],
-            mla_cache_torch,
-            scale,
-            data["kv_lora_rank"],
+    @pytest.mark.parametrize(
+        "batch_size,num_heads,qk_nope_head_dim,qk_rope_head_dim,"
+        "kv_lora_rank,v_head_dim,max_seq_len,cache_offset",
+        [
+            pytest.param(2, 8, 64, 32, 256, 64, 128, 5, id="basic"),
+            pytest.param(1, 4, 32, 16, 128, 32, 64, 3, id="single_batch"),
+            pytest.param(16, 8, 64, 32, 256, 64, 256, 20, id="large_batch"),
+            pytest.param(4, 16, 128, 64, 512, 128, 512, 50, id="deepseek_dims"),
+            pytest.param(2, 4, 32, 16, 128, 32, 64, 0, id="cache_offset_zero"),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.bfloat16])
+    def test_decode(
+        self,
+        batch_size,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        max_seq_len,
+        cache_offset,
+        dtype,
+    ):
+        """Decode correctness across configurations and dtypes."""
+        data, mla_cache = self._create_decode_data(
+            batch_size,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
+            max_seq_len,
+            cache_offset,
+            dtype,
         )
-        out_triton = torch.ops.auto_deploy.triton_cached_mla_with_cache(
-            data["q_nope"],
-            data["q_pe"],
-            data["compressed_kv"],
-            data["kpe"],
-            data["kv_b_proj_weight"],
-            data["batch_info_host"],
-            data["seq_len"],
-            data["input_pos"],
-            data["slot_idx"],
-            data["cu_seqlen"],
-            mla_cache_triton,
-            scale,
-            data["kv_lora_rank"],
-        )
-        return out_torch, out_triton
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_decode_basic(self, dtype):
-        """Basic decode correctness test."""
-        data = self._create_decode_data(
-            batch_size=2,
-            num_heads=8,
-            qk_nope_head_dim=64,
-            qk_rope_head_dim=32,
-            kv_lora_rank=256,
-            v_head_dim=64,
-            max_seq_len=128,
-            cache_offset=5,
-            dtype=dtype,
-        )
-        mla_cache = torch.zeros(2, 128, 256 + 32, dtype=dtype, device=self.device)
-        mla_cache[:, :5, :] = torch.randn_like(mla_cache[:, :5, :])
-
-        out_torch, out_triton = self._run_both(data, mla_cache.clone(), mla_cache.clone())
-
+        out_torch, out_triton = _run_both_ops(data, mla_cache.clone(), mla_cache.clone())
         assert out_triton.shape == out_torch.shape
         assert torch.isfinite(out_triton).all()
-        torch.testing.assert_close(out_triton, out_torch, rtol=self.rtol, atol=self.atol)
-
-    def test_decode_single_batch(self):
-        """Decode with batch_size=1."""
-        data = self._create_decode_data(
-            batch_size=1,
-            num_heads=4,
-            qk_nope_head_dim=32,
-            qk_rope_head_dim=16,
-            kv_lora_rank=128,
-            v_head_dim=32,
-            max_seq_len=64,
-            cache_offset=3,
-        )
-        mla_cache = torch.zeros(1, 64, 128 + 16, dtype=torch.bfloat16, device=self.device)
-        mla_cache[:, :3, :] = torch.randn_like(mla_cache[:, :3, :])
-
-        out_torch, out_triton = self._run_both(data, mla_cache.clone(), mla_cache.clone())
-        torch.testing.assert_close(out_triton, out_torch, rtol=self.rtol, atol=self.atol)
-
-    def test_decode_large_batch(self):
-        """Decode with larger batch size."""
-        data = self._create_decode_data(
-            batch_size=16,
-            num_heads=8,
-            qk_nope_head_dim=64,
-            qk_rope_head_dim=32,
-            kv_lora_rank=256,
-            v_head_dim=64,
-            max_seq_len=256,
-            cache_offset=20,
-        )
-        mla_cache = torch.zeros(16, 256, 256 + 32, dtype=torch.bfloat16, device=self.device)
-        mla_cache[:, :20, :] = torch.randn_like(mla_cache[:, :20, :])
-
-        out_torch, out_triton = self._run_both(data, mla_cache.clone(), mla_cache.clone())
-        # Wider tolerance for larger configs: Triton uses float32 accumulation throughout
-        # while torch reference mixes bf16 intermediates, causing minor numerical differences
-        torch.testing.assert_close(out_triton, out_torch, rtol=1e-1, atol=2e-1)
-
-    def test_decode_deepseek_dims(self):
-        """Decode with DeepSeek V2-like dimensions (kv_lora_rank=512)."""
-        data = self._create_decode_data(
-            batch_size=4,
-            num_heads=16,
-            qk_nope_head_dim=128,
-            qk_rope_head_dim=64,
-            kv_lora_rank=512,
-            v_head_dim=128,
-            max_seq_len=512,
-            cache_offset=50,
-        )
-        mla_cache = torch.zeros(4, 512, 512 + 64, dtype=torch.bfloat16, device=self.device)
-        mla_cache[:, :50, :] = torch.randn_like(mla_cache[:, :50, :])
-
-        out_torch, out_triton = self._run_both(data, mla_cache.clone(), mla_cache.clone())
-        # Wider tolerance for large kv_lora_rank: float32 vs bf16 accumulation paths
-        # cause minor divergence in ~0.2% of elements
-        torch.testing.assert_close(out_triton, out_torch, rtol=1e-1, atol=2e-1)
-
-    def test_decode_cache_offset_zero(self):
-        """Decode at position 0 (first token, no prior cache)."""
-        data = self._create_decode_data(
-            batch_size=2,
-            num_heads=4,
-            qk_nope_head_dim=32,
-            qk_rope_head_dim=16,
-            kv_lora_rank=128,
-            v_head_dim=32,
-            max_seq_len=64,
-            cache_offset=0,
-        )
-        mla_cache = torch.zeros(2, 64, 128 + 16, dtype=torch.bfloat16, device=self.device)
-
-        out_torch, out_triton = self._run_both(data, mla_cache.clone(), mla_cache.clone())
-        torch.testing.assert_close(out_triton, out_torch, rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(out_triton, out_torch, rtol=RTOL, atol=ATOL)
 
     def test_decode_cache_update(self):
         """Verify that cache is updated identically by both backends."""
-        data = self._create_decode_data(
+        data, mla_cache = self._create_decode_data(
             batch_size=2,
             num_heads=4,
             qk_nope_head_dim=32,
@@ -249,42 +183,11 @@ class TestTritonMLADecode:
             max_seq_len=64,
             cache_offset=5,
         )
-        mla_cache_torch = torch.zeros(2, 64, 128 + 16, dtype=torch.bfloat16, device=self.device)
-        mla_cache_torch[:, :5, :] = torch.randn_like(mla_cache_torch[:, :5, :])
-        mla_cache_triton = mla_cache_torch.clone()
+        mla_cache_torch = mla_cache.clone()
+        mla_cache_triton = mla_cache.clone()
 
-        _ = torch.ops.auto_deploy.torch_cached_mla_with_cache(
-            data["q_nope"],
-            data["q_pe"],
-            data["compressed_kv"],
-            data["kpe"],
-            data["kv_b_proj_weight"],
-            data["batch_info_host"],
-            data["seq_len"],
-            data["input_pos"],
-            data["slot_idx"],
-            data["cu_seqlen"],
-            mla_cache_torch,
-            None,
-            data["kv_lora_rank"],
-        )
-        _ = torch.ops.auto_deploy.triton_cached_mla_with_cache(
-            data["q_nope"],
-            data["q_pe"],
-            data["compressed_kv"],
-            data["kpe"],
-            data["kv_b_proj_weight"],
-            data["batch_info_host"],
-            data["seq_len"],
-            data["input_pos"],
-            data["slot_idx"],
-            data["cu_seqlen"],
-            mla_cache_triton,
-            None,
-            data["kv_lora_rank"],
-        )
+        _run_both_ops(data, mla_cache_torch, mla_cache_triton)
 
-        # Cache at the written positions should match
         torch.testing.assert_close(
             mla_cache_triton[:, 5, :], mla_cache_torch[:, 5, :], rtol=0, atol=0
         )
@@ -296,8 +199,6 @@ class TestTritonMLAPrefill:
     @pytest.fixture(autouse=True)
     def setup_method(self):
         self.device = "cuda"
-        self.atol = 5e-2
-        self.rtol = 5e-2
         torch.cuda.empty_cache()
         torch.manual_seed(42)
 
@@ -313,11 +214,10 @@ class TestTritonMLAPrefill:
         max_seq_len: int,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        """Create test data for prefill phase (seq_len > 1)."""
+        """Create test data and MLA cache for dense prefill (uniform seq_len)."""
         kv_head_dim = qk_nope_head_dim + v_head_dim
         total_tokens = batch_size * seq_len
 
-        # Flattened inputs for context phase: [1, total_tokens, ...]
         q_nope = torch.randn(
             1, total_tokens, num_heads, qk_nope_head_dim, dtype=dtype, device=self.device
         )
@@ -328,9 +228,8 @@ class TestTritonMLAPrefill:
         kpe = torch.randn(1, total_tokens, 1, qk_rope_head_dim, dtype=dtype, device=self.device)
         kv_b_proj_weight = torch.randn(
             num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=self.device
-        )
+        ) * math.sqrt(1.0 / kv_lora_rank)
 
-        # Metadata
         seq_len_tensor = torch.full((batch_size,), seq_len, device=self.device, dtype=torch.int32)
         input_pos = torch.zeros(batch_size, device=self.device, dtype=torch.int32)
         slot_idx = torch.arange(batch_size, device=self.device, dtype=torch.int32)
@@ -340,7 +239,15 @@ class TestTritonMLAPrefill:
         _bi.update([batch_size, total_tokens, 0, 0, 0, 0])
         batch_info_host = _bi.serialize()
 
-        return {
+        mla_cache = torch.zeros(
+            batch_size,
+            max_seq_len,
+            kv_lora_rank + qk_rope_head_dim,
+            dtype=dtype,
+            device=self.device,
+        )
+
+        data = {
             "q_nope": q_nope,
             "q_pe": q_pe,
             "compressed_kv": compressed_kv,
@@ -353,81 +260,28 @@ class TestTritonMLAPrefill:
             "cu_seqlen": cu_seqlen,
             "kv_lora_rank": kv_lora_rank,
         }
+        return data, mla_cache
 
-    def test_prefill_basic(self):
-        """Basic prefill correctness test."""
-        batch_size, seq_len, num_heads = 2, 4, 8
-        qk_nope_head_dim, qk_rope_head_dim = 64, 32
-        kv_lora_rank, v_head_dim = 256, 64
-        max_seq_len = 128
+    def _create_ragged_prefill_data(
+        self,
+        padded_seq_len: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        kv_lora_rank: int,
+        v_head_dim: int,
+        max_seq_len: int,
+        seq_lens: tuple,
+        input_positions: tuple,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        """Create ragged prefill data with padded inputs and packed reference.
 
-        data = self._create_prefill_data(
-            batch_size,
-            seq_len,
-            num_heads,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            kv_lora_rank,
-            v_head_dim,
-            max_seq_len,
-        )
-
-        mla_cache_torch = torch.zeros(
-            batch_size,
-            max_seq_len,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        mla_cache_triton = mla_cache_torch.clone()
-
-        out_torch = torch.ops.auto_deploy.torch_cached_mla_with_cache(
-            data["q_nope"],
-            data["q_pe"],
-            data["compressed_kv"],
-            data["kpe"],
-            data["kv_b_proj_weight"],
-            data["batch_info_host"],
-            data["seq_len"],
-            data["input_pos"],
-            data["slot_idx"],
-            data["cu_seqlen"],
-            mla_cache_torch,
-            None,
-            data["kv_lora_rank"],
-        )
-        out_triton = torch.ops.auto_deploy.triton_cached_mla_with_cache(
-            data["q_nope"],
-            data["q_pe"],
-            data["compressed_kv"],
-            data["kpe"],
-            data["kv_b_proj_weight"],
-            data["batch_info_host"],
-            data["seq_len"],
-            data["input_pos"],
-            data["slot_idx"],
-            data["cu_seqlen"],
-            mla_cache_triton,
-            None,
-            data["kv_lora_rank"],
-        )
-
-        assert out_triton.shape == out_torch.shape
-        # Wider tolerance for prefill: Triton uses absorption (fp32 compute in compressed
-        # space) while torch reference uses expansion (bf16 kv_b_proj matmul over
-        # kv_lora_rank dims). These are mathematically equivalent but numerically different
-        # paths — the bf16 reduction in the expansion path is the dominant error source.
-        torch.testing.assert_close(out_triton, out_torch, rtol=2e-1, atol=1.0)
-
-    def test_prefill_ragged_with_padded_flatten(self):
-        """Prefill correctness when flattened inputs contain per-sequence padding gaps."""
-        batch_size, padded_seq_len, num_heads = 3, 6, 8
-        qk_nope_head_dim, qk_rope_head_dim = 64, 32
-        kv_lora_rank, v_head_dim = 256, 64
-        max_seq_len = 128
-        dtype = torch.bfloat16
+        Returns (padded, packed, meta, mla_cache) where padded/packed hold the
+        qkv tensors for triton/torch respectively, and meta holds shared metadata.
+        """
+        batch_size = len(seq_lens)
         device = self.device
-
         kv_head_dim = qk_nope_head_dim + v_head_dim
         total_padded = batch_size * padded_seq_len
 
@@ -439,79 +293,165 @@ class TestTritonMLAPrefill:
         kpe = torch.randn(1, total_padded, 1, qk_rope_head_dim, dtype=dtype, device=device)
         kv_b_proj_weight = torch.randn(
             num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=device
-        )
+        ) * math.sqrt(1.0 / kv_lora_rank)
 
-        # Ragged active lengths stored inside padded [B, S] flatten layout.
-        seq_len = torch.tensor([4, 2, 5], device=device, dtype=torch.int32)
+        seq_len_t = torch.tensor(seq_lens, device=device, dtype=torch.int32)
         seq_start = torch.tensor(
-            [0, padded_seq_len, 2 * padded_seq_len], device=device, dtype=torch.int32
+            [i * padded_seq_len for i in range(batch_size)], device=device, dtype=torch.int32
         )
-        input_pos = torch.tensor([1, 0, 2], device=device, dtype=torch.int32)
+        input_pos = torch.tensor(input_positions, device=device, dtype=torch.int32)
         slot_idx = torch.arange(batch_size, device=device, dtype=torch.int32)
 
-        total_tokens = int(seq_len.sum().item())
+        total_tokens = int(seq_len_t.sum().item())
         _bi = BatchInfo()
         _bi.update([batch_size, total_tokens, 0, 0, 0, 0])
         batch_info_host = _bi.serialize()
 
-        # Active-token indices into the padded flatten [B * S] layout.
         token_indices = torch.cat(
             [
                 torch.arange(start, start + length, device=device, dtype=torch.long)
-                for start, length in zip(seq_start.tolist(), seq_len.tolist())
+                for start, length in zip(seq_start.tolist(), seq_len_t.tolist())
             ]
         )
 
-        mla_cache_torch = torch.zeros(
-            batch_size,
-            max_seq_len,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        mla_cache_triton = mla_cache_torch.clone()
+        seq_start_packed = torch.zeros_like(seq_len_t)
+        seq_start_packed[1:] = seq_len_t.cumsum(0)[:-1]
 
-        # Torch reference path expects dense packing for prefill outputs.
-        # Build packed tensors with equivalent active-token content.
-        q_nope_packed = q_nope.index_select(1, token_indices)
-        q_pe_packed = q_pe.index_select(1, token_indices)
-        compressed_kv_packed = compressed_kv.index_select(1, token_indices)
-        kpe_packed = kpe.index_select(1, token_indices)
-        seq_start_packed = torch.zeros_like(seq_len)
-        seq_start_packed[1:] = seq_len.cumsum(0)[:-1]
+        mla_cache = torch.zeros(
+            batch_size, max_seq_len, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+        )
+
+        padded = {"q_nope": q_nope, "q_pe": q_pe, "compressed_kv": compressed_kv, "kpe": kpe}
+        packed = {
+            "q_nope": q_nope.index_select(1, token_indices),
+            "q_pe": q_pe.index_select(1, token_indices),
+            "compressed_kv": compressed_kv.index_select(1, token_indices),
+            "kpe": kpe.index_select(1, token_indices),
+        }
+        meta = {
+            "kv_b_proj_weight": kv_b_proj_weight,
+            "batch_info_host": batch_info_host,
+            "seq_len": seq_len_t,
+            "input_pos": input_pos,
+            "slot_idx": slot_idx,
+            "seq_start": seq_start,
+            "seq_start_packed": seq_start_packed,
+            "kv_lora_rank": kv_lora_rank,
+            "token_indices": token_indices,
+        }
+        return padded, packed, meta, mla_cache
+
+    @pytest.mark.parametrize(
+        "batch_size,seq_len,num_heads,qk_nope_head_dim,qk_rope_head_dim,"
+        "kv_lora_rank,v_head_dim,max_seq_len",
+        [
+            pytest.param(2, 4, 8, 64, 32, 256, 64, 128, id="basic"),
+            pytest.param(1, 8, 4, 32, 16, 128, 32, 64, id="single_batch"),
+            pytest.param(1, 32, 8, 64, 32, 256, 64, 128, id="long_seq"),
+            pytest.param(4, 8, 8, 64, 32, 256, 64, 256, id="large_batch"),
+            pytest.param(2, 4, 16, 128, 64, 512, 128, 512, id="deepseek_dims"),
+        ],
+    )
+    def test_prefill(
+        self,
+        batch_size,
+        seq_len,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        max_seq_len,
+    ):
+        """Dense prefill correctness test."""
+        data, mla_cache = self._create_prefill_data(
+            batch_size,
+            seq_len,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
+            max_seq_len,
+        )
+        out_torch, out_triton = _run_both_ops(data, mla_cache.clone(), mla_cache.clone())
+        assert out_triton.shape == out_torch.shape
+        torch.testing.assert_close(out_triton, out_torch, rtol=RTOL, atol=ATOL)
+
+    @pytest.mark.parametrize(
+        "padded_seq_len,num_heads,qk_nope_head_dim,qk_rope_head_dim,"
+        "kv_lora_rank,v_head_dim,max_seq_len,seq_lens,input_positions",
+        [
+            pytest.param(6, 8, 64, 32, 256, 64, 128, (4, 2, 5), (1, 0, 2), id="basic"),
+            pytest.param(8, 4, 32, 16, 128, 32, 64, (3, 7), (0, 0), id="two_seqs"),
+            pytest.param(6, 8, 64, 32, 256, 64, 128, (4,), (5,), id="single_seq_offset"),
+            pytest.param(
+                4, 16, 128, 64, 512, 128, 512, (2, 4, 1, 3), (10, 0, 5, 20), id="deepseek_dims"
+            ),
+            pytest.param(16, 8, 64, 32, 256, 64, 128, (2, 1, 3), (0, 0, 0), id="heavy_padding"),
+        ],
+    )
+    def test_prefill_ragged(
+        self,
+        padded_seq_len,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        max_seq_len,
+        seq_lens,
+        input_positions,
+    ):
+        """Ragged prefill: triton gets padded flatten layout, torch gets dense packing."""
+        padded, packed, meta, mla_cache = self._create_ragged_prefill_data(
+            padded_seq_len,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
+            max_seq_len,
+            seq_lens,
+            input_positions,
+        )
+        mla_cache_torch = mla_cache.clone()
+        mla_cache_triton = mla_cache.clone()
 
         out_torch = torch.ops.auto_deploy.torch_cached_mla_with_cache(
-            q_nope_packed,
-            q_pe_packed,
-            compressed_kv_packed,
-            kpe_packed,
-            kv_b_proj_weight,
-            batch_info_host,
-            seq_len,
-            input_pos,
-            slot_idx,
-            seq_start_packed,
+            packed["q_nope"],
+            packed["q_pe"],
+            packed["compressed_kv"],
+            packed["kpe"],
+            meta["kv_b_proj_weight"],
+            meta["batch_info_host"],
+            meta["seq_len"],
+            meta["input_pos"],
+            meta["slot_idx"],
+            meta["seq_start_packed"],
             mla_cache_torch,
             None,
-            kv_lora_rank,
+            meta["kv_lora_rank"],
         )
         out_triton = torch.ops.auto_deploy.triton_cached_mla_with_cache(
-            q_nope,
-            q_pe,
-            compressed_kv,
-            kpe,
-            kv_b_proj_weight,
-            batch_info_host,
-            seq_len,
-            input_pos,
-            slot_idx,
-            seq_start,
+            padded["q_nope"],
+            padded["q_pe"],
+            padded["compressed_kv"],
+            padded["kpe"],
+            meta["kv_b_proj_weight"],
+            meta["batch_info_host"],
+            meta["seq_len"],
+            meta["input_pos"],
+            meta["slot_idx"],
+            meta["seq_start"],
             mla_cache_triton,
             None,
-            kv_lora_rank,
+            meta["kv_lora_rank"],
         )
 
-        torch.testing.assert_close(out_triton[0, token_indices], out_torch[0], rtol=2e-1, atol=1.0)
+        torch.testing.assert_close(
+            out_triton[0, meta["token_indices"]], out_torch[0], rtol=RTOL, atol=ATOL
+        )
 
 
 class TestTritonMLADescriptor:
