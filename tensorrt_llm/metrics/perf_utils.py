@@ -25,17 +25,13 @@ from .enums import MetricNames, RequestEventTiming
 
 def process_req_perf_metrics(
         req_perf_metrics_dict: Optional[dict],
-        output_length: int,
-        is_multiple_response: bool = False) -> dict[MetricNames, float | int]:
+        output_length: int) -> dict[MetricNames, float | int]:
     """Compute derived per-request latency and token-count metrics.
 
     Args:
         req_perf_metrics_dict: Raw timing dict from the executor, keyed by
             ``RequestEventTiming`` enum members.  May be ``None`` or empty.
         output_length: Number of output tokens generated for this request.
-        is_multiple_response: True when ``sampling_params.n > 1``; token
-            counts and TPOT are suppressed in this case to avoid double-
-            counting across response candidates.
 
     Returns:
         Dict mapping ``MetricNames`` enum members to numeric values.
@@ -79,16 +75,15 @@ def process_req_perf_metrics(
     if last_token > 0 and first_scheduled > 0:
         stat[MetricNames.INFERENCE_TIME] = last_token - first_scheduled
 
-    # Token counts — suppressed for multi-response (n>1) to avoid double-
-    # counting across response candidates.
-    if output_length > 0 and not is_multiple_response:
+    # Token counts — recorded per candidate.  When n>1 each candidate has
+    # its own timestamps and token stream so metrics are valid per candidate.
+    if output_length > 0:
         stat[MetricNames.GENERATION_TOKENS] = output_length
 
     # TPOT = decode duration per output token.  Requires at least 2 tokens
     # (denominator would be 0 for a single-token output) and both timestamps
     # present (first_token=0 default would produce bogus values).
-    if (output_length > 1 and not is_multiple_response
-            and first_token > 0 and last_token > 0):
+    if (output_length > 1 and first_token > 0 and last_token > 0):
         stat[MetricNames.TPOT] = (last_token - first_token) / (output_length -
                                                                 1)
 

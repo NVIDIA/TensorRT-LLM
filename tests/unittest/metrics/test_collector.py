@@ -513,11 +513,15 @@ class TestProcessReqPerfMetrics:
         assert stat[MetricNames.GENERATION_TOKENS] == 1
         assert MetricNames.TPOT not in stat
 
-    def test_generation_tokens_excluded_for_multiple_response(self):
-        stat = process_req_perf_metrics(_FULL_TIMESTAMPS,
-                                        output_length=50,
-                                        is_multiple_response=True)
-        assert MetricNames.GENERATION_TOKENS not in stat
+    def test_per_candidate_metrics_computed_independently(self):
+        """Each candidate gets its own GENERATION_TOKENS and TPOT, even when
+        candidates have different output lengths."""
+        stat_a = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=50)
+        stat_b = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=30)
+        assert stat_a[MetricNames.GENERATION_TOKENS] == 50
+        assert stat_b[MetricNames.GENERATION_TOKENS] == 30
+        # TPOT differs because output_length differs
+        assert stat_a[MetricNames.TPOT] != stat_b[MetricNames.TPOT]
 
     def test_zero_output_length_excludes_tokens(self):
         stat = process_req_perf_metrics(_FULL_TIMESTAMPS, output_length=0)

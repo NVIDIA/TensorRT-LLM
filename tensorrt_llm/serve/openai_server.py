@@ -850,7 +850,15 @@ class OpenAIServer:
         if not res.finished:
             return
         if self.metrics_collector:
-            self.metrics_collector.log_request_metrics_dict(res.metrics_dict)
+            if res.candidate_metrics:
+                for candidate_m in res.candidate_metrics:
+                    self.metrics_collector.log_request_metrics_dict(
+                        candidate_m)
+            elif res.metrics_dict:
+                # Fallback for paths that populate metrics_dict directly
+                # (e.g. PostprocWorker).
+                self.metrics_collector.log_request_metrics_dict(
+                    res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
             # Wake up the stats collector to drain iteration stats
             if getattr(self.generator.args, "enable_iter_perf_stats", True):
