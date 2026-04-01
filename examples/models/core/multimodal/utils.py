@@ -127,7 +127,13 @@ def add_common_args(parser):
                         default=False,
                         action='store_true',
                         help="Whether or not to turn on the debug mode")
-    return parser
+    parser.add_argument(
+        '--trust_remote_code',
+        action='store_true',
+        default=False,
+        help='Allow loading models with custom remote code from HuggingFace Hub. '
+             'Only enable this for models from trusted sources.')
+        return parser
 
 
 def levenshtein_distance(s1, s2):
