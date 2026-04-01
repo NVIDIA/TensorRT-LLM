@@ -1378,8 +1378,8 @@ static-analysis-files: &static_analysis_files |
         tests/unittest/_torch/sampler/test_beam_search_util.py |
     )$
 
-# Global exclude pattern for vendored third-party code
-exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$)'
+# Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
+exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1388,30 +1388,15 @@ repos:
     hooks:
     -   id: isort
         files: *common_files
-        exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
 -   repo: https://github.com/Lucas-C/pre-commit-hooks.git
     rev: v1.5.5
     hooks:
     -   id: remove-crlf
-        exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
 -   repo: https://github.com/google/yapf
     rev: v0.43.0
     hooks:
     -   id: yapf
         files: *common_files
-        exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
@@ -1420,24 +1405,11 @@ repos:
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer
-        exclude: |
-            (?x)^(
-                .*cubin\.cpp$ |
-                .*cubin\.h$ |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
     -   id: check-yaml
         args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
-        exclude: |
-            (?x)^(
-                .*\.(patch|md)$ |
-                scripts/attribution/data/cas/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
+        exclude: '(\.(patch|md)|scripts/attribution/data/cas/.*)$'
     -   id: check-toml
     -   id: mixed-line-ending
         args: [--fix=lf]
@@ -1459,32 +1431,15 @@ repos:
         - tomli
         args: ['--config', 'pyproject.toml']
         files: *common_files
-        exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
 -   repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v16.0.0
     hooks:
     -   id: clang-format
         types_or: [c++, c, cuda]
-        exclude: |
-            (?x)^(
-                .*cubin\.cpp$ |
-                .*_cubin\.h$ |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:
     -   id: cmake-format
-        exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
 -   repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
@@ -1493,28 +1448,13 @@ repos:
         - tomli
         # add ignore words list
         args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
-        exclude: |
-            (?x)^(
-                scripts/attribution/data/cas/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
+        exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
     -   id: ruff
         args: [--fix, --exit-non-zero-on-fix]
-        exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
     -   id: ruff-format
-        exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllmGen_fmha_export/.* |
-                cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/.*
-            )$
 -   repo: https://github.com/executablebooks/mdformat
     rev: 0.7.17
     hooks:

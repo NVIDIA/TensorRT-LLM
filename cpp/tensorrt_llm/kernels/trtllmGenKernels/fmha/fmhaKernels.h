@@ -397,11 +397,10 @@ private:
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
     {
-        // uses2CtaMma in the cubin hash means "2CTA MMA kernel variant" (MLA KeepsMmaAb with clusterDimX=2).
-        // For CgaSmemReduction, algoFilterForCubinPath sets clusterDimX *= mMaxNumCtasKv for launch, which can
-        // make clusterDimX==2 and would be misread as uses2CtaMma. Cubins for CGA are built with twoCtaMode=false,
-        // so we must not treat CGA's scaled clusterDimX as uses2CtaMma for hash lookup.
-        bool uses2CtaMma = (options.mClusterDimX == 2) && !isCgaSmemReduction(options.mMultiCtasKvMode);
+        // uses2CtaMma: "2CTA MMA kernel variant" (MLA KeepsMmaAb with clusterDimX=2).
+        // CGA scaling (clusterDimX *= mMaxNumCtasKv) is applied only at launch time in launchFmhaKernel,
+        // so options.mClusterDimX here is the unscaled value from the autotuner.
+        bool uses2CtaMma = (options.mClusterDimX == 2);
         // Debug info.
         std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="
             + std::to_string(static_cast<int>(mDtypeKv)) + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut))
