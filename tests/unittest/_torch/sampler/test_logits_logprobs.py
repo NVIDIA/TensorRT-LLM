@@ -290,6 +290,11 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
     """Two scenarios:
     - logprobs=0: Returns only sampled token (1 element)
     - logprobs=K (K>0): Returns top-K tokens + sampled token if not in top-K (up to K+1 elements)
+
+    For prompt logprobs, the "target" token at position t is the NEXT prompt
+    token (token_ids[t+1]), since context_logits[t] predicts what follows the
+    input at position t.  The last position has no next prompt token, so only
+    the top-K (or top-1 for k=0) is returned.
     """
 
     sampling_params = SamplingParams(
@@ -309,40 +314,60 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
             f"Expected {len(token_ids)} logprob entries, got {len(logprobs)}"
         )
 
-        for token_idx, (sampled_token_id, token_logprobs) in enumerate(zip(token_ids, logprobs)):
-            print(
-                f"\n  Token {token_idx}: "
-                f"ID={sampled_token_id}, "
-                f"Text={simple_llm.tokenizer.decode([sampled_token_id])!r}"
+        for token_idx, token_logprobs in enumerate(logprobs):
+            # The target token for position t is the next prompt token
+            is_last_position = (token_idx == len(token_ids) - 1)
+            target_token_id = (
+                token_ids[token_idx + 1] if not is_last_position else None
             )
 
-            assert sampled_token_id in token_logprobs, (
-                f"Token {token_idx}: Sampled token ID {sampled_token_id} not in logprobs dict: {token_logprobs.keys()}"
+            print(
+                f"\n  Token {token_idx}: "
+                f"Input ID={token_ids[token_idx]}, "
+                f"Target ID={target_token_id}, "
+                f"Text={simple_llm.tokenizer.decode([token_ids[token_idx]])!r}"
             )
 
             if logprobs_k == 0:
                 assert len(token_logprobs) == 1, (
-                    f"Token {token_idx}: Expected 1 logprob (sampled only), got {len(token_logprobs)}"
+                    f"Token {token_idx}: Expected 1 logprob, got {len(token_logprobs)}"
                 )
+                if target_token_id is not None:
+                    assert target_token_id in token_logprobs, (
+                        f"Token {token_idx}: Target token ID {target_token_id} "
+                        f"not in logprobs dict: {token_logprobs.keys()}"
+                    )
             else:
                 assert len(token_logprobs) <= logprobs_k + 1, (
                     f"Token {token_idx}: Expected at most {logprobs_k + 1} logprobs, got {len(token_logprobs)}"
                 )
                 assert len(token_logprobs) >= 1
 
-            sorted_tokens_by_prob = sorted(
-                token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
-            )
+                if target_token_id is not None:
+                    assert target_token_id in token_logprobs, (
+                        f"Token {token_idx}: Target token ID {target_token_id} "
+                        f"not in logprobs dict: {token_logprobs.keys()}"
+                    )
 
-            if logprobs_k > 0:
-                sampled_token_rank = token_logprobs[sampled_token_id].rank
-                sampled_in_topk = sampled_token_rank <= logprobs_k
+                    sorted_tokens_by_prob = sorted(
+                        token_logprobs.items(),
+                        key=lambda x: (x[1].logprob, -x[1].rank),
+                        reverse=True,
+                    )
+                    target_rank = token_logprobs[target_token_id].rank
+                    target_in_topk = target_rank <= logprobs_k
 
-                if not sampled_in_topk:
-                    assert sorted_tokens_by_prob[-1][0] == sampled_token_id, (
-                        f"Token {token_idx}: Sampled token (ID={sampled_token_id}, rank={sampled_token_rank}) "
-                        f"not in top-{logprobs_k}, should be last in sorted list, "
-                        f"but last token is ID={sorted_tokens_by_prob[-1][0]}"
+                    if not target_in_topk:
+                        assert sorted_tokens_by_prob[-1][0] == target_token_id, (
+                            f"Token {token_idx}: Target token (ID={target_token_id}, rank={target_rank}) "
+                            f"not in top-{logprobs_k}, should be last in sorted list, "
+                            f"but last token is ID={sorted_tokens_by_prob[-1][0]}"
+                        )
+                else:
+                    # Last position: only top-K, no extra target token
+                    assert len(token_logprobs) == logprobs_k, (
+                        f"Token {token_idx} (last): Expected {logprobs_k} logprobs (top-K only), "
+                        f"got {len(token_logprobs)}"
                     )
 
         print(f"{'=' * 80}\n")
@@ -429,9 +454,12 @@ def test_logprobs_against_logits(
                 "generation",
             )
         if prompt_logprobs_k is not None:
-            context_tokens = output.prompt_token_ids
-            context_logprobs = output.outputs[0].prompt_logprobs
-            context_logits = output.context_logits.to(device="cuda")
+            # For prompt logprobs, the target at position t is the next
+            # prompt token (t+1). Shift tokens and skip the last logprob
+            # position (which has no next prompt token to validate against).
+            context_tokens = output.prompt_token_ids[1:]
+            context_logprobs = output.outputs[0].prompt_logprobs[:-1]
+            context_logits = output.context_logits[:-1].to(device="cuda")
             check_logprobs(
                 prompt_logprobs_k,
                 context_tokens,
