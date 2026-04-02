@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -119,6 +119,10 @@ public:
         // this is a buffer of size [num_tokens, num_heads_q] with each element
         // representing the max and LSE/denominator of the softmax values
         float2* softmax_stats = nullptr;
+        // Optional SageAttention scaling factors.
+        float const* sage_attn_sfs_q = nullptr;
+        float const* sage_attn_sfs_k = nullptr;
+        float const* sage_attn_sfs_v = nullptr;
     };
 
     template <typename T>
@@ -252,6 +256,18 @@ public:
         static constexpr int block_size_m = 64;
         int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
         int sm_cnt = mMultiProcessorCount;
+        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+        return num_sm_parts;
+    }
+
+    static int getFlashMlaNumSmPartsStatic(int s_q, int num_heads, int num_kv_heads, int head_size_v)
+    {
+        static constexpr int block_size_m = 64;
+        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
+        int device;
+        cudaGetDevice(&device);
+        int sm_cnt;
+        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, device);
         int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
         return num_sm_parts;
     }
@@ -507,6 +523,12 @@ public:
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactorPrefill = 0;
     float mSkipSoftmaxThresholdScaleFactorDecode = 0;
+    // Optional SageAttention block sizes.
+    // Currently, these are only consumed by the TllmGen backend path.
+    int mSageAttnNumEltsPerBlkQ = 0;
+    int mSageAttnNumEltsPerBlkK = 0;
+    int mSageAttnNumEltsPerBlkV = 0;
+    bool mSageAttnQkInt8 = false;
 #ifdef SKIP_SOFTMAX_STAT
     uint32_t* mSkipSoftmaxTotalBlocks;
     uint32_t* mSkipSoftmaxSkippedBlocks;
@@ -529,7 +551,8 @@ public:
             mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
             mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
-            mSkipSoftmaxThresholdScaleFactorDecode);
+            mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
+            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 
 private:

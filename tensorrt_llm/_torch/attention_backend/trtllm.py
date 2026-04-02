@@ -206,6 +206,8 @@ class TrtllmAttentionWrapper:
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
         block_ids_per_seq: Optional[torch.Tensor] = None,
+        flash_mla_tile_scheduler_metadata: Optional[torch.Tensor] = None,
+        flash_mla_num_splits: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
         cache_indirection: Optional[torch.Tensor] = None,
         kv_scale_orig_quant: Optional[torch.Tensor] = None,
@@ -327,6 +329,8 @@ class TrtllmAttentionWrapper:
         self.mrope_position_deltas = mrope_config.get(
             'mrope_position_deltas') if mrope_config is not None else None
         self.block_ids_per_seq = block_ids_per_seq
+        self.flash_mla_tile_scheduler_metadata = flash_mla_tile_scheduler_metadata
+        self.flash_mla_num_splits = flash_mla_num_splits
         self.softmax_stats_tensor = softmax_stats_tensor
         self.attention_sinks = attention_sinks
         self.sparse_kv_indices = sparse_kv_indices
@@ -403,6 +407,10 @@ class TrtllmAttentionWrapper:
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
+        sage_attn_num_elts_per_blk_q: int = 0,
+        sage_attn_num_elts_per_blk_k: int = 0,
+        sage_attn_num_elts_per_blk_v: int = 0,
+        sage_attn_qk_int8: bool = False,
     ):
         """
         Run the attention operation.
@@ -637,6 +645,13 @@ class TrtllmAttentionWrapper:
                 global_layer_idx=self.global_layer_idx,
             )
         else:
+            use_sage_attn = any(sf > 0 for sf in [
+                sage_attn_num_elts_per_blk_q, sage_attn_num_elts_per_blk_k,
+                sage_attn_num_elts_per_blk_v
+            ])
+
+            assert not use_sage_attn or not is_fused_qkv, "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false)."
+
             thop.attention(
                 q,
                 k,
@@ -716,6 +731,12 @@ class TrtllmAttentionWrapper:
                 mla_bmm1_scale,
                 mla_bmm2_scale,
                 quant_q_buffer,
+                self.flash_mla_tile_scheduler_metadata,
+                self.flash_mla_num_splits,
+                sage_attn_num_elts_per_blk_q,
+                sage_attn_num_elts_per_blk_k,
+                sage_attn_num_elts_per_blk_v,
+                sage_attn_qk_int8,
             )
 
         if self.print_skip_softmax_stat:
@@ -854,6 +875,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+
+    # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
+    # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
+    flash_mla_tile_scheduler_metadata: Optional[torch.Tensor] = None
+    flash_mla_num_splits: Optional[torch.Tensor] = None
+    _flash_mla_metadata_valid: bool = field(default=False,
+                                            init=False,
+                                            repr=False)
 
     @property
     def max_seq_len(self) -> int:
@@ -1000,6 +1029,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
+                # Allocate fixed-size buffers for pre-computed FlashMLA metadata.
+                # These are pre-allocated so their GPU addresses are stable across CUDA graph captures.
+                sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()).multi_processor_count
+                self.flash_mla_tile_scheduler_metadata = self.get_empty(
+                    buffers,
+                    [sm_count * 8],  # TileSchedulerMetaDataSize = 8
+                    cache_name="flash_mla_tile_scheduler_metadata",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
+                self.flash_mla_num_splits = self.get_empty(
+                    buffers,
+                    [self.kv_cache_manager.max_batch_size + 1],
+                    cache_name="flash_mla_num_splits",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
             if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
                 self.ctx_cached_token_indptr = self.get_empty(
@@ -1070,7 +1117,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
-        pass
+        if self.enable_flash_mla:
+            self._flash_mla_metadata_valid = False
+
+    def update_for_spec_dec(self) -> None:
+        # MTP updates kv_lens_cuda in-place between sub-steps, which changes
+        # cache_seq_lens seen by the C++ attention op.  Invalidate the metadata
+        # so that forward() recomputes it for the next sub-step.
+        if self.enable_flash_mla:
+            self._flash_mla_metadata_valid = False
 
     def update_helix_param(
         self,
@@ -1200,6 +1255,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                                   num_seqs]
 
     def prepare_flash_mla(self) -> None:
+        # Invalidate the pre-computed metadata so that forward() recomputes it
+        # for this forward pass before the first attention layer runs.
+        self._flash_mla_metadata_valid = False
         block_ids_per_seq = maybe_pin_memory(
             self.kv_cache_manager.get_block_ids_per_seq(self.request_ids))
         num_blocks = block_ids_per_seq.shape[1]
@@ -1759,6 +1817,31 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return torch.float8_e4m3fn
         return None
 
+    def _compute_flash_mla_metadata(self,
+                                    metadata: TrtllmAttentionMetadata) -> None:
+        num_generations = metadata.num_generations
+        if num_generations <= 0:
+            return
+
+        generation_slice = slice(metadata.num_contexts,
+                                 metadata.num_contexts + num_generations)
+        generation_kv_lens = metadata.kv_lens_cuda_runtime[generation_slice]
+        generation_num_splits = metadata.flash_mla_num_splits[:num_generations +
+                                                              1]
+
+        s_q = int(metadata.seq_lens[metadata.num_contexts].item())
+
+        thop.compute_flash_mla_metadata(
+            generation_kv_lens,
+            metadata.flash_mla_tile_scheduler_metadata,
+            generation_num_splits,
+            num_generations,
+            s_q,
+            self.wrapper.num_heads,
+            1,
+            self.wrapper.kv_lora_rank,
+        )
+
     def create_output(self, q, *, is_quantize_output: bool,
                       metadata: TrtllmAttentionMetadata,
                       attention_mask: AttentionMask, is_gen_only: bool,
@@ -1801,6 +1884,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
+        sage_attn_num_elts_per_blk_q: int = 0,
+        sage_attn_num_elts_per_blk_k: int = 0,
+        sage_attn_num_elts_per_blk_v: int = 0,
+        sage_attn_qk_int8: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -1882,6 +1969,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
 
+        # Compute FlashMLA tile-scheduler metadata once per forward pass.
+        # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
+        # recomputation when cache_seq_lens change. The metadata must always match the
+        # compacted generation sub-batch, which is also the layout used by block_ids_per_seq.
+        if (metadata.enable_flash_mla
+                and attention_input_type != AttentionInputType.context_only
+                and metadata.num_generations > 0
+                and not metadata._flash_mla_metadata_valid):
+            self._compute_flash_mla_metadata(metadata)
+            metadata._flash_mla_metadata_valid = True
+
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1902,7 +2000,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
-            # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
+            flash_mla_tile_scheduler_metadata=metadata.
+            flash_mla_tile_scheduler_metadata
+            if metadata.enable_flash_mla else None,
+            flash_mla_num_splits=metadata.flash_mla_num_splits
+            if metadata.enable_flash_mla else None,
             workspace=metadata.workspace
             if not metadata.is_cuda_graph else metadata.cuda_graph_workspace,
             cache_indirection=metadata.cache_indirection,
@@ -1953,20 +2055,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         self.wrapper.global_layer_idx = self.layer_idx
 
-        self.wrapper.run(q,
-                         output,
-                         output_sf,
-                         k,
-                         v,
-                         is_fused_qkv=not metadata.is_cross and k is None,
-                         update_kv_cache=not metadata.is_cross or k is not None,
-                         attention_mask=attention_mask,
-                         cu_q_seqlens=cu_q_seqlens,
-                         cu_kv_seqlens=cu_kv_seqlens,
-                         fmha_scheduler_counter=fmha_scheduler_counter,
-                         mla_bmm1_scale=mla_bmm1_scale,
-                         mla_bmm2_scale=mla_bmm2_scale,
-                         quant_q_buffer=quant_q_buffer)
+        self.wrapper.run(
+            q,
+            output,
+            output_sf,
+            k,
+            v,
+            is_fused_qkv=not metadata.is_cross and k is None,
+            update_kv_cache=not metadata.is_cross or k is not None,
+            attention_mask=attention_mask,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            mla_bmm1_scale=mla_bmm1_scale,
+            mla_bmm2_scale=mla_bmm2_scale,
+            quant_q_buffer=quant_q_buffer,
+            sage_attn_num_elts_per_blk_q=sage_attn_num_elts_per_blk_q,
+            sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
+            sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v,
+            sage_attn_qk_int8=sage_attn_qk_int8)
 
         if output_sf is None:
             return output

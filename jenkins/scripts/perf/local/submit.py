@@ -430,6 +430,11 @@ def main():
         choices=["source", "wheel"],
         help="Installation mode: source (pip install -e ., default) or wheel (pip install *.whl)",
     )
+    parser.add_argument(
+        "--wheel-path",
+        default="",
+        help="Path to a specific wheel file to install (used when INSTALL_MODE=wheel)",
+    )
     parser.add_argument("--capture-nsys", action="store_true", help="Capture nsys profile")
     parser.add_argument(
         "--nsys-start-stop",
@@ -573,6 +578,7 @@ def main():
             f"export configYamlPath='{config_yaml}'",
             f"export BUILD_WHEEL={'true' if args.build_wheel else 'false'}",
             f"export INSTALL_MODE='{args.install_mode}'",
+            f"export WHEEL_PATH='{args.wheel_path}'",
         ]
     )
 

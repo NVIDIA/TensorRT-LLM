@@ -1533,7 +1533,7 @@ public:
     static constexpr SizeType32 kDefaultRequestStatsMaxIterations = 0;
 
     explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
-        KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = true,
+        KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = false,
         SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,

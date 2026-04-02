@@ -878,6 +878,7 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                 mtp_num_modules + 1 -
                 num_accepted_tokens[num_contexts:batch_size])
+            attn_metadata.on_update_kv_lens()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):

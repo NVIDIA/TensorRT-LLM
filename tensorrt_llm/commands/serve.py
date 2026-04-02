@@ -34,11 +34,14 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
-from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
+                                                  resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+    resolve_auto_tool_parser
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # Global variable to store the Popen object of the child process
@@ -675,17 +678,19 @@ class ChoiceWithAlias(click.Choice):
         "prototype"))
 @click.option(
     "--reasoning_parser",
-    type=click.Choice(ReasoningParserFactory.keys()),
+    type=click.Choice(["auto"] + list(ReasoningParserFactory.keys())),
     default=None,
     help=help_info_with_stability_tag(
-        "Specify the parser for reasoning models.", "prototype"),
+        "Specify the parser for reasoning models. "
+        "Use 'auto' to automatically select based on the model.", "prototype"),
 )
 @click.option(
     "--tool_parser",
-    type=click.Choice(ToolParserFactory.parsers.keys()),
+    type=click.Choice(["auto"] + list(ToolParserFactory.parsers.keys())),
     default=None,
-    help=help_info_with_stability_tag("Specify the parser for tool models.",
-                                      "prototype"),
+    help=help_info_with_stability_tag(
+        "Specify the parser for tool models. "
+        "Use 'auto' to automatically select based on the model.", "prototype"),
 )
 @click.option("--metadata_server_config_file",
               type=str,
@@ -808,6 +813,33 @@ def serve(
             "It now defaults to True and will be removed in a future release. "
             "This flag only affects the TRT backend.")
 
+    if tool_parser == "auto":
+        resolved = resolve_auto_tool_parser(model)
+        if resolved is None:
+            raise click.BadParameter(
+                f"Cannot auto-detect tool parser for model '{model}'. "
+                f"Supported model types for auto-detection: qwen2, qwen3, "
+                f"qwen3_moe, qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3, "
+                f"deepseek_v32, kimi_k2, kimi_k25, glm4. "
+                f"Please specify a parser explicitly: "
+                f"{list(ToolParserFactory.parsers.keys())}",
+                param_hint="--tool_parser")
+        logger.info(f"Auto-detected tool parser: {resolved}")
+        tool_parser = resolved
+
+    if reasoning_parser == "auto":
+        resolved = resolve_auto_reasoning_parser(model)
+        if resolved is None:
+            raise click.BadParameter(
+                f"Cannot auto-detect reasoning parser for model '{model}'. "
+                f"Supported model types for auto-detection: qwen3, qwen3_moe, "
+                f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
+                f"deepseek_v32 (R1 only), nemotron_h. "
+                f"Please specify a parser explicitly: "
+                f"{list(ReasoningParserFactory.keys())}",
+                param_hint="--reasoning_parser")
+        logger.info(f"Auto-detected reasoning parser: {resolved}")
+        reasoning_parser = resolved
     if "--revision" in sys.argv:
         logger.warning("--revision is deprecated, use --hf_revision instead.")
 
@@ -936,7 +968,9 @@ def serve(
         launch_visual_gen_server(host, port, model, diffusion_args,
                                  metadata_server_cfg)
 
-    if get_is_diffusion_model(model):
+    is_visual_gen = extra_visual_gen_options is not None or get_is_diffusion_model(
+        model)
+    if is_visual_gen:
         _serve_visual_gen()
     else:
         _serve_llm()
@@ -1070,6 +1104,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
+@click.option("-s",
+              "--schedule_style",
+              type=click.Choice(["context_first", "generation_first"],
+                                case_sensitive=False),
+              default=None,
+              help="The schedule style for the disaggregated server.")
 @click.option(
     "--metrics-log-interval",
     type=int,
@@ -1084,6 +1124,7 @@ def disaggregated(
     request_timeout: int,
     log_level: str,
     metrics_log_interval: int,
+    schedule_style: str,
 ):
     """Running server in disaggregated mode"""
 
@@ -1098,7 +1139,8 @@ def disaggregated(
         logger.warning("--config_file is deprecated, use --config instead.")
 
     disagg_cfg = parse_disagg_config_file(config_file)
-
+    if schedule_style:
+        disagg_cfg.schedule_style = schedule_style
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))

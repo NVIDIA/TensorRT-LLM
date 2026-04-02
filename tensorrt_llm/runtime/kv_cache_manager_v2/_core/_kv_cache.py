@@ -1128,6 +1128,13 @@ class _KVCache:
     @contextmanager
     def _record_event(self) -> Iterator[None]:
         assert self._finish_event is None
+        if self._cuda_stream is None:
+            # Cache was never resumed — no GPU work was performed,
+            # so no CUDA event synchronization is needed.  Blocks
+            # only contain _PageHolders (not _SharedPageLocks) and
+            # their destructors do not read finish_event.
+            yield
+            return
         self._finish_event = CachedCudaEvent(self.cuda_stream)
         try:
             yield
