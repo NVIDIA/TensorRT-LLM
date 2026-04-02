@@ -1,5 +1,6 @@
 from .modeling_deepseek import DeepSeekV3ForCausalLM
 from .modeling_gemma3n import Gemma3nForCausalLM, Gemma3nForConditionalGeneration
+from .modeling_gemma4 import Gemma4ForCausalLM, Gemma4ForConditionalGeneration
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_mistral3 import Mistral3ForConditionalGenerationAD, Mistral4ForCausalLM
@@ -11,6 +12,8 @@ __all__ = (
     "DeepSeekV3ForCausalLM",
     "Gemma3nForCausalLM",
     "Gemma3nForConditionalGeneration",
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
     "Glm4MoeLiteForCausalLM",
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",

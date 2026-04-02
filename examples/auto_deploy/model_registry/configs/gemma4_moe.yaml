@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gemma 4 MoE (26B total, 4B activated) — text-only AD export path.
+# Uses triton paged attention backend: supports head_dim=512 (global_head_dim),
+# paged KV cache, CUDA-graph-compatible, FlashDecoding for decode.
+attn_backend: triton_paged
