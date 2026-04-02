@@ -688,7 +688,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_dense_topk_indices(self,
                                    kv_lens,
                                    device=False):  # device=False means use CPU
-        """Prepare dense TopK indices for short sequences that skip the indexer."""
 
         if self.num_contexts > 0 and self.skip_indexer_for_ctx_reqs:
             ctx_range = slice(self.num_ctx_tokens)
