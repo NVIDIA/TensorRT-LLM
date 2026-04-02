@@ -338,7 +338,12 @@ class Llama4MoE(nn.Module):
         fn1 = lambda: self.compute_routed_output(
             hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
-            fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
+            fn0,
+            fn1,
+            self.moe_event[0],
+            self.moe_event[1],
+            self.aux_stream,
+            disable_on_compile=True)
         if cutlass_min_latency_mode:
             return [shared_output, *routed_output]
 
