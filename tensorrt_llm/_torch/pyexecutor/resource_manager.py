@@ -590,7 +590,8 @@ class KVCacheManager(BaseResourceManager):
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
-            self.impl.store_context_blocks(request)
+            if request.context_remaining_length == 0:
+                self.impl.store_context_blocks(request)
 
     def locate_accepted_draft_tokens(self, requests: List[LlmRequest]):
         num_accepted_draft_tokens = []
