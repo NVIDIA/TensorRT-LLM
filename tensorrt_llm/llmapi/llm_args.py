@@ -3542,6 +3542,18 @@ class TorchLlmArgs(BaseLlmArgs):
         description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
         status="prototype",
     )
+    use_cute_dsl_bf16_bmm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        status="prototype",
+    )
+    use_cute_dsl_bf16_gemm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
+        status="prototype",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
