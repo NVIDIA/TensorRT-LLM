@@ -38,7 +38,7 @@ gantt
 | **3** | Simulated clock | `SimClock`, no `time.sleep()`, accumulate predicted times | **Done** |
 | **3.5** | Single-process mode | Force single-process executor for sim, fix clock visibility, TP>1 | **Done** |
 | **4** | Metrics output | Per-request TTFT/TPOT/ITL, per-iteration breakdown, `metrics.json` | **Done** |
-| **5** | CLI integration | `trtllm-bench --mode sim` with dataset input | Planned |
+| **5** | CLI integration | `trtllm-bench throughput --sim [--sim-config]` with 3-tier verification | **Done** |
 | **6** | Request arrival modeling | Staggered arrivals, `--request-rate`, online serving sim | Planned |
 | **7** | Multi-GPU / distributed | PP support, disagg KV transfer modeling | Planned |
 
