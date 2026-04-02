@@ -462,6 +462,9 @@ class PyExecutor:
             self.kv_cache_manager.snapshot_warmup_baseline()
 
         self.is_shutdown = False
+        self._fatal_error: Optional[BaseException] = None
+        self._consecutive_error_count: int = 0
+        self._max_consecutive_errors: int = 10
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
@@ -2092,6 +2095,7 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
+                self._consecutive_error_count = 0
                 self.iter_counter += 1
 
     def _prepare_draft_requests(self):
@@ -3363,12 +3367,44 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _is_fatal_error(self, error_msg: str) -> bool:
+        """Check if an error message indicates an unrecoverable CUDA/system error."""
+        fatal_patterns = [
+            "cuda out of memory",
+            "cuda error",
+            "cudaerrorillegaladd",
+            "cudaerrorlaunchfailure",
+            "nccl error",
+            "device-side assert",
+            "unrecoverable",
+        ]
+        error_lower = error_msg.lower()
+        return any(p in error_lower for p in fatal_patterns)
+
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None):
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+
+        is_fatal = self._is_fatal_error(error_msg)
+
+        # Track consecutive errors to detect persistent failure loops
+        self._consecutive_error_count += 1
+        if self._consecutive_error_count >= self._max_consecutive_errors:
+            is_fatal = True
+            logger.error(
+                "Consecutive error threshold reached "
+                f"({self._consecutive_error_count}), treating as fatal")
+
+        if is_fatal:
+            self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
+            logger.error(
+                f"Fatal error detected, initiating shutdown: {error_msg}")
+            # Fail ALL active requests on fatal error, not just the current batch
+            requests = None
+
         failed_requests = requests if requests is not None else self.active_requests
         for request in failed_requests:
             req_id = request.py_request_id
@@ -3387,6 +3423,9 @@ class PyExecutor:
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
             self._terminate_request(request)
+
+        if self._fatal_error is not None:
+            self.executor_request_queue.enqueue_shutdown_request()
 
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,

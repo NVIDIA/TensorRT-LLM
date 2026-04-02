@@ -101,6 +101,10 @@ class GenerationExecutor(ABC):
         # A flag to avoid calling shutdown() recursively. This happens when the background threads raise errors.
         self.doing_shutdown = False
 
+        # Tracks unrecoverable engine errors (e.g. CUDA OOM crash).
+        # Once set, health checks return unhealthy and shutdown is initiated.
+        self._fatal_error: Optional[BaseException] = None
+
         self._last_client_id: int = 1
 
         # whether it's the executor instance of LLM API
@@ -283,6 +287,7 @@ class GenerationExecutor(ABC):
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
+                self._set_fatal_error(error)
                 self.shutdown()
             raise error
 
@@ -291,12 +296,38 @@ class GenerationExecutor(ABC):
         if not self._error_queue.empty():
             e = self._error_queue.get()
             self._error_queue.task_done()
+            self._set_fatal_error(e)
             self.shutdown()
             # We can catch some exceptions here.
             raise e
 
+    def _set_fatal_error(self, error: BaseException):
+        """Record an unrecoverable engine error. Only the first error is kept."""
+        if self._fatal_error is None:
+            self._fatal_error = error
+            logger.error(f"Fatal engine error recorded: {repr(error)}")
+
     def is_shutdown(self) -> bool:
-        return self.doing_shutdown
+        return self.doing_shutdown or self._fatal_error is not None
+
+    def check_health(self) -> bool:
+        """Check if the executor is healthy.
+
+        Returns False if the executor has been shut down, has a fatal error,
+        or has pending fatal errors in the error queue. Safe to call from
+        any thread.
+        """
+        if self.doing_shutdown or self._fatal_error is not None:
+            return False
+        # Drain the error queue so that background errors (e.g. MPI worker
+        # crash) are detected even when no generate() calls are in flight.
+        if not self._error_queue.empty():
+            try:
+                self._handle_background_error()
+            except Exception:
+                pass  # _handle_background_error sets _fatal_error + shutdown
+            return self._fatal_error is None and not self.doing_shutdown
+        return True
 
     @abstractmethod
     def shutdown(self):
