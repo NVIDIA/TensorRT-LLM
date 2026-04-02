@@ -288,6 +288,25 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.",
 )
+@optgroup.group("Simulation Mode",
+                help="Run throughput benchmark in simulation mode.")
+@optgroup.option(
+    "--sim",
+    is_flag=True,
+    default=False,
+    help="Enable simulation mode. Uses predicted batch times instead of GPU execution.",
+)
+@optgroup.option(
+    "--sim-config",
+    "sim_config_path",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    help="Path to YAML file with sim predictor config. "
+    "Without this, uses constant predictor defaults.",
+)
 @click.pass_obj
 def throughput_command(
     bench_env: BenchmarkEnvironment,
@@ -352,6 +371,50 @@ def throughput_command(
         # NOTE: This table is only accurate for non-multimodal models.
         #       The accurate table for multimodal models will be logged after the benchmark is done.
         logger.info(metadata.get_summary_for_print())
+
+    # === Sim mode: bypass normal engine setup and async benchmark ===
+    sim_enabled: bool = params.get("sim", False)
+    sim_config_path = params.get("sim_config_path")
+
+    if sim_enabled:
+        from tensorrt_llm.bench.benchmark.sim_benchmark import (
+            load_sim_config, run_sim_benchmark, print_sim_report,
+            write_sim_report, write_sim_request_report)
+
+        sim_config = load_sim_config(sim_config_path)
+        predictor_desc = sim_config.predictor.name
+        if sim_config.predictor.name == "aiconfigurator":
+            predictor_desc += f" ({sim_config.predictor.device_name})"
+
+        sampling_args = {
+            "end_id": options.eos_id,
+            "pad_id": options.eos_id,
+        }
+        sampling_params = SamplingParams(**sampling_args)
+
+        metrics = run_sim_benchmark(
+            model=options.checkpoint_path or bench_env.model,
+            requests=requests,
+            sim_config=sim_config,
+            sampling_params=sampling_params,
+            tp_size=params.get("tp", 1),
+            pp_size=params.get("pp", 1),
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=options.max_seq_len,
+            kv_cache_free_gpu_mem_fraction=options.kv_cache_percent,
+        )
+
+        print_sim_report(metrics, bench_env.model,
+                         tp_size=params.get("tp", 1),
+                         predictor_desc=predictor_desc)
+
+        if options.report_json:
+            write_sim_report(metrics, options.report_json)
+        if options.request_json:
+            write_sim_request_report(sim_config, options.request_json)
+
+        return  # Skip normal benchmark path
 
     # Engine configuration parsing
     if options.backend and options.backend.lower(
