@@ -248,11 +248,6 @@ class AdGraphOutput(IRDLOperation):
     inputs = var_operand_def(AnyAttr())
 
 
-# ---------------------------------------------------------------------------
-# Primitive ops for elementwise fusion
-# ---------------------------------------------------------------------------
-
-
 @irdl_op_definition
 class AdMul(IRDLOperation):
     """Elementwise multiplication — mirrors ``aten.mul.Tensor``."""
