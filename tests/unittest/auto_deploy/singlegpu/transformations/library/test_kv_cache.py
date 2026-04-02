@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn as nn
-from _model_test_utils import GQA
+from _model_test_utils import GQA, default_max_num_tokens
 from _torch_test_utils import all_close
 
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
@@ -166,7 +166,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     cm = CachedSequenceInterface(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
-        max_num_tokens=(max_position_embeddings + 1) * batch_size,
+        max_num_tokens=default_max_num_tokens(max_position_embeddings, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -291,7 +291,7 @@ def dummy_cached_interface():
     return CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
-        max_num_tokens=129 * 4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -368,7 +368,7 @@ def test_resize_kv_cache_transform_runs_when_needed():
     cm = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
-        max_num_tokens=129 * 4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -418,7 +418,7 @@ def test_insert_cached_attention_uses_add_resource():
     cm = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
-        max_num_tokens=(max_seq_len + 1) * batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -492,7 +492,7 @@ def test_insert_cached_attention_passes_kv_cache_config():
     cm = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
-        max_num_tokens=(max_seq_len + 1) * batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
