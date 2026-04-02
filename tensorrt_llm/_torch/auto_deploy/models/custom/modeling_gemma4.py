@@ -32,23 +32,19 @@ Key architectural features of Gemma 4 vs standard transformers:
 - Final logit softcapping
 """
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from tokenizers import Tokenizer
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig, PreTrainedTokenizerFast
+from transformers import AutoConfig, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import ModelOutput, cached_file
+from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -250,10 +246,10 @@ def _build_rope_cache(
 
 
 class Gemma4RMSNorm(nn.Module):
-    """RMSNorm matching HF Gemma4 (transformers >= 5.5).
+    """RMSNorm with Gemma4-style (weight + scale_shift) semantics.
 
-    The checkpoint stores effective weights directly — no ``+1.0`` offset.
-    Uses the ``torch_rmsnorm`` canonical op for AD transform compatibility.
+    For AD export, we store the *effective* weight = checkpoint_weight + scale_shift
+    via a load hook, then use the standard torch_rmsnorm op.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
@@ -264,6 +260,16 @@ class Gemma4RMSNorm(nn.Module):
             self.weight = nn.Parameter(torch.ones(dim))
         else:
             self.register_buffer("weight", torch.ones(dim), persistent=False)
+        if with_scale:
+            self._register_load_state_dict_pre_hook(self._apply_scale_shift)
+
+    @staticmethod
+    def _apply_scale_shift(state_dict, prefix, *_args, **_kwargs):
+        """Gemma4 RMSNorm stores weight that is used as (weight + 1.0).
+        Convert to effective weight at load time so torch_rmsnorm works directly."""
+        key = prefix + "weight"
+        if key in state_dict:
+            state_dict[key] = state_dict[key] + 1.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.auto_deploy.torch_rmsnorm(x, self.weight, self.eps)
@@ -381,6 +387,27 @@ class Gemma4MoEBlock(nn.Module):
                 for _ in range(config.num_experts)
             ]
         )
+        self._register_load_state_dict_pre_hook(self._unfuse_moe_weights)
+
+    def _unfuse_moe_weights(self, state_dict, prefix, *_args, **_kwargs):
+        """Convert fused checkpoint MoE weights to per-expert format."""
+        gate_up_key = prefix + "gate_up_proj"
+        down_key = prefix + "down_proj"
+        scale_key = prefix + "per_expert_scale"
+
+        if gate_up_key not in state_dict:
+            return
+
+        gate_up = state_dict.pop(gate_up_key)  # [E, 2*I, H]
+        down = state_dict.pop(down_key)  # [E, H, I]
+        scale = state_dict.pop(scale_key)  # [E]
+
+        inter = self.intermediate_size
+        for e in range(self.num_experts):
+            state_dict[f"{prefix}experts.{e}.gate_proj.weight"] = gate_up[e, :inter, :]
+            state_dict[f"{prefix}experts.{e}.up_proj.weight"] = gate_up[e, inter:, :]
+            # Fold per_expert_scale into down_proj
+            state_dict[f"{prefix}experts.{e}.down_proj.weight"] = down[e] * scale[e]
 
     def forward(
         self,
@@ -497,8 +524,6 @@ class Gemma4TextDecoderLayer(nn.Module):
     def __init__(self, config: Gemma4TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.num_experts = config.num_experts
-        self.expert_intermediate_size = config.expert_intermediate_size
         self.attention_type = config.layer_types[layer_idx]
         self.self_attn = Gemma4TextAttention(config, layer_idx)
         self.mlp = Gemma4TextMLP(config)
@@ -512,7 +537,6 @@ class Gemma4TextDecoderLayer(nn.Module):
         if self.enable_moe_block:
             self.router = Gemma4Router(config)
             self.moe = Gemma4MoEBlock(config)
-            self._register_load_state_dict_pre_hook(self._unfuse_moe_weights)
             self.post_feedforward_layernorm_1 = Gemma4RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
@@ -522,46 +546,6 @@ class Gemma4TextDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm_2 = Gemma4RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-
-    def _unfuse_moe_weights(self, state_dict, prefix, *_args, **_kwargs):
-        """Convert layer-level fused Gemma4 MoE checkpoint weights to per-expert weights."""
-        candidates = [
-            (
-                prefix + "experts.gate_up_proj",
-                prefix + "experts.down_proj",
-                prefix + "router.per_expert_scale",
-            ),
-            (
-                prefix + "moe.gate_up_proj",
-                prefix + "moe.down_proj",
-                prefix + "moe.per_expert_scale",
-            ),
-        ]
-
-        gate_up_key = down_key = scale_key = None
-        for gate_up_candidate, down_candidate, scale_candidate in candidates:
-            if (
-                gate_up_candidate in state_dict
-                and down_candidate in state_dict
-                and scale_candidate in state_dict
-            ):
-                gate_up_key = gate_up_candidate
-                down_key = down_candidate
-                scale_key = scale_candidate
-                break
-
-        if gate_up_key is None or down_key is None or scale_key is None:
-            return
-
-        gate_up = state_dict.pop(gate_up_key)  # [E, 2*I, H]
-        down = state_dict.pop(down_key)  # [E, H, I]
-        scale = state_dict.pop(scale_key)  # [E]
-
-        inter = self.expert_intermediate_size
-        for e in range(self.num_experts):
-            state_dict[f"{prefix}moe.experts.{e}.gate_proj.weight"] = gate_up[e, :inter, :]
-            state_dict[f"{prefix}moe.experts.{e}.up_proj.weight"] = gate_up[e, inter:, :]
-            state_dict[f"{prefix}moe.experts.{e}.down_proj.weight"] = down[e] * scale[e]
 
     def forward(
         self,
@@ -899,93 +883,10 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
 
 
 # ---------------------------------------------------------------------------
-# Wrapper tokenizer for Gemma 4
-#
-# The upstream HF checkpoint ships ``extra_special_tokens`` as a *list* in
-# tokenizer_config.json, which is incompatible with transformers <5.3.
-# This thin wrapper loads the tokenizer assets directly, bypassing the
-# problematic codepath.
-# ---------------------------------------------------------------------------
-
-_TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
-_CHAT_TEMPLATE_FILE = "chat_template.jinja"
-_TOKENIZER_FILE = "tokenizer.json"
-
-
-class ADGemma4Tokenizer(PreTrainedTokenizerFast):
-    """Wrapper that loads the upstream Gemma 4 tokenizer on current transformers."""
-
-    vocab_files_names = {"tokenizer_file": _TOKENIZER_FILE}
-    model_input_names = ["input_ids", "attention_mask"]
-    slow_tokenizer_class = None
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | Path,
-        *inputs,
-        **kwargs,
-    ) -> "ADGemma4Tokenizer":
-        del inputs
-        for k in ("_from_auto", "_commit_hash", "trust_remote_code"):
-            kwargs.pop(k, None)
-
-        config_path = cached_file(pretrained_model_name_or_path, _TOKENIZER_CONFIG_FILE, **kwargs)
-        assert config_path is not None
-        config = json.loads(Path(config_path).read_text())
-
-        tokenizer_file = cached_file(pretrained_model_name_or_path, _TOKENIZER_FILE, **kwargs)
-        assert tokenizer_file is not None
-
-        # ``extra_special_tokens`` is a list in the upstream config; map it to
-        # the standard ``additional_special_tokens`` field.
-        extra = config.get("extra_special_tokens", [])
-        if isinstance(extra, list):
-            additional = extra
-        else:
-            additional = list(extra.keys()) if isinstance(extra, dict) else []
-
-        tokenizer = cls(
-            tokenizer_object=Tokenizer.from_file(tokenizer_file),
-            name_or_path=str(pretrained_model_name_or_path),
-            bos_token=config.get("bos_token"),
-            eos_token=config.get("eos_token"),
-            unk_token=config.get("unk_token"),
-            pad_token=config.get("pad_token"),
-            additional_special_tokens=additional,
-            clean_up_tokenization_spaces=config.get("clean_up_tokenization_spaces", False),
-            model_max_length=config.get("model_max_length"),
-            padding_side=config.get("padding_side", "left"),
-            truncation_side=config.get("truncation_side", "left"),
-        )
-
-        template_path = cached_file(
-            pretrained_model_name_or_path,
-            _CHAT_TEMPLATE_FILE,
-            _raise_exceptions_for_missing_entries=False,
-            **kwargs,
-        )
-        if template_path is not None:
-            tokenizer.chat_template = Path(template_path).read_text()
-
-        return tokenizer
-
-
-@ModelFactoryRegistry.register("Gemma4ForConditionalGeneration")
-class Gemma4ForConditionalGenerationFactory(AutoModelForCausalLMFactory):
-    """Factory that wires the wrapper tokenizer for Gemma 4."""
-
-    def init_tokenizer(self) -> Optional[Any]:
-        if self.tokenizer is None:
-            return None
-        return ADGemma4Tokenizer.from_pretrained(self.tokenizer)
-
-
-# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Gemma4TextConfig", Gemma4ForCausalLM)
-Gemma4ForConditionalGenerationFactory.register_custom_model_cls(
+AutoModelForCausalLMFactory.register_custom_model_cls(
     "Gemma4Config", Gemma4ForConditionalGeneration
 )
