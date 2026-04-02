@@ -99,7 +99,6 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mWindowSize{std::numeric_limits<int>::max()}
     // sentinel: unattached; valid sizes are >= 1 or kRecurrentStates (-1)
     , mIsPlaceholder{false}
-    , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
     , mDurationMs{std::nullopt}
@@ -990,6 +989,13 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     {
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
+        // Claim both blocks BEFORE the swap so getCacheLevel() still reflects the
+        // actual free-queue each iterator belongs to.  After swapMemoryPoolBlockOffset()
+        // isPrimary() is inverted for both blocks, so calling claimBlock() post-swap
+        // would make it erase from the wrong std::list -- undefined behaviour.
+        // This ordering matches WindowBlockManager::offloadBlock().
+        mEvictionPolicy->claimBlock(block);        // block is PRIMARY  -> erases from primary queue
+        mEvictionPolicy->claimBlock(offloadBlock); // offloadBlock is SECONDARY -> erases from secondary queue
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
@@ -1000,18 +1006,19 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
                 mWindowSize);
         }
-        // Update the block as a secondary block (maintaining its priority)
-        mEvictionPolicy->claimBlock(block);
-        // Release the block into secondary block queue
+        // Release block (now SECONDARY after the swap) into the secondary queue
         mEvictionPolicy->releaseBlock(block);
         // We have the offloaded block as the block to use now.
         block = offloadBlock;
     }
+    else
+    {
+        // Claim the block in primary block queue
+        mEvictionPolicy->claimBlock(block, priority, durationMs);
+    }
 
     // Removes children of the block from the search tree
     freeChildren(block);
-    // Claim the block in primary block queue
-    mEvictionPolicy->claimBlock(block, priority, durationMs);
 
     // Deal with invalidating block save for reuse for the sequence
     if (mBlockToSequence.count(block->getBlockId()) > 0)

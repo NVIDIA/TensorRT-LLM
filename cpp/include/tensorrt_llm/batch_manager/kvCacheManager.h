@@ -337,9 +337,6 @@ private:
     // Distinct from getPrevBlock() (which navigates the radix lookup tree)
     BlockPtr mPrevBlockInSeq;
 
-    // Iterator pointing to this block in mFreeBlocks.
-    std::optional<FreeBlocksQueue::iterator> mFreeBlockIterator;
-
     // Flag indicating if block is full
     bool mIsFull;
 
