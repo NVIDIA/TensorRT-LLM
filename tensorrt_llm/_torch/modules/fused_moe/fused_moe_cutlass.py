@@ -633,9 +633,10 @@ class CutlassFusedMoE(MoE):
             self.w2_weight.view(weight_dtype),
             self.w2_bias,
             output_dtype,
-            quant_scales=list(self.quant_scales[:6]) +
-            ([self.fc2_weight_scale_2]
-             if hasattr(self, 'fc2_weight_scale_2') else []),
+            quant_scales=list(self.quant_scales) +
+            ([self.fc2_weight_scale_2] if self.has_nvfp4
+             and getattr(self, 'force_dynamic_quantization', False)
+             and hasattr(self, 'fc2_weight_scale_2') else []),
             input_sf=x_sf,
             swizzled_input_sf=is_sf_swizzled,
             swiglu_alpha=self.swiglu_alpha,
