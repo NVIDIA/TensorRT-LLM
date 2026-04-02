@@ -135,10 +135,19 @@ class TestSiglipVisionModel(unittest.TestCase):
             attn_metadata=attn_metadata,
         )
 
-        # Compare all hidden states
+        # Compare all hidden states.
+        # TRT-LLM applies post_layernorm to the last encoder hidden state
+        # (matching production usage), so the last element must be compared
+        # against HF's post_layernormed last_hidden_state rather than the
+        # raw hidden_states[-1].
+        num_states = len(tllm_outputs)
+        for i in range(num_states):
+            tllm_hs = tllm_outputs[i]
+            if i < num_states - 1:
+                hf_hs = hf_outputs.hidden_states[i]
+            else:
+                hf_hs = hf_outputs.last_hidden_state
 
-        for i, (hf_hs, tllm_hs) in enumerate(
-                zip(hf_outputs.hidden_states, tllm_outputs)):
             self.assertEqual(hf_hs.shape, tllm_hs.shape,
                              f"Shape mismatch for hidden state {i}")
 
