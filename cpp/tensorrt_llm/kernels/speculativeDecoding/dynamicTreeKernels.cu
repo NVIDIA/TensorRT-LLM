@@ -506,8 +506,11 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
             uint64_t dpIdx = static_cast<uint64_t>(curIndex) - 1u;
             float pDraft
                 = draftProbs[(static_cast<uint64_t>(bx) * (numDraftTokens - 1) + dpIdx) * vocabSize + draftTokenId];
-            float pTarget
-                = targetProbs[(static_cast<uint64_t>(bx) * numDraftTokens + curIndex) * vocabSize + draftTokenId];
+            // Rejection sampling compares draft siblings under the target
+            // distribution of the currently accepted parent node.
+            float pTarget = targetProbs[(static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx)
+                    * vocabSize
+                + draftTokenId];
 
             // Rejection test for the current sibling:
             //   accept with probability min(1, q(x) / p(x))
@@ -561,7 +564,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
             {
                 uint64_t dpIdx = static_cast<uint64_t>(firstChild) - 1u;
                 float const* tProbs
-                    = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + firstChild) * vocabSize;
+                    = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * vocabSize;
                 float const* dProbs
                     = draftProbs + (static_cast<uint64_t>(bx) * (numDraftTokens - 1) + dpIdx) * vocabSize;
 
