@@ -21,6 +21,7 @@ In LLM inference, workload imbalances and communication bottlenecks often lead t
   - [Experimental Setup](#experimental-setup)
   - [Context-Only Evaluation](#context-only-evaluation)
   - [End-to-End Evaluation](#end-to-end-evaluation)
+  - [Reproducing Steps](#reproducing-steps)
 - [Summary](#summary)
 - [Future Work](#future-work)
 - [Acknowledgment](#acknowledgment)
@@ -35,7 +36,7 @@ This leads to the key design question behind DWDP: can we remove collective sync
 
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Synchronization overhead caused by workload imbalance in DEP for DeepSeek-R1 on GB200 with <code>ISL/OSL = 8K/1K</code> and input ratio <code>0.8</code>.</em></sub></p>
@@ -56,7 +57,7 @@ DWDP also provides greater flexibility in expert placement. Because each rank on
 
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Overview of DWDP with DWDP group size 4.</em></sub></p>
@@ -138,7 +139,7 @@ Each DWDP-enabled MoE layer registers a `DwdpLayerHandleCollector`. During model
 
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
 </figure>
 </div>
 
@@ -203,7 +204,7 @@ One mitigation is to split each remote-weight transfer into fixed-size slices an
 
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Nsight Systems trace showing many-to-one source-side communication contention in DWDP under a short compute-window setting.</em></sub></p>
@@ -232,8 +233,6 @@ We split the discussion into context-only and end-to-end results.
 
 The context-only study isolates the context phase, uses the Artificial Analysis dataset, and compares DWDP against a DEP baseline.
 
-#### Results
-
 We first examine a context-only iteration-latency breakdown of DEP4 and DWDP4 for DeepSeek-R1 under `ISL = 8K`, `ratio = 0.8`, and `max_num_tokens = 32768` on a GB200 context server. The last column reports per-category deltas normalized to the DEP4 iteration latency.
 
 
@@ -258,11 +257,9 @@ At the same time, compute categories such as Attention and Others become slower.
 
 The end-to-end study uses the SemiAnalysis dataset with ISL=`8K`, OSL=`1K`, and input ratio `0.8`. The generation server configuration is kept fixed, and DWDP is applied only to the context server. The comparison is made against Pareto points from the DEP baseline.
 
-#### Results
-
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. End-to-end Pareto frontier comparison between baseline and DWDP.</em></sub></p>
@@ -284,7 +281,7 @@ The serving-efficiency benefit becomes smaller at high TPS/user. In this region,
 
 *Table 4. End-to-end performance summary of DWDP across target TPS/user ranges.*
 
-We also evaluate median TTFT, including queueing time, the results are summarized in Table 5.
+We also evaluate median TTFT, including queueing time. The results are summarized in Table 5.
 Compared with the baseline, DWDP increases TTFT across the evaluated TPS/user ranges. At low TPS/user, TTFT can increase substantially for pairs with more aggressive reductions in context GPU count. These regressions come from lowering the aggregate service rate of the context stage and worsening rate matching between the context and generation stages. We expect this issue to be mitigated by better request matching in future work, especially because DWDP enables finer-grained context configurations.
 
 | TPS/user range | TPS/GPU speedup | Baseline TTFT (ms) | DWDP TTFT (ms) |
@@ -304,7 +301,7 @@ The above experiments use:
 
 - GB200 NVL72
 - DeepSeek-R1 NVFP4 checkpoint
-- Artificial Analysis dataset with `ISL = 8K`, `OSL = 1`, and `ISL ratio = 0.8`
+- SemiAnalysis dataset with maximum input length `8K`, output length `1K`, and input ratio `0.8`
 
 
 To reproduce the same style of end-to-end comparison in TensorRT-LLM today:
