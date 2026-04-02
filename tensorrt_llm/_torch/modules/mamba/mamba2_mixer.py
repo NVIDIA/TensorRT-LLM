@@ -30,6 +30,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
+from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ...speculative import SpecMetadata
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -111,6 +112,11 @@ class Mamba2Mixer(nn.Module):
         self.slot_mapping = None
         self.is_paged_state = False
 
+        self.in_proj_lora = None
+        if config.lora_config is not None:
+            self.in_proj_lora = LoraLayer([LoraModuleType.MAMBA_IN_PROJ],
+                                          [d_in_proj // tp_size])
+
         # in_proj
         self.in_proj = Linear(
             d_model,
@@ -121,7 +127,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.in_proj_lora)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -185,8 +192,10 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
-        # Determine if NVFP4 quantization is enabled
-        self.is_nvfp4 = (config.quant_config is not None
+        # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
+        # Disable fused RMSNorm+NVFP4 when LoRA is configured.
+        self.is_nvfp4 = (config.lora_config is None
+                         and config.quant_config is not None
                          and config.quant_config.quant_mode is not None
                          and config.quant_config.quant_mode.has_nvfp4())
 
@@ -202,6 +211,11 @@ class Mamba2Mixer(nn.Module):
             is_nvfp4=self.is_nvfp4,
         )
 
+        self.out_proj_lora = None
+        if config.lora_config is not None:
+            self.out_proj_lora = LoraLayer([LoraModuleType.MAMBA_OUT_PROJ],
+                                           [d_model])
+
         # out_proj
         self.out_proj = Linear(
             d_inner,
@@ -212,7 +226,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.out_proj_lora)
 
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
@@ -223,10 +238,8 @@ class Mamba2Mixer(nn.Module):
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
-        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant.
+        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
 
-        Called from post_load_weights (weights don't exist during __init__).
-        """
         if getattr(self.out_proj, 'input_scale', None) is not None:
             self.norm.nvfp4_scale = self.out_proj.input_scale
         else:
@@ -238,6 +251,7 @@ class Mamba2Mixer(nn.Module):
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -269,8 +283,10 @@ class Mamba2Mixer(nn.Module):
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
 
-        # in_proj
-        zxbcdt = self.in_proj(hidden_states)
+        # in_proj (LoRA is applied internally by Linear layer)
+        zxbcdt = self.in_proj(hidden_states,
+                              lora_params=lora_params,
+                              layer_idx=self.layer_idx)
 
         # Split z and dt with views.
         z = zxbcdt[:, :self.tp_d_inner]
@@ -530,7 +546,9 @@ class Mamba2Mixer(nn.Module):
         hidden_states = self.norm(preallocated_ssm_out, z[:num_actual_tokens])
 
         # out_proj
-        out = self.out_proj(hidden_states)
+        out = self.out_proj(hidden_states,
+                            lora_params=lora_params,
+                            layer_idx=self.layer_idx)
 
         return out[:num_actual_tokens]
 
