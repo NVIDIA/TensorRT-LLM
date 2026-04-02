@@ -115,17 +115,31 @@ VBENCH_LTX2_FP8_GOLDEN_SCORES = {
 # LTX-2 Two-Stage configuration
 LTX2_UPSAMPLER_SUBPATH = "LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
 LTX2_DISTILLED_LORA_SUBPATH = "LTX-2/ltx-2-19b-distilled-lora-384.safetensors"
-LTX2_TWO_STAGE_HEIGHT = 512
-LTX2_TWO_STAGE_WIDTH = 768
+LTX2_TWO_STAGE_HEIGHT = 1024
+LTX2_TWO_STAGE_WIDTH = 1536
 LTX2_TWO_STAGE_NUM_FRAMES = 121
 LTX2_TWO_STAGE_STEPS = 40
 LTX2_TWO_STAGE_GUIDANCE_SCALE = 4.0
 
 # Golden VBench scores for two-stage pipeline variants.
 # Initially None — first CI run is a baseline that prints scores for capture.
-VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES = None
+VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES = {
+    "subject_consistency": 0.9785,
+    "background_consistency": 0.9498,
+    "motion_smoothness": 0.9894,
+    "dynamic_degree": 1.0,
+    "aesthetic_quality": 0.6165,
+    "imaging_quality": 0.6948,
+}
 
-VBENCH_LTX2_TWO_STAGE_FP8_GOLDEN_SCORES = None
+VBENCH_LTX2_TWO_STAGE_FP8_GOLDEN_SCORES = {
+    "subject_consistency": 0.9820,
+    "background_consistency": 0.9617,
+    "motion_smoothness": 0.9885,
+    "dynamic_degree": 1.0,
+    "aesthetic_quality": 0.6017,
+    "imaging_quality": 0.7136,
+}
 
 VBENCH_REPO = "https://github.com/Vchitect/VBench.git"
 # Pin to a fixed commit for reproducible shallow-fetch

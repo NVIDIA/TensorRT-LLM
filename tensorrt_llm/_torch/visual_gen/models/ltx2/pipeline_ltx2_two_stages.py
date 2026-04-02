@@ -372,6 +372,7 @@ def _apply_lora_deltas(
                 ws_param.data.copy_(new_scale)
             else:
                 # BF16/FP16/FP32 — direct in-place addition
+                saved_state[param_name] = param.data.clone()
                 param.data.add_(
                     delta.to(param.device, param.dtype),
                     alpha=sign,
@@ -680,8 +681,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         finally:
             self.transformer.set_ulysses_enabled(True)
             if saved_quant_state:
+                # for FP8 / FP4 stage 2, we restore the original quantized weights by copying them back
                 _restore_lora_state(self.transformer, saved_quant_state)
             else:
+                # for BF16 stage 2, we restore the original weights by subtracting LoRA deltas
                 _apply_lora_deltas(
                     self.transformer,
                     self._distilled_lora_deltas,
