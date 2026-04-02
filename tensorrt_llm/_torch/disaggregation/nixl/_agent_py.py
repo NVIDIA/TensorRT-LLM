@@ -4,6 +4,7 @@ from enum import Enum
 from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
 
 # Import base classes for type compatibility
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
@@ -36,9 +37,11 @@ class NixlTransferStatus(TransferStatus):
         while status in (TransferState.PENDING, TransferState.PROCESSING):
             status = TransferState(self.agent.check_xfer_state(self.handle))
             if status == TransferState.ERROR:
-                return False  # Transfer failed
+                logger.error("NIXL transfer entered ERROR state (agent=%s).", self.agent.name)
+                return False
             if timeout is not None and (time.time() - start_time > timeout):
-                return False  # Timeout
+                logger.warning("NIXL transfer wait timed out after %s ms.", timeout_ms)
+                return False
             time.sleep(sleep_time)
             sleep_time = min(sleep_time * 2, max_sleep_time)
         return status == TransferState.DONE
@@ -61,23 +64,25 @@ class NixlTransferAgent(BaseTransferAgent):
         )
         self.agent = nixl_agent(name, agent_config)
 
-    def register_memory(self, descs: RegMemoryDescs):
+    def _get_validated_reg_descs(self, descs: RegMemoryDescs):
         if not descs.descs:
             raise ValueError("descs.descs must not be empty")
-        if isinstance(descs.descs[0], tuple):
-            assert len(descs.descs[0]) == 4, f"Expected 4 elements per desc, got {descs.descs[0]}"
+        if isinstance(descs.descs[0], tuple) and len(descs.descs[0]) != 4:
+            raise ValueError(
+                f"Expected 4 elements per desc, got {len(descs.descs[0])}: {descs.descs[0]}"
+            )
         reg_descs = self.agent.get_reg_descs(descs.descs, descs.type)
-        assert reg_descs is not None, "Failed to get reg_descs"
-        self.agent.register_memory(reg_descs)
+        if reg_descs is None:
+            raise RuntimeError(
+                f"nixl get_reg_descs returned None for type={descs.type}, count={len(descs.descs)}"
+            )
+        return reg_descs
+
+    def register_memory(self, descs: RegMemoryDescs):
+        self.agent.register_memory(self._get_validated_reg_descs(descs))
 
     def deregister_memory(self, descs: RegMemoryDescs):
-        if not descs.descs:
-            raise ValueError("descs.descs must not be empty")
-        if isinstance(descs.descs[0], tuple):
-            assert len(descs.descs[0]) == 4, f"Expected 4 elements per desc, got {descs.descs[0]}"
-        reg_descs = self.agent.get_reg_descs(descs.descs, descs.type)
-        assert reg_descs is not None, "Failed to get reg_descs"
-        self.agent.deregister_memory(reg_descs)
+        self.agent.deregister_memory(self._get_validated_reg_descs(descs))
 
     def load_remote_agent(self, name: str, agent_desc: bytes):
         self.agent.add_remote_agent(agent_desc)
@@ -97,9 +102,15 @@ class NixlTransferAgent(BaseTransferAgent):
     @nvtx_range("NixlTransferAgent.submit_transfer_requests")
     def submit_transfer_requests(self, request: TransferRequest) -> TransferStatus:
         src_xfer_descs = self.agent.get_xfer_descs(request.src_descs.descs, request.src_descs.type)
+        if src_xfer_descs is None:
+            raise RuntimeError(
+                f"nixl get_xfer_descs returned None for src type={request.src_descs.type}"
+            )
         dst_xfer_descs = self.agent.get_xfer_descs(request.dst_descs.descs, request.dst_descs.type)
-        assert src_xfer_descs is not None, "Failed to get src_xfer_descs"
-        assert dst_xfer_descs is not None, "Failed to get dst_xfer_descs"
+        if dst_xfer_descs is None:
+            raise RuntimeError(
+                f"nixl get_xfer_descs returned None for dst type={request.dst_descs.type}"
+            )
         sync_message = "" if request.sync_message is None else request.sync_message
         handle = self.agent.initialize_xfer(
             request.op,
@@ -110,5 +121,7 @@ class NixlTransferAgent(BaseTransferAgent):
         )
         status = self.agent.transfer(handle)
         if status == "ERROR":
-            raise RuntimeError("NIXL transfer initialization failed.")
+            raise RuntimeError(
+                f"NIXL transfer failed: op={request.op}, remote={request.remote_name}"
+            )
         return NixlTransferStatus(self.agent, handle)
