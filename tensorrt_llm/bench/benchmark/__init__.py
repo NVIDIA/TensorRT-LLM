@@ -155,6 +155,7 @@ def generate_json_report(report_path: Optional[Path], func: Callable):
         logger.debug("No report path provided, skipping report generation.")
     else:
         logger.info(f"Writing report information to {report_path}...")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         with open(report_path, "w") as f:
             f.write(json.dumps(func(), indent=4))
         logger.info(f"Report information written to {report_path}.")
