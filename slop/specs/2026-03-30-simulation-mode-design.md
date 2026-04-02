@@ -18,16 +18,20 @@ gantt
     dateFormat YYYY-MM-DD
     axisFormat %b %d
 
-    section Done
+    section v1 Complete
     Phase 0 - Minimal POC              :done, p0, 2026-03-30, 1d
     Phase 1 - Config + Predictor        :done, p1, 2026-03-31, 1d
     Phase 2 - AIConfigurator            :done, p2, 2026-03-31, 1d
+    Phase 3 - Simulated Clock           :done, p3, 2026-03-31, 1d
+    Phase 3.5 - Single-Process + TP>1   :done, p35, 2026-04-01, 1d
+    Phase 4 - Metrics Output            :done, p4, 2026-04-02, 1d
+    Phase 5 - CLI Integration           :done, p5, 2026-04-02, 1d
 
-    section Planned
-    Phase 3 - Simulated Clock           :active, p3, 2026-04-01, 2d
-    Phase 4 - Metrics Output            :p4, after p3, 2d
-    Phase 5 - CLI Integration           :p5, after p4, 2d
-    Phase 6 - Multi-GPU                 :p6, after p5, 3d
+    section v2 Planned
+    Phase 6 - Arrival Modeling           :p6, 2026-04-03, 3d
+    Phase 7a - PP Support               :p7a, after p6, 3d
+    Phase 7b - Disagg KV Transfer       :p7b, after p6, 3d
+    Phase 8 - GPU-Free (Mock KV)        :p8, after p7a, 2d
 ```
 
 | Phase | Goal | Key Deliverable | Status |
@@ -40,15 +44,43 @@ gantt
 | **4** | Metrics output | Per-request TTFT/TPOT/ITL, per-iteration breakdown, `metrics.json` | **Done** |
 | **5** | CLI integration | `trtllm-bench throughput --sim [--sim-config]` with 3-tier verification | **Done** |
 | **6** | Request arrival modeling | Staggered arrivals, `--request-rate`, online serving sim | Planned |
-| **7** | Multi-GPU / distributed | PP support, disagg KV transfer modeling | Planned |
+| **7a** | PP support | SimDistributed PP send/recv, multi-stage pipeline sim | Planned |
+| **7b** | Disagg KV transfer | KV cache transfer latency modeling for disagg serving | Planned |
+| **8** | GPU-free sim (mock KV cache) | Eliminate GPU requirement entirely | Backlog |
 
-**Dropped**: Mock KV cache manager (GPU for KV cache is acceptable).
+**Dropped from v1**: Mock KV cache manager (GPU for KV cache is acceptable for 1-GPU).
 
 **Long-term vision**: Deep-Sim (`slop/specs/2026-04-01-deep-sim-vision.md`) —
 replace AIC batch predictor with per-op timing hooks embedded in TRT-LLM ops.
 v1 (AIC-Sim) builds the serving sim infrastructure; Deep-Sim replaces only the
 prediction layer. Components designed for reusability: `SimClock`, `SimConfig`,
 `SimSampler`, single-process mode, metrics output, CLI integration.
+
+**Fidelity & limitations**: See `slop/specs/simulation-fidelity-and-limitations.md`
+for what's faithfully modeled vs known gaps (piggybacking, overlap, disagg, PP).
+
+### Implementation Findings (Post-v1)
+
+1. **PP is blocked, not just deferred** — `SimDistributed` raises
+   `NotImplementedError` for PP send/recv. Phase 7 split into 7a (PP, hard)
+   and 7b (disagg KV transfer, medium) because they have different complexity.
+
+2. **Constant predictor calibration is surprisingly useful** — Extracting real
+   prefill/decode times from `--iteration_log` and feeding back as constant
+   predictor gives ~30% structural accuracy. Could be productized as
+   `--calibrate` mode (polish, not a new phase).
+
+3. **GPU still required** — KV cache block allocation needs a GPU even in sim.
+   HiSim avoids this by fully mocking KV cache. Moved to Phase 8 (backlog)
+   since 1-GPU is acceptable. Becomes priority if GPU-free is needed.
+
+4. **trtllm-bench output format mismatch** — Real report.json is nested
+   (`engine`, `benchmarking_results`), sim report is flat. `compare_reports.py`
+   bridges this. Full format parity is minor polish.
+
+5. **Architecture validates Deep-Sim** — The SimModelEngine→SimSampler→SimClock
+   separation maps cleanly to Deep-Sim's per-op timing vision.
+   `SimClock.record_iteration()` is the exact aggregation point.
 
 **Reordering rationale** (2026-04-02): Phase 5 (CLI) moved before arrival modeling
 because `trtllm-bench` submits all requests at once (batch mode) — no arrival
