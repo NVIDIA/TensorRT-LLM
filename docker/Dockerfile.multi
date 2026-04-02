@@ -54,7 +54,7 @@ COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --ignore-installed --no-cache-dir -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt && \
-    pip3 uninstall -y nbconvert || true
+    { pip3 uninstall -y nbconvert || true; }
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
