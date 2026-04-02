@@ -44,15 +44,6 @@ Read the actual source code for each check. Cite `file:line_number` for every PA
 
 Note: BB1–BB2 only apply if the HF source indicates the model is multi-modal (has image/audio inputs). Mark N/A with justification for pure language models.
 
-### BB. Vision / Multi-Modal Support
-
-| # | Check | How to verify |
-|---|-------|---------------|
-| BB1 | If the model has a vision tower (multi-modal), the full `nn.Module` hierarchy for the vision component is present in the modeling file — it is NOT omitted, stubbed out, or replaced with a `pass` body | Grep for vision-related class names (e.g., `VisionTower`, `ViT`, `CLIPVision`, `SiglipVision`) from the HF source. If the model is multi-modal and none appear, flag as FAIL. |
-| BB2 | The test file asserts that vision-related weight keys are present in the model's `state_dict` after `load_state_dict` | Grep the test file for assertions on vision weight key names (or a check that vision-prefixed keys are in the loaded state_dict). Absence of any such assertion is a FAIL for multi-modal models. |
-
-Note: BB1–BB2 only apply if the HF source indicates the model is multi-modal (has image/audio inputs). Mark N/A with justification for pure language models.
-
 ### C. Ops & Compatibility (STRICT — canonical ops are the backbone of AD)
 
 | # | Check | How to verify |
