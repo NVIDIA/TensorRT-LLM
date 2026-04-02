@@ -179,6 +179,43 @@ def test_parallel_config_validation(parallel_field, invalid_value):
         LlmArgs(**kwargs)
 
 
+def test_pipeline_cache_accepts_pre_weight_load_boundary(tmp_path):
+    args = LlmArgs(
+        model="test-model",
+        transforms={
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+        pipeline_cache={
+            "enabled": True,
+            "root": tmp_path,
+            "boundaries": ["sharding_transform_executor"],
+        },
+    )
+
+    assert args.pipeline_cache.enabled
+    assert args.pipeline_cache.root == tmp_path
+    assert args.pipeline_cache.boundaries == ["sharding_transform_executor"]
+
+
+def test_pipeline_cache_rejects_post_sharding_boundary(tmp_path):
+    with pytest.raises(ValueError, match="only supports pre-weight-loading boundaries through"):
+        LlmArgs(
+            model="test-model",
+            transforms={
+                "compile_model": {
+                    "stage": "compile",
+                },
+            },
+            pipeline_cache={
+                "enabled": True,
+                "root": tmp_path,
+                "boundaries": ["compile_model"],
+            },
+        )
+
+
 # ================================
 # CUDA Graph Batch Sizes Tests
 # ================================

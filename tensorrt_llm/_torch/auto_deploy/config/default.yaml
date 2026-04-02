@@ -1,5 +1,10 @@
 # This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
 # of the model and optimize it for inference.
+pipeline_cache:
+  enabled: true
+  boundaries:
+    - sharding_transform_executor
+
 transforms:
   ############################################################################################
   # BUILD MODEL, EXPORT TO GRAPH MODULE, AND CLEAN UP

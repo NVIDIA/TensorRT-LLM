@@ -2,7 +2,7 @@
 
 import gc
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -20,10 +20,17 @@ from .interface import (
     TransformConfig,
     TransformRegistry,
 )
+from .pipeline_cache import PipelineSnapshotManager
 
 
 class InferenceOptimizer:
-    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig, mapping=None):
+    def __init__(
+        self,
+        factory: ModelFactory,
+        config: InferenceOptimizerConfig,
+        mapping=None,
+        pipeline_cache_config: Optional[Any] = None,
+    ):
         self.factory = factory
         self.config = self._clean_config(config)
         if not dist.is_initialized():
@@ -31,8 +38,17 @@ class InferenceOptimizer:
         else:
             local_rank, world_size = dist_ad.get_rank_world_size()
         self.shared_config = SharedConfig(
-            local_rank=local_rank, world_size=world_size, mapping=mapping
+            local_rank=local_rank,
+            world_size=world_size,
+            mapping=mapping,
         )
+        self.pipeline_cache = PipelineSnapshotManager(
+            factory=factory,
+            config=self.config,
+            shared_config=self.shared_config,
+            pipeline_cache_config=pipeline_cache_config,
+        )
+        self.shared_config.pipeline_cache = self.pipeline_cache
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
         """Get a typed checked ("strict") config with sorted keys according to stages."""
@@ -63,6 +79,11 @@ class InferenceOptimizer:
         # RUN THROUGH CONFIGURED TRANSFORMATIONS
         ############################################################################################
 
+        start_idx = 0
+        restored_mod, start_idx = self.pipeline_cache.maybe_restore(cm)
+        if restored_mod is not None:
+            mod = restored_mod
+
         # start with an empty model if not provided
         if mod is None:
             mod = nn.Module()
@@ -70,6 +91,9 @@ class InferenceOptimizer:
         # iterate over all transforms sorted by stage in the config
         start_time = time.time()
         for idx, (t_name, t_config) in enumerate(self.config.items()):
+            if idx < start_idx:
+                continue
+
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform

@@ -127,6 +127,7 @@ class SharedConfig(BaseModel):
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
     mapping: Any = Field(default=None)  # Mapping object from ad_executor
+    pipeline_cache: Any = Field(default=None)
 
 
 class TransformConfig(BaseModel):
@@ -252,6 +253,33 @@ class TransformInfo(BaseModel):
 
 
 TransformHistory = Dict[str, TransformInfo]
+
+
+def _to_jsonable(obj: Any) -> Any:
+    """Convert nested AutoDeploy metadata into a JSON-serializable structure."""
+    if isinstance(obj, BaseModel):
+        return obj.model_dump(mode="json")
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    return obj
+
+
+def serialize_autodeploy_meta(autodeploy_meta: AutodeployMeta) -> Dict[str, Any]:
+    """Convert AutoDeploy metadata into a JSON-serializable dictionary."""
+    return _to_jsonable(autodeploy_meta)
+
+
+def deserialize_autodeploy_meta(autodeploy_meta: Dict[str, Any]) -> AutodeployMeta:
+    """Restore typed AutoDeploy metadata from a serialized dictionary."""
+    restored = dict(autodeploy_meta)
+    history = restored.get(BaseTransform._history_key, {})
+    restored[BaseTransform._history_key] = {
+        name: value if isinstance(value, TransformInfo) else TransformInfo(**value)
+        for name, value in history.items()
+    }
+    return restored
 
 
 def with_transform_logging(call_fn: Callable) -> Callable:
@@ -488,6 +516,8 @@ class BaseTransform(ABC):
         autodeploy_meta[self._mem_history_key] = mem_history
 
         self._set_autodeploy_meta(mod, autodeploy_meta)
+        if shared_config.pipeline_cache is not None:
+            shared_config.pipeline_cache.maybe_save(t_name, idx, self.config, mod, cm)
         self._visualize_graph(mod, idx)
 
         # Dump graph after transform for debugging (controlled by AD_DUMP_GRAPHS_DIR env var)
