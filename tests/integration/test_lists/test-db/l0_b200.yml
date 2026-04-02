@@ -165,8 +165,6 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
-  - unittest/_torch/visual_gen/test_wan.py -k "not TestWanTwoStageTransformer"
-  - unittest/_torch/visual_gen/test_wan_i2v.py
   - unittest/_torch/visual_gen/test_model_loader.py
   - unittest/_torch/visual_gen/test_flux_transformer.py
   - unittest/_torch/visual_gen/test_flux_attention.py
@@ -174,6 +172,14 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
+  - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
+  - unittest/_torch/visual_gen/test_wan_features.py
+  - unittest/_torch/visual_gen/test_wan_transformer.py
   # - examples/test_visual_gen.py
 - condition:
     ranges:
