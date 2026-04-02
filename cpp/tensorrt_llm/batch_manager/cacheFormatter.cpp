@@ -220,16 +220,36 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
 
-    if (llmRequest.getInputTokensExtraIds().has_value())
+    auto multimodalHashes = llmRequest.getMultimodalHashes();
+    bool isMultimodal = multimodalHashes.has_value() && *multimodalHashes && !(*multimodalHashes)->empty();
+    if (isMultimodal)
     {
         auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-        auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size()) - 1;
+        auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size());
         auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
-            lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/false);
+            lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/true);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
+        auto reuseResult = BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
+        if (reuseResult.has_value())
+        {
+            return std::move(*reuseResult);
+        }
+        TLLM_LOG_WARNING(
+            "getBlockRangeForSending: request %lu, multimodal reuse tree lookup failed, "
+            "falling back to fromAllBlockIds",
+            llmRequest.mRequestId);
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
     }
-    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+
+    auto reuseResult = BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    if (reuseResult.has_value())
+    {
+        return std::move(*reuseResult);
+    }
+    TLLM_LOG_WARNING(
+        "getBlockRangeForSending: request %lu, reuse tree lookup failed, falling back to fromAllBlockIds",
+        llmRequest.mRequestId);
+    return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
