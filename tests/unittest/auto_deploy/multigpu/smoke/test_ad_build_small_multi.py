@@ -23,11 +23,6 @@ from build_and_run_ad import ExperimentConfig, main
     ],
 )
 def test_build_ad(world_size: int, model_hub_id: str, llm_extra_args: dict):
-    # TODO: Revisit transformers-mode multigpu smoke coverage for Llama 3.1 specifically.
-    # This test keeps only the maintained graph-model AutoDeploy path for
-    # meta-llama/Meta-Llama-3.1-8B-Instruct. In this branch, the Llama path is served by
-    # branch-owned AD custom modeling rather than the stock HF modeling code, so the deprecated
-    # mode="transformers" path is no longer the right coverage target for this test.
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
 
     experiment_config["args"]["world_size"] = world_size
