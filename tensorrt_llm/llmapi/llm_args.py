@@ -357,6 +357,11 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
+    target_sparsity: Optional[Union[float, Dict[str, float]]] = Field(
+        default=None,
+        description="Target sparsity for prefill and/or decode phases. "
+        "Requires formula coefficients in the model's config.json. "
+        "Ignored if threshold_scale_factor is also set.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -372,6 +377,56 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if isinstance(self.threshold_scale_factor, dict):
             return self.threshold_scale_factor.get('decode', None)
         return self.threshold_scale_factor
+
+    @property
+    def target_sparsity_prefill(self) -> Optional[float]:
+        if isinstance(self.target_sparsity, dict):
+            return self.target_sparsity.get('prefill', None)
+        return self.target_sparsity
+
+    @property
+    def target_sparsity_decode(self) -> Optional[float]:
+        if isinstance(self.target_sparsity, dict):
+            return self.target_sparsity.get('decode', None)
+        return self.target_sparsity
+
+    def resolve_for_target_sparsity(
+            self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
+        """
+        Given formula coefficients from HF config.json (dict with 'prefill' and
+        'decode' keys, each containing 'a' and 'b'), compute threshold_scale_factor
+        and return a new SkipSoftmaxAttentionConfig with it set.
+
+        formula example:
+          {"prefill": {"a": 7e-5, "b": 7.929109},
+           "decode":  {"a": 7e-5, "b": 16.9025}}
+
+        If threshold_scale_factor is already set, it takes precedence and
+        this method returns self unchanged.
+        """
+        if self.threshold_scale_factor is not None:
+            return self
+
+        import math
+
+        def _compute(phase: str, sparsity: Optional[float]) -> Optional[float]:
+            if sparsity is None:
+                return None
+            coeffs = formula.get(phase)
+            if not coeffs or 'a' not in coeffs or 'b' not in coeffs:
+                raise ValueError(
+                    f"SkipSoftmaxAttentionConfig: config.json is missing formula "
+                    f"coefficients for phase '{phase}' needed to compute "
+                    f"threshold_scale_factor from target_sparsity.")
+            return coeffs['a'] * math.exp(coeffs['b'] * sparsity)
+
+        return SkipSoftmaxAttentionConfig(
+            algorithm=self.algorithm,
+            target_sparsity=self.target_sparsity,
+            threshold_scale_factor={
+                'prefill': _compute('prefill', self.target_sparsity_prefill),
+                'decode': _compute('decode', self.target_sparsity_decode),
+            })
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -482,8 +537,8 @@ class MoeConfig(StrictBaseModel):
     Configuration for MoE.
     """
     backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
-        "TRITON"] = Field(
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
+        "DENSEGEMM", "VANILLA", "TRITON"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1860,6 +1915,7 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     ''' Context chunking policy. '''
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
+    FORCE_CHUNK = "FORCE_CHUNK"
 
     def _to_pybind(self):
         return getattr(_ContextChunkingPolicy, self.value)
@@ -2391,6 +2447,30 @@ TOKENIZER_ALIASES = {
     'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
     'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
 }
+
+
+class DwdpConfig(StrictBaseModel):
+    """Configuration for Distributed Weight Data Parallelism (DWDP).
+
+    DWDP accelerates the context (prefill) phase of disaggregated MoE serving
+    by combining data parallelism with NVLink-based expert weight sharing.
+    Each worker holds a subset of experts locally and asynchronously prefetches
+    the remaining experts from peer workers via CUDA IPC, enabling fully
+    asynchronous execution across ranks without synchronization barriers.
+
+    Currently supported with the CuteDSL MoE backend and NVFP4 quantization
+    on NVLink-connected multi-GPU systems.
+    """
+    dwdp_size: int = Field(default=1,
+                           description="The number of GPUs per DWDP group.")
+    num_groups: int = Field(
+        default=1,
+        description=
+        "The number of DWDP groups. Total workers = num_groups * dwdp_size.")
+    num_experts_per_worker: int = Field(
+        default=0, description="The number of experts per worker.")
+    num_prefetch_experts: int = Field(
+        default=0, description="The number of prefetch experts per worker.")
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -3273,6 +3353,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="NVFP4 GEMM backend config.",
         status="beta")
 
+    dwdp_config: Optional[DwdpConfig] = Field(
+        default=None,
+        description="DWDP (Distributed Weight Data Parallelism) config.",
+        status="prototype")
+
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",
                               status="beta")
@@ -3280,8 +3365,12 @@ class TorchLlmArgs(BaseLlmArgs):
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
         description=
-        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
-        status="beta")
+        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. "
+        "TRTLLMSampler is deprecated and will be removed in release 1.4.",
+        status="deprecated",
+        deprecated=
+        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler."
+    )
 
     sampler_force_async_worker: bool = Field(
         default=False,
@@ -3743,6 +3832,7 @@ def update_llm_args_with_extra_dict(
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
         "kv_cache_config": KvCacheConfig,
+        "dwdp_config": DwdpConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
