@@ -332,7 +332,8 @@ def build_command(
               quant_config=quant_config,
               workspace=str(bench_env.workspace),
               load_format=load_format,
-              trust_remote_code=trust_remote_code)
+              trust_remote_code=trust_remote_code,
+              telemetry_config=bench_env.telemetry_config)
     # Save the engine.
     llm.save(engine_dir)
     llm.shutdown()

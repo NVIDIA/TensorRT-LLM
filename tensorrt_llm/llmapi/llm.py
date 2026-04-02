@@ -256,6 +256,25 @@ class BaseLLM:
                 self.mpi_session.shutdown()
             raise
 
+        # --- Usage telemetry (fail-silent) ---
+        try:
+            import tensorrt_llm.usage as _usage
+            telemetry_config = getattr(self.args, 'telemetry_config', None)
+            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
+            # CLI commands set their specific context before LLM construction,
+            # so this only fires for users calling LLM() directly.
+            if telemetry_config is not None:
+                if telemetry_config.usage_context == _usage.UsageContext.UNKNOWN:
+                    telemetry_config = telemetry_config.model_copy(
+                        update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            _usage.report_usage(
+                llm_args=self.args,
+                pretrained_config=self._hf_model_config,
+                telemetry_config=telemetry_config,
+            )
+        except Exception as exc:
+            logger.debug("Usage telemetry setup failed: %s", exc)
+
         try:
             if self.args.otlp_traces_endpoint:
                 tracing.init_tracer("trt.llm", self.args.otlp_traces_endpoint)
@@ -1064,7 +1083,14 @@ class _TrtLLM(BaseLLM):
         # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
-        self._hf_model_config = self._try_load_hf_model_config()
+        # Load HF config from the original HF model dir when available,
+        # since self.args.model now points to the engine dir (whose
+        # config.json uses TRT-LLM schema, not HF schema).
+        if self._hf_model_dir is not None:
+            self._hf_model_config = ModelLoader.load_hf_model_config(
+                self._hf_model_dir)
+        else:
+            self._hf_model_config = self._try_load_hf_model_config()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:

@@ -278,6 +278,41 @@ Deprecation is used to inform developers that some APIs and tools are no longer 
 4. Removal After Migration Period
   - After the 3-month migration period ends, deprecated APIs, tools, or parameters are removed in a manner consistent with semantic versioning (major version changes may include breaking removals).
 
+## Telemetry Data Collection
+
+TensorRT-LLM collects anonymous telemetry data by default. This data is used
+in aggregate to understand usage patterns and prioritize engineering efforts.
+**This data cannot be traced back to any individual user.** No prompts,
+user-identifying information, or persistent identifiers are collected. Any
+deployment identifiers are ephemeral, randomly generated per deployment, and
+not linked to users. The data we collect includes:
+
+- Ingress point (e.g., LLM API, CLI, serve command)
+- Deployment duration (via periodic heartbeats)
+- GPU SKUs, count, memory, and CUDA version
+- Model architecture class name (e.g., `LlamaForCausalLM`)
+- Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
+- System information (OS platform, Python version, CPU architecture, CPU count)
+- TRT-LLM version and backend
+- Feature flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
+- Disaggregated serving metadata (role and deployment ID)
+
+Telemetry is automatically disabled in CI and test environments.
+
+### Opting Out of Telemetry Data Collection
+
+To disable telemetry data collection, use any of the following methods:
+
+- **Environment variable**: Set `TRTLLM_NO_USAGE_STATS=1`, `DO_NOT_TRACK=1`, or `TELEMETRY_DISABLED=true`
+- **File-based**: Create the file `~/.config/trtllm/do_not_track`
+- **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`
+- **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
+
+The telemetry collection code is fully open source and auditable at
+[`tensorrt_llm/usage/`](./tensorrt_llm/usage/). For a detailed field-by-field
+reference of exactly what is collected, see the
+[schema documentation](./tensorrt_llm/usage/schemas/README.md).
+
 ## Useful Links
 - [Quantized models on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4): A growing collection of quantized (e.g., FP8, FP4) and optimized LLMs, including [DeepSeek FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), ready for fast inference with TensorRT LLM.
 - [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo): A datacenter scale distributed inference serving framework that works seamlessly with TensorRT LLM.

@@ -2268,6 +2268,8 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_configure(config):
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
