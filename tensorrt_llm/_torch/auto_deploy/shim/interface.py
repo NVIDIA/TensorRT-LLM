@@ -101,6 +101,24 @@ class CachedSequenceInterface:
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
+        # Optional hook to transform named_args before they reach the model.
+        # Used by VLM models (e.g. Qwen3.5 MoE) to convert input_ids →
+        # inputs_embeds and expand position_ids to 3D before the compiled
+        # GraphModule, keeping vision/embedding preprocessing outside the graph.
+        self._named_args_hook: Optional[
+            Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
+        ] = None
+
+    def set_named_args_hook(
+        self, hook: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
+    ) -> None:
+        """Register a hook that transforms named_args before model forward.
+
+        The hook receives the raw named_args dict and must return a new dict
+        with the kwargs the model actually expects.  Buffers in the returned
+        dict must have stable addresses for CUDA graph compatibility.
+        """
+        self._named_args_hook = hook
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -110,7 +128,10 @@ class CachedSequenceInterface:
     @property
     def named_args(self) -> Dict[str, torch.Tensor]:
         """Return all the named arguments owned by this interface."""
-        return {**self.info.named_args, **self._caches}
+        raw = {**self.info.named_args, **self._caches}
+        if self._named_args_hook is not None:
+            return self._named_args_hook(raw)
+        return raw
 
     def get_arg(
         self, name: str, truncate: Optional[bool] = None, unflatten: Optional[bool] = None
