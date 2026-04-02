@@ -26,8 +26,6 @@ import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..config import AttentionConfig
-
 # Lazy imports to avoid circular dependency
 if TYPE_CHECKING:
     from .flash_attn4 import FlashAttn4Attention
@@ -86,8 +84,6 @@ def create_attention(
     dtype: Optional[torch.dtype] = None,
     max_batch_size: int = 16,
     max_seq_len: int = 4096,
-    attention_config: Optional[AttentionConfig] = None,
-    attention_metadata_state: Optional[dict] = None,
     **kwargs,
 ) -> "DiffusionAttentionBackend":
     """
@@ -108,29 +104,12 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
-        attention_config: Optional AttentionConfig; sage_attention_config is
-            extracted and forwarded to the TRTLLM backend when present.
-        attention_metadata_state: Optional model-scoped metadata state from
-            visual-gen config. Required for TRTLLM backend.
         **kwargs: Additional backend-specific arguments
 
     Returns:
         Diffusion attention backend instance (TrtllmAttention or VanillaAttention)
     """
     attn_cls = get_visual_gen_attention_backend(backend)
-
-    # Extract sage_attention_config from AttentionConfig and pass to TRTLLM backend.
-    # AttentionConfig validation already ensures sage_attention_config is only set
-    # when backend="TRTLLM", so no silent no-op is possible.
-    if attention_config is not None and attention_config.sage_attention_config is not None:
-        kwargs["sage_attention_config"] = attention_config.sage_attention_config
-    if backend.upper() == "TRTLLM":
-        if attention_metadata_state is None:
-            raise ValueError(
-                "TRTLLM backend requires `attention_metadata_state` from "
-                "DiffusionModelConfig; creation path must not allocate metadata implicitly."
-            )
-        kwargs["attention_metadata_state"] = attention_metadata_state
 
     return attn_cls(
         layer_idx=layer_idx,

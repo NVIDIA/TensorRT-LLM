@@ -44,78 +44,12 @@ class PipelineComponent(str, Enum):
 # =============================================================================
 
 
-class SageAttentionConfig(BaseModel):
-    """Configuration for SageAttention quantization (TRTLLM backend only).
-
-    SageAttention quantizes Q/K/V into FP8 (or INT8 for Q/K) with per-block
-    scaling factors, enabling faster attention kernels. Providing this config
-    to AttentionConfig enables SageAttention; omitting it (None) disables it.
-
-    Similar to ``sparse_attention_config`` for the base TRTLLM attention
-    backend — the presence of the config object signals enablement.
-
-    Currently these (num_elts_per_blk_q, num_elts_per_blk_k, num_elts_per_blk_v)
-    combinations are enabled:
-    - (1, 1, 1)
-    - (1, 4, 1)
-    - (1, 16, 1) [for qk_int8 == True only]
-    """
-
-    num_elts_per_blk_q: int = PydanticField(
-        1, ge=0, description="Elements per quantization block for Q (0 disables)"
-    )
-    num_elts_per_blk_k: int = PydanticField(
-        4, ge=0, description="Elements per quantization block for K (0 disables)"
-    )
-    num_elts_per_blk_v: int = PydanticField(
-        1, ge=0, description="Elements per quantization block for V (0 disables)"
-    )
-    qk_int8: bool = PydanticField(True, description="Use INT8 (vs E4M3) for Q/K quantization")
-
-
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
     backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
     )
-    sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
-        None,
-        description=(
-            "SageAttention config (TRTLLM backend only). "
-            "Set to a SageAttentionConfig instance to enable SageAttention; "
-            "leave as None to disable."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _validate_sage_attn_config(self) -> "AttentionConfig":
-        SUPPORTED_SAGE_CONFIGS = {
-            (1, 1, 1, False),
-            (1, 4, 1, False),
-            (1, 1, 1, True),
-            (1, 4, 1, True),
-            (1, 16, 1, True),
-        }
-
-        if self.sage_attention_config is not None:
-            if self.backend != "TRTLLM":
-                raise ValueError(
-                    f"sage_attention_config requires backend='TRTLLM', "
-                    f"got backend='{self.backend}'. Either set backend='TRTLLM' "
-                    f"or remove sage_attention_config."
-                )
-            if (
-                self.sage_attention_config.num_elts_per_blk_q,
-                self.sage_attention_config.num_elts_per_blk_k,
-                self.sage_attention_config.num_elts_per_blk_v,
-                self.sage_attention_config.qk_int8,
-            ) not in SUPPORTED_SAGE_CONFIGS:
-                raise ValueError(
-                    f"Unsupported {self.sage_attention_config=}."
-                    " Fallback to non-SageAttention TRTLLM attention"
-                )
-        return self
 
 
 class ParallelConfig(StrictBaseModel):
@@ -526,11 +460,6 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     return components
 
 
-def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
-    return {"metadata": None, "capacity": (0, 0)}
-
-
 # =============================================================================
 # DiffusionModelConfig - Internal configuration (merged/parsed)
 # =============================================================================
@@ -569,7 +498,6 @@ class DiffusionModelConfig(BaseModel):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
-    attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
 
@@ -900,10 +828,6 @@ class DiffusionModelConfig(BaseModel):
                     cls.load_diffusion_quant_config(quant_dict)
                 )
 
-        attention_metadata_state = (
-            create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
-        )
-
         return cls(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
@@ -916,7 +840,6 @@ class DiffusionModelConfig(BaseModel):
             cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
             attention=attention_cfg,
-            attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             teacache=teacache_cfg,
             skip_create_weights_in_init=True,
