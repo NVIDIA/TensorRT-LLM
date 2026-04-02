@@ -352,8 +352,7 @@ def test_lora_cuda_graph_params_filling_kernel_special_cases():
     compare_cuda_graph_lora_params_filler(test_params6)
 
 
-def llama_7b_lora_from_dir_test_harness(cuda_graph_config,
-                                        use_speculative) -> None:
+def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
         max_lora_rank=8,
@@ -361,9 +360,7 @@ def llama_7b_lora_from_dir_test_harness(cuda_graph_config,
         max_cpu_loras=2)
     llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
-              speculative_config=NGramDecodingConfig(
-                  max_draft_len=5) if use_speculative else None,
-              cuda_graph_config=cuda_graph_config)
+              **llm_kwargs)
     try:
         prompts = [
             "美国的首都在哪里? \n答案:",
@@ -389,8 +386,13 @@ def llama_7b_lora_from_dir_test_harness(cuda_graph_config,
 @test_lora_with_and_without_cuda_graph
 @pytest.mark.parametrize("use_speculative", [True, False])
 def test_llama_7b_lora(cuda_graph_config, use_speculative):
-    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config,
-                                        use_speculative=use_speculative)
+    llm_kwargs = {
+        "cuda_graph_config":
+        cuda_graph_config,
+        "speculative_config":
+        NGramDecodingConfig(max_draft_len=5) if use_speculative else None
+    }
+    llama_7b_lora_from_dir_test_harness(**llm_kwargs)
 
 
 @skip_gpu_memory_less_than_40gb
