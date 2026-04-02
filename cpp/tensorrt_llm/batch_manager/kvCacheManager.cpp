@@ -89,6 +89,11 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
     return sequenceBlocks;
 }
 
+// Compute maximum number of tokens that have been computed by prefill and generation.
+// Accounts for chunked prefill to avoid storing state that hasn't been written to KV cache yet.
+// We call LlmRequest::getContextRemainingLength to see how many tokens are still waiting to be computed in prefill.
+// If this value is > 0 prefill is not finished yet, and number of computed tokens must be capped at the current context position.
+// If it is == 0, we are in generation mode, and number of computed tokens equals number of unique tokens stored in request.
 SizeType32 getMaterializedUniqueTokenCountForReuse(
     VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
@@ -100,6 +105,8 @@ SizeType32 getMaterializedUniqueTokenCountForReuse(
     return totalUniqueTokenCount;
 }
 
+// Compute number of tokens that can be stored for reuse. The last computed token is never stored in KV cache, hence cannot be stored for reuse.
+// Number of tokens that can be stored for reuse is thus the greater of 0 or getMaterializedUniqueTokenCountForReuse() - 1.
 SizeType32 getUsableUniqueTokenCountForReuse(
     VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
