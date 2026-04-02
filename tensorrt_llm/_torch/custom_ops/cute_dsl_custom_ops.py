@@ -3471,8 +3471,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             l = 1  # dense GEMM
 
             # Define candidates together
-            mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4)]
+            mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256),
+                                      (256, 128)]
+            cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1)]
 
             # Map torch dtype to cutlass dtype
             if self.output_dtype not in self._CUTLASS_DTYPE_MAP:
