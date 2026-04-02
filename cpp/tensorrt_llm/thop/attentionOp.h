@@ -80,8 +80,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata = std::nullopt,
     std::optional<torch::Tensor> flash_mla_num_splits = std::nullopt, int64_t const sage_attn_num_elts_per_blk_q = 0,
     int64_t const sage_attn_num_elts_per_blk_k = 0, int64_t const sage_attn_num_elts_per_blk_v = 0,
-    bool sage_attn_qk_int8 = false,
-    std::optional<int64_t> opt_num_contexts = std::nullopt, std::optional<int64_t> opt_num_ctx_tokens = std::nullopt);
+    bool sage_attn_qk_int8 = false, int64_t num_contexts = 0, int64_t num_ctx_tokens = 0);
 
 struct KvCachePoolPointers
 {

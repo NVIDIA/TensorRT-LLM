@@ -40,10 +40,20 @@ void indexer_k_cache_scatter_op(th::Tensor const& k_fp8, th::Tensor const& k_sca
             && slot_mapping_scale.is_cuda(),
         "All tensors must be CUDA tensors");
 
+    // Validate tensor dimensions
     TORCH_CHECK(k_fp8.dim() == 2, "k_fp8 must be 2D [num_tokens, head_dim]");
     TORCH_CHECK(k_scale.dim() == 2, "k_scale must be 2D [num_tokens, scale_elements]");
+    TORCH_CHECK(slot_mapping_fp8.dim() == 1, "slot_mapping_fp8 must be 1D [num_tokens]");
+    TORCH_CHECK(slot_mapping_scale.dim() == 1, "slot_mapping_scale must be 1D [num_tokens]");
     TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D [num_blocks, block_size, 1, per_token_size], got %d dims",
         static_cast<int>(k_cache.dim()));
+
+    // Validate tensor dtypes — reinterpret_cast below assumes specific element sizes
+    TORCH_CHECK(k_fp8.element_size() == 1, "k_fp8 must have 1-byte elements (e.g. FP8), got %d", k_fp8.element_size());
+    TORCH_CHECK(k_scale.element_size() == 4, "k_scale must have 4-byte elements (e.g. float32), got %d",
+        k_scale.element_size());
+    TORCH_CHECK(slot_mapping_fp8.scalar_type() == torch::kInt64, "slot_mapping_fp8 must be int64");
+    TORCH_CHECK(slot_mapping_scale.scalar_type() == torch::kInt64, "slot_mapping_scale must be int64");
 
     TORCH_CHECK(k_fp8.is_contiguous(), "k_fp8 must be contiguous");
     TORCH_CHECK(k_scale.is_contiguous(), "k_scale must be contiguous");
@@ -52,8 +62,8 @@ void indexer_k_cache_scatter_op(th::Tensor const& k_fp8, th::Tensor const& k_sca
 
     // FP8 is 1 byte per element, so head_dim in elements == head_dim in bytes.
     int32_t const head_dim = static_cast<int32_t>(k_fp8.size(1));
-    // float32 scale: each element is 4 bytes.
-    int32_t const scale_size = static_cast<int32_t>(k_scale.size(1)) * 4;
+    // Scale size in bytes: num_scale_elements * bytes_per_element.
+    int32_t const scale_size = static_cast<int32_t>(k_scale.size(1)) * static_cast<int32_t>(k_scale.element_size());
 
     int32_t const cache_dim_0 = static_cast<int32_t>(k_cache.size(0));
     int32_t const cache_dim_1 = static_cast<int32_t>(k_cache.size(1));

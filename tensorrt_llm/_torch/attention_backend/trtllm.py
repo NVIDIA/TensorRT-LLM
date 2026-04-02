@@ -412,7 +412,6 @@ class TrtllmAttentionWrapper:
         sage_attn_num_elts_per_blk_v: int = 0,
         sage_attn_qk_int8: bool = False,
         num_contexts: int = 0,
-        num_generations: int = 0,
         num_ctx_tokens: int = 0,
     ):
         """
@@ -646,7 +645,6 @@ class TrtllmAttentionWrapper:
                 self.quant_config,
                 self.kv_cache_manager,
                 num_contexts,
-                num_generations,
                 num_ctx_tokens,
                 global_layer_idx=self.global_layer_idx,
             )
@@ -2072,7 +2070,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v,
             sage_attn_qk_int8=sage_attn_qk_int8,
             num_contexts=metadata.num_contexts,
-            num_generations=metadata.num_generations,
             num_ctx_tokens=metadata.num_ctx_tokens)
 
         if output_sf is None:

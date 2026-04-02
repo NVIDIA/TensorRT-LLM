@@ -632,8 +632,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t const sage_attn_num_elts_per_blk_q, int64_t const sage_attn_num_elts_per_blk_k,
-    int64_t const sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8,
-    std::optional<int64_t> opt_num_contexts, std::optional<int64_t> opt_num_ctx_tokens)
+    int64_t const sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -836,29 +835,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     }
     bool const is_gen_only = attn_input_type == AttentionInputType::GenerationOnly;
 
-    int32_t num_contexts;
-    if (opt_num_contexts.has_value())
-    {
-        num_contexts = static_cast<int32_t>(opt_num_contexts.value());
-    }
-    else
-    {
-        num_contexts = 0;
-        for (int32_t idx = 0; idx < num_seqs; idx++)
-        {
-            if (request_types[idx] != RequestType::kCONTEXT)
-            {
-                break;
-            }
-            ++num_contexts;
-        }
-    }
-    int32_t const num_generations = num_seqs - num_contexts;
+    int32_t const num_generations = num_seqs - static_cast<int32_t>(num_contexts);
     int32_t const num_tokens = qkv_or_q.size(0);
-    int32_t const num_ctx_tokens = opt_num_ctx_tokens.has_value()
-        ? static_cast<int32_t>(opt_num_ctx_tokens.value())
-        : host_context_lengths.slice(0, 0, num_contexts).sum().item<int32_t>();
-    int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - num_ctx_tokens;
+    int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - static_cast<int32_t>(num_ctx_tokens);
     auto const ctx_total_kv_len = host_total_kv_lens.index({0}).item<int32_t>();
     auto const gen_total_kv_len = host_total_kv_lens.index({1}).item<int32_t>();
 

@@ -72,9 +72,8 @@ void initBindings(nb::module_& m)
         nb::arg("quant_q_buffer") = std::nullopt, nb::arg("flash_mla_tile_scheduler_metadata") = std::nullopt,
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
-        nb::arg("sage_attn_qk_int8") = false, nb::arg("opt_num_contexts") = std::nullopt,
-        nb::arg("opt_num_ctx_tokens") = std::nullopt, "Multi-head attention operation",
-        nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
+        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",
