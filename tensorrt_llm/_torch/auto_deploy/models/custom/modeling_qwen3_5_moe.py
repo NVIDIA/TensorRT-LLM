@@ -733,8 +733,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
     """Qwen3.5 MoE text model (embed + decoder layers + final norm + lm_head).
 
     lm_head is included so that the exported GraphModule contains it directly,
-    allowing sharding and gather_logits_before_lm_head transforms to see it
-    without post-export grafting.
+    allowing sharding and gather_logits_before_lm_head transforms to see it.
     """
 
     def __init__(self, config: Qwen3_5MoeTextConfig):
