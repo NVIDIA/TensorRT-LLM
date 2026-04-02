@@ -49,3 +49,18 @@ def get_flashinfer_sparse_attn_attention_backend(sparse_attn_config: "SparseAtte
     raise ValueError(
         f"Unsupported sparse attention algorithm in flashinfer attention backend: {sparse_attn_config.algorithm}"
     )
+
+
+def get_sparse_attention_method(sparse_attn_config, **kwargs):
+    """Factory to create a SparseAttentionMethod for the given config.
+
+    Returns None if no sparse method applies (e.g. skip_softmax or no config).
+    """
+    if sparse_attn_config is None:
+        return None
+    if sparse_attn_config.algorithm == "dsa":
+        from .dsa_method import DSASparseMethod
+
+        return DSASparseMethod(**kwargs)
+    # Future sparse algorithms that need MLA-level integration would be added here.
+    return None

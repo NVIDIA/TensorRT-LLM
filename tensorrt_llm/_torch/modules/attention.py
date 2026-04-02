@@ -21,8 +21,7 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
-from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
+from ..attention_backend.sparse import get_sparse_attention_method
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -35,12 +34,6 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-
-# Import FlashMLA sparse attention kernel
-try:
-    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
-except ImportError:
-    flash_mla_sparse_fwd = None
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -1089,11 +1082,10 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
-        # Currently only DSA sparse attention is supported.
-        if config is not None and config.sparse_attention_config is not None and config.sparse_attention_config.algorithm == "dsa":
-            self.is_dsa = True
-        else:
-            self.is_dsa = False
+        # Create sparse attention method if applicable (e.g. DSA).
+        # This object encapsulates all algorithm-specific dispatch logic
+        # so the MLA module itself stays algorithm-agnostic.
+        self.sparse_method = None
 
         # tensor parallel
         config = config or ModelConfig()
@@ -1279,8 +1271,8 @@ class MLA(nn.Module):
             aux_stream=aux_stream,
         )
 
-        # Register MLA context with DSA backend so it can access MLA helpers
-        if self.is_dsa and hasattr(self.mqa, 'register_mla_context'):
+        # Register MLA context with sparse backends that need it
+        if hasattr(self.mqa, 'register_mla_context'):
             self.mqa.register_mla_context(self)
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
@@ -1312,11 +1304,20 @@ class MLA(nn.Module):
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
                 f"got '{_threshold_str}'") from err
 
-        # MHA attention backend: used by non-DSA (standard MLA) and optionally
-        # by DSA for the short-seq path (dense attention, no sparse config).
-        _short_seq_mha = (self.is_dsa and self.short_seq_mha_threshold > 0
+        # Initialize sparse attention method (e.g. DSA) now that threshold is known.
+        if config is not None and config.sparse_attention_config is not None:
+            self.sparse_method = get_sparse_attention_method(
+                config.sparse_attention_config,
+                short_seq_mha_threshold=self.short_seq_mha_threshold,
+            )
+
+        _has_sparse_method = self.sparse_method is not None
+        # MHA attention backend: used by non-sparse (standard MLA) and optionally
+        # by sparse methods for the short-seq path (dense attention, no sparse config).
+        _short_seq_mha = (_has_sparse_method
+                          and self.short_seq_mha_threshold > 0
                           and not self.apply_rotary_emb)
-        if not self.is_dsa or _short_seq_mha:
+        if not _has_sparse_method or _short_seq_mha:
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -1534,8 +1535,8 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        # For DSA, capture qr (compressed query before q_b_proj) for the indexer
-        qr = q if self.is_dsa else None
+        # For sparse methods, capture qr (compressed query before q_b_proj) for the indexer
+        qr = q if self.sparse_method is not None else None
 
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
@@ -1575,32 +1576,12 @@ class MLA(nn.Module):
             topk_indices_ctx = (topk_indices[:num_ctx_tokens, :]
                                 if topk_indices is not None else None)
 
-            if topk_indices_ctx is not None:
-                # DSA sparse context path
-                if self._should_use_short_mha(attn_metadata, position_ids):
-                    self.forward_context(q_ctx, compressed_kv_ctx, k_pe_ctx,
-                                         position_ids, attn_metadata,
-                                         output[:num_ctx_tokens, :],
-                                         latent_cache_ctx)
-                elif get_sm_version() >= 100:
-                    self.forward_absorption_context(
-                        q_ctx,
-                        compressed_kv_ctx,
-                        k_pe_ctx,
-                        attn_metadata,
-                        output[:num_ctx_tokens, :],
-                        latent_cache=latent_cache_ctx,
-                        topk_indices=topk_indices_ctx)
-                else:
-                    self.forward_sparse_mla_kvcache_bf16(
-                        q_ctx,
-                        latent_cache_ctx,
-                        attn_metadata,
-                        output[:num_ctx_tokens, :],
-                        topk_indices_ctx,
-                        is_generation=False)
+            if topk_indices_ctx is not None and self.sparse_method is not None:
+                self.sparse_method.dispatch_context(
+                    self, q_ctx, compressed_kv_ctx, k_pe_ctx, attn_metadata,
+                    output[:num_ctx_tokens, :], latent_cache_ctx,
+                    topk_indices_ctx, position_ids)
             else:
-                # Standard (non-DSA) context path
                 self.forward_context(
                     q_ctx,
                     compressed_kv_ctx,
@@ -1628,27 +1609,12 @@ class MLA(nn.Module):
             topk_indices_gen = (topk_indices[num_ctx_tokens:num_tokens, :]
                                 if topk_indices is not None else None)
 
-            if topk_indices_gen is not None:
-                # DSA sparse generation path
-                if get_sm_version() >= 100:
-                    self.forward_absorption_generation(
-                        q_gen,
-                        compressed_kv_gen,
-                        k_pe_gen,
-                        attn_metadata,
-                        output[num_ctx_tokens:num_tokens, :],
-                        latent_cache=latent_cache_gen,
-                        topk_indices=topk_indices_gen)
-                else:
-                    self.forward_sparse_mla_kvcache_bf16(
-                        q_gen,
-                        latent_cache_gen,
-                        attn_metadata,
-                        output[num_ctx_tokens:num_tokens, :],
-                        topk_indices_gen,
-                        is_generation=True)
+            if topk_indices_gen is not None and self.sparse_method is not None:
+                self.sparse_method.dispatch_generation(
+                    self, q_gen, compressed_kv_gen, k_pe_gen, attn_metadata,
+                    output[num_ctx_tokens:num_tokens, :], latent_cache_gen,
+                    topk_indices_gen)
             else:
-                # Standard (non-DSA) generation path
                 self.forward_absorption_generation(
                     q_gen,
                     compressed_kv_gen,
@@ -1658,14 +1624,6 @@ class MLA(nn.Module):
                     position_ids=position_ids,
                     latent_cache=latent_cache_gen,
                 )
-
-    def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
-                              hidden_states: torch.Tensor,
-                              attn_metadata: AttentionMetadata,
-                              output: torch.Tensor) -> None:
-        """Deprecated: use forward_impl() which now handles DSA via
-        predict_sparse_indices(). Kept as a thin wrapper for compatibility."""
-        self.forward_impl(position_ids, hidden_states, attn_metadata, output)
 
     def forward_context_default(
         self,
@@ -1714,90 +1672,6 @@ class MLA(nn.Module):
         )
 
         return attn_output
-
-    def _should_use_short_mha(self, attn_metadata: AttentionMetadata,
-                              position_ids: Optional[torch.Tensor]) -> bool:
-        """Check if the short-seq MHA optimization should be used for context.
-
-        Uses max_ctx_kv_len (max total KV length per context sequence,
-        including cached tokens) when available, to correctly account for
-        chunked context where the full attention span exceeds the threshold
-        even if the new token count is small.  Falls back to num_ctx_tokens
-        (total new context tokens) when max_ctx_kv_len is not set.
-
-        Disabled under torch compile so that the split DSA custom ops
-        (mla_dsa_proj / mla_dsa_attn_inplace) have unconditionally
-        straight-line control flow for CUDA graph capture.
-        """
-        if is_torch_compiling():
-            return False
-        if not (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
-                and self.mapping.cp_size == 1 and position_ids is not None):
-            return False
-        effective_len = getattr(attn_metadata, 'max_ctx_kv_len',
-                                attn_metadata.num_ctx_tokens)
-        return effective_len <= self.short_seq_mha_threshold
-
-    def forward_context_dsa(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Deprecated: DSA context dispatch is now inlined in forward_impl().
-        Kept for test compatibility."""
-        if self._should_use_short_mha(attn_metadata, position_ids):
-            return self.forward_context(q, compressed_kv, k_pe, position_ids,
-                                        attn_metadata, output, latent_cache)
-
-        if get_sm_version() >= 100:
-            return self.forward_absorption_context(q,
-                                                   compressed_kv,
-                                                   k_pe,
-                                                   attn_metadata,
-                                                   output,
-                                                   latent_cache=latent_cache,
-                                                   topk_indices=topk_indices)
-        else:
-            return self.forward_sparse_mla_kvcache_bf16(q,
-                                                        latent_cache,
-                                                        attn_metadata,
-                                                        output,
-                                                        topk_indices,
-                                                        is_generation=False)
-
-    def forward_generation_dsa(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Deprecated: DSA generation dispatch is now inlined in forward_impl().
-        Kept for test compatibility."""
-        if get_sm_version() >= 100:
-            return self.forward_absorption_generation(q,
-                                                      compressed_kv,
-                                                      k_pe,
-                                                      attn_metadata,
-                                                      output,
-                                                      latent_cache=latent_cache,
-                                                      topk_indices=topk_indices)
-        else:
-            return self.forward_sparse_mla_kvcache_bf16(q,
-                                                        latent_cache,
-                                                        attn_metadata,
-                                                        output,
-                                                        topk_indices,
-                                                        is_generation=True)
 
     def forward_context_with_cached_kv(
         self,
@@ -2407,150 +2281,6 @@ class MLA(nn.Module):
 
         return output
 
-    @nvtx_range("forward_sparse_mla_kvcache_bf16")
-    def forward_sparse_mla_kvcache_bf16(
-        self,
-        q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        attn_metadata: DSAtrtllmAttentionMetadata,
-        output: torch.Tensor,
-        topk_indices: torch.Tensor,
-        is_generation: bool = False,
-    ) -> torch.Tensor:
-        """
-        Forward sparse MLA (DSA) for BF16 KV cache for both context and generation phases using FlashMLA kernels
-
-        To form the input for FlashMLA kernel and adapt our KV cache manager, we need to:
-        1. Append current tokens to paged cache and apply rope to q/k via mla_rope_append_paged_kv_assign_q
-        2. Load full kv cache from paged memory (with k rope applied)
-        3. Call FlashMLA sparse attention kernel for sparse prefill/decode
-        """
-        assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), \
-            "DSA requires DSAtrtllmAttentionMetadata"
-        # Append current tokens to paged cache and apply RoPE to q
-        # This writes latent_cache to paged KV and modifies q in-place
-        trtllm_attention = self.mqa
-        with nvtx_range_debug(
-                f"mla_rope_append_paged_kv_assign_q_is_generation={is_generation}"
-        ):
-            trtllm_attention.mla_rope_append_paged_kv_assign_q(
-                q, latent_cache, attn_metadata, is_generation=is_generation)
-
-        num_tokens = q.shape[0]
-        q_nope, q_rope = q.view(-1, self.num_heads_tp, self.qk_head_dim).split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_nope_out = torch.empty(
-            [num_tokens, self.num_heads_tp, (self.kv_lora_rank)],
-            dtype=q.dtype,
-            device=q.device,
-        )
-
-        if self.k_b_proj_trans.dtype == torch.bfloat16:
-            # [num_heads, num_tokens, self.qk_nope_head_dim]
-            q_nope_t = q_nope.transpose(0, 1)
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
-            # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
-            # The output of bmm is written directly into fused_q
-            torch.ops.trtllm.bmm_out(q_nope_t,
-                                     self.k_b_proj_trans.transpose(1, 2),
-                                     q_nope_out)
-        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            fp8_block_scaling_bmm_out(
-                q_nope,
-                self.k_b_proj_trans,
-                self.k_b_proj_trans_scale,
-                q_nope_out,
-                self.k_b_proj_trans_dequant,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            raise NotImplementedError(
-                f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
-
-        q_nope_out = q_nope_out.transpose(0, 1)
-        q_concat = torch.cat([q_nope_out, q_rope], dim=-1)
-
-        sm_version = get_sm_version()
-        # FlashMLA sparse kernel (bf16) requires num_heads=128 on sm100 or multiple of 64 on sm90
-        if sm_version >= 100:
-            padding = 128
-            assert self.num_heads_tp <= padding, (
-                f"SM100 FlashMLA sparse kernel requires exactly {padding} heads, "
-                f"got {self.num_heads_tp}. Padding from values > {padding} is not supported."
-            )
-        else:  # SM90
-            padding = ((self.num_heads_tp + 63) // 64) * 64  # multiple of 64
-
-        if self.num_heads_tp != padding:
-            logger.warning_once(
-                f"Padding num_heads from {self.num_heads_tp} to {padding} "
-                f"due to FlashMLA sparse attention kernel requirement",
-                key="sparse_mla_padding_warning")
-
-            # Create padded tensor with zeros for extra heads
-            q_padded = q_concat.new_empty(
-                (num_tokens, padding, q_concat.shape[2]))
-            q_padded[:, :self.num_heads_tp, :] = q_concat
-            q_concat = q_padded
-
-        # Convert indices and return all-layer KV pool
-        # Note: underlying pool is layer-interleaved: [num_blocks, num_layers, kv_factor, tokens_per_block, num_kv_heads, head_dim]
-        # to avoid reshape(copy) per-layer KV cache, we return all-layer KV pool w/ topk indices adjusted by stride_factor=num_layers*tokens_per_block
-        topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
-            topk_indices,
-            attn_metadata,
-            layer_idx=self.layer_idx,
-            is_generation=is_generation,
-        )
-        topk_indices_pool = topk_indices_pool.view(num_tokens, 1, -1)
-        if flash_mla_sparse_fwd is not None:
-            attn_out_latent = flash_mla_sparse_fwd(q_concat, kv_cache_pool,
-                                                   topk_indices_pool,
-                                                   self.softmax_scale)[0]
-        else:
-            raise RuntimeError(
-                "flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built."
-            )
-
-        # [seq, num_heads, kv_lora_rank], account for padding
-        attn_out_latent = attn_out_latent[:, :self.num_heads_tp, :]
-        attn_out_latent = attn_out_latent.view(
-            [-1, self.num_heads_tp, self.kv_lora_rank])
-        if self.num_heads_tp != padding:
-            attn_out_latent = attn_out_latent.contiguous()
-
-        assert (attn_out_latent.shape[0] == q.shape[0]
-                and attn_out_latent.shape[1] == self.num_heads_tp)
-
-        attn_output = output.view(
-            [num_tokens, self.num_heads_tp, self.v_head_dim])
-
-        if self.v_b_proj.dtype == torch.bfloat16:
-            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
-            # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
-        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            fp8_block_scaling_bmm_out(
-                attn_out_latent,
-                self.v_b_proj,
-                self.v_b_proj_scale,
-                attn_output.transpose(0, 1),
-                self.v_b_proj_dequant,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            raise NotImplementedError(
-                f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-        return output
-
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2568,7 +2298,7 @@ class MLA(nn.Module):
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(
                 hidden_states, position_ids, self.layer_idx_str, attn_output,
-                None if self.is_dsa else latent_cache_gen)
+                None if self.sparse_method is not None else latent_cache_gen)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
