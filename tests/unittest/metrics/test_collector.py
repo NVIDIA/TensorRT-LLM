@@ -248,10 +248,9 @@ class TestConfigInfoMetrics:
             "gpu_type": "NVIDIA H100",
         }
         collector.log_config_info(model_config=model_config)
-
-        from prometheus_client import REGISTRY
-        # Verify the metric was registered
-        assert "trtllm_model_config_info" in REGISTRY._names_to_collectors
+        assert REGISTRY.get_sample_value("trtllm_model_config_info",
+                                         {"model_name": "test_model",
+                                          **model_config}) == 1.0
 
     def test_parallel_config_info(self, collector):
         parallel_config = {
@@ -260,9 +259,9 @@ class TestConfigInfoMetrics:
             "gpu_count": "8",
         }
         collector.log_config_info(parallel_config=parallel_config)
-
-        from prometheus_client import REGISTRY
-        assert "trtllm_parallel_config_info" in REGISTRY._names_to_collectors
+        assert REGISTRY.get_sample_value("trtllm_parallel_config_info",
+                                         {"model_name": "test_model",
+                                          **parallel_config}) == 1.0
 
     def test_speculative_config_info(self, collector):
         spec_config = {
@@ -272,9 +271,9 @@ class TestConfigInfoMetrics:
             "spec_draft_model": "eagle-model",
         }
         collector.log_config_info(speculative_config=spec_config)
-
-        from prometheus_client import REGISTRY
-        assert "trtllm_speculative_config_info" in REGISTRY._names_to_collectors
+        assert REGISTRY.get_sample_value("trtllm_speculative_config_info",
+                                         {"model_name": "test_model",
+                                          **spec_config}) == 1.0
 
     def test_kv_cache_config_info(self, collector):
         kv_cache_config = {
@@ -283,9 +282,9 @@ class TestConfigInfoMetrics:
             "cache_dtype": "auto",
         }
         collector.log_config_info(kv_cache_config=kv_cache_config)
-
-        from prometheus_client import REGISTRY
-        assert "trtllm_kv_cache_config_info" in REGISTRY._names_to_collectors
+        assert REGISTRY.get_sample_value("trtllm_kv_cache_config_info",
+                                         {"model_name": "test_model",
+                                          **kv_cache_config}) == 1.0
 
     def test_no_config_no_error(self, collector):
         """No error when all configs are None."""
@@ -317,6 +316,31 @@ SAMPLE_REQUEST_METRICS_FULL = {
 }
 
 
+
+
+class TestRequestSuccessCounter:
+    """Test counter_request_success increments with the correct finished_reason label."""
+
+    def test_success_counter_incremented(self, collector):
+        labels = {"model_name": "test_model", "finished_reason": "end_id"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_counter_value(collector.counter_request_success,
+                                  labels) == 1
+
+    def test_success_counter_tracks_finish_reason_separately(self, collector):
+        """Different finish_reason values must be tracked in separate label series."""
+        metrics_stop = {
+            **SAMPLE_REQUEST_METRICS_FULL,
+            MetricsCollector.labelname_finish_reason: "stop_words",
+        }
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        collector.log_request_metrics_dict(metrics_stop)
+        assert _get_counter_value(
+            collector.counter_request_success,
+            {"model_name": "test_model", "finished_reason": "end_id"}) == 1
+        assert _get_counter_value(
+            collector.counter_request_success,
+            {"model_name": "test_model", "finished_reason": "stop_words"}) == 1
 
 
 class TestPerRequestTokenCounters:
@@ -417,6 +441,30 @@ class TestPerRequestPhaseHistograms:
                                     labels) == 1
         assert _get_histogram_sum(collector.histogram_inference_time_request,
                                   labels) == pytest.approx(2.4)
+
+    def test_e2e_time_observed(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_histogram_count(collector.histogram_e2e_time_request,
+                                    labels) == 1
+        assert _get_histogram_sum(collector.histogram_e2e_time_request,
+                                  labels) == pytest.approx(2.5)
+
+    def test_ttft_observed(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_histogram_count(collector.histogram_time_to_first_token,
+                                    labels) == 1
+        assert _get_histogram_sum(collector.histogram_time_to_first_token,
+                                  labels) == pytest.approx(0.3)
+
+    def test_tpot_observed(self, collector):
+        labels = {"model_name": "test_model"}
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        assert _get_histogram_count(collector.histogram_time_per_output_token,
+                                    labels) == 1
+        assert _get_histogram_sum(collector.histogram_time_per_output_token,
+                                  labels) == pytest.approx(0.05)
 
     def test_missing_phase_times_no_observation(self, collector):
         """No histogram observations when phase times are absent."""
