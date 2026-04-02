@@ -391,8 +391,8 @@ class OpenAIServer:
         }
         quant_config = getattr(args, "quant_config", None)
         if quant_config is not None:
-            model_config["quantization"] = str(
-                quant_config.quant_algo) if quant_config.quant_algo else "none"
+            quant_algo = getattr(quant_config, "quant_algo", None)
+            model_config["quantization"] = str(quant_algo) if quant_algo else "none"
         else:
             model_config["quantization"] = "none"
         max_seq_len = getattr(args, "max_seq_len", None)
