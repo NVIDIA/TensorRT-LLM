@@ -637,7 +637,9 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         world_size: int,
         min_local_shape: int = 1,
     ) -> None:
-        # Prepend prefix for VLM models where gm is a submodule
+        # Prepend prefix: Qwen3.5 full-model export puts the GraphModule inside
+        # the parent (e.g. model.language_model.*), so state_dict keys carry the
+        # parent prefix that weight_name alone does not include.
         scale_key = prefix + weight_name + "_scale_inv"
         if scale_key in state_dict:
             scale = state_dict[scale_key]
@@ -721,7 +723,9 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         world_size: int,
         min_local_shape: int = 1,
     ) -> None:
-        # Prepend prefix for VLM models where gm is a submodule
+        # Prepend prefix: Qwen3.5 full-model export puts the GraphModule inside
+        # the parent (e.g. model.language_model.*), so state_dict keys carry the
+        # parent prefix that weight_name alone does not include.
         key = prefix + weight_name + "_scale"
         if key in state_dict:
             state_dict[key] = _shard_fp4_weight_scale(
