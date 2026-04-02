@@ -86,7 +86,15 @@ class MistralAttention(Attention):
             config=model_config,
         )
 
-        self.attention_window_size = getattr(config, "sliding_window", None)
+        # Per-layer sliding window attention.
+        # Ministral uses layer_types to mark sliding vs full attention layers.
+        # Mistral (without layer_types) applies SWA uniformly to all layers.
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is not None and layer_idx is not None:
+            is_sliding = layer_types[layer_idx] == "sliding_attention"
+            self.attention_window_size = config.sliding_window if is_sliding else None
+        else:
+            self.attention_window_size = getattr(config, "sliding_window", None)
 
     def forward(
         self,
