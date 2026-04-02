@@ -1,0 +1,12 @@
+# Standalone AutoDeploy config for serving Mistral Small 4 119B.
+runtime: trtllm
+attn_backend: trtllm
+compile_backend: torch-simple
+model_factory: Mistral3ForConditionalGeneration
+skip_loading_weights: false
+max_seq_len: 512
+world_size: 8
+tokenizer: mistralai/Mistral-Small-4-119B-2603
+transforms:
+  insert_cached_mla_attention:
+    backend: torch_mla

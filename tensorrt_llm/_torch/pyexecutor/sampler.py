@@ -3284,11 +3284,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         state: SampleStateTorch,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
-        if not state.requests:
-            return
-
         if state.sampler_event:
             state.sampler_event.synchronize()
+
+        if not state.requests:
+            return
 
         assert state.host is not None
         new_tokens = state.host.new_tokens
@@ -4696,11 +4696,12 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
     ) -> None:
         # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)
-        if not state.requests:
-            return
 
         if state.sampler_event:
             state.sampler_event.synchronize()
+
+        if not state.requests:
+            return
 
         beam_width = self.beam_width(state.requests)
 

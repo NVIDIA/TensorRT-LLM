@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,10 +26,11 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
-#include "cubin/kernelMetaInfo.h"
+#include "cubin_visual_gen/kernelMetaInfoVisualGen.h"
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "kernelParamsVisualGen.h"
 #include "prepareCustomMask.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
@@ -92,20 +93,45 @@ public:
 
 public:
     using KernelMeta = TllmGenFmhaKernelMetaInfo;
+    using KernelMetaVx = TllmGenFmhaKernelMetaInfoVx;
     using RunnerParams = TllmGenFmhaRunnerParams;
     using SelectKernelParams = TllmGenSelectKernelParams;
 
     // Ctor.
-    TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ, Data_type dtypeKv,
-        Data_type dtypeOut, unsigned int smArch)
+    TllmGenFmhaKernel(KernelMeta const* pMetaStart, KernelMetaVx const* pMetaStartVx, unsigned int nMetaCount,
+        Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int smArch, int maxNumHeadsQPerKvInCta,
+        int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV,
+        Data_type dataTypeQkReinterpret)
         : mDtypeQ(dtypeQ)
         , mDtypeKv(dtypeKv)
         , mDtypeOut(dtypeOut)
         , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
         , mKernelMeta(pMetaStart)
+        , mKernelMetaVx(pMetaStartVx)
         , mKernelMetaCount(nMetaCount)
         , mSM(smArch)
+        , mMaxNumHeadsQPerKvInCta(maxNumHeadsQPerKvInCta)
+        , mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ)
+        , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
+        , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
+        , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
+        , mDataTypeQkReinterpret(dataTypeQkReinterpret)
     {
+    }
+
+    // Always convert to extended kernelMeta for kernel variant selection
+    KernelMetaVx getKernelMetaVx(int index) const
+    {
+        if (mKernelMeta != nullptr)
+        {
+            return KernelMetaVx(mKernelMeta[index]);
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(
+                mKernelMetaVx != nullptr, "mKernelMeta and mKernelMetaVx can't be nullptr at the same time.");
+            return mKernelMetaVx[index];
+        }
     }
 
     void loadKernels()
@@ -113,9 +139,15 @@ public:
         // Build a lookup map for all kernels.
         for (unsigned int i = 0; i < mKernelMetaCount; ++i)
         {
-            auto const& kernelMeta = mKernelMeta[i];
+            auto const kernelMeta = getKernelMetaVx(i);
             if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ
-                && kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut)
+                && kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut
+                && kernelMeta.mMaxNumHeadsQPerKvInCta == mMaxNumHeadsQPerKvInCta
+                && kernelMeta.mNumEltsPerSageAttnBlkQ == mNumEltsPerSageAttnBlkQ
+                && kernelMeta.mNumEltsPerSageAttnBlkK == mNumEltsPerSageAttnBlkK
+                && kernelMeta.mNumEltsPerSageAttnBlkP == mNumEltsPerSageAttnBlkP
+                && kernelMeta.mNumEltsPerSageAttnBlkV == mNumEltsPerSageAttnBlkV
+                && kernelMeta.mDataTypeQkReinterpret == mDataTypeQkReinterpret)
             {
                 // Load CUmodules
                 CUmodule hmod{0};
@@ -144,7 +176,7 @@ public:
                 auto it = mFunctions.find(hash);
                 if (it != mFunctions.end())
                 {
-                    auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
+                    auto const existingKernelMeta = getKernelMetaVx(it->second.mMetaInfoIndex);
                     TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
                         "The kernel's hashId has conflicts with others.");
                     // Prefer specific SM version over family version
@@ -229,7 +261,7 @@ public:
         return std::make_pair(mFunctions.find(hashId) != mFunctions.end(), info);
     }
 
-    std::pair<CUfunction, KernelMeta> loadKernel(
+    std::pair<CUfunction, KernelMetaVx> loadKernel(
         RunnerParams const& params, SelectKernelParams const& selectKernelParams) const
     {
         auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
@@ -238,8 +270,8 @@ public:
         // Add debug info when kernels are not found.
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "Trtllm-gen kernels not found: " + info);
 
-        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
-        const CUfunction func = findIter->second.mDeviceFunction;
+        auto const kernelMeta = getKernelMetaVx(findIter->second.mMetaInfoIndex);
+        CUfunction const func = findIter->second.mDeviceFunction;
         // Return the kernel function and kernel meta.
         return std::make_pair(func, kernelMeta);
     }
@@ -279,12 +311,25 @@ public:
                 runPrepareCustomMask(kernelMeta, params, params.stream);
             }
 
-            // Prepare the kernel parameters.
-            auto kernelParams = KernelParams::setKernelParams(
-                params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+            // Prepare the kernel parameters based on kernel type.
+            KernelParams kernelParams;
+            KernelParamsVisualGen kernelParamsVisualGen;
+            void* kernelParamsPtr = nullptr;
+            if (!kernelMeta.mIsVisualGenKernel)
+            {
+                kernelParams = KernelParams::setKernelParams(
+                    params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+                kernelParamsPtr = &kernelParams;
+            }
+            else
+            {
+                kernelParamsVisualGen = KernelParamsVisualGen::setKernelParams(
+                    params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+                kernelParamsPtr = &kernelParamsVisualGen;
+            }
 
             // Prepare kernel parameters list for cuLaunchKernelEx.
-            void* kernelParamsList[] = {&kernelParams};
+            void* kernelParamsList[] = {kernelParamsPtr};
             CUlaunchConfig launch_config;
             launch_config.blockDimX = kernelMeta.mThreadsPerCTA;
             launch_config.blockDimY = 1;
@@ -353,7 +398,16 @@ public:
             TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
             // Run the separate reduction kernel if needed.
-            runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+            if (!kernelMeta.mIsVisualGenKernel)
+            {
+                runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(
+                    !isGmemReductionWithSeparateKernel(static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode)),
+                    "VisualGen kernel should not require separate reduction.");
+            }
 
             // Break the while op.
             break;
@@ -814,6 +868,20 @@ private:
     // Select a kernel based on the heuristic.
     void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
+        // VisualGen context kernels currently use a fixed kernel family in meta tables.
+        // (e.g. tileSizeQ=128, tileSizeKv=128).
+        if (isContextKernel(params.mKernelType) && isSeparateQkv(params.mQkvLayout)
+            && (mNumEltsPerSageAttnBlkQ > 0 || mNumEltsPerSageAttnBlkK > 0 || mNumEltsPerSageAttnBlkP > 0
+                || mNumEltsPerSageAttnBlkV > 0 || mDataTypeQkReinterpret != DATA_TYPE_E4M3))
+        {
+            selectKernelParams.mKernelType = FmhaKernelType::Context;
+            selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+            selectKernelParams.mTileSizeQ = 128;
+            selectKernelParams.mTileSizeKv = 128;
+            selectKernelParams.mHeadDimPerCtaV = params.mHeadDimV;
+            selectKernelParams.mReuseSmemKForV = false;
+            selectKernelParams.mUses2CtaMma = false;
+        }
 
         // Select the kernel based on the kernel type.
         if (isGenerationKernel(params.mKernelType) && isMlaGenKernel(params))
@@ -885,8 +953,15 @@ private:
     Data_type mDtypeQ, mDtypeKv, mDtypeOut;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     KernelMeta const* mKernelMeta;
+    KernelMetaVx const* mKernelMetaVx;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
+    int mMaxNumHeadsQPerKvInCta;
+    int mNumEltsPerSageAttnBlkQ;
+    int mNumEltsPerSageAttnBlkK;
+    int mNumEltsPerSageAttnBlkP;
+    int mNumEltsPerSageAttnBlkV;
+    Data_type mDataTypeQkReinterpret;
     std::unordered_map<unsigned char const*, CUmodule> mModules;
 
     struct KernelInfo
@@ -904,18 +979,28 @@ class TllmFmhaKernelFactory
 {
 public:
     using KernelType = TllmGenFmhaKernel;
+    using KernelMeta = typename KernelType::KernelMeta;
+    using KernelMetaVx = typename KernelType::KernelMetaVx;
 
-    KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels,
-        Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
+    KernelType const* getKernels(KernelMeta const* pKernelList, KernelMetaVx const* pKernelListVx,
+        unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm,
+        int maxNumHeadsQPerKvInCta, int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
+        int numEltsPerSageAttnBlkV, Data_type dataTypeQkReinterpret)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
+        TLLM_CHECK_WITH_INFO(numEltsPerSageAttnBlkQ <= 64 && numEltsPerSageAttnBlkK <= 64
+                && numEltsPerSageAttnBlkP <= 64 && numEltsPerSageAttnBlkV <= 64,
+            "SageAttention allows numEltsPerSageAttnBlk up to 64.");
 
-        auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
+        auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm, maxNumHeadsQPerKvInCta, numEltsPerSageAttnBlkQ,
+            numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV, dataTypeQkReinterpret);
         auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
-            KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
+            KernelType* newKernel = new KernelType{pKernelList, pKernelListVx, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm,
+                maxNumHeadsQPerKvInCta, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP,
+                numEltsPerSageAttnBlkV, dataTypeQkReinterpret};
             newKernel->loadKernels();
             mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
             return newKernel;
@@ -938,22 +1023,65 @@ public:
 private:
     TllmFmhaKernelFactory() = default;
 
-    inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm) const
+    inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm,
+        int maxNumHeadsQPerKvInCta, int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
+        int numEltsPerSageAttnBlkV, Data_type dataTypeQkReinterpret) const
     {
+        auto const computeLog2BlockSizePlus1 = [](int blockSize) -> int
+        {
+            if (blockSize <= 0)
+            {
+                return 0;
+            }
+            TLLM_CHECK_WITH_INFO((blockSize & (blockSize - 1)) == 0, "SageAttn block size must be a power of 2.");
+            return __builtin_ctz(static_cast<unsigned int>(blockSize)) + 1;
+        };
+        // Format of the hash key:
+        // Bit 0  - 15: smVer
+        // Bit 16 - 19: dtypeQ
+        // Bit 20 - 23: dtypeKv
+        // Bit 24 - 27: dtypeOut
+        // Bit 28 - 31: maxNumHeadsQPerKvInCta [VisualGen kernels from below].
+        // Bit 32 - 34: log2NumEltsPerSageAttnBlkQ + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkQ is 64.
+        // Bit 35 - 37: log2NumEltsPerSageAttnBlkK + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkK is 64.
+        // Bit 38 - 40: log2NumEltsPerSageAttnBlkP + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkP is 64.
+        // Bit 41 - 43: log2NumEltsPerSageAttnBlkV + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkV is 64.
+        // Bit 44 - 47: dataTypeQkReinterpret.
         return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 | static_cast<uint64_t>(dtypeKv) << 20
-            | static_cast<uint64_t>(dtypeOut) << 24;
+            | static_cast<uint64_t>(dtypeOut) << 24 | (static_cast<uint64_t>(maxNumHeadsQPerKvInCta) << 28)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkQ)) << 32)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkK)) << 35)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkP)) << 38)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41)
+            | (static_cast<uint64_t>(dataTypeQkReinterpret) << 44);
     }
 
-    std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
+    std::unordered_map<uint64_t, std::unique_ptr<KernelType> const> mKernels;
 };
 
-inline TllmGenFmhaKernel const* getTllmFmhaKernels(
-    Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
+inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
+    unsigned int sm, int maxNumHeadsQPerKvInCta, int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK,
+    int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV, Data_type dataTypeQkReinterpret)
 {
 
 #ifndef EXCLUDE_SM_100F
-    return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
-        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
+    if (numEltsPerSageAttnBlkQ + numEltsPerSageAttnBlkK + numEltsPerSageAttnBlkP + numEltsPerSageAttnBlkV == 0
+        && dataTypeQkReinterpret == DATA_TYPE_E4M3)
+    {
+        // No VisualGen-specific option set. Load regular kernels.
+        return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos, nullptr,
+            sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm,
+            maxNumHeadsQPerKvInCta, 0, 0, 0, 0, DATA_TYPE_E4M3);
+    }
+    else
+    {
+        // Load VisualGen extension kernels.
+        TLLM_LOG_DEBUG("Using VisualGen extended kernels.");
+        return TllmFmhaKernelFactory::Get().getKernels(nullptr, sTllmGenFmhaKernelMetaInfosVx,
+            sizeof(sTllmGenFmhaKernelMetaInfosVx) / sizeof(sTllmGenFmhaKernelMetaInfosVx[0]), dtypeQ, dtypeKv, dtypeOut,
+            sm, maxNumHeadsQPerKvInCta, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP,
+            numEltsPerSageAttnBlkV, dataTypeQkReinterpret);
+    }
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100F
