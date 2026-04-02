@@ -700,7 +700,6 @@ class TestTwoStagePipelineVariantResolution:
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
         }
-        config.extra_attrs.get = config.extra_attrs.get
 
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2TwoStagesPipeline
@@ -713,7 +712,6 @@ class TestTwoStagePipelineVariantResolution:
 
         config = MagicMock()
         config.extra_attrs = {}
-        config.extra_attrs.get = config.extra_attrs.get
 
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2Pipeline
@@ -726,7 +724,6 @@ class TestTwoStagePipelineVariantResolution:
 
         config = MagicMock()
         config.extra_attrs = {"spatial_upsampler_path": "/fake/upsampler.safetensors"}
-        config.extra_attrs.get = config.extra_attrs.get
 
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2Pipeline
