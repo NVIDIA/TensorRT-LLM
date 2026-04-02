@@ -1802,8 +1802,10 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
+        # NCCL_SYMMETRIC is excluded from auto-tuning: the autotuner fails to
+        # evaluate it fairly in CPU-starved systems, leading to misleading
+        # benchmark results that cause it to be selected or rejected incorrectly.
         valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
