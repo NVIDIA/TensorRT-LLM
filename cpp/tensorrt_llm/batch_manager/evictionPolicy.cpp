@@ -30,6 +30,8 @@ auto const kMinPriority = executor::KvCacheRetentionConfig::kMinRetentionPriorit
 auto const kMaxPriority = executor::KvCacheRetentionConfig::kMaxRetentionPriority;
 
 auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority;
+// No longer used for priority boosting (pinning replaced it), but kept for backward compat.
+auto const kRadixTreeBlockPriority = kDefaultPriority + 10;
 executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
 int const kNumCacheLevels = 2;
@@ -139,6 +141,15 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
+    // Blocks in the radix tree (reusable by future requests) are boosted above the
+    // default priority so truly-free blocks are evicted first. This preserves cached
+    // data longer, increasing reuse opportunities for future requests.
+    // isShared() is only true when block reuse is enabled and the block is in the radix tree.
+    if (block->isShared() && block->getPriority() == kDefaultPriority)
+    {
+        block->setPriority(kRadixTreeBlockPriority);
+    }
+
     // If there are no children, this is a leaf block. Insert into a queue.
     auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
     if (toFront)
@@ -223,6 +234,19 @@ void LRUEvictionPolicy::refresh()
         }
         block->setPriority(kDefaultPriority);
     }
+}
+
+SizeType32 LRUEvictionPolicy::getNumTrulyFreeBlocks(SizeType32 cacheLevel)
+{
+    // Count blocks at priority below kRadixTreeBlockPriority (i.e., truly empty blocks
+    // that don't hold cached radix-tree data). These are evicted before cached blocks.
+    SizeType32 count = 0;
+    auto const radixIdx = getPriorityIdx(kRadixTreeBlockPriority);
+    for (SizeType32 level = 0; level < radixIdx; ++level)
+    {
+        count += static_cast<SizeType32>(mFreeQueues[cacheLevel][level].size());
+    }
+    return count;
 }
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy
