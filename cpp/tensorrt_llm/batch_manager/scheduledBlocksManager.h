@@ -31,34 +31,45 @@ class NoEvictScheduledBlocksManager
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 public:
-    explicit NoEvictScheduledBlocksManager(BaseKVCacheManager const& kvCacheManager)
+    explicit NoEvictScheduledBlocksManager(BaseKVCacheManager& kvCacheManager)
         : mKvCacheManager(kvCacheManager)
-        , mAvailableBlocks(mKvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize())
     {
+        // Track cumulative needed blocks per window (after reuse subtraction).
+        // Compare against effectiveFree (= totalFree - reservedBlocks) to decide admission.
+        // This pattern matches MaxUtilizationScheduledBlocksManager and avoids the
+        // double-counting issue that occurs when subtracting from an availableBlocks counter.
+        for (auto const& [ws, _] : mKvCacheManager.getBlockManager().getWindowSizesMetadata())
+        {
+            mCumulativeNeeded[ws] = 0;
+        }
     }
 
     void decrementReservedBlocks(LlmRequest const& req)
     {
-        for (auto& [windowSize, availableBlocks] : mAvailableBlocks)
+        for (auto& [windowSize, cumNeeded] : mCumulativeNeeded)
         {
-            availableBlocks -= mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
+            cumNeeded += mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
         }
     }
 
     bool enoughAvailableBlocks(LlmRequest const& req)
     {
-        return std::all_of(mAvailableBlocks.cbegin(), mAvailableBlocks.cend(),
+        return std::all_of(mCumulativeNeeded.cbegin(), mCumulativeNeeded.cend(),
             [this, &req](auto const& pair)
             {
-                auto const& [windowSize, availableBlocks] = pair;
-                auto const neededBlocks = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
-                return neededBlocks <= availableBlocks;
+                auto const& [windowSize, cumNeeded] = pair;
+                auto const thisNeeded = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
+                auto const effectiveFree = mKvCacheManager.getBlockManager().getEffectiveFreeBlocks(windowSize);
+                return (cumNeeded + thisNeeded) <= effectiveFree;
             });
     }
 
 private:
-    BaseKVCacheManager const& mKvCacheManager;
-    std::map<SizeType32, SizeType32> mAvailableBlocks;
+    BaseKVCacheManager& mKvCacheManager;
+    // Cumulative blocks needed by already-admitted requests (after reuse subtraction).
+    // Admission check: effectiveFree >= cumulativeNeeded + candidateNeeded
+    // where effectiveFree = totalFree - reservedBlocks.
+    std::map<SizeType32, SizeType32> mCumulativeNeeded;
 };
 
 class MaxUtilizationScheduledBlocksManager
@@ -66,7 +77,7 @@ class MaxUtilizationScheduledBlocksManager
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 public:
-    MaxUtilizationScheduledBlocksManager(BaseKVCacheManager const& kvCacheManager, bool twoStepsLookAhead)
+    MaxUtilizationScheduledBlocksManager(BaseKVCacheManager& kvCacheManager, bool twoStepsLookAhead)
         : mKvCacheManager(kvCacheManager)
         , mTwoStepsLookAhead(twoStepsLookAhead)
     {
@@ -111,7 +122,7 @@ public:
     }
 
 private:
-    BaseKVCacheManager const& mKvCacheManager;
+    BaseKVCacheManager& mKvCacheManager;
     std::map<SizeType32, SizeType32> mNumScheduledBlocks;
     bool const mTwoStepsLookAhead;
 };

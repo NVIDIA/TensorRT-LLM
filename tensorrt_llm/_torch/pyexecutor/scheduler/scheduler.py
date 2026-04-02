@@ -224,6 +224,11 @@ class BindCapacityScheduler(CapacityScheduler):
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+        # Reset scheduling reservations before the capacity scheduler reads block estimates.
+        # startScheduling() clears the reservation set so each scheduling pass starts fresh.
+        if self.kv_cache_manager is not None:
+            self.kv_cache_manager.start_scheduling()
+
         return self.impl(active_requests, self.kv_cache_manager, self.peft_cache_manager)
 
 
@@ -287,6 +292,7 @@ class SimpleScheduler(RequestScheduler):
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids
         )
+
         # Convert from binding type RequestVector to list[LlmRequest],
         # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(
@@ -817,6 +823,10 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
     def schedule(
         self, scheduler: "PyCapacityScheduler", active_requests: RequestList
     ) -> tuple[RequestList, RequestList]:
+        # Reset scheduling reservations before reading block estimates.
+        # This clears the reservation set so each scheduling pass starts fresh.
+        scheduler.kv_cache_manager.start_scheduling()
+
         scheduled_requests: RequestList = []
         has_peft = scheduler.peft_cache_manager is not None
 
@@ -1047,37 +1057,49 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
 class NoEvictScheduledBlocksManager:
     """
     Python equivalent of C++ kv_cache_manager::NoEvictScheduledBlocksManager.
-    Tracks available blocks per window size for GUARANTEED_NO_EVICT scheduling.
+    Tracks cumulative needed blocks per window size for GUARANTEED_NO_EVICT scheduling.
+    Compares against effectiveFree (= totalFree - reservedBlocks) to decide admission.
 
-    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:29-62
+    This pattern matches MaxUtilizationScheduledBlocksManager and avoids the
+    double-counting issue that occurs when subtracting from an availableBlocks counter:
+    cached blocks counted as reusable are both in the free pool and subtracted from
+    needed blocks, so a simple availableBlocks -= needed would not account for the
+    cached blocks that will be claimed from the free pool.
+
+    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h
     """
 
     def __init__(self, kv_cache_manager):
-        """
-        Initialize with free blocks from KVCacheManager.
-        C++ equivalent: mAvailableBlocks = mKvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize()
-        """
         self.kv_cache_manager = kv_cache_manager
-        stats = kv_cache_manager.get_kv_cache_stats()
-        self.available_blocks: dict[int, int] = dict(stats.num_free_blocks_per_window_size)
+        window_sizes = set(kv_cache_manager.max_attention_window_vec)
+        self.cumulative_needed: dict[int, int] = {ws: 0 for ws in window_sizes}
 
     def decrement_reserved_blocks(self, req: LlmRequest) -> None:
-        """
-        Decrement available blocks by the blocks needed to complete this request.
-        C++ reference: scheduledBlocksManager.h:40-46
-        """
-        for window_size in self.available_blocks:
+        """Add this request's needed blocks to the cumulative total."""
+        for window_size in self.cumulative_needed:
             needed = self.kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
-            self.available_blocks[window_size] -= needed
+            self.cumulative_needed[window_size] += needed
+        effective_free = dict(self.kv_cache_manager.get_effective_free_blocks_per_window_size())
+        logger.debug(
+            f"[NoEvict] After admitting request {req.request_id}: "
+            f"cumulative_needed={self.cumulative_needed}, "
+            f"effective_free={effective_free}"
+        )
 
     def enough_available_blocks(self, req: LlmRequest) -> bool:
         """
-        Check if there are enough available blocks for this request across all window sizes.
-        C++ reference: scheduledBlocksManager.h:48-57
+        Check: effectiveFree >= cumulativeNeeded + thisNeeded for all window sizes.
+        effectiveFree = totalFree - reservedBlocks (accounts for cached blocks).
+        cumulativeNeeded + thisNeeded = fresh blocks for all admitted + candidate requests.
         """
+        effective_free = dict(self.kv_cache_manager.get_effective_free_blocks_per_window_size())
         return all(
-            self.kv_cache_manager.get_remaining_blocks_to_completion(req, ws) <= avail
-            for ws, avail in self.available_blocks.items()
+            (
+                self.cumulative_needed.get(ws, 0)
+                + self.kv_cache_manager.get_remaining_blocks_to_completion(req, ws)
+            )
+            <= effective_free.get(ws, 0)
+            for ws in self.cumulative_needed
         )
 
 

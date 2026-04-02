@@ -43,6 +43,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -622,6 +623,9 @@ public:
 
     void startScheduling();
 
+    //! \brief Enable radix-tree block boosting and pinning. Called when block reuse is enabled.
+    void setEnableRadixTreeBoosting(bool enable);
+
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
     //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
     [[nodiscard]] SizeType32 addSequence(
@@ -640,6 +644,16 @@ public:
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    //! \details Makes blocks reusable immediately so concurrent requests sharing the same
+    //! prefix can find them before the full context finishes processing. SWA windows are
+    //! skipped because their block boundaries shift as the context grows.
+    //! \param sequence The generation request whose chunk just completed.
+    //! \param llmRequest The LLM request with token data and metadata.
+    //! \param processedTokens Token count after the chunk end (i.e. getContextCurrentPosition()).
+    void storeChunkedContextBlocks(
+        GenerationRequest& sequence, LlmRequest const& llmRequest, SizeType32 processedTokens);
 
     //! \brief Pin blocks associated with a sequence to prevent eviction.
     void pinBlocks(GenerationRequest& sequence);
@@ -681,6 +695,7 @@ public:
 
     // Get num free blocks in the primary memory pool
     [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
+    [[nodiscard]] SizeType32 getNumTrulyFreeBlocks() const noexcept;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
@@ -714,7 +729,27 @@ public:
 
     [[nodiscard]] bool schedulingHasFreeBlocks(SizeType32 numRequired) const noexcept
     {
-        return mSchedulingNumFreeBlocks >= numRequired;
+        return getEffectiveFreeBlocks() >= numRequired;
+    }
+
+    //! \brief Get the number of effective free blocks during scheduling.
+    //! \details Returns free blocks minus blocks reserved for reuse by countReusableBlocks.
+    [[nodiscard]] SizeType32 getEffectiveFreeBlocks() const noexcept
+    {
+        return mSchedulingNumFreeBlocks - mSchedulingReservedBlocks;
+    }
+
+    [[nodiscard]] SizeType32 getSchedulingReservedBlocks() const noexcept
+    {
+        return mSchedulingReservedBlocks;
+    }
+
+    //! \brief Get the count of allocated-only reusable blocks from the last countReusableBlocks call.
+    //! \details Only blocks with active refs (hasRefs=true) are counted. These are safe to use for
+    //! token budget estimation since they can't be evicted before addSequence claims them.
+    [[nodiscard]] SizeType32 getLastAllocatedReusableBlocks() const noexcept
+    {
+        return mLastAllocatedReusableBlocks;
     }
 
     [[nodiscard]] SizeType32 getMaxNumBlocks() const noexcept
@@ -830,12 +865,10 @@ public:
     //!          of the request's context are already cached.
     //! \param uniqueTokens The unique tokens representing the request's context.
     //! \param llmRequest The request to check for reusable blocks.
-    //! \param onlyAllocated If true, only count blocks that have active references (already allocated
-    //!        to another sequence). Free cached blocks are excluded because they are already counted
-    //!        in the eviction policy's free count.
     //! \return The number of full blocks that can be reused.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
+    //! \details Also reserves cached (no-ref) blocks in mSchedulingReservedBlockIds to
+    //! prevent double-counting in the effective free block count.
+    [[nodiscard]] SizeType32 countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest);
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
@@ -982,6 +1015,16 @@ private:
 
     // Used to keep track of number of free blocks during scheduling
     SizeType32 mSchedulingNumFreeBlocks;
+    // Tracks which cached blocks have been counted as reusable during the current
+    // scheduling pass. Used to prevent double-counting when multiple requests share
+    // a prefix (Rule 3: only the first request to count a block reserves it).
+    // Cleared at each startScheduling() call. Memory is proportional to reserved
+    // blocks (bounded by prefix length), not total blocks.
+    std::unordered_set<KVCacheBlock::IdType> mSchedulingReservedBlockIds;
+    SizeType32 mSchedulingReservedBlocks{0};
+    // Count of reusable blocks with active refs from the last countReusableBlocks call.
+    // Used for diagnostics and logging.
+    SizeType32 mLastAllocatedReusableBlocks{0};
     // Number of tokens per one block
     SizeType32 mTokensPerBlock;
     // Whether this window is sliding window attention/full attention
@@ -1146,8 +1189,7 @@ public:
 
     //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
     //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
+    [[nodiscard]] SizeType32 countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest);
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
@@ -1172,6 +1214,14 @@ public:
 
     void startScheduling();
 
+    void setEnableRadixTreeBoosting(bool enable)
+    {
+        for (auto& [_, manager] : mWindowBlockManagers)
+        {
+            manager.setEnableRadixTreeBoosting(enable);
+        }
+    }
+
     [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
     {
         std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
@@ -1180,6 +1230,48 @@ public:
             numFreeBlocksPerWindowSize[windowSize] = manager.getNumFreeBlocks();
         }
         return numFreeBlocksPerWindowSize;
+    }
+
+    [[nodiscard]] std::map<SizeType32, SizeType32> getEffectiveFreeBlocksPerWindowSize() const
+    {
+        std::map<SizeType32, SizeType32> result;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            result[windowSize] = manager.getEffectiveFreeBlocks();
+        }
+        return result;
+    }
+
+    [[nodiscard]] SizeType32 getEffectiveFreeBlocks(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize).getEffectiveFreeBlocks();
+    }
+
+    //! \brief Get the allocated-only reusable block count from the last countReusableBlocks call.
+    //! \details Only works for single-window (non-variable) configs. Returns the count from
+    //! the only WindowBlockManager. Used for diagnostics and logging.
+    [[nodiscard]] SizeType32 getLastAllocatedReusableBlocks() const
+    {
+        TLLM_CHECK_WITH_INFO(
+            !isVariableWindow(), "getLastAllocatedReusableBlocks does not work for variable window attention");
+        return mWindowBlockManagers.cbegin()->second.getLastAllocatedReusableBlocks();
+    }
+
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumTrulyFreeBlocksPerWindowSize() const
+    {
+        std::map<SizeType32, SizeType32> result;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            // In variable-window (multi-window) configs, SWA windows are excluded from
+            // the truly-free count since their eviction behavior differs from full-attention
+            // windows. In single-window configs, even SWA windows are included normally.
+            if (mIsVariableWindow && manager.isSWA())
+            {
+                continue;
+            }
+            result[windowSize] = manager.getNumTrulyFreeBlocks();
+        }
+        return result;
     }
 
     [[nodiscard]] SizeType32 getNumFreeBlocks() const
@@ -1365,6 +1457,11 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    //! \details Delegates to each non-SWA WindowBlockManager.
+    void storeChunkedContextBlocks(
+        GenerationRequest& sequence, LlmRequest const& llmRequest, SizeType32 processedTokens);
+
     //! \brief Store newest block for reuse
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
@@ -1529,6 +1626,19 @@ public:
 
     [[nodiscard]] virtual SizeType32 getNumFreeBlocks() const = 0;
 
+    virtual void setIterThreshold(SizeType32 iterThreshold) {}
+
+    [[nodiscard]] virtual std::map<SizeType32, SizeType32> getNumTrulyFreeBlocksPerWindowSize() const
+    {
+        return {};
+    }
+
+    //! \brief Get effective free blocks (free minus scheduling-reserved) per window size.
+    [[nodiscard]] virtual std::map<SizeType32, SizeType32> getEffectiveFreeBlocksPerWindowSize() const
+    {
+        return {};
+    }
+
     [[nodiscard]] virtual SizeType32 getNumPools() const = 0;
 
     // only used by test
@@ -1549,15 +1659,14 @@ public:
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
     [[nodiscard]] virtual SizeType32 getNeededBlocksOneStep(
-        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const
+        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize)
         = 0;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens)
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
-        = 0;
+    [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) = 0;
 
     /// @brief Pin blocks associated with a request to prevent eviction.
     /// @param requestId The ID of the request whose blocks should be pinned.
@@ -1621,18 +1730,25 @@ public:
 
     //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
     //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
-    //!          of the request's context are already cached.
+    //!          of the request's context are already cached. Also reserves cached (no-ref) blocks
+    //!          in the scheduling reservation set to prevent double-counting.
     //! \param uniqueTokens The unique tokens representing the request's context.
     //! \param llmRequest The request to check for reusable blocks.
-    //! \param onlyAllocated If true, only count blocks that have active references.
     //! \return The number of full blocks that can be reused.
     [[nodiscard]] virtual SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest)
         = 0;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
+
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    //! \details Called after each non-final context chunk. Blocks become reusable
+    //! immediately, enabling prefix sharing with concurrent requests before the full
+    //! context finishes. Implementations that do not support chunked prefill may
+    //! leave this as a no-op.
+    virtual void storeChunkedContextBlocks([[maybe_unused]] LlmRequest const& llmRequest) {}
 
     //! \brief Store newest block for reuse.
     //! \details This block become reusable from next step.
@@ -1859,6 +1975,10 @@ public:
         return mBlockManager.getNumFreeBlocksPerWindowSize();
     }
 
+    void setIterThreshold(SizeType32 iterThreshold) override;
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumTrulyFreeBlocksPerWindowSize() const override;
+    [[nodiscard]] std::map<SizeType32, SizeType32> getEffectiveFreeBlocksPerWindowSize() const override;
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
@@ -1905,14 +2025,13 @@ public:
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
     [[nodiscard]] SizeType32 getNeededBlocksOneStep(
-        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const override;
+        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) override;
 
     /// @brief  Function that computes the number of KV cache blocks remaining to advance a request to completion (i.e.
     /// for maxNewTokens); the allocated blocks are excluded
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(
-        LlmRequest const& req, SizeType32 windowSize) const override;
+    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) override;
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;
@@ -2002,11 +2121,14 @@ public:
 
     //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
     [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const override;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) override;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     void storeContextBlocks(LlmRequest const& llmRequest) override;
+
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    void storeChunkedContextBlocks(LlmRequest const& llmRequest) override;
 
     //! \brief Store newest blocks for reuse
     void storeNewBlock(LlmRequest const& llmRequest) override;
