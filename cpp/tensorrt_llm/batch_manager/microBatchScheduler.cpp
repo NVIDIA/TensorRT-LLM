@@ -410,11 +410,11 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
 
     utils::sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
 
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_INFO(
         "batchSize (num ctx/enc requests + num gen requests): %u", contextRequests.size() + generationRequests.size());
-    TLLM_LOG_DEBUG("batchNumTokens (num ctx/enc input tokens + num gen input tokens) / maxNumTokens: %d / %d",
+    TLLM_LOG_INFO("batchNumTokens (num ctx/enc input tokens + num gen input tokens) / maxNumTokens: %d / %d",
         batchNumTokens, maxNumTokensRuntime.value_or(0));
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_INFO(
         "[Summary] Micro Batch scheduler schedules %d context/encoder requests, %d generation requests. "
         "%d requests inflight with the model already",
         contextRequests.size(), generationRequests.size(), inflightReqIds.size());

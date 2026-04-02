@@ -190,6 +190,11 @@ class MockKVCacheManager:
         self._scheduling_reserved_block_ids = set()
         self._scheduling_reserved_blocks = 0
 
+    def pin_newly_reserved_blocks(self):
+        # Mock: no-op since the mock doesn't have a real eviction policy.
+        # The pinning is tested via C++ unit tests.
+        pass
+
     def scheduling_remove_sequence(self, req_id: int):
         pass
 

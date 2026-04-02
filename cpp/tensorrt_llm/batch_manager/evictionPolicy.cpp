@@ -274,7 +274,7 @@ void LRUEvictionPolicy::boostReservedBlock(BlockPtr block)
     mNumFreeBlocksPerLevel[cacheLevel]--;
     mPinnedReservedBlocks.push_back(block);
 
-    TLLM_LOG_DEBUG("boostReservedBlock: pinned block %d (was priority %d), pinnedCount=%zu", id, block->getPriority(),
+    TLLM_LOG_INFO("boostReservedBlock: pinned block %d (was priority %d), pinnedCount=%zu", id, block->getPriority(),
         mPinnedReservedBlocks.size());
 }
 
