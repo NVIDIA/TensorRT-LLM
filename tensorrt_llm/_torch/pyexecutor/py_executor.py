@@ -1707,7 +1707,7 @@ class PyExecutor:
                 new_requests += iter_requests
                 self.hang_detector.checkpoint()
                 if self.num_fetch_requests < fill_target:
-                    time.sleep(1)
+                    time.sleep(0.1)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
