@@ -205,12 +205,20 @@ TEST_P(VirtualMemoryOffloadConfigurator, Test)
 
     CUDAVirtualMemoryChunk::CreatorPtr creator
         = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+<<<<<<< HEAD
                                                CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
+=======
+                                               CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, 0}},
+>>>>>>> 279844eed9 (Fix again)
             size);
 
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, size,
+<<<<<<< HEAD
         CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+=======
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, 0}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+>>>>>>> 279844eed9 (Fix again)
     configurators.push_back(std::make_unique<OffloadConfigurator>(address, size, backType, stream.get(), false));
 
     CUDAVirtualMemoryChunk vm(std::move(creator), std::move(configurators));
@@ -598,13 +606,22 @@ TEST_F(VirtualMemoryTest, TestFacilities)
 
         // Create original CUDAVirtualMemoryChunk
         CUDAVirtualMemoryChunk::CreatorPtr creator = std::make_unique<LocalCreator<>>(
+<<<<<<< HEAD
             CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
                 CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
+=======
+            CUmemAllocationProp{
+                CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE, CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, 0}},
+>>>>>>> 279844eed9 (Fix again)
             size);
 
         CUDAVirtualMemoryChunk::Configurators configurators;
         configurators.push_back(std::make_unique<UnicastConfigurator>(address, size,
+<<<<<<< HEAD
             CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+=======
+            CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, 0}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+>>>>>>> 279844eed9 (Fix again)
 
         CUDAVirtualMemoryChunk original(std::move(creator), std::move(configurators));
         original.materialize();
@@ -963,12 +980,20 @@ TEST_F(VirtualMemoryManagerTest, TestBasic)
 
     CUDAVirtualMemoryChunk::CreatorPtr creator
         = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+<<<<<<< HEAD
                                                CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
+=======
+                                               CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, 0}},
+>>>>>>> 279844eed9 (Fix again)
             size);
 
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, size,
+<<<<<<< HEAD
         CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+=======
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, 0}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+>>>>>>> 279844eed9 (Fix again)
 
     auto memoryBegin = getCurrentProcessMemoryInfo();
 
