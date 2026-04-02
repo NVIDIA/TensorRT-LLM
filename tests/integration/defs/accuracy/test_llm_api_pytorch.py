@@ -1710,7 +1710,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_bfloat16_4gpus_kv_cache_aware_routing(self, mtp_nextn):
         """Accuracy test for attention DP with KV cache-aware routing."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=True)
+                                        enable_block_reuse=True,
+                                        use_kv_cache_manager_v2=False)
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(),
