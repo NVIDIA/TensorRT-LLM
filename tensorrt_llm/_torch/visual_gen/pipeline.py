@@ -12,6 +12,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
+from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
@@ -231,8 +232,6 @@ class BasePipeline(nn.Module):
                 f"Transformer path does not exist: {transformer_path}. "
                 f"Checkpoint directory must contain a 'transformer' subdirectory."
             )
-
-        from .checkpoints import WeightLoader
 
         weight_loader = WeightLoader(components=transformer_components)
         return weight_loader.load_weights(checkpoint_dir, self.mapping)

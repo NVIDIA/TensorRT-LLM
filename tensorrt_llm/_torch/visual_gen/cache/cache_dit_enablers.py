@@ -14,6 +14,23 @@ from tensorrt_llm.logger import logger
 
 from ..config import CacheDiTConfig
 
+try:
+    import cache_dit
+    from cache_dit import (
+        BlockAdapter,
+        DBCacheConfig,
+        ForwardPattern,
+        ParamsModifier,
+        TaylorSeerCalibratorConfig,
+    )
+except ImportError:
+    cache_dit = None  # type: ignore[assignment, misc]
+    BlockAdapter = None  # type: ignore[assignment, misc]
+    DBCacheConfig = None  # type: ignore[assignment, misc]
+    ForwardPattern = None  # type: ignore[assignment, misc]
+    ParamsModifier = None  # type: ignore[assignment, misc]
+    TaylorSeerCalibratorConfig = None  # type: ignore[assignment, misc]
+
 # Batched CFG on Wan (2.1 and 2.2): default enable_separate_cfg False (single cond+uncond batch).
 _WAN_CFG_DEFAULT = False
 _FLUX_CFG_DEFAULT = False
@@ -82,16 +99,14 @@ def split_wan22_inference_steps(pipeline: Any, num_inference_steps: int) -> tupl
 
 
 def _build_db_cache_config(user: CacheDiTConfig, **overrides: Any) -> Any:
-    from cache_dit import DBCacheConfig
-
+    assert DBCacheConfig is not None
     return DBCacheConfig(**db_cache_kwargs_from_cache_dit_config(user, **overrides))
 
 
 def _maybe_calibrator(cache_dit_cfg: CacheDiTConfig):
     if not cache_dit_cfg.enable_taylorseer:
         return None
-    from cache_dit import TaylorSeerCalibratorConfig
-
+    assert TaylorSeerCalibratorConfig is not None
     return TaylorSeerCalibratorConfig(taylorseer_order=cache_dit_cfg.taylorseer_order)
 
 
@@ -104,7 +119,7 @@ def _refresh_ctx(
     *,
     extra_reset: Optional[dict] = None,
 ) -> None:
-    from cache_dit import DBCacheConfig
+    assert DBCacheConfig is not None
 
     if cache_dit_cfg.scm_steps_mask_policy is None:
         cache_dit.refresh_context(module, num_inference_steps=num_inference_steps, verbose=verbose)
@@ -138,13 +153,22 @@ def _refresh_ctx(
 
 def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> CacheDiTEnableResult:
     """Wan T2V / I2V: single transformer (2.1) or dual (2.2)."""
-    import cache_dit
-    from cache_dit import BlockAdapter, DBCacheConfig, ForwardPattern, ParamsModifier
+    if (
+        cache_dit is None
+        or BlockAdapter is None
+        or ForwardPattern is None
+        or ParamsModifier is None
+    ):
+        raise RuntimeError(
+            "cache_dit package is not installed. Install the cache-dit distribution "
+            "for your environment (see https://github.com/vipshop/cache-dit)."
+        )
 
     calibrator = _maybe_calibrator(cache_dit_cfg)
     separate = _resolved_enable_separate_cfg(cache_dit_cfg, _WAN_CFG_DEFAULT)
 
     transformer_2 = getattr(pipeline, "transformer_2", None)
+
     if transformer_2 is None:
         db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=separate)
         logger.info("Cache-DiT: Wan single-transformer mode (Pattern_2 BlockAdapter).")
@@ -175,6 +199,7 @@ def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> Ca
             summary_modules=[pipeline.transformer],
         )
 
+    assert DBCacheConfig is not None
     shared = DBCacheConfig(
         **db_cache_kwargs_from_cache_dit_config(cache_dit_cfg, enable_separate_cfg=separate),
     )
@@ -230,8 +255,16 @@ def enable_cache_dit_for_flux(
     is_flux2: bool,
 ) -> CacheDiTEnableResult:
     """Cache-DiT BlockAdapter for FLUX.1 / FLUX.2."""
-    import cache_dit
-    from cache_dit import BlockAdapter, ForwardPattern, ParamsModifier
+    if (
+        cache_dit is None
+        or BlockAdapter is None
+        or ForwardPattern is None
+        or ParamsModifier is None
+    ):
+        raise RuntimeError(
+            "cache_dit package is not installed. Install the cache-dit distribution "
+            "for your environment (see https://github.com/vipshop/cache-dit)."
+        )
 
     calibrator = _maybe_calibrator(cache_dit_cfg)
     separate = _resolved_enable_separate_cfg(cache_dit_cfg, _FLUX_CFG_DEFAULT)
