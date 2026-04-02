@@ -197,6 +197,11 @@ class CutlassMoEOp(MoEOp):
         use_dynamic_fc2_scale = getattr(module, 'force_dynamic_quantization',
                                         False)
 
+        # Ensure quant_scales is a plain list for C++ ArrayRef<Tensor> binding.
+        # NamedTuple (e.g. FusedMoEQuantScalesW4A8) may not convert correctly.
+        if not isinstance(quant_scales, list):
+            quant_scales = list(quant_scales)
+
         # Run the actual MoE computation
         output = run_moe(x, token_selected_slots, token_final_scales,
                          w3_w1_weight.view(weight_dtype), w3_w1_bias,
