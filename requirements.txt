@@ -85,3 +85,4 @@ nvidia-cuda-tileiras>=13.1,<13.2
 etcd-sdk-python==0.0.7
 python-multipart
 smg-grpc-proto>=0.4.2
+pystack
