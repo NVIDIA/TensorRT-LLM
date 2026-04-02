@@ -408,7 +408,6 @@ class TrtllmAttentionWrapper:
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
         num_contexts: int = 0,
-        num_generations: int = 0,
         num_ctx_tokens: int = 0,
     ):
         """
@@ -642,7 +641,6 @@ class TrtllmAttentionWrapper:
                 self.quant_config,
                 self.kv_cache_manager,
                 num_contexts,
-                num_generations,
                 num_ctx_tokens,
                 global_layer_idx=self.global_layer_idx,
             )
@@ -2059,7 +2057,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          mla_bmm2_scale=mla_bmm2_scale,
                          quant_q_buffer=quant_q_buffer,
                          num_contexts=metadata.num_contexts,
-                         num_generations=metadata.num_generations,
                          num_ctx_tokens=metadata.num_ctx_tokens)
 
         if output_sf is None:
