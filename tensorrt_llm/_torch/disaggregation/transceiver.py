@@ -172,7 +172,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for idx, lg in enumerate(self._page_table.layer_groups):
             if isinstance(lg, MambaLayerGroup):
                 # Mamba layer groups have no KV cache blocks; skip.
-                groups.append([])
+                groups.append(np.array([], dtype=np.int64))
                 continue
             block_ids = self._get_block_ids(req, idx, lg)
 

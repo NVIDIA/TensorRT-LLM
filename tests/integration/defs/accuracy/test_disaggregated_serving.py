@@ -1873,14 +1873,16 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    def test_auto_dtype(self):
-        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("UCX")
+    @parametrize_with_ids("use_python_transceiver", [True, False])
+    def test_auto_dtype(self, use_python_transceiver):
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
+            "UCX", use_python_transceiver)
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(8)
-    def test_nixl_backend(self, use_python_runtime):
+    def test_nixl_backend(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("NIXL")
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
@@ -1891,8 +1893,11 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
             "NIXL", use_python_runtime=True)
         ctx_cfg["tensor_parallel_size"] = 2
+        ctx_cfg["moe_expert_parallel_size"] = 2
         ctx_cfg["enable_attention_dp"] = True
         gen_cfg["tensor_parallel_size"] = 4
+        gen_cfg["moe_expert_parallel_size"] = 4
+        gen_cfg["pipeline_parallel_size"] = 1
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])

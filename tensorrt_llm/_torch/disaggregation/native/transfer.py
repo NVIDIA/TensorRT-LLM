@@ -87,6 +87,7 @@ class RecvReqInfo:
                 "unique_rid": self.unique_rid,
                 "start_token_idx": self.start_token_idx,
                 "aux_slot": self.aux_slot,
+                "mamba_state_index": self.mamba_state_index,
             }
         )
 
@@ -511,13 +512,12 @@ class Sender(SenderBase):
         # tuples and construct the final sizes array with a single np.repeat().
         # For 48k+ items this avoids many small allocations in the hot loop.
         size_specs: list[tuple[int, int]] = []
-        dst_device_id = None
+        dst_device_id = peer_ri.device_id
+        extractor = self._registrar.self_extractor
+        peer_extractor = self._registrar.peer_extractor(
+            peer_ri.instance_name, peer_ri.instance_rank
+        )
         if self._registrar.should_send_kv(targets, peer_ri):
-            dst_device_id = peer_ri.device_id
-            extractor = self._registrar.self_extractor
-            peer_extractor = self._registrar.peer_extractor(
-                peer_ri.instance_name, peer_ri.instance_rank
-            )
             pool_mapping = self._registrar.get_pool_mapping(peer_ri)
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
@@ -566,19 +566,19 @@ class Sender(SenderBase):
             dst_frags = np.array([], dtype=np.int64)
             kv_sizes = np.array([], dtype=np.int64)
 
-            # handle mamba fragments
-            m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
-                self_page_table=extractor.page_table,
-                peer_page_table=peer_extractor.page_table,
-                src_slot=task._slice.mamba_state_index,
-                dst_slot=req_info.mamba_state_index,
-                self_ri=self._registrar.self_rank_info,
-                peer_ri=peer_ri,
-            )
-            if m_src:
-                src_frags.extend(m_src)
-                dst_frags.extend(m_dst)
-                kv_sizes.extend(m_sizes)
+        # handle mamba fragments
+        m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
+            self_page_table=extractor.page_table,
+            peer_page_table=peer_extractor.page_table,
+            src_slot=task._slice.mamba_state_index,
+            dst_slot=req_info.mamba_state_index,
+            self_ri=self._registrar.self_rank_info,
+            peer_ri=peer_ri,
+        )
+        if m_src:
+            src_frags = np.concatenate([src_frags, np.array(m_src, dtype=np.int64)])
+            dst_frags = np.concatenate([dst_frags, np.array(m_dst, dtype=np.int64)])
+            kv_sizes = np.concatenate([kv_sizes, np.array(m_sizes, dtype=np.int64)])
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)

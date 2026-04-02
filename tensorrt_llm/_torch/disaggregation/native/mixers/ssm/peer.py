@@ -337,7 +337,7 @@ class MambaPolicy:
         layer_offsets: Dict[int, int],
         overlapping_layers: List[int],
         slot: int,
-    ) -> List[int]:
+    ) -> np.ndarray:
         """Build per-layer pointers for a given pool (conv or ssm) and slot."""
         ptrs = []
         for glid in overlapping_layers:
@@ -345,7 +345,7 @@ class MambaPolicy:
             ptrs.append(
                 pool.base_address + lid * pool.num_slots * pool.slot_bytes + slot * pool.slot_bytes
             )
-        return ptrs
+        return np.array(ptrs, dtype=np.int64)
 
     @staticmethod
     def _select_mapper(
