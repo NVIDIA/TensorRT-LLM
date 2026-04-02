@@ -43,10 +43,9 @@ from ..attention_interface import (
     Constant,
     MHACallable,
     PrepareMetadataHostCallable,
-    ResourceHandler,
     ResourceHandlerDict,
-    SequenceInfo,
 )
+from .flashinfer_mla import MLAPagedResourceHandler
 from .triton_mla_cache_append import append_paged_mla_cache
 
 
@@ -56,30 +55,6 @@ class _WorkspaceState:
 
 
 _WORKSPACES: Dict[Tuple[torch.device, torch.dtype], _WorkspaceState] = {}
-
-
-class _CombinedMLAPagedResourceHandler(ResourceHandler):
-    """Allocate a combined MLA paged cache for Path 2."""
-
-    @property
-    def is_paged(self) -> bool:
-        return True
-
-    def __init__(self, *token_shape: int, dtype: torch.dtype) -> None:
-        self.token_shape = token_shape
-        self.dtype = dtype
-
-    def _get_bytes_per_token(self) -> int:
-        return math.prod(self.token_shape) * self.dtype.itemsize
-
-    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
-        return torch.empty(
-            sequence_info.num_blocks,
-            sequence_info.tokens_per_block,
-            *self.token_shape,
-            device=sequence_info.device,
-            dtype=self.dtype,
-        )
 
 
 def _get_workspace(device: torch.device) -> torch.Tensor:
@@ -519,7 +494,7 @@ class FlashInferTrtllmMLAAttention(AttentionDescriptor):
             cache_dtype = torch.bfloat16
 
         return {
-            "mla_paged_cache": _CombinedMLAPagedResourceHandler(
+            "mla_paged_cache": MLAPagedResourceHandler(
                 kv_lora_rank + qk_rope_head_dim,
                 dtype=cache_dtype,
             )
