@@ -811,10 +811,11 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             hidden_states = decoder_layer(hidden_states, position_embeddings=position_embeddings)
 
         hidden_states = self.norm(hidden_states)
-        if self.lm_head is not None:
-            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
-            return Qwen3_5MoeCausalLMOutput(logits=logits)
-        return Qwen3_5MoeOutput(last_hidden_state=hidden_states)
+        assert self.lm_head is not None, (
+            "lm_head not set — call set_lm_head() from the parent model before forward()"
+        )
+        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        return Qwen3_5MoeCausalLMOutput(logits=logits)
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
