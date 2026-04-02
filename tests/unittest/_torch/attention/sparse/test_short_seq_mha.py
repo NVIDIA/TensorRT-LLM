@@ -377,10 +377,20 @@ def _make_metadata(
 
 
 def _run_forward(
-    mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices=None
+    mla,
+    q,
+    compressed_kv,
+    k_pe,
+    latent_cache,
+    position_ids,
+    metadata,
+    sparse_intermediates=None,
 ):
     """Run sparse context dispatch on cloned inputs and return the output tensor."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
+    kwargs = {}
+    if sparse_intermediates:
+        kwargs = {k: v[: q.shape[0]] for k, v in sparse_intermediates.items()}
     mla.sparse_method.dispatch_context(
         mla,
         q=q.clone(),
@@ -389,8 +399,8 @@ def _run_forward(
         attn_metadata=metadata,
         output=output,
         latent_cache=latent_cache.clone(),
-        topk_indices=topk_indices,
         position_ids=position_ids.clone(),
+        **kwargs,
     )
     return output
 
@@ -464,15 +474,16 @@ def test_standard_path_when_exceeds_threshold():
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
 
     metadata = _make_metadata(attn_cls, seq_lens, kv_mgr, mapping, sparse_config)
-    topk_indices = mla.mqa.indexer(
-        qr,
-        hidden_states,
+    sparse_intermediates = mla.sparse_method.pre_attn_process(
+        mla,
         metadata,
+        hidden_states,
+        qr,
         position_ids,
     )
 
     output = _run_forward(
-        mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices
+        mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, sparse_intermediates
     )
     assert torch.isfinite(output).all()
     kv_mgr.shutdown()
@@ -519,16 +530,17 @@ def test_agrees_with_absorption_path():
             mla_module.short_seq_mha_threshold > 0
             and total_tokens <= mla_module.short_seq_mha_threshold
         )
-        topk = None
+        intermediates = None
         if not use_short:
-            topk = mla_module.mqa.indexer(
-                qr.clone(),
-                hidden_states.clone(),
+            intermediates = mla_module.sparse_method.pre_attn_process(
+                mla_module,
                 meta,
+                hidden_states.clone(),
+                qr.clone(),
                 position_ids.clone(),
             )
         out = _run_forward(
-            mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, topk
+            mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, intermediates
         )
         kv_mgr.shutdown()
         return out

@@ -22,7 +22,7 @@ access projection layers, absorption methods, and attention backends.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Dict, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -39,33 +39,33 @@ class SparseAttentionMethod(Protocol):
     Implementations receive the MLA instance (``mla``) to access shared
     building blocks (projections, absorption paths, attention backends)
     without owning them.
+
+    The workflow is:
+    1. ``pre_attn_process()`` — token-parallel preprocessing (projections,
+       k-cache scatter) on ALL tokens before ctx/gen split.
+    2. ``dispatch_context()`` / ``dispatch_generation()`` — phase-specific
+       attention dispatch. Sparse index prediction happens inside the
+       trtllm backend (via ``sparse_attn_predict``), not in MLA.
     """
 
-    def predict_sparse_indices(
+    def pre_attn_process(
         self,
         mla: MLA,
         attn_metadata: AttentionMetadata,
         hidden_states: torch.Tensor,
         qr: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """Predict sparse attention indices for the current batch.
+    ) -> Dict[str, torch.Tensor]:
+        """Pre-attention processing for sparse methods.
 
-        Called from MLA.forward_impl() to determine which KV blocks each
-        token should attend to.  Delegates to the trtllm attention backend's
-        predict_sparse_indices() so all trtllm-based sparse methods share
-        the same prediction interface.
-
-        Args:
-            mla: The MLA module instance.
-            attn_metadata: Attention metadata for the current batch.
-            hidden_states: Pre-attention hidden states.
-            qr: Compressed query before q_b_proj (needed by DSA indexer).
-            position_ids: Token position IDs.
+        Called once on ALL tokens before the ctx/gen split.  Performs
+        token-parallel compute (e.g. indexer projections, k-cache scatter)
+        and returns intermediates that will be sliced per ctx/gen and
+        passed through to the backend's ``sparse_attn_predict()``.
 
         Returns:
-            Optional topk index tensor ``[num_tokens, topk]``, or None
-            when sparse routing is not applicable.
+            Dict of intermediate tensors (e.g. q_fp8, k_fp8, k_scale,
+            weights) keyed by name.
         """
         ...
 
@@ -78,12 +78,14 @@ class SparseAttentionMethod(Protocol):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor],
-        topk_indices: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
+        **kwargs,
     ) -> None:
         """Dispatch context-phase attention for this sparse method.
 
-        Called from MLA.forward_impl() when topk_indices is not None.
+        Sparse index prediction is handled inside the trtllm backend
+        (via ``sparse_attn_predict``), not here.  Intermediates from
+        ``pre_attn_process`` are passed through via kwargs.
         """
         ...
 
@@ -96,10 +98,12 @@ class SparseAttentionMethod(Protocol):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor],
-        topk_indices: Optional[torch.Tensor],
+        **kwargs,
     ) -> None:
         """Dispatch generation-phase attention for this sparse method.
 
-        Called from MLA.forward_impl() when topk_indices is not None.
+        Sparse index prediction is handled inside the trtllm backend
+        (via ``sparse_attn_predict``), not here.  Intermediates from
+        ``pre_attn_process`` are passed through via kwargs.
         """
         ...

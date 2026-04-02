@@ -678,18 +678,21 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
         sum(batch_query_lens[:i + 1]) for i in range(len(batch_order))
     ]
     num_ctx_tokens = sum(query_lens[i] for i in ctx_indices)
-    topk_indices_local = mla.mqa.indexer(
-        qr,
-        hidden_states,
+
+    # Pre-attention processing: run indexer projections + k-cache scatter
+    sparse_intermediates = mla.sparse_method.pre_attn_process(
+        mla,
         attn_metadata,
+        hidden_states,
+        qr,
         position_ids,
     )
 
-    # Validate indexer output against expected causal indices (since seq_len < topk=2048)
     if num_contexts > 0:
-        # Transform context indices from local to global
-        ctx_topk_local = topk_indices_local[:num_ctx_tokens]
-
+        ctx_kwargs = {
+            k: v[:num_ctx_tokens]
+            for k, v in sparse_intermediates.items()
+        }
         mla.sparse_method.dispatch_context(
             mla,
             q=q[:num_ctx_tokens],
@@ -698,18 +701,19 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             attn_metadata=attn_metadata,
             output=output[:num_ctx_tokens],
             latent_cache=latent_cache[:num_ctx_tokens],
-            topk_indices=ctx_topk_local,  # Use global indices
             position_ids=None,
+            **ctx_kwargs,
         )
         print(
             f"  ✓ Context forward: {num_ctx_tokens} tokens from {num_contexts} requests"
         )
 
     if num_generations > 0:
-        # Transform generation indices from local to global
         num_gen_tokens = sum(query_lens[i] for i in gen_indices)
-        gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
-                                            num_gen_tokens]
+        gen_kwargs = {
+            k: v[num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
+            for k, v in sparse_intermediates.items()
+        }
         mla.sparse_method.dispatch_generation(
             mla,
             q=q[num_ctx_tokens:],
@@ -718,7 +722,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             attn_metadata=attn_metadata,
             output=output[num_ctx_tokens:],
             latent_cache=latent_cache[num_ctx_tokens:],
-            topk_indices=gen_topk_local,  # Use global indices
+            **gen_kwargs,
         )
         print(
             f"  ✓ Generation forward: {sum(query_lens[i] for i in gen_indices)} tokens from {num_generations} requests"

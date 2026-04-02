@@ -1496,7 +1496,7 @@ class MLA(nn.Module):
         """
         Unified forward pass for the MLA module. Writes result into output
         tensor in-place. Handles both standard MLA and DSA sparse attention
-        via the sparse_method's predict_sparse_indices() hook.
+        via the sparse_method's pre_attn_process() and dispatch hooks.
 
         Args:
             position_ids (Optional[torch.IntTensor]): The position IDs.
@@ -1545,11 +1545,11 @@ class MLA(nn.Module):
             self.aux_stream,
         )
 
-        # Ask the sparse method to predict sparse indices.  Non-sparse MLA
-        # skips this entirely (topk_indices stays None).
-        topk_indices = None
+        # Pre-attention processing for sparse methods: run indexer projections
+        # and k-cache scatter on ALL tokens before ctx/gen split.
+        sparse_intermediates = {}
         if self.sparse_method is not None:
-            topk_indices = self.sparse_method.predict_sparse_indices(
+            sparse_intermediates = self.sparse_method.pre_attn_process(
                 self, attn_metadata, hidden_states, qr, position_ids)
 
         assert q.shape[
@@ -1570,14 +1570,18 @@ class MLA(nn.Module):
                 q_ctx = self._attention_scaling(
                     q_ctx, position_ids[..., :num_ctx_tokens])
 
-            topk_indices_ctx = (topk_indices[:num_ctx_tokens, :]
-                                if topk_indices is not None else None)
-
-            if topk_indices_ctx is not None and self.sparse_method is not None:
-                self.sparse_method.dispatch_context(
-                    self, q_ctx, compressed_kv_ctx, k_pe_ctx, attn_metadata,
-                    output[:num_ctx_tokens, :], latent_cache_ctx,
-                    topk_indices_ctx, position_ids)
+            if self.sparse_method is not None and sparse_intermediates:
+                # Slice intermediates for context tokens
+                ctx_kwargs = {
+                    k: v[:num_ctx_tokens]
+                    for k, v in sparse_intermediates.items()
+                }
+                self.sparse_method.dispatch_context(self, q_ctx,
+                                                    compressed_kv_ctx, k_pe_ctx,
+                                                    attn_metadata,
+                                                    output[:num_ctx_tokens, :],
+                                                    latent_cache_ctx,
+                                                    position_ids, **ctx_kwargs)
             else:
                 self.forward_context(
                     q_ctx,
@@ -1603,14 +1607,16 @@ class MLA(nn.Module):
                 q_gen = self._attention_scaling(
                     q_gen, position_ids[..., num_ctx_tokens:])
 
-            topk_indices_gen = (topk_indices[num_ctx_tokens:num_tokens, :]
-                                if topk_indices is not None else None)
-
-            if topk_indices_gen is not None and self.sparse_method is not None:
+            if self.sparse_method is not None and sparse_intermediates:
+                # Slice intermediates for generation tokens
+                gen_kwargs = {
+                    k: v[num_ctx_tokens:num_tokens]
+                    for k, v in sparse_intermediates.items()
+                }
                 self.sparse_method.dispatch_generation(
                     self, q_gen, compressed_kv_gen, k_pe_gen, attn_metadata,
                     output[num_ctx_tokens:num_tokens, :], latent_cache_gen,
-                    topk_indices_gen)
+                    **gen_kwargs)
             else:
                 self.forward_absorption_generation(
                     q_gen,
@@ -1993,6 +1999,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
@@ -2130,6 +2137,7 @@ class MLA(nn.Module):
             mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+            **kwargs,
         )
         fused_q = None
 
@@ -2176,6 +2184,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
@@ -2242,6 +2251,7 @@ class MLA(nn.Module):
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
             is_generation=False,  # used by DSA attention
+            **kwargs,
         )
         fused_q = None
 

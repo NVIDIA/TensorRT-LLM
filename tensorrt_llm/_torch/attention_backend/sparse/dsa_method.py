@@ -194,31 +194,48 @@ class DSASparseMethod:
 
     Handles context/generation dispatch for DSA: short-seq MHA optimization,
     absorption path (SM100+), and sparse FlashMLA kernels (SM90).
+
+    The workflow is:
+    1. ``pre_attn_process()`` runs pre_indexer_proj + _update_k_cache on ALL
+       tokens (token-parallel, before ctx/gen split).
+    2. ``dispatch_context()`` / ``dispatch_generation()`` pass intermediates
+       through to the trtllm backend where ``sparse_attn_predict()`` runs
+       the actual sparse indexing per phase.
     """
 
     def __init__(self, short_seq_mha_threshold: int = 0):
         self.short_seq_mha_threshold = short_seq_mha_threshold
 
-    def predict_sparse_indices(
+    @torch.inference_mode()
+    def pre_attn_process(
         self,
         mla: MLA,
         attn_metadata: AttentionMetadata,
         hidden_states: torch.Tensor,
         qr: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """Predict sparse indices by delegating to the trtllm backend.
+    ) -> dict:
+        """Run pre_indexer_proj and _update_k_cache on all tokens.
 
-        Forwards ``qr`` (compressed query before q_b_proj), ``hidden_states``,
-        and ``position_ids`` to DSATrtllmAttention.predict_sparse_indices()
-        which runs the DSA indexer.
+        Returns dict of intermediates (q_fp8, k_fp8, k_scale, weights)
+        that will be sliced per ctx/gen and forwarded to the backend.
         """
-        return mla.mqa.predict_sparse_indices(
-            attn_metadata,
-            qr=qr,
-            hidden_states=hidden_states,
-            position_ids=position_ids,
+        indexer = mla.mqa.indexer
+        q_fp8, k_fp8, k_scale, weights = indexer.pre_indexer_proj(
+            qr,
+            hidden_states,
+            position_ids,
         )
+        # Scatter k values into indexer k cache for ALL tokens before
+        # ctx/gen split — the backend's sparse_attn_predict will read
+        # from this cache during indexing.
+        indexer._update_k_cache(k_fp8, k_scale, attn_metadata)
+        return {
+            "q_fp8": q_fp8,
+            "k_fp8": k_fp8,
+            "k_scale": k_scale,
+            "weights": weights,
+        }
 
     def dispatch_context(
         self,
@@ -229,8 +246,8 @@ class DSASparseMethod:
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor],
-        topk_indices: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
+        **kwargs,
     ) -> None:
         """Dispatch context-phase attention for DSA."""
         if _should_use_short_mha(mla, attn_metadata, position_ids):
@@ -245,11 +262,17 @@ class DSASparseMethod:
                 attn_metadata,
                 output,
                 latent_cache=latent_cache,
-                topk_indices=topk_indices,
+                **kwargs,
             )
         else:
             _forward_sparse_mla_kvcache_bf16(
-                mla, q, latent_cache, attn_metadata, output, topk_indices, is_generation=False
+                mla,
+                q,
+                latent_cache,
+                attn_metadata,
+                output,
+                kwargs.get("topk_indices"),
+                is_generation=False,
             )
 
     def dispatch_generation(
@@ -261,7 +284,7 @@ class DSASparseMethod:
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor],
-        topk_indices: Optional[torch.Tensor],
+        **kwargs,
     ) -> None:
         """Dispatch generation-phase attention for DSA."""
         if get_sm_version() >= 100:
@@ -272,9 +295,15 @@ class DSASparseMethod:
                 attn_metadata,
                 output,
                 latent_cache=latent_cache,
-                topk_indices=topk_indices,
+                **kwargs,
             )
         else:
             _forward_sparse_mla_kvcache_bf16(
-                mla, q, latent_cache, attn_metadata, output, topk_indices, is_generation=True
+                mla,
+                q,
+                latent_cache,
+                attn_metadata,
+                output,
+                kwargs.get("topk_indices"),
+                is_generation=True,
             )

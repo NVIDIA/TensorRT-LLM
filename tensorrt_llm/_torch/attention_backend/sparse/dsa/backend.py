@@ -64,37 +64,38 @@ class DSATrtllmAttention(TrtllmAttention):
             aux_stream,
         )
 
-    def predict_sparse_indices(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Optional[torch.Tensor]:
-        """Run the DSA indexer to predict sparse attention indices.
-
-        Requires ``qr`` (compressed query before q_b_proj), ``hidden_states``,
-        and ``position_ids`` in kwargs.  Returns topk_indices shaped
-        ``[num_tokens, index_topk]``.
-        """
-        qr = kwargs.get("qr")
-        hidden_states = kwargs.get("hidden_states")
-        position_ids = kwargs.get("position_ids")
-        if qr is None or hidden_states is None or position_ids is None:
-            return None
-        return self.indexer.forward(qr, hidden_states, metadata, position_ids)
-
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: DSAtrtllmAttentionMetadata,
-        hidden_states: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
         is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Transform the local topk indices to global topk indices in paged kv cache
+        """Run sparse indexing and transform indices for the C++ kernel.
+
+        Expects ``q_fp8`` and ``weights`` in kwargs (produced by
+        ``pre_attn_process`` and sliced per ctx/gen by MLA).
+        Calls ``sparse_attn_indexer`` to compute topk_indices, then
+        transforms them to global paged KV cache indices.
+        """
+        q_fp8 = kwargs.get("q_fp8")
+        k_fp8 = kwargs.get("k_fp8")
+        k_scale = kwargs.get("k_scale")
+        weights = kwargs.get("weights")
+        if q_fp8 is None or weights is None:
+            return None, None
+
+        topk_indices = self.indexer.sparse_attn_indexer(
+            metadata,
+            q,  # q used for shape/device in buffer allocation
+            q_fp8,
+            k_fp8,
+            k_scale,
+            weights,
+            is_generation=is_generation,
+        )
+
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, self.get_local_layer_idx(metadata), is_generation
         )
@@ -162,4 +163,3 @@ class DSATrtllmAttention(TrtllmAttention):
             beam_width,
             self.wrapper.quant_mode,
         )
-
