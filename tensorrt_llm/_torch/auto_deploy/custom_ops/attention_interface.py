@@ -38,6 +38,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
+from ..utils.node_utils import extract_op_args, get_op_schema
 
 Constant = Union[int, float, str, None]
 
@@ -63,6 +64,14 @@ def _list_to_tensor(data: list, dtype: torch.dtype) -> torch.Tensor:
     if np_dtype is not None:
         return torch.from_numpy(np.array(data, dtype=np_dtype))
     return torch.tensor(data, dtype=dtype)
+
+
+def _extract_optional_op_arg(node: Node, arg_name: str):
+    """Return an op argument if it exists in the schema, otherwise ``None``."""
+    schema_arg_names = {arg.name for arg in get_op_schema(node.target).arguments}
+    if arg_name not in schema_arg_names:
+        return None
+    return extract_op_args(node, arg_name)[0]
 
 
 class PrepareMetadataHostCallable(Protocol):
@@ -1855,6 +1864,11 @@ class AttentionDescriptor(ABC):
         raise NotImplementedError
 
     @classmethod
+    def supports_shared_kv(cls) -> bool:
+        """Whether this backend supports shared-KV cache aliasing."""
+        return False
+
+    @classmethod
     @abstractmethod
     def get_standard_metadata_args(cls) -> List[str]:
         """Get the list of standard metadata arguments that are expected by the attention op."""
@@ -1920,6 +1934,16 @@ class AttentionDescriptor(ABC):
         caches. The constants are expected to be of type int, float, str, or None.
         """
         return []
+
+    @classmethod
+    def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
+        """Return the logical layer index associated with a source attention node, if any."""
+        return _extract_optional_op_arg(source_attn_node, "layer_idx")
+
+    @classmethod
+    def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
+        """Return the KV source layer for a shared-KV attention node, if any."""
+        return _extract_optional_op_arg(source_attn_node, "shared_kv_source_layer_idx")
 
     @staticmethod
     def resolve_cache_dtype(dtype_config: str, fallback_dtype: torch.dtype) -> torch.dtype:
