@@ -813,7 +813,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         hidden_states = self.norm(hidden_states)
         if self.lm_head is not None:
             logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
-            return Qwen3_5MoeOutput(last_hidden_state=logits)
+            return Qwen3_5MoeCausalLMOutput(logits=logits)
         return Qwen3_5MoeOutput(last_hidden_state=hidden_states)
 
 
@@ -862,8 +862,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             rope_cos=rope_cos,
             rope_sin=rope_sin,
         )
-        # lm_head is inside the text model, outputs already contain logits
-        logits = outputs[0]
+        logits = outputs.logits
         return Qwen3_5MoeCausalLMOutput(logits=logits)
 
 
@@ -2624,8 +2623,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
             video_grid_thw=video_grid_thw,
             **kwargs,
         )
-        # lm_head is inside language_model, so outputs already contain logits
-        logits = outputs.last_hidden_state
+        logits = outputs.logits
         return Qwen3_5MoeConditionalOutput(logits=logits)
 
 
