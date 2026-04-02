@@ -1709,15 +1709,26 @@ def _update_node_args(node: Node, args: tuple) -> None:
     if "sharded" in node.meta and node.meta["sharded"]:
         return
 
-    # Build new args: preserve current Node refs, apply stored non-Node values
-    new_args = []
-    for i, stored_arg in enumerate(args):
+    def _merge_arg(current_arg: Any, stored_arg: Any) -> Any:
         if isinstance(stored_arg, Node):
-            # Node args: preserve current value (may have been updated by other transforms)
-            new_args.append(node.args[i])
-        else:
-            # Non-Node args (shapes, sizes, indices): use stored sharded value
-            new_args.append(stored_arg)
+            return current_arg if isinstance(current_arg, Node) else stored_arg
+
+        if isinstance(stored_arg, tuple) and isinstance(current_arg, (tuple, list)):
+            if len(stored_arg) == len(current_arg):
+                return tuple(_merge_arg(cur, old) for cur, old in zip(current_arg, stored_arg))
+            return stored_arg
+
+        if isinstance(stored_arg, list) and isinstance(current_arg, (tuple, list)):
+            if len(stored_arg) == len(current_arg):
+                return [_merge_arg(cur, old) for cur, old in zip(current_arg, stored_arg)]
+            return stored_arg
+
+        return stored_arg
+
+    # Build new args: preserve current Node refs recursively, apply stored non-Node values.
+    new_args = [
+        _merge_arg(current_arg, stored_arg) for current_arg, stored_arg in zip(node.args, args)
+    ]
 
     node.args = tuple(new_args)
     node.meta["sharded"] = True

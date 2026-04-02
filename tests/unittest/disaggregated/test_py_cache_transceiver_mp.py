@@ -19,7 +19,6 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType, LlmRequestState
@@ -240,13 +239,6 @@ def worker_fn(
     # Initialize distributed (use gloo for single GPU compatibility)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
     tensorrt_llm.logger.set_level("info")
-
-    def on_hang_detected():
-        print(f"[Rank {rank}] Hang detected! Forcing exit.", flush=True)
-        os._exit(1)
-
-    hang_detector = HangDetector(timeout=60, on_detected=on_hang_detected)
-    hang_detector.start()
 
     ctx_instance_num = ctx_tp * ctx_pp
     gen_instance_num = gen_tp * gen_pp
@@ -478,7 +470,6 @@ def worker_fn(
 
     # Synchronize all processes
     dist.barrier()
-    hang_detector.checkpoint()
 
     # ===== Batch process multiple requests (like C++ cacheTransceiverTest) =====
     # Reference: C++ test uses lenList = {30, 10, 60, 80}
@@ -702,33 +693,29 @@ def worker_fn(
         f"handling {len(my_requests)}, {'CTX' if is_ctx else 'GEN'} mode, tp_rank={tp_rank}",
         flush=True,
     )
-    hang_detector.checkpoint()
 
     # ===== Phase 2: Transfer  =====
     if ctx_gen_workflow == "gen_first1":
-        _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests, hang_detector.checkpoint)
+        _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests)
     elif ctx_gen_workflow == "gen_first2":
-        _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests, hang_detector.checkpoint)
+        _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests)
     else:
         _run_ctx_first_transfer(
             rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
         )
-    hang_detector.checkpoint()
 
     # ===== Phase 3: Wait for remaining transfers to complete =====
     # Synchronize before checking completion
-    hang_detector.checkpoint()
+
     dist.barrier()
-    hang_detector.checkpoint()
 
     if is_ctx and my_requests:
         transceiver.check_context_transfer_status(None)
         print(f"[Rank {rank}] CTX: All transfers completed ({mode_str})", flush=True)
-        hang_detector.checkpoint()
+
     elif not is_ctx and my_requests:
         transceiver.check_gen_transfer_status(None)
         print(f"[Rank {rank}] GEN: All transfers completed ({mode_str})", flush=True)
-        hang_detector.checkpoint()
 
         if is_gen_first:
             # verify the aux data is unpacked correctly
@@ -748,9 +735,8 @@ def worker_fn(
                 )
 
     # Synchronize before verification
-    hang_detector.checkpoint()
+
     dist.barrier()
-    hang_detector.checkpoint()
 
     # ===== Phase 4: Batch verify all requests =====
     # All ranks must participate in gather (collective op), so iterate all_requests.
@@ -807,9 +793,7 @@ def worker_fn(
     dist.broadcast(pass_tensor, src=0)
     assert pass_tensor.item() == 1, "Some requests failed verification!"
 
-    hang_detector.checkpoint()
     dist.barrier()
-    hang_detector.checkpoint()
 
     # ===== Phase 5: Cleanup requests =====
     # All ranks added all requests, so all need to remove them
@@ -819,8 +803,6 @@ def worker_fn(
 
     if rank == 0:
         print(f"[Rank {rank}] Cleanup completed ({mode_str})")
-
-    hang_detector.stop()
 
     # Cleanup
     dist.destroy_process_group()
@@ -902,13 +884,8 @@ def _wait_ctx_request_ready(transceiver, my_requests):
     return all_ready
 
 
-def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests, checkpoint_fn=None):
+def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests):
     """Generation-first transfer: ctx prepares first, then gen receives and ctx sends."""
-
-    def _checkpoint():
-        if checkpoint_fn:
-            checkpoint_fn()
-
     # Step 1: Context side calls prepare_context_requests, no kvcache request is sent, thus no request
     # can reach CONTEXT_INIT state.
     if is_ctx:
@@ -921,9 +898,7 @@ def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests, checkpoint_
             assert req.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
         print(f"[Rank {rank}] CTX: All requests are waiting for being scheduled", flush=True)
 
-    _checkpoint()
     dist.barrier()
-    _checkpoint()
 
     # Step 2: Generation side submits receive requests
     if not is_ctx:
@@ -937,15 +912,12 @@ def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests, checkpoint_
             f"[Rank {rank}] GEN: Submitted {len(my_requests)} gen-first receive requests",
             flush=True,
         )
-    _checkpoint()
     dist.barrier()
-    _checkpoint()
 
     if is_ctx:
         # Poll until all requests reach CONTEXT_INIT (peer info arrived)
         transceiver.prepare_context_requests(ctx_my_requests)
         _wait_ctx_request_ready(transceiver, ctx_my_requests)
-        _checkpoint()
 
         for req_idx, request in my_requests:
             print(
@@ -956,13 +928,8 @@ def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests, checkpoint_
         print(f"[Rank {rank}] CTX: Submitted {len(my_requests)} send requests", flush=True)
 
 
-def _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests, checkpoint_fn=None):
+def _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests):
     """Generation-first transfer: gen receives first, then ctx prepares and sends."""
-
-    def _checkpoint():
-        if checkpoint_fn:
-            checkpoint_fn()
-
     # Step 1: Generation side submits receive requests, now context side doesn't know the requests
     # but gets kvcache requests first
     if not is_ctx:
@@ -976,9 +943,7 @@ def _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests, checkpoint_
             f"[Rank {rank}] GEN: Submitted {len(my_requests)} gen-first receive requests",
             flush=True,
         )
-    _checkpoint()
     dist.barrier()
-    _checkpoint()
     time.sleep(3)  # wait for the receive requests to be submitted
     # Step 2: Context side calls prepare_context_requests, now context side knows the requests
     # all requests can reach CONTEXT_INIT state directly.
@@ -988,11 +953,8 @@ def _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests, checkpoint_
         transceiver.prepare_context_requests(ctx_my_requests)
         print(f"[Rank {rank}] CTX: Called prepare_context_requests", flush=True)
         _wait_ctx_request_ready(transceiver, ctx_my_requests)
-        _checkpoint()
 
-    _checkpoint()
     dist.barrier()
-    _checkpoint()
     # Step 3: Context side sends the data
     if is_ctx:
         for req_idx, request in my_requests:

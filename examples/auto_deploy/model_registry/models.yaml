@@ -354,6 +354,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: mistralai/Mistral-Small-3.1-24B-Instruct-2503
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+- name: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+- name: mistralai/Mistral-Small-4-119B-2603
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'mistral_small_4_119b.yaml']
 # --- DeepSeek R1 distills (Jan 2025) ---
 - name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']

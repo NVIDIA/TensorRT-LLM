@@ -1,6 +1,7 @@
 import os
 import random
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -326,7 +327,10 @@ def worker_fn(
             sender_session = transfer_worker.create_tx_session(ctx_request)
 
             # Get block ids and send
-            block_ids = kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
+            block_ids = np.asarray(
+                kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0],
+                dtype=np.int64,
+            )
             send_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
             send_future = sender_session.send(send_kv_slice)
 
@@ -365,7 +369,10 @@ def worker_fn(
             receiver_session = transfer_worker.create_rx_session(gen_request)
 
             # Get block ids and receive
-            block_ids = kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
+            block_ids = np.asarray(
+                kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0],
+                dtype=np.int64,
+            )
             recv_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
             recv_future = receiver_session.receive(recv_kv_slice)
 

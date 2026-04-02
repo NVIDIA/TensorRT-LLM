@@ -131,6 +131,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        conditional_disagg_config: Optional[dict] = None,
                        otlp_config: Optional[dict] = None,
                        disagg_cluster: Optional[dict] = None,
+                       node_id: Optional[int] = None,
+                       schedule_style: Literal[
+                           'context_first',
+                           'generation_first'] = 'context_first',
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -174,7 +178,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                                 conditional_disagg_config, otlp_config,
                                 max_retries, perf_metrics_max_requests,
                                 disagg_cluster_config)
-
+    if node_id is not None:
+        config.node_id = node_id
+    if schedule_style:
+        config.schedule_style = schedule_style
     return config
 
 
