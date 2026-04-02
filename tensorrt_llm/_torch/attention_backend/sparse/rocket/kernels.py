@@ -1,3 +1,5 @@
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -8,13 +10,24 @@ import triton.language as tl
 
 
 @triton.jit
-def rocket_qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr,
-                           k_output_offsets_ptr, context_lens_ptr,
-                           context_cumsum_ptr, valid_seq_indices_ptr,
-                           window_size, num_heads, num_kv_heads, head_dim,
-                           q_total_output_tokens, k_total_output_tokens,
-                           valid_batch_size, BLOCK_SIZE: tl.constexpr,
-                           BLOCK_SIZE_M: tl.constexpr):
+def rocket_qk_split_kernel(
+    input_ptr,
+    q_output_ptr,
+    k_output_ptr,
+    k_output_offsets_ptr,
+    context_lens_ptr,
+    context_cumsum_ptr,
+    valid_seq_indices_ptr,
+    window_size,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    q_total_output_tokens,
+    k_total_output_tokens,
+    valid_batch_size,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
     valid_seq_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     dim_offset = tl.program_id(2) * BLOCK_SIZE
@@ -66,16 +79,17 @@ def rocket_qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr,
 
         # Calculate input indices with proper dimension offset for Q/K separation
         input_dim_indices = input_dim_offset + actual_head_idx * head_dim + dim_indices
-        src_indices = src_token_pos[:, None] * (
-            num_heads * head_dim +
-            2 * num_kv_heads * head_dim) + input_dim_indices[None, :]
+        src_indices = (
+            src_token_pos[:, None] * (num_heads * head_dim + 2 * num_kv_heads * head_dim)
+            + input_dim_indices[None, :]
+        )
 
         # Calculate output indices
-        dst_indices = (actual_head_idx * total_output_tokens +
-                       dst_token_pos[:, None]) * head_dim + dim_indices[None, :]
+        dst_indices = (
+            actual_head_idx * total_output_tokens + dst_token_pos[:, None]
+        ) * head_dim + dim_indices[None, :]
 
-        full_mask = token_mask[:, None] & dim_mask[
-            None, :]  # [BLOCK_SIZE_M, BLOCK_SIZE]
+        full_mask = token_mask[:, None] & dim_mask[None, :]  # [BLOCK_SIZE_M, BLOCK_SIZE]
 
         data = tl.load(input_ptr + src_indices, mask=full_mask, other=0.0)
         tl.store(output_ptr + dst_indices, data, mask=full_mask)
@@ -122,12 +136,16 @@ def triton_rocket_qk_split(
     q_total_output_tokens = window_size * valid_batch_size
     k_total_output_tokens = total_rocket_k_ctx_tokens
 
-    q_window = torch.empty((num_heads, q_total_output_tokens, head_dim),
-                           device=input_tensor.device,
-                           dtype=input_tensor.dtype)
-    k_context = torch.empty((num_kv_heads, k_total_output_tokens, head_dim),
-                            device=input_tensor.device,
-                            dtype=input_tensor.dtype)
+    q_window = torch.empty(
+        (num_heads, q_total_output_tokens, head_dim),
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+    k_context = torch.empty(
+        (num_kv_heads, k_total_output_tokens, head_dim),
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
 
     BLOCK_SIZE = 128  # Dimension block size
     BLOCK_SIZE_M = 128  # Token block size for parallel processing
@@ -136,22 +154,24 @@ def triton_rocket_qk_split(
     total_heads = num_heads + num_kv_heads
     grid = (valid_batch_size, total_heads, triton.cdiv(head_dim, BLOCK_SIZE))
 
-    rocket_qk_split_kernel[grid](input_tensor,
-                                 q_window,
-                                 k_context,
-                                 k_output_offsets,
-                                 input_lens,
-                                 input_lens_cumsum,
-                                 valid_seq_indices,
-                                 window_size,
-                                 num_heads,
-                                 num_kv_heads,
-                                 head_dim,
-                                 q_total_output_tokens,
-                                 k_total_output_tokens,
-                                 valid_batch_size,
-                                 BLOCK_SIZE=BLOCK_SIZE,
-                                 BLOCK_SIZE_M=BLOCK_SIZE_M)
+    rocket_qk_split_kernel[grid](
+        input_tensor,
+        q_window,
+        k_context,
+        k_output_offsets,
+        input_lens,
+        input_lens_cumsum,
+        valid_seq_indices,
+        window_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        q_total_output_tokens,
+        k_total_output_tokens,
+        valid_batch_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+    )
 
     return q_window, k_context
 
@@ -159,7 +179,6 @@ def triton_rocket_qk_split(
 ########################################################
 # BMM kernel
 ########################################################
-
 
 
 @triton.jit
@@ -211,15 +230,11 @@ def rocket_batch_to_flatten_kernel(
             # Load from prefix_indices
             flattened_idx = valid_idx_in_selected * num_kv_heads + head_idx
             prefix_indices = flattened_idx * prefix_budget + token_offsets
-            prefix_values = tl.load(prefix_indices_ptr + prefix_indices,
-                                    mask=token_mask,
-                                    other=0)
+            prefix_values = tl.load(prefix_indices_ptr + prefix_indices, mask=token_mask, other=0)
 
             # Store to output
             output_indices = head_idx * total_sparse_tokens + output_offset + token_offsets
-            tl.store(output_indices_ptr + output_indices,
-                     prefix_values,
-                     mask=token_mask)
+            tl.store(output_indices_ptr + output_indices, prefix_values, mask=token_mask)
 
         # Process window tokens
         for token_block_start in tl.range(0, window_size, BLOCK_SIZE):
@@ -230,10 +245,10 @@ def rocket_batch_to_flatten_kernel(
             window_values = context_len - window_size + token_offsets
 
             # Store to output at prefix_budget offset
-            output_indices = head_idx * total_sparse_tokens + output_offset + prefix_budget + token_offsets
-            tl.store(output_indices_ptr + output_indices,
-                     window_values,
-                     mask=token_mask)
+            output_indices = (
+                head_idx * total_sparse_tokens + output_offset + prefix_budget + token_offsets
+            )
+            tl.store(output_indices_ptr + output_indices, window_values, mask=token_mask)
     else:
         # Invalid batch: generate [0, 1, ..., context_len-1]
         num_tokens = context_len
@@ -246,17 +261,20 @@ def rocket_batch_to_flatten_kernel(
 
             # Store to output
             output_indices = head_idx * total_sparse_tokens + output_offset + token_offsets
-            tl.store(output_indices_ptr + output_indices,
-                     sequential_indices,
-                     mask=token_mask)
+            tl.store(output_indices_ptr + output_indices, sequential_indices, mask=token_mask)
 
 
 def triton_rocket_batch_to_flatten(
-        prefix_indices: torch.Tensor, input_lens: torch.Tensor,
-        valid_seq_indices: torch.Tensor, output_offsets: torch.Tensor,
-        batch_size: int, total_output_tokens: int, window_size: int,
-        prompt_budget: int,
-        num_kv_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+    prefix_indices: torch.Tensor,
+    input_lens: torch.Tensor,
+    valid_seq_indices: torch.Tensor,
+    output_offsets: torch.Tensor,
+    batch_size: int,
+    total_output_tokens: int,
+    window_size: int,
+    prompt_budget: int,
+    num_kv_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Flatten indices considering both valid and invalid batches.
     For valid sequences, combines prefix_indices with dynamically computed window indices.
@@ -280,26 +298,30 @@ def triton_rocket_batch_to_flatten(
     valid_batch_size = total_tasks // num_kv_heads
 
     # Create output tensor
-    sparse_indices = torch.empty((num_kv_heads, total_output_tokens),
-                                 dtype=prefix_indices.dtype,
-                                 device=prefix_indices.device)
+    sparse_indices = torch.empty(
+        (num_kv_heads, total_output_tokens),
+        dtype=prefix_indices.dtype,
+        device=prefix_indices.device,
+    )
 
     # Launch kernel
     BLOCK_SIZE = 512
     grid = (batch_size, num_kv_heads)
 
-    rocket_batch_to_flatten_kernel[grid](prefix_indices,
-                                         sparse_indices,
-                                         input_lens,
-                                         valid_seq_indices,
-                                         output_offsets,
-                                         batch_size,
-                                         valid_batch_size,
-                                         num_kv_heads,
-                                         prefix_budget,
-                                         window_size,
-                                         prompt_budget,
-                                         BLOCK_SIZE=BLOCK_SIZE)
+    rocket_batch_to_flatten_kernel[grid](
+        prefix_indices,
+        sparse_indices,
+        input_lens,
+        valid_seq_indices,
+        output_offsets,
+        batch_size,
+        valid_batch_size,
+        num_kv_heads,
+        prefix_budget,
+        window_size,
+        prompt_budget,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
 
     return sparse_indices
 
@@ -354,24 +376,26 @@ def rocket_update_kt_cache_gen_kernel(
     if block_offset_in_seq >= max_kt_blocks_per_seq:
         return
 
-    block_idx = tl.load(kt_cache_block_offsets_ptr +
-                        batch_idx * max_kt_blocks_per_seq + block_offset_in_seq)
+    block_idx = tl.load(
+        kt_cache_block_offsets_ptr + batch_idx * max_kt_blocks_per_seq + block_offset_in_seq
+    )
     token_idx_in_block = last_kt_token_idx % tokens_per_block
 
-    cache_base = ((block_idx * tokens_per_block + token_idx_in_block) *
-                  num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+    cache_base = (
+        block_idx * tokens_per_block + token_idx_in_block
+    ) * num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim
 
     cache_min_indices = cache_base + dim_indices
     cache_max_indices = cache_base + head_dim + dim_indices
 
     kt_mask = dim_mask & (kt_token_idx_in_page > 0)
 
-    k_min_existing = tl.load(kt_cache_tensor_ptr + cache_min_indices,
-                             mask=kt_mask,
-                             other=float('inf'))
-    k_max_existing = tl.load(kt_cache_tensor_ptr + cache_max_indices,
-                             mask=kt_mask,
-                             other=float('-inf'))
+    k_min_existing = tl.load(
+        kt_cache_tensor_ptr + cache_min_indices, mask=kt_mask, other=float("inf")
+    )
+    k_max_existing = tl.load(
+        kt_cache_tensor_ptr + cache_max_indices, mask=kt_mask, other=float("-inf")
+    )
 
     k_min_new = tl.minimum(k_min_existing, k_values)
     k_max_new = tl.maximum(k_max_existing, k_values)
@@ -411,19 +435,21 @@ def triton_rocket_update_kt_cache_gen(
 
     DIM_BLOCK_SIZE = triton.next_power_of_2(head_dim)
 
-    rocket_update_kt_cache_gen_kernel[grid](k,
-                                            kt_cache_tensor,
-                                            kt_cache_block_offsets,
-                                            kv_lens,
-                                            num_gen_tokens,
-                                            num_kv_heads,
-                                            head_dim,
-                                            kt_page_size,
-                                            tokens_per_block,
-                                            max_kt_blocks_per_seq,
-                                            k.stride(0),
-                                            k.stride(1),
-                                            DIM_BLOCK_SIZE=DIM_BLOCK_SIZE)
+    rocket_update_kt_cache_gen_kernel[grid](
+        k,
+        kt_cache_tensor,
+        kt_cache_block_offsets,
+        kv_lens,
+        num_gen_tokens,
+        num_kv_heads,
+        head_dim,
+        kt_page_size,
+        tokens_per_block,
+        max_kt_blocks_per_seq,
+        k.stride(0),
+        k.stride(1),
+        DIM_BLOCK_SIZE=DIM_BLOCK_SIZE,
+    )
 
 
 @triton.jit
@@ -481,12 +507,11 @@ def rocket_update_kt_cache_ctx_kernel(
         dim_indices = dim_block_start + dim_offsets
         dim_mask = dim_indices < head_dim
 
-        kv_token_indices = tl.load(sparse_kv_indices_ptr + kv_indices,
-                                   mask=kv_mask,
-                                   other=0)
+        kv_token_indices = tl.load(sparse_kv_indices_ptr + kv_indices, mask=kv_mask, other=0)
         # Calculate indices for loading keys [BLOCK_SIZE_DIM, BLOCK_SIZE_KV]
         k_base_indices = (kv_token_indices[None, :] + context_start) * (
-            q_hidden_size + 2 * kv_hidden_size) + k_dim_base
+            q_hidden_size + 2 * kv_hidden_size
+        ) + k_dim_base
         k_indices = k_base_indices + dim_indices[:, None]
 
         combined_mask = kv_mask[None, :] & dim_mask[:, None]
@@ -494,30 +519,27 @@ def rocket_update_kt_cache_ctx_kernel(
         # Load key values [BLOCK_SIZE_DIM, BLOCK_SIZE_KV]
         k_values = tl.load(k_ptr + k_indices, mask=combined_mask, other=0.0)
 
-        k_values = tl.reshape(k_values,
-                              (BLOCK_SIZE_DIM, BLOCK_SIZE_KT, kt_page_size))
+        k_values = tl.reshape(k_values, (BLOCK_SIZE_DIM, BLOCK_SIZE_KT, kt_page_size))
 
-        k_min = tl.min(k_values,
-                       axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
-        k_max = tl.max(k_values,
-                       axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
+        k_min = tl.min(k_values, axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
+        k_max = tl.max(k_values, axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
 
         # Calculate cache locations [BLOCK_SIZE_KT]
         block_offsets_in_seq = kt_offsets // tokens_per_block
-        valid_block_mask = (block_offsets_in_seq
-                            < max_kt_blocks_per_seq) & kt_mask
+        valid_block_mask = (block_offsets_in_seq < max_kt_blocks_per_seq) & kt_mask
 
         # Load block indices [BLOCK_SIZE_KT]
         block_offset_addrs = batch_idx * max_kt_blocks_per_seq + block_offsets_in_seq
-        block_indices = tl.load(kt_cache_block_offsets_ptr + block_offset_addrs,
-                                mask=valid_block_mask,
-                                other=0)
+        block_indices = tl.load(
+            kt_cache_block_offsets_ptr + block_offset_addrs, mask=valid_block_mask, other=0
+        )
 
         tokens_in_block = kt_offsets % tokens_per_block
 
         # Calculate cache base addresses [BLOCK_SIZE_KT]
-        cache_bases = ((block_indices * tokens_per_block + tokens_in_block) *
-                       num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+        cache_bases = (
+            block_indices * tokens_per_block + tokens_in_block
+        ) * num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim
 
         cache_min_addrs = cache_bases[None, :] + dim_indices[:, None]
         cache_max_addrs = cache_min_addrs + head_dim
@@ -547,7 +569,8 @@ def triton_rocket_update_kt_cache_ctx(
     Update KT cache during context phase using sparse indices.
 
     Args:
-        qkv_input: QKV input tensor [total_sparse_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
+        qkv_input: QKV input tensor
+            [total_sparse_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
         kt_cache_tensor: KT cache [num_blocks, tokens_per_block, num_kv_heads, 2*head_dim]
         kt_cache_block_offsets: Block offsets [batch_size, max_kt_blocks_per_seq]
         sparse_kv_indices: Sparse KV indices [num_kv_heads, total_sparse_tokens]
@@ -568,8 +591,7 @@ def triton_rocket_update_kt_cache_ctx(
     BLOCK_SIZE_KT = 8
     BLOCK_SIZE_DIM = triton.next_power_of_2(head_dim)
 
-    grid = (batch_size, num_kv_heads,
-            (total_kt_tokens + BLOCK_SIZE_KT - 1) // BLOCK_SIZE_KT)
+    grid = (batch_size, num_kv_heads, (total_kt_tokens + BLOCK_SIZE_KT - 1) // BLOCK_SIZE_KT)
 
     rocket_update_kt_cache_ctx_kernel[grid](
         qkv_input,
@@ -639,21 +661,18 @@ def rocket_paged_kt_cache_bmm_kernel(
     dim_indices = tl.arange(0, DIM_BLOCK_SIZE)
     dim_mask = dim_indices < head_dim
 
-    q_indices = q_base + q_head_offsets[:, None] * q_stride_2 + dim_indices[
-        None, :] * q_stride_3
-    q_values = tl.load(q_ptr + q_indices,
-                       mask=q_head_mask[:, None] & dim_mask[None, :])
+    q_indices = q_base + q_head_offsets[:, None] * q_stride_2 + dim_indices[None, :] * q_stride_3
+    q_values = tl.load(q_ptr + q_indices, mask=q_head_mask[:, None] & dim_mask[None, :])
 
     dim_pos_values = tl.sum(q_values, axis=0) > 0
-    dim_pos_values = tl.broadcast_to(dim_pos_values[None, :],
-                                     (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
+    dim_pos_values = tl.broadcast_to(dim_pos_values[None, :], (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
 
     q_values = q_values.to(kt_cache_tensor_ptr.dtype.element_ty)
 
     for kt_block_idx_start in tl.range(
-            0,
-            num_kt_tokens,
-            KT_BLOCK_SIZE,
+        0,
+        num_kt_tokens,
+        KT_BLOCK_SIZE,
     ):
         kt_block_idx_start = tl.multiple_of(kt_block_idx_start, KT_BLOCK_SIZE)
 
@@ -662,44 +681,41 @@ def rocket_paged_kt_cache_bmm_kernel(
 
         block_offsets = batch_idx * max_kt_blocks_per_seq + kt_token_indices // tokens_per_block
 
-        block_indices = tl.load(kt_cache_block_offsets_ptr + block_offsets,
-                                mask=kt_token_mask,
-                                other=0)
+        block_indices = tl.load(
+            kt_cache_block_offsets_ptr + block_offsets, mask=kt_token_mask, other=0
+        )
         token_indices_in_block = kt_token_indices % tokens_per_block
 
         cache_bases = (
-            (block_indices * tokens_per_block + token_indices_in_block) *
-            num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+            block_indices * tokens_per_block + token_indices_in_block
+        ) * num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim
 
-        combined_mask = dim_mask[
-            None, :] & kt_token_mask[:,
-                                     None]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
+        combined_mask = (
+            dim_mask[None, :] & kt_token_mask[:, None]
+        )  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
 
         kt_cache_indices_min = cache_bases[:, None] + dim_indices[None, :]
         kt_cache_indices_max = kt_cache_indices_min + head_dim
-        kt_cache_values_min = tl.load(kt_cache_tensor_ptr +
-                                      kt_cache_indices_min,
-                                      mask=combined_mask,
-                                      other=0.0)
-        kt_cache_values_max = tl.load(kt_cache_tensor_ptr +
-                                      kt_cache_indices_max,
-                                      mask=combined_mask,
-                                      other=0.0)
+        kt_cache_values_min = tl.load(
+            kt_cache_tensor_ptr + kt_cache_indices_min, mask=combined_mask, other=0.0
+        )
+        kt_cache_values_max = tl.load(
+            kt_cache_tensor_ptr + kt_cache_indices_max, mask=combined_mask, other=0.0
+        )
 
-        kt_cache_values = tl.where(dim_pos_values > 0, kt_cache_values_max,
-                                   kt_cache_values_min)
+        kt_cache_values = tl.where(dim_pos_values > 0, kt_cache_values_max, kt_cache_values_min)
 
-        results = tl.dot(q_values,
-                         kt_cache_values.T)  # [Q_BLOCK_SIZE, KT_BLOCK_SIZE]
+        results = tl.dot(q_values, kt_cache_values.T)  # [Q_BLOCK_SIZE, KT_BLOCK_SIZE]
 
         output_mask = q_head_mask[:, None] & kt_token_mask[None, :]
-        output_indices = (kv_head_idx * num_heads_per_kv * total_kt_tokens +
-                          q_head_offsets[:, None] * total_kt_tokens +
-                          output_offset + kt_token_indices[None, :])
+        output_indices = (
+            kv_head_idx * num_heads_per_kv * total_kt_tokens
+            + q_head_offsets[:, None] * total_kt_tokens
+            + output_offset
+            + kt_token_indices[None, :]
+        )
 
-        tl.store(output_ptr + output_indices,
-                 results * sm_scale,
-                 mask=output_mask)
+        tl.store(output_ptr + output_indices, results * sm_scale, mask=output_mask)
 
 
 def triton_rocket_paged_kt_cache_bmm(
@@ -738,11 +754,11 @@ def triton_rocket_paged_kt_cache_bmm(
         sm_scale = 1.0 / math.sqrt(head_dim)
 
     # Create output tensor with shape [num_kv_heads, num_heads_per_kv, total_kt_tokens]
-    output = torch.empty((num_kv_heads, num_heads_per_kv, total_kt_tokens),
-                         dtype=torch.float32,
-                         device=q.device)
+    output = torch.empty(
+        (num_kv_heads, num_heads_per_kv, total_kt_tokens), dtype=torch.float32, device=q.device
+    )
 
-    grid = lambda meta: (num_gen_tokens, num_kv_heads)
+    grid = lambda meta: (num_gen_tokens, num_kv_heads)  # noqa: E731
 
     Q_BLOCK_SIZE = num_heads_per_kv
     KT_BLOCK_SIZE = 64
@@ -782,6 +798,7 @@ def triton_rocket_paged_kt_cache_bmm(
 
 
 # Adapted from https://github.com/triton-lang/triton/issues/3698#issuecomment-2067681396
+
 
 @triton.jit
 def rocket_reduce_scores_kernel(
@@ -856,9 +873,7 @@ def triton_rocket_reduce_scores(
     """
     total_kt_tokens = scores.shape[-1]
 
-    output = torch.empty((num_kv_heads, total_kt_tokens),
-                         dtype=torch.float32,
-                         device=scores.device)
+    output = torch.empty((num_kv_heads, total_kt_tokens), dtype=torch.float32, device=scores.device)
 
     BLOCK_SIZE = 256
     grid = (batch_size, num_kv_heads)
@@ -880,5 +895,3 @@ def triton_rocket_reduce_scores(
 ########################################################
 # Convert request-local indices to global KV cache pool indices
 ########################################################
-
-
