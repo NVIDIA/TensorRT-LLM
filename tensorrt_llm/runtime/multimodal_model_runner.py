@@ -27,6 +27,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
 
 from .. import profiler
+from .._deprecation import emit_engine_arch_deprecation
 from .._utils import (maybe_pin_memory, mpi_rank, prefer_pinned,
                       str_dtype_to_torch, str_dtype_to_trt,
                       supports_inflight_batching, torch_dtype_to_trt,
@@ -352,6 +353,7 @@ class PhiMMUtils:
 class MultimodalModelRunner:
 
     def __init__(self, args):
+        emit_engine_arch_deprecation("MultimodalModelRunner")
         self.args = args
         self.use_trtllm_vision_engine = False
 

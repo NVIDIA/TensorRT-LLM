@@ -968,7 +968,9 @@ def serve(
         launch_visual_gen_server(host, port, model, diffusion_args,
                                  metadata_server_cfg)
 
-    if get_is_diffusion_model(model):
+    is_visual_gen = extra_visual_gen_options is not None or get_is_diffusion_model(
+        model)
+    if is_visual_gen:
         _serve_visual_gen()
     else:
         _serve_llm()
@@ -1102,6 +1104,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
+@click.option("-s",
+              "--schedule_style",
+              type=click.Choice(["context_first", "generation_first"],
+                                case_sensitive=False),
+              default=None,
+              help="The schedule style for the disaggregated server.")
 @click.option(
     "--metrics-log-interval",
     type=int,
@@ -1116,6 +1124,7 @@ def disaggregated(
     request_timeout: int,
     log_level: str,
     metrics_log_interval: int,
+    schedule_style: str,
 ):
     """Running server in disaggregated mode"""
 
@@ -1130,7 +1139,8 @@ def disaggregated(
         logger.warning("--config_file is deprecated, use --config instead.")
 
     disagg_cfg = parse_disagg_config_file(config_file)
-
+    if schedule_style:
+        disagg_cfg.schedule_style = schedule_style
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))

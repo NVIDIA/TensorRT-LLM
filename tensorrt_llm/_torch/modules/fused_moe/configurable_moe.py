@@ -36,6 +36,7 @@ from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
+from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -53,6 +54,7 @@ from .communication import (
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 
 
@@ -253,6 +255,19 @@ class ConfigurableMoE(MoE):
         # Validate configuration
         self.validate_config()
 
+        # ========== Optional DWDP integration ==========
+        self.dwdp_manager = get_global_dwdp_manager()
+        self.dwdp_handle_collector = None
+        self.dwdp_rank = None
+        self.enable_dwdp = False
+        if self.dwdp_manager is not None and self._should_enable_dwdp():
+            self.enable_dwdp = True
+            self.dwdp_handle_collector = self.dwdp_manager.add_layer(
+                layer_idx=self.layer_idx,
+            )
+            self.dwdp_rank = self.dwdp_manager.dwdp_rank
+            self.backend.dwdp_handle_collector = self.dwdp_handle_collector
+
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
         # This avoids duplicate post_load_weights calls (once for ConfigurableMoE, once for backend)
@@ -278,6 +293,22 @@ class ConfigurableMoE(MoE):
             assert self.routing_method.top_k == 1, (
                 "apply_router_weight_on_input only supports top-1 routing"
             )
+
+    def _should_enable_dwdp(self) -> bool:
+        # DWDP is currently supported only for CuteDslFusedMoE with NVFP4 quantization.
+        if not isinstance(self.backend, CuteDslFusedMoE):
+            return False
+
+        quant_config = getattr(self.backend, "quant_config", None)
+        if quant_config is None:
+            quant_config = getattr(self.model_config, "quant_config", None)
+        if quant_config is None:
+            return False
+
+        quant_mode = getattr(quant_config, "layer_quant_mode", None)
+        return bool(
+            quant_mode is not None and hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4()
+        )
 
     def _create_comm_strategy(self, model_config: ModelConfig) -> Optional[Communication]:
         """
@@ -483,6 +514,10 @@ class ConfigurableMoE(MoE):
                 do_finalize,
             )
 
+        # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk)
+        if self.enable_dwdp:
+            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+
         # ========== Step 4: Handle output truncation and EPLB repeat ==========
         if self.use_dp and self.parallel_size > 1:
             outputs = outputs[: all_rank_num_tokens[self.mapping.tp_rank]]
@@ -605,8 +640,8 @@ class ConfigurableMoE(MoE):
 
             assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
-            # CutlassFusedMoE expects float32, while TRTLLMGenFusedMoE uses bfloat16
-            if isinstance(self.backend, CutlassFusedMoE):
+            # CutlassFusedMoE and DenseGEMMFusedMoE expect float32, while TRTLLMGenFusedMoE uses bfloat16
+            if isinstance(self.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
                 assert token_final_scales.dtype == torch.float32
             assert token_selected_experts.dtype == torch.int32
 
@@ -1117,7 +1152,12 @@ class ConfigurableMoE(MoE):
         kwargs = {}
 
         # Common parameters for Cutlass and DeepGemm
-        if self.backend.__class__ in (CutlassFusedMoE, DeepGemmFusedMoE, CuteDslFusedMoE):
+        if self.backend.__class__ in (
+            CutlassFusedMoE,
+            DeepGemmFusedMoE,
+            CuteDslFusedMoE,
+            DenseGEMMFusedMoE,
+        ):
             pass
 
         # Cutlass-specific parameters
@@ -1156,6 +1196,11 @@ class ConfigurableMoE(MoE):
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
+
+            if self.enable_dwdp:
+                kwargs["dwdp_weight_view"] = self.dwdp_manager.build_weight_view(
+                    self.layer_idx, self.backend
+                )
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:

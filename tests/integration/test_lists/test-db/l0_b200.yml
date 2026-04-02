@@ -111,11 +111,13 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
@@ -280,3 +282,22 @@ l0_b200:
   - unittest/auto_deploy/singlegpu/smoke
   - unittest/auto_deploy/singlegpu/transformations
   - unittest/auto_deploy/singlegpu/utils
+  # ------------- AutoDeploy Perf Sanity ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*b100*'
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: autodeploy
+  tests:
+  # ------------- AutoDeploy Perf Sanity ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)

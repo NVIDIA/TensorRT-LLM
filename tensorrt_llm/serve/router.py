@@ -163,6 +163,7 @@ class Router(ABC):
         self._session = None
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
+        self._prepared_ready_servers: set[str] = set()
 
     @abstractmethod
     def _on_servers_updated(self, old_servers, new_servers):
@@ -184,32 +185,44 @@ class Router(ABC):
                                    timeout=timeout) as response:
                 return await response.json()
         except Exception as e:
-            logger.error(f"Error fetching server info for server {server}: {e}")
+            logger.warning(
+                f"Error fetching server info for server {server}: {e}")
+            raise RuntimeError(
+                f"Failed to fetch server info for server {server}") from e
         finally:
             await session.close()
-            return {}
 
     async def _prepare_server(self, server: str):
-        if self._server_preparation_func:
-            await self._server_preparation_func(server)
-
-        self._server_info[server] = await self._fetch_server_info(
-            server, self._health_check_timeout)
-        logger.info(f"server is ready with info: {self._server_info[server]}")
+        if server in self._prepared_ready_servers:
+            return
+        try:
+            if self._server_preparation_func:
+                await self._server_preparation_func(server)
+            server_info = await self._fetch_server_info(
+                server, self._health_check_timeout)
+            self._server_info[server] = server_info
+            logger.info(
+                f"server is ready with info: {self._server_info[server]}")
+            self._prepared_ready_servers.add(server)
+        except RuntimeError as e:
+            # swallow the error, if the server becomes ready or is added later, it will be prepared again
+            logger.warning(f"Error preparing server {server}: {e}")
 
     async def prepare_servers(self, servers: Optional[List[str]] = None):
         for server in servers or self._servers:
+            if server not in self._servers:
+                continue
             await self._prepare_server(server)
 
     async def add_server(self, server: str):
         if server in self._servers:
             logger.warning(f"Server {server} already exists")
             return
-        await self._prepare_server(server)
         async with self._lock:
             old_servers = self._servers.copy()
             self._servers = [*old_servers, server]
             self._on_servers_updated(old_servers, self._servers)
+        await self._prepare_server(server)
         logger.debug(
             f"Added server {server}, {self._server_role.name} current server list: {self._servers}"
         )
@@ -224,6 +237,7 @@ class Router(ABC):
                 old_server for old_server in old_servers if old_server != server
             ]
             self._on_servers_updated(old_servers, self._servers)
+        self._prepared_ready_servers.discard(server)
         self._server_info.pop(server, None)
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
@@ -308,6 +322,8 @@ class Router(ABC):
                         # Log removed servers
                         for server in old_servers:
                             if server not in final_servers:
+                                self._prepared_ready_servers.discard(server)
+                                self._server_info.pop(server, None)
                                 logger.info(f"Server {server} is removed")
 
                         # Log added servers

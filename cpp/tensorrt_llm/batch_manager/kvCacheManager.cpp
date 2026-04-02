@@ -2255,10 +2255,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
             && !req.isDisaggGenerationInitState())
         {
-            auto const uniqueTokens = req.getUniqueTokens(0);
+            auto const& uniqueTokens = req.getUniqueTokens(0);
             auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
+            auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
+            // `addSequence()` ignores the last prompt token because its KV cannot be recovered.
+            // When the prompt lands exactly on a block boundary, counting reusable full blocks from
+            // all unique tokens can over-credit one extra shared block.
+            TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
+            auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
             // Only subtract from shared blocks (reusable blocks are always shared)
-            auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
+            auto const reusableSharedBlocks
+                = std::min({numReusableBlocks, numSharedBlocks, maxRecoverableSharedBlocks});
             numRequiredBlocks -= reusableSharedBlocks;
             // Store on request so the micro batch scheduler can use it for token budget
             req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
