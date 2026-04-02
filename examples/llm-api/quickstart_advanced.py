@@ -99,6 +99,13 @@ def add_llm_args(parser):
         type=str,
         default=None,
         help='Path to a YAML file for MoE load balancer (EPLB) configuration.')
+    parser.add_argument(
+        '--use_cute_dsl_blockscaling_mm',
+        default=False,
+        action='store_true',
+        help=
+        'Use CuTe DSL blockscaling mm for dense GEMM (enables GEMM+SwiGLU fusion for shared experts on Blackwell)'
+    )
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
@@ -331,6 +338,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        use_cute_dsl_blockscaling_mm=args.use_cute_dsl_blockscaling_mm,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
