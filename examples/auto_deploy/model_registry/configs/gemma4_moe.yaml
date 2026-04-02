@@ -5,5 +5,5 @@
 # Uses triton paged attention backend: supports head_dim=512 (global_head_dim),
 # paged KV cache, CUDA-graph-compatible, FlashDecoding for decode.
 model_factory: Gemma4ForConditionalGeneration
-tokenizer: google/gemma-4-31B-it
+tokenizer: google/gemma-4-26B-A4B-it
 attn_backend: triton_paged
