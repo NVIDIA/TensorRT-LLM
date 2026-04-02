@@ -156,6 +156,18 @@ class ModelFactory(ABC):
         """
         return None
 
+    def get_pipeline_cache_model_identifier(self) -> str:
+        """Return a stable model identifier for pipeline cache key generation."""
+        return str(self._model)
+
+    def get_pipeline_cache_checkpoint_fingerprint(self) -> str:
+        """Return a checkpoint fingerprint input for pipeline cache key generation.
+
+        The default implementation uses the configured model identifier/path directly. Model
+        factories may override this with a stronger fingerprint if they can determine one cheaply.
+        """
+        return str(self._model)
+
     def build_model(self, device: str) -> nn.Module:
         """Build the model on the desired device.
 

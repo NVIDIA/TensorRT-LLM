@@ -457,7 +457,10 @@ class ADEngine(ModelEngine):
 
         # construct inference optimizer
         build_and_optimize = InferenceOptimizer(
-            factory=factory, config=ad_config.transforms, mapping=mapping
+            factory=factory,
+            config=ad_config.transforms,
+            mapping=mapping,
+            pipeline_cache_config=ad_config.pipeline_cache,
         )
 
         # construct engine
