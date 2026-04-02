@@ -29,7 +29,6 @@ class DatasetFormatError(ValueError):
     """Raised when the input dataset stream is empty, corrupted, or incorrectly formatted."""
 
 
-
 def initialize_tokenizer(model_name: str,
                          custom_tokenizer: str = None) -> PreTrainedTokenizer:
     """Initialize a tokenizer.

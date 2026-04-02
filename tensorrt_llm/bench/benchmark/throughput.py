@@ -294,8 +294,8 @@ from tensorrt_llm.sampling_params import SamplingParams
     "--scheduler_policy",
     type=click.Choice(["guaranteed_no_evict", "max_utilization"]),
     default="guaranteed_no_evict",
-    help=
-    "KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.",
+    help=("KV cache scheduler policy: guaranteed_no_evict prevents request"
+          " eviction, max_utilization optimizes for throughput."),
 )
 @click.pass_obj
 def throughput_command(
@@ -412,8 +412,9 @@ def throughput_command(
     exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
     exec_settings["settings_config"]["beam_width"] = options.beam_width
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings["settings_config"]["scheduler_policy"] = (
+        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy
+        == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION)
     exec_settings["settings_config"]["chunking"] = enable_chunked_context
 
     # Dynamic runtime features.
