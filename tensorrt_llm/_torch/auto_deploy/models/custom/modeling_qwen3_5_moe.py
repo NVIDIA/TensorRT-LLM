@@ -844,6 +844,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+        self.model.set_lm_head(new_embeddings)
 
     def forward(
         self,
@@ -2587,6 +2588,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
 
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+        self.model.language_model.set_lm_head(new_embeddings)
 
     def forward(
         self,
