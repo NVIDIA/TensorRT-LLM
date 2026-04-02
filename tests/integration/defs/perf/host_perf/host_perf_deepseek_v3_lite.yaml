@@ -1,0 +1,63 @@
+# Host performance regression test configs for DeepSeek-V3-Lite (FP8).
+#
+# These configs are designed to be HOST-overhead-dominant:
+# - Small batch sizes (1, 8) so GPU is not saturated
+# - Short sequences (ISL=128, OSL=128-256) for high iteration rate
+# - Single GPU (TP=1) to avoid communication overhead
+#
+# On these configs, host scheduling/sampling overhead is a significant fraction
+# of per-iteration time, so host regressions show up in ITL/TPOT metrics.
+#
+# DeepSeek-V3-Lite exercises MLA attention + MoE routing host paths that
+# simpler dense models do not cover.
+
+metadata:
+  model_name: deepseek_v3_lite_fp8
+  supported_gpus:
+  - H100
+  - H200
+  - B200
+  - B300
+hardware:
+  gpus_per_node: 1
+server_configs:
+  # Config 1: Single-request decode — pure host overhead baseline
+  # With BS=1, each iteration has minimal GPU work. Host scheduling,
+  # sampling, and response handling overhead dominates ITL.
+  - name: "v3lite_fp8_bs1_128_128"
+    model_name: "deepseek_v3_lite_fp8"
+    tensor_parallel_size: 1
+    max_batch_size: 1
+    max_num_tokens: 256
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 1
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con1_128_128"
+        concurrency: 1
+        iterations: 200
+        isl: 128
+        osl: 128
+        backend: "openai"
+
+  # Config 2: Small batch decode — exercises scheduling with multiple requests
+  # BS=8 adds scheduling/batching overhead while keeping GPU work small.
+  - name: "v3lite_fp8_bs8_128_256"
+    model_name: "deepseek_v3_lite_fp8"
+    tensor_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 2048
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 8
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con8_128_256"
+        concurrency: 8
+        iterations: 200
+        isl: 128
+        osl: 256
+        backend: "openai"

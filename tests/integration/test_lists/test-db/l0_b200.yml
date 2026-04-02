@@ -176,6 +176,13 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   # - examples/test_visual_gen.py
+  # ------------- Host perf module regression tests (6 representative scenarios) ---------------
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_greedy[greedy_bs8]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_stop_words[stopwords_bs32]
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_generation
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_context
 - condition:
     ranges:
       system_gpu_count:
@@ -250,6 +257,13 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
   - unittest/_torch/visual_gen/test_wan.py::TestWanTwoStageTransformer
+  # ------------- Host perf E2E regression tests (post-merge) ---------------
+  # LLM API direct — dense (Llama-8B BS=8), MoE/MLA (DeepSeek-V3-Lite), spec decode
+  - perf/host_perf/test_llmapi_perf.py::test_llmapi_perf[llmapi-host_perf_llama8b-llama8b_fp16_bs8_128_256-con8_128_256]
+  - perf/host_perf/test_llmapi_perf.py::test_llmapi_perf[llmapi-host_perf_deepseek_v3_lite-v3lite_fp8_bs8_128_256-con8_128_256]
+  - perf/host_perf/test_llmapi_perf.py::test_llmapi_perf[llmapi-host_perf_llama8b_spec_decode-llama8b_spec_bs1_128_128-con1_128_128]
+  # trtllm-serve E2E — full serving stack validation
+  - perf/host_perf/test_host_perf.py::test_host_perf[host_perf_llama8b-llama8b_fp16_bs8_128_256-con8_128_256]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:
