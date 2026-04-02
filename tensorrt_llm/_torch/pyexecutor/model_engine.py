@@ -2636,6 +2636,24 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
+        if total_num_tokens > self.max_num_tokens:
+            ctx_details = []
+            for r in scheduled_requests.context_requests:
+                pos = r.context_current_position
+                csz = r.context_chunk_size
+                full = len(r.get_tokens(0))
+                tokens = min(csz, max(0, full - pos))
+                ctx_details.append(
+                    f"rid={r.py_request_id} pos={pos} chunk={csz} "
+                    f"full={full} tokens={tokens}")
+            gen_count = len(scheduled_requests.generation_requests)
+            from tensorrt_llm.logger import logger as _mnt_logger
+            _mnt_logger.error(
+                f"MNT overflow: total={total_num_tokens} "
+                f"max={self.max_num_tokens} "
+                f"ctx_reqs={len(scheduled_requests.context_requests)} "
+                f"gen_reqs={gen_count} "
+                f"ctx_breakdown=[{'; '.join(ctx_details)}]")
         assert total_num_tokens <= self.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
         )
