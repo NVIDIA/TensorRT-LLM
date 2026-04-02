@@ -162,14 +162,6 @@ public:
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
         T* k_ptr = nullptr;
         T* v_ptr = nullptr;
-        if (k.has_value())
-        {
-            k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
-        }
-        if (v.has_value())
-        {
-            v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
-        }
         AttentionOutT* context_buf = static_cast<AttentionOutT*>(output.slice(0, token_offset).data_ptr());
         TORCH_CHECK(!op.mFuseFp4Quant || output_sf.has_value());
         void* context_buf_sf = op.mFuseFp4Quant ? output_sf->data_ptr() : nullptr;
@@ -233,6 +225,8 @@ public:
                 TORCH_CHECK(k->strides()[1] == 1);
                 TORCH_CHECK(v->strides()[1] == 1);
 
+                k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
+                v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
                 mla_params.k_buf = k_ptr;
                 mla_params.v_buf = v_ptr;
 
@@ -636,20 +630,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
-    std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
-    int64_t const sage_attn_num_elts_per_blk_q, int64_t const sage_attn_num_elts_per_blk_k,
-    int64_t const sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8)
+    std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
-    // Currently, SageAttention block-size options are only consumed by the TllmGen backend path.
-    bool const use_sage_attn
-        = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
 
-    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn,
-        "Context attention only allows these non-MLA cases: fused QKV; separate QKV with SageAttention");
+    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv, "Only fused QKV is supported for non-MLA attention now");
     TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
     auto qkv_or_q = q;
     if (is_fused_qkv)
@@ -662,13 +650,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
     }
-    if (use_sage_attn)
-    {
-        TLLM_CHECK_WITH_INFO(
-            !is_fused_qkv, "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false).");
-        TLLM_CHECK_WITH_INFO(k.has_value(), "SageAttention requires k tensor to be provided.");
-        TLLM_CHECK_WITH_INFO(v.has_value(), "SageAttention requires v tensor to be provided.");
-    }
+
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(qkv_or_q.scalar_type());
     auto const out_dtype = output.scalar_type();
     bool const is_fp8_out = out_dtype == torch::kFloat8_e4m3fn;
@@ -753,19 +735,15 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
-    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
-        || use_sage_attn;
+    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha);
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
+
     op->mAttentionChunkSize = attention_chunk_size;
     op->mSkipSoftmaxThresholdScaleFactorPrefill
         = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
     op->mSkipSoftmaxThresholdScaleFactorDecode
         = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
-    op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
-    op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
-    op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v);
-    op->mSageAttnQkInt8 = sage_attn_qk_int8;
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;

@@ -21,10 +21,6 @@
 #include "transferAgent.h"
 #endif
 
-#ifdef ENABLE_MOONCAKE
-#include "../mooncake_utils/transferAgent.h"
-#endif
-
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
@@ -173,10 +169,13 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_prop_ro("remote_name", &kvc::TransferRequest::getRemoteName)
         .def_prop_ro("sync_message", &kvc::TransferRequest::getSyncMessage);
 
-    // TransferStatus base class
+    // TransferStatus base class - release GIL for potentially blocking operations.
+    // All concrete subclasses (Nixl, Mooncake) perform blocking waits, so releasing
+    // the GIL here is safe and necessary for correct behavior when the concrete
+    // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
-        .def("is_completed", &kvc::TransferStatus::isCompleted)
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1);
+        .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -257,39 +256,11 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
 #endif
 
-#ifdef ENABLE_MOONCAKE
-    // MooncakeTransferStatus class - release GIL for blocking operations
-    nb::class_<kvc::MooncakeTransferStatus, kvc::TransferStatus>(m, "MooncakeTransferStatus")
-        .def("is_completed", &kvc::MooncakeTransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::MooncakeTransferStatus::wait, nb::arg("timeout_ms") = -1,
-            nb::call_guard<nb::gil_scoped_release>());
-
-    // MooncakeTransferAgent class
-    nb::class_<kvc::MooncakeTransferAgent, kvc::BaseTransferAgent>(m, "MooncakeTransferAgent")
-        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"))
-        .def("register_memory", &kvc::MooncakeTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::MooncakeTransferAgent::deregisterMemory, nb::arg("descs"))
-        .def("load_remote_agent",
-            nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
-        .def("load_remote_agent_by_connection",
-            nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
-                &kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::MooncakeTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::MooncakeTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::MooncakeTransferAgent::invalidateRemoteAgent, nb::arg("name"))
-        .def(
-            "submit_transfer_requests",
-            [](kvc::MooncakeTransferAgent& self, kvc::TransferRequest const& request)
-            { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
-        .def("notify_sync_message", &kvc::MooncakeTransferAgent::notifySyncMessage, nb::arg("name"),
-            nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::MooncakeTransferAgent::getNotifiedSyncMessages)
-        .def("check_remote_descs", &kvc::MooncakeTransferAgent::checkRemoteDescs, nb::arg("name"),
-            nb::arg("memory_descs"));
-#endif
+    // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally
+    // NOT registered here. Directly binding them would create a load-time dependency on
+    // libtensorrt_llm_mooncake_wrapper.so (and transitively libtransfer_engine.so),
+    // causing import to fail on machines without Mooncake installed.
+    // Instead, use make_transfer_agent("mooncake", config) which loads the library lazily.
 
     // Factory function to create transfer agent by backend name (uses dynamic loading)
     m.def(
