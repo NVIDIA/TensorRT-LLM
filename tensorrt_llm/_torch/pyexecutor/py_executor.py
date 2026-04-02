@@ -1195,6 +1195,20 @@ class PyExecutor:
             self.wait_on_pp_send_handles(self.send_expected_batch_num_handles,
                                          i)
 
+        # Clean up resource managers (KV cache, etc.) inside the event loop
+        # thread before it exits.  For non-rank-0 workers the external
+        # PyExecutor.shutdown() path is never called (BaseWorker.shutdown
+        # skips engine.shutdown() when can_enqueue_requests() is False),
+        # so this is the only opportunity to release KV cache resources
+        # and avoid leaving them for GC __del__ which may encounter
+        # corrupted internal state.
+        # For rank 0 this is redundant with PyExecutor.shutdown() but
+        # harmless — the second shutdown on each manager is a no-op
+        # (empty radix tree + _destroyed guard on pool groups).
+        for manager in self.resource_manager.resource_managers.values():
+            if manager:
+                manager.shutdown()
+
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
@@ -1990,9 +2004,10 @@ class PyExecutor:
                             with torch.cuda.stream(self.execution_stream):
                                 self.drafter.prepare_draft_tokens(
                                     scheduled_batch, self.resource_manager)
-                                # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
+                                # Pad draft tokens to the max draft length and extend KV cache
+                                # capacity to match. This is for CUDA graph compatibility.
                                 self.drafter.pad_draft_tokens_for_cuda_graph(
-                                    scheduled_batch)
+                                    scheduled_batch, self.resource_manager)
                             torch.cuda.current_stream().wait_stream(
                                 self.execution_stream)
                         # add_batch must be called again to restore to target requests with updated draft tokens.

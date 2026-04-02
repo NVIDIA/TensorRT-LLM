@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/baaedfdb2d3f1d70b7dbcde08b083abfe6017a92/tests/utils.py
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,8 @@ class RemoteOpenAIServer:
         self.proc = subprocess.Popen(launch_cmd,
                                      env=env,
                                      stdout=self._get_output(),
-                                     stderr=self._get_output())
+                                     stderr=self._get_output(),
+                                     start_new_session=True)
         if wait:
             self.wait_for_server(timeout=self.MAX_SERVER_START_WAIT_S)
 
@@ -79,13 +81,64 @@ class RemoteOpenAIServer:
     def __exit__(self, exc_type, exc_value, traceback):
         self.terminate()
 
+    def _dump_stacks(self, pid: int):
+        """Dump stack traces of a hanging process for debugging."""
+        try:
+            # Try pystack first (best for Python processes)
+            result = subprocess.run(
+                ["pystack", "remote", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                print(f"=== pystack for PID {pid} ===")
+                print(result.stdout)
+                return
+            else:
+                print(
+                    f"pystack failed (rc={result.returncode}): {result.stderr}")
+        except FileNotFoundError:
+            print("pystack not found, falling back to /proc stacks")
+        except subprocess.TimeoutExpired:
+            print("pystack timed out")
+
+        # Fallback: kernel-level stacks via /proc
+        try:
+            for task_dir in os.listdir(f"/proc/{pid}/task"):
+                stack_path = f"/proc/{pid}/task/{task_dir}/stack"
+                if os.path.exists(stack_path):
+                    with open(stack_path) as f:
+                        stack = f.read().strip()
+                    if stack:
+                        print(f"=== /proc stack for TID {task_dir} ===")
+                        print(stack)
+        except Exception as e:
+            print(f"Failed to read /proc stacks: {e}")
+
     def terminate(self):
         if self.proc is None:
             return
-        self.proc.terminate()
+        pid = self.proc.pid
+
+        # SIGTERM the process group first (graceful shutdown)
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            self.proc.terminate()
+
         try:
             self.proc.wait(timeout=30)
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired:
+            print(f"[teardown] SIGTERM timed out for PID {pid}, "
+                  "dumping stacks before SIGKILL...")
+            self._dump_stacks(pid)
+            # SIGKILL the entire process group
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except OSError:
+                pass
             self.proc.kill()
             self.proc.wait(timeout=30)
         try:
@@ -182,7 +235,8 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
         self.proc = subprocess.Popen(launch_cmd,
                                      env=env,
                                      stdout=self._get_output(),
-                                     stderr=self._get_output())
+                                     stderr=self._get_output(),
+                                     start_new_session=True)
         if wait_ready:
             self._wait_for_server(url=self.url_for("health"),
                                   timeout=self.MAX_SERVER_START_WAIT_S)
@@ -231,6 +285,7 @@ class RemoteMMEncoderServer(RemoteOpenAIServer):
 
         self.proc = subprocess.Popen(launch_cmd,
                                      stdout=self._get_output(),
-                                     stderr=self._get_output())
+                                     stderr=self._get_output(),
+                                     start_new_session=True)
         self._wait_for_server(url=self.url_for("health"),
                               timeout=self.MAX_SERVER_START_WAIT_S)

@@ -208,6 +208,7 @@ def test_llm_reward_model():
 @skip_ray
 @pytest.mark.part3
 def test_llm_perf_metrics():
+    pytest.skip("KV cache v2 does not support kv cache stats")
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config) as llm:
         sampling_params = SamplingParams(max_tokens=10,

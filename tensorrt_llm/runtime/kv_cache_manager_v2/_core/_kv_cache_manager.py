@@ -183,7 +183,10 @@ class KVCacheManager:
         self._last_update_num_closed_requests = 0
 
     def __del__(self) -> None:
-        self.shutdown()
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     def shutdown(self) -> None:
         self.clear_reusable_blocks()

@@ -118,22 +118,26 @@ class KvCacheCreator:
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
-        self._kv_cache_manager_cls = get_kv_cache_manager_cls(
-            model_engine.model.model_config, kv_cache_config)
         self._execution_stream = execution_stream
-        if self._kv_cache_manager_cls == KVCacheManagerV2:
-            if kv_connector_manager is not None or (
-                    max_beam_width is not None and max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
-                    "Falling back to KVCacheManager.")
+        self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+            model_engine)
         self._draft_config = draft_config
         self._skip_est = skip_est
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
-        return get_kv_cache_manager_cls(model_engine.model.model_config,
-                                        self._kv_cache_config)
+        cls = get_kv_cache_manager_cls(model_engine.model.model_config,
+                                       self._kv_cache_config)
+        if cls == KVCacheManagerV2:
+            if self._kv_connector_manager is not None or (
+                    self._max_beam_width is not None and self._max_beam_width
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
+                    "Falling back to KVCacheManager.")
+                cls = KVCacheManager
+        return cls
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -358,8 +362,9 @@ class KvCacheCreator:
 
         free_mem, total_mem = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
-        max_num_tokens_in_memory = max_memory // self._get_kv_size_per_token(
-        ) // self._tokens_per_block * self._tokens_per_block
+        max_num_tokens_in_memory = int(
+            max_memory // self._get_kv_size_per_token() //
+            self._tokens_per_block * self._tokens_per_block)
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
         return min(

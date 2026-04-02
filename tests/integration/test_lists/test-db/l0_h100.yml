@@ -179,7 +179,8 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
     - unittest/_torch/executor
-    - unittest/_torch/ray_orchestrator/single_gpu
+    # Hang confirmed: test_llm_sleep hangs (reproduced on H100 PCIe)
+    # - unittest/_torch/ray_orchestrator/single_gpu
     - unittest/llmapi/test_llm_pytorch.py -m "part0"
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"

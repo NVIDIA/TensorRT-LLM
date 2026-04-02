@@ -36,6 +36,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
                                                       _KVCache)
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
+    gen_multi_modal_tokens
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -663,8 +665,9 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
+                draft_len = get_draft_token_length(req)
                 self.impl.add_token(req.py_request_id)
-                for _ in range(get_draft_token_length(req)):
+                for _ in range(draft_len):
                     self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
@@ -673,6 +676,9 @@ class KVCacheManager(BaseResourceManager):
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
+
+    def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
+        """No-op for V1; interface kept consistent with V2."""
 
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
@@ -1738,11 +1744,33 @@ class KVCacheManagerV2(BaseResourceManager):
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
-            cache_tiers.append(
-                HostCacheTierConfig(quota=kv_cache_config.host_cache_size))
+            host_quota = kv_cache_config.host_cache_size
+        else:
+            # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
+            # evict and later restore KV cache pages.  Without a host tier,
+            # suspended pages have nowhere to be offloaded and resume()
+            # always fails, causing a scheduling deadlock where no
+            # generation request can ever make progress.
+            #
+            # Automatically provision a host tier matching the GPU quota so
+            # suspend/resume works out of the box.  Cap at available host
+            # memory to avoid allocation failures.
+            import os
+            try:
+                mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
+                    'SC_AVPHYS_PAGES')
+            except (ValueError, OSError):
+                mem_available = float('inf')
+            host_quota = min(quota, int(mem_available * 0.5))
+            if host_quota <= 0:
+                host_quota = quota
+        if host_quota > 0:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(
-                f"KV cache manager v2 host cache quota set to {kv_cache_config.host_cache_size / (1 << 30)}GiB"
+                f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
+
+        self.vocab_size = vocab_size
 
         config = self._build_cache_config(
             kv_cache_config,
@@ -1766,13 +1794,13 @@ class KVCacheManagerV2(BaseResourceManager):
         (self.kv_cache_pool_pointers,
          self.kv_cache_pool_mapping) = self._build_pool_mapping_tensors()
 
-        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
-        self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
-                                   1) // tokens_per_block
-        if self.max_blocks_per_seq % 4 != 0:
-            self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
-
         self.kv_cache_map: dict[int, _KVCache] = {}
+
+        # Tracks the draft length allocated by try_allocate_generation per
+        # request.  Used by extend_capacity_for_tokens to compute the exact
+        # padding delta instead of blindly extending, which would cause
+        # unbounded capacity growth.
+        self._allocated_draft_lens: dict[int, int] = {}
 
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
@@ -1792,6 +1820,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} that can be allocated in kv cache manager, setting max_seq_len to {max_num_tokens}"
             )
             self.max_seq_len = max_num_tokens
+
+        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel.
+        # Computed after max_seq_len clamping, but account for extra tokens
+        # (num_extra_kv_tokens + max_total_draft_tokens) so the host
+        # page-index buffer is large enough for the maximum capacity a single
+        # sequence can reach during warmup or normal operation.
+        # The +1 accounts for the base decode token that
+        # _required_gen_capacity adds on top of draft tokens.
+        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self.max_total_draft_tokens + 1
+        self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block -
+                                   1) // tokens_per_block
+        if self.max_blocks_per_seq % 4 != 0:
+            self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
@@ -1995,12 +2036,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
         clamped = self.impl.clamp_max_seq_len_for_mem(
-            batch_size, token_num_upper_bound + extra_tokens) - extra_tokens
+            batch_size, token_num_upper_bound + extra_tokens) - 2 * extra_tokens
         # clamp_max_seq_len_for_mem considers all tiers (GPU + host).  When
         # max_tokens is explicitly set, cap by GPU-only capacity so callers
         # (e.g. CUDA graph warmup) don't exceed the GPU pool.
         if self._gpu_max_tokens is not None:
-            clamped = min(clamped, self._gpu_max_tokens)
+            clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
 
     def get_num_free_blocks(self) -> int:
@@ -2046,6 +2087,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
+        draft_len = get_draft_token_length(req)
+        self._allocated_draft_lens[req.py_request_id] = draft_len
         return kv_cache.resize(
             self._required_gen_capacity(req, kv_cache.capacity))
 
@@ -2092,10 +2135,14 @@ class KVCacheManagerV2(BaseResourceManager):
             if kv_cache is None:
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id,
-                    req.get_tokens(DEFAULT_BEAM_INDEX)[:-1]
-                    if self.enable_block_reuse else None)
+                if self.enable_block_reuse:
+                    all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                    tokens = self._augment_tokens_for_block_reuse(
+                        all_tokens, req, end=len(all_tokens) - 1)
+                else:
+                    tokens = None
+                kv_cache = self._create_kv_cache(req.py_request_id,
+                                                 req.lora_task_id, tokens)
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2139,6 +2186,33 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         return True
+
+    def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
+        """Extend KV cache capacity for the CUDA-graph padding delta.
+
+        ``try_allocate_generation`` allocated capacity for the schedule-reduced
+        draft length.  After padding restores ``py_draft_tokens`` to the static
+        max, we must extend by exactly the difference so that the subsequent
+        rewind (which operates on the padded length) does not underflow.
+
+        The delta is computed from ``_allocated_draft_lens`` (recorded by
+        ``try_allocate_generation``) vs the current draft length (post-padding).
+        """
+        allocated = self._allocated_draft_lens.pop(request.py_request_id, None)
+        if allocated is None:
+            return
+        current_draft_len = get_draft_token_length(request)
+        delta = current_draft_len - allocated
+        if delta <= 0:
+            return
+        kv_cache = self.kv_cache_map[request.py_request_id]
+        new_capacity = kv_cache.capacity + delta
+        success = kv_cache.resize(new_capacity)
+        if not success:
+            raise ValueError(
+                f"Failed to extend capacity of KV cache for request "
+                f"{request.py_request_id} by {delta} tokens "
+                f"(target capacity {new_capacity})")
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache (move to host tier)."""
@@ -2202,6 +2276,58 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                     )
+
+    def _augment_tokens_for_block_reuse(
+            self,
+            tokens: Sequence[int],
+            req: LlmRequest,
+            start: int = 0,
+            end: int | None = None) -> Sequence[TokenIdExt]:
+        """Augment token sequence with multimodal content digests for block reuse.
+
+        Multimodal placeholder tokens (e.g. image_token_id) share the same ID
+        regardless of the underlying content. This method replaces each
+        multimodal token region with TokenIdExt values produced by
+        gen_multi_modal_tokens(), embedding the content digest (Blake3 hash)
+        into the token sequence so that the radix tree can distinguish blocks
+        belonging to different images/videos.
+
+        When *start*/*end* are given, only the slice ``tokens[start:end]`` is
+        materialized and returned. This avoids re-augmenting the full prompt
+        on every chunk during chunked prefill.
+
+        For text-only requests this is a no-op.
+        """
+        if end is None:
+            end = len(tokens)
+        is_sliced = start != 0 or end != len(tokens)
+
+        if (req.multimodal_hashes is None or req.multimodal_positions is None
+                or req.multimodal_lengths is None):
+            return tokens[start:end] if is_sliced else tokens
+
+        result: list[TokenIdExt] = list(tokens[start:end])
+        for hash_ints, pos, length in zip(req.multimodal_hashes,
+                                          req.multimodal_positions,
+                                          req.multimodal_lengths):
+            mm_end = pos + length
+            # Skip multimodal items outside [start, end).
+            if mm_end <= start or pos >= end:
+                continue
+            # Convert 8 x int32 hash to 32-byte digest (big-endian,
+            # matching v1 C++ getNthByte which extracts MSB first).
+            digest = b''.join(
+                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+            mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
+            # Overlap between [pos, mm_end) and [start, end).
+            overlap_start = max(pos, start)
+            overlap_end = min(mm_end, end)
+            mm_offset = overlap_start - pos
+            result_offset = overlap_start - start
+            n = overlap_end - overlap_start
+            result[result_offset:result_offset +
+                   n] = mm_tokens[mm_offset:mm_offset + n]
+        return result
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
@@ -2296,7 +2422,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
                         req.py_request_id, req.lora_task_id, input_tokens)
                     success = draft_kv_cache.resume(
-                        torch.cuda.current_stream().cuda_stream)
+                        draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
                         release_resources(req, free_draft_resources=True)
                         return None
@@ -2315,7 +2441,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
                     success = kv_cache.resize(new_capacity)
                     if not success:
-                        release_resources(req)
+                        release_resources(req,
+                                          free_draft_resources=draft_kv_cache
+                                          is not None)
                         return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
@@ -2342,6 +2470,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             return
@@ -2357,16 +2486,18 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.close()
         self.index_mapper.remove_sequence(request.py_request_id)
 
-    def get_batch_cache_indices(self,
-                                request_ids: List[int],
-                                layer_id: int = 0) -> List[List[int]]:
-
-        # returns the block numbers needed for each request
-        return self._get_batch_cache_indices_by_pool_id(
-            request_ids,
-            pool_id=self.layer_to_pool_mapping_dict[
-                self.layer_offsets[layer_id]],
-            is_kv_aggregate=True)
+    def get_batch_cache_indices(
+            self,
+            request_ids: List[int],
+            layer_id: Optional[int] = None) -> List[List[int]]:
+        if layer_id is None:
+            pool_id = 0
+        else:
+            pool_id = self.layer_to_pool_mapping_dict[
+                self.layer_offsets[layer_id]]
+        return self._get_batch_cache_indices_by_pool_id(request_ids,
+                                                        pool_id=pool_id,
+                                                        is_kv_aggregate=True)
 
     def _get_batch_cache_indices_by_pool_id(
             self,
@@ -2499,6 +2630,12 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         return bool(has_invalid_values)
 
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
     def shutdown(self):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
@@ -2582,21 +2719,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
                 if req.context_current_position > kv_cache.num_committed_tokens:
-                    kv_cache.commit(
-                        req.get_tokens(DEFAULT_BEAM_INDEX)
-                        [kv_cache.num_committed_tokens:req.
-                         context_current_position])
+                    tokens = self._augment_tokens_for_block_reuse(
+                        req.get_tokens(DEFAULT_BEAM_INDEX),
+                        req,
+                        start=kv_cache.num_committed_tokens,
+                        end=req.context_current_position)
+                    kv_cache.commit(tokens)
                 if req.context_remaining_length == 0:
                     kv_cache.stop_committing()
             else:
-                # For draft managers, prepare_resources may have failed to
-                # resize capacity (OOM). Ensure capacity >= history_length
-                # before setting history_length to avoid ValueError.
-                new_capacity = None
-                if self.is_draft and kv_cache.capacity < req.context_current_position:
-                    new_capacity = req.context_current_position + self.num_extra_kv_tokens
-                success = kv_cache.resize(new_capacity,
-                                          req.context_current_position)
+                success = kv_cache.resize(None, req.context_current_position)
                 if not success:
                     raise ValueError(
                         f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
