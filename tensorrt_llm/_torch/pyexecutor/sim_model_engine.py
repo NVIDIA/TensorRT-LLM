@@ -113,6 +113,9 @@ class SimModelEngine:
             predicted_time = self.time_predictor.predict(batch)
             if self.clock is not None:
                 self.clock.step(predicted_time)
+                self.clock.record_iteration(
+                    predicted_time, num_ctx_requests,
+                    num_ctx_tokens, num_gen_tokens)
                 logger.debug(
                     "[SimModelEngine] iter=%d predicted=%.3fms total=%.3fms",
                     self.clock.num_iterations,

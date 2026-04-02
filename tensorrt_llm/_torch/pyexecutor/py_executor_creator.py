@@ -304,7 +304,7 @@ def _create_sim_py_executor(
 
     model_engine = SimModelEngine(llm_args, vocab_size, max_num_sequences,
                                    time_predictor=predictor, clock=clock)
-    sampler = SimSampler()
+    sampler = SimSampler(clock=clock)
 
     # We need a minimal model shim so KvCacheCreator can read model_config
     # to determine layer count, num_kv_heads, head_size, etc.
