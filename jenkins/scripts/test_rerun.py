@@ -70,7 +70,8 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
     rerun_2_filename = os.path.join(outdir, 'rerun_2.txt')
 
     # Map test name to test line in test_list_filename.
-    # e.g. test_to_line: {"test_name": "test_name TIMEOUT (90)"}
+    # e.g. tests: ["test_name1", "test_name2", "test_name3"]
+    # test_to_line: {"test_name1": "test_name1", "test_name2": "test_name2 TIMEOUT (90)", "test_name3": "test_name3 TIMEOUT (30)"}
     tests = []
     test_to_line = {}
     if test_list_filename and os.path.exists(test_list_filename):
@@ -84,6 +85,8 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
                 test_to_line[test_name] = line
 
     # Get tests that terminated unexpectedly from unfinished_test_filename.
+    # e.g. unfinished_test_line: "stage_name/test_name1"
+    # unfinished_tests: ["test_name1", "test_name2", "test_name3"]
     unfinished_tests = []
     if unfinished_test_filename and os.path.exists(unfinished_test_filename):
         with open(unfinished_test_filename, 'r') as f:
@@ -103,13 +106,15 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
                                              rerun_2_file, test_to_line)
 
         for test in tests:
+            if test in ran_tests:
+                continue
             # Part 2: process unfinished tests
-            if test in unfinished_tests:
+            elif test in unfinished_tests:
                 rerun_0_file.write(test_to_line[test] + '\n')
                 print(test +
                       " will not rerun because it terminated unexpectedly.")
             # Part 3: process tests that did not run
-            elif test not in ran_tests:
+            else:
                 rerun_1_file.write(test_to_line[test] + '\n')
                 print(test + " will rerun 1 time, because it did not run")
 
