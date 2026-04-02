@@ -2179,11 +2179,11 @@ void Executor::Impl::terminateContextFinishedRequests(InTransList& inTransmissio
         auto req = item.request;
         if (req->isDisaggContextCompleteState())
         {
-            // If lastBlockId was tracked, unpin it. Otherwise, just terminate.
+            // If pinnedBlockIds were tracked, unpin them. Otherwise, just terminate.
             auto kvMgr = mModel->getKVCacheManager();
-            if (kvMgr && item.lastBlockId.has_value())
+            if (kvMgr && !item.pinnedBlockIds.empty())
             {
-                kvMgr->unpinBlocksById(item.lastBlockId.value());
+                kvMgr->unpinBlocksById(item.pinnedBlockIds);
             }
             else
             {
@@ -2234,14 +2234,14 @@ Executor::Impl::RequestList Executor::Impl::populateNewResponses(
             // move the in transmission requests to another tracker
             if (llmReq->isDisaggContextTransmissionState())
             {
-                std::optional<SizeType32> lastBlockId{};
+                std::vector<SizeType32> pinnedBlockIds{};
                 auto kvMgr = mModel->getKVCacheManager();
                 if (kvMgr && kvMgr->isEnableBlockReuse() && !kvMgr->getBlockManager().isVariableWindow())
                 {
-                    lastBlockId = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
+                    pinnedBlockIds = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
                     mModel->terminateRequest(llmReq);
                 }
-                inTransmissionRequests.push_back(InTransmissionItem{*it, lastBlockId});
+                inTransmissionRequests.push_back(InTransmissionItem{*it, pinnedBlockIds});
             }
             finishedRequests.push_back(*it);
             it = activeRequests.erase(it);
