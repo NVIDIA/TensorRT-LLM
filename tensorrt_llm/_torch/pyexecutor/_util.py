@@ -51,6 +51,18 @@ from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
 
+_worker_log_file_path = os.environ.get("TLLM_WORKER_LOG_FILE")
+_worker_log_file = open(_worker_log_file_path,
+                        "a") if _worker_log_file_path else None
+
+
+def _log_to_file(msg):
+    if _worker_log_file is not None:
+        from datetime import datetime
+        ts = datetime.now().strftime("%m/%d/%Y-%H:%M:%S")
+        _worker_log_file.write(f"[{ts}] {msg}\n")
+        _worker_log_file.flush()
+
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -125,9 +137,11 @@ class KvCacheCreator:
             if kv_connector_manager is not None or (
                     max_beam_width is not None and max_beam_width
                     > 1) or self._kv_cache_config.event_buffer_max_size > 0:
-                logger.warning(
+                _msg = (
                     "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
                     "Falling back to KVCacheManager.")
+                logger.warning(_msg)
+                _log_to_file(_msg)
         self._draft_config = draft_config
         self._skip_est = skip_est
 
@@ -182,12 +196,14 @@ class KvCacheCreator:
 
         available_kv_mem = (total_gpu_memory - peak_memory +
                             allocated_bytes) * fraction
-        logger.error(
+        _msg = (
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
             f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
         )
+        logger.error(_msg)
+        _log_to_file(_msg)
         return int(available_kv_mem)
 
     def _create_dummy_mm_context_request(
@@ -200,9 +216,12 @@ class KvCacheCreator:
 
         input_processor = self._model_engine.input_processor
         if not (hasattr(input_processor, "get_dummy_prompt")):
-            logger.warning("The input processor of the model does not have the method [get_dummy_prompt] implemented." \
-            "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
-            "the image encoder")
+            _msg = (
+                "The input processor of the model does not have the method [get_dummy_prompt] implemented."
+                "Profiling with the default input dummy context request. This may not take into account the memory consumption of "
+                "the image encoder")
+            logger.warning(_msg)
+            _log_to_file(_msg)
             return requests
 
         max_num_tokens = self._max_num_tokens
@@ -384,9 +403,9 @@ class KvCacheCreator:
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
-            logger.info(
-                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
-            )
+            _msg = "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            logger.info(_msg)
+            _log_to_file(_msg)
             estimating_kv_cache = False
         return estimating_kv_cache
 
@@ -409,12 +428,12 @@ class KvCacheCreator:
         end, total_gpu_memory = torch.cuda.mem_get_info()
         total_used_bytes = total_gpu_memory - end
         model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        logger.error(
-            f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
-        )
-        logger.error(
-            f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
-        )
+        _msg = f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+        logger.error(_msg)
+        _log_to_file(_msg)
+        _msg = f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+        logger.error(_msg)
+        _log_to_file(_msg)
 
         if py_executor is not None and not self._skip_est:
             py_executor.set_gather_responses(True)
@@ -468,12 +487,12 @@ class KvCacheCreator:
             activation_bytes = torch_peak_memory - model_bytes
             extra_cost = max(total_used_bytes - torch_used_bytes, 0)
             peak_memory = torch_peak_memory + extra_cost
-            logger.info(
-                f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
-            )
-            logger.info(
-                f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
-            )
+            _msg = f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
+            logger.info(_msg)
+            _log_to_file(_msg)
+            _msg = f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
+            logger.info(_msg)
+            _log_to_file(_msg)
 
         else:
             peak_memory = total_used_bytes
@@ -504,18 +523,20 @@ class KvCacheCreator:
 
                 # raise error if it is VSWA case
                 if is_vswa:
-                    logger.warning(
-                        "max_tokens should not be set for VSWA case as it is ambiguous concept for VSWA."
-                    )
+                    _msg = "max_tokens should not be set for VSWA case as it is ambiguous concept for VSWA."
+                    logger.warning(_msg)
+                    _log_to_file(_msg)
                 # calculate max memory from max_tokens
                 kv_cache_max_memory_from_max_tokens = self._max_kv_tokens_in * self._get_kv_size_per_token(
                 )
                 kv_cache_max_memory = min(kv_cache_max_memory,
                                           kv_cache_max_memory_from_max_tokens)
-                logger.info(
+                _msg = (
                     f"max_tokens={self._max_kv_tokens_in} is provided. It limits max memory to {kv_cache_max_memory_from_max_tokens / (GB):.2f} GiB. "
                     f"New max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
                 )
+                logger.info(_msg)
+                _log_to_file(_msg)
             # For KvCacheManager, its logic still relies on max_tokens to control capacity
             self._kv_cache_config.max_tokens = int(
                 kv_cache_max_memory // self._get_kv_size_per_token())
@@ -526,13 +547,13 @@ class KvCacheCreator:
         if self._kv_cache_config.max_gpu_total_bytes > 0:
             kv_cache_max_memory = min(kv_cache_max_memory,
                                       self._kv_cache_config.max_gpu_total_bytes)
-            logger.info(
-                f"max_gpu_total_bytes={self._kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
-            )
+            _msg = f"max_gpu_total_bytes={self._kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
+            logger.info(_msg)
+            _log_to_file(_msg)
 
-        logger.info(
-            f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
-        )
+        _msg = f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
+        logger.info(_msg)
+        _log_to_file(_msg)
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
         if isinstance(self._profiling_stage_data, dict):
@@ -611,9 +632,9 @@ class KvCacheCreator:
         back to the target model's config via _get_effective_draft_config().
         """
         if self._mapping.enable_attention_dp:
-            logger.info(
-                "Attention DP is enabled, separate draft KV cache is not supported."
-            )
+            _msg = "Attention DP is enabled, separate draft KV cache is not supported."
+            logger.info(_msg)
+            _log_to_file(_msg)
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
@@ -683,9 +704,11 @@ class KvCacheCreator:
                     > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
-                logger.warning(
+                _msg = (
                     "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
                     "Falling back to KVCacheManager for draft model.")
+                logger.warning(_msg)
+                _log_to_file(_msg)
                 draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
@@ -746,10 +769,12 @@ class KvCacheCreator:
         draft_budget = int(total_budget * draft_kv / total_kv)
         target_budget = total_budget - draft_budget
 
-        logger.info(
+        _msg = (
             f"Splitting KV cache budget: total={total_budget / GB:.2f} GiB, "
             f"target={target_budget / GB:.2f} GiB ({target_kv}B/tok), "
             f"draft={draft_budget / GB:.2f} GiB ({draft_kv}B/tok)")
+        logger.info(_msg)
+        _log_to_file(_msg)
 
         self._kv_cache_config.max_gpu_total_bytes = target_budget
 
@@ -837,10 +862,12 @@ def _build_per_layer_num_kv_heads(
         return num_key_value_heads
 
     num_spec_layers = get_num_spec_layers(spec_config)
-    logger.info(f"Per-layer KV heads for speculative decoding: "
-                f"target={num_key_value_heads} x {num_hidden_layers} layers, "
-                f"draft={draft_num_kv_heads} x {num_spec_layers} layers, "
-                f"total={num_hidden_layers + num_spec_layers} layers")
+    _msg = (f"Per-layer KV heads for speculative decoding: "
+            f"target={num_key_value_heads} x {num_hidden_layers} layers, "
+            f"draft={draft_num_kv_heads} x {num_spec_layers} layers, "
+            f"total={num_hidden_layers + num_spec_layers} layers")
+    logger.info(_msg)
+    _log_to_file(_msg)
     return [num_key_value_heads] * num_hidden_layers + [draft_num_kv_heads
                                                         ] * num_spec_layers
 
@@ -1131,9 +1158,9 @@ def create_py_executor_instance(
 
     max_num_sequences = max_batch_size * mapping.pp_size
 
-    logger.info(
-        f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
-    )
+    _msg = f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
+    logger.info(_msg)
+    _log_to_file(_msg)
 
     for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
@@ -1163,9 +1190,9 @@ def create_py_executor_instance(
         num_kv_attention_heads_per_layer = model_binding_config.num_kv_heads_per_layer
         if max(num_kv_attention_heads_per_layer) != min(
                 num_kv_attention_heads_per_layer):
-            logger.warning(
-                "Defining LORA with per-layer KV heads is not supported for LORA, using the max number of KV heads per layer"
-            )
+            _msg = "Defining LORA with per-layer KV heads is not supported for LORA, using the max number of KV heads per layer"
+            logger.warning(_msg)
+            _log_to_file(_msg)
             num_kv_attention_heads = max(num_kv_attention_heads_per_layer)
         else:
             # all layers have the same number of KV heads
@@ -1434,11 +1461,12 @@ def instantiate_sampler(
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if llm_args.sampler_type == SamplerType.TRTLLMSampler:
-        logger.warning(
-            "TRTLLMSampler is deprecated and will be removed in release 1.4. Please use TorchSampler instead."
-        )
-        logger.debug(f"DecodingMode: {decoding_mode.name}")
+    if llm_args.sampler_type == SamplerType.TRTLLMSampler or (
+            llm_args.sampler_type == SamplerType.auto
+            and decoding_mode.isBeamSearch()):
+        _msg = f"DecodingMode: {decoding_mode.name}"
+        logger.debug(_msg)
+        _log_to_file(_msg)
         return TRTLLMSampler(engine.model,
                              engine.dtype,
                              mapping,
@@ -1471,9 +1499,9 @@ def get_decoding_mode(
 
     # Override decoding mode when beam width is one
     if max_beam_width == 1 and decoding_mode.isBeamSearch():
-        logger.warning(
-            "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP."
-        )
+        _msg = "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP."
+        logger.warning(_msg)
+        _log_to_file(_msg)
         decoding_mode = DecodingMode.TopKTopP()
 
     return decoding_mode
@@ -1507,7 +1535,9 @@ def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
                     return tensor.shape[1] if tensor.shape[
                         0] == rank else tensor.shape[0]
     except Exception as e:
-        logger.debug(f"Failed to infer shared expert size from adapter: {e}")
+        _msg = f"Failed to infer shared expert size from adapter: {e}"
+        logger.debug(_msg)
+        _log_to_file(_msg)
     return 0
 
 
@@ -1547,7 +1577,9 @@ def _adjust_torch_mem_fraction():
     # FIXME: PyTorch only uses the garbage_collection_threshold setting
     #        if a memory fraction is set, cf.
     #   https://github.com/pytorch/pytorch/blob/cd995bfb2aac8891465809be3ce29543bd524287/c10/cuda/CUDACachingAllocator.cpp#L1357
-    logger.debug("Setting PyTorch memory fraction to 1.0")
+    _msg = "Setting PyTorch memory fraction to 1.0"
+    logger.debug(_msg)
+    _log_to_file(_msg)
     torch.cuda.set_per_process_memory_fraction(1.0)
 
     # FIXME: As soon as
@@ -1560,9 +1592,11 @@ def _adjust_torch_mem_fraction():
         and "expandable_segments:True" not in torch_allocator_config)
     torch_mem_threshold_set = "garbage_collection_threshold:" in torch_allocator_config
     if torch_mem_threshold_advised and not torch_mem_threshold_set:
-        logger.warning(
+        _msg = (
             "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
             " or 'expandable_segments:True' in PYTORCH_ALLOC_CONF.")
+        logger.warning(_msg)
+        _log_to_file(_msg)
 
     # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
     #       fraction < 1.0 is beneficial, because
@@ -1579,9 +1613,9 @@ def _adjust_torch_mem_fraction():
     safety_margin = 32 * 1024**2
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
-    logger.info(
-        f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
-    )
+    _msg = f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
+    logger.info(_msg)
+    _log_to_file(_msg)
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
 
 
