@@ -331,7 +331,6 @@ def launch_disaggregated_llm(
             for i, (env, args) in enumerate(server_configs):
                 if enable_redirect_log:
                     f = open(f"output_{server_name}_{i}.log", "w+")
-                    env["TLLM_LOG_LEVEL"] = "INFO"
                     proc = popen(args, env=env, stdout=f, stderr=f)
                     log_files.append(f)
                 else:
@@ -359,10 +358,13 @@ def launch_disaggregated_llm(
     with (
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
             temp_dir,
-            multi_popen(ctx_servers, "ctx") as ctx_processes,
-            multi_popen(gen_servers, "gen") as gen_processes,
-            multi_popen([(os.environ, server_cmd)], "disagg") as
-            server_processes,
+            multi_popen(ctx_servers, "ctx",
+                        enable_redirect_log=False) as ctx_processes,
+            multi_popen(gen_servers, "gen", enable_redirect_log=False) as
+            gen_processes,
+            multi_popen([(base_env, server_cmd)],
+                        "disagg",
+                        enable_redirect_log=False) as server_processes,
     ):
         start_time = time.time()
         server_is_ready = False
@@ -1655,6 +1657,70 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.parametrize(
+        "gen_tp_pp", [(1, 1), (1, 2), (2, 1), (2, 2)],
+        ids=["gen_tp1pp1", "gen_tp1pp2", "gen_tp2pp1", "gen_tp2pp2"])
+    @pytest.mark.parametrize(
+        "ctx_tp_pp",
+        [(1, 1), (1, 2), (2, 1), (2, 2), (1, 4)],
+        ids=[
+            "ctx_tp1pp1", "ctx_tp1pp2", "ctx_tp2pp1", "ctx_tp2pp2", "ctx_tp1pp4"
+        ],
+    )
+    def test_gen_first(self, ctx_tp_pp, gen_tp_pp):
+        ctx_tp, ctx_pp = ctx_tp_pp
+        gen_tp, gen_pp = gen_tp_pp
+        total_gpus = ctx_tp * ctx_pp + gen_tp * gen_pp
+        if total_gpus > get_device_count():
+            pytest.skip(f"Not enough devices for {total_gpus} GPUs")
+        transceiver_runtime = "PYTHON"
+        transceiver_backend = "NIXL"
+        kv_cache_config = {
+            "enable_block_reuse": True,
+            "enable_partial_reuse": False,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": ctx_tp,
+            "pipeline_parallel_size": ctx_pp,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": transceiver_backend,
+                "transceiver_runtime": transceiver_runtime,
+            },
+            "kv_cache_config": kv_cache_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": gen_tp,
+            "pipeline_parallel_size": gen_pp,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": transceiver_backend,
+                "transceiver_runtime": transceiver_runtime,
+            },
+            "kv_cache_config": kv_cache_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            },
+            "schedule_style": "generation_first",
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            # MMLU is good enough for such a sanity test
+            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU"])
 
 
 @skip_pre_blackwell

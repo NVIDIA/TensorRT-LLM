@@ -132,6 +132,7 @@ def run_generate(
         "Qwen3/Qwen3-30B-A3B-FP8",
     ],
 )
+@pytest.mark.part0
 def test_llm_update_weights(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
@@ -183,6 +184,7 @@ def test_llm_update_weights(model_dir):
         "Qwen3/Qwen3-30B-A3B-FP8",
     ],
 )
+@pytest.mark.part1
 def test_llm_partial_update_weights(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
@@ -247,6 +249,7 @@ def test_llm_partial_update_weights(model_dir):
         ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B-FP8"),
     ],
 )
+@pytest.mark.part2
 def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
     model_dir = str(llm_models_root() / model_dir)
     fp8_model_dir = str(llm_models_root() / fp8_model_dir)

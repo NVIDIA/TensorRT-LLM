@@ -53,6 +53,10 @@ public:
         kSHARED_EXPERT_H_TO_4H = 19,
         kSHARED_EXPERT_4H_TO_H = 20,
         kSHARED_EXPERT_GATE = 21,
+        kMAMBA_IN_PROJ = 22,
+        kMAMBA_OUT_PROJ = 23,
+        kMOE_LATENT_FC1 = 24,
+        kMOE_LATENT_FC2 = 25,
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
@@ -196,7 +200,8 @@ public:
     static std::vector<LoraModule> createLoraModules(std::vector<std::string> const& loraModuleNames,
         SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
         SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts, SizeType32 sharedExpertHiddenSize = 0,
-        SizeType32 moeHiddenSize = 0);
+        SizeType32 moeHiddenSize = 0, SizeType32 mambaInProjSize = 0, SizeType32 mambaInnerSize = 0,
+        SizeType32 moeLatentSize = 0);
 
     static ModuleType constexpr toModuleType(std::string_view const& name)
     {
@@ -244,6 +249,14 @@ public:
             return ModuleType::kSHARED_EXPERT_4H_TO_H;
         else if (name == "shared_expert_gate")
             return ModuleType::kSHARED_EXPERT_GATE;
+        else if (name == "mamba_in_proj")
+            return ModuleType::kMAMBA_IN_PROJ;
+        else if (name == "mamba_out_proj")
+            return ModuleType::kMAMBA_OUT_PROJ;
+        else if (name == "moe_latent_fc1")
+            return ModuleType::kMOE_LATENT_FC1;
+        else if (name == "moe_latent_fc2")
+            return ModuleType::kMOE_LATENT_FC2;
         else
             return ModuleType::kINVALID;
     }
@@ -274,6 +287,10 @@ public:
         case ModuleType::kSHARED_EXPERT_H_TO_4H: return "shared_expert_h_to_4h";
         case ModuleType::kSHARED_EXPERT_4H_TO_H: return "shared_expert_4h_to_h";
         case ModuleType::kSHARED_EXPERT_GATE: return "shared_expert_gate";
+        case ModuleType::kMAMBA_IN_PROJ: return "mamba_in_proj";
+        case ModuleType::kMAMBA_OUT_PROJ: return "mamba_out_proj";
+        case ModuleType::kMOE_LATENT_FC1: return "moe_latent_fc1";
+        case ModuleType::kMOE_LATENT_FC2: return "moe_latent_fc2";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";

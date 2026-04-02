@@ -357,6 +357,11 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
+    target_sparsity: Optional[Union[float, Dict[str, float]]] = Field(
+        default=None,
+        description="Target sparsity for prefill and/or decode phases. "
+        "Requires formula coefficients in the model's config.json. "
+        "Ignored if threshold_scale_factor is also set.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -372,6 +377,56 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if isinstance(self.threshold_scale_factor, dict):
             return self.threshold_scale_factor.get('decode', None)
         return self.threshold_scale_factor
+
+    @property
+    def target_sparsity_prefill(self) -> Optional[float]:
+        if isinstance(self.target_sparsity, dict):
+            return self.target_sparsity.get('prefill', None)
+        return self.target_sparsity
+
+    @property
+    def target_sparsity_decode(self) -> Optional[float]:
+        if isinstance(self.target_sparsity, dict):
+            return self.target_sparsity.get('decode', None)
+        return self.target_sparsity
+
+    def resolve_for_target_sparsity(
+            self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
+        """
+        Given formula coefficients from HF config.json (dict with 'prefill' and
+        'decode' keys, each containing 'a' and 'b'), compute threshold_scale_factor
+        and return a new SkipSoftmaxAttentionConfig with it set.
+
+        formula example:
+          {"prefill": {"a": 7e-5, "b": 7.929109},
+           "decode":  {"a": 7e-5, "b": 16.9025}}
+
+        If threshold_scale_factor is already set, it takes precedence and
+        this method returns self unchanged.
+        """
+        if self.threshold_scale_factor is not None:
+            return self
+
+        import math
+
+        def _compute(phase: str, sparsity: Optional[float]) -> Optional[float]:
+            if sparsity is None:
+                return None
+            coeffs = formula.get(phase)
+            if not coeffs or 'a' not in coeffs or 'b' not in coeffs:
+                raise ValueError(
+                    f"SkipSoftmaxAttentionConfig: config.json is missing formula "
+                    f"coefficients for phase '{phase}' needed to compute "
+                    f"threshold_scale_factor from target_sparsity.")
+            return coeffs['a'] * math.exp(coeffs['b'] * sparsity)
+
+        return SkipSoftmaxAttentionConfig(
+            algorithm=self.algorithm,
+            target_sparsity=self.target_sparsity,
+            threshold_scale_factor={
+                'prefill': _compute('prefill', self.target_sparsity_prefill),
+                'decode': _compute('decode', self.target_sparsity_decode),
+            })
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -482,8 +537,8 @@ class MoeConfig(StrictBaseModel):
     Configuration for MoE.
     """
     backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
-        "TRITON"] = Field(
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
+        "DENSEGEMM", "VANILLA", "TRITON"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1125,19 +1180,37 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return False
 
 
+class SAEnhancerConfig(StrictBaseModel):
+    """Configuration for the Suffix Automaton (SA) draft enhancer.
+
+    Use this to combine SA pattern-matching drafting with another speculative
+    decoding method (Eagle3, MTP, PARD).  When provided as ``sa_config`` on a
+    decoding config, SA drafting is enabled and may override neural draft
+    tokens when the suffix match length meets the *threshold*.
+
+    For standalone SA speculative decoding (no neural drafter), use
+    :class:`SADecodingConfig` instead.
+    """
+
+    threshold: PositiveInt = Field(
+        default=4,
+        description="Minimum suffix match length required for the SA output "
+        "to override neural draft tokens.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True, each request searches all active SA states "
+        "for the longest match, not just its own. Improves acceptance rates "
+        "when requests share common patterns.")
+
+
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
-    # Suffix Automaton speculative decoding settings
-    use_sa_spec: Optional[bool] = Field(
-        default=False,
+    sa_config: Optional[SAEnhancerConfig] = Field(
+        default=None,
         status="beta",
-        description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: PositiveInt = Field(
-        default=4,
-        description="The threshold for the Suffix Automaton Decoding. If the"
-        " length of the suffix match exceeds the threshold, use"
-        " the suffix automaton output for the next draft tokens.")
+        description="Optional Suffix Automaton configuration. When set, "
+        "combines SA drafting with Eagle3 speculative decoding.")
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -1274,17 +1347,37 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class SADecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+    """Configuration for standalone Suffix Automaton (SA) speculative decoding.
 
-    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
-    the target model forward; supports CUDA graph and overlap scheduler.
+    Uses a GPU-native suffix automaton for pattern matching. Drafting runs
+    inside the target model forward; supports CUDA graph and overlap scheduler.
+
+    To combine SA with a neural drafter (Eagle3, MTP, PARD) instead of using
+    it standalone, pass :class:`SAEnhancerConfig` via ``sa_config``.
     """
     decoding_type: Literal["SA"] = "SA"
     max_matching_ngram_size: int = Field(
         default=-1,
         description="Positive value (e.g., 3): fixed-size ngram matching. "
         "-1: longest possible match via suffix automaton. 0 is invalid.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True, each request searches all active SA states "
+        "for the longest match, not just its own. Improves acceptance rates "
+        "when requests share common patterns. "
+        "Limitations: at most 1024 concurrent slots; suffix matching is "
+        "capped at 64 tokens per request.")
+
+    global_pool_size: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of SA slots in the global pool. "
+        "When None and enable_global_pool=True, defaults to "
+        "max(64, max_batch_size) — a fixed-size pool independent of batch size. "
+        "When set explicitly, must be >= max_batch_size. "
+        "Completed requests' SA states are retained in the pool for "
+        "cross-request search until the pool is full, at which point "
+        "the oldest completed request is evicted. "
+        "Only effective when enable_global_pool=True.")
 
     @model_validator(mode='after')
     def validate_sa_config(self):
@@ -1292,8 +1385,20 @@ class SADecodingConfig(DecodingBaseConfig):
             raise ValueError(
                 "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
                 "Got 0.")
+        if self.enable_global_pool and self.max_matching_ngram_size != -1 and not (
+                1 <= self.max_matching_ngram_size <= 64):
+            raise ValueError(
+                "max_matching_ngram_size must be -1 (longest match) or in [1, 64] "
+                "when enable_global_pool is True. "
+                f"Got {self.max_matching_ngram_size}.")
         if self.max_draft_len is None or self.max_draft_len <= 0:
             raise ValueError("max_draft_len must be > 0 for SA")
+        if self.global_pool_size is not None:
+            if self.global_pool_size < 1:
+                raise ValueError("global_pool_size must be >= 1")
+            if not self.enable_global_pool:
+                raise ValueError(
+                    "global_pool_size requires enable_global_pool=True")
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
@@ -1360,16 +1465,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
 
-    # Suffix Automaton speculative decoding settings
-    use_sa_spec: Optional[bool] = Field(
-        default=False,
+    sa_config: Optional[SAEnhancerConfig] = Field(
+        default=None,
         status="beta",
-        description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: PositiveInt = Field(
-        default=4,
-        description="The threshold for the Suffix Automaton Decoding. If the"
-        " length of the suffix match exceeds the threshold, use"
-        " the suffix automaton output for the next draft tokens.")
+        description="Optional Suffix Automaton configuration. When set, "
+        "combines SA drafting with MTP speculative decoding.")
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -1407,7 +1507,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend in ("pytorch", "_autodeploy")
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
@@ -1449,16 +1549,11 @@ class PARDDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["PARD"] = "PARD"
 
-    # Suffix Automaton speculative decoding settings
-    use_sa_spec: Optional[bool] = Field(
-        default=False,
+    sa_config: Optional[SAEnhancerConfig] = Field(
+        default=None,
         status="beta",
-        description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: PositiveInt = Field(
-        default=4,
-        description="The threshold for the Suffix Automaton Decoding. If the"
-        " length of the suffix match exceeds the threshold, use"
-        " the suffix automaton output for the next draft tokens.")
+        description="Optional Suffix Automaton configuration. When set, "
+        "combines SA drafting with PARD speculative decoding.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -1860,6 +1955,7 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     ''' Context chunking policy. '''
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
+    FORCE_CHUNK = "FORCE_CHUNK"
 
     def _to_pybind(self):
         return getattr(_ContextChunkingPolicy, self.value)
@@ -2384,6 +2480,30 @@ class _ModelWrapper:
     @property
     def model_name(self) -> Union[str, Path]:
         return self.model if isinstance(self.model, str) else None
+
+
+class DwdpConfig(StrictBaseModel):
+    """Configuration for Distributed Weight Data Parallelism (DWDP).
+
+    DWDP accelerates the context (prefill) phase of disaggregated MoE serving
+    by combining data parallelism with NVLink-based expert weight sharing.
+    Each worker holds a subset of experts locally and asynchronously prefetches
+    the remaining experts from peer workers via CUDA IPC, enabling fully
+    asynchronous execution across ranks without synchronization barriers.
+
+    Currently supported with the CuteDSL MoE backend and NVFP4 quantization
+    on NVLink-connected multi-GPU systems.
+    """
+    dwdp_size: int = Field(default=1,
+                           description="The number of GPUs per DWDP group.")
+    num_groups: int = Field(
+        default=1,
+        description=
+        "The number of DWDP groups. Total workers = num_groups * dwdp_size.")
+    num_experts_per_worker: int = Field(
+        default=0, description="The number of experts per worker.")
+    num_prefetch_experts: int = Field(
+        default=0, description="The number of prefetch experts per worker.")
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -3274,6 +3394,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="NVFP4 GEMM backend config.",
         status="beta")
 
+    dwdp_config: Optional[DwdpConfig] = Field(
+        default=None,
+        description="DWDP (Distributed Weight Data Parallelism) config.",
+        status="prototype")
+
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",
                               status="beta")
@@ -3281,8 +3406,12 @@ class TorchLlmArgs(BaseLlmArgs):
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
         description=
-        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
-        status="beta")
+        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. "
+        "TRTLLMSampler is deprecated and will be removed in release 1.4.",
+        status="deprecated",
+        deprecated=
+        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler."
+    )
 
     sampler_force_async_worker: bool = Field(
         default=False,
@@ -3555,6 +3684,14 @@ class TorchLlmArgs(BaseLlmArgs):
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
+            if isinstance(self.speculative_config, SADecodingConfig):
+                pool_size = self.speculative_config.global_pool_size
+                if pool_size is not None and self.max_batch_size is not None:
+                    if pool_size < self.max_batch_size:
+                        raise ValueError(
+                            f"global_pool_size ({pool_size}) must be >= "
+                            f"max_batch_size ({self.max_batch_size})")
+
             if isinstance(self.speculative_config,
                           SaveHiddenStatesDecodingConfig):
                 logger.warning(
@@ -3744,6 +3881,7 @@ def update_llm_args_with_extra_dict(
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
         "kv_cache_config": KvCacheConfig,
+        "dwdp_config": DwdpConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

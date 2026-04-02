@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.region import DataRole, MemRegionGroup, SpecRegion
@@ -89,7 +90,7 @@ def test_extract():
     )
 
     extractor = KVRegionExtractorV1(manager)
-    region_ids = [0, 1]
+    region_ids = np.array([0, 1], dtype=np.int64)
     spec_region = extractor.extract(region_ids)
 
     assert isinstance(spec_region, SpecRegion)
@@ -108,9 +109,10 @@ def test_extract():
         pool_base_ptr = (
             int(pool_ptrs.data_ptr()) if hasattr(pool_ptrs, "data_ptr") else int(pool_ptrs)
         )
+    assert isinstance(memory.ptrs, np.ndarray)
     expected_block_bytes = memory.bytes_per_region
     expected_ptrs = [pool_base_ptr + block_id * expected_block_bytes for block_id in region_ids]
-    assert list(memory.ptrs) == expected_ptrs
+    np.testing.assert_array_equal(memory.ptrs, expected_ptrs)
 
     manager.shutdown()
 
