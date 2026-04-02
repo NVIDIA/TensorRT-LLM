@@ -35,7 +35,7 @@ This leads to the key design question behind DWDP: can we remove collective sync
 
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="700">
+  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Synchronization overhead caused by workload imbalance in DEP for DeepSeek-R1 on GB200 with <code>ISL/OSL = 8K/1K</code> and input ratio <code>0.8</code>.</em></sub></p>
@@ -56,7 +56,7 @@ DWDP also provides greater flexibility in expert placement. Because each rank on
 
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="900">
+  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Overview of DWDP with DWDP group size 4.</em></sub></p>
@@ -138,7 +138,7 @@ Each DWDP-enabled MoE layer registers a `DwdpLayerHandleCollector`. During model
 
 <div align="center">
 <figure>
-  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="850">
+  <img src="https://raw.githubusercontent.com/wanqian-nv/TensorRT-LLM/user/serli/dwdp_tech_blog/docs/source/blogs/media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
 </figure>
 </div>
 
