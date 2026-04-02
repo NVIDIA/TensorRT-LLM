@@ -53,10 +53,13 @@ def create_llm(model_dir,
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
 @pytest.mark.parametrize("use_python_scheduler", [False, True],
                          ids=["cpp_scheduler", "python_scheduler"])
+@pytest.mark.parametrize("enable_block_reuse", [False, True],
+                         ids=["no_reuse", "block_reuse"])
 @pytest.mark.high_cuda_memory
 @pytest.mark.mpi_ray_parity
 def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
-                                       use_python_scheduler):
+                                       use_python_scheduler,
+                                       enable_block_reuse):
     scheduler_config = SchedulerConfig(
         use_python_scheduler=use_python_scheduler)
 
@@ -78,7 +81,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     with create_llm(model_path,
                     disable_overlap_scheduler=False,
                     sampler_type=sampler_type,
-                    scheduler_config=scheduler_config) as llm:
+                    scheduler_config=scheduler_config,
+                    enable_block_reuse=enable_block_reuse) as llm:
         outputs_with_overlap = llm.generate(prompts,
                                             sampling_params=sampling_config,
                                             use_tqdm=True)
@@ -90,7 +94,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     with create_llm(model_path,
                     disable_overlap_scheduler=True,
                     sampler_type=sampler_type,
-                    scheduler_config=scheduler_config) as llm:
+                    scheduler_config=scheduler_config,
+                    enable_block_reuse=enable_block_reuse) as llm:
         outputs_without_overlap = llm.generate(prompts,
                                                sampling_params=sampling_config,
                                                use_tqdm=True)
@@ -99,61 +104,6 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
         ] for request_output in outputs_without_overlap]
 
     # Verify outputs are consistent
-    for with_overlap, without_overlap in zip(texts_with_overlap,
-                                             texts_without_overlap,
-                                             strict=True):
-        assert with_overlap == without_overlap
-
-
-@pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
-@pytest.mark.parametrize("use_python_scheduler", [False, True],
-                         ids=["cpp_scheduler", "python_scheduler"])
-@pytest.mark.high_cuda_memory
-@pytest.mark.mpi_ray_parity
-def test_overlap_scheduler_with_block_reuse(model_path, test_case, sampler_type,
-                                            use_python_scheduler):
-    """Verify that overlap scheduler with block_reuse produces the same
-    results as without overlap scheduler (with block_reuse enabled in both)."""
-    scheduler_config = SchedulerConfig(
-        use_python_scheduler=use_python_scheduler)
-
-    prompts = test_case["prompts"]
-    max_new_tokens = test_case["max_new_tokens"]
-    temperature = test_case["temperature"]
-    top_p = test_case["top_p"]
-    stop_words = test_case["stop_words"]
-
-    sampling_config = SamplingParams(max_tokens=max_new_tokens,
-                                     stop=stop_words,
-                                     temperature=temperature,
-                                     top_p=top_p,
-                                     n=1,
-                                     use_beam_search=True)
-
-    with create_llm(model_path,
-                    disable_overlap_scheduler=False,
-                    sampler_type=sampler_type,
-                    scheduler_config=scheduler_config,
-                    enable_block_reuse=True) as llm:
-        outputs_with_overlap = llm.generate(prompts,
-                                            sampling_params=sampling_config,
-                                            use_tqdm=True)
-        texts_with_overlap = [[
-            completion.text for completion in request_output.outputs
-        ] for request_output in outputs_with_overlap]
-
-    with create_llm(model_path,
-                    disable_overlap_scheduler=True,
-                    sampler_type=sampler_type,
-                    scheduler_config=scheduler_config,
-                    enable_block_reuse=True) as llm:
-        outputs_without_overlap = llm.generate(prompts,
-                                               sampling_params=sampling_config,
-                                               use_tqdm=True)
-        texts_without_overlap = [[
-            completion.text for completion in request_output.outputs
-        ] for request_output in outputs_without_overlap]
-
     for with_overlap, without_overlap in zip(texts_with_overlap,
                                              texts_without_overlap,
                                              strict=True):
