@@ -2764,13 +2764,11 @@ class PyExecutor:
             reusable_in_chunk = max(0,
                                     reusable - ctx_req.context_current_position)
             remaining = ctx_req.context_remaining_length
-            if (reusable_in_chunk > 0
-                    and reusable_in_chunk + ctx_req.context_chunk_size
-                    < remaining):
+            if (reusable_in_chunk > 0 and
+                    reusable_in_chunk + ctx_req.context_chunk_size < remaining):
                 compute = ctx_req.context_chunk_size
             else:
-                compute = max(1,
-                              ctx_req.context_chunk_size - reusable_in_chunk)
+                compute = max(1, ctx_req.context_chunk_size - reusable_in_chunk)
             num_scheduled_ctx_tokens += compute
         num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
                                        for gen_req in generation_requests)
@@ -2788,8 +2786,8 @@ class PyExecutor:
         if self.dist.rank != 0:
             return
 
-        num_scheduled_gen_tokens = sum(
-            1 + gen_req.num_draft_tokens for gen_req in generation_requests)
+        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
+                                       for gen_req in generation_requests)
         num_scheduled_ctx_formula = num_scheduled_tokens - num_scheduled_gen_tokens
 
         chunk_ctx_sum = 0
@@ -2817,8 +2815,7 @@ class PyExecutor:
                     f"reusable={reusable} formula_contrib={formula_contrib}")
         n_ctx = len(context_requests)
         if n_ctx > max_detail:
-            ctx_summaries.append(
-                f"... +{n_ctx - max_detail} more ctx req(s)")
+            ctx_summaries.append(f"... +{n_ctx - max_detail} more ctx req(s)")
 
         logger.info(
             "batch_wait: formula_total=",
@@ -2862,8 +2859,7 @@ class PyExecutor:
         self._maybe_log_batch_wait_decision(context_requests,
                                             generation_requests,
                                             num_scheduled_tokens,
-                                            wait_threshold,
-                                            should_waiting)
+                                            wait_threshold, should_waiting)
         if should_waiting:
             self.batch_wait_iters_count += 1
             return []

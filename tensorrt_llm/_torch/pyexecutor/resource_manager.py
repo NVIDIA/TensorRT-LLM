@@ -625,8 +625,8 @@ class KVCacheManager(BaseResourceManager):
             remaining_budget = None
             if self.enable_block_reuse and not self.is_draft:
                 gen_tokens = sum(
-                    req.get_beam_width_by_iter(for_next_iteration=False)
-                    + get_draft_token_length(req)
+                    req.get_beam_width_by_iter(for_next_iteration=False) +
+                    get_draft_token_length(req)
                     for req in scheduled_batch.generation_requests)
                 remaining_budget = self.max_num_tokens - gen_tokens
 
@@ -652,8 +652,8 @@ class KVCacheManager(BaseResourceManager):
                             unique_tokens = req.get_unique_tokens(0)
                             reusable_blocks = self.impl.count_reusable_blocks(
                                 unique_tokens, req, False)
-                            actual_reuse = (reusable_blocks
-                                            * self.tokens_per_block)
+                            actual_reuse = (reusable_blocks *
+                                            self.tokens_per_block)
                             req_compute = self._estimate_post_reuse_compute(
                                 actual_reuse, req.context_chunk_size,
                                 req.prompt_len)
@@ -669,9 +669,9 @@ class KVCacheManager(BaseResourceManager):
                             remaining_budget -= req_compute
 
                         try:
-                            self.impl.add_sequence(
-                                req.py_request_id, req.prompt_len,
-                                req_beam_width, req)
+                            self.impl.add_sequence(req.py_request_id,
+                                                   req.prompt_len,
+                                                   req_beam_width, req)
                         except RuntimeError:
                             logger.warning(
                                 f"add_sequence: req "
@@ -692,8 +692,7 @@ class KVCacheManager(BaseResourceManager):
                         reusable = (req.estimated_reusable_tokens
                                     if req.is_first_context_chunk else 0)
                         remaining_budget -= self._estimate_post_reuse_compute(
-                            reusable, req.context_chunk_size,
-                            req.prompt_len)
+                            reusable, req.context_chunk_size, req.prompt_len)
 
                 accepted_ctx_requests.append(req)
 
@@ -723,8 +722,7 @@ class KVCacheManager(BaseResourceManager):
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
 
-    def _estimate_post_reuse_compute(self, reuse_tokens: int,
-                                     chunk_size: int,
+    def _estimate_post_reuse_compute(self, reuse_tokens: int, chunk_size: int,
                                      prompt_len: int) -> int:
         """Estimate forward compute tokens after setPrepopulatedPromptLen.
 
@@ -735,8 +733,8 @@ class KVCacheManager(BaseResourceManager):
         P = reuse_tokens
         if P > 0 and P < prompt_len:
             if P + chunk_size < prompt_len:
-                aligned_end = ((P + chunk_size) // self.tokens_per_block
-                               * self.tokens_per_block)
+                aligned_end = ((P + chunk_size) // self.tokens_per_block *
+                               self.tokens_per_block)
                 return max(1, aligned_end - P)
             return max(1, prompt_len - P)
         return chunk_size

@@ -146,9 +146,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
             // Compute-aware budget accounting for setPrepopulatedPromptLen's
             // chunk-shift behaviour (non-last chunks keep their full size).
             SizeType32 const contextRemaining = llmReq->getContextRemainingLength();
-            SizeType32 const reusable = llmReq->isFirstContextChunk()
-                ? std::min(llmReq->getEstimatedReusableTokens(), contextRemaining)
-                : 0;
+            SizeType32 const reusable
+                = llmReq->isFirstContextChunk() ? std::min(llmReq->getEstimatedReusableTokens(), contextRemaining) : 0;
             SizeType32 const pastCompute = reuse_adjusted_compute(pastChunkSize, reusable, contextRemaining);
             SizeType32 const actualCompute = reuse_adjusted_compute(actualChunkSize, reusable, contextRemaining);
             SizeType32 const computeIncrement = actualCompute - pastCompute;
@@ -209,8 +208,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
         }
         if (maxContextLength)
         {
-            SizeType32 const actualCompute
-                = reuse_adjusted_compute(actualChunkSize, reusable, suggestedChunkSize);
+            SizeType32 const actualCompute = reuse_adjusted_compute(actualChunkSize, reusable, suggestedChunkSize);
             if (actualCompute > maxContextLength.value())
             {
                 actualChunkSize = maxContextLength.value();
@@ -224,8 +222,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
         llmReq->setContextChunkSize(actualChunkSize);
         if (ctxTokensCapacity)
         {
-            SizeType32 const modelCost
-                = reuse_adjusted_compute(actualChunkSize, reusable, suggestedChunkSize);
+            SizeType32 const modelCost = reuse_adjusted_compute(actualChunkSize, reusable, suggestedChunkSize);
             ctxTokensCapacity = ctxTokensCapacity.value() - modelCost;
         }
     }
@@ -324,8 +321,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
             {
                 constexpr SizeType32 beam{0};
                 SizeType32 const contextTokens = llmReq->getNumTokens(beam);
-                SizeType32 const draftTokens
-                    = llmReq->hasDraftTokens() ? llmReq->getNumDraftTokens() : 0;
+                SizeType32 const draftTokens = llmReq->hasDraftTokens() ? llmReq->getNumDraftTokens() : 0;
                 reqNumTokens = contextTokens + draftTokens;
                 SizeType32 const contextCompute
                     = reuse_adjusted_compute(contextTokens, reusable, llmReq->getContextRemainingLength());
