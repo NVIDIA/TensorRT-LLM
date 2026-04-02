@@ -5,6 +5,8 @@ auto_deploy custom ops for export compatibility. Qwen3-Next is a hybrid model
 with linear attention (GatedDeltaNet) and full attention layers, plus MoE.
 """
 
+from functools import lru_cache
+
 import pytest
 import torch
 from _model_test_utils import assert_rmse_close
@@ -191,8 +193,9 @@ def _convert_hf_full_model_state_dict(hf_state_dict: dict, config) -> dict:
     return dict(hf_state_dict)
 
 
-def _load_qwen3_next_gdn_layer():
-    """Build a tiny HF Qwen3Next model and extract its GDN block."""
+@lru_cache(maxsize=1)
+def _get_qwen3_next_gdn_state():
+    """Build and cache a tiny HF Qwen3Next GDN block state."""
     config = AutoConfig.for_model("qwen3_next")
     config.num_hidden_layers = 1
     config.use_cache = False
@@ -223,6 +226,19 @@ def _load_qwen3_next_gdn_layer():
     assert isinstance(module, HFQwen3NextGatedDeltaNet), (
         f"Expected HF Qwen3NextGatedDeltaNet, got {type(module)}"
     )
+
+    state_dict = {
+        name: tensor.detach().cpu().clone() for name, tensor in module.state_dict().items()
+    }
+    return config, state_dict
+
+
+def _load_qwen3_next_gdn_layer():
+    """Build a tiny HF Qwen3Next GDN block from cached HF weights."""
+    config, state_dict = _get_qwen3_next_gdn_state()
+    module = HFQwen3NextGatedDeltaNet(config, layer_idx=0)
+    module.load_state_dict(state_dict)
+    module.eval()
     return module, config
 
 
