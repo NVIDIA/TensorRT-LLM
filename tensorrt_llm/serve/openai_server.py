@@ -447,16 +447,16 @@ class OpenAIServer:
                 speculative_config["spec_draft_model"] = str(draft_model)
 
         # KV cache config
-        kv_cache_cfg = getattr(args, "kv_cache_config", None)
+        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
         kv_cache_config = None
-        if kv_cache_cfg is not None:
+        if kv_cache_config_obj is not None:
             kv_cache_config = {}
             for field in ("page_size", "enable_block_reuse",
                           "enable_partial_reuse", "free_gpu_memory_fraction"):
-                val = getattr(kv_cache_cfg, field, None)
+                val = getattr(kv_cache_config_obj, field, None)
                 if val is not None:
                     kv_cache_config[field] = str(val)
-            kv_dtype = getattr(kv_cache_cfg, "dtype", None)
+            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
             if kv_dtype is not None:
                 kv_cache_config["cache_dtype"] = str(kv_dtype)
 
