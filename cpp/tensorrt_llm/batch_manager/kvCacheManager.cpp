@@ -1499,12 +1499,18 @@ void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
 void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
 {
     auto const minTokensForBlockDetach = mWindowSize + mTokensPerBlock;
-    while (
-        sequence.getNumTokens() - sequence.getNumFrontBlocksRemoved() * getTokensPerBlock() >= minTokensForBlockDetach)
+    while (mIsSWA
+        && sequence.getNumTokens() - sequence.getNumFrontBlocksRemoved() * getTokensPerBlock()
+            >= minTokensForBlockDetach)
     {
-        // Detaching block for SWA is non-trivial due to the radix tree structure.
-        // For now, when reuse is enabled, we do not detach blocks for SWA.
-        TLLM_CHECK_WITH_INFO(mIsSWA, "A block only go out-of-window in SWA");
+        if (sequence.getBeamWidth() > 1)
+        {
+            TLLM_LOG_WARNING(
+                "[kv cache manager] Skipping front block detachment for SWA with beamWidth > 1 (beamWidth=%d). "
+                "Block detachment is not supported for beam search.",
+                sequence.getBeamWidth());
+            break;
+        }
         detachFrontBlock(sequence);
     }
 
