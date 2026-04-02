@@ -379,9 +379,10 @@ def _make_metadata(
 def _run_forward(
     mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices=None
 ):
-    """Run forward_context_dsa on cloned inputs and return the output tensor."""
+    """Run sparse context dispatch on cloned inputs and return the output tensor."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
-    mla.forward_context_dsa(
+    mla.sparse_method.dispatch_context(
+        mla,
         q=q.clone(),
         compressed_kv=compressed_kv.clone(),
         k_pe=k_pe.clone(),
@@ -658,10 +659,12 @@ def test_chunked_context_rejects_when_kv_exceeds_threshold():
     pos_c2 = torch.arange(cached_per_seq[0], total_per_seq[0], device=device, dtype=torch.int32)
 
     # max_ctx_kv_len (96) > threshold (80) -> short MHA should NOT be used.
-    assert not mla._should_use_short_mha(meta_c2, pos_c2)
+    from tensorrt_llm._torch.attention_backend.sparse.dsa_method import _should_use_short_mha
+
+    assert not _should_use_short_mha(mla, meta_c2, pos_c2)
 
     # With threshold large enough for the full KV -> short MHA IS used.
     mla.short_seq_mha_threshold = total_per_seq[0] + 100
-    assert mla._should_use_short_mha(meta_c2, pos_c2)
+    assert _should_use_short_mha(mla, meta_c2, pos_c2)
 
     kv_mgr.shutdown()

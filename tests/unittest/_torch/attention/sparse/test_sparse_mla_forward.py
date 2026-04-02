@@ -690,7 +690,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
         # Transform context indices from local to global
         ctx_topk_local = topk_indices_local[:num_ctx_tokens]
 
-        mla.forward_context_dsa(
+        mla.sparse_method.dispatch_context(
+            mla,
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
             k_pe=k_pe[:num_ctx_tokens],
@@ -698,6 +699,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             output=output[:num_ctx_tokens],
             latent_cache=latent_cache[:num_ctx_tokens],
             topk_indices=ctx_topk_local,  # Use global indices
+            position_ids=None,
         )
         print(
             f"  ✓ Context forward: {num_ctx_tokens} tokens from {num_contexts} requests"
@@ -708,7 +710,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
         num_gen_tokens = sum(query_lens[i] for i in gen_indices)
         gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens]
-        mla.forward_generation_dsa(
+        mla.sparse_method.dispatch_generation(
+            mla,
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
             k_pe=k_pe[num_ctx_tokens:],

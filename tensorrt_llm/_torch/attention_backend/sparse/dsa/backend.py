@@ -82,24 +82,6 @@ class DSATrtllmAttention(TrtllmAttention):
             return None
         return self.indexer.forward(qr, hidden_states, metadata, position_ids)
 
-    def predict_sparse_indices(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Optional[torch.Tensor]:
-        """Run the DSA indexer to predict sparse attention indices.
-
-        Requires ``qr`` (compressed query before q_b_proj), ``hidden_states``,
-        and ``position_ids`` in kwargs.  Returns topk_indices shaped
-        ``[num_tokens, index_topk]``.
-        """
-        qr = kwargs.get('qr')
-        hidden_states = kwargs.get('hidden_states')
-        position_ids = kwargs.get('position_ids')
-        if qr is None or hidden_states is None or position_ids is None:
-            return None
-        return self.indexer.forward(qr, hidden_states, metadata, position_ids)
-
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
