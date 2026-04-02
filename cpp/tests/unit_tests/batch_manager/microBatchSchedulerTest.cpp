@@ -1189,8 +1189,9 @@ protected:
 
         return std::make_shared<kv_cache_manager::KVCacheManager>(
             /*numLayers=*/10, /*nbKvHeads=*/10, /*sizePerHead=*/1, tokensPerBlock, blocksPerWindow, maxNumRequests,
-            /*maxBeamWidth=*/1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, nvinfer1::DataType::kHALF,
-            /*sinkTokenLength=*/0, stream, maxNumTokensPerSeq, enableReuse, /*onboardBlocks=*/true);
+            /*maxBeamWidth=*/1, std::vector<SizeType32>{maxNumTokensPerSeq}, nvinfer1::DataType::kHALF,
+            /*sinkTokenLength=*/0, stream, maxNumTokensPerSeq, /*chunkSize=*/maxNumTokensPerSeq, enableReuse,
+            /*onboardBlocks=*/true);
     }
 
     static std::shared_ptr<LlmRequest> createRequestWithTokens(
