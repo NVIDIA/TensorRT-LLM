@@ -286,7 +286,7 @@ public:
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
-            && options.mDtypeKv != tg::Dtype::E2m1;
+            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64;
         if (shouldUseNvrtc)
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
