@@ -27,16 +27,14 @@ def gather_tokens(
     """Gather hidden states using token_gather_indices before LM head.
 
     Args:
-        hidden_states: Hidden states tensor of shape [batch_size, 1, *other_dims] or
-            [1, total_token_length, *other_dims]
+        hidden_states: Hidden states tensor of shape [batch_size, 1, *other_dims],
+            [1, total_token_length, *other_dims], or [batch_size, seq_len, *other_dims].
         token_gather_indices: indices for gathering logits.
         batch_info_host: BatchInfo tensor containing tokens_gather_info.
     Returns:
         Gathered and flattened hidden states [num_gathered_tokens, hidden]
     """
-    # final shape is [total_tokens, *other_dims]
     bsz, sl, *other_dims = hidden_states.shape
-    assert bsz == 1 or sl == 1, "expected batch size or sequence length to be 1"
     hidden_states = hidden_states.view(bsz * sl, *other_dims)
 
     batch_info = BatchInfo(batch_info_host)
@@ -49,10 +47,12 @@ def gather_tokens(
     else:
         out = hidden_states.clone(memory_format=torch.contiguous_format)
         num_tokens_final = bsz * sl
-    if bsz == 1:
-        return out.view(1, num_tokens_final, *other_dims)
-    else:
+    # Generate-only batches use [batch, 1, ...] and need to preserve batch-major layout for the
+    # downstream squeeze. Any shape with seq_len > 1 is treated as a flattened token batch.
+    if sl == 1 and bsz > 1:
         return out.view(num_tokens_final, 1, *other_dims)
+    else:
+        return out.view(1, num_tokens_final, *other_dims)
 
 
 @gather_tokens.register_fake
