@@ -37,7 +37,7 @@ def test_ad_guided_decoding_regex_e2e():
     experiment_config["args"]["guided_decoding_backend"] = guided_decoding_backend
 
     experiment_config["prompt"]["batch_size"] = 1
-    experiment_config["prompt"]["queries"] = {"prompt": test_case["prompt"]}
+    experiment_config["prompt"]["queries"] = test_case["prompt"]
 
     cfg = ExperimentConfig(**experiment_config)
 
