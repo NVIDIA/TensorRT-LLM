@@ -41,6 +41,34 @@ class SparseAttentionMethod(Protocol):
     without owning them.
     """
 
+    def predict_sparse_indices(
+        self,
+        mla: MLA,
+        attn_metadata: AttentionMetadata,
+        hidden_states: torch.Tensor,
+        qr: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Predict sparse attention indices for the current batch.
+
+        Called from MLA.forward_impl() to determine which KV blocks each
+        token should attend to.  Delegates to the trtllm attention backend's
+        predict_sparse_indices() so all trtllm-based sparse methods share
+        the same prediction interface.
+
+        Args:
+            mla: The MLA module instance.
+            attn_metadata: Attention metadata for the current batch.
+            hidden_states: Pre-attention hidden states.
+            qr: Compressed query before q_b_proj (needed by DSA indexer).
+            position_ids: Token position IDs.
+
+        Returns:
+            Optional topk index tensor ``[num_tokens, topk]``, or None
+            when sparse routing is not applicable.
+        """
+        ...
+
     def dispatch_context(
         self,
         mla: MLA,

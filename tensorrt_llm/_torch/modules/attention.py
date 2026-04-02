@@ -8,8 +8,7 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
-                                 nvtx_range_debug)
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1497,7 +1496,7 @@ class MLA(nn.Module):
         """
         Unified forward pass for the MLA module. Writes result into output
         tensor in-place. Handles both standard MLA and DSA sparse attention
-        via the backend's predict_sparse_indices() hook.
+        via the sparse_method's predict_sparse_indices() hook.
 
         Args:
             position_ids (Optional[torch.IntTensor]): The position IDs.
@@ -1546,14 +1545,12 @@ class MLA(nn.Module):
             self.aux_stream,
         )
 
-        # Ask the attention backend to predict sparse indices (no-op for
-        # non-DSA backends, runs the indexer for DSA).
-        topk_indices = self.mqa.predict_sparse_indices(
-            attn_metadata,
-            qr=qr,
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-        )
+        # Ask the sparse method to predict sparse indices.  Non-sparse MLA
+        # skips this entirely (topk_indices stays None).
+        topk_indices = None
+        if self.sparse_method is not None:
+            topk_indices = self.sparse_method.predict_sparse_indices(
+                self, attn_metadata, hidden_states, qr, position_ids)
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"

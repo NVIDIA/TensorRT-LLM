@@ -199,6 +199,27 @@ class DSASparseMethod:
     def __init__(self, short_seq_mha_threshold: int = 0):
         self.short_seq_mha_threshold = short_seq_mha_threshold
 
+    def predict_sparse_indices(
+        self,
+        mla: MLA,
+        attn_metadata: AttentionMetadata,
+        hidden_states: torch.Tensor,
+        qr: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Predict sparse indices by delegating to the trtllm backend.
+
+        Forwards ``qr`` (compressed query before q_b_proj), ``hidden_states``,
+        and ``position_ids`` to DSATrtllmAttention.predict_sparse_indices()
+        which runs the DSA indexer.
+        """
+        return mla.mqa.predict_sparse_indices(
+            attn_metadata,
+            qr=qr,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+        )
+
     def dispatch_context(
         self,
         mla: MLA,
