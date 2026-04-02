@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -243,6 +243,11 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // SageAttention scaling factors for Q, K, P and V.
+    float const* sageAttnSfsQPtr = nullptr;
+    float const* sageAttnSfsKPtr = nullptr;
+    float const* sageAttnSfsPPtr = nullptr;
+    float const* sageAttnSfsVPtr = nullptr;
     // The sequence lengths for Q.
     int const* seqlensQPtr;
 
@@ -278,6 +283,11 @@ struct TllmGenFmhaRunnerParams
     int mNumPagesInMemPool;
     // The number of multiProcessor for the GPU.
     int mMultiProcessorCount;
+    // Number of elements per SageAttention block must be power of 2. Only used when sageAttnSfs?Ptr != nullptr.
+    int mLogNumEltsPerSageAttnBlkQ = 0;
+    int mLogNumEltsPerSageAttnBlkK = 0;
+    int mLogNumEltsPerSageAttnBlkP = 0;
+    int mLogNumEltsPerSageAttnBlkV = 0;
     // Scaling factor for Q.
     float mScaleQ;
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight

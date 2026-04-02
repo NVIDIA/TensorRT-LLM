@@ -86,6 +86,8 @@ class Attention(nn.Module):
 
         self._init_qkv_proj()
 
+        attention_metadata_state = getattr(config, "attention_metadata_state", None)
+
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
             # "per_head": norm over each head independently (e.g. FLUX, dim=head_dim)
@@ -132,6 +134,8 @@ class Attention(nn.Module):
             num_kv_heads=backend_num_kv_heads,
             quant_config=self.quant_config,
             dtype=self.dtype,
+            attention_config=config.attention,
+            attention_metadata_state=attention_metadata_state,
         )
 
         # Wrap with parallelism strategy (orthogonal to backend choice)

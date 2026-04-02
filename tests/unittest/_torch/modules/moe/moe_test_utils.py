@@ -45,6 +45,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     TRTLLMGenFusedMoE,
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -62,6 +63,7 @@ class MoeBackendType(str, Enum):
     TRTLLM = "TRTLLM"
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
+    DENSEGEMM = "DENSEGEMM"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -71,6 +73,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
+        MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -533,6 +536,82 @@ def should_skip_deepgemm(
     return None
 
 
+def should_skip_densegemm(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    model_config: "MoeModelConfig" = None,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Check DenseGEMM backend specific constraints.
+
+    DenseGEMM reshapes all expert weights into a single dense matrix and performs
+    a single large GEMM. It only supports NVFP4 quantization on Blackwell (SM 100/103).
+
+    Constraints:
+    - Only NVFP4 quantization
+    - hidden_size and intermediate_size must be 128-aligned (NVFP4 requirement)
+    - intermediate_size must be 256-aligned (MMA tile K boundary)
+    - DenseGEMM supports TP (DTP/TTP) but not EP (DEP/TEP) since all experts
+      must reside on a single GPU for the dense matrix formulation.
+
+    Returns:
+        Skip reason string if test should be skipped, None otherwise
+    """
+    if backend_type != MoeBackendType.DENSEGEMM:
+        return None
+
+    # DenseGEMM only supports NVFP4
+    if quant_algo != QuantAlgo.NVFP4:
+        return f"DenseGEMMFusedMoE only supports NVFP4 quantization (got quant_algo={quant_algo})"
+
+    # DenseGEMM does not support EP modes (DEP/TEP). All experts must reside
+    # on the same GPU for the dense matrix formulation. TP modes (DTP/TTP) are
+    # supported since they shard intermediate_size, not experts.
+    if parallel_mode in ("DEP", "TEP"):
+        return (
+            f"DenseGEMMFusedMoE does not support expert parallelism "
+            f"(got parallel_mode={parallel_mode}). All experts must reside on a single GPU."
+        )
+
+    # DenseGEMM does not support DeepEP communication.
+    if comm_method in ("DEEPEP", "DEEPEPLOWLATENCY"):
+        return (
+            f"DenseGEMMFusedMoE does not support EP communication (got comm_method={comm_method})."
+        )
+
+    if model_config is not None:
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+
+        # In TP mode, intermediate_size is sharded across moe_tp_size GPUs
+        sharded_intermediate = intermediate_size // moe_tp_size
+
+        # 128-alignment required for NVFP4 dense GEMM kernels
+        if hidden_size % 128 != 0 or sharded_intermediate % 128 != 0:
+            return (
+                f"DenseGEMMFusedMoE NVFP4 requires 128-aligned sizes "
+                f"(got h={hidden_size}, i={sharded_intermediate} "
+                f"[{intermediate_size}/tp{moe_tp_size}])"
+            )
+
+        # FC2 DenseGEMM kernel tiles K with MMA tile size 256.
+        # intermediate_size (= weight_per_expert for FC2) must be 256-aligned
+        # so expert boundaries align with MMA tile boundaries.
+        _MMA_TILE_K = 256
+        if sharded_intermediate % _MMA_TILE_K != 0:
+            return (
+                f"DenseGEMMFusedMoE requires intermediate_size to be a multiple "
+                f"of {_MMA_TILE_K} (got {sharded_intermediate} "
+                f"[{intermediate_size}/tp{moe_tp_size}]). "
+                f"FC2 kernel cannot split alpha_scale at non-aligned expert boundaries."
+            )
+
+    return None
+
+
 def should_skip_multi_gpu(
     parallel_mode: str,
     model_config: "MoeModelConfig",
@@ -703,15 +782,21 @@ def get_quick_skip_reason(
             lambda: should_skip_deepgemm(
                 backend_type, quant_algo=quant_algo, model_config=model_config
             ),
+            lambda: should_skip_densegemm(
+                backend_type, quant_algo=quant_algo, model_config=model_config
+            ),
         ]
         for check in skip_checks:
             skip_reason = check()
             if skip_reason:
                 return skip_reason
 
-        # DEEPGEMM: float16 reference module constraint
-        if backend_type == MoeBackendType.DEEPGEMM and dtype == torch.float16:
-            return "DeepGemmFusedMoE reference module requires bfloat16 input"
+        # DEEPGEMM/DENSEGEMM: float16 reference module constraint
+        if (
+            backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.DENSEGEMM)
+            and dtype == torch.float16
+        ):
+            return f"{backend_type.value} reference module requires bfloat16 input"
 
         # 128-alignment requirement for quantization
         if quant_algo is not None:

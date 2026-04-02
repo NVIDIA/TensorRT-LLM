@@ -17,6 +17,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
@@ -503,6 +504,7 @@ def execute(workers, func, hf_model):
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size

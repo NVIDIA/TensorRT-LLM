@@ -13,6 +13,7 @@ from einops import rearrange
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama import convert
@@ -443,6 +444,7 @@ def convert_from_hf(hf_model,
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size
 

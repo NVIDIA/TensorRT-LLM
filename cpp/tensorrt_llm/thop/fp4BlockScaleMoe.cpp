@@ -410,9 +410,11 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         if (out_hidden < args.hidden_size)
         {
             // out_tensor has unpadded hidden dim (e.g., nvfp4 with padding).
-            // Set valid_hidden_size so the finalize kernel writes only the needed columns.
+            // Set valid_hidden_size so the finalize kernel writes only the needed columns
+            // directly into out_tensor. Keep output_hidden_size at the full hidden_size so
+            // Gemm2 still computes at the padded width (its cubin config requires it).
             args.valid_hidden_size = out_hidden;
-            args.output_hidden_size = tensorrt_llm::common::roundUp(out_hidden, static_cast<int64_t>(128));
+            args.output_hidden_size = args.hidden_size;
         }
         else
         {
