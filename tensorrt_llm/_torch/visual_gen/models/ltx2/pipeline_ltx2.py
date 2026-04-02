@@ -1157,6 +1157,10 @@ class LTX2Pipeline(BasePipeline):
         if do_stg and stg_blocks:
             stg_perturbation = build_stg_perturbation_config(stg_blocks)
 
+        # Invalidate text KV cache so the first denoise step refills it.
+        # Context is constant within a generate() call but changes between calls.
+        self.transformer.invalidate_text_kv_cache()
+
         # ---- 8. Denoising loop ------------------------------------------
         def _run_transformer(
             v_latents,

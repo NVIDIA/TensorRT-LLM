@@ -67,6 +67,14 @@ class TransformerArgsPreprocessor:
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
 
+        # Cache for context/mask/PE — these depend only on text context and
+        # positions which are constant across denoise steps.  Keyed by
+        # id(modality.context) which is stable within a single generate() call.
+        self._cached_context: torch.Tensor | None = None
+        self._cached_mask: torch.Tensor | None = None
+        self._cached_pe: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._cache_key: int | None = None
+
     def _prepare_timestep(
         self,
         timestep: torch.Tensor,
@@ -128,23 +136,36 @@ class TransformerArgsPreprocessor:
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
-        context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
-        attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
-        pe = self._prepare_positional_embeddings(
-            positions=modality.positions,
-            inner_dim=self.inner_dim,
-            max_pos=self.max_pos,
-            use_middle_indices_grid=self.use_middle_indices_grid,
-            num_attention_heads=self.num_attention_heads,
-            x_dtype=modality.latent.dtype,
-        )
+
+        # Cache context projection, attention mask, and RoPE.
+        # modality.context is the same tensor object across denoise steps
+        # (pipeline passes the same video_embeds/audio_embeds every step).
+        ctx_key = modality.context.data_ptr()
+        if self._cache_key != ctx_key:
+            context, attention_mask = self._prepare_context(
+                modality.context, x, modality.context_mask
+            )
+            attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
+            pe = self._prepare_positional_embeddings(
+                positions=modality.positions,
+                inner_dim=self.inner_dim,
+                max_pos=self.max_pos,
+                use_middle_indices_grid=self.use_middle_indices_grid,
+                num_attention_heads=self.num_attention_heads,
+                x_dtype=modality.latent.dtype,
+            )
+            self._cached_context = context
+            self._cached_mask = attention_mask
+            self._cached_pe = pe
+            self._cache_key = ctx_key
+
         return TransformerArgs(
             x=x,
-            context=context,
-            context_mask=attention_mask,
+            context=self._cached_context,
+            context_mask=self._cached_mask,
             timesteps=timestep,
             embedded_timestep=embedded_timestep,
-            positional_embeddings=pe,
+            positional_embeddings=self._cached_pe,
             cross_positional_embeddings=None,
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
@@ -192,17 +213,24 @@ class MultiModalTransformerArgsPreprocessor:
         self.cross_pe_max_pos = cross_pe_max_pos
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
+        self._cached_cross_pe: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._cross_pe_key: int | None = None
 
     def prepare(self, modality: Modality) -> TransformerArgs:
         transformer_args = self.simple_preprocessor.prepare(modality)
-        cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
-            positions=modality.positions[:, 0:1, :],
-            inner_dim=self.audio_cross_attention_dim,
-            max_pos=[self.cross_pe_max_pos],
-            use_middle_indices_grid=True,
-            num_attention_heads=self.simple_preprocessor.num_attention_heads,
-            x_dtype=modality.latent.dtype,
-        )
+
+        pos_key = modality.positions.data_ptr()
+        if self._cross_pe_key != pos_key:
+            self._cached_cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
+                positions=modality.positions[:, 0:1, :],
+                inner_dim=self.audio_cross_attention_dim,
+                max_pos=[self.cross_pe_max_pos],
+                use_middle_indices_grid=True,
+                num_attention_heads=self.simple_preprocessor.num_attention_heads,
+                x_dtype=modality.latent.dtype,
+            )
+            self._cross_pe_key = pos_key
+
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
@@ -211,7 +239,7 @@ class MultiModalTransformerArgsPreprocessor:
         )
         return replace(
             transformer_args,
-            cross_positional_embeddings=cross_pe,
+            cross_positional_embeddings=self._cached_cross_pe,
             cross_scale_shift_timestep=cross_scale_shift_timestep,
             cross_gate_timestep=cross_gate_timestep,
         )

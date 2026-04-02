@@ -301,6 +301,11 @@ class BasicAVTransformerBlock(nn.Module):
             self._ulysses_size = config.parallel.dit_ulysses_size
             self._ulysses_pg = getattr(config, "ulysses_process_group", None)
 
+        # Text cross-attention KV cache.  Filled on first use per
+        # generate() call; invalidated by invalidate_text_kv_cache().
+        self._text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None
+
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
 
@@ -505,6 +510,12 @@ class BasicAVTransformerBlock(nn.Module):
             perturbations, BatchedPerturbationConfig
         )
 
+        # Text cross-attention KV cache: compute once, reuse across steps.
+        if run_vx and self._text_kv_video is None:
+            self._text_kv_video = self.attn2.project_kv(video.context)
+        if run_ax and self._text_kv_audio is None:
+            self._text_kv_audio = self.audio_attn2.project_kv(audio.context)
+
         # --- Video self-attention + text cross-attention ---
         if run_vx:
             skip_v_self = has_perturbations and perturbations.all_in_batch(
@@ -525,7 +536,7 @@ class BasicAVTransformerBlock(nn.Module):
                 vx = vx + v_self_out
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
-                context=video.context,
+                pre_projected_kv=self._text_kv_video,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -549,7 +560,7 @@ class BasicAVTransformerBlock(nn.Module):
                 ax = ax + a_self_out
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
-                context=audio.context,
+                pre_projected_kv=self._text_kv_audio,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -1111,6 +1122,15 @@ class LTXModel(nn.Module):
         gathered = [torch.empty_like(x) for _ in range(self.ulysses_size)]
         dist.all_gather(gathered, x, group=self.ulysses_pg)
         return torch.cat(gathered, dim=1)
+
+    def invalidate_text_kv_cache(self) -> None:
+        """Mark text KV cache as stale so the next forward() refills it.
+
+        Call once before each denoising loop (i.e. per generate() request).
+        """
+        for block in self.transformer_blocks:
+            block._text_kv_video = None
+            block._text_kv_audio = None
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
         """Configure whether audio uses Ulysses based on sequence length.

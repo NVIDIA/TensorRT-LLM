@@ -519,5 +519,132 @@ class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
         self.fail("transformer_blocks.0.attn1.qkv_proj not found in model")
 
 
+class TestLTX2TextKVCache(unittest.TestCase):
+    """Test text cross-attention KV cache (register_buffer approach)."""
+
+    DEVICE = "cuda"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_text_kv_cache_numerical_equivalence(self):
+        """Cache-hit output must match cache-miss output bitwise."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        torch.manual_seed(42)
+        dtype = torch.bfloat16
+        model_config = _create_model_config()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo, model_config=model_config, **AUDIO_VIDEO_CONFIG
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+
+        batch, v_frames, v_h, v_w = 1, 1, 4, 4
+        v_patches, a_patches, text_len = v_frames * v_h * v_w, 8, 8
+        in_ch = AUDIO_VIDEO_CONFIG["in_channels"]
+        a_in_ch = AUDIO_VIDEO_CONFIG["audio_in_channels"]
+        cap_ch = AUDIO_VIDEO_CONFIG["caption_channels"]
+        v_ctx = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        a_ctx = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        v_pos = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+        a_pos = _make_audio_positions(batch, a_patches, self.DEVICE)
+
+        def make_mods(ts):
+            return (
+                Modality(
+                    latent=torch.randn(batch, v_patches, in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([ts], device=self.DEVICE),
+                    positions=v_pos,
+                    context=v_ctx,
+                ),
+                Modality(
+                    latent=torch.randn(batch, a_patches, a_in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([ts], device=self.DEVICE),
+                    positions=a_pos,
+                    context=a_ctx,
+                ),
+            )
+
+        with torch.no_grad():
+            torch.manual_seed(100)
+            model(*make_mods(0.8))  # call 1: fills cache
+            torch.manual_seed(200)
+            v2_cached, a2_cached = model(*make_mods(0.5))  # call 2: uses cache
+
+            # Clear cache and re-run call 2
+            model.invalidate_text_kv_cache()
+
+            torch.manual_seed(200)
+            v2_nocache, a2_nocache = model(*make_mods(0.5))
+
+        self.assertTrue(
+            torch.equal(v2_cached, v2_nocache),
+            f"Video diff: {(v2_cached - v2_nocache).abs().max():.6e}",
+        )
+        self.assertTrue(
+            torch.equal(a2_cached, a2_nocache),
+            f"Audio diff: {(a2_cached - a2_nocache).abs().max():.6e}",
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_text_kv_cache_invalidation(self):
+        """Different context must produce different output."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        torch.manual_seed(42)
+        dtype = torch.bfloat16
+        model_config = _create_model_config()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo, model_config=model_config, **AUDIO_VIDEO_CONFIG
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+
+        batch, v_frames, v_h, v_w = 1, 1, 4, 4
+        v_patches, a_patches, text_len = v_frames * v_h * v_w, 8, 8
+        in_ch = AUDIO_VIDEO_CONFIG["in_channels"]
+        a_in_ch = AUDIO_VIDEO_CONFIG["audio_in_channels"]
+        cap_ch = AUDIO_VIDEO_CONFIG["caption_channels"]
+        v_pos = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+        a_pos = _make_audio_positions(batch, a_patches, self.DEVICE)
+
+        torch.manual_seed(100)
+        lat_v = torch.randn(batch, v_patches, in_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        lat_a = torch.randn(batch, a_patches, a_in_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        ctx_A = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        ctx_B = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+
+        def make_mod(lat, ctx, pos):
+            return Modality(
+                latent=lat.clone(),
+                timesteps=torch.tensor([0.5], device=self.DEVICE),
+                positions=pos,
+                context=ctx,
+            )
+
+        with torch.no_grad():
+            vA, aA = model(video=make_mod(lat_v, ctx_A, v_pos), audio=make_mod(lat_a, ctx_A, a_pos))
+            model.invalidate_text_kv_cache()  # new context → must invalidate
+            vB, aB = model(video=make_mod(lat_v, ctx_B, v_pos), audio=make_mod(lat_a, ctx_B, a_pos))
+
+        self.assertFalse(torch.equal(vA, vB), "Video: cache may be stale")
+        self.assertFalse(torch.equal(aA, aB), "Audio: cache may be stale")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
