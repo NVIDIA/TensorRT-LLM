@@ -387,7 +387,17 @@ def setup_llm(args, **kwargs):
 
 def main():
     args = parse_arguments()
-    prompts = args.prompt if args.prompt else example_prompts
+
+    if args.dataset:
+        prompts = []
+        with open(args.dataset, 'r') as f:
+            for line in f:
+                entry = json.loads(line.strip())
+                prompts.append(entry["question"][-1])
+        if args.num_samples is not None:
+            prompts = prompts[:args.num_samples]
+    else:
+        prompts = args.prompt if args.prompt else example_prompts
 
     llm, sampling_params = setup_llm(args)
     new_prompts = []
