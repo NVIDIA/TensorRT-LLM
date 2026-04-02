@@ -19,6 +19,7 @@
  */
 
 #include "bindings.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/vector.h>
@@ -29,8 +30,9 @@
 // Forward declarations - we don't include the suffix automaton headers directly
 // because they contain macros that redefine cudaStream_t to int for non-CUDA compilers.
 // These functions are implemented in the CUDA-compiled suffixAutomatonKernels.cu
-// Note: Must use the _v1 inline namespace to match the TRTLLM_NAMESPACE_BEGIN macro
-namespace tensorrt_llm::_v1::kernels::speculative_decoding::suffix_automaton
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding::suffix_automaton
 {
 // Forward declaration of the opaque SuffixAutomaton type
 struct SuffixAutomaton;
@@ -73,9 +75,11 @@ size_t getSuffixAutomatonStateSize(size_t maxSeqLen);
 void initAutomaton(void* memory, size_t maxSeqLen);
 void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTokens);
 void relocateAutomaton(SuffixAutomaton* sa, void* oldBase, void* newBase);
-} // namespace tensorrt_llm::_v1::kernels::speculative_decoding::suffix_automaton
+} // namespace kernels::speculative_decoding::suffix_automaton
 
-namespace sa = tensorrt_llm::_v1::kernels::speculative_decoding::suffix_automaton;
+TRTLLM_NAMESPACE_END
+
+namespace sa = tensorrt_llm::kernels::speculative_decoding::suffix_automaton;
 
 namespace tensorrt_llm::nanobind::suffix_automaton
 {
