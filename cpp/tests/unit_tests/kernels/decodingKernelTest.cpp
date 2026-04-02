@@ -26,6 +26,8 @@
 #include <curand_kernel.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstring>
 #include <random>
 #include <unordered_set>
 
@@ -317,6 +319,8 @@ void fillTensorAtIndex(ITensor::SharedPtr tensor, SizeType32 idx, std::vector<T>
     target = ITensor::slice(target, 0, insertLen);
     bufferManager->copy(src.data(), *target);
 }
+
+} // anonymous namespace
 
 class TestGatherTree : public ::testing::Test
 {
@@ -691,6 +695,182 @@ TEST_F(TestGatherTree, GatherTreeWithSwap)
 
     EXPECT_TRUE(checkResult());
 }
+
+// Test that generation logits are correctly reordered after gatherTree finalization.
+// Uses the same hardcoded beam search data as GatherTreeNoSwap, creates sentinel logits
+// where logits[slot][g][v] = slot (so we can verify which slot each beam's logits came from),
+// then runs the reorder algorithm and checks the result.
+TEST_F(TestGatherTree, GenerationLogitsReorder)
+{
+    // Compile-time proof that the fixture data causes beam reordering.
+    // hardcodeBuffersLen10: parentIds[slot=1][t=3] = 0 (row 1, col 3 of the parentIds table).
+    // Since 0 != 1, any beam trace through slot 1 at t=4 steps to slot 0 at t=3 — a concrete swap.
+    static constexpr SizeType32 kFixtureParentIds_slot1_t3 = 0;
+    static_assert(kFixtureParentIds_slot1_t3 != 1,
+        "parentIds[slot=1][t=3] must differ from slot 1 to guarantee a beam swap in this test");
+
+    createBuffers();
+    hardcodeBuffersLen10();
+    cudaDeviceSynchronize();
+    kernels::gatherTree(
+        mDecodingState->getJointDecodingOutput(), mDecodingState->getJointDecodingInput(), mSamplingConfig, *mStream);
+    cudaDeviceSynchronize();
+
+    // Verify gatherTree worked first
+    ASSERT_TRUE(checkResult());
+
+    // Now test the generation logits reordering algorithm.
+    // Copy ids, parentIds, gatheredIds, and seqLengths to host.
+    auto idsHost = mBufferManager->copyFrom(*mDecodingState->getIds(0), MemoryType::kCPU);
+    auto parentIdsHost = mBufferManager->copyFrom(*ITensor::at(mDecodingState->getParentIds(), {0}), MemoryType::kCPU);
+    auto gatheredIdsHost = mBufferManager->copyFrom(*mDecodingState->getGatheredIds(0), MemoryType::kCPU);
+    auto seqLengthsHost = mBufferManager->copyFrom(*mDecodingState->getSequenceLengths(0), MemoryType::kCPU);
+
+    auto const* idsData = bufferCast<TokenIdType>(*idsHost);
+    auto const* parentIdsData = bufferCast<TokenIdType>(*parentIdsHost);
+    auto const* gatheredIdsData = bufferCast<TokenIdType>(*gatheredIdsHost);
+    auto const* seqLengthsData = bufferCast<SizeType32>(*seqLengthsHost);
+
+    SizeType32 constexpr promptLen = 3;           // matches inputLengths in hardcodeBuffersLen10
+    SizeType32 constexpr vocabSizePadded = 32000; // LLaMA vocab size (matches fixture token IDs)
+    SizeType32 const maxNewTokens = maxSeqLen - promptLen;
+
+    // Populate sentinel logits: for each (pre-reassignment slot, gen step), place a 1.0f
+    // at the selected token position. All other entries stay 0. After correct reordering,
+    // logits[beam][g][gatheredToken] should be positive (the sentinel landed at the right place).
+    std::vector<float> logits(static_cast<size_t>(beamWidth) * maxNewTokens * vocabSizePadded, 0.0f);
+    for (SizeType32 postSlot = 0; postSlot < beamWidth; ++postSlot)
+    {
+        auto const genLen = seqLengthsData[postSlot] - promptLen;
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            SizeType32 const t = promptLen + g;
+            SizeType32 const preSlot = parentIdsData[postSlot * maxSeqLen + t];
+            TokenIdType const token = idsData[postSlot * maxSeqLen + t];
+            logits[static_cast<size_t>(preSlot * maxNewTokens + g) * vocabSizePadded + token] = 1.0f;
+        }
+    }
+
+    // Build slot trace and reorder (same algorithm as reorderGenerationLogitsForBeamSearch)
+    std::vector<std::vector<SizeType32>> slotTrace(beamWidth, std::vector<SizeType32>(maxNewTokens, 0));
+
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const seqLen = seqLengthsData[beam];
+        auto const genLen = seqLen - promptLen;
+        if (genLen <= 0)
+        {
+            continue;
+        }
+
+        // Find starting slot by matching backtracked sequence
+        SizeType32 startSlot = -1;
+        for (SizeType32 s = 0; s < beamWidth; ++s)
+        {
+            SizeType32 slot = s;
+            bool matches = true;
+            for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+            {
+                if (idsData[slot * maxSeqLen + t] != gatheredIdsData[beam * maxSeqLen + t])
+                {
+                    matches = false;
+                    break;
+                }
+                if (t > promptLen)
+                {
+                    slot = parentIdsData[slot * maxSeqLen + t];
+                }
+            }
+            if (matches)
+            {
+                startSlot = s;
+                break;
+            }
+        }
+        ASSERT_GE(startSlot, 0) << "Could not find starting slot for beam " << beam;
+
+        // Build pre-reassignment slot trace in a single pass
+        SizeType32 slot = startSlot;
+        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+        {
+            slot = parentIdsData[slot * maxSeqLen + t];
+            slotTrace[beam][t - promptLen] = slot;
+        }
+    }
+
+    // Reorder logits using a temp buffer (same approach as the production code)
+    auto const stepSize = static_cast<size_t>(vocabSizePadded) * sizeof(float);
+    std::vector<float> temp(beamWidth * vocabSizePadded);
+    auto* logitsPtr = reinterpret_cast<uint8_t*>(logits.data());
+    auto* tempPtr = reinterpret_cast<uint8_t*>(temp.data());
+
+    std::vector<SizeType32> genLens(beamWidth);
+    SizeType32 maxGenLen = 0;
+    for (SizeType32 b = 0; b < beamWidth; ++b)
+    {
+        genLens[b] = std::max(SizeType32{0}, seqLengthsData[b] - promptLen);
+        maxGenLen = std::max(maxGenLen, genLens[b]);
+    }
+
+    for (SizeType32 g = 0; g < maxGenLen; ++g)
+    {
+        bool stepNeedsReorder = false;
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g < genLens[b] && slotTrace[b][g] != b)
+            {
+                stepNeedsReorder = true;
+                break;
+            }
+        }
+        if (!stepNeedsReorder)
+        {
+            continue;
+        }
+
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            auto const offset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            std::memcpy(tempPtr + static_cast<size_t>(b) * stepSize, logitsPtr + offset, stepSize);
+        }
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g >= genLens[b])
+            {
+                continue;
+            }
+            auto const dstOffset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            auto const srcSlot = slotTrace[b][g];
+            std::memcpy(logitsPtr + dstOffset, tempPtr + static_cast<size_t>(srcSlot) * stepSize, stepSize);
+        }
+    }
+
+    // Cross-check: after reorder, logits[beam][g][gatheredToken] should equal the 1.0f sentinel
+    // placed there during population. This is non-tautological: gatheredIdsData is produced
+    // independently by gatherTree tracing through parentIds, while the logits were reordered via
+    // the slot trace. A wrong slot's logits would have 0.0f at this position.
+    bool allCorrect = true;
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const genLen = genLens[beam];
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            TokenIdType const gatheredToken = gatheredIdsData[beam * maxSeqLen + (promptLen + g)];
+            float const logitAtGatheredToken
+                = logits[static_cast<size_t>(beam * maxNewTokens + g) * vocabSizePadded + gatheredToken];
+            if (logitAtGatheredToken != 1.0f)
+            {
+                TLLM_LOG_ERROR("Beam %d, step %d: logit at gathered token %d is %.1f, expected 1.0", beam, g,
+                    gatheredToken, logitAtGatheredToken);
+                allCorrect = false;
+            }
+        }
+    }
+    EXPECT_TRUE(allCorrect);
+}
+
+namespace
+{
 
 enum AcceptKernelMode
 {

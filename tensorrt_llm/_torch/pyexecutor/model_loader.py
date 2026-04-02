@@ -497,6 +497,25 @@ class ModelLoader:
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
+        # Store allreduce pre-allocation config for AllReduce module access.
+        # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
+        # KimiK25Config) that store the text config under .text_config are
+        # handled transparently.  For flat configs get_text_config() returns
+        # self, so this is safe for all config types.  Still guard with
+        # try/except for configs that lack hidden_size entirely.
+        try:
+            config.extra_attrs[
+                'allreduce_max_num_tokens'] = config.max_num_tokens
+            config.extra_attrs[
+                'allreduce_hidden_size'] = config.pretrained_config.get_text_config(
+                ).hidden_size
+            config.extra_attrs[
+                'allreduce_dtype'] = config.pretrained_config.torch_dtype
+        except AttributeError as e:
+            logger.warning(
+                f"Could not read allreduce pre-allocation config from "
+                f"{type(config.pretrained_config).__name__}: {e}. "
+                f"AllReduce pre-allocation will be skipped.")
 
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
