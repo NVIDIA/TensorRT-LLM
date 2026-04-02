@@ -1,7 +1,9 @@
-"""Testing module patches that enable export of MiniMax-M2 model.
+"""Test the MiniMax-M2 MoE forward used for export compatibility.
 
-This test verifies that the patched MiniMaxM2SparseMoeBlock forward function
-produces identical outputs to the original HuggingFace implementation.
+This verifies that the AutoDeploy MoE implementation in
+``MiniMaxM2SparseMoeBlock.forward`` produces numerically equivalent hidden
+states to the original HuggingFace implementation when applied to the same
+module weights and inputs.
 """
 
 import types
@@ -13,7 +15,9 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 # Import custom_ops to register torch.ops.auto_deploy.torch_moe
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.models.patches.minimax_m2 import minimax_m2_moe
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_minimax_m2 import (
+    MiniMaxM2SparseMoeBlock,
+)
 
 
 def _load_minimax_m2_moe_layer(model_name_or_path):
@@ -65,14 +69,7 @@ def _load_minimax_m2_moe_layer(model_name_or_path):
 
 
 def test_minimax_m2_moe_patch():
-    """Test that the patched MiniMaxM2SparseMoeBlock forward matches HF implementation.
-
-    The patch rewrites the forward to use torch.ops.auto_deploy.torch_moe
-    for torch.export compatibility while maintaining numerical equivalence.
-
-    Since importing minimax_m2.py auto-patches module instances, we use the
-    CLASS method (type(module).forward) as the original HF reference.
-    """
+    """Test that the AutoDeploy MiniMaxM2SparseMoeBlock forward matches HF."""
     # Resolve model path at test time (not collection time) to avoid ValueError
     try:
         model_name = hf_id_to_local_model_dir("MiniMaxAI/MiniMax-M2")
@@ -82,7 +79,7 @@ def test_minimax_m2_moe_patch():
     # Set seed for reproducibility
     torch.manual_seed(42)
 
-    # Get MoE module (instance is already patched by import side-effect)
+    # Get HF MoE module from the remote-code model implementation.
     module = _load_minimax_m2_moe_layer(model_name)
     assert module is not None, "Failed to load MiniMax-M2 MoE layer"
 
@@ -94,33 +91,19 @@ def test_minimax_m2_moe_patch():
     hidden_size = 16
     inputs = torch.randn(2, 6, hidden_size, dtype=torch.bfloat16)
 
-    # The CLASS method is still the original HuggingFace implementation
-    # (the auto-patch only patches instance methods, not the class)
+    # The class method on the loaded module is the original HF implementation.
     original_class_forward = type(module).forward
 
-    # Generate reference output using original HF class method
-    # Uses: same module weights, same input tensor
+    # Generate reference output using the original HF class method.
     with torch.no_grad():
-        ref_output, ref_router_logits = original_class_forward(module, inputs)
+        ref_output, _ = original_class_forward(module, inputs)
 
-    # The instance forward is already patched by the import side-effect,
-    # but let's be explicit and apply our patch function directly
-    module.forward = types.MethodType(minimax_m2_moe, module)
+    # Replace the instance forward with the AutoDeploy implementation.
+    module.forward = types.MethodType(MiniMaxM2SparseMoeBlock.forward, module)
 
-    # Generate test output using patched implementation
-    # Uses: same module weights, same input tensor
+    # Generate test output using the AutoDeploy implementation.
     with torch.no_grad():
-        test_output, test_router_logits = module(inputs)
-
-    # Verify outputs match
-    # Router logits should be identical (same computation path)
-    torch.testing.assert_close(
-        ref_router_logits,
-        test_router_logits,
-        atol=1e-5,
-        rtol=1e-5,
-        msg="Router logits mismatch between original and patched MoE",
-    )
+        test_output = module(inputs)
 
     # Final hidden states should be very close
     # (small tolerance for different computation order in torch_moe)
