@@ -339,7 +339,6 @@ unittest/disaggregated/test_py_cache_transceiver_mp.py::test_v2_transceiver_mp[c
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass] SKIP (https://nvbugs/5996656)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-trtllm] SKIP (https://nvbugs/5997046)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_python_scheduler[ep4-mtp_nextn=0] SKIP (https://nvbugs/5997051)
-perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_tep8_mtp3_8k1k] SKIP (https://nvbugs/5997092)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8 SKIP (https://nvbugs/6004530)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp1tp1cp4] SKIP (https://nvbugs/6007201)
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/6007285)
@@ -363,4 +362,3 @@ accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2] SKIP (https://nvbugs/6007201)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/6029882)
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[bf16-4-attn_dp_off-trtllm] SKIP (https://nvbugs/5919796)
-perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_grace_blackwell-r1_fp4_v2_tep8_mtp3] SKIP (https://nvbugs/5997092)
