@@ -962,3 +962,22 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
                 c_sf_multi_valid.append(c_sf_multi_unswizzled[i])
             c_sf_multi_valid = torch.cat(c_sf_multi_valid)
             check_accuracy(c_sf_multi_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+
+
+def test_cutedsl_load_weights_signature_matches_base():
+    """Ensure CuteDslFusedMoE.load_weights accepts allow_partial_loading.
+
+    Regression guard for the fix where CuteDslFusedMoE.load_weights was
+    missing the allow_partial_loading parameter, causing TypeError when
+    called from modeling_utils._load_weights_impl via the params_map path.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+
+    params = inspect.signature(CuteDslFusedMoE.load_weights).parameters
+    assert "weights" in params, "CuteDslFusedMoE.load_weights must accept 'weights' parameter"
+    assert "allow_partial_loading" in params, (
+        "CuteDslFusedMoE.load_weights must accept 'allow_partial_loading' "
+        "to match the MoE base class interface"
+    )
