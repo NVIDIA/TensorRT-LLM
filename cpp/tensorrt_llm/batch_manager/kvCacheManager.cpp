@@ -1019,7 +1019,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
             : ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
         pool.layerFirstLayout = isRecurrentState();
 
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads, shape={%d, %d, %d, %d}%s",
             mLogPrefix.c_str(), mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads, cacheShape.d[0], cacheShape.d[1],
             cacheShape.d[2], cacheShape.d[3], pool.layerFirstLayout ? " (layer-first)" : "");
@@ -1972,7 +1972,7 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         auto prevBlock = getBlockById(prevBlockId);
         if (prevBlock->isPlaceholder())
         {
-            TLLM_LOG_INFO(
+            TLLM_LOG_DEBUG(
                 "%s::copyLinearAttentionBlock - Previous block %d is a placeholder, skip. This usually happens when "
                 "chunked context is enabled but reusing is disabled.",
                 mLogPrefix.c_str(), prevBlockId);
@@ -2368,7 +2368,7 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     {
         usableSize = std::min(llmRequest->getPromptLen() - 1, usableSize); // TODO: enable store for completed sequences
     }
-    TLLM_LOG_INFO("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
+    TLLM_LOG_DEBUG("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
         mLogPrefix.c_str(), llmRequest->mRequestId, mWindowSize, uniqueTokens.size(), usableSize);
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
