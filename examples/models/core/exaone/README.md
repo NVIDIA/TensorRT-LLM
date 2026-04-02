@@ -14,9 +14,11 @@ This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EX
     - [EXAONE-3.0](#exaone-30)
     - [EXAONE-Deep](#exaone-deep)
     - [EXAONE-4.0](#exaone-40)
+    - [EXAONE-4.5](#exaone-45)
     - [K-EXAONE](#k-exaone)
   - [PyTorch flow](#pytorch-flow)
     - [Running EXAONE-4.0](#running-exaone-40)
+    - [Running EXAONE-4.5](#running-exaone-45)
     - [Running K-EXAONE](#running-k-exaone)
       - [MoE Backend Options](#moe-backend-options)
     - [PyTorch flow Quantization](#pytorch-flow-quantization)
@@ -45,6 +47,7 @@ This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EX
   * FP16
   * BF16
   * Tensor Parallel (TP)
+  * Multimodal (EXAONE-4.5 only)
   * Expert Parallel (EP) (K-EXAONE only)
   * Attention Data Parallel (ADP) (K-EXAONE only)
   * Disaggregated Serving
@@ -59,7 +62,7 @@ This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EX
 
 **Note:**
 - **EXAONE-3.0** & **EXAONE-Deep** are supported using the [TRT Flow](#trt-flow).
-- **EXAONE-4.0** & **K-EXAONE** are supported using the [PyTorch flow](#pytorch-flow).
+- **EXAONE-4.0**, **EXAONE-4.5**, & **K-EXAONE** are supported using the [PyTorch flow](#pytorch-flow).
 
 Please refer to the corresponding sections below for usage instructions and examples for each model.
 
@@ -90,6 +93,17 @@ export HF_MODEL_DIR=hf_models/exaone4
 git clone https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B $HF_MODEL_DIR
 ```
 
+### EXAONE-4.5
+
+EXAONE-4.5 is a multimodal model. It is supported only via the [PyTorch flow](#pytorch-flow).
+
+Download the HuggingFace checkpoint for your EXAONE-4.5 variant from the [LGAI-EXAONE](https://huggingface.co/LGAI-EXAONE) organization. The example below uses `EXAONE-4.5-33B`; replace it with the variant you want to run.
+
+```bash
+export HF_MODEL_DIR=hf_models/exaone4_5
+git clone https://huggingface.co/LGAI-EXAONE/EXAONE-4.5-33B $HF_MODEL_DIR
+```
+
 ### K-EXAONE
 
 K-EXAONE is a Mixture of Experts (MoE) model based on the EXAONE architecture. It features a hybrid architecture with both dense and MoE layers, sliding window attention, and supports FP8 and NVFP4 quantization for efficient inference.
@@ -115,6 +129,21 @@ The output will be like:
 [0] Prompt: 'Hello, my name is', Generated text: " [Your Name], and I'm a [Your Profession]. I'm here to learn and share with you.\n\nBest regards,\n[Your Name]\n\nThis letter is concise, professional, and clearly states who you are and what you're here for. It's a good starting point"
 [1] Prompt: 'The capital of France is', Generated text: ' Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris'
 [2] Prompt: 'The future of AI is', Generated text: ' not just about technology but also about how we choose to use it. We must ensure that AI is developed and deployed in a way that benefits all of humanity, not just a select few. This means prioritizing ethical considerations, transparency, and accountability in AI development. It also means involving diverse stakeholders in the conversation about AI'
+```
+
+### Running EXAONE-4.5
+
+To quickly run EXAONE-4.5 models, you can use [examples/llm-api/quickstart_multimodal.py](../../../llm-api/quickstart_multimodal.py):
+
+```bash
+python ../../../llm-api/quickstart_multimodal.py --model_dir $HF_MODEL_DIR
+```
+
+The output will be like:
+```bash
+[0] Prompt: 'Describe the natural environment in the image.', Generated text: 'Okay, the user asked me to describe the natural environment in the image. But wait, there's no image provided here. Hmm, that's a problem. How can I describe something I can't see?\n\nFirst, I need to check if there's any image attached. The user mentioned "the image," but in the current context, there's no image data. Maybe they forgot'
+[1] Prompt: 'Describe the object and the weather condition in the image.', Generated text: 'Okay, the user asked me to describe the object and the weather condition in the image. But wait, there's no image provided here. Hmm, that's a problem. How can I describe something I can't see?\n\nFirst, I need to check if there's any image attached. The user mentioned "the image," but in the current context, there's no image data. Maybe'
+[2] Prompt: 'Describe the traffic condition on the road in the image.', Generated text: 'Okay, the user is asking me to describe the traffic condition on the road in the image. But wait, there's a problem here—I don't actually see any image. The user mentioned "the image," but in this text-based interface, there's no visual content provided. \n\nHmm, I need to handle this carefully. The user might have forgotten to attach the image or assumed I could see it'
 ```
 
 ### Running K-EXAONE
