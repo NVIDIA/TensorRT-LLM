@@ -1424,3 +1424,16 @@ TRTLLM_NAMESPACE_END
     {                                                                                                                  \
         tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
     } while (0)
+
+// Warn-only variant: log a warning on failure but do not throw or abort.
+// Use for cleanup/secondary operations where a CUDA error is non-fatal (e.g. free on an error path).
+#define TLLM_CUDA_CHECK_WARN(stat)                                                                                     \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cudaError_t const _tllm_cuda_warn_err = (stat);                                                                \
+        if (TLLM_UNLIKELY(_tllm_cuda_warn_err != cudaSuccess))                                                         \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "CUDA error in %s (%s:%d): %s", #stat, __FILE__, __LINE__, cudaGetErrorString(_tllm_cuda_warn_err));   \
+        }                                                                                                              \
+    } while (0)
