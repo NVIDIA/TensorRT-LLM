@@ -116,6 +116,7 @@ class LlmManager:
         sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
         tokenizer = self.tokenizer
+        loop = asyncio.get_running_loop()
 
         messages: List[dict] = []
         total_input_tokens = 0
@@ -129,8 +130,9 @@ class LlmManager:
             for turn_id, question in enumerate(request.turns):
                 messages.append({"role": "user", "content": question})
 
-                input_ids = tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True)
+                input_ids = await loop.run_in_executor(
+                    None, lambda: tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True))
 
                 output: RequestOutput = self.llm.generate_async(
                     input_ids,
@@ -147,8 +149,9 @@ class LlmManager:
                 all_output_tokens.extend(turn_tokens)
                 total_input_tokens += len(input_ids)
 
-                assistant_text = tokenizer.decode(turn_tokens,
-                                                  skip_special_tokens=True)
+                assistant_text = await loop.run_in_executor(
+                    None, lambda: tokenizer.decode(turn_tokens,
+                                                   skip_special_tokens=True))
                 messages.append({
                     "role": "assistant",
                     "content": assistant_text
