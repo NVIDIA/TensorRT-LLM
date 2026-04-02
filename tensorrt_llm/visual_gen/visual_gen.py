@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
 import atexit
 import queue
 import socket
@@ -86,6 +87,10 @@ class DiffusionRemoteClient:
         self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
         self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
 
+        # Generate shared HMAC keys for IPC authentication
+        self.req_hmac_key = os.urandom(32)
+        self.resp_hmac_key = os.urandom(32)
+
         # IPC setup
         self.requests_ipc = None
         self.responses_ipc = None
@@ -122,6 +127,8 @@ class DiffusionRemoteClient:
                     "request_queue_addr": self.req_addr_connect,
                     "response_queue_addr": self.resp_addr_connect,
                     "diffusion_args": self.diffusion_args,
+                    "req_hmac_key": self.req_hmac_key,
+                    "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
                 },
             )
@@ -205,16 +212,16 @@ class DiffusionRemoteClient:
         try:
             logger.info("DiffusionClient: Initializing IPC")
             self.requests_ipc = ZeroMqQueue(
-                (self.request_queue_addr, None),
+                (self.request_queue_addr, self.req_hmac_key),
                 is_server=True,
                 socket_type=zmq.PUSH,
-                use_hmac_encryption=False,
+                use_hmac_encryption=True,
             )
             self.responses_ipc = ZeroMqQueue(
-                (self.response_queue_addr, None),
+                (self.response_queue_addr, self.resp_hmac_key),
                 is_server=True,
                 socket_type=zmq.PULL,
-                use_hmac_encryption=False,
+                use_hmac_encryption=True,
             )
             logger.info("DiffusionClient: IPC ready")
             return True
