@@ -2600,6 +2600,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def get_input_embeddings(self):
+        return self.model.language_model.get_input_embeddings()
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -2646,6 +2649,16 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
         super().__init__(submodule_name)
 
     def _init_dynamic_shape_lookup(self):
+        if self.submodule_name == "":
+            # Full model export: position_ids enters as 2D (B, S), expanded
+            # to 3D inside the graph by the wrapper's fast path.
+            batch_size_dyn = Dim.DYNAMIC
+            seq_len_dyn = Dim.DYNAMIC
+            return {
+                "input_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+                "position_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+            }
+        # Inner model export: position_ids enters as 3D (3, B, S).
         base = super()._init_dynamic_shape_lookup()
         batch_size_dyn = Dim.DYNAMIC
         seq_len_dyn = Dim.DYNAMIC
@@ -2654,22 +2667,13 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
 
     @classmethod
     def from_autoinferred(cls, model: nn.Module) -> "Qwen3_5MoeTextExportInfo":
-        """Auto-infer the text submodule and capture lm_head from the parent model."""
-        text_config_cls = type(model.config.text_config)
+        """Export the full model as a single GraphModule.
 
-        submodule_key = None
-        for name, submodule in model.named_modules():
-            if isinstance(getattr(submodule, "config", None), text_config_cls):
-                submodule_key = name
-                break
-
-        if submodule_key is None:
-            raise ValueError(
-                "Could not find text submodule in model. Expected text submodule to have a config "
-                f"object of type {text_config_cls}."
-            )
-
-        return cls(submodule_key)
+        Using submodule_name="" exports the entire model (embedding + text model
+        + lm_head) as one FX GraphModule. This allows piecewise CUDA graph capture
+        since compile_model receives a GraphModule directly.
+        """
+        return cls("")
 
 
 class Qwen3_5MoeADInputProcessor:
