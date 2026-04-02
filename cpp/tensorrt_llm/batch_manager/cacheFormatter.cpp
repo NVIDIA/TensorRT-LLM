@@ -246,8 +246,7 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     {
         return std::move(*reuseResult);
     }
-    TLLM_LOG_WARNING(
-        "getBlockRangeForSending: request %lu, reuse tree lookup failed, falling back to fromAllBlockIds",
+    TLLM_LOG_WARNING("getBlockRangeForSending: request %lu, reuse tree lookup failed, falling back to fromAllBlockIds",
         llmRequest.mRequestId);
     return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
 }
