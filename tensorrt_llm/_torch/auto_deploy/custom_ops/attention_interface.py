@@ -1253,7 +1253,7 @@ class SequenceInfo:
                 self.get_arg("token_gather_indices"),
                 self.batch_info.serialize(),
             )
-        return self.flatten(token_tnsr)
+        return token_tnsr.reshape(token_tnsr.shape[0] * token_tnsr.shape[1], *token_tnsr.shape[2:])
 
     @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
