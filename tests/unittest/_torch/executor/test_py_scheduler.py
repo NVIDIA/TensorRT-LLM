@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestSta
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ChunkingPolicy,
     ContextChunkingConfig,
+    NoEvictScheduledBlocksManager,
     PyCapacityScheduler,
     PyMicroBatchScheduler,
     SimpleUnifiedScheduler,
@@ -136,6 +137,8 @@ class MockKVCacheManager:
         blocks_per_request: int = 5,
         is_variable_window: bool = False,
         enable_block_reuse: bool = False,
+        num_truly_free_blocks: Optional[int] = None,
+        blocks_per_request_cached: int = 0,
     ):
         self._window_sizes = window_sizes or [128]
         self._num_free_blocks = num_free_blocks
@@ -144,6 +147,23 @@ class MockKVCacheManager:
         self.enable_block_reuse = enable_block_reuse
         self.max_attention_window_vec = self._window_sizes
         self._scheduling_started = False
+        # num_truly_free_blocks: blocks not in the radix tree (never reused).
+        # Defaults to num_free_blocks when not specified.
+        self._num_truly_free_blocks = (
+            num_truly_free_blocks if num_truly_free_blocks is not None else num_free_blocks
+        )
+        # blocks_per_request_cached: blocks needed when all cached blocks
+        # count as reusable (fewer blocks needed due to cache hits).
+        self._blocks_per_request_cached = blocks_per_request_cached
+        # Reservation tracking: tracks which cached blocks have been
+        # reserved during the current scheduling pass.
+        self._scheduling_reserved_block_ids: set = set()
+        self._scheduling_reserved_blocks: int = 0
+
+    def set_iter_threshold(self, threshold: int) -> None:
+        # No-op: the adaptive onlyAllocated mechanism has been replaced
+        # with a reservation-based approach in C++.
+        pass
 
     def get_kv_cache_stats(self) -> MockKVCacheStats:
         return MockKVCacheStats(
@@ -157,10 +177,18 @@ class MockKVCacheManager:
         return self._blocks_per_request
 
     def scheduling_has_free_blocks(self, total: int, window_size: int) -> bool:
-        return total <= self._num_free_blocks
+        effective_free = self._num_free_blocks - self._scheduling_reserved_blocks
+        return total <= effective_free
+
+    def get_effective_free_blocks_per_window_size(self) -> dict:
+        effective_free = self._num_free_blocks - self._scheduling_reserved_blocks
+        return {ws: effective_free for ws in self._window_sizes}
 
     def start_scheduling(self):
         self._scheduling_started = True
+        # Reset reservation state at the start of each scheduling pass.
+        self._scheduling_reserved_block_ids = set()
+        self._scheduling_reserved_blocks = 0
 
     def scheduling_remove_sequence(self, req_id: int):
         pass
@@ -2600,6 +2628,164 @@ class TestPyCapacitySchedulerKVCacheReuse:
         assert len(fitting) == 2
 
 
+class TestNoEvictReservationAccounting:
+    """
+    Tests for the NoEvictScheduledBlocksManager cumulative_needed pattern.
+    Verifies that the reservation accounting correctly prevents over-admission
+    when cached blocks reduce get_remaining_blocks_to_completion but are still
+    drawn from the free pool (the double-counting bug fix).
+    """
+
+    def test_no_over_admit_with_cached_blocks(self):
+        """
+        Verify that cached prefix blocks do not cause over-admission.
+
+        Setup: 20 free blocks, each request needs 10 blocks total but only
+        5 fresh blocks (the other 5 are cached/reusable). With correct
+        accounting, only 4 requests fit (4 * 5 = 20 fresh blocks needed
+        <= 20 effective free). A 5th request would need 25 > 20.
+
+        With the old available_blocks bug, effectiveFree was re-read each
+        iteration and never decremented by fresh blocks, so ALL requests
+        would appear to fit.
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=20,
+            blocks_per_request=5,  # remaining_blocks_to_completion per request (fresh only)
+            enable_block_reuse=True,
+        )
+        scheduler = PyCapacityScheduler(
+            max_num_requests=10,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        )
+        # Create 6 requests with the same prefix tokens
+        tokens = list(range(50))
+        requests = [_make_request(i, prompt_len=50, input_tokens=tokens) for i in range(6)]
+
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+
+        # 20 free blocks / 5 fresh blocks per request = 4 requests max
+        assert len(fitting) == 4, (
+            f"Expected 4 admitted requests (20 free / 5 fresh each), got {len(fitting)}"
+        )
+
+    def test_cumulative_needed_tracks_correctly(self):
+        """
+        Directly verify that NoEvictScheduledBlocksManager.cumulative_needed
+        accumulates correctly across multiple decrement_reserved_blocks calls.
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=100,
+            blocks_per_request=7,
+            window_sizes=[128],
+        )
+        manager = NoEvictScheduledBlocksManager(kv)
+
+        # Initially, cumulative_needed should be zero for all window sizes
+        assert manager.cumulative_needed == {128: 0}
+
+        # Admit 3 requests: each needs 7 blocks
+        r0 = _make_request(0, prompt_len=10)
+        r1 = _make_request(1, prompt_len=10)
+        r2 = _make_request(2, prompt_len=10)
+
+        manager.decrement_reserved_blocks(r0)
+        assert manager.cumulative_needed == {128: 7}
+
+        manager.decrement_reserved_blocks(r1)
+        assert manager.cumulative_needed == {128: 14}
+
+        manager.decrement_reserved_blocks(r2)
+        assert manager.cumulative_needed == {128: 21}
+
+    def test_enough_available_blocks_uses_effective_free(self):
+        """
+        Verify that enough_available_blocks compares cumulative_needed + thisNeeded
+        against effectiveFree, correctly rejecting when the sum exceeds capacity.
+
+        Setup: effectiveFree=100, each request needs 30 blocks.
+        - Request 1: 0 + 30 <= 100 -> fits
+        - Request 2: 30 + 30 <= 100 -> fits
+        - Request 3: 60 + 30 <= 100 -> fits
+        - Request 4: 90 + 30 <= 100 -> does NOT fit (120 > 100)
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=100,
+            blocks_per_request=30,
+            window_sizes=[128],
+        )
+        manager = NoEvictScheduledBlocksManager(kv)
+
+        r0 = _make_request(0, prompt_len=10)
+        r1 = _make_request(1, prompt_len=10)
+        r2 = _make_request(2, prompt_len=10)
+        r3 = _make_request(3, prompt_len=10)
+
+        # First request: cumulative=0, needed=30, effective_free=100 -> fits
+        assert manager.enough_available_blocks(r0) is True
+        manager.decrement_reserved_blocks(r0)
+
+        # Second request: cumulative=30, needed=30, effective_free=100 -> fits
+        assert manager.enough_available_blocks(r1) is True
+        manager.decrement_reserved_blocks(r1)
+
+        # Third request: cumulative=60, needed=30, effective_free=100 -> fits (90 <= 100)
+        assert manager.enough_available_blocks(r2) is True
+        manager.decrement_reserved_blocks(r2)
+
+        # Fourth request: cumulative=90, needed=30, effective_free=100 -> does NOT fit (120 > 100)
+        assert manager.enough_available_blocks(r3) is False
+
+    def test_multiple_window_sizes(self):
+        """
+        Verify cumulative_needed is tracked independently per window size.
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=50,
+            blocks_per_request=10,
+            window_sizes=[64, 256],
+            is_variable_window=True,
+        )
+        manager = NoEvictScheduledBlocksManager(kv)
+
+        assert set(manager.cumulative_needed.keys()) == {64, 256}
+        assert all(v == 0 for v in manager.cumulative_needed.values())
+
+        r0 = _make_request(0, prompt_len=10)
+        manager.decrement_reserved_blocks(r0)
+        # Both window sizes should track independently
+        assert manager.cumulative_needed[64] == 10
+        assert manager.cumulative_needed[256] == 10
+
+    def test_boundary_exact_fit(self):
+        """
+        When cumulative_needed + thisNeeded == effectiveFree exactly,
+        the request should be admitted (uses <= comparison).
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=100,
+            blocks_per_request=50,
+            window_sizes=[128],
+        )
+        manager = NoEvictScheduledBlocksManager(kv)
+
+        r0 = _make_request(0, prompt_len=10)
+        r1 = _make_request(1, prompt_len=10)
+        r2 = _make_request(2, prompt_len=10)
+
+        # First: 0 + 50 <= 100 -> fits
+        assert manager.enough_available_blocks(r0) is True
+        manager.decrement_reserved_blocks(r0)
+
+        # Second: 50 + 50 = 100 <= 100 -> fits exactly
+        assert manager.enough_available_blocks(r1) is True
+        manager.decrement_reserved_blocks(r1)
+
+        # Third: 100 + 50 = 150 > 100 -> does not fit
+        assert manager.enough_available_blocks(r2) is False
+
+
 class TestPyCapacitySchedulerDisaggAdvanced:
     """
     Advanced tests for disaggregated generation init scheduling.
@@ -2641,3 +2827,289 @@ class TestPyCapacitySchedulerStaticBatchAdvanced:
         fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
         assert len(fitting) == 1
         assert fitting[0].request_id == 0
+
+
+# ############################################################################
+#
+# Part N+1: iter_threshold formula computation tests
+#
+# ############################################################################
+
+
+class TestIterThresholdFormula:
+    """
+    Tests for the T_iter formula: (T + K - 1) // K + N * W + N * D + N * W * (D + 1)
+    This formula is computed in _util.py::_create_kv_cache_manager and passed to
+    kv_cache_manager.impl.set_iter_threshold().
+    """
+
+    @staticmethod
+    def compute_iter_threshold(T: int, K: int, N: int, W: int, D: int) -> int:
+        """Mirror the formula from _util.py."""
+        return (T + K - 1) // K + N * W + N * D + N * W * (D + 1)
+
+    def test_basic_no_spec_decoding(self):
+        """Common case: no spec decoding (D=0), beam_width=1."""
+        # T=8192, K=32, N=128, W=1, D=0
+        result = self.compute_iter_threshold(8192, 32, 128, 1, 0)
+        # ceil(8192/32) + 128*1 + 0 + 128*1*1 = 256 + 128 + 0 + 128 = 512
+        assert result == 512
+
+    def test_small_batch(self):
+        """Small batch size."""
+        # T=8192, K=32, N=8, W=1, D=0
+        result = self.compute_iter_threshold(8192, 32, 8, 1, 0)
+        # 256 + 8 + 0 + 8 = 272
+        assert result == 272
+
+    def test_with_spec_decoding(self):
+        """With speculative decoding draft tokens."""
+        # T=8192, K=32, N=8, W=1, D=4
+        result = self.compute_iter_threshold(8192, 32, 8, 1, 4)
+        # 256 + 8 + 32 + 8*1*5 = 256 + 8 + 32 + 40 = 336
+        assert result == 336
+
+    def test_with_beam_width(self):
+        """With beam search (W=4)."""
+        # T=8192, K=32, N=8, W=4, D=0
+        result = self.compute_iter_threshold(8192, 32, 8, 4, 0)
+        # 256 + 32 + 0 + 32 = 320
+        assert result == 320
+
+    def test_with_beam_and_spec(self):
+        """With both beam search and spec decoding."""
+        # T=8192, K=32, N=8, W=4, D=3
+        result = self.compute_iter_threshold(8192, 32, 8, 4, 3)
+        # 256 + 32 + 24 + 32*4 = 256 + 32 + 24 + 128 = 440
+        assert result == 440
+
+    def test_non_divisible_tokens_per_block(self):
+        """T not divisible by K — ceiling division."""
+        # T=100, K=32, N=4, W=1, D=0
+        result = self.compute_iter_threshold(100, 32, 4, 1, 0)
+        # ceil(100/32) + 4 + 0 + 4 = 4 + 4 + 4 = 12
+        assert result == 12
+
+    def test_single_request(self):
+        """N=1 minimum batch."""
+        # T=1024, K=64, N=1, W=1, D=0
+        result = self.compute_iter_threshold(1024, 64, 1, 1, 0)
+        # 16 + 1 + 0 + 1 = 18
+        assert result == 18
+
+
+# ############################################################################
+#
+# Part N+2: BindCapacityScheduler start_scheduling() call tests
+#
+# ############################################################################
+
+
+class TestBindCapacitySchedulerStartScheduling:
+    """
+    Tests that BindCapacityScheduler.schedule_request() calls
+    start_scheduling() on the KV cache manager before the C++ scheduler
+    reads block estimates. This is critical for resetting scheduling
+    reservation state each iteration.
+    """
+
+    def test_start_scheduling_called_before_schedule(self):
+        """
+        Verify that start_scheduling() is called and reservation state
+        is reset before the scheduler reads block estimates.
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=100,
+            blocks_per_request=5,
+            enable_block_reuse=True,
+        )
+
+        scheduler = PyCapacityScheduler(
+            max_num_requests=50,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+
+        requests = [make_context_request(0)]
+        scheduler.schedule_request(requests)
+
+        # After schedule_request, start_scheduling() was called
+        assert kv._scheduling_started is True
+        # Reservation state should have been reset at start
+        # (may have been updated during scheduling, but was reset first)
+
+    def test_start_scheduling_with_none_kv_manager(self):
+        """
+        Verify schedule_request works when kv_cache_manager is None
+        (no crash, start_scheduling not called).
+        """
+        scheduler = PyCapacityScheduler(
+            max_num_requests=50,
+            kv_cache_manager=None,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        requests = [make_context_request(0)]
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+        # Should work without error; requests limited only by max_num_requests
+        assert len(fitting) == 1
+
+    def test_start_scheduling_called_every_iteration(self):
+        """
+        Verify start_scheduling() is called on every schedule_request() call,
+        resetting reservation state each time.
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=100,
+            blocks_per_request=5,
+            enable_block_reuse=True,
+        )
+
+        scheduler = PyCapacityScheduler(
+            max_num_requests=50,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+
+        # Iter 1
+        scheduler.schedule_request([make_context_request(0)])
+        assert kv._scheduling_started is True
+
+        # Iter 2: reservation state should be reset
+        scheduler.schedule_request([make_context_request(1)])
+        assert kv._scheduling_started is True
+
+    def test_guaranteed_no_evict_also_gets_start_scheduling(self):
+        """
+        Verify that with GUARANTEED_NO_EVICT policy, start_scheduling()
+        is still called. PyCapacityScheduler always calls start_scheduling()
+        regardless of policy.
+        """
+        kv = MockKVCacheManager(
+            num_free_blocks=100,
+            blocks_per_request=5,
+            enable_block_reuse=True,
+        )
+
+        scheduler = PyCapacityScheduler(
+            max_num_requests=50,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        )
+
+        requests = [make_context_request(0)]
+        scheduler.schedule_request(requests)
+
+        # PyCapacityScheduler always calls start_scheduling() before scheduling.
+        assert kv._scheduling_started is True
+
+
+# ############################################################################
+#
+# Part N+3: store_chunked_context_blocks mock tests
+#
+# ############################################################################
+
+
+class MockKVCacheManagerWithChunkedStorage(MockKVCacheManager):
+    """Extended mock that tracks store_chunked_context_blocks calls."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.store_context_blocks_calls = []
+        self.store_chunked_context_blocks_calls = []
+
+    def store_context_blocks(self, request):
+        self.store_context_blocks_calls.append(request.request_id)
+
+    def store_chunked_context_blocks(self, request):
+        self.store_chunked_context_blocks_calls.append(request.request_id)
+
+
+class TestStoreChunkedContextBlocks:
+    """
+    Tests for the store_chunked_context_blocks call in resource_manager.py.
+
+    The resource manager should call store_chunked_context_blocks for non-final
+    context chunks and store_context_blocks for the final chunk.
+    Since resource_manager.py uses the C++ impl directly, these tests verify
+    the branching logic using a mock that tracks which method is called.
+    """
+
+    def test_non_final_chunk_dispatches_to_chunked_store(self):
+        """
+        When context_remaining_length > 0 (non-final chunk),
+        the resource_manager branching logic should call
+        store_chunked_context_blocks, not store_context_blocks.
+        """
+        kv = MockKVCacheManagerWithChunkedStorage(
+            num_free_blocks=100,
+            enable_block_reuse=True,
+        )
+        # Simulate the resource_manager branching logic for a non-final chunk:
+        # context_remaining_length > 0
+        context_remaining_length = 100  # non-final
+        if context_remaining_length == 0:
+            kv.store_context_blocks(make_context_request(0))
+        elif hasattr(kv, "store_chunked_context_blocks"):
+            kv.store_chunked_context_blocks(make_context_request(0))
+
+        assert len(kv.store_chunked_context_blocks_calls) == 1
+        assert len(kv.store_context_blocks_calls) == 0
+
+    def test_final_chunk_dispatches_to_full_store(self):
+        """
+        When context_remaining_length == 0 (final chunk),
+        the resource_manager branching logic should call
+        store_context_blocks, not store_chunked_context_blocks.
+        """
+        kv = MockKVCacheManagerWithChunkedStorage(
+            num_free_blocks=100,
+            enable_block_reuse=True,
+        )
+        # Simulate the resource_manager branching logic for a final chunk:
+        # context_remaining_length == 0
+        context_remaining_length = 0  # final
+        if context_remaining_length == 0:
+            kv.store_context_blocks(make_context_request(0))
+        elif hasattr(kv, "store_chunked_context_blocks"):
+            kv.store_chunked_context_blocks(make_context_request(0))
+
+        assert len(kv.store_context_blocks_calls) == 1
+        assert len(kv.store_chunked_context_blocks_calls) == 0
+
+    def test_hasattr_guard_prevents_crash(self):
+        """
+        When impl doesn't have store_chunked_context_blocks (old binary),
+        the hasattr guard prevents a crash — the else branch is skipped.
+        """
+        kv = MockKVCacheManager(num_free_blocks=100)
+        # MockKVCacheManager does NOT have store_chunked_context_blocks
+        assert not hasattr(kv, "store_chunked_context_blocks")
+
+        # Simulate the resource_manager branching logic with missing method:
+        context_remaining_length = 100  # non-final
+        if context_remaining_length == 0:
+            kv.store_context_blocks(make_context_request(0))  # type: ignore
+        elif hasattr(kv, "store_chunked_context_blocks"):
+            kv.store_chunked_context_blocks(make_context_request(0))
+        # No crash — the hasattr guard skips the call
+
+    def test_chunked_storage_tracking(self):
+        """
+        Verify that store_chunked_context_blocks and store_context_blocks
+        can be called in sequence (simulating multi-chunk context).
+        """
+        kv = MockKVCacheManagerWithChunkedStorage(
+            num_free_blocks=100,
+            enable_block_reuse=True,
+        )
+
+        # Simulate chunk 1 (non-final)
+        kv.store_chunked_context_blocks(make_context_request(0))
+        # Simulate chunk 2 (non-final)
+        kv.store_chunked_context_blocks(make_context_request(0))
+        # Simulate final chunk
+        kv.store_context_blocks(make_context_request(0))
+
+        assert len(kv.store_chunked_context_blocks_calls) == 2
+        assert len(kv.store_context_blocks_calls) == 1

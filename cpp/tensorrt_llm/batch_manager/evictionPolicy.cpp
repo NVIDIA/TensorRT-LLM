@@ -30,6 +30,8 @@ auto const kMinPriority = executor::KvCacheRetentionConfig::kMinRetentionPriorit
 auto const kMaxPriority = executor::KvCacheRetentionConfig::kMaxRetentionPriority;
 
 auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority;
+// No longer used for priority boosting (pinning replaced it), but kept for backward compat.
+auto const kRadixTreeBlockPriority = kDefaultPriority + 10;
 executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
 int const kNumCacheLevels = 2;
@@ -48,7 +50,7 @@ SizeType32 getPriorityIdx(executor::RetentionPriority priority)
 } // namespace
 
 void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
-    std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
+    std::optional<executor::RetentionPriority> secondaryOffloadMinPriority, bool enableRadixTreeBoosting)
 {
     SizeType32 startIdx = 0;
 
@@ -71,6 +73,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
         startIdx += sizes[cacheLevel];
     }
     mNumFreeBlocksPerLevel = sizes;
+    mEnableRadixTreeBoosting = enableRadixTreeBoosting;
 
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultSecondaryOffloadMinPriority);
 }
@@ -138,6 +141,14 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     TLLM_CHECK_WITH_INFO(!block->isPlaceholder(), "Attempted to release a placeholder block into the eviction queue");
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
+
+    // When block reuse is enabled, blocks in the radix tree (reusable by future requests)
+    // are boosted above the default priority so truly-free blocks are evicted first.
+    // This preserves cached data longer, increasing reuse opportunities for future requests.
+    if (mEnableRadixTreeBoosting && block->isShared() && block->getPriority() == kDefaultPriority)
+    {
+        block->setPriority(kRadixTreeBlockPriority);
+    }
 
     // If there are no children, this is a leaf block. Insert into a queue.
     auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
@@ -223,6 +234,82 @@ void LRUEvictionPolicy::refresh()
         }
         block->setPriority(kDefaultPriority);
     }
+}
+
+SizeType32 LRUEvictionPolicy::getNumTrulyFreeBlocks(SizeType32 cacheLevel)
+{
+    // Count blocks at priority below kRadixTreeBlockPriority (i.e., truly empty blocks
+    // that don't hold cached radix-tree data). These are evicted before cached blocks.
+    SizeType32 count = 0;
+    auto const radixIdx = getPriorityIdx(kRadixTreeBlockPriority);
+    for (SizeType32 level = 0; level < radixIdx; ++level)
+    {
+        count += static_cast<SizeType32>(mFreeQueues[cacheLevel][level].size());
+    }
+    return count;
+}
+
+void LRUEvictionPolicy::boostReservedBlock(BlockPtr block)
+{
+    if (!mEnableRadixTreeBoosting)
+    {
+        // Block reuse is disabled — no pinning needed
+        return;
+    }
+
+    SizeType32 const cacheLevel = getCacheLevel(block);
+    SizeType32 const id = block->getBlockId();
+
+    if (mFreeBlockIterators[id] == std::nullopt)
+    {
+        // Block is not in the free pool (already claimed or already pinned) — nothing to do
+        return;
+    }
+
+    // Pin the block: remove from free queue so getFreeBlock() can never evict it.
+    // This guarantees the block survives until addSequence claims it, making
+    // estimatedReusableTokens accurate.
+    mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
+    mFreeBlockIterators[id] = std::nullopt;
+    mNumFreeBlocksPerLevel[cacheLevel]--;
+    mPinnedReservedBlocks.push_back(block);
+
+    TLLM_LOG_DEBUG("boostReservedBlock: pinned block %d (was priority %d), pinnedCount=%zu", id, block->getPriority(),
+        mPinnedReservedBlocks.size());
+}
+
+void LRUEvictionPolicy::unpinAllReservedBlocks()
+{
+    // Release all pinned blocks back to the free queue.
+    // Called at the start of each scheduling pass (startScheduling).
+    for (auto const& block : mPinnedReservedBlocks)
+    {
+        SizeType32 const cacheLevel = getCacheLevel(block);
+        SizeType32 const id = block->getBlockId();
+
+        if (mFreeBlockIterators[id] != std::nullopt)
+        {
+            // Already back in the free pool (e.g., claimed and released by addSequence) — skip
+            continue;
+        }
+
+        // If the block was claimed by addSequence (has refs), don't put it back in free queue
+        if (block->hasRefs())
+        {
+            continue;
+        }
+
+        // Put block back in free queue at its current priority
+        auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
+        mFreeBlockIterators[id] = q.insert(q.end(), block);
+        mNumFreeBlocksPerLevel[cacheLevel]++;
+    }
+    mPinnedReservedBlocks.clear();
+}
+
+void LRUEvictionPolicy::setEnableRadixTreeBoosting(bool enable)
+{
+    mEnableRadixTreeBoosting = enable;
 }
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy

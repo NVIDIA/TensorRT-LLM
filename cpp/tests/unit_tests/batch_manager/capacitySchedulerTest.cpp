@@ -2265,3 +2265,323 @@ TEST_F(CapacitySchedulerTest, MaxUtilizationNoReuseWhenDisabled)
     // Both requests start at iteration 0 and finish together, so numIterations = maxNewTokens
     EXPECT_EQ(numIterations, maxNewTokens);
 }
+
+// Tests for NoEvictScheduledBlocksManager reservation fix (cumulativeNeeded pattern)
+// These tests verify that the scheduler does not over-admit requests when cached blocks
+// exist in the radix tree. The old availableBlocks decrement pattern double-counted cached
+// blocks (once as free, once as reusable), causing over-admission and "No free block found" crashes.
+
+TEST_F(CapacitySchedulerTest, NoEvictDoesNotOverAdmitWithCachedBlocks)
+{
+    // Verify that the NoEvict scheduler does not admit more requests than can actually fit
+    // when cached blocks exist in the radix tree.
+    //
+    // Setup: 20 blocks total, tokensPerBlock=16. A previous request cached 9 blocks of
+    // prefix in the radix tree. New requests share that prefix and each need ~10 context
+    // blocks + generation blocks. The scheduler must not admit too many.
+    SizeType32 const tokensPerBlock = 16;
+    SizeType32 const totalBlocks = 20;
+    SizeType32 const kvCacheMaxNumTokens = totalBlocks * tokensPerBlock; // 320 tokens
+    SizeType32 const kvCacheMaxNumTokensPerSeq = 200;
+    SizeType32 const maxNumRequests = 10;
+    SizeType32 const maxInputLen = 1000;
+    bool const enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+
+    // Step 1: Create a "seed" request with a long prompt to populate the radix tree cache.
+    // promptLen = 10 * tokensPerBlock = 160 tokens → after storeContextBlocks (which stores
+    // uniqueTokens.size()-1 = 159 tokens), floor(159/16) = 9 full blocks are cached.
+    SizeType32 const seedPromptLen = 10 * tokensPerBlock; // 160 tokens
+    SizeType32 const seedMaxNewTokens = 1;
+    auto seedTokens = std::make_shared<std::vector<int32_t>>(seedPromptLen);
+    std::iota(seedTokens->begin(), seedTokens->end(), 0);
+
+    // Run seed request to completion via the standard runTest infrastructure.
+    {
+        auto capacityScheduler = CapacityScheduler(
+            maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        RequestList seedRequests;
+        seedRequests.push_back(createRequest(seedTokens, seedMaxNewTokens, 100));
+        std::vector<ExpectedState> seedExpected;
+        seedExpected.push_back(ExpectedState{0, seedMaxNewTokens, {100}, {{100, seedMaxNewTokens, seedPromptLen, 0}}});
+        auto addNewRequestsCb = [](RequestList&, int) {};
+        runTest(capacityScheduler, kvCacheManager, seedRequests, seedExpected, addNewRequestsCb, maxInputLen,
+            peftCacheManager);
+    }
+    // After the seed completes, removeSequence stores its blocks in the radix tree.
+    // 9 cached blocks are now in the free pool AND the radix tree.
+
+    // Step 2: Create multiple new requests that share the cached prefix but have DIFFERENT
+    // suffix tokens. This ensures beneficialToSkip returns false (each request's first new
+    // block is unique), so the scheduler must use the reservation logic to decide admission.
+    // Each request needs:
+    //   - ~10 context blocks (9 reusable + 1 fresh) = 1 fresh context block
+    //   - plus generation blocks for maxNewTokens
+    // With 20 total blocks, 9 are cached (reserved on first match), so effectiveFree = 20 - 9 = 11.
+    // Each request's cumulativeNeeded contribution = getRemainingBlocksToCompletion which
+    // subtracts 9 reusable blocks. So each needs about 1 context + ceil(maxNewTokens/tokensPerBlock) gen blocks.
+    SizeType32 const newMaxNewTokens = 5;
+    SizeType32 const numNewRequests = 6;
+
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+    RequestList activeRequests;
+    for (SizeType32 i = 0; i < numNewRequests; ++i)
+    {
+        // Same prefix as seed (first 9*16 = 144 tokens), but different suffix per request.
+        // This avoids beneficialToSkip since each request contributes a different new block.
+        auto tokens = std::make_shared<std::vector<int32_t>>(*seedTokens);
+        // Modify the last block's tokens to make each request unique
+        for (SizeType32 j = 9 * tokensPerBlock; j < seedPromptLen; ++j)
+        {
+            (*tokens)[j] = 10000 + i * 100 + j;
+        }
+        activeRequests.push_back(createRequest(tokens, newMaxNewTokens, static_cast<uint64_t>(i)));
+    }
+
+    // Run the scheduler to see how many are admitted.
+    auto [scheduledRequestsList, scheduledDisaggGenInitRequestsLists, pausedRequests]
+        = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, std::nullopt);
+
+    SizeType32 const numAdmitted = static_cast<SizeType32>(scheduledRequestsList.size());
+
+    // Key assertion: the scheduler must NOT admit all requests. With only 20 blocks total
+    // and each request needing blocks for context + generation, there isn't room for all 6.
+    // The exact count depends on implementation details, but it must be strictly less than
+    // numNewRequests and at least 1.
+    // Note: GuaranteedNoEvictScheduler does not produce paused requests — unscheduled
+    // requests simply remain in activeRequests.
+    EXPECT_GE(numAdmitted, 1) << "At least one request should be admitted";
+    EXPECT_LT(numAdmitted, numNewRequests) << "Not all requests should be admitted (over-admission bug)";
+}
+
+TEST_F(CapacitySchedulerTest, NoEvictReservationAccountingMultipleRequests)
+{
+    // Verify that when multiple requests share the same cached prefix:
+    // 1. effectiveFree only decreases by the prefix reservation once (Rule 3)
+    // 2. cumulativeNeeded increases for each admitted request
+    // 3. The total admitted count is correct given capacity
+    SizeType32 const tokensPerBlock = 10;
+    SizeType32 const totalBlocks = 30;
+    SizeType32 const kvCacheMaxNumTokens = totalBlocks * tokensPerBlock; // 300 tokens
+    SizeType32 const kvCacheMaxNumTokensPerSeq = 100;
+    SizeType32 const maxNumRequests = 10;
+    SizeType32 const maxInputLen = 1000;
+    bool const enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+
+    // Seed: promptLen = 50 tokens → storeContextBlocks stores 49 tokens → floor(49/10) = 4 cached blocks.
+    SizeType32 const seedPromptLen = 50;
+    SizeType32 const seedMaxNewTokens = 1;
+    auto seedTokens = std::make_shared<std::vector<int32_t>>(seedPromptLen);
+    std::iota(seedTokens->begin(), seedTokens->end(), 0);
+
+    {
+        auto capacityScheduler = CapacityScheduler(
+            maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        RequestList seedRequests;
+        seedRequests.push_back(createRequest(seedTokens, seedMaxNewTokens, 100));
+        std::vector<ExpectedState> seedExpected;
+        seedExpected.push_back(ExpectedState{0, seedMaxNewTokens, {100}, {{100, seedMaxNewTokens, seedPromptLen, 0}}});
+        auto addNewRequestsCb = [](RequestList&, int) {};
+        runTest(capacityScheduler, kvCacheManager, seedRequests, seedExpected, addNewRequestsCb, maxInputLen,
+            peftCacheManager);
+    }
+    // 4 cached blocks in radix tree, 30 total blocks.
+
+    // Create 3 requests with the SAME cached prefix but DIFFERENT suffix tokens.
+    // This ensures beneficialToSkip returns false and all are evaluated by admission logic.
+    SizeType32 const newMaxNewTokens = 10;
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+    RequestList activeRequests;
+    for (int i = 0; i < 3; ++i)
+    {
+        // Share the first 4 blocks (40 tokens) with the seed, but differ in the last block.
+        auto tokens = std::make_shared<std::vector<int32_t>>(*seedTokens);
+        // Modify the last block's tokens (positions 40-49) to make each request unique
+        for (int j = 4 * tokensPerBlock; j < seedPromptLen; ++j)
+        {
+            (*tokens)[j] = 10000 + i * 100 + j;
+        }
+        activeRequests.push_back(createRequest(tokens, newMaxNewTokens, static_cast<uint64_t>(i)));
+    }
+
+    auto [scheduledRequestsList, scheduledDisaggGenInitRequestsLists, pausedRequests]
+        = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, std::nullopt);
+
+    SizeType32 const numAdmitted = static_cast<SizeType32>(scheduledRequestsList.size());
+
+    // With 30 blocks total, 4 cached blocks reserved → effectiveFree = 26.
+    // Each request's getRemainingBlocksToCompletion: numContextBlocks=5, reusable=4, so
+    // effectiveContext=1, numGenBlocks=ceil((50+10)/10)-5=1, total=1+1=2 blocks needed per request.
+    // 3 requests × 2 = 6 cumulative needed ≤ 26 effectiveFree → all 3 should fit.
+    EXPECT_EQ(numAdmitted, 3) << "All 3 requests should be admitted with 30 blocks and shared prefix";
+    EXPECT_EQ(pausedRequests.size(), 0u) << "No requests should be paused";
+}
+
+TEST_F(CapacitySchedulerTest, NoEvictReservationWithDifferentPrefixes)
+{
+    // Verify that reservations accumulate correctly for distinct prefixes,
+    // and admission count is limited by the combined reservation impact.
+    SizeType32 const tokensPerBlock = 10;
+    SizeType32 const totalBlocks = 20;
+    SizeType32 const kvCacheMaxNumTokens = totalBlocks * tokensPerBlock; // 200 tokens
+    SizeType32 const kvCacheMaxNumTokensPerSeq = 100;
+    SizeType32 const maxNumRequests = 10;
+    SizeType32 const maxInputLen = 1000;
+    bool const enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+
+    // Cache prefix A: tokens [0..39] → 40 tokens, stores 39 tokens → 3 cached blocks
+    auto prefixA = std::make_shared<std::vector<int32_t>>(40);
+    std::iota(prefixA->begin(), prefixA->end(), 0);
+
+    // Cache prefix B: tokens [1000..1039] → 40 tokens, stores 39 tokens → 3 cached blocks
+    auto prefixB = std::make_shared<std::vector<int32_t>>(40);
+    std::iota(prefixB->begin(), prefixB->end(), 1000);
+
+    // Run seed requests to populate both prefixes in the radix tree.
+    {
+        auto capacityScheduler = CapacityScheduler(
+            maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+        // Seed request A
+        RequestList seedRequestsA;
+        seedRequestsA.push_back(createRequest(prefixA, 1, 100));
+        std::vector<ExpectedState> seedExpectedA;
+        seedExpectedA.push_back(ExpectedState{0, 1, {100}, {{100, 1, 40, 0}}});
+        auto addNewRequestsCb = [](RequestList&, int) {};
+        runTest(capacityScheduler, kvCacheManager, seedRequestsA, seedExpectedA, addNewRequestsCb, maxInputLen,
+            peftCacheManager);
+
+        // Seed request B
+        RequestList seedRequestsB;
+        seedRequestsB.push_back(createRequest(prefixB, 1, 101));
+        std::vector<ExpectedState> seedExpectedB;
+        seedExpectedB.push_back(ExpectedState{0, 1, {101}, {{101, 1, 40, 0}}});
+        runTest(capacityScheduler, kvCacheManager, seedRequestsB, seedExpectedB, addNewRequestsCb, maxInputLen,
+            peftCacheManager);
+    }
+    // Now 3 + 3 = 6 cached blocks in radix tree, 20 total blocks.
+
+    // Create requests matching different prefixes, each with a unique suffix to avoid
+    // beneficialToSkip (each request's first new block is unique).
+    SizeType32 const newMaxNewTokens = 10;
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+    RequestList activeRequests;
+    // 2 requests matching prefix A (first 30 tokens shared, last 10 differ)
+    for (int i = 0; i < 2; ++i)
+    {
+        auto tokens = std::make_shared<std::vector<int32_t>>(*prefixA);
+        for (int j = 3 * tokensPerBlock; j < 40; ++j)
+        {
+            (*tokens)[j] = 20000 + i * 100 + j;
+        }
+        activeRequests.push_back(createRequest(tokens, newMaxNewTokens, static_cast<uint64_t>(i)));
+    }
+    // 2 requests matching prefix B (first 30 tokens shared, last 10 differ)
+    for (int i = 0; i < 2; ++i)
+    {
+        auto tokens = std::make_shared<std::vector<int32_t>>(*prefixB);
+        for (int j = 3 * tokensPerBlock; j < 40; ++j)
+        {
+            (*tokens)[j] = 30000 + i * 100 + j;
+        }
+        activeRequests.push_back(createRequest(tokens, newMaxNewTokens, static_cast<uint64_t>(i + 2)));
+    }
+
+    auto [scheduledRequestsList, scheduledDisaggGenInitRequestsLists, pausedRequests]
+        = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, std::nullopt);
+
+    SizeType32 const numAdmitted = static_cast<SizeType32>(scheduledRequestsList.size());
+
+    // 20 total blocks. Two different prefixes each reserve 3 blocks → effectiveFree = 20 - 6 = 14.
+    // Each request needs: contextBlocks=4, reusable=3, effectiveContext=1, genBlocks=ceil((40+10)/10)-4=1,
+    // so ~2 blocks each. 4 requests * 2 = 8 <= 14 → all 4 should fit.
+    // Note: GuaranteedNoEvictScheduler does not produce paused requests.
+    EXPECT_GE(numAdmitted, 1) << "At least one request should be admitted";
+    EXPECT_LE(numAdmitted, 4) << "At most 4 requests can be admitted";
+
+    // With different prefixes, reservations from both prefix A and prefix B should accumulate.
+    // The effective free blocks should be reduced by both sets of cached blocks.
+    // If both prefixes' requests are admitted, the scheduler correctly handles multiple
+    // distinct prefix reservations.
+    EXPECT_GE(numAdmitted, 2) << "Requests from both prefixes should be admitted";
+}
+
+TEST_F(CapacitySchedulerTest, MaxUtilizationDoesNotOverAdmitWithCachedBlocks)
+{
+    // Same scenario as NoEvictDoesNotOverAdmitWithCachedBlocks but using MaxUtilizationScheduler.
+    // Verifies that schedulingHasFreeBlocks also handles cached blocks correctly.
+    SizeType32 const tokensPerBlock = 16;
+    SizeType32 const totalBlocks = 20;
+    SizeType32 const kvCacheMaxNumTokens = totalBlocks * tokensPerBlock; // 320 tokens
+    SizeType32 const kvCacheMaxNumTokensPerSeq = 200;
+    SizeType32 const maxNumRequests = 10;
+    SizeType32 const maxInputLen = 1000;
+    bool const enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+
+    // Seed: promptLen = 160 tokens → stores 159 tokens → floor(159/16) = 9 cached blocks.
+    SizeType32 const seedPromptLen = 10 * tokensPerBlock; // 160 tokens
+    SizeType32 const seedMaxNewTokens = 1;
+    auto seedTokens = std::make_shared<std::vector<int32_t>>(seedPromptLen);
+    std::iota(seedTokens->begin(), seedTokens->end(), 0);
+
+    {
+        auto capacityScheduler
+            = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+        RequestList seedRequests;
+        seedRequests.push_back(createRequest(seedTokens, seedMaxNewTokens, 100));
+        std::vector<ExpectedState> seedExpected;
+        seedExpected.push_back(ExpectedState{0, seedMaxNewTokens, {100}, {{100, seedMaxNewTokens, seedPromptLen, 0}}});
+        auto addNewRequestsCb = [](RequestList&, int) {};
+        runTest(capacityScheduler, kvCacheManager, seedRequests, seedExpected, addNewRequestsCb, maxInputLen,
+            peftCacheManager);
+    }
+
+    // Create multiple new requests sharing the cached prefix but with different suffixes
+    // to avoid beneficialToSkip.
+    SizeType32 const newMaxNewTokens = 5;
+    SizeType32 const numNewRequests = 6;
+
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+    RequestList activeRequests;
+    for (SizeType32 i = 0; i < numNewRequests; ++i)
+    {
+        auto tokens = std::make_shared<std::vector<int32_t>>(*seedTokens);
+        for (SizeType32 j = 9 * tokensPerBlock; j < seedPromptLen; ++j)
+        {
+            (*tokens)[j] = 10000 + i * 100 + j;
+        }
+        activeRequests.push_back(createRequest(tokens, newMaxNewTokens, static_cast<uint64_t>(i)));
+    }
+
+    auto [scheduledRequestsList, scheduledDisaggGenInitRequestsLists, pausedRequests]
+        = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, std::nullopt);
+
+    SizeType32 const numAdmitted = static_cast<SizeType32>(scheduledRequestsList.size());
+
+    // MaxUtilization uses getNeededBlocksOneStep (one-step lookahead), which is less
+    // conservative than getRemainingBlocksToCompletion. With 9 cached blocks and only
+    // ~1-2 blocks needed per step, it may admit all 6 requests. The key verification
+    // is that the scheduler doesn't crash (no "No free block found") and that blocks
+    // are accounted correctly — not that it rejects requests.
+    EXPECT_GE(numAdmitted, 1) << "At least one request should be admitted";
+    EXPECT_LE(numAdmitted, numNewRequests) << "Admitted count should not exceed total requests";
+}

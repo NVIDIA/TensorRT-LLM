@@ -34,7 +34,7 @@ public:
     // TODO(TRTLLM-1564): Don't use a separate `initialize` function. Ensure eviction policies can't be in-between a
     // state of construction and initialization.
     virtual void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
-        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
+        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority, bool enableRadixTreeBoosting = false)
         = 0;
 
     /// @brief Get a free block from the specified cache level
@@ -45,11 +45,28 @@ public:
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
     /// @brief Get the amount of free blocks in the primary memory pool
     virtual SizeType32 getNumFreeBlocks(SizeType32 cacheLevel) = 0;
+    /// @brief Get the amount of free blocks in the primary memory pool that are NOT in the radix tree
+    /// (i.e. blocks at priority < kRadixTreeBlockPriority that will be evicted before cached blocks)
+    virtual SizeType32 getNumTrulyFreeBlocks(SizeType32 cacheLevel) = 0;
     /// @brief Claim a free block. Called when the cache manager allocates or reuses a new block
     virtual void claimBlock(BlockPtr block) = 0;
     virtual void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
         std::optional<std::chrono::milliseconds> durationMs)
         = 0;
+    /// @brief Pin a reserved block so it cannot be evicted by getFreeBlock().
+    /// @details Called by countReusableBlocks when a cached block is counted as reusable.
+    /// The block is removed from the free queue and tracked separately.
+    /// Must call unpinAllReservedBlocks() at the start of each scheduling pass to release them.
+    virtual void boostReservedBlock(BlockPtr block) = 0;
+
+    /// @brief Release all pinned reserved blocks back to the free queue.
+    /// @details Called by startScheduling() at the beginning of each scheduling pass.
+    virtual void unpinAllReservedBlocks() = 0;
+
+    /// @brief Enable or disable radix-tree block boosting and pinning.
+    /// @details Should be set to true when block reuse is enabled.
+    virtual void setEnableRadixTreeBoosting(bool enable) = 0;
+
     /// @brief Perform any per-iteration bookkeeping
     virtual void refresh() = 0;
 
@@ -71,17 +88,23 @@ class LRUEvictionPolicy : public BaseEvictionPolicy
 {
 public:
     void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
-        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority) override;
+        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
+        bool enableRadixTreeBoosting = false) override;
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel) override;
 
     void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;
 
     SizeType32 getNumFreeBlocks(SizeType32 cacheLevel) override;
+    SizeType32 getNumTrulyFreeBlocks(SizeType32 cacheLevel) override;
 
     void claimBlock(BlockPtr block) override;
     void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
         std::optional<std::chrono::milliseconds> durationMs) override;
+
+    void boostReservedBlock(BlockPtr block) override;
+    void unpinAllReservedBlocks() override;
+    void setEnableRadixTreeBoosting(bool enable) override;
 
     // Check the expiring blocks heap, and move expired blocks back to the default queue.
     void refresh() override;
@@ -98,6 +121,12 @@ private:
     std::vector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
     // Amount of free blocks at each cache level
     std::vector<SizeType32> mNumFreeBlocksPerLevel;
+    // Blocks pinned by boostReservedBlock — removed from free queues to prevent eviction.
+    // Released back by unpinAllReservedBlocks() at the start of each scheduling pass.
+    std::vector<BlockPtr> mPinnedReservedBlocks;
+    // When true, radix-tree blocks are priority-boosted on release and pinned during scheduling.
+    // Set to true when block reuse is enabled; false otherwise.
+    bool mEnableRadixTreeBoosting{false};
     // Secondary offload threshold. Blocks below this priority won't be evicted.
     executor::RetentionPriority mSecondaryOffloadMinPriority;
     // Heap of block times

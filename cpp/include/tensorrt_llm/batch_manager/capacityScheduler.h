@@ -111,15 +111,14 @@ public:
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
-        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
+        kv_cache_manager::BaseKVCacheManager& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 protected:
     template <bool StaticBatchScheduling>
-    [[nodiscard]] std::tuple<RequestVector, RequestVector> impl(
-        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
+    [[nodiscard]] std::tuple<RequestVector, RequestVector> impl(kv_cache_manager::BaseKVCacheManager& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 private:
@@ -135,8 +134,8 @@ public:
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
-        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
+        kv_cache_manager::BaseKVCacheManager& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 };
 
@@ -165,7 +164,7 @@ public:
     [[nodiscard]] std::tuple<RequestVector, RequestVector, RequestVector> operator()(RequestList const& activeRequests,
         OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager = std::nullopt,
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager = std::nullopt) const;
 
 private:
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,

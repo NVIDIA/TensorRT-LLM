@@ -589,8 +589,7 @@ class KVCacheManager(BaseResourceManager):
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
                                   lora_task_id=lora_task_id)
-        num_blocks = self.impl.count_reusable_blocks(unique_tokens, dummy_req,
-                                                     False)
+        num_blocks = self.impl.count_reusable_blocks(unique_tokens, dummy_req)
         return num_blocks * self.tokens_per_block
 
     def shutdown(self):
@@ -819,13 +818,15 @@ class KVCacheManager(BaseResourceManager):
             if request.py_rewind_len > 0:
                 self.rewind_kv_cache(request, request.py_rewind_len)
 
-        # For context requests, store completed context blocks for KV cache reuse.
-        # We wait until context_remaining_length == 0 (all chunks processed) before
-        # storing, so that SWA windows are safe to store — blocks won't go out-of-window
-        # and be evicted while the context is still in-flight.
+        # For context requests, store blocks for KV cache reuse.
         for request in scheduled_batch.context_requests:
             if request.context_remaining_length == 0:
+                # Final chunk: store all context blocks (includes partial last block).
                 self.impl.store_context_blocks(request)
+            elif hasattr(self.impl, 'store_chunked_context_blocks'):
+                # Non-final chunk: store only complete blocks for early prefix sharing.
+                # SWA windows are skipped internally by storeChunkedContextBlocks.
+                self.impl.store_chunked_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,

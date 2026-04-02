@@ -966,6 +966,20 @@ void TrtGptModelInflightBatching::storeContextBlocks(std::shared_ptr<LlmRequest>
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::storeChunkedContextBlocks(std::shared_ptr<LlmRequest> const& llmReq)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    if (mKvCacheManager)
+    {
+        mKvCacheManager->storeChunkedContextBlocks(*llmReq);
+    }
+    if (mCrossKvCacheManager)
+    {
+        mCrossKvCacheManager->storeChunkedContextBlocks(*llmReq);
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::storeNewBlock(std::shared_ptr<LlmRequest> const& llmReq)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -1166,6 +1180,13 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                                 // iteration is expected.
                                 llmReq->setState(LlmRequestState::kGENERATION_TO_COMPLETE);
                             }
+                        }
+                        else
+                        {
+                            // Non-final chunk: store completed full blocks immediately so that
+                            // concurrent requests sharing the same prefix can find and reuse them
+                            // before this request finishes its full context phase.
+                            storeChunkedContextBlocks(llmReq);
                         }
                     }
                     else if (llmReq->isGenerationInProgressState())

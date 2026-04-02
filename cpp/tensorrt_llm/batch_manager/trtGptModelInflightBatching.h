@@ -265,6 +265,10 @@ private:
     //! These blocks become reusable from next step.
     void storeContextBlocks(std::shared_ptr<LlmRequest> const& req);
 
+    //! @brief Store full blocks from a completed (non-final) context chunk for early reuse.
+    //! Enables prefix sharing with concurrent requests before the full context finishes.
+    void storeChunkedContextBlocks(std::shared_ptr<LlmRequest> const& req);
+
     //! @brief Store newest kv cache block for reuse.
     //! The block become reusable from next step.
     void storeNewBlock(std::shared_ptr<LlmRequest> const& req);
