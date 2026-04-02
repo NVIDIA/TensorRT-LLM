@@ -1075,10 +1075,13 @@ class NoEvictScheduledBlocksManager:
         self.cumulative_needed: dict[int, int] = {ws: 0 for ws in window_sizes}
 
     def decrement_reserved_blocks(self, req: LlmRequest) -> None:
-        """Add this request's needed blocks to the cumulative total."""
+        """Add this request's needed blocks to the cumulative total, then pin."""
         for window_size in self.cumulative_needed:
             needed = self.kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
             self.cumulative_needed[window_size] += needed
+        # Pin reserved blocks now that the request is admitted.
+        # Deferred from countReusableBlocks so rejected requests don't lock out blocks.
+        self.kv_cache_manager.pin_newly_reserved_blocks()
         effective_free = dict(self.kv_cache_manager.get_effective_free_blocks_per_window_size())
         logger.debug(
             f"[NoEvict] After admitting request {req.request_id}: "
@@ -1159,6 +1162,8 @@ class MaxUtilizationScheduledBlocksManager:
                 f"for window size {window_size}"
             )
             self.num_scheduled_blocks[window_size] = blocks_if_scheduled
+        # Pin reserved blocks now that the request is admitted.
+        self.kv_cache_manager.pin_newly_reserved_blocks()
 
 
 class PyCapacityScheduler:

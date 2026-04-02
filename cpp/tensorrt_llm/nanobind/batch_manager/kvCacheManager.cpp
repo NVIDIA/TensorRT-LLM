@@ -362,6 +362,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("allocate_pools", &BaseKVCacheManager::allocatePools, nb::call_guard<nb::gil_scoped_release>())
         .def("release_pools", &BaseKVCacheManager::releasePools, nb::call_guard<nb::gil_scoped_release>())
         .def("start_scheduling", &BaseKVCacheManager::startScheduling, nb::call_guard<nb::gil_scoped_release>())
+        .def("pin_newly_reserved_blocks", &BaseKVCacheManager::pinNewlyReservedBlocks,
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("tokens_per_block", &BaseKVCacheManager::getTokensPerBlock)
         .def_prop_ro("max_num_blocks", &BaseKVCacheManager::getMaxNumBlocks)
         .def_prop_ro("num_pools", &BaseKVCacheManager::getNumPools)

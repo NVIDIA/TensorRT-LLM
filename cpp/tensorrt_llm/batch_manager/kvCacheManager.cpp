@@ -960,6 +960,17 @@ void WindowBlockManager::setEnableRadixTreeBoosting(bool enable)
     mEvictionPolicy->setEnableRadixTreeBoosting(enable);
 }
 
+void WindowBlockManager::pinNewlyReservedBlocks()
+{
+    auto const listSize = static_cast<SizeType32>(mSchedulingReservedBlockList.size());
+    for (SizeType32 i = mSchedulingPinnedBlocks; i < listSize; ++i)
+    {
+        auto const blockId = mSchedulingReservedBlockList[i];
+        mEvictionPolicy->boostReservedBlock(mAllBlocksById[blockId]);
+    }
+    mSchedulingPinnedBlocks = listSize;
+}
+
 void WindowBlockManager::startScheduling()
 {
     // Release blocks pinned during the previous scheduling pass back to the free pool.
@@ -967,8 +978,10 @@ void WindowBlockManager::startScheduling()
     mEvictionPolicy->unpinAllReservedBlocks();
     mSchedulingNumFreeBlocks = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
     mSchedulingReservedBlocks = 0;
-    mSchedulingReservedBlockIds.clear(); // O(reserved), bucket array reused
-    TLLM_LOG_DEBUG("%s::startScheduling - freeBlocks=%d", mLogPrefix.c_str(), mSchedulingNumFreeBlocks);
+    mSchedulingPinnedBlocks = 0;
+    mSchedulingReservedBlockIds.clear();
+    mSchedulingReservedBlockList.clear();
+    TLLM_LOG_INFO("%s::startScheduling - freeBlocks=%d", mLogPrefix.c_str(), mSchedulingNumFreeBlocks);
     for (auto& [requestId, slotAllocatedBlocks] : mAllocatedBlocksPerSeq)
     {
         for (auto& allocatedBlock : slotAllocatedBlocks)
@@ -1051,7 +1064,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
             // sequence 0 is the dummy sequence for warm up
             if (originalOwnerSequenceId != 0)
             {
-                TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d was originally held but released from sequence %d",
+                TLLM_LOG_INFO("%s::getFreeBlock - Block %d was originally held but released from sequence %d",
                     mLogPrefix.c_str(), block->getBlockId(), originalOwnerSequenceId);
             }
             else
@@ -1061,7 +1074,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
             }
             if (block->isShared())
             {
-                TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is a radix tree block being evicted from sequence %d",
+                TLLM_LOG_INFO("%s::getFreeBlock - Block %d is a radix tree block being evicted from sequence %d",
                     mLogPrefix.c_str(), block->getBlockId(), originalOwnerSequenceId);
             }
 
@@ -1255,14 +1268,16 @@ SizeType32 WindowBlockManager::countReusableBlocks(VecUniqueTokens const& unique
         // by a prior request in this scheduling pass, reserve it now.
         // This deducts it from effective free so it's not double-counted.
         // Rule 3: if block ID is already in the set, a prior request reserved it — skip.
+        // Note: blocks are NOT pinned here — pinning is deferred to pinNewlyReservedBlocks()
+        // which is called only when the request is admitted. This prevents rejected requests
+        // from locking out blocks that other requests could use.
         auto const blockId = matchingBlock->getBlockId();
         if (!matchingBlock->hasRefs() && mSchedulingReservedBlockIds.count(blockId) == 0)
         {
             mSchedulingReservedBlockIds.insert(blockId);
+            mSchedulingReservedBlockList.push_back(blockId);
             ++mSchedulingReservedBlocks;
             ++newReservations;
-            // Boost priority so getFreeBlock() evicts truly-free blocks before reserved blocks
-            mEvictionPolicy->boostReservedBlock(matchingBlock);
         }
 
         searchRoot = std::move(matchingBlock);
@@ -1271,7 +1286,7 @@ SizeType32 WindowBlockManager::countReusableBlocks(VecUniqueTokens const& unique
     // Store the allocated-only count for diagnostics and logging.
     mLastAllocatedReusableBlocks = allocatedReusableBlocks;
 
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_INFO(
         "%s::countReusableBlocks - request %lu: %d reusable (%d allocated), %d new reservations, "
         "%d total reserved, effectiveFree=%d",
         mLogPrefix.c_str(), llmRequest.mRequestId, reusableBlocks, allocatedReusableBlocks, newReservations,
@@ -2049,7 +2064,7 @@ void WindowBlockManager::storeChunkedContextBlocks(
         return;
     }
 
-    TLLM_LOG_DEBUG("%s::storeChunkedContextBlocks for request %lu, %d storable tokens (processedTokens=%d)",
+    TLLM_LOG_INFO("%s::storeChunkedContextBlocks for request %lu, %d storable tokens (processedTokens=%d)",
         mLogPrefix.c_str(), requestId, numStorableTokens, processedTokens);
 
     // allowPartial=false: only complete blocks are stored. The partial block at the end of a
@@ -2351,6 +2366,11 @@ void KVCacheManager::startScheduling()
     mBlockManager.startScheduling();
 }
 
+void KVCacheManager::pinNewlyReservedBlocks()
+{
+    mBlockManager.pinNewlyReservedBlocks();
+}
+
 void KVCacheManager::setIterThreshold(SizeType32 /*iterThreshold*/)
 {
     // No-op: iterThreshold is no longer used. Reservation-based scheduling replaces adaptive onlyAllocated.
@@ -2399,7 +2419,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // Safe to credit all reusable blocks because boostReservedBlock pins cached blocks
             // in the eviction policy — they cannot be evicted before addSequence claims them.
             req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
-            TLLM_LOG_DEBUG(
+            TLLM_LOG_INFO(
                 "getNeededBlocksOneStep: request %lu, totalNeeded=%d, reusable=%d, netNeeded=%d, "
                 "estimatedReusableTokens=%d",
                 req.mRequestId, numSharedBlocks + numUnSharedBlocks, reusableSharedBlocks, numRequiredBlocks,
@@ -2514,7 +2534,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
         result = (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
     }
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_INFO(
         "getRemainingBlocksToCompletion: request %lu, contextBlocks=%d, reusable=%d, effectiveContext=%d, remaining=%d",
         req.mRequestId, numContextBlocks, numReusableContextBlocks, effectiveContextBlocks, result);
     return result;
@@ -2657,13 +2677,13 @@ void KVCacheManager::addSequence(
     if (!mBlockManager.isSequenceHeld(requestId))
     {
         mBlockManager.holdSequence(requestId);
-        TLLM_LOG_DEBUG(
+        TLLM_LOG_INFO(
             "[kv cache manager] Encounter new sequence %d, initialize sequence storage validity for all window sizes",
             requestId);
     }
     else
     {
-        TLLM_LOG_DEBUG(
+        TLLM_LOG_INFO(
             "[kv cache manager] Encounter existing sequence %d, skip sequence storage validity initialization",
             requestId);
     }
@@ -2707,7 +2727,7 @@ void KVCacheManager::addSequence(
     // Set the prepopulated prompt length once using the minimum across all windows
     if (llmRequest && mEnableBlockReuse)
     {
-        TLLM_LOG_DEBUG("KVCacheManager::addSequence: Setting prepopulatedPromptLen to %d", minPrepopulatedPromptLen);
+        TLLM_LOG_INFO("KVCacheManager::addSequence: Setting prepopulatedPromptLen to %d", minPrepopulatedPromptLen);
         llmRequest->setPrepopulatedPromptLen(minPrepopulatedPromptLen, getTokensPerBlock());
         // Clear the scheduling estimate now that the authoritative value is set.
         // This prevents subsequent chunks from double-counting reusable tokens.
@@ -2814,7 +2834,7 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     if (mBlockManager.isSequenceHeld(requestId))
     {
         mBlockManager.releaseSequence(requestId);
-        TLLM_LOG_DEBUG("Remove sequence %d, release sequence storage validity for all window sizes", requestId);
+        TLLM_LOG_INFO("Remove sequence %d, release sequence storage validity for all window sizes", requestId);
     }
     TLLM_CHECK(!mBlockManager.isSequenceHeld(requestId));
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);

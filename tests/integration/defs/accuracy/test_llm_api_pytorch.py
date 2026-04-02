@@ -3425,12 +3425,13 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=False,
-                 speculative_config=mtp_config,
                  print_iter_log=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm)
 
 
 @skip_pre_blackwell

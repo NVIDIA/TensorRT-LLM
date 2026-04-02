@@ -626,6 +626,12 @@ public:
     //! \brief Enable radix-tree block boosting and pinning. Called when block reuse is enabled.
     void setEnableRadixTreeBoosting(bool enable);
 
+    //! \brief Pin reserved blocks that haven't been pinned yet.
+    //! \details Called after a request is admitted. Pins blocks from mSchedulingReservedBlockList
+    //! starting from mSchedulingPinnedBlocks index. This defers pinning to admission time so
+    //! rejected requests don't lock out blocks from other requests.
+    void pinNewlyReservedBlocks();
+
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
     //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
     [[nodiscard]] SizeType32 addSequence(
@@ -1021,7 +1027,11 @@ private:
     // Cleared at each startScheduling() call. Memory is proportional to reserved
     // blocks (bounded by prefix length), not total blocks.
     std::unordered_set<KVCacheBlock::IdType> mSchedulingReservedBlockIds;
+    // Ordered list of reserved block IDs for incremental pinning.
+    std::vector<KVCacheBlock::IdType> mSchedulingReservedBlockList;
     SizeType32 mSchedulingReservedBlocks{0};
+    // How many entries in mSchedulingReservedBlockList have been pinned so far.
+    SizeType32 mSchedulingPinnedBlocks{0};
     // Count of reusable blocks with active refs from the last countReusableBlocks call.
     // Used for diagnostics and logging.
     SizeType32 mLastAllocatedReusableBlocks{0};
@@ -1219,6 +1229,14 @@ public:
         for (auto& [_, manager] : mWindowBlockManagers)
         {
             manager.setEnableRadixTreeBoosting(enable);
+        }
+    }
+
+    void pinNewlyReservedBlocks()
+    {
+        for (auto& [_, manager] : mWindowBlockManagers)
+        {
+            manager.pinNewlyReservedBlocks();
         }
     }
 
@@ -1618,6 +1636,11 @@ public:
 
     virtual void startScheduling() = 0;
 
+    //! \brief Pin reserved blocks that haven't been pinned yet.
+    //! \details Called after a request is admitted. Defers pinning to admission time
+    //! so rejected requests don't lock out blocks from other requests.
+    virtual void pinNewlyReservedBlocks() {}
+
     [[nodiscard]] virtual SizeType32 getTokensPerBlock() const = 0;
 
     [[nodiscard]] virtual SizeType32 getMaxNumBlocks() const = 0;
@@ -1924,6 +1947,7 @@ public:
     void releasePools() override;
 
     void startScheduling() override;
+    void pinNewlyReservedBlocks() override;
 
     [[nodiscard]] SizeType32 getTokensPerBlock() const override
     {

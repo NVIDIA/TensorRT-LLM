@@ -80,7 +80,7 @@ bool oneManagerBeneficialToSkip(tensorrt_llm::batch_manager::kv_cache_manager::B
         {
             // newContextBlock was contributed by earlier scheduled request.
             // Better to skip this step so we can reuse.
-            TLLM_LOG_DEBUG(
+            TLLM_LOG_INFO(
                 "[NoEvict] Request %lu: beneficialToSkip=true, first new block contributed by "
                 "another in-flight context request (block will be reusable after that request's chunk completes)",
                 llmRequest->mRequestId);
@@ -92,7 +92,7 @@ bool oneManagerBeneficialToSkip(tensorrt_llm::batch_manager::kv_cache_manager::B
     }
     else
     {
-        TLLM_LOG_DEBUG(
+        TLLM_LOG_INFO(
             "[NoEvict] Request %lu: all context blocks already in KV cache, no skip needed", llmRequest->mRequestId);
     }
     // Either all context blocks are already in KV cache,
@@ -256,7 +256,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
             !req->isDisaggGenerationInitState()
             && (!req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState())))
         {
-            TLLM_LOG_DEBUG("[NoEvict] Request %lu skipped: state=%d, noScheduleUntil=%d, noScheduleAfter=%d",
+            TLLM_LOG_INFO("[NoEvict] Request %lu skipped: state=%d, noScheduleUntil=%d, noScheduleAfter=%d",
                 req->mRequestId, static_cast<int>(req->getState()), static_cast<int>(getNoScheduleUntilState()),
                 static_cast<int>(getNoScheduleAfterState()));
             continue;
@@ -309,7 +309,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     && beneficialToSkip(req, kvCacheManager, crossKvCacheManager, newlyContributedContextBlocks,
                         newlyContributedCrossContextBlocks))
                 {
-                    TLLM_LOG_DEBUG(
+                    TLLM_LOG_INFO(
                         "[NoEvict] Request %lu skipped: beneficialToSkip=true (reuse from another ctx request)",
                         req->mRequestId);
                     continue;
@@ -329,7 +329,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
                     auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
 
-                    TLLM_LOG_DEBUG(
+                    TLLM_LOG_INFO(
                         "[NoEvict] Request %lu admission check: enoughBlocks=%d, enoughCrossBlocks=%d, "
                         "isFirstContextChunk=%d, estimatedReusableTokens=%d",
                         req->mRequestId, enoughBlocks, enoughCrossBlocks, req->isFirstContextChunk(),
@@ -337,7 +337,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 
                     if (enoughBlocks && enoughCrossBlocks && neededPeftPages <= availablePeftPages)
                     {
-                        TLLM_LOG_DEBUG("[NoEvict] Request %lu ADMITTED", req->mRequestId);
+                        TLLM_LOG_INFO("[NoEvict] Request %lu ADMITTED", req->mRequestId);
                         scheduledRequests.emplace_back(req);
                         reservedBlocks.decrementReservedBlocks(*req);
                         if (reservedCrossBlocks)
@@ -350,7 +350,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     }
                     else if (!enoughBlocks || !enoughCrossBlocks)
                     {
-                        TLLM_LOG_DEBUG("[NoEvict] Request %lu REJECTED: enoughBlocks=%d, enoughCrossBlocks=%d",
+                        TLLM_LOG_INFO("[NoEvict] Request %lu REJECTED: enoughBlocks=%d, enoughCrossBlocks=%d",
                             req->mRequestId, enoughBlocks, enoughCrossBlocks);
                         // If one requests fails to be scheduled, break
                         break;
@@ -547,7 +547,7 @@ std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::opera
             {
                 throw std::runtime_error("Unsupported capacity scheduler policy");
             }
-            TLLM_LOG_DEBUG("[Summary] Capacity scheduler allows %d requests, pauses %d requests",
+            TLLM_LOG_INFO("[Summary] Capacity scheduler allows %d requests, pauses %d requests",
                 tmpFittingRequests.size(), pausedRequests.size());
 
             RequestVector fittingRequests;

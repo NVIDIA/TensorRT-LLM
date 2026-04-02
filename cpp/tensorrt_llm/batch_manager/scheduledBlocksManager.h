@@ -48,8 +48,15 @@ public:
     {
         for (auto& [windowSize, cumNeeded] : mCumulativeNeeded)
         {
-            cumNeeded += mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
+            auto const needed = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
+            cumNeeded += needed;
+            auto const effectiveFree = mKvCacheManager.getBlockManager().getEffectiveFreeBlocks(windowSize);
+            TLLM_LOG_INFO("[NoEvict] After admitting request %lu: ws=%d, needed=%d, cumNeeded=%d, effectiveFree=%d",
+                req.mRequestId, windowSize, needed, cumNeeded, effectiveFree);
         }
+        // Pin the reserved blocks now that the request is admitted.
+        // Deferred from countReusableBlocks so rejected requests don't lock out blocks.
+        mKvCacheManager.pinNewlyReservedBlocks();
     }
 
     bool enoughAvailableBlocks(LlmRequest const& req)
@@ -60,6 +67,9 @@ public:
                 auto const& [windowSize, cumNeeded] = pair;
                 auto const thisNeeded = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
                 auto const effectiveFree = mKvCacheManager.getBlockManager().getEffectiveFreeBlocks(windowSize);
+                TLLM_LOG_INFO("[NoEvict] Check request %lu: ws=%d, needed=%d, cumNeeded=%d, effectiveFree=%d, fits=%d",
+                    req.mRequestId, windowSize, thisNeeded, cumNeeded, effectiveFree,
+                    (cumNeeded + thisNeeded) <= effectiveFree);
                 return (cumNeeded + thisNeeded) <= effectiveFree;
             });
     }
@@ -119,6 +129,8 @@ public:
                 "MaxUtilizationScheduler: scheduled blocks %i for window size %i", blocksIfScheduled, windowSize);
             mNumScheduledBlocks.at(windowSize) = blocksIfScheduled;
         }
+        // Pin the reserved blocks now that the request is admitted.
+        mKvCacheManager.pinNewlyReservedBlocks();
     }
 
 private:
