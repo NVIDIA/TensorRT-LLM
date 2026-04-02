@@ -23,7 +23,6 @@ from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreT
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_olmo3 import Olmo3ForCausalLM
 from .modeling_openelm import OpenELMForCausalLM
-from .modeling_qwen2 import Qwen2ForCausalLM
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
@@ -66,7 +65,6 @@ __all__ = (
     "Phi4FlashForCausalLM",
     "Phi4MMForCausalLM",
     "Phi4VisionRForConditionalGeneration",
-    "Qwen2ForCausalLM",
     "Qwen3ForCausalLM",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
