@@ -1610,9 +1610,8 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
         feature_status[
             "disaggregated_serving"] = llm_args.cache_transceiver_config is not None
         feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
-        feature_status["mtp"] = (
-            isinstance(llm_args.speculative_config, MTPDecodingConfig)
-            and llm_args.speculative_config.num_nextn_predict_layers > 0)
+        feature_status["mtp"] = isinstance(llm_args.speculative_config,
+                                           MTPDecodingConfig)
         feature_status["eagle3_one_model"] = (
             isinstance(llm_args.speculative_config, EagleDecodingConfig)
             and llm_args.speculative_config.eagle3_one_model)

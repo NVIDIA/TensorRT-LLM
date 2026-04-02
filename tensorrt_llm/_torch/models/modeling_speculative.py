@@ -813,11 +813,16 @@ class MTPForCausalLM(nn.Module):
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
-        mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle_one_model(
-        ) else model_config.spec_config.num_nextn_predict_layers
+        checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
+        if spec_dec_mode.is_mtp_eagle_one_model():
+            mtp_num_layers = 1
+            mtp_repeat_count = model_config.spec_config.max_draft_len
+        else:
+            mtp_num_layers = min(model_config.spec_config.max_draft_len,
+                                 checkpoint_mtp_num_layers)
+            mtp_repeat_count = 1
 
-        moe_load_balancer_set_repeated_for_next_layer(
-            model_config.spec_config.num_nextn_predict_layers // mtp_num_layers)
+        moe_load_balancer_set_repeated_for_next_layer(mtp_repeat_count)
 
         self.mtp_layers = nn.ModuleList([
             mtp_layer(model_config, layer_idx + start_layer_idx,

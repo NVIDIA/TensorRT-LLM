@@ -143,7 +143,7 @@ kv_cache_config:
   mamba_ssm_philox_rounds: 5
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 5
+  max_draft_len: 5
   allow_advanced_sampling: true
 cuda_graph_config:
   max_batch_size: 64
