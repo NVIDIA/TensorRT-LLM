@@ -368,10 +368,7 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
 
     mConfig->mManager.add(address, mConfig->mTag,
         std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                             {
-                                                 CU_MEM_LOCATION_TYPE_DEVICE,
-                                                 device,
-                                             }},
+                                             CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, device}},
             alignedSize),
         std::move(configurators));
 
