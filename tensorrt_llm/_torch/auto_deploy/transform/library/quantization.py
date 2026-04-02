@@ -405,9 +405,9 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         return ([scales["input_scale"]], [scales["weight_scale"], scales["alpha"]], [], [])
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
-        # Prepend prefix so the hook works when the GraphModule is a submodule
-        # of the model on which load_state_dict is called (e.g., VLM models
-        # where the text model lives at model.language_model.*).
+        # Prepend prefix: Qwen3.5 full-model export keeps the GraphModule as a
+        # submodule of the parent (e.g. model.language_model.*), so state_dict
+        # keys include the parent prefix that weight_name alone does not have.
         weight_name = prefix + weight_name
         if weight_name in state_dict:
             input_scale_name = weight_name.rsplit(".", 1)[0] + ".input_scale"

@@ -148,7 +148,7 @@ class ExportToGM(BaseTransform):
         # "model.vision_model" separately.
         def _is_child(child: str, parent: str) -> bool:
             """Check if ``child`` is a child of ``parent``."""
-            # covers "a.b.c" is a parent of "a.b" or parent being "", i.e., root (a parent of all!)
+            # parent "" means full-model export, which is a parent of everything
             return parent == "" or child.startswith(f"{parent}.")
 
         sub_keys = [info.submodule_name for info in export_infos]
@@ -197,7 +197,7 @@ class ExportToGM(BaseTransform):
             e_info.post_process(sub_mod, sub_gm)
 
             # set the sub graph module
-            if e_info.submodule_name == "":
+            if e_info.is_full_model_export:
                 mod = sub_gm
             else:
                 mod.set_submodule(e_info.submodule_name, sub_gm)
