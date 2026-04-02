@@ -20,18 +20,12 @@ from build_and_run_ad import ExperimentConfig, main
                 },
             },
         ),
-        (
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
-                },
-                "mode": "transformers",
-            },
-        ),
     ],
 )
 def test_build_ad(world_size: int, model_hub_id: str, llm_extra_args: dict):
+    # TODO: Revisit transformers-mode multigpu smoke coverage for Llama 3.1 specifically.
+    # This test keeps only the maintained graph-model AutoDeploy path for
+    # meta-llama/Meta-Llama-3.1-8B-Instruct; mode="transformers" is deprecated.
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
 
     experiment_config["args"]["world_size"] = world_size
