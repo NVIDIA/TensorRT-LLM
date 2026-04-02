@@ -1054,6 +1054,27 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_model_arch: Literal["llama3", "mistral_large3"] = Field(
         default="llama3",
         description="The model architecture of the eagle3 model.")
+    # If true, uses rejection sampling for draft token acceptance instead of strict token equality.
+    # Rejection sampling provides lossless acceleration that exactly matches the target model's
+    # distribution. Requires allow_advanced_sampling=True. Only applicable to 1-model code paths.
+    use_rejection_sampling: bool = Field(
+        default=False,
+        description=
+        "If true, uses rejection sampling for draft token acceptance instead of "
+        "strict token equality. Rejection sampling provides lossless acceleration "
+        "that exactly matches the target model's distribution. Requires "
+        "allow_advanced_sampling=True. Only applicable to 1-model code paths. "
+        "PyTorch backend only.")
+
+    @field_validator('use_rejection_sampling')
+    @classmethod
+    def validate_use_rejection_sampling(cls, v, info):
+        if v and not info.data.get('allow_advanced_sampling', False):
+            raise ValueError(
+                "use_rejection_sampling=True requires allow_advanced_sampling=True. "
+                "Please set allow_advanced_sampling=True to enable rejection sampling."
+            )
+        return v
 
     @field_validator('eagle_choices', mode='before')
     @classmethod
@@ -1081,7 +1102,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
             )
 
         self.num_eagle_layers = self.max_draft_len
-        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -1122,10 +1142,30 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 raise ValueError(
                     "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
                 )
-            if self.max_total_draft_tokens is None or self.max_total_draft_tokens <= 0:
-                raise ValueError(
-                    "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+
+        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
+            self.use_dynamic_tree = True
+            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK is required for dynamic tree"
+            assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
+            total_history_draft_tokens = self.dynamic_tree_max_topK + self.dynamic_tree_max_topK * self.dynamic_tree_max_topK * (
+                self.max_draft_len - 1)
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
+
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
+            else:
+                assert self.max_total_draft_tokens >= self.max_draft_len, f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
+                assert self.max_total_draft_tokens <= self.dynamic_tree_max_topK * self.max_draft_len, (
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
+                    f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
+                )
+
+        # Linear tree
+        if self.max_total_draft_tokens is None:
+            self.max_total_draft_tokens = self.max_draft_len
 
         return self
 
@@ -1182,6 +1222,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
+
+    max_batch_size: Optional[int] = Field(
+        default=None,
+        description="Max batch size for pre-allocating dynamic tree buffers. "
+        "Required when use_dynamic_tree=True.")
 
     # Suffix Automaton speculative decoding settings
     use_sa_spec: Optional[bool] = Field(
@@ -2101,8 +2146,8 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
+        Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
-        Eagle3DecodingConfig,
         LookaheadDecodingConfig,
         MedusaDecodingConfig,
         MTPDecodingConfig,

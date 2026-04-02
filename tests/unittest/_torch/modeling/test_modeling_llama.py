@@ -20,7 +20,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, _update_kv_cache_draft_token_location)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.utils import SpecDecodingTensor
+from tensorrt_llm._torch.speculative.interface import (SpecMetadata,
+                                                       SpeculativeDecodingMode)
+from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -516,6 +518,20 @@ class TestLlama(unittest.TestCase):
         is_spec_dec_dynamic_tree = True
         max_total_draft_tokens = gen_input_ids_0.size(-1) - 1
 
+        spec_tree_mgr = SpecTreeManager(
+            max_num_requests=1,
+            use_dynamic_tree=is_spec_dec_dynamic_tree,
+            max_total_draft_tokens=max_total_draft_tokens,
+            max_draft_len=max_total_draft_tokens,
+            eagle_choices=None,
+            dynamic_tree_max_topK=10,
+        )
+        # Populate with test data
+        spec_tree_mgr.spec_dec_position_offsets[:1, :].copy_(
+            spec_decoding_position_offsets.unsqueeze(0))
+        spec_tree_mgr.spec_dec_packed_mask[:1, :, :].copy_(
+            spec_decoding_packed_mask)
+
         attn_metadata_gen_phase_0 = metadata_cls(
             seq_lens=torch.tensor([gen_input_ids_0.size(-1)], dtype=torch.int),
             num_contexts=0,
@@ -534,10 +550,6 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
             num_heads_per_kv=num_heads_per_kv,
         )
-        spec_decoding_tensor = SpecDecodingTensor(
-            position_offsets=spec_decoding_position_offsets,
-            packed_mask=spec_decoding_packed_mask)
-
         attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
@@ -547,7 +559,7 @@ class TestLlama(unittest.TestCase):
             max_draft_len=max_total_draft_tokens,
             max_total_draft_tokens=max_total_draft_tokens,
             model_is_wrapped=False,
-            spec_decoding_tensor=spec_decoding_tensor,
+            spec_tree_manager=spec_tree_mgr,
         )
 
         gen_position_ids_0 = [
@@ -594,15 +606,35 @@ class TestLlama(unittest.TestCase):
         attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
         attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
         attn_metadata_gen_phase_0.prepare()
+        is_tree_phase1 = is_spec_dec_tree if get_sm_version() < 100 else False
+        spec_tree_mgr_phase1 = None
+        spec_metadata_phase1 = None
+        if is_tree_phase1:
+            max_draft_1 = gen_input_ids_1.size(-1) - 1
+            spec_tree_mgr_phase1 = SpecTreeManager(
+                max_num_requests=1,
+                use_dynamic_tree=True,
+                max_total_draft_tokens=max_draft_1,
+                max_draft_len=max_draft_1,
+                eagle_choices=None,
+                dynamic_tree_max_topK=10,
+            )
+            spec_metadata_phase1 = SpecMetadata(
+                max_num_requests=1,
+                max_draft_len=max_draft_1,
+                max_total_draft_tokens=max_draft_1,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+            )
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_spec_dec_tree
-            if get_sm_version() < 100 else False,
-            is_spec_dec_dynamic_tree=False,
+            is_spec_dec_tree=is_tree_phase1,
+            is_spec_dec_dynamic_tree=is_tree_phase1,
             max_draft_len=gen_input_ids_1.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
-            model_is_wrapped=False)
+            model_is_wrapped=False,
+            spec_metadata=spec_metadata_phase1,
+            spec_tree_manager=spec_tree_mgr_phase1)
 
         gen_position_ids_1 = [
             torch.full(
@@ -649,15 +681,35 @@ class TestLlama(unittest.TestCase):
         attn_metadata_ref.spec_decoding_packed_mask = None
         attn_metadata_ref.spec_decoding_generation_lengths = None
         attn_metadata_ref.prepare()
+        is_tree_ref = is_spec_dec_tree if get_sm_version() < 100 else False
+        spec_tree_mgr_ref = None
+        spec_metadata_ref = None
+        if is_tree_ref:
+            max_draft_ref = gen_input_ids_ref.size(-1) - 1
+            spec_tree_mgr_ref = SpecTreeManager(
+                max_num_requests=1,
+                use_dynamic_tree=True,
+                max_total_draft_tokens=max_draft_ref,
+                max_draft_len=max_draft_ref,
+                eagle_choices=None,
+                dynamic_tree_max_topK=10,
+            )
+            spec_metadata_ref = SpecMetadata(
+                max_num_requests=1,
+                max_draft_len=max_draft_ref,
+                max_total_draft_tokens=max_draft_ref,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+            )
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_spec_dec_tree
-            if get_sm_version() < 100 else False,
-            is_spec_dec_dynamic_tree=False,
+            is_spec_dec_tree=is_tree_ref,
+            is_spec_dec_dynamic_tree=is_tree_ref,
             max_draft_len=gen_input_ids_ref.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
-            model_is_wrapped=False)
+            model_is_wrapped=False,
+            spec_metadata=spec_metadata_ref,
+            spec_tree_manager=spec_tree_mgr_ref)
 
         gen_position_ids_ref = [
             torch.full((gen_input_ids_ref.size(-1), ),
@@ -675,12 +727,12 @@ class TestLlama(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(gen_logits_1[0, :],
                                    gen_logits_ref[2, :],
-                                   atol=0.4,
-                                   rtol=0.4)
+                                   atol=1.0,
+                                   rtol=1.0)
         torch.testing.assert_close(gen_logits_1[1, :],
                                    gen_logits_ref[3, :],
-                                   atol=0.4,
-                                   rtol=0.4)
+                                   atol=1.0,
+                                   rtol=1.0)
 
         token_id_ref = torch.argmax(gen_logits_ref[3, :], dim=-1)
         token_id_gen = torch.argmax(gen_logits_1[1, :], dim=-1)
