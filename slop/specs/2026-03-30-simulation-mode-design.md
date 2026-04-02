@@ -36,10 +36,11 @@ gantt
 | **1** | Config + predictor interface | `SimConfig` Pydantic model, `InferTimePredictor` ABC, constant predictor | **Done** |
 | **2** | AIConfigurator integration | Real batch time predictions via AIC SDK | **Done** |
 | **3** | Simulated clock | `SimClock`, no `time.sleep()`, accumulate predicted times | **Done** |
-| **3.5** | Single-process mode | Force single-process executor for sim, fix clock visibility | Planned |
-| **4** | Metrics output | `metrics.json`, `request.jsonl`, `iteration.jsonl` from simulated clock | Planned |
-| **5** | CLI integration | `trtllm-bench --mode sim` and/or `trtllm-serve --sim` | Planned |
-| **6** | Multi-GPU / distributed | TP/EP/PP support via config | Planned |
+| **3.5** | Single-process mode | Force single-process executor for sim, fix clock visibility, TP>1 | **Done** |
+| **4** | Metrics output | Per-request TTFT/TPOT/ITL, per-iteration breakdown, `metrics.json` | **Done** |
+| **5** | CLI integration | `trtllm-bench --mode sim` with dataset input | Planned |
+| **6** | Request arrival modeling | Staggered arrivals, `--request-rate`, online serving sim | Planned |
+| **7** | Multi-GPU / distributed | PP support, disagg KV transfer modeling | Planned |
 
 **Dropped**: Mock KV cache manager (GPU for KV cache is acceptable).
 
@@ -49,7 +50,10 @@ v1 (AIC-Sim) builds the serving sim infrastructure; Deep-Sim replaces only the
 prediction layer. Components designed for reusability: `SimClock`, `SimConfig`,
 `SimSampler`, single-process mode, metrics output, CLI integration.
 
-**Reordering rationale** (2026-03-31): Phases 3-6 were reordered from the original plan.
+**Reordering rationale** (2026-04-02): Phase 5 (CLI) moved before arrival modeling
+because `trtllm-bench` submits all requests at once (batch mode) — no arrival
+modeling needed for parity. Phase 6 (arrival modeling) is for future online
+serving simulation. TP>1 already works via SimDistributed (Phase 3.5).
 Simulated clock (originally Phase 6) was pulled forward because `time.sleep()` pollutes
 wall-clock measurements — metrics from Phase 4 need a virtual clock to be meaningful.
 GPU-free mode (originally Phase 4) was dropped — requiring a GPU for KV cache capacity
