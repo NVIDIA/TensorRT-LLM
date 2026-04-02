@@ -59,5 +59,11 @@ transforms:
     enabled: true
   gather_logits_before_lm_head:
     enabled: true
+  # Promote inner text-model GraphModule to top-level so compile_model
+  # can apply piecewise CUDA graph. Embedding and vision preprocessing
+  # are handled by a named_args hook outside the graph.
+  extract_text_model:
+    stage: post_load_fusion
+    run_per_gm: false
   compile_model:
     piecewise_enabled: true

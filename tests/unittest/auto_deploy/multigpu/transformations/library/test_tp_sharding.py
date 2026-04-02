@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 from _model_test_utils import FakeFineGrainedFP8Linear, FakeFP8Linear, MoEOpModel
-from torch._inductor.pattern_matcher import stable_topological_sort
 from _torch_test_utils import fp4_compatible, trtllm_ops_available
+from torch._inductor.pattern_matcher import stable_topological_sort
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
