@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/baaedfdb2d3f1d70b7dbcde08b083abfe6017a92/tests/utils.py
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,8 @@ class RemoteOpenAIServer:
         self.proc = subprocess.Popen(launch_cmd,
                                      env=env,
                                      stdout=self._get_output(),
-                                     stderr=self._get_output())
+                                     stderr=self._get_output(),
+                                     start_new_session=True)
         if wait:
             self.wait_for_server(timeout=self.MAX_SERVER_START_WAIT_S)
 
@@ -117,13 +119,26 @@ class RemoteOpenAIServer:
     def terminate(self):
         if self.proc is None:
             return
-        self.proc.terminate()
+        pid = self.proc.pid
+
+        # SIGTERM the process group first (graceful shutdown)
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            self.proc.terminate()
+
         try:
             self.proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            print(f"[teardown] SIGTERM timed out for PID {self.proc.pid}, "
+            print(f"[teardown] SIGTERM timed out for PID {pid}, "
                   "dumping stacks before SIGKILL...")
-            self._dump_stacks(self.proc.pid)
+            self._dump_stacks(pid)
+            # SIGKILL the entire process group
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except OSError:
+                pass
             self.proc.kill()
             self.proc.wait(timeout=30)
         try:
@@ -220,7 +235,8 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
         self.proc = subprocess.Popen(launch_cmd,
                                      env=env,
                                      stdout=self._get_output(),
-                                     stderr=self._get_output())
+                                     stderr=self._get_output(),
+                                     start_new_session=True)
         if wait_ready:
             self._wait_for_server(url=self.url_for("health"),
                                   timeout=self.MAX_SERVER_START_WAIT_S)
@@ -269,6 +285,7 @@ class RemoteMMEncoderServer(RemoteOpenAIServer):
 
         self.proc = subprocess.Popen(launch_cmd,
                                      stdout=self._get_output(),
-                                     stderr=self._get_output())
+                                     stderr=self._get_output(),
+                                     start_new_session=True)
         self._wait_for_server(url=self.url_for("health"),
                               timeout=self.MAX_SERVER_START_WAIT_S)
