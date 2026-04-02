@@ -80,6 +80,31 @@ class DynamicTreeOpsConverter:
         self._rej_accept_token_buf = torch.zeros(
             max_batch_size, max_path_len, dtype=torch.int64, device=device
         )
+        self._rej_seed_buf = torch.zeros(1, dtype=torch.int64, device=device)
+        self._rej_offset_buf = torch.zeros(1, dtype=torch.int64, device=device)
+
+    def _get_rejection_rng_tensor(
+        self,
+        value: int | torch.Tensor,
+        buffer: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        if isinstance(value, int):
+            buffer.fill_(value)
+            return buffer
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"{name} must be an int or torch.Tensor, got {type(value)!r}"
+            )
+        if value.dtype != torch.int64:
+            raise TypeError(f"{name} must be int64 tensor, got {value.dtype}")
+        if value.numel() < 1:
+            raise ValueError(f"{name} tensor must have at least one element")
+        if value.device != buffer.device:
+            raise ValueError(
+                f"{name} tensor must be on device {buffer.device}, got {value.device}"
+            )
+        return value.reshape(-1)[:1]
 
     def build_dynamic_tree(
         self,
@@ -217,8 +242,8 @@ class DynamicTreeOpsConverter:
         retrieve_next_sibling: torch.Tensor,
         num_gens: int,
         num_spec_step: int,
-        seed: int = 0,
-        offset: int = 0,
+        seed: int | torch.Tensor = 0,
+        offset: int | torch.Tensor = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tree-aware rejection sampling for speculative decoding (CUDA kernel).
 
@@ -257,6 +282,10 @@ class DynamicTreeOpsConverter:
         accept_index = self._rej_accept_index_buf[:num_gens]
         accept_token = self._rej_accept_token_buf[:num_gens]
         accept_tok_num = self._rej_accept_token_num_buf[:num_gens]
+        seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
+        offset_tensor = self._get_rejection_rng_tensor(
+            offset, self._rej_offset_buf, "offset"
+        )
 
         try:
             torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
@@ -269,8 +298,8 @@ class DynamicTreeOpsConverter:
                 accept_tok_num,
                 accept_token,
                 num_spec_step,
-                seed,
-                offset,
+                seed_tensor,
+                offset_tensor,
             )
         except Exception as e:
             raise RuntimeError(

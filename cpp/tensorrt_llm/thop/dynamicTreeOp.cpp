@@ -179,7 +179,7 @@ void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retri
 //! Accepts draft tokens by rejection sampling at each depth using pre-computed probabilities.
 void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& draftProbs, th::Tensor& targetProbs,
     th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling, th::Tensor& acceptIndex, th::Tensor& acceptTokenNum,
-    th::Tensor& acceptToken, int64_t numSpecStep, int64_t seed, int64_t offset)
+    th::Tensor& acceptToken, int64_t numSpecStep, th::Tensor& seed, th::Tensor& offset)
 {
     TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
     TORCH_CHECK(draftProbs.dim() == 3, "draftProbs must be 3D tensor");
@@ -209,6 +209,14 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
     TORCH_CHECK(acceptIndex.size(0) >= batchSize && acceptIndex.size(1) >= numSpecStep, "acceptIndex buffer too small");
     TORCH_CHECK(acceptTokenNum.size(0) >= batchSize, "acceptTokenNum buffer too small");
     TORCH_CHECK(acceptToken.size(0) >= batchSize && acceptToken.size(1) >= numSpecStep, "acceptToken buffer too small");
+    TORCH_CHECK(seed.scalar_type() == torch::kInt64, "seed must be int64 tensor");
+    TORCH_CHECK(offset.scalar_type() == torch::kInt64, "offset must be int64 tensor");
+    TORCH_CHECK(seed.numel() >= 1, "seed tensor must have at least one element");
+    TORCH_CHECK(offset.numel() >= 1, "offset tensor must have at least one element");
+    TORCH_CHECK(seed.is_cuda(), "seed must be CUDA tensor");
+    TORCH_CHECK(offset.is_cuda(), "offset must be CUDA tensor");
+    TORCH_CHECK(seed.device() == candidates.device(), "seed must be on the same device as candidates");
+    TORCH_CHECK(offset.device() == candidates.device(), "offset must be on the same device as candidates");
 
     auto stream = at::cuda::getCurrentCUDAStream(candidates.device().index());
 
@@ -219,8 +227,7 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
     tk::invokeVerifyDynamicTreeRejection(acceptIndex.data_ptr<int64_t>(), acceptTokenNum.data_ptr<int64_t>(),
         acceptToken.data_ptr<int64_t>(), candidates.data_ptr<int64_t>(), draftProbs.data_ptr<float>(),
         targetProbs.data_ptr<float>(), retrieveNextToken.data_ptr<int32_t>(), retrieveNextSibling.data_ptr<int32_t>(),
-        batchSize, numDraftTokens, numSpecStep, vocabSize, static_cast<uint64_t>(seed), static_cast<uint64_t>(offset),
-        stream);
+        batchSize, numDraftTokens, numSpecStep, vocabSize, seed.data_ptr<int64_t>(), offset.data_ptr<int64_t>(), stream);
 }
 
 } // namespace torch_ext
@@ -285,7 +292,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor candidates, Tensor draftProbs, Tensor targetProbs, "
         "Tensor retrieveNextToken, Tensor retrieveNextSibling, "
         "Tensor(a!) acceptIndex, Tensor(b!) acceptTokenNum, Tensor(c!) acceptToken, "
-        "int numSpecStep, int seed, int offset) -> ()");
+        "int numSpecStep, Tensor seed, Tensor offset) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

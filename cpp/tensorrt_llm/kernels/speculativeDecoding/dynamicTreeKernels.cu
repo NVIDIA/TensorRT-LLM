@@ -18,8 +18,6 @@
 #include "dynamicTreeKernels.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include <curand_kernel.h>
-
 TRTLLM_NAMESPACE_BEGIN
 
 using namespace tensorrt_llm::runtime;
@@ -406,6 +404,8 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
 //   terminates traversal for that request.
 // ------------------------------------------------------------
 
+#include <curand_kernel.h>
+
 __device__ int64_t sampleFromDistribution(curandStatePhilox4_32_10_t& state, float const* probs, uint32_t vocabSize)
 {
     float r = curand_uniform(&state);
@@ -438,21 +438,23 @@ __device__ int64_t sampleFromDistribution(curandStatePhilox4_32_10_t& state, flo
 //!                             (= max_path_len = max_draft_len + 1).
 //! \param numDraftTokens       total tree nodes per batch (including root).
 //! \param vocabSize            vocabulary size.
-//! \param seed                 Philox RNG seed.
-//! \param offset               Philox RNG offset (increment between calls for variety).
+//! \param seed                 [1] int64 on GPU. Philox RNG seed.
+//! \param offset               [1] int64 on GPU. Philox RNG offset.
 __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens,
-    uint32_t vocabSize, uint64_t seed, uint64_t offset)
+    uint32_t vocabSize, int64_t const* seed, int64_t const* offset)
 {
     uint32_t bx = blockIdx.x;
     if (bx >= batchSize)
+    {
         return;
+    }
 
     uint32_t batchOffset = bx * numDraftTokens;
 
     curandStatePhilox4_32_10_t state;
-    curand_init(seed, static_cast<uint64_t>(bx), offset, &state);
+    curand_init(static_cast<uint64_t>(seed[0]), static_cast<uint64_t>(bx), static_cast<uint64_t>(offset[0]), &state);
 
     // Root (depth 0): initialize path state at tree position 0.
     //
@@ -518,6 +520,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
             //   p(x) = pDraft  from the draft model proposal
             //   q(x) = pTarget from the target model verification distribution
             float acceptProb = fminf(1.0f, pTarget / (pDraft + 1e-10f));
+
             float u = curand_uniform(&state);
 
             if (u < acceptProb)
@@ -631,7 +634,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, SizeType32 batchSize, SizeType32 numDraftTokens, SizeType32 numSpecStep,
-    SizeType32 vocabSize, uint64_t seed, uint64_t offset, cudaStream_t stream)
+    SizeType32 vocabSize, int64_t const* seed, int64_t const* offset, cudaStream_t stream)
 {
     dim3 grid(batchSize);
     dim3 block(1);

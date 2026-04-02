@@ -109,13 +109,13 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
 //! \param numDraftTokens runtime::SizeType32. Total tree nodes per request (including root).
 //! \param numSpecStep    runtime::SizeType32. Second dim of acceptIndex/acceptToken.
 //! \param vocabSize      runtime::SizeType32. Vocabulary size.
-//! \param seed           uint64_t. Philox RNG seed.
-//! \param offset         uint64_t. Philox RNG offset.
+//! \param seed           [1] int64 on GPU. Philox RNG seed.
+//! \param offset         [1] int64 on GPU. Philox RNG offset.
 //! \param stream         cudaStream_t.
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens,
-    runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize, uint64_t seed, uint64_t offset,
+    runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize, int64_t const* seed, int64_t const* offset,
     cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
