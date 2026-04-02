@@ -644,7 +644,7 @@ class Attention(nn.Module):
         return q, k, v
 
     def _use_quantize_output(self):
-        # If o_proj can't assume, then no need to quantize the output to nvfp4
+        # If o_proj can't consume, then no need to quantize the output to nvfp4
         if hasattr(self.attn, 'has_nvfp4'
                    ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
             return False
