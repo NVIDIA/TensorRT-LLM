@@ -336,7 +336,6 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5997543)
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model SKIP (https://nvbugs/5997534)
 unittest/disaggregated/test_py_cache_transceiver_mp.py::test_v2_transceiver_mp[ctx_first-v2_mp_tp1_pp1_to_tp1_pp2] SKIP (https://nvbugs/5996642)
-accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass] SKIP (https://nvbugs/5996656)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-trtllm] SKIP (https://nvbugs/5997046)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_python_scheduler[ep4-mtp_nextn=0] SKIP (https://nvbugs/5997051)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_tep8_mtp3_8k1k] SKIP (https://nvbugs/5997092)
