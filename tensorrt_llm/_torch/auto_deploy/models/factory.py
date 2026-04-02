@@ -45,6 +45,11 @@ class SubModuleExportInfo:
         self._dynamic_shape_lookup: Optional[Dict[str, DynamicShape]] = None
 
     @property
+    def is_full_model_export(self) -> bool:
+        """True when exporting the entire model as a single GraphModule."""
+        return self.submodule_name == ""
+
+    @property
     @final
     def dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
         """Return the lookup for the dynamic shapes of keyword arguments.

@@ -2634,21 +2634,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
 
 
 class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
-    """Export info for mRoPE models that receive 3D position_ids ``(3, B, S)``.
+    """Export info for mRoPE models.
 
-    Dim 0 is always 3 (temporal, height, width) and is static; dims 1 and 2
-    (batch, sequence) are dynamic.
+    Exports the full model (embed + decoder + norm + lm_head) as a single
+    GraphModule so that sharding and graph-level transforms (e.g.
+    ``gather_logits_before_lm_head``) can see lm_head directly, and piecewise
+    CUDA graph capture receives a GraphModule at the top level.
 
-    When ``lm_head`` is supplied, it is grafted onto the exported graph so that
-    sharding and other graph-level transforms (e.g. ``gather_logits_before_lm_head``)
-    can see and optimize it.
+    When ``submodule_name=""`` (full model export), position_ids enters as 2D
+    ``(B, S)`` and is expanded to 3D inside the graph. When exporting an inner
+    submodule, position_ids enters as 3D ``(3, B, S)`` with a static dim 0.
     """
 
     def __init__(self, submodule_name: str):
         super().__init__(submodule_name)
 
     def _init_dynamic_shape_lookup(self):
-        if self.submodule_name == "":
+        if self.is_full_model_export:
             # Full model export: position_ids enters as 2D (B, S), expanded
             # to 3D inside the graph by the wrapper's fast path.
             batch_size_dyn = Dim.DYNAMIC

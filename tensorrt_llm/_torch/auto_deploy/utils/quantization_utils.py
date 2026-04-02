@@ -121,17 +121,26 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
 
 
 def _strip_model_prefix(name: str) -> str:
-    """Strip common VLM model prefixes so exclude patterns match bare GraphModule paths.
+    """Strip model prefixes so quant exclude patterns match GraphModule paths.
 
-    Quant config exclude patterns may use the full checkpoint path (e.g.,
-    ``model.language_model.layers.0.linear_attn*``) while the exported GraphModule
-    uses bare paths (e.g., ``layers.0.linear_attn.in_proj_qkv``).  We normalize
-    both the pattern and the module name by stripping known prefixes.
+    Qwen3.5 MoE uses full-model export (submodule_name="") which makes the
+    GraphModule paths relative to the exported root.  For example:
+    - Checkpoint key:   ``model.language_model.layers.0.self_attn.q_proj``
+    - GraphModule path: ``layers.0.self_attn.q_proj``
+
+    But quant config exclude patterns are written against checkpoint keys
+    (e.g. ``model.language_model.layers.0.linear_attn*``).  This function
+    strips the known Qwen3.5 checkpoint prefixes so that both sides can be
+    compared on the same base path.
+
+    Known prefixes (Qwen3.5 MoE):
+    - ``model.language_model.`` — ForConditionalGeneration (multimodal)
+    - ``model.`` — ForCausalLM (text-only)
     """
     prefixes = ("model.language_model.", "model.")
     for p in prefixes:
         if name.startswith(p):
-            return name[len(p):]
+            return name[len(p) :]
     return name
 
 
@@ -144,7 +153,7 @@ def _pattern_matches(modname: str, pattern: str) -> bool:
     """
     if fnmatch(modname, pattern):
         return True
-    # Retry with VLM prefix stripped from both sides
+    # Retry with Qwen3.5 model prefix stripped from both sides
     return fnmatch(_strip_model_prefix(modname), _strip_model_prefix(pattern))
 
 
