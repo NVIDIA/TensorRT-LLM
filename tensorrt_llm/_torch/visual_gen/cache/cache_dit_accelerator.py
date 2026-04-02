@@ -13,9 +13,14 @@ from ..config import CacheDiTConfig
 from .base import CacheAccelerator
 from .cache_dit_enablers import CacheDiTEnableResult, enable_cache_dit_for_pipeline
 
+try:
+    import cache_dit
+except ImportError:
+    cache_dit = None  # type: ignore[assignment, misc]
+
 
 class CacheDiTAccelerator(CacheAccelerator):
-    """Per-block caching via the optional ``cache_dit`` package."""
+    """Per-block caching via the cache_dit package."""
 
     def __init__(self, pipeline: Any, cfg: CacheDiTConfig):
         self._pipeline = pipeline
@@ -24,11 +29,7 @@ class CacheDiTAccelerator(CacheAccelerator):
 
     @staticmethod
     def is_available() -> bool:
-        try:
-            import cache_dit  # noqa: F401
-        except ImportError:
-            return False
-        return True
+        return cache_dit is not None
 
     @classmethod
     def try_create(cls, pipeline: Any, cfg: CacheDiTConfig) -> Optional["CacheDiTAccelerator"]:
@@ -50,7 +51,7 @@ class CacheDiTAccelerator(CacheAccelerator):
     def unwrap(self) -> None:
         if self._result is None:
             return
-        import cache_dit
+        assert cache_dit is not None
 
         target = self._result.disable_target
         try:
@@ -67,7 +68,7 @@ class CacheDiTAccelerator(CacheAccelerator):
     def get_stats(self) -> Dict[str, Any]:
         if self._result is None:
             return {}
-        import cache_dit
+        assert cache_dit is not None
 
         stats: Dict[str, Any] = {}
         for i, module in enumerate(self._result.summary_modules):
