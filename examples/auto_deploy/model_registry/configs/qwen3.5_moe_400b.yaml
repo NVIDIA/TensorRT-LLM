@@ -3,8 +3,8 @@ compile_backend: torch-cudagraph
 attn_backend: trtllm
 max_seq_len: 262144
 max_num_tokens: 16000
-max_batch_size: 32
-cuda_graph_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+max_batch_size: 256
+cuda_graph_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 64, 128, 256]
 world_size: 8
 enable_chunked_prefill: true
 model_factory: Qwen3_5MoeForConditionalGeneration
@@ -15,6 +15,7 @@ kv_cache_config:
 model_kwargs:
   torch_dtype: bfloat16
 transforms:
+  # disable for text only use case
   initialize_mrope_delta_cache:
     enabled: true
   export_to_gm:
@@ -24,7 +25,8 @@ transforms:
   fuse_nvfp4_moe:
     backend: trtllm_gen
   detect_sharding:
-    dist_mapping: {moe_tp: 8, moe_ep: 1}
+    # for long input, tp8ep1 gives better performance
+    # dist_mapping: {moe_tp: 8, moe_ep: 1}
     allreduce_strategy: SYMM_MEM
     shard_all_unprocessed: true
     simple_shard_filter: "lm_head"
