@@ -706,9 +706,10 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_config=model_config,
         )
         self.model_nextn = 0
-        if (model_config.spec_config is not None
-                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+        if (model_config.spec_config is not None and
+            (model_config.spec_config.spec_dec_mode.is_mtp_one_model() or
+             model_config.spec_config.spec_dec_mode.is_mtp_eagle_one_model())):
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There are not MTP modules in the checkpoint."
@@ -769,9 +770,10 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
             aux_stream_dict=aux_stream_dict,
         )
         self.model_nextn = 0
-        if (model_config.spec_config is not None
-                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+        if (model_config.spec_config is not None and
+            (model_config.spec_config.spec_dec_mode.is_mtp_one_model() or
+             model_config.spec_config.spec_dec_mode.is_mtp_eagle_one_model())):
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."

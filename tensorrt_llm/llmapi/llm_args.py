@@ -1055,6 +1055,34 @@ class EagleDecodingConfig(DecodingBaseConfig):
         default="llama3",
         description="The model architecture of the eagle3 model.")
 
+    # Relaxed acceptance settings (mirrors MTPDecodingConfig for thinking models)
+    use_relaxed_acceptance_for_thinking: bool = Field(
+        default=False,
+        description=
+        "Enable relaxed acceptance during thinking phase for reasoning models. "
+        "Accepts draft tokens matching any top-K candidate instead of exact top-1."
+    )
+    relaxed_topk: int = Field(
+        default=1,
+        description=
+        "Number of top candidate tokens to consider for relaxed acceptance. "
+        "Draft token is accepted if it matches any of these.")
+    relaxed_delta: float = Field(
+        default=0.,
+        description=
+        "Probability threshold for relaxed acceptance. Only candidates with "
+        "prob >= (top-1 prob - delta) are kept.")
+    begin_thinking_phase_token: int = Field(
+        default=128798,
+        description=
+        "Token ID marking start of thinking phase. Relaxed acceptance only applies within this phase."
+    )
+    end_thinking_phase_token: int = Field(
+        default=128799,
+        description=
+        "Token ID marking end of thinking phase. Strict acceptance resumes after this."
+    )
+
     @field_validator('eagle_choices', mode='before')
     @classmethod
     def validate_eagle_choices(cls, v):
@@ -1384,11 +1412,6 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
 class MTPDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["MTP"] = "MTP"
-    num_nextn_predict_layers: PositiveInt = Field(
-        default=1,
-        description=
-        "Number of MTP modules. Each module predicts the next token, so N modules produce N draft tokens."
-    )
     use_relaxed_acceptance_for_thinking: bool = Field(
         default=False,
         description=
@@ -1426,14 +1449,14 @@ class MTPDecodingConfig(DecodingBaseConfig):
         " length of the suffix match exceeds the threshold, use"
         " the suffix automaton output for the next draft tokens.")
 
-    # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
-    # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
-    num_nextn_predict_layers_from_model_config: int = Field(
-        default=1,
+    # Internal field: number of MTP layers in the model checkpoint.
+    # Auto-populated from pretrained_config by update_spec_config_from_model_config.
+    # Do not set manually.
+    num_nextn_predict_layers: Optional[int] = Field(
+        default=None,
         init=False,
-        description=
-        "Internal field storing MTP layer count from model config. Used to decide decoding mode: "
-        "when model has 1 layer and use_mtp_vanilla=False, uses faster EAGLE-style MTP instead of vanilla MTP."
+        description="Number of MTP layers in the model checkpoint. "
+        "Auto-populated from the model's pretrained config. Do not set manually."
     )
 
     begin_thinking_phase_token: int = Field(
@@ -1449,8 +1472,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        self.max_draft_len = self.num_nextn_predict_layers
-        self.max_total_draft_tokens = self.num_nextn_predict_layers  # Current MTP only supports linear tree
+        # Default max_draft_len to 1 if not set by the user.
+        # For vanilla MTP, update_spec_config_from_model_config will override this
+        # with the actual num_nextn_predict_layers from the model.
+        if self.max_draft_len is None:
+            self.max_draft_len = 1
+        self.max_total_draft_tokens = self.max_draft_len  # Current MTP only supports linear tree
         return self
 
     @model_validator(mode="after")
@@ -1470,13 +1497,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
             return 1
         return 0
 
-    @functools.cached_property
+    @property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
+
+        # num_nextn_predict_layers is set from the model's pretrained config by
+        # update_spec_config_from_model_config. Treat None (before model load) as 1.
+        n = self.num_nextn_predict_layers if self.num_nextn_predict_layers is not None else 1
+        if n == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
+        elif n == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 

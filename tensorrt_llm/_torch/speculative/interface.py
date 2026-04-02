@@ -156,7 +156,7 @@ class SpeculativeDecodingMode(IntEnum):
     AUTO = auto()
 
     def is_mtp_one_model(self):
-        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+        return self == SpeculativeDecodingMode.MTP
 
     def is_mtp_eagle_one_model(self):
         return self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
@@ -172,7 +172,8 @@ class SpeculativeDecodingMode(IntEnum):
 
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
-        ) or self.is_external_drafter() or self.is_sa()
+        ) or self.is_mtp_eagle_one_model() or self.is_external_drafter(
+        ) or self.is_sa()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -205,28 +206,31 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_pard() or self.is_draft_target_one_model()
 
     def without_logits(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_external_drafter() or self.is_sa()
+        return self.is_mtp_one_model() or self.is_mtp_eagle_one_model(
+        ) or self.is_eagle3_one_model() or self.is_external_drafter(
+        ) or self.is_sa()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram() or self.is_sa() or self.is_external_drafter()
+        return self.is_mtp_one_model() or self.is_mtp_eagle_one_model(
+        ) or self.is_eagle3_one_model() or self.is_ngram() or self.is_sa(
+        ) or self.is_external_drafter()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_sa() or self.has_draft_model() or self.is_external_drafter(
-        )
+        return self.is_mtp_one_model() or self.is_mtp_eagle_one_model(
+        ) or self.is_eagle3_one_model() or self.is_sa() or self.has_draft_model(
+        ) or self.is_external_drafter()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_external_drafter() or self.is_sa()
+        return self.is_mtp_one_model() or self.is_mtp_eagle_one_model(
+        ) or self.is_eagle3_one_model() or self.is_external_drafter(
+        ) or self.is_sa()
 
     def support_dynamic_draft_len(self):
         # TODO: expand to all one-model algorithms
-        return self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_eagle_one_model()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -247,7 +251,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_eagle3_one_model() or self.is_external_drafter()
 
     def has_spec_decoder(self):
-        return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
+        return self.is_mtp_one_model() or self.is_mtp_eagle_one_model(
+        ) or self.is_mtp_eagle() or self.is_eagle3(
         ) or self.is_eagle3_one_model() or self.is_external_drafter(
         ) or self.is_sa()
 

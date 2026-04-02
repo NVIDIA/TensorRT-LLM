@@ -386,53 +386,62 @@ class Eagle3DraftModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        assert self.embed_tokens is not None
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
+        try:
+            assert self.embed_tokens is not None
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
 
-        assert hidden_states is not None
-        # NOTE: If hidden states from the target model have to be concatenated,
-        # ideally, we expect that to happen outside the model definition. This
-        # helps us avoid data-dependent control flow and gives us better CUDA
-        # graph coverage.
-        if self._eh_proj_before_attn:
-            input_embeds = self.enorm(inputs_embeds)
-            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-            hidden_states = self.eh_proj(hidden_states)
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
-        residual = None
-        if self.num_layers > 1:
-            for layer in self.midlayer:
-                if residual is not None:
-                    hidden_states = hidden_states + residual
-                hidden_states, residual = layer(
+            assert hidden_states is not None
+            # NOTE: If hidden states from the target model have to be concatenated,
+            # ideally, we expect that to happen outside the model definition. This
+            # helps us avoid data-dependent control flow and gives us better CUDA
+            # graph coverage.
+            if self._eh_proj_before_attn:
+                input_embeds = self.enorm(inputs_embeds)
+                hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+                hidden_states = self.eh_proj(hidden_states)
+
+            residual = None
+            if self.num_layers > 1:
+                for layer in self.midlayer:
+                    if residual is not None:
+                        hidden_states = hidden_states + residual
+                    hidden_states, residual = layer(
+                        position_ids=position_ids,
+                        embeds=inputs_embeds,
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata,
+                        spec_metadata=spec_metadata,
+                    )
+            else:
+                hidden_states, residual = self.midlayer(
                     position_ids=position_ids,
                     embeds=inputs_embeds,
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
                 )
-        else:
-            hidden_states, residual = self.midlayer(
-                position_ids=position_ids,
-                embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-            )
 
-        hidden_states, hidden_states_to_save = self.norm(
-            hidden_states, residual)
-        if self._return_hidden_post_norm:
-            return hidden_states, hidden_states
-        return hidden_states, hidden_states_to_save
+            hidden_states, hidden_states_to_save = self.norm(
+                hidden_states, residual)
+            if self._return_hidden_post_norm:
+                return hidden_states, hidden_states
+            return hidden_states, hidden_states_to_save
+        finally:
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
 # We use Llama3 as the base architecture for EAGLE3 draft layers
@@ -812,12 +821,14 @@ class MTPForCausalLM(nn.Module):
                     f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
-        assert spec_dec_mode.is_mtp_one_model()
+        assert (spec_dec_mode.is_mtp_one_model()
+                or spec_dec_mode.is_mtp_eagle_one_model())
         mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle_one_model(
-        ) else model_config.spec_config.num_nextn_predict_layers
+        ) else model_config.pretrained_config.num_nextn_predict_layers
 
         moe_load_balancer_set_repeated_for_next_layer(
-            model_config.spec_config.num_nextn_predict_layers // mtp_num_layers)
+            model_config.pretrained_config.num_nextn_predict_layers //
+            mtp_num_layers)
 
         self.mtp_layers = nn.ModuleList([
             mtp_layer(model_config, layer_idx + start_layer_idx,
@@ -990,7 +1001,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif spec_dec_mode.is_mtp_one_model():
+    elif (spec_dec_mode.is_mtp_one_model()
+          or spec_dec_mode.is_mtp_eagle_one_model()):
         return MTPForCausalLM(model_config,
                               model_config.pretrained_config.num_hidden_layers,
                               lm_head, model)

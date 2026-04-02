@@ -1831,9 +1831,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                          model_config=model_config)
 
         self.model_nextn = 0
-        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
+        if model_config.spec_config is not None and (
+                model_config.spec_config.spec_dec_mode.is_mtp_one_model() or
+                model_config.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
