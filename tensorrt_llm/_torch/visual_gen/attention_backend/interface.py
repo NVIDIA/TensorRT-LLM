@@ -22,7 +22,6 @@ from abc import ABC, abstractmethod
 from enum import Enum
 
 import torch
-import torch.nn as nn
 
 
 class AttentionTensorLayout(str, Enum):
@@ -37,13 +36,16 @@ class AttentionTensorLayout(str, Enum):
     HND = "HND"  # [B, H, S, D] - batch, heads, seq, dim
 
 
-class AttentionBackend(nn.Module, ABC):
+class AttentionBackend(ABC):
     """Contract for all visual-gen attention backends.
 
     Every backend must implement ``forward`` and declare a ``preferred_layout``.
     Backends pick the kwargs they need from the caller and ignore the rest
     via ``**kwargs``.
     """
+
+    def __call__(self, *args, **kwargs) -> torch.Tensor:
+        return self.forward(*args, **kwargs)
 
     @abstractmethod
     def forward(

@@ -57,7 +57,6 @@ class UlyssesAttention(AttentionBackend):
         inner_backend: AttentionBackend,
         process_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        super().__init__()
         self.inner_backend = inner_backend
         self.process_group = process_group
         self._preferred_layout = AttentionTensorLayout.NHD

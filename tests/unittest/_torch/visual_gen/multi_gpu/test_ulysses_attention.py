@@ -221,7 +221,7 @@ def _logic_ulysses_forward(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
@@ -246,7 +246,7 @@ def _logic_ulysses_with_mask(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
@@ -285,7 +285,7 @@ def _logic_ulysses_vs_standard_multi_gpu(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     ulysses_output = attention(q_shard, k_shard, v_shard)
 
@@ -337,7 +337,7 @@ def _logic_different_batch_sizes(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     for batch_size in [1, 2, 4, 8]:
         q = torch.randn(batch_size, seq_per_rank, num_heads, head_dim, device=device)
@@ -360,7 +360,7 @@ def _logic_different_head_dims(rank, world_size):
         attention = UlyssesAttention(
             inner_backend=inner,
             process_group=None,
-        ).to(device)
+        )
 
         q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
         k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
@@ -383,7 +383,7 @@ def _logic_world_size_4(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
@@ -456,7 +456,6 @@ class _FusedVanillaAttention(AttentionBackend):
     """Test-only backend that supports fused QKV to exercise the 5D A2A path."""
 
     def __init__(self, num_heads: int, head_dim: int):
-        super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = 1.0 / math.sqrt(head_dim)
@@ -500,13 +499,13 @@ def _logic_ulysses_fused_vs_unfused(rank, world_size):
     attn_unfused = UlyssesAttention(
         inner_backend=inner_unfused,
         process_group=None,
-    ).to(device)
+    )
 
     inner_fused = _FusedVanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
     attn_fused = UlyssesAttention(
         inner_backend=inner_fused,
         process_group=None,
-    ).to(device)
+    )
 
     out_unfused = attn_unfused(q, k, v)
     out_fused = attn_fused(q, k, v)
@@ -543,7 +542,7 @@ def _logic_ulysses_fused_vs_standard(rank, world_size):
     attn_fused = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     fused_output = attn_fused(q_shard, k_shard, v_shard)
 
@@ -639,7 +638,7 @@ class TestUlyssesAttention:
         ulysses_attn = UlyssesAttention(
             inner_backend=inner,
             process_group=None,
-        ).to(device)
+        )
 
         torch.manual_seed(42)
         q = torch.randn(batch, seq, num_heads, head_dim, device=device)

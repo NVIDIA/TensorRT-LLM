@@ -60,8 +60,6 @@ class FlashAttn4Attention(AttentionBackend):
         dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
-        super().__init__()
-
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim

@@ -22,7 +22,6 @@ Handles the specifics of no-KV-cache operation and fused QKV requirements.
 from typing import Optional, Union
 
 import torch
-import torch.nn as nn
 
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -167,12 +166,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         max_batch_size: int = 16,
         max_seq_len: int = 4096,
     ):
-        # nn.Module.__init__ must be called explicitly because the LLM
-        # AttentionBackend.__init__ (reached via BaseTrtllmAttention) does
-        # not use cooperative super(), so nn.Module is never reached through
-        # the normal MRO chain.
-        nn.Module.__init__(self)
-
         num_kv_heads = num_kv_heads or num_heads
 
         super().__init__(
