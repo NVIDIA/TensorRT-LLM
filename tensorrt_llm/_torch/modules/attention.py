@@ -645,7 +645,8 @@ class Attention(nn.Module):
 
     def _use_quantize_output(self):
         # If o_proj can't assume, then no need to quantize the output to nvfp4
-        if self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
+        if hasattr(self.attn, 'has_nvfp4'
+                   ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
             return False
         # If no quant is applied, no need to quantize the output
         if not self.quant_config.layer_quant_mode.has_any_quant(
