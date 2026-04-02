@@ -2267,51 +2267,6 @@ class Qwen3_5MoeModel(nn.Module):
             **kwargs,
         )
 
-    def preprocess(
-        self,
-        input_ids: torch.LongTensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run all VLM preprocessing and return (inputs_embeds, position_ids_3d).
-
-        This is the same logic as forward() but stops before calling
-        language_model.  Used by the extract_text_model named_args hook to
-        prepare inputs for the compiled text model GraphModule.
-        """
-        # Reuse forward() but intercept the language_model call.
-        captured = {}
-        original_lm = self.language_model
-
-        class _Capture(nn.Module):
-            def forward(self_, inputs_embeds, position_ids, **kw):
-                captured["inputs_embeds"] = inputs_embeds
-                captured["position_ids"] = position_ids
-                # Return dummy output to short-circuit.
-                return Qwen3_5MoeCausalLMOutput(logits=torch.zeros(1, device=inputs_embeds.device))
-
-        self.language_model = _Capture()
-        try:
-            self.forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                **kwargs,
-            )
-        finally:
-            self.language_model = original_lm
-
-        return captured["inputs_embeds"], captured["position_ids"]
-
     def _build_chunked_multimodal_positions(
         self,
         input_ids: torch.LongTensor,
@@ -2668,40 +2623,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
 
 
 class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
-    """Export info for mRoPE models.
+    """Export info for mRoPE models that receive 3D position_ids ``(3, B, S)``.
 
-    Exports the full model (embed + decoder + norm + lm_head) as a single
-    GraphModule so that sharding and graph-level transforms (e.g.
-    ``gather_logits_before_lm_head``) can see lm_head directly, and piecewise
-    CUDA graph capture receives a GraphModule at the top level.
-
-    When ``submodule_name=""`` (full model export), position_ids enters as 2D
-    ``(B, S)`` and is expanded to 3D inside the graph. When exporting an inner
-    submodule, position_ids enters as 3D ``(3, B, S)`` with a static dim 0.
+    Dim 0 is always 3 (temporal, height, width) and is static; dims 1 and 2
+    (batch, sequence) are dynamic.
     """
 
     def __init__(self, submodule_name: str):
         super().__init__(submodule_name)
 
     def _init_dynamic_shape_lookup(self):
-        # Text model export: receives inputs_embeds (B, S, hidden) and
-        # position_ids as 3D (3, B, S) from the VLM wrapper.
-        # input_ids is not used (embedding happens outside the GraphModule).
         base = super()._init_dynamic_shape_lookup()
         batch_size_dyn = Dim.DYNAMIC
         seq_len_dyn = Dim.DYNAMIC
         base["position_ids"] = {1: batch_size_dyn, 2: seq_len_dyn}
         return base
-
-    @classmethod
-    def from_autoinferred(cls, model: nn.Module) -> "Qwen3_5MoeTextExportInfo":
-        """Export only the text model (decoder + norm + lm_head) as a GraphModule.
-
-        Embedding, vision encoding, and mRoPE delta computation happen outside
-        the GraphModule in the VLM wrapper.  The extract_text_model transform
-        later promotes this GraphModule to top-level for piecewise CUDA graph.
-        """
-        return cls("model.language_model")
 
 
 class Qwen3_5MoeADInputProcessor:
