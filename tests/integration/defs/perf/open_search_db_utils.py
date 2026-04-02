@@ -501,11 +501,10 @@ def prepare_regressive_test_cases(latest_history_data_dict, history_data_dict,
                 threshold = default_threshold
 
             diff = _calculate_diff(metric, new_value, baseline_value)
-            info_lines.append(
-                f"  {metric}: value={new_value:.4f} "
-                f"baseline={baseline_value:.4f} "
-                f"threshold={threshold * 100:.2f}% "
-                f"diff={diff:+.2f}%")
+            info_lines.append(f"  {metric}: value={new_value:.4f} "
+                              f"baseline={baseline_value:.4f} "
+                              f"threshold={threshold * 100:.2f}% "
+                              f"diff={diff:+.2f}%")
 
             # Check if this metric is regressive (only for key regression metrics)
             if metric in REGRESSION_METRICS:
