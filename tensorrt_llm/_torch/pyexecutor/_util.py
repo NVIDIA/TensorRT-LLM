@@ -31,6 +31,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid)
+from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -1122,6 +1123,7 @@ def create_py_executor_instance(
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
+    dwdp_manager: Optional[DwdpManager] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -1141,6 +1143,8 @@ def create_py_executor_instance(
 
     peft_cache_manager = None
     if lora_config is not None:
+        # TODO: Refactor dimension resolution into a LoraModuleDimensions
+        # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
@@ -1188,6 +1192,26 @@ def create_py_executor_instance(
         if moe_intermediate is not None and moe_intermediate > 0:
             moe_hidden_size = moe_intermediate // mapping.tp_size
 
+        # Mamba dimensions for hybrid models (e.g., Nemotron-H)
+        # d_inner = mamba_head_dim * mamba_num_heads
+        # d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
+        mamba_in_proj_size = 0
+        mamba_inner_size = 0
+        mamba_head_dim = getattr(pretrained_config, 'mamba_head_dim', 0)
+        mamba_num_heads = getattr(pretrained_config, 'mamba_num_heads', 0)
+        if mamba_head_dim > 0 and mamba_num_heads > 0:
+            d_inner = mamba_head_dim * mamba_num_heads
+            mamba_inner_size = d_inner // mapping.tp_size
+            n_groups = getattr(pretrained_config, 'n_groups', 1)
+            d_state = getattr(pretrained_config, 'ssm_state_size', 128)
+            d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
+            mamba_in_proj_size = d_in_proj // mapping.tp_size
+
+        # MoE latent size for latent MoE models (e.g., Nemotron-H SuperV3).
+        # Latent projections are replicated (not TP-sharded), so pass the
+        # raw config value without dividing by tp_size.
+        moe_latent_size = getattr(pretrained_config, 'moe_latent_size', 0) or 0
+
         # For MoE models with shared experts: replace mlp_* target modules with
         # shared_expert_* equivalents. The shared expert uses different LoRA
         # module types with their own intermediate size. For pure MoE models
@@ -1218,7 +1242,10 @@ def create_py_executor_instance(
             tp_size=mapping.tp_size,
             num_experts=num_experts,
             shared_expert_hidden_size=shared_expert_hidden_size,
-            moe_hidden_size=moe_hidden_size)
+            moe_hidden_size=moe_hidden_size,
+            mamba_in_proj_size=mamba_in_proj_size,
+            mamba_inner_size=mamba_inner_size,
+            moe_latent_size=moe_latent_size)
 
         model_binding_config.use_lora_plugin = True
         model_binding_config.lora_modules = lora_modules
@@ -1360,7 +1387,9 @@ def create_py_executor_instance(
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
-        waiting_queue_policy=waiting_queue_policy)
+        waiting_queue_policy=waiting_queue_policy,
+        dwdp_manager=dwdp_manager,
+    )
 
 
 def create_torch_sampler_args(

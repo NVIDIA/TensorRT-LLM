@@ -11,6 +11,7 @@ from tensorrt_llm.mapping import Mapping
 from ...llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
+    MTPDecodingConfig,
     SamplerType,
     TorchLlmArgs,
     _ParallelConfig,
@@ -115,19 +116,38 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     @model_validator(mode="after")
     def setup_hidden_state_capture(self):
-        if self.speculative_config is None or not isinstance(
-            self.speculative_config, EagleDecodingConfig
-        ):
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return self
+
+        if isinstance(spec_config, MTPDecodingConfig):
+            if not spec_config.mtp_eagle_one_model:
+                return self
+            if spec_config.use_mtp_vanilla:
+                raise ValueError("mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled")
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
+                    "enabled. Ensure num_nextn_predict_layers is set in the model config."
+                )
+            capture_layers = {-1}
+            self.model_factory = "eagle_one_model"
+        elif isinstance(spec_config, EagleDecodingConfig):
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "EagleDecodingConfig.max_draft_len must not be None. "
+                    "Provide a positive integer for max_draft_len."
+                )
+            capture_layers = spec_config.eagle3_layers_to_capture
+            if spec_config.eagle3_one_model:
+                self.model_factory = "eagle_one_model"
+        else:
             return self
 
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
-            self.speculative_config.eagle3_layers_to_capture
+            capture_layers
         )
-
-        # Use the eagle_one_model factory for one-model Eagle speculative decoding
-        if self.speculative_config.eagle3_one_model:
-            self.model_factory = "eagle_one_model"
 
         return self
 
