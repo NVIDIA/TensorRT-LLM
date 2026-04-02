@@ -41,7 +41,8 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (UCompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
+                                                UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -167,15 +168,20 @@ class OpenAIDisaggServer:
         that convention so the ConversationRouter can provide session
         affinity without requiring clients to set the body field.
 
-        The header value is stored directly on the request as
-        ``_conversation_id`` so it survives even when
-        ``disaggregated_params`` is later replaced by the service layer."""
+        When ``disaggregated_params`` is ``None`` (standard OpenAI
+        requests without disagg fields), a minimal instance is created
+        to carry the conversation_id.  The service layer replaces it
+        later for ctx/gen routing but extracts conversation_id first."""
         header_conv_id = raw_req.headers.get("x-correlation-id")
         if header_conv_id is None:
             return
-        if req.disaggregated_params is not None:
-            if req.disaggregated_params.conversation_id is None:
-                req.disaggregated_params.conversation_id = header_conv_id
+        if req.disaggregated_params is None:
+            req.disaggregated_params = DisaggregatedParams(
+                request_type="",
+                conversation_id=header_conv_id,
+            )
+        elif req.disaggregated_params.conversation_id is None:
+            req.disaggregated_params.conversation_id = header_conv_id
 
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:

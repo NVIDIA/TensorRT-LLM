@@ -1,7 +1,8 @@
 import asyncio
-import heapq
 import os
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
@@ -160,6 +161,7 @@ class LoadBalancingMixin:
         self._use_tokens = use_tokens
         self._server_state: dict[str, ServerState] = {}
         self._req_routing_table: dict[int, str] = {}
+        self._rr_counter = 0
         for server in servers or []:
             self._server_state[server] = self._create_server_state(server)
 
@@ -189,6 +191,25 @@ class LoadBalancingMixin:
         server = self._req_routing_table.pop(id(request))
         if server in self._server_state:
             await self._server_state[server].decrement_load(request, **kwargs)
+        return server
+
+    def _select_least_loaded(
+            self,
+            exclude_server: Optional[str] = None) -> Optional[str]:
+        """Pick the server with the lowest load. Round-robin breaks ties."""
+        candidates = [
+            s for s in self._server_state if s != exclude_server
+        ]
+        if not candidates:
+            return None
+        loads = {s: self._get_server_load(s) for s in candidates}
+        min_load = min(loads.values())
+        tied = [s for s in candidates if loads[s] == min_load]
+        server = tied[self._rr_counter % len(tied)]
+        self._rr_counter += 1
+        logger.info(
+            f"LoadBalancingMixin: selected={server}, "
+            f"loads={loads}, tied={tied}, rr={self._rr_counter - 1}")
         return server
 
 
@@ -556,32 +577,13 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers, use_tokens)
-        self._server_load_heap = []
-        self._init_heap()
 
     def _on_servers_updated(self, old_servers, new_servers):
-        """Rebuild the heap when the server list changes."""
-        # Keep the state for servers that still exist
-        current_state = {}
+        new_state = {}
         for server in new_servers:
-            if server in self._server_state:
-                # Keep existing state
-                current_state[server] = self._server_state[server]
-            else:
-                # Initialize new server state
-                current_state[server] = self._create_server_state(server)
-
-        # Update state and rebuild heap
-        self._server_state = current_state
-        self._server_load_heap = []
-        for server in new_servers:
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
-
-    def _init_heap(self):
-        for server in self._servers:
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
+            new_state[server] = (self._server_state.get(server)
+                                 or self._create_server_state(server))
+        self._server_state = new_state
 
     async def get_next_server(
             self,
@@ -590,33 +592,17 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         self._validate_servers_available()
 
         async with self._lock:
-            if exclude_server:
-                server_load_heap = [(self._get_server_load(server), server)
-                                    for server in self._servers
-                                    if server != exclude_server]
-                heapq.heapify(server_load_heap)
-            else:
-                server_load_heap = self._server_load_heap
-
-            server = heapq.heappop(server_load_heap)[1]
+            server = self._select_least_loaded(exclude_server)
+            if server is None:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
             await self._register_request(server, request)
-            # maintain the member heap
-            if exclude_server:
-                self._server_load_heap = server_load_heap
-                if exclude_server in self._server_state:
-                    heapq.heappush(
-                        self._server_load_heap,
-                        (self._get_server_load(exclude_server), exclude_server))
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
 
         return server, {"server_info": self._server_info.get(server, {})}
 
     async def finish_request(self, request: OpenAIRequest):
         async with self._lock:
-            server = await self._unregister_request(request)
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
+            await self._unregister_request(request)
 
 
 def block_key_hasher(token_ids: list[int],
@@ -640,7 +626,8 @@ class BlockHashMixin:
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
-            self._tokenizers[model] = AutoTokenizer.from_pretrained(model)
+            self._tokenizers[model] = AutoTokenizer.from_pretrained(
+                model, trust_remote_code=True)
         return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
@@ -717,23 +704,26 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_load_balancing(servers, use_tokens)
         self._init_block_hashing(tokens_per_block)
-
+        self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
         logger.info(
             f"KvCacheAwareRouter: tokens_per_block={self._tokens_per_block}")
+
+    def _create_server_state(self, server):
+        return KvCacheAwareServerState(server, self._use_tokens,
+                                       self._tokens_per_block)
 
     async def get_next_server(
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         async with self._lock:
-            servers = list([
+            servers = [
                 server for server in self._server_state.keys()
                 if server != exclude_server
-            ])
+            ]
         token_lists = self._tokenize(request)
         block_hashes = self._compute_block_hashes(token_lists)
         padded_tokens = sum(
@@ -755,7 +745,18 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             score = matches[-1] / padded_tokens - workloads[
                 i] / self._max_batch_size
             scores.append(score)
-        server = servers[scores.index(max(scores))]
+        max_score = max(scores)
+        tied = [i for i, s in enumerate(scores) if s == max_score]
+        winner = tied[self._rr_counter % len(tied)]
+        self._rr_counter += 1
+        server = servers[winner]
+        logger.info(
+            f"KvCacheAwareRouter: selected={server}, "
+            f"scores={dict(zip(servers, [f'{s:.4f}' for s in scores]))}, "
+            f"matches={dict(zip(servers, matches))}, "
+            f"workloads={dict(zip(servers, workloads))}, "
+            f"padded_tokens={padded_tokens}, "
+            f"tied={[servers[i] for i in tied]}, rr={self._rr_counter - 1}")
         async with self._lock:
             await self._register_request(server, request)
         return server, {
@@ -772,11 +773,77 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await self._unregister_request(request, session=session)
 
     def _on_servers_updated(self, old_servers, new_servers):
-        for new_server in new_servers:
-            self._server_state[new_server] = self._create_server_state(
-                new_server)
-        for old_server in old_servers:
-            self._server_state.pop(old_server, None)
+        new_state = {}
+        for server in new_servers:
+            new_state[server] = (self._server_state.get(server)
+                                 or self._create_server_state(server))
+        self._server_state = new_state
+
+
+class _BlockHashTrie:
+    """Prefix tree mapping block-hash sequences to session IDs.
+
+    Each session ID is stored at every node along its hash path so that
+    partial prefix matches are discovered in O(L) time (L = query length).
+    """
+
+    class _Node:
+        __slots__ = ('children', 'session_ids')
+
+        def __init__(self):
+            self.children: dict[int, '_BlockHashTrie._Node'] = {}
+            self.session_ids: set[str] = set()
+
+    def __init__(self):
+        self._root = self._Node()
+
+    def insert(self, session_id: str, block_hashes: list[int]):
+        """Register *session_id* at every node along *block_hashes*."""
+        node = self._root
+        for h in block_hashes:
+            if h not in node.children:
+                node.children[h] = self._Node()
+            node = node.children[h]
+            node.session_ids.add(session_id)
+
+    def remove(self, session_id: str, block_hashes: list[int]):
+        """Remove *session_id* from its hash path and prune empty nodes."""
+        node = self._root
+        path = []  # list of (parent_node, hash_key)
+        for h in block_hashes:
+            if h not in node.children:
+                break
+            path.append((node, h))
+            node = node.children[h]
+            node.session_ids.discard(session_id)
+        # Prune empty leaf nodes bottom-up
+        for parent, key in reversed(path):
+            child = parent.children[key]
+            if not child.session_ids and not child.children:
+                del parent.children[key]
+            else:
+                break
+
+    def find_longest_prefix_match(
+        self,
+        block_hashes: list[int],
+        valid_fn: Optional[Callable[[str], bool]] = None,
+    ) -> tuple[Optional[str], int]:
+        """Return ``(session_id, match_depth)`` for the deepest valid
+        match, or ``(None, 0)`` when no valid session matches."""
+        node = self._root
+        best_id: Optional[str] = None
+        best_depth = 0
+        for depth, h in enumerate(block_hashes, 1):
+            if h not in node.children:
+                break
+            node = node.children[h]
+            for sid in node.session_ids:
+                if valid_fn is None or valid_fn(sid):
+                    best_id = sid
+                    best_depth = depth
+                    break
+        return best_id, best_depth
 
 
 class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
@@ -804,32 +871,38 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             preamble.
     """
 
-    CHAR_PER_TOKEN = 4  # approximate number of characters per token
+    CHAR_PER_TOKEN = 4  # approximate characters per token
+    # Seconds after which an in-flight request's load contribution is
+    # automatically expired.  This prevents unbounded load accumulation
+    # when a server crashes and ``finish_request`` is never called.
+    _LOAD_EXPIRY_SECONDS = 120.0
 
     def __init__(self,
                  server_role: ServerRole,
                  servers: List[str] = None,
                  metadata_server_cfg: MetadataServerConfig = None,
                  metadata_server: JsonDictionary = None,
-                 use_tokens: bool = False,
                  match_threshold: float = 0.75,
                  tokens_per_block: int = 128,
                  use_token_ids: bool = False,
                  hash_skip_count: int = 0,
+                 max_sessions: int = 10000,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_load_balancing(servers, use_tokens)
+        self._init_load_balancing(servers)
         self._init_block_hashing(tokens_per_block)
-        self._server_load_heap: list[tuple[int, str]] = []
-        self._init_heap()
 
         self._match_threshold = match_threshold
         self._use_token_ids = use_token_ids
         self._hash_skip_count = hash_skip_count
+        self._max_sessions = max_sessions
 
-        # conversation_id -> (server, block_hashes)
-        self._session_table: dict[str, tuple[str, list[int]]] = {}
+        # conversation_id -> (server, block_hashes)  LRU-ordered
+        self._session_table: OrderedDict[str, tuple[str, list[int]]] = (
+            OrderedDict())
+        # Prefix tree for O(L) block-hash matching
+        self._hash_trie = _BlockHashTrie()
         # server -> set of conversation_ids (reverse index)
         self._server_sessions: dict[str, set[str]] = {
             s: set()
@@ -837,30 +910,117 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         }
         self._implicit_id_counter = 0
 
-    def _init_heap(self):
-        for server in self._servers:
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
+        # In-flight content-load tracking: estimated tokens currently
+        # being processed on each server.  Incremented on assignment,
+        # decremented on finish.  When loads are equal, round-robin
+        # breaks ties to ensure balanced assignment.
+        self._server_content_load: dict[str, int] = {
+            s: 0 for s in (servers or [])
+        }
+        # id(request) -> (server, weight, monotonic_timestamp)
+        self._req_content_entry: dict[int, tuple[str, int, float]] = {}
+
+        logger.info(
+            f"ConversationRouter: tokens_per_block={self._tokens_per_block}, "
+            f"match_threshold={self._match_threshold}, "
+            f"use_token_ids={self._use_token_ids}, "
+            f"hash_skip_count={self._hash_skip_count}, "
+            f"max_sessions={self._max_sessions}, "
+            f"servers={servers}")
+
+    # ── content-based load tracking ──
+
+    def _estimate_content_weight(
+            self, request: OpenAIRequest,
+            block_hashes: Optional[list[int]] = None) -> int:
+        """Estimate request weight in tokens without tokenization.
+
+        When *block_hashes* are available (IMPLICIT / FALLBACK paths),
+        uses ``len(block_hashes) * tokens_per_block``.  Otherwise
+        estimates from text character length.
+        """
+        if block_hashes is not None:
+            return len(block_hashes) * self._tokens_per_block
+        text = self._extract_text(request)
+        return max(len(text) // self.CHAR_PER_TOKEN, 1)
+
+    def _add_content_load(self, server: str, request: OpenAIRequest,
+                          weight: int):
+        self._server_content_load[server] = (
+            self._server_content_load.get(server, 0) + weight)
+        self._req_content_entry[id(request)] = (
+            server, weight, time.monotonic())
+
+    def _remove_content_load(self, server: str, request: OpenAIRequest):
+        entry = self._req_content_entry.pop(id(request), None)
+        if entry is not None:
+            _, weight, _ = entry
+            self._server_content_load[server] = max(
+                self._server_content_load.get(server, 0) - weight, 0)
+
+    def _get_content_load(self, server: str) -> int:
+        return self._server_content_load.get(server, 0)
+
+    def _expire_stale_loads(self):
+        """Remove load contributions from requests older than
+        ``_LOAD_EXPIRY_SECONDS``.  This prevents unbounded load
+        accumulation when a server crashes and ``finish_request``
+        is never called for its in-flight requests."""
+        now = time.monotonic()
+        expired = [
+            req_id for req_id, (_, _, ts) in self._req_content_entry.items()
+            if now - ts > self._LOAD_EXPIRY_SECONDS
+        ]
+        for req_id in expired:
+            server, weight, _ = self._req_content_entry.pop(req_id)
+            self._server_content_load[server] = max(
+                self._server_content_load.get(server, 0) - weight, 0)
+        if expired:
+            loads = {s: self._get_content_load(s) for s in self._servers}
+            logger.info(
+                f"ConversationRouter: expired {len(expired)} stale load "
+                f"entries, loads={loads}")
+
+    def _select_least_loaded(self, exclude_server: Optional[str] = None) -> Optional[str]:
+        """Pick the server with the lowest in-flight content load.
+
+        When multiple servers share the same minimum load, round-robin
+        breaks the tie to ensure balanced assignment."""
+        candidates = [
+            s for s in self._servers if s != exclude_server
+        ]
+        if not candidates:
+            return None
+        loads = {s: self._get_content_load(s) for s in candidates}
+        min_load = min(loads.values())
+        tied = [s for s in candidates if loads[s] == min_load]
+        server = tied[self._rr_counter % len(tied)]
+        self._rr_counter += 1
+        logger.info(
+            f"ConversationRouter._select_least_loaded: selected={server}, "
+            f"content_loads={loads}, tied={tied}, rr={self._rr_counter - 1}")
+        return server
 
     def _on_servers_updated(self, old_servers, new_servers):
-        """Rebuild heap and reverse index; stale session mappings are
-        lazily evicted on the next get_next_server call."""
-        current_state = {}
+        """Rebuild reverse index; evict sessions that pointed to removed
+        servers."""
         new_server_sessions: dict[str, set[str]] = {}
         for server in new_servers:
-            if server in self._server_state:
-                current_state[server] = self._server_state[server]
-            else:
-                current_state[server] = self._create_server_state(server)
             new_server_sessions[server] = self._server_sessions.get(
                 server, set())
+            if server not in self._server_content_load:
+                self._server_content_load[server] = 0
 
-        self._server_state = current_state
+        # Evict sessions pointing to removed servers
+        removed_servers = set(old_servers) - set(new_servers)
+        for removed in removed_servers:
+            for conv_id in list(self._server_sessions.get(removed, ())):
+                entry = self._session_table.pop(conv_id, None)
+                if entry is not None:
+                    self._hash_trie.remove(conv_id, entry[1])
+            self._server_content_load.pop(removed, None)
+
         self._server_sessions = new_server_sessions
-        self._server_load_heap = []
-        for server in new_servers:
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
 
     # ── text extraction & block-hash prefix matching ──
 
@@ -937,30 +1097,30 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                                exclude_server: Optional[str]) -> Optional[str]:
         """Find the session whose stored block hashes share the longest
         prefix with *block_hashes* and whose match ratio meets the
-        threshold."""
+        threshold.  Uses ``_hash_trie`` for O(L) lookup."""
         if not block_hashes:
             return None
-        best_conv_id = None
-        best_match_count = 0
-        for conv_id, (server, stored_hashes) in self._session_table.items():
-            if server not in self._server_state:
-                continue
-            if server == exclude_server:
-                continue
-            if not stored_hashes:
-                continue
-            match_count = 0
-            for a, b in zip(stored_hashes, block_hashes):
-                if a != b:
-                    break
-                match_count += 1
-            if match_count > best_match_count:
-                best_match_count = match_count
-                best_conv_id = conv_id
+
+        def _valid(conv_id: str) -> bool:
+            entry = self._session_table.get(conv_id)
+            if entry is None:
+                return False
+            server = entry[0]
+            return (server in self._server_state
+                    and server != exclude_server)
+
+        best_conv_id, best_depth = self._hash_trie.find_longest_prefix_match(
+            block_hashes, _valid)
+
         if best_conv_id is None:
             return None
-        ratio = best_match_count / len(block_hashes)
+        ratio = best_depth / len(block_hashes)
         if ratio >= self._match_threshold:
+            best_server = self._session_table[best_conv_id][0]
+            logger.debug(
+                f"ConversationRouter: implicit match conv_id={best_conv_id}, "
+                f"server={best_server}, match_ratio={ratio:.3f} "
+                f"({best_depth}/{len(block_hashes)} blocks)")
             return best_conv_id
         return None
 
@@ -975,34 +1135,29 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._implicit_id_counter += 1
         return f"_implicit:{self._implicit_id_counter}"
 
-    def _select_least_loaded(self, exclude_server: Optional[str] = None) -> str:
-        if exclude_server:
-            heap = [(self._get_server_load(s), s) for s in self._servers
-                    if s != exclude_server]
-            heapq.heapify(heap)
-        else:
-            heap = self._server_load_heap
-
-        server = heapq.heappop(heap)[1]
-
-        if exclude_server:
-            self._server_load_heap = heap
-            if exclude_server in self._server_state:
-                heapq.heappush(
-                    self._server_load_heap,
-                    (self._get_server_load(exclude_server), exclude_server))
-        return server
-
     def _update_session(self, conv_id: str, server: str,
                         block_hashes: list[int]):
         old = self._session_table.get(conv_id)
         if old is not None:
-            old_server = old[0]
+            old_server, old_hashes = old
             if old_server in self._server_sessions:
                 self._server_sessions[old_server].discard(conv_id)
+            self._hash_trie.remove(conv_id, old_hashes)
         self._session_table[conv_id] = (server, block_hashes)
+        self._session_table.move_to_end(conv_id)
+        self._hash_trie.insert(conv_id, block_hashes)
         if server in self._server_sessions:
             self._server_sessions[server].add(conv_id)
+        # LRU eviction when over capacity
+        while len(self._session_table) > self._max_sessions:
+            self._evict_oldest_session()
+
+    def _evict_oldest_session(self):
+        """Remove the least-recently-used session from all indices."""
+        conv_id, (server, hashes) = self._session_table.popitem(last=False)
+        self._hash_trie.remove(conv_id, hashes)
+        if server in self._server_sessions:
+            self._server_sessions[server].discard(conv_id)
 
     # ── public interface ──
 
@@ -1012,27 +1167,52 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         self._validate_servers_available()
 
-        async with self._lock:
-            conv_id = self._get_conversation_id(request)
+        # Pre-compute outside the lock (tokenization + hashing)
+        conv_id = self._get_conversation_id(request)
+        block_hashes = self._request_to_block_hashes(request)
+        weight = self._estimate_content_weight(request, block_hashes)
 
-            # 1. Explicit conversation_id — sticky routing
+        async with self._lock:
+            # Expire stale load entries from crashed/hung servers
+            self._expire_stale_loads()
+
+            # 1. Explicit conversation_id — sticky routing.
+            #    Always honour session affinity when the server is alive
+            #    and not explicitly excluded.  No overload gate — the
+            #    server itself provides backpressure.
             if conv_id and conv_id in self._session_table:
-                sticky_server, old_hashes = self._session_table[conv_id]
-                if (sticky_server in self._server_state
-                        and sticky_server != exclude_server):
-                    self._update_session(conv_id, sticky_server, old_hashes)
+                sticky_server, _ = self._session_table[conv_id]
+                if sticky_server not in self._server_state:
+                    logger.info(
+                        f"ConversationRouter: STICKY MISS conv_id={conv_id} "
+                        f"-> server={sticky_server} NOT in server_state, "
+                        f"falling through to FALLBACK")
+                elif sticky_server == exclude_server:
+                    logger.debug(
+                        f"ConversationRouter: STICKY MISS conv_id={conv_id} "
+                        f"-> server={sticky_server} is exclude_server")
+                else:
+                    self._update_session(conv_id, sticky_server, block_hashes)
                     await self._register_request(sticky_server, request)
-                    heapq.heappush(
-                        self._server_load_heap,
-                        (self._get_server_load(sticky_server), sticky_server))
+                    self._add_content_load(sticky_server, request, weight)
+                    loads = {s: self._get_content_load(s)
+                             for s in self._servers}
+                    logger.info(
+                        f"ConversationRouter: STICKY conv_id={conv_id} "
+                        f"-> server={sticky_server}, "
+                        f"content_loads={loads}, weight={weight}")
                     return sticky_server, {
                         "server_info": self._server_info.get(sticky_server, {})
                     }
+            elif conv_id:
+                logger.debug(
+                    f"ConversationRouter: NEW conv_id={conv_id} "
+                    f"not in session_table "
+                    f"(size={len(self._session_table)})")
 
-            # Block hashes only needed when session id is absent
-            block_hashes = self._request_to_block_hashes(request)
-
-            # 2. Implicit block-hash prefix matching
+            # 2. Implicit block-hash prefix matching.
+            #    Always honour match when the server is alive.
+            matched_id = None
             if not conv_id:
                 matched_id = self._find_matching_session(
                     block_hashes, exclude_server)
@@ -1041,31 +1221,46 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     self._update_session(matched_id, sticky_server,
                                          block_hashes)
                     await self._register_request(sticky_server, request)
-                    heapq.heappush(
-                        self._server_load_heap,
-                        (self._get_server_load(sticky_server), sticky_server))
+                    self._add_content_load(sticky_server, request, weight)
+                    loads = {s: self._get_content_load(s)
+                             for s in self._servers}
+                    logger.info(
+                        f"ConversationRouter: IMPLICIT match "
+                        f"conv_id={matched_id} -> server={sticky_server}, "
+                        f"content_loads={loads}, weight={weight}")
                     return sticky_server, {
-                        "server_info": self._server_info.get(sticky_server, {})
+                        "server_info":
+                        self._server_info.get(sticky_server, {})
                     }
 
-            # 3. Fallback — least-loaded
+            # 3. Fallback — least-loaded server for new sessions or
+            #    sessions whose sticky server is unavailable.
             server = self._select_least_loaded(exclude_server)
+            if server is None:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
             await self._register_request(server, request)
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
+            self._add_content_load(server, request, weight)
 
-            # Store session mapping
+            # Store session mapping.
             if not conv_id:
                 conv_id = self._generate_implicit_id()
             self._update_session(conv_id, server, block_hashes)
+            loads = {s: self._get_content_load(s) for s in self._servers}
+            logger.info(
+                f"ConversationRouter: FALLBACK conv_id={conv_id} "
+                f"-> server={server}, content_loads={loads}, weight={weight}")
 
         return server, {"server_info": self._server_info.get(server, {})}
 
     async def finish_request(self, request: OpenAIRequest):
         async with self._lock:
             server = await self._unregister_request(request)
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
+            self._remove_content_load(server, request)
+            loads = {s: self._get_content_load(s) for s in self._servers}
+            logger.info(
+                f"ConversationRouter: FINISH server={server}, "
+                f"content_loads={loads}")
 
 
 def create_router(
