@@ -391,27 +391,6 @@ class Gemma4MoEBlock(nn.Module):
                 for _ in range(config.num_experts)
             ]
         )
-        self._register_load_state_dict_pre_hook(self._unfuse_moe_weights)
-
-    def _unfuse_moe_weights(self, state_dict, prefix, *_args, **_kwargs):
-        """Convert fused checkpoint MoE weights to per-expert format."""
-        gate_up_key = prefix + "gate_up_proj"
-        down_key = prefix + "down_proj"
-        scale_key = prefix + "per_expert_scale"
-
-        if gate_up_key not in state_dict:
-            return
-
-        gate_up = state_dict.pop(gate_up_key)  # [E, 2*I, H]
-        down = state_dict.pop(down_key)  # [E, H, I]
-        scale = state_dict.pop(scale_key)  # [E]
-
-        inter = self.intermediate_size
-        for e in range(self.num_experts):
-            state_dict[f"{prefix}experts.{e}.gate_proj.weight"] = gate_up[e, :inter, :]
-            state_dict[f"{prefix}experts.{e}.up_proj.weight"] = gate_up[e, inter:, :]
-            # Fold per_expert_scale into down_proj
-            state_dict[f"{prefix}experts.{e}.down_proj.weight"] = down[e] * scale[e]
 
     def forward(
         self,
@@ -528,6 +507,8 @@ class Gemma4TextDecoderLayer(nn.Module):
     def __init__(self, config: Gemma4TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.num_experts = config.num_experts
+        self.expert_intermediate_size = config.expert_intermediate_size
         self.attention_type = config.layer_types[layer_idx]
         self.self_attn = Gemma4TextAttention(config, layer_idx)
         self.mlp = Gemma4TextMLP(config)
@@ -541,6 +522,7 @@ class Gemma4TextDecoderLayer(nn.Module):
         if self.enable_moe_block:
             self.router = Gemma4Router(config)
             self.moe = Gemma4MoEBlock(config)
+            self._register_load_state_dict_pre_hook(self._unfuse_moe_weights)
             self.post_feedforward_layernorm_1 = Gemma4RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
@@ -550,6 +532,46 @@ class Gemma4TextDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm_2 = Gemma4RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
+
+    def _unfuse_moe_weights(self, state_dict, prefix, *_args, **_kwargs):
+        """Convert layer-level fused Gemma4 MoE checkpoint weights to per-expert weights."""
+        candidates = [
+            (
+                prefix + "experts.gate_up_proj",
+                prefix + "experts.down_proj",
+                prefix + "router.per_expert_scale",
+            ),
+            (
+                prefix + "moe.gate_up_proj",
+                prefix + "moe.down_proj",
+                prefix + "moe.per_expert_scale",
+            ),
+        ]
+
+        gate_up_key = down_key = scale_key = None
+        for gate_up_candidate, down_candidate, scale_candidate in candidates:
+            if (
+                gate_up_candidate in state_dict
+                and down_candidate in state_dict
+                and scale_candidate in state_dict
+            ):
+                gate_up_key = gate_up_candidate
+                down_key = down_candidate
+                scale_key = scale_candidate
+                break
+
+        if gate_up_key is None or down_key is None or scale_key is None:
+            return
+
+        gate_up = state_dict.pop(gate_up_key)  # [E, 2*I, H]
+        down = state_dict.pop(down_key)  # [E, H, I]
+        scale = state_dict.pop(scale_key)  # [E]
+
+        inter = self.expert_intermediate_size
+        for e in range(self.num_experts):
+            state_dict[f"{prefix}moe.experts.{e}.gate_proj.weight"] = gate_up[e, :inter, :]
+            state_dict[f"{prefix}moe.experts.{e}.up_proj.weight"] = gate_up[e, inter:, :]
+            state_dict[f"{prefix}moe.experts.{e}.down_proj.weight"] = down[e] * scale[e]
 
     def forward(
         self,
