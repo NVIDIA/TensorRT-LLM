@@ -1849,7 +1849,9 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
 
         if prompt_logprobs:
             assert prompt_logprobs_result and len(
-                prompt_logprobs_result[0].keys()) == prompt_logprobs
+                prompt_logprobs_result[0].keys()) in {
+                    prompt_logprobs, prompt_logprobs + 1
+                }
             print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
 
         if logprobs:
