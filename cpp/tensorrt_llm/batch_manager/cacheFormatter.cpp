@@ -223,8 +223,9 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     if (llmRequest.getInputTokensExtraIds().has_value())
     {
         auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size()) - 1;
         auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
-            lastBlockKey.uniqueTokens, lastBlockKey.uniqueTokens.size(), tokensPerBlock, /*allowPartial=*/true);
+            lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/false);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
         return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
     }
