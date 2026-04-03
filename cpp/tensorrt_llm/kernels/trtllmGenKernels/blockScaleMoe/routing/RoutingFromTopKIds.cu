@@ -69,7 +69,6 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
     bool const useStaticBlock = data.mNumTokens <= routingCustom::BlockKernelMaxNumTokens;
     bool const useDynBlock = !useStaticBlock && data.mNumTokens <= routingCustom::DynBlockKernelMaxNumTokens
         && data.mNumExperts <= routingCustom::DynBlockKernelMaxNumExperts;
-    bool const useSingleBlock = useStaticBlock || useDynBlock;
 
     // runPostTopKPipeline only handles pre-computed topK (mPtrTopKIds or mPtrTopKPacked),
     // never raw scores. The cluster kernel's routingPermutation uses thread-per-expanded-index
@@ -80,7 +79,6 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
     bool const useSingleCluster = (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster);
 
     routingCustom::Data lastKernelData = customData;
-    lastKernelData.mPdlAllowOverlap = false;
 
     if (useDynBlock)
     {

@@ -586,17 +586,12 @@ void run(Data& data, void* stream)
         // Maximum number of tokens supported by the kernel using a cooperative launch.
         int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
 
-        // Last routing kernel: disable overlap so GEMM waits via stream serialization.
-        bool const savedAllowOverlap = data.mPdlAllowOverlap;
-
         if (useSingleCluster)
         {
-            data.mPdlAllowOverlap = false;
             launchClusterKernel(data, numThreadsHist, stream);
         }
         else if ((smMajor >= 9) && (data.mNumTokens <= maxTokensCoop))
         {
-            data.mPdlAllowOverlap = false;
             launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
         }
         else
@@ -612,11 +607,8 @@ void run(Data& data, void* stream)
                 = std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
             launchHistogramKernel(data, numBlocksHistogram, numThreadsHist, stream);
-            data.mPdlAllowOverlap = false;
             launchOffsetsKernel(data, numBlocksOffsets, numThreadsHist, stream);
         }
-
-        data.mPdlAllowOverlap = savedAllowOverlap;
     }
 }
 

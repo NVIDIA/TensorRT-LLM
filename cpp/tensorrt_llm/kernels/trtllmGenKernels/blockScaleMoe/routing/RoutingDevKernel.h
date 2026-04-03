@@ -38,7 +38,7 @@
                                                                                                                        \
         cudaLaunchAttribute attributes[2] = {};                                                                        \
         attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                         \
-        attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl && data.mPdlAllowOverlap);         \
+        attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);                                  \
         attributes[1].id = cudaLaunchAttributeCooperative;                                                             \
         attributes[1].val.cooperative = int(coopLaunch);                                                               \
         config.attrs = attributes;                                                                                     \

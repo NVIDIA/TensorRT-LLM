@@ -44,12 +44,6 @@ struct DataBase
 {
     bool mUsePdl{false};
 
-    // Controls programmaticStreamSerializationAllowed launch attribute independently of mUsePdl.
-    // When false, the launch attribute is 0 even if mUsePdl is true, preventing the NEXT kernel
-    // from starting early. The kernel still does cudaGridDependencySynchronize/Trigger internally.
-    // Set to false on the LAST routing kernel so downstream GEMM waits via stream serialization.
-    bool mPdlAllowOverlap{true};
-
     // optional: only used as an intermediate buffer when the number of tokens is large.
     // dim: max([2*NumThreads] = [512], mNumExperts*2)
     int32_t* mPtrExpertCounts{nullptr};

@@ -995,9 +995,7 @@ void run(Data const& data, void* stream)
 
     uint32_t const numThreadsHist = min(1024, getMaxNumExperts(data.mNumExperts));
 
-    // Last routing kernel: disable programmaticStreamSerializationAllowed so GEMM waits.
     Data lastKernelData = data;
-    lastKernelData.mPdlAllowOverlap = false;
 
     if (useDynBlock)
     {

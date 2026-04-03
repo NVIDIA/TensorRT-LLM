@@ -689,7 +689,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         // Setup finalize data
         finalizeData.mDtypeElt = args.mDtypeOut;
         finalizeData.mDtypeExpW = args.mDtypeExpW;
-        finalizeData.mUsePdl = false;
+        finalizeData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
         finalizeData.mUseDeepSeekFp8 = false;
         finalizeData.inPtr = workspace.gemm2_output;
         finalizeData.outPtr = args.output;
