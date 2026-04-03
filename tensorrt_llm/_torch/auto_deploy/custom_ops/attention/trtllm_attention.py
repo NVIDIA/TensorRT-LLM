@@ -509,12 +509,8 @@ def trtllm_mha_with_cache(
         None,  # quant_q_buffer
         None,  # flash_mla_tile_scheduler_metadata
         None,  # flash_mla_num_splits
-        0,  # sage_attn_num_elts_per_blk_q
-        0,  # sage_attn_num_elts_per_blk_k
-        0,  # sage_attn_num_elts_per_blk_v
-        False,  # sage_attn_qk_int8
-        _GlobalTrtllmPlanner.num_contexts,  # num_contexts
-        _GlobalTrtllmPlanner.num_ctx_tokens,  # num_ctx_tokens
+        num_contexts=_GlobalTrtllmPlanner.num_contexts,
+        num_ctx_tokens=_GlobalTrtllmPlanner.num_ctx_tokens,
     )
 
     if out is not None:

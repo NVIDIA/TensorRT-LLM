@@ -631,8 +631,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
-    int64_t const sage_attn_num_elts_per_blk_q, int64_t const sage_attn_num_elts_per_blk_k,
-    int64_t const sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens)
+    int64_t num_contexts, int64_t num_ctx_tokens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
