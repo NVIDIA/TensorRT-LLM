@@ -69,7 +69,7 @@ class BaseMambaCacheManager(ABC):
     """Abstract interface for accessing mamba/recurrent state caches.
 
     Implemented by MambaCacheManager (standalone mamba-only models) and
-    LinearHybridCacheManager (hybrid attention+mamba models). Use
+    CppMambaHybridCacheManager (hybrid attention+mamba models). Use
     ``isinstance(mgr, BaseMambaCacheManager)`` to check for mamba capability.
     """
 
@@ -678,7 +678,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 
-class MambaHybridCacheManagerV1(KVCacheManager, MambaCacheManager):
+class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     """Hybrid cache manager combining separate KVCacheManager and MambaCacheManager.
 
     Manages KV cache and mamba states in independent pools. Used for
@@ -805,7 +805,7 @@ def calc_context_stop_positions(prompt_len: int,
     return stop_positions
 
 
-class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
+class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
     """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
 
     Both KV cache blocks and recurrent state blocks are managed by the unified
@@ -879,7 +879,7 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
-                "Partial reuse is not supported for linear hybrid cache, disabling partial reuse"
+                "Partial reuse is not supported for mamba hybrid models, disabling partial reuse"
             )
             kv_cache_config.enable_partial_reuse = False
 
@@ -1008,7 +1008,6 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             scheduled_batch.generation_requests
         for req in self.requests:
             self.impl.copy_linear_attention_block(req)
-        # self.impl.sync_transfer_manager_with_buffer_manager()
         self.impl.refresh_blocks()
         self._setup_state_indices()
 
@@ -1017,7 +1016,7 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self._prepare_resources(scheduled_batch)
 
     def is_speculative(self) -> bool:
-        # C++ MambaCacheManager does not support speculative decoding
+        # Not implemented yet.
         return False
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
@@ -1038,7 +1037,6 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             self.requests.remove(request)
         super().free_resources(request, pin_on_release)
 
-    # TODO: this should be called only once per iteration (not per layer)
     def _setup_state_indices(self) -> torch.Tensor:
         block_indices = []
         for req in self.requests:
@@ -1061,8 +1059,8 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             # (no longer multiplied by num_linear_layers)
             value = self.host_block_offsets[self.recurrent_states_pool_index, i,
                                             0, block_indices[i]]
-            assert value >= 0 and value < self.blocks_per_window[LinearCacheType.RECURRENT_STATES.value][0], \
-                f"value: {value} at index {i} is not in the range of [0, {self.blocks_per_window[LinearCacheType.RECURRENT_STATES.value][0]}).\nself.host_block_offsets[self.recurrent_states_pool_index, :, 0, 0]: {self.host_block_offsets[self.recurrent_states_pool_index, :, 0, 0]}"
+            assert value >= 0 and value < self.blocks_per_window[
+                LinearCacheType.RECURRENT_STATES.value][0]
             host_linear_block_offsets[i] = value
 
         torch.fill_(self._cuda_state_indices, 0)
@@ -1163,13 +1161,15 @@ class _MambaHybridCacheManagerMeta(type):
     def __instancecheck__(cls, instance):
         if cls is MambaHybridCacheManager:
             return isinstance(
-                instance, (MambaHybridCacheManagerV1, LinearHybridCacheManager))
+                instance,
+                (MixedMambaHybridCacheManager, CppMambaHybridCacheManager))
         return super().__instancecheck__(instance)
 
     def __subclasscheck__(cls, subclass):
         if cls is MambaHybridCacheManager:
             return issubclass(
-                subclass, (MambaHybridCacheManagerV1, LinearHybridCacheManager))
+                subclass,
+                (MixedMambaHybridCacheManager, CppMambaHybridCacheManager))
         return super().__subclasscheck__(subclass)
 
     def __getattr__(cls, name):
@@ -1182,8 +1182,8 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
     """Factory that selects the appropriate hybrid cache manager.
 
     Selection logic:
-    - Speculative decoding or TRTLLM_USE_CPP_MAMBA=1 -> MambaHybridCacheManagerV1
-    - Otherwise (default) -> LinearHybridCacheManager
+    - Speculative decoding or TRTLLM_USE_CPP_MAMBA=1 -> MixedMambaHybridCacheManager
+    - Otherwise (default) -> CppMambaHybridCacheManager
     """
 
     def __new__(
@@ -1222,9 +1222,10 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
 
         if use_v1:
             logger.info(
-                "Using MambaHybridCacheManagerV1 for hybrid cache management")
-            return MambaHybridCacheManagerV1(*positional_args, **kwargs)
+                "Using MixedMambaHybridCacheManager for hybrid cache management"
+            )
+            return MixedMambaHybridCacheManager(*positional_args, **kwargs)
         else:
             logger.info(
-                "Using LinearHybridCacheManager for hybrid cache management")
-            return LinearHybridCacheManager(*positional_args, **kwargs)
+                "Using CppMambaHybridCacheManager for hybrid cache management")
+            return CppMambaHybridCacheManager(*positional_args, **kwargs)
