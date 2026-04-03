@@ -32,16 +32,7 @@ from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
-from .open_search_db_utils import (
-    add_baseline_fields_to_post_merge_data,
-    add_id,
-    check_perf_regression,
-    get_common_values,
-    get_history_data,
-    get_job_info,
-    post_new_perf_data,
-    prepare_regressive_test_cases,
-)
+from .perf_regression_utils import process_and_upload_test_results
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
@@ -93,6 +84,36 @@ PERF_METRIC_LOG_QUERIES = {
     "median_e2el": re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     "p99_e2el": re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
+
+# Metrics where larger is better
+MAXIMIZE_METRICS = [
+    "d_seq_throughput",
+    "d_token_throughput",
+    "d_total_token_throughput",
+    "d_user_throughput",
+    "d_mean_tpot",
+    "d_median_tpot",
+    "d_p99_tpot",
+]
+
+# Metrics where smaller is better
+MINIMIZE_METRICS = [
+    "d_mean_ttft",
+    "d_median_ttft",
+    "d_p99_ttft",
+    "d_mean_itl",
+    "d_median_itl",
+    "d_p99_itl",
+    "d_mean_e2el",
+    "d_median_e2el",
+    "d_p99_e2el",
+]
+
+# Key metrics that determine regression (throughput metrics only)
+REGRESSION_METRICS = [
+    "d_token_throughput",
+    "d_total_token_throughput",
+]
 
 
 def get_model_dir(model_name: str) -> str:
@@ -1495,8 +1516,6 @@ class PerfSanityTestConfig:
         match_keys = []
 
         if self.runtime == "aggr_server":
-            job_config = get_job_info()
-            is_post_merge = job_config["b_is_post_merge"]
             new_data_dict = {}
             cmd_idx = 0
             for server_idx, client_configs in self.server_client_configs.items():
@@ -1525,7 +1544,6 @@ class PerfSanityTestConfig:
                         if server_config.gpus != server_config.gpus_per_node
                         else "aggr_server",
                     }
-                    new_data.update(job_config)
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
                     # Add test_case_name for convenient filtering on OpenSearch
@@ -1534,10 +1552,6 @@ class PerfSanityTestConfig:
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
-                    new_data["s_stage_name"] = os.environ.get("stageName", "")
-                    new_data["s_test_list"] = self._test_param_labels
-
-                    add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
 
@@ -1551,8 +1565,6 @@ class PerfSanityTestConfig:
             if self.server_configs[0][2].disagg_serving_type != "BENCHMARK":
                 return
 
-            job_config = get_job_info()
-            is_post_merge = job_config["b_is_post_merge"]
             new_data_dict = {}
             cmd_idx = 0
 
@@ -1591,7 +1603,6 @@ class PerfSanityTestConfig:
                         "l_num_ctx_servers": num_ctx_servers,
                         "l_num_gen_servers": num_gen_servers,
                     }
-                    new_data.update(job_config)
                     if num_ctx_servers > 0:
                         new_data.update(ctx_server_config_dict)
                     if num_gen_servers > 0:
@@ -1603,10 +1614,6 @@ class PerfSanityTestConfig:
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
-                    new_data["s_stage_name"] = os.environ.get("stageName", "")
-                    new_data["s_test_list"] = self._test_param_labels
-
-                    add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
 
@@ -1628,29 +1635,20 @@ class PerfSanityTestConfig:
         else:
             return
 
-        if not new_data_dict:
-            print_info("No data to upload to database.")
-            return
+        extra_fields = {
+            "s_stage_name": os.environ.get("stageName", ""),
+            "s_test_list": self._test_param_labels,
+        }
 
-        # Find common values across all data entries to narrow down query scope
-        common_values_dict = get_common_values(new_data_dict, match_keys)
-
-        # Get history data for each cmd_idx
-        latest_history_data_dict, history_data_dict = get_history_data(
-            new_data_dict, match_keys, common_values_dict
+        process_and_upload_test_results(
+            new_data_dict=new_data_dict,
+            match_keys=match_keys,
+            maximize_metrics=MAXIMIZE_METRICS,
+            minimize_metrics=MINIMIZE_METRICS,
+            regression_metrics=REGRESSION_METRICS,
+            extra_fields=extra_fields,
+            upload_to_db=self.upload_to_db,
         )
-
-        # Update regression info in new_data_dict (both post-merge and pre-merge)
-        prepare_regressive_test_cases(latest_history_data_dict, history_data_dict, new_data_dict)
-
-        if is_post_merge:
-            # Embed baseline fields into post-merge data
-            add_baseline_fields_to_post_merge_data(latest_history_data_dict, new_data_dict)
-
-        if self.upload_to_db:
-            post_new_perf_data(new_data_dict)
-
-        check_perf_regression(new_data_dict, fail_on_regression=not is_post_merge)
 
 
 # Perf sanity test case parameters
