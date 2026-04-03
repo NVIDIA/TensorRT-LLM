@@ -3171,6 +3171,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 module.w3_w1_weight_scale.data[expert_idx])
             self._shuffle_and_interleave_w2_weight_scale(
                 module.w2_weight_scale.data[expert_idx])
+            # Shuffle biases (same shuffle as weights, deferred from load)
+            if module.bias:
+                self._shuffle_w3_w1_weight(module,
+                                           module.w3_w1_bias.data[expert_idx])
+                self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
 
         # Compute fc31_scale_c now that global input_scale and alphas are finalized
         # c_global_sf: fc2_input_scale
@@ -3571,7 +3576,13 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             processed.view(self.block_scales_dtype).reshape(orig_shape))
 
     def _shuffle_all_experts(self, module: torch.nn.Module):
-        """Override to pass is_gated_act_gemm for w3_w1 weight scale shuffle."""
+        """Override to pass is_gated_act_gemm for w3_w1 weight scale shuffle.
+
+        Also shuffles biases (w3_w1_bias, w2_bias) which are loaded via the
+        same load_expert_w3_w1_weight / load_expert_w2_weight methods. In the
+        main branch these are shuffled during loading; we must do it here since
+        shuffle was deferred to support partial weight loading.
+        """
         num_experts = module.w3_w1_weight.data.shape[0]
         for expert_idx in range(num_experts):
             self._shuffle_w3_w1_weight(module,
@@ -3582,6 +3593,11 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                 is_gated_act_gemm=module.is_gated_activation)
             self._shuffle_and_interleave_w2_weight_scale(
                 module.w2_weight_scale.data[expert_idx])
+            # Shuffle biases (same shuffle as weights)
+            if module.bias:
+                self._shuffle_w3_w1_weight(module,
+                                           module.w3_w1_bias.data[expert_idx])
+                self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
 
         # Compute fc31_scale_c now that global input_scale and alphas are finalized.
         from ...utils import ActivationType
