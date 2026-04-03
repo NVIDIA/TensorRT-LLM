@@ -16,6 +16,7 @@
  */
 
 #include "kvCacheManagerTestUtilBinding.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <nanobind/nanobind.h>
