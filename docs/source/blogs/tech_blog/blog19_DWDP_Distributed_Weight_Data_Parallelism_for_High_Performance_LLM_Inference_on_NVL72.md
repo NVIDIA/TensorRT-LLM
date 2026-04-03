@@ -2,7 +2,7 @@
 
 By NVIDIA TensorRT LLM Team
 
-In LLM inference, workload imbalances and communication bottlenecks often lead to excessive synchronization overhead, limiting GPU utilization. We present DWDP (Distributed Weight Data Parallelism), an inference parallelization strategy that preserves data-parallel execution while offloading MoE weights across peer GPUs. By removing collective inter-rank synchronization, DWDP allows each GPU to progress independently. Implemented in TensorRT-LLM and evaluated with DeepSeek-R1 on GB200 NVL72, DWDP improves end-to-end output TPS/GPU by 8.8% at comparable TPS/user in the 20-100 TPS/user serving range under 8K input sequence length and 1K output sequence length. The DWDP implementation has been merged into TensorRT-LLM ([PR #12136](https://github.com/NVIDIA/TensorRT-LLM/pull/12136)). A more detailed technical introduction is also available on arXiv ([link placeholder](https://arxiv.org/abs/XXXX.XXXXX)).
+In LLM inference, workload imbalances and communication bottlenecks often lead to excessive synchronization overhead, limiting GPU utilization. We present DWDP (Distributed Weight Data Parallelism), an inference parallelization strategy that preserves data-parallel execution while offloading MoE weights across peer GPUs. By removing collective inter-rank synchronization, DWDP allows each GPU to progress independently. Implemented in TensorRT-LLM and evaluated with DeepSeek-R1 on GB200 NVL72, DWDP improves end-to-end output TPS/GPU by 8.8% at comparable TPS/user in the 20-100 TPS/user serving range under 8K input sequence length and 1K output sequence length. The DWDP implementation has been merged into TensorRT-LLM ([PR #12136](https://github.com/NVIDIA/TensorRT-LLM/pull/12136)). A more detailed technical introduction is also available on arXiv ([arXiv:2604.01621](https://arxiv.org/abs/2604.01621)).
 
 ## Table of Contents
 
@@ -30,16 +30,16 @@ In LLM inference, workload imbalances and communication bottlenecks often lead t
 
 Most existing inference parallelism strategies introduce layer-wise inter-rank synchronization. That synchronization becomes increasingly problematic in real-world LLM serving, where per-rank workloads are rarely balanced. At the request level, different ranks often see different sequence lengths and KV-cache hit rates. At the weight level, activated computation can also vary across ranks, especially for MoE models. Together, these effects create substantial per-rank latency variation during inference. Once the execution model synchronizes at layer boundaries, end-to-end throughput becomes bounded by the slowest rank.
 
-This effect can be quantified using a DEP configuration for DeepSeek-R1 on GB200 with `ISL/OSL = 8K/1K` and input ratio `0.8`. In that setup, synchronization overhead reaches approximately `10%` when the coefficient of variation of per-rank sequence lengths is `20%`, which is well within the range observed in production workloads. In other words, synchronization overhead is not a corner case. Under realistic imbalance, it can materially reduce end-to-end inference throughput.
+This effect can be quantified using a DEP configuration for DeepSeek-R1 on GB200 with `ISL/OSL = 8K/1` and input ratio `0.8`. In that setup, synchronization overhead reaches approximately `10%` when the coefficient of variation of per-rank sequence lengths is `20%`, which is well within the range observed in production workloads. In other words, synchronization overhead is not a corner case. Under realistic imbalance, it can materially reduce end-to-end inference throughput.
 
 This leads to the key design question behind DWDP: can we remove collective synchronization and let each rank progress independently?
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
+  <img src="../media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1. Synchronization overhead caused by workload imbalance in DEP for DeepSeek-R1 on GB200 with <code>ISL/OSL = 8K/1K</code> and input ratio <code>0.8</code>.</em></sub></p>
+<p align="center"><sub><em>Figure 1. Synchronization overhead caused by workload imbalance in DEP for DeepSeek-R1 on GB200 with <code>ISL/OSL = 8K/1</code> and input ratio <code>0.8</code>.</em></sub></p>
 
 ## DWDP Overview
 
@@ -51,13 +51,13 @@ Within a DWDP group, attention weights are fully replicated on each rank, while 
 
 At runtime, DWDP overlaps the asynchronous prefetch of remote experts for layer `l+1` with the MoE block of layer `l` and the attention block of layer `l+1`. Together, these two blocks create the compute window that hides remote weight prefetch. Before the MoE block of layer `l+1` begins, the rank waits only for its own prefetched experts to arrive. After the layer finishes, those prefetched remote experts are released. To sustain this pipeline across layers, DWDP uses double buffering with prefetching.
 
-To eliminate collective inter-rank synchronization during inference, DWDP avoids NCCL-based collective remote-weight gathering such as all-gather. Instead, each rank pulls remote experts from peer GPUs through copy-engine-based `cudaMemcpyAsync`, which does not consume SM resources. These transfers are issued as serial peer-to-peer pulls, so they do not reintroduce synchronization across the group. Once a rank has the experts it needs for the next MoE block, it can continue independently.
+To eliminate collective inter-rank synchronization during inference, DWDP avoids NCCL-based collective remote-weight gathering such as all-gather. Instead, each rank pulls remote experts from peer GPUs through copy-engine-based `cudaMemcpyAsync`, which does not consume SM resources. These transfers are issued as serial peer-to-peer pulls, so they do not introduce synchronization across the group. Once a rank has the experts it needs for the next MoE block, it can continue independently.
 
 DWDP also provides greater flexibility in expert placement. Because each rank only needs to fetch the weights for one layer before executing its MoE block, DWDP does not require the number of experts to be exactly divisible by the DWDP group size, and it does not require a perfectly disjoint expert partition across ranks. Instead, ranks can be configured with the same number of local experts while allowing redundant expert placement when necessary, for example to support group sizes that do not evenly divide the number of experts. This weaker placement constraint enables resource provisioning at single-rank granularity. When memory permits, the same redundancy can also reduce remote prefetch overhead by increasing the number of local experts on each rank.
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
+  <img src="../media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Overview of DWDP with DWDP group size 4.</em></sub></p>
@@ -68,7 +68,7 @@ We use a simple layer-wise roofline-style model to identify when DWDP can outper
 
 We focus on two derived metrics in Table 1: `T_compute / T_prefetch`, which indicates whether DWDP can hide remote weight prefetch, and `T_DEP / T_DWDP`, which captures DWDP's expected advantage over DEP.
 
-Table 1 shows that DWDP begins to outperform DEP at around 16K input tokens at batch size 1. As input sequence length increases, `T_compute / T_prefetch` grows from below `1` to above `1`, indicating that longer contexts provide a sufficiently large compute window to amortize and eventually hide remote prefetch overhead. This reveals a key limitation of DWDP: it needs enough computation per layer to cover remote weight prefetch. The 16K crossover is specific to the batch-size-1 setting. Increasing the batch size enlarges the compute window and can make DWDP beneficial even for shorter contexts.
+Table 1 shows that DWDP begins to outperform DEP at around 16K input tokens at batch size 1. As input sequence length increases, `T_compute / T_prefetch` grows from below `1` to above `1`, indicating that longer contexts provide a sufficiently large compute window to amortize and eventually hide remote prefetch overhead. This reveals that DWDP needs enough computation per layer to cover remote weight prefetch. The 16K crossover is specific to the batch-size-1 setting. Increasing the batch size enlarges the compute window and can make DWDP beneficial even for shorter contexts.
 
 | Input sequence length | `T_compute / T_prefetch` | `T_DEP / T_DWDP` |
 | --- | ---: | ---: |
@@ -139,7 +139,7 @@ Each DWDP-enabled MoE layer registers a `DwdpLayerHandleCollector`. During model
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
+  <img src="../media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
 </figure>
 </div>
 
@@ -171,13 +171,14 @@ In the current DWDP code path, the runtime flow can be summarized by the diagram
 
 ### Current Code-Level Constraints
 
-The current implementation supports only a narrow set of code paths:
+The current implementation has the following constraints:
 
 - DWDP only supports the `CuteDSL` MoE backend with `NVFP4`.
 - DWDP only supports `TP = 1` inside each DWDP group.
 - DWDP only supports the MPI worker launch flow used by `trtllm-serve disaggregated_mpi_worker`.
 - DWDP does not support overlap scheduler.
 - DWDP does not support EPLB on the same MoE path.
+- DWDP requires fused-finalize-enabled FC2.
 
 ## Key Optimizations
 
@@ -204,14 +205,14 @@ One mitigation is to split each remote-weight transfer into fixed-size slices an
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
+  <img src="../media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Nsight Systems trace showing many-to-one source-side communication contention in DWDP under a short compute-window setting.</em></sub></p>
 
 Our experiments show that the additional gain is most visible when the compute window is short. For example, under the `ISL = 8K` context-only workload with `ISL ratio = 0.5` and `max_num_tokens (MNT) = 16384`, contention mitigation delivers an `8%` TPS/GPU gain over the DWDP version without this optimization.
 
-It is important to emphasize that this optimization is part of the broader DWDP design exploration, but it is not yet included in the current productized DWDP code path.
+**Important:** This optimization is part of the broader DWDP design exploration, but it is not yet included in the current productized DWDP code path.
 
 
 
@@ -223,7 +224,7 @@ The experiments in this section use the following setup.
 Unless otherwise stated, the results in this section do not include the additional performance gain from the contention-mitigation optimization described above.
 
 - Hardware: GB200 NVL72
-- Commit: the measurements in this section are based on TensorRT-LLM commit `3a89495`
+- Commit: the DWDP implementation evaluated in this section was developed based on TensorRT-LLM commit `3a89495`
 - Model: [DeepSeek-R1-0528-NVFP4-v2](https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4-v2)
 - Serving mode: disaggregated serving, with DWDP applied on the context server
 
@@ -233,7 +234,7 @@ We split the discussion into context-only and end-to-end results.
 
 The context-only study isolates the context phase, uses the Artificial Analysis dataset, and compares DWDP against a DEP baseline.
 
-We first examine a context-only iteration-latency breakdown of DEP4 and DWDP4 for DeepSeek-R1 under `ISL = 8K`, `ratio = 0.8`, and `max_num_tokens = 32768` on a GB200 context server. The last column reports per-category deltas normalized to the DEP4 iteration latency.
+We first examine a context-only iteration-latency breakdown of DEP4 and DWDP4 for DeepSeek-R1 under `ISL = 8K`, `ratio = 0.8`, and `max_num_tokens = 32768` on GB200x4. The last column reports per-category deltas normalized to the DEP4 iteration latency.
 
 
 | Category | DEP4 (`us`) | DWDP4 (`us`) | `Delta / T_DEP4` |
@@ -247,7 +248,7 @@ We first examine a context-only iteration-latency breakdown of DEP4 and DWDP4 fo
 | Synchronization Cost | 161.85 | 0.00 | 12.26% |
 | **Iteration Latency** | **1319.85** | **1131.58** | **14.26%** |
 
-*Table 3. Context-only iteration-latency breakdown of DEP4 and DWDP4 for DeepSeek-R1 under `ISL = 8K`, `ratio = 0.8`, and `max_num_tokens = 32768` on a GB200 context server.*
+*Table 3. Context-only iteration-latency breakdown of DEP4 and DWDP4 for DeepSeek-R1 under `ISL = 8K`, `ratio = 0.8`, and `max_num_tokens = 32768` on GB200x4.*
 
 The breakdown highlights both the promise and the remaining inefficiencies of DWDP. Relative to DEP, DWDP removes synchronization cost entirely and takes communication off the critical path. Together, these two effects correspond to a `21.86%` gross reduction in iteration latency.
 
@@ -259,7 +260,7 @@ The end-to-end study uses the SemiAnalysis dataset with ISL=`8K`, OSL=`1K`, and 
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="700">
+  <img src="../media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. End-to-end Pareto frontier comparison between baseline and DWDP.</em></sub></p>
@@ -321,12 +322,12 @@ python3 examples/dwdp/reproduce.py \
 
 ## Summary
 
-- DWDP's first advantage is that it removes the synchronization penalty caused by imbalanced workloads, which makes it a better fit for real LLM serving.
+- DWDP's first advantage is that it removes the synchronization overhead caused by imbalanced workloads, which makes it a better fit for real LLM serving.
 - DWDP's second advantage is flexibility: it gives the system finer-grained freedom when provisioning context GPUs in disaggregated serving.
-- DWDP is not a universal win. It needs a sufficiently large compute window to hide remote expert prefetch, which is why it is best matched to the context side.
+- DWDP needs a sufficiently large compute window to hide remote expert prefetch, which is why it is best matched to the context side.
 - DWDP depends on strong hardware support. High-bandwidth peer GPU connectivity such as GB200 NVL72 is what makes DWDP practical.
-- DWDP introduces new engineering challenges, especially around split-weight handling and asynchronous remote-weight pull.
-- Today, DWDP supports only a narrow set of code paths and deployment assumptions. Expanding that support remains future work.
+- DWDP introduces new engineering challenges, especially around split-weight handling and asynchronous remote-weight prefetch.
+- Today, DWDP supports only a subset of code paths and deployment assumptions. Expanding that support remains future work.
 
 
 ## Future Work

@@ -42,6 +42,7 @@ Update these sections before running:
 - `environment`
   Set `container_image`, `container_mount`, `model_path`, and usually
   `trtllm_repo`.
+  By default, benchmark logs are written under `examples/dwdp/logs/`.
 - `datasets`
   Map short dataset keys to concrete dataset files.
 
@@ -50,6 +51,8 @@ points it to `examples/disaggregated/slurm/benchmark`, which is what
 `submit_dwdp.py` expects for locating the benchmark shell scripts.
 
 ## Configure `dwdp_reproduce.yaml`
+
+This file can define both context-only and end-to-end reproduction experiments.
 
 The reproduction matrix is split into:
 
@@ -91,3 +94,6 @@ Generated configs are written to `examples/dwdp/generated/`.
 The filenames include both the experiment name and the generated benchmark
 identifier so they can be inspected or reused directly with
 `submit_dwdp.py`.
+
+> **IMPORTANT:** Benchmark run logs are written by default to
+> `examples/dwdp/logs/<timestamp>/...`.
