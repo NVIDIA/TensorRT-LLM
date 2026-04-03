@@ -67,21 +67,14 @@ class TransformerArgsPreprocessor:
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
 
-        # Cache for context/mask/PE — these depend only on text context and
-        # positions which are constant across denoise steps.  Keyed by
-        # data_ptr() which is stable within a single generate() call.
-        # Must be cleared between generate() calls via clear_cache().
-        self._cached_context: torch.Tensor | None = None
-        self._cached_mask: torch.Tensor | None = None
-        self._cached_pe: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._cache_key: int | None = None
+        # Text context cache — injected via set_text_cache() by pipeline.
+        self._text_cache = None  # LTX2TextContextCache | None
+        self._modality_name: str = "video"
 
-    def clear_cache(self) -> None:
-        """Reset preprocessor cache.  Call between generate() requests."""
-        self._cached_context = None
-        self._cached_mask = None
-        self._cached_pe = None
-        self._cache_key = None
+    def set_text_cache(self, cache, modality_name: str) -> None:
+        """Inject shared text context cache.  Called once by pipeline."""
+        self._text_cache = cache
+        self._modality_name = modality_name
 
     def _prepare_timestep(
         self,
@@ -139,17 +132,22 @@ class TransformerArgsPreprocessor:
             freq_grid_generator=freq_grid_generator,
         )
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
+    def prepare(self, modality: Modality, is_unconditional: bool = False) -> TransformerArgs:
         x = self.patchify_proj(modality.latent.contiguous())
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
 
-        # Cache context projection, attention mask, and RoPE.
-        # modality.context is the same tensor object across denoise steps
-        # (pipeline passes the same video_embeds/audio_embeds every step).
-        ctx_key = modality.context.data_ptr()
-        if self._cache_key != ctx_key:
+        # Context projection, attention mask, and RoPE are constant across
+        # denoise steps.  Try cache first; compute on miss or when disabled.
+        entry = (
+            self._text_cache.get_preproc(is_unconditional, self._modality_name)
+            if self._text_cache is not None
+            else None
+        )
+        if entry is not None and entry.context is not None:
+            context, attention_mask, pe = entry.context, entry.mask, entry.pe
+        else:
             context, attention_mask = self._prepare_context(
                 modality.context, x, modality.context_mask
             )
@@ -162,18 +160,16 @@ class TransformerArgsPreprocessor:
                 num_attention_heads=self.num_attention_heads,
                 x_dtype=modality.latent.dtype,
             )
-            self._cached_context = context
-            self._cached_mask = attention_mask
-            self._cached_pe = pe
-            self._cache_key = ctx_key
+            if entry is not None:
+                entry.context, entry.mask, entry.pe = context, attention_mask, pe
 
         return TransformerArgs(
             x=x,
-            context=self._cached_context,
-            context_mask=self._cached_mask,
+            context=context,
+            context_mask=attention_mask,
             timesteps=timestep,
             embedded_timestep=embedded_timestep,
-            positional_embeddings=self._cached_pe,
+            positional_embeddings=pe,
             cross_positional_embeddings=None,
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
@@ -221,29 +217,35 @@ class MultiModalTransformerArgsPreprocessor:
         self.cross_pe_max_pos = cross_pe_max_pos
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
-        self._cached_cross_pe: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._cross_pe_key: int | None = None
 
-    def clear_cache(self) -> None:
-        """Reset all caches (base + cross-PE).  Call between generate() requests."""
-        self.simple_preprocessor.clear_cache()
-        self._cached_cross_pe = None
-        self._cross_pe_key = None
+    def set_text_cache(self, cache, modality_name: str) -> None:
+        """Inject shared text context cache.  Delegates to inner preprocessor."""
+        self.simple_preprocessor.set_text_cache(cache, modality_name)
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
-        transformer_args = self.simple_preprocessor.prepare(modality)
+    def prepare(self, modality: Modality, is_unconditional: bool = False) -> TransformerArgs:
+        sp = self.simple_preprocessor
+        transformer_args = sp.prepare(modality, is_unconditional)
 
-        pos_key = modality.positions.data_ptr()
-        if self._cross_pe_key != pos_key:
-            self._cached_cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
+        # Cross-PE: constant across steps, cache when enabled.
+        # Reuse the same entry that prepare() just read/wrote.
+        entry = (
+            sp._text_cache.get_preproc(is_unconditional, sp._modality_name)
+            if sp._text_cache is not None
+            else None
+        )
+        if entry is not None and entry.cross_pe is not None:
+            cross_pe = entry.cross_pe
+        else:
+            cross_pe = sp._prepare_positional_embeddings(
                 positions=modality.positions[:, 0:1, :],
                 inner_dim=self.audio_cross_attention_dim,
                 max_pos=[self.cross_pe_max_pos],
                 use_middle_indices_grid=True,
-                num_attention_heads=self.simple_preprocessor.num_attention_heads,
+                num_attention_heads=sp.num_attention_heads,
                 x_dtype=modality.latent.dtype,
             )
-            self._cross_pe_key = pos_key
+            if entry is not None:
+                entry.cross_pe = cross_pe
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,
@@ -253,7 +255,7 @@ class MultiModalTransformerArgsPreprocessor:
         )
         return replace(
             transformer_args,
-            cross_positional_embeddings=self._cached_cross_pe,
+            cross_positional_embeddings=cross_pe,
             cross_scale_shift_timestep=cross_scale_shift_timestep,
             cross_gate_timestep=cross_gate_timestep,
         )

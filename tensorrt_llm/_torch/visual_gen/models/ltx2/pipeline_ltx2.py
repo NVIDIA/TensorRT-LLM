@@ -401,6 +401,18 @@ class LTX2Pipeline(BasePipeline):
         )
         self.transformer._transformer_config = vars(cfg)
 
+        # Text context cache — caches constant text computations across
+        # denoise steps.  Supports 2 CFG slots (cond + uncond).
+        from .text_context_cache import LTX2TextContextCache
+
+        self._text_cache = LTX2TextContextCache(
+            num_layers=getattr(cfg, "num_layers", 48),
+            max_batch_size=1,
+        )
+        # Inject cache into preprocessors for context/mask/PE caching.
+        self.transformer.video_args_preprocessor.set_text_cache(self._text_cache, "video")
+        self.transformer.audio_args_preprocessor.set_text_cache(self._text_cache, "audio")
+
     # ------------------------------------------------------------------
     # Component loading
     # ------------------------------------------------------------------
@@ -1157,9 +1169,9 @@ class LTX2Pipeline(BasePipeline):
         if do_stg and stg_blocks:
             stg_perturbation = build_stg_perturbation_config(stg_blocks)
 
-        # Invalidate text KV cache so the first denoise step refills it.
-        # Context is constant within a generate() call but changes between calls.
-        self.transformer.invalidate_text_kv_cache()
+        # Invalidate text context cache (preprocessor + KV) so the first
+        # denoise step refills it.
+        self._text_cache.invalidate()
 
         # ---- 8. Denoising loop ------------------------------------------
         def _run_transformer(
@@ -1170,6 +1182,7 @@ class LTX2Pipeline(BasePipeline):
             a_context,
             mask,
             perturbations=None,
+            is_unconditional=False,
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
 
@@ -1219,6 +1232,8 @@ class LTX2Pipeline(BasePipeline):
                 video=video_mod,
                 audio=audio_mod,
                 perturbations=perturbations,
+                text_cache=self._text_cache,
+                is_unconditional=is_unconditional,
             )
 
             dn_v = None
@@ -1285,6 +1300,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        is_unconditional=True,
                     )
 
                 local_v = local_v.contiguous()
@@ -1321,6 +1337,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        is_unconditional=True,
                     )
 
             # STG: perturbed attention pass
