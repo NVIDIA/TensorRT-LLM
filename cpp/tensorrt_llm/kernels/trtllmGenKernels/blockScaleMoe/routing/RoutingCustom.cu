@@ -896,9 +896,14 @@ void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHi
         LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, numThreadsHist,
             /*smemSize=*/0, stream, NoOpPreprocess, NoOpPostprocess, NumExperts576Experts, NumTop8Experts);
     }
+    else if (data.mNumExperts <= NumExperts1024Experts)
+    {
+        LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, numThreadsHist,
+            /*smemSize=*/0, stream, NoOpPreprocess, NoOpPostprocess, NumExperts1024Experts, NumTop8Experts);
+    }
     else
     {
-        TLLM_LOG_ERROR("Coop kernel does not support numExperts > %d", NumExperts576Experts);
+        TLLM_LOG_ERROR("Coop kernel does not support numExperts > %d", NumExperts1024Experts);
     }
 }
 
