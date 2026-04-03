@@ -77,7 +77,7 @@ TensorRT LLM
 </details>
 
 ## Latest News
-* [08/05] 🎨 TensorRT LLM now supports diffusion models for visual generation [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/models/visual-generation.md)
+* [04/03] 🎨 TensorRT LLM now supports diffusion models for visual generation [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/models/visual-generation.md)
 
 <details close>
 <summary>Previous News</summary>
