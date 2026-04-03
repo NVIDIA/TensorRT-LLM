@@ -6,3 +6,5 @@ wheel>=0.46.2
 tornado>=6.5.5
 # WAR against https://github.com/advisories/GHSA-3936-cmfr-pm3m
 black>=26.3.1
+# WAR to keep type check precommit result stable
+types-psutil==7.2.2.20260130
