@@ -1367,7 +1367,10 @@ class SequenceInfo:
     @nvtx_range("ad_host_prepare_for_attention_forward")
     def run_host_prepare_for_attention_forward(self) -> None:
         for host_function, args in self._host_prepare_functions:
-            host_function(**{arg: self.get_arg(arg) for arg in args})
+            with nvtx_range("ad_host_prepare_get_args"):
+                kwargs = {arg: self.get_arg(arg) for arg in args}
+            with nvtx_range("ad_host_prepare_call"):
+                host_function(**kwargs)
 
     @nvtx_range("ad_offset_pos_and_cache_")
     def offset_pos_and_cache_(self, offset: torch.Tensor) -> None:
@@ -1386,63 +1389,96 @@ class SequenceInfo:
             "seq_len_with_cache",
             "use_initial_states",
         }
-        needs_d2h_sync = [
-            k + self._host_suffix
-            for k in _REQUIRES_UPDATE
-            if self._is_active(k + self._host_suffix, check_both=False)
-        ]
-        sync_to_host = any(needs_d2h_sync)
-        if sync_to_host:
-            ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
+        with nvtx_range("ad_opc_needs_d2h_sync"):
+            needs_d2h_sync = [
+                k + self._host_suffix
+                for k in _REQUIRES_UPDATE
+                if self._is_active(k + self._host_suffix, check_both=False)
+            ]
+        with nvtx_range("ad_opc_sync_to_host_check"):
+            sync_to_host = any(needs_d2h_sync)
+            if sync_to_host:
+                ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
 
-        num_sequences = self.num_sequences
-        assert offset.shape[0] == num_sequences, f"{offset.shape[0]=} != {num_sequences=}"
+        with nvtx_range("ad_opc_num_sequences"):
+            num_sequences = self.num_sequences
+            assert offset.shape[0] == num_sequences, f"{offset.shape[0]=} != {num_sequences=}"
 
         # --- input_pos (update as always) ---
-        input_pos = self.get_arg("input_pos", truncate=True)
-        input_pos += offset.to(input_pos.dtype)
+        with nvtx_range("ad_opc_input_pos"):
+            input_pos = self.get_arg("input_pos", truncate=True)
+            input_pos += offset.to(input_pos.dtype)
 
         # --- cache assignments ---
         # NOTE: cache_loc and cu_num_pages must be up-to-date together -> enforced in nest_sequences
-        if any(self._is_active(arg) for arg in ("cache_loc", "cu_num_pages", "last_page_len")):
-            last_page_len = self.get_arg("last_page_len", truncate=True)
-            last_page_len += offset
-            delta = (last_page_len > self.tokens_per_block).int() - (last_page_len <= 0).int()
-            torch.ops.auto_deploy.adjust_ragged_triton(
-                cache_loc=self.get_arg("cache_loc"),
-                cu_num_blocks=self.get_arg("cu_num_pages"),
-                extra_idx=self.get_arg("extra_page_per_seq"),
-                delta=delta,
-                num_sequences=num_sequences,
-                max_blocks_per_seq=self.max_blocks_per_seq,
-            )
-            last_page_len -= 1
-            last_page_len %= self.tokens_per_block
-            last_page_len += 1
+        with nvtx_range("ad_opc_cache_assignments"):
+            if any(self._is_active(arg) for arg in ("cache_loc", "cu_num_pages", "last_page_len")):
+                with nvtx_range("ad_opc_last_page_len_delta"):
+                    last_page_len = self.get_arg("last_page_len", truncate=True)
+                    last_page_len += offset
+                    delta = (last_page_len > self.tokens_per_block).int() - (
+                        last_page_len <= 0
+                    ).int()
+                with nvtx_range("ad_opc_adjust_ragged_triton"):
+                    torch.ops.auto_deploy.adjust_ragged_triton(
+                        cache_loc=self.get_arg("cache_loc"),
+                        cu_num_blocks=self.get_arg("cu_num_pages"),
+                        extra_idx=self.get_arg("extra_page_per_seq"),
+                        delta=delta,
+                        num_sequences=num_sequences,
+                        max_blocks_per_seq=self.max_blocks_per_seq,
+                    )
+                with nvtx_range("ad_opc_last_page_len_wrap"):
+                    last_page_len -= 1
+                    last_page_len %= self.tokens_per_block
+                    last_page_len += 1
 
         # --- position_ids (device) ---
-        position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
-        # position_ids is per-token while offset is per-sequence; expand if needed
-        if self.is_generate_only:
-            offset_for_pos_ids = offset
-        else:
-            seq_len = self.get_arg("seq_len", truncate=True)
-            offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
-        position_ids += offset_for_pos_ids
+        with nvtx_range("ad_opc_position_ids"):
+            position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
+            # position_ids is per-token while offset is per-sequence; expand if needed
+
+            if self.is_generate_only:
+                with nvtx_range("ad_opc_position_ids_offset_generate_only"):
+                    offset_for_pos_ids = offset
+            else:
+                num_prefill, num_extend, num_decode = self.batch_info.get_num_sequences()
+                num_prefill_tokens, num_extend_tokens, num_decode_tokens = (
+                    self.batch_info.get_num_tokens()
+                )
+                # Fast path: extend-only batch (e.g. Eagle spec-dec steady state).
+                # All sequences have the same token count, so use a scalar repeat
+                # to avoid the sync from variable-length repeat_interleave.
+                if num_prefill == 0 and num_decode == 0 and num_extend > 0:
+                    with nvtx_range("ad_opc_position_ids_offset_extend_only"):
+                        tokens_per_seq = num_extend_tokens // num_extend
+                        offset_for_pos_ids = offset.repeat_interleave(tokens_per_seq)
+                else:
+                    with nvtx_range("ad_opc_position_ids_offset_mixed"):
+                        seq_len = self.get_arg("seq_len", truncate=True)
+                        offset_for_pos_ids = torch.repeat_interleave(
+                            offset, seq_len.to(torch.int64)
+                        )
+
+            with nvtx_range("ad_opc_position_ids_offset_add"):
+                position_ids += offset_for_pos_ids
 
         # --- seq_len_with_cache (device) ---
-        swc = self.get_arg("seq_len_with_cache", truncate=True)
-        swc += offset
+        with nvtx_range("ad_opc_seq_len_with_cache"):
+            swc = self.get_arg("seq_len_with_cache", truncate=True)
+            swc += offset
 
         # --- use_initial_states (device) ---
-        use_initial_states = self.get_arg("use_initial_states", truncate=True)
-        use_initial_states[:] = input_pos > 0
+        with nvtx_range("ad_opc_use_initial_states"):
+            use_initial_states = self.get_arg("use_initial_states", truncate=True)
+            use_initial_states[:] = input_pos > 0
 
         # --- Bulk device-to-host sync ---
         # TODO: we have to continue thinking about this and dissect more what fields are needed in
         # the forward pass if we use cudagraph...
-        if sync_to_host:
-            self._input_buffer.copy_to_host()
+        with nvtx_range("ad_opc_copy_to_host"):
+            if sync_to_host:
+                self._input_buffer.copy_to_host()
 
     @nvtx_range("ad_offset_with_new_lens_")
     def offset_with_new_lens_(self, new_lens_ungathered: torch.Tensor) -> None:

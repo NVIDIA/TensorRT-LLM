@@ -34,7 +34,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import get_sm_version, nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
@@ -202,31 +202,38 @@ class _TrtllmPlanner:
         num_seq = num_prefill + num_decode
 
         # host_request_types: 0 = prefill (context), 1 = decode (generation)
-        self.host_request_types[:num_prefill].fill_(0)
-        self.host_request_types[num_prefill:num_seq].fill_(1)
+        with nvtx_range("ad_trtllm_plan_host_request_types"):
+            self.host_request_types[:num_prefill].fill_(0)
+            self.host_request_types[num_prefill:num_seq].fill_(1)
 
         # Use prompt_lens if available (original context length, constant across
         # iterations). Falls back to seq_len_host (correct for prefill, wrong for
         # extend/decode on subsequent iterations). Matches PyTorch backend's
         # prompt_lens which is set once per request and never changes.
-        context_lens = prompt_lens_host if prompt_lens_host is not None else seq_len_host
+        with nvtx_range("ad_trtllm_plan_host_context_lens"):
+            context_lens = prompt_lens_host if prompt_lens_host is not None else seq_len_host
 
         # host_total_kv_lens: [context_total_kv, gen_total_kv]
         is_capturing = torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up()
         if is_capturing:
-            self.host_total_kv_lens[0] = max_context_length * num_prefill
-            self.host_total_kv_lens[1] = max_context_length * num_decode
-            self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
-            self.host_context_lengths[:num_seq].fill_(max_context_length)
-            self.context_lengths_gpu[:num_seq].fill_(max_context_length)
+            with nvtx_range("ad_trtllm_plan_host_capturing"):
+                self.host_total_kv_lens[0] = max_context_length * num_prefill
+                self.host_total_kv_lens[1] = max_context_length * num_decode
+                self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
+                self.host_context_lengths[:num_seq].fill_(max_context_length)
+                self.context_lengths_gpu[:num_seq].fill_(max_context_length)
         else:
-            self.host_total_kv_lens[0] = seq_len_with_cache_host[:num_prefill].sum()
-            self.host_total_kv_lens[1] = seq_len_with_cache_host[num_prefill:num_seq].sum()
-            # Match PyTorch backend: host_past_kv_lengths = total KV cache length
-            # after this forward (cached_token_lens + seq_lens_kv).
-            self.host_past_kv_lengths[:num_seq] = seq_len_with_cache_host[:num_seq]
-            self.host_context_lengths[:num_seq] = context_lens[:num_seq]
-            self.context_lengths_gpu[:num_seq].copy_(context_lens[:num_seq])
+            with nvtx_range("ad_trtllm_plan_host_total_kv_lens"):
+                self.host_total_kv_lens[0] = seq_len_with_cache_host[:num_prefill].sum()
+                self.host_total_kv_lens[1] = seq_len_with_cache_host[num_prefill:num_seq].sum()
+            with nvtx_range("ad_trtllm_plan_host_past_kv_lengths"):
+                # Match PyTorch backend: host_past_kv_lengths = total KV cache length
+                # after this forward (cached_token_lens + seq_lens_kv).
+                self.host_past_kv_lengths[:num_seq] = seq_len_with_cache_host[:num_seq]
+            with nvtx_range("ad_trtllm_plan_host_context_lengths"):
+                self.host_context_lengths[:num_seq] = context_lens[:num_seq]
+            with nvtx_range("ad_trtllm_plan_host_context_lengths_gpu"):
+                self.context_lengths_gpu[:num_seq].copy_(context_lens[:num_seq], non_blocking=True)
 
     def update_host_request_types(self, batch_info: BatchInfo) -> None:
         """
@@ -329,25 +336,31 @@ def prepare_trtllm_metadata_host(
     host_context_lengths. Also performs one-time spec-dec tensor initialization
     when spec_config is provided and spec-dec hasn't been set up yet.
     """
-    batch_info = BatchInfo(batch_info_host)
-    num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
+    with nvtx_range("ad_trtllm_host_batch_info"):
+        batch_info = BatchInfo(batch_info_host)
+        num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
 
-    _GlobalTrtllmPlanner.init_spec_decoding(batch_info.get_max_batch_size(), spec_config)
+    with nvtx_range("ad_trtllm_host_init_spec_decoding"):
+        _GlobalTrtllmPlanner.init_spec_decoding(batch_info.get_max_batch_size(), spec_config)
 
-    _GlobalTrtllmPlanner.reset(
-        torch.device("cuda"), batch_info.get_max_batch_size(), batch_info.get_max_blocks_per_seq()
-    )
+    with nvtx_range("ad_trtllm_host_reset"):
+        _GlobalTrtllmPlanner.reset(
+            torch.device("cuda"),
+            batch_info.get_max_batch_size(),
+            batch_info.get_max_blocks_per_seq(),
+        )
 
     # Extend (spec decoding) requests are expected as decode requests by the kernel.
-    _GlobalTrtllmPlanner.plan_host(
-        num_prefill=num_prefill,
-        num_decode=num_decode + num_extend,
-        max_context_length=batch_info.get_max_context_length(),
-        seq_len_with_cache_host=seq_len_with_cache_host,
-        input_pos_host=input_pos_host,
-        seq_len_host=seq_len_host,
-        prompt_lens_host=prompt_lens_host,
-    )
+    with nvtx_range("ad_trtllm_host_plan_host"):
+        _GlobalTrtllmPlanner.plan_host(
+            num_prefill=num_prefill,
+            num_decode=num_decode + num_extend,
+            max_context_length=batch_info.get_max_context_length(),
+            seq_len_with_cache_host=seq_len_with_cache_host,
+            input_pos_host=input_pos_host,
+            seq_len_host=seq_len_host,
+            prompt_lens_host=prompt_lens_host,
+        )
 
 
 # =============================================================================
