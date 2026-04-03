@@ -37,6 +37,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
 from .config_utils import is_nemotron_hybrid, is_qwen3_hybrid
+from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
@@ -383,6 +384,14 @@ def create_py_executor(
         chunk_size=max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
+
+    # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    dwdp_manager: Optional[DwdpManager] = None
+    if llm_args.dwdp_config is not None:
+        assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
+        dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
+        dwdp_manager.__enter__()
+        logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
     mem_monitor = _ExecutorMemoryMonitor()
 
@@ -748,6 +757,11 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
+    # Exchange IPC Handles and Initialize Dwdp Prefetch Buffer
+    if dwdp_manager is not None:
+        dwdp_manager.exchange_all_handles()
+        dwdp_manager.initialize_prefetch_buffer()
+
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
     # to provide a resource manager if required.
@@ -865,6 +879,7 @@ def create_py_executor(
                 cache_transceiver_config=cache_transceiver_config,
                 virtual_memory_pools=vm_pools,
                 execution_stream=execution_stream,
+                dwdp_manager=dwdp_manager,
             )
 
     _adjust_torch_mem_fraction()

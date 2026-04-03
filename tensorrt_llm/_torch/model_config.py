@@ -524,6 +524,7 @@ class ModelConfig(Generic[TConfig]):
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
                         q_split_threshold = sparse_attention_config.q_split_threshold
+                        enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -532,6 +533,7 @@ class ModelConfig(Generic[TConfig]):
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False
                         q_split_threshold = 8192
+                        enable_heuristic_topk = False
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -542,7 +544,8 @@ class ModelConfig(Generic[TConfig]):
                             skip_indexer_for_short_seqs,
                             use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
-                            indexer_rope_interleave=indexer_rope_interleave)
+                            indexer_rope_interleave=indexer_rope_interleave,
+                            enable_heuristic_topk=enable_heuristic_topk)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -701,6 +704,12 @@ class ModelConfig(Generic[TConfig]):
             num_kv_heads = ceil_div(num_key_value_heads,
                                     attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
+
+        # For hybrid models (e.g., Nemotron-H with Mamba + Attention), LoRA can be applied
+        # to non-attention layers (e.g., Mamba in_proj/out_proj). Set num_lora_layers to
+        # total layers so the C++ LoRA validation accepts all layer indices.
+        if is_nemotron_hybrid(self.pretrained_config):
+            model_config_cpp.set_num_lora_layers(num_layers)
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:

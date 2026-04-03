@@ -2100,5 +2100,291 @@ class TestToolParserFactory:
         assert isinstance(parser, MiniMaxM2ToolParser)
 
 
+# ============================================================================
+# FunctionDefinition strict field and ChatCompletionRequest store field Tests
+# ============================================================================
+
+
+class TestFunctionDefinitionStrictField:
+    """Test that FunctionDefinition accepts the strict field (TRTLLM-11616)."""
+
+    def test_strict_true_accepted(self):
+        """FunctionDefinition should accept strict=True without validation error."""
+        func_def = FunctionDefinition(
+            name="get_weather",
+            description="Get weather",
+            parameters={
+                "type": "object",
+                "properties": {}
+            },
+            strict=True,
+        )
+        assert func_def.strict is True
+
+    def test_strict_false_accepted(self):
+        """FunctionDefinition should accept strict=False without validation error."""
+        func_def = FunctionDefinition(
+            name="get_weather",
+            description="Get weather",
+            parameters={
+                "type": "object",
+                "properties": {}
+            },
+            strict=False,
+        )
+        assert func_def.strict is False
+
+    def test_strict_none_by_default(self):
+        """FunctionDefinition should default strict to None."""
+        func_def = FunctionDefinition(
+            name="get_weather",
+            description="Get weather",
+        )
+        assert func_def.strict is None
+
+    def test_tool_param_with_strict(self):
+        """ChatCompletionToolsParam should accept function with strict field."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="search_web",
+                description="Search",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string"
+                        }
+                    },
+                },
+                strict=True,
+            ),
+        )
+        assert tool.function.strict is True
+        assert tool.function.name == "search_web"
+
+
+# ============================================================================
+# Strict tool structural tag constraint building Tests
+# ============================================================================
+
+
+class TestBuildToolStrictGuidedDecoding:
+    """Test _build_tool_strict_guided_decoding_params from openai_server."""
+
+    def test_no_strict_tools_returns_none(self):
+        """Should return None when no tool has strict=True."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is None
+
+    def test_strict_false_returns_none(self):
+        """Should return None when all tools have strict=False."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                    strict=False,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is None
+
+    def test_no_tools_returns_none(self):
+        """Should return None when tools list is empty or None."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        assert _build_tool_strict_guided_decoding_params(None, "qwen3") is None
+        assert _build_tool_strict_guided_decoding_params([], "qwen3") is None
+
+    def test_no_parser_returns_none(self):
+        """Should return None when no tool parser is provided."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        assert _build_tool_strict_guided_decoding_params(tools, None) is None
+        assert _build_tool_strict_guided_decoding_params(tools, "") is None
+
+    def test_strict_tool_with_qwen3_parser(self):
+        """Should build GuidedDecodingParams with structural_tag for Qwen3."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is not None
+        assert result.structural_tag is not None
+
+        stag = json.loads(result.structural_tag)
+        assert stag["type"] == "structural_tag"
+        fmt = stag["format"]
+        assert fmt["type"] == "triggered_tags"
+        assert "<tool_call>" in fmt["triggers"]
+        assert len(fmt["tags"]) == 1
+
+        tag = fmt["tags"][0]
+        assert "get_weather" in tag["begin"]
+        assert tag["content"]["type"] == "json_schema"
+        assert tag["content"]["json_schema"]["properties"]["location"][
+            "type"] == "string"
+
+    def test_mixed_strict_and_non_strict(self):
+        """Should constrain strict tools and allow any text for non-strict."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                    strict=True,
+                ),
+            ),
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="search_web",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                    strict=False,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is not None
+
+        stag = json.loads(result.structural_tag)
+        fmt = stag["format"]
+        assert len(fmt["tags"]) == 2
+
+        # First tag (strict) should have json_schema content
+        assert fmt["tags"][0]["content"]["type"] == "json_schema"
+        # Second tag (non-strict) should have any_text content
+        assert fmt["tags"][1]["content"]["type"] == "any_text"
+
+    def test_unsupported_parser_returns_none(self):
+        """Should return None for parsers that don't support structural tags."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        # glm4 does not support structural tags
+        result = _build_tool_strict_guided_decoding_params(tools, "glm4")
+        assert result is None
+
+    def test_strict_tool_with_deepseek_parser(self):
+        """Should build GuidedDecodingParams with structural_tag for DeepSeek."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="calculate",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "expr": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "deepseek_v3")
+        assert result is not None
+        assert result.structural_tag is not None
+
+        stag = json.loads(result.structural_tag)
+        fmt = stag["format"]
+        assert fmt["type"] == "triggered_tags"
+        assert len(fmt["tags"]) == 1
+        assert "calculate" in fmt["tags"][0]["begin"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
