@@ -1362,23 +1362,6 @@ class FlashInferTrtllmGenAttention:
             )
 
 
-def _parse_request_types(host_request_types: torch.Tensor) -> Tuple[int, int]:
-    """
-    Parse request types to count context and generation requests.
-
-    Args:
-        host_request_types: Request types tensor (0=context, 1=generation).
-        num_seqs: Total number of sequences.
-
-    Returns:
-        Tuple of (num_contexts, num_generations).
-    """
-
-    num_generations = host_request_types.sum().item()
-    num_contexts = host_request_types.size(0) - num_generations
-    return num_contexts, num_generations
-
-
 def is_supported(
     q: torch.Tensor,
     num_heads: int,
@@ -1561,6 +1544,8 @@ def trtllm_gen_attention(
     quant_q_buffer: Optional[torch.Tensor],
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
+    num_contexts: int,
+    num_ctx_tokens: int,
     global_layer_idx: Optional[int] = None,
 ) -> None:
     """
@@ -1691,9 +1676,7 @@ def trtllm_gen_attention(
     if attention_input_type is not None:
         attn_input_type = AttentionInputType(attention_input_type)
 
-    num_contexts, num_generations = _parse_request_types(host_request_types)
-
-    num_ctx_tokens = int(host_context_lengths[:num_contexts].sum()) if num_contexts > 0 else 0
+    num_generations = host_request_types.size(0) - num_contexts
     num_gen_tokens = num_tokens - num_ctx_tokens
 
     # Prepare Workspace

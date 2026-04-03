@@ -703,7 +703,7 @@ def test_indexer_k_cache_scatter_custom_op():
                              dtype=torch.bfloat16)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
 
-    # Prepare byte-level data
+    # Prepare byte-level data for the Python reference path
     scale_size = k_scale.shape[1] * 4
     k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(num_tokens, head_dim)
     k_scale_flat = k_scale.view(-1)
@@ -742,9 +742,10 @@ def test_indexer_k_cache_scatter_custom_op():
 
     # ========== Path 1: CUDA Kernel ==========
     print(f"\n=== Path 1: CUDA Kernel ===")
-    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
-                                                k_cache_cuda, flat_indices_fp8,
-                                                flat_indices_scale)
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache_cuda,
+                                                metadata.slot_mapping_fp8,
+                                                metadata.slot_mapping_scale,
+                                                num_tokens)
     torch.cuda.synchronize()
     print(f"✓ CUDA kernel completed")
 
