@@ -108,8 +108,7 @@ class RPCClient:
         self._client_socket = ZeroMqQueue(address=(address, hmac_key),
                                           is_server=False,
                                           is_async=True,
-                                          use_hmac_encryption=hmac_key
-                                          is not None,
+                                          use_hmac_encryption=True,
                                           socket_type=socket_type,
                                           name="rpc_client")
         self._pending_futures = {}
