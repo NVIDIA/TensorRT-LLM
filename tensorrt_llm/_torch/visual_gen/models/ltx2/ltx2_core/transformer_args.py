@@ -69,11 +69,19 @@ class TransformerArgsPreprocessor:
 
         # Cache for context/mask/PE — these depend only on text context and
         # positions which are constant across denoise steps.  Keyed by
-        # id(modality.context) which is stable within a single generate() call.
+        # data_ptr() which is stable within a single generate() call.
+        # Must be cleared between generate() calls via clear_cache().
         self._cached_context: torch.Tensor | None = None
         self._cached_mask: torch.Tensor | None = None
         self._cached_pe: tuple[torch.Tensor, torch.Tensor] | None = None
         self._cache_key: int | None = None
+
+    def clear_cache(self) -> None:
+        """Reset preprocessor cache.  Call between generate() requests."""
+        self._cached_context = None
+        self._cached_mask = None
+        self._cached_pe = None
+        self._cache_key = None
 
     def _prepare_timestep(
         self,
@@ -215,6 +223,12 @@ class MultiModalTransformerArgsPreprocessor:
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
         self._cached_cross_pe: tuple[torch.Tensor, torch.Tensor] | None = None
         self._cross_pe_key: int | None = None
+
+    def clear_cache(self) -> None:
+        """Reset all caches (base + cross-PE).  Call between generate() requests."""
+        self.simple_preprocessor.clear_cache()
+        self._cached_cross_pe = None
+        self._cross_pe_key = None
 
     def prepare(self, modality: Modality) -> TransformerArgs:
         transformer_args = self.simple_preprocessor.prepare(modality)

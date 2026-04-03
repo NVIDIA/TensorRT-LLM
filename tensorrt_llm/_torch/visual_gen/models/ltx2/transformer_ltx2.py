@@ -1127,10 +1127,14 @@ class LTXModel(nn.Module):
         """Mark text KV cache as stale so the next forward() refills it.
 
         Call once before each denoising loop (i.e. per generate() request).
+        Clears both the block-level KV cache and the preprocessor cache
+        to avoid stale data_ptr() hits across generate() calls.
         """
         for block in self.transformer_blocks:
             block._text_kv_video = None
             block._text_kv_audio = None
+        self.video_args_preprocessor.clear_cache()
+        self.audio_args_preprocessor.clear_cache()
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
         """Configure whether audio uses Ulysses based on sequence length.
