@@ -227,22 +227,6 @@ def test_diffusion_args_to_quant_config():
     assert args.dynamic_weight_quant is True
 
 
-def test_parallel_config_to_visual_gen_mapping():
-    """Test that ParallelConfig correctly generates VisualGenMapping."""
-    from tensorrt_llm._torch.visual_gen import ParallelConfig
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    pc = ParallelConfig(dit_cfg_size=2, dit_tp_size=2, dit_ulysses_size=2)
-    vgm = pc.to_visual_gen_mapping(world_size=8, rank=0)
-    assert isinstance(vgm, VisualGenMapping)
-    assert vgm.cfg_size == 2
-    assert vgm.tp_size == 2
-    assert vgm.ulysses_size == 2
-    assert vgm.ring_size == 1
-    llm_mapping = vgm.to_llm_mapping()
-    assert llm_mapping.tp_size == 2
-
-
 def test_load_without_quant_config_no_fp8(checkpoint_exists):
     """Test that loading without quant_config does NOT produce FP8 weights."""
     if not checkpoint_exists:

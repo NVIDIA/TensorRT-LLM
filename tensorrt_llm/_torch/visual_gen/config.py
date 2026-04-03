@@ -9,6 +9,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
+from tensorrt_llm._torch.visual_gen.mapping import DEFAULT_DIM_ORDER
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
@@ -95,7 +96,7 @@ class ParallelConfig(StrictBaseModel):
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
     dit_dim_order: str = PydanticField(
-        "cfg-tp-ring-ulysses",
+        DEFAULT_DIM_ORDER,
         description=(
             "Outermost-to-innermost ordering of parallelism axes for the "
             "DeviceMesh. Innermost = most contiguous ranks."
@@ -116,6 +117,17 @@ class ParallelConfig(StrictBaseModel):
     @property
     def n_workers(self) -> int:
         return self.dit_cfg_size * self.dit_ulysses_size
+
+    @property
+    def total_parallel_size(self) -> int:
+        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.dit_ulysses_size
+
+    def validate_world_size(self, world_size: int) -> None:
+        if self.total_parallel_size > world_size:
+            raise ValueError(
+                f"total_parallel_size ({self.total_parallel_size}) "
+                f"exceeds world_size ({world_size})"
+            )
 
 
 class TeaCacheConfig(StrictBaseModel):

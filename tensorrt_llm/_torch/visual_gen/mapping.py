@@ -21,6 +21,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 _VALID_DIM_NAMES = frozenset({"cfg", "tp", "ring", "ulysses"})
+DEFAULT_DIM_ORDER = "cfg-tp-ring-ulysses"
 
 
 class VisualGenMapping(DeviceMeshTopologyImpl):
@@ -49,7 +50,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         tp_size: int = 1,
         ring_size: int = 1,
         ulysses_size: int = 1,
-        order: str = "cfg-tp-ring-ulysses",
+        order: str = DEFAULT_DIM_ORDER,
     ):
         product = cfg_size * tp_size * ring_size * ulysses_size
         if product != world_size:
@@ -65,7 +66,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 f"{sorted(_VALID_DIM_NAMES)}, got '{order}'"
             )
 
-        self._world_size = world_size
+        self.world_size = world_size
         self._rank = rank
         self.cfg_size = cfg_size
         self.tp_size = tp_size
@@ -82,17 +83,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if dist.is_initialized() and world_size > 1:
             self.build_mesh()
-
-    # ------------------------------------------------------------------
-    # DeviceMeshTopologyImpl requires self.world_size for its guards
-    # ------------------------------------------------------------------
-    @property
-    def world_size(self) -> int:
-        return self._world_size
-
-    @world_size.setter
-    def world_size(self, value: int):
-        self._world_size = value
 
     # ------------------------------------------------------------------
     # Mesh construction
