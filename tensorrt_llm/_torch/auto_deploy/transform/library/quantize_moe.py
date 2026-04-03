@@ -205,7 +205,10 @@ class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
                     skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
                 )
             quantized_layers = qcfg.get("quantized_layers", {})
-        elif qcfg.get("quant_algo", "").upper() != self.algo_name:
+        elif (
+            qcfg.get("quant_algo", "").upper() != self.algo_name
+            and qcfg.get("quant_method", "").upper() != self.algo_name
+        ):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -370,6 +373,10 @@ class QuantizeFineGrainedFP8MOE(Quantization):
 
         quant_method = str(qcfg.get("quant_method", "")).lower()
         if quant_method != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        if qcfg.get("weight_block_size") is None:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

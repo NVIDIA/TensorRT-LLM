@@ -476,8 +476,8 @@ void KVCacheBlock::detachPreviousPlaceholdersFromLookupTree() const
         {
             return;
         }
-        auto slibings = current->getNextBlocks();
-        for (auto const& [key, block] : slibings)
+        auto siblings = current->getNextBlocks();
+        for (auto const& [key, block] : siblings)
         {
             if (!block->isPlaceholder() && block.get() != this)
             {
@@ -641,11 +641,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             else
             {
                 auto const [fullPrimaryBlocks, unusedSecondaryBlocks] = blocksPerWindow.at(maxSequenceLength);
-                numPlaceholderBlocks = fullPrimaryBlocks - allottedPrimaryBlocks;
-                numPlaceholderBlocks = std::max(numPlaceholderBlocks, fullPrimaryBlocks);
-                TLLM_CHECK_WITH_INFO(numPlaceholderBlocks >= 0,
-                    "Full-attention primary blocks (%d) must be >= linear-attention primary blocks (%d)",
-                    fullPrimaryBlocks, allottedPrimaryBlocks);
+                numPlaceholderBlocks
+                    = fullPrimaryBlocks; // The full attention runs out of blocks before we use all placeholders.
             }
         }
 
@@ -847,9 +844,9 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
             mAllPlaceholderBlocksById[static_cast<size_t>(-placeholderBlockId)] = block;
         }
 
-        auto policy = std::make_shared<MaybePlaceholderLRUEvictionPolicy>();
+        auto policy = std::make_shared<LRUEvictionPolicy>();
         policy->initialize(mAllBlocksById, {blocksInPrimaryPool, blocksInSecondaryPool}, secondaryOffloadMinPriority);
-        policy->initializePlaceholders(mAllPlaceholderBlocksById, numPlaceholderBlocks, secondaryOffloadMinPriority);
+        policy->initializePlaceholders(mAllPlaceholderBlocksById);
         mEvictionPolicy = policy;
     }
     else
@@ -1022,7 +1019,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
             : ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
         pool.layerFirstLayout = isRecurrentState();
 
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads, shape={%d, %d, %d, %d}%s",
             mLogPrefix.c_str(), mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads, cacheShape.d[0], cacheShape.d[1],
             cacheShape.d[2], cacheShape.d[3], pool.layerFirstLayout ? " (layer-first)" : "");
@@ -1657,7 +1654,7 @@ SizeType32 WindowBlockManager::addSequence(
     bool shareLastContextBlockAmongBeams = sequence.getBeamWidth() == 1;
     if (isRecurrentState())
     {
-        shareLastContextBlockAmongBeams &= inputLength % mTokensPerBlock == 0;
+        shareLastContextBlockAmongBeams |= inputLength % mTokensPerBlock == 0;
     }
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, llmRequest,
         perBlockRetentions, shareLastContextBlockAmongBeams, mode, directory);
@@ -1975,7 +1972,7 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         auto prevBlock = getBlockById(prevBlockId);
         if (prevBlock->isPlaceholder())
         {
-            TLLM_LOG_INFO(
+            TLLM_LOG_DEBUG(
                 "%s::copyLinearAttentionBlock - Previous block %d is a placeholder, skip. This usually happens when "
                 "chunked context is enabled but reusing is disabled.",
                 mLogPrefix.c_str(), prevBlockId);
@@ -2092,6 +2089,15 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             }
             if (pinBlocks)
             {
+                // If the block has no refs it sits in the eviction policy's free
+                // queue. Claim it first so that the later unpinBlocksById /
+                // releaseBlock cycle does not create a duplicate queue entry.
+                // Pass the block's existing priority and duration so that
+                // claimBlock does not clear its retention/expiry metadata.
+                if (!searchRoot->hasRefs())
+                {
+                    mEvictionPolicy->claimBlock(searchRoot, searchRoot->getPriority(), searchRoot->getDurationMs());
+                }
                 searchRoot->incRefCount();
                 pinnedBlockIds.push_back(searchRoot->getBlockId());
             }
@@ -2371,7 +2377,7 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     {
         usableSize = std::min(llmRequest->getPromptLen() - 1, usableSize); // TODO: enable store for completed sequences
     }
-    TLLM_LOG_INFO("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
+    TLLM_LOG_DEBUG("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
         mLogPrefix.c_str(), llmRequest->mRequestId, mWindowSize, uniqueTokens.size(), usableSize);
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
@@ -2672,10 +2678,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
             && !req.isDisaggGenerationInitState())
         {
-            auto const uniqueTokens = req.getUniqueTokens(0);
+            auto const& uniqueTokens = req.getUniqueTokens(0);
             auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
+            auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
+            // `addSequence()` ignores the last prompt token because its KV cannot be recovered.
+            // When the prompt lands exactly on a block boundary, counting reusable full blocks from
+            // all unique tokens can over-credit one extra shared block.
+            TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
+            auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
             // Only subtract from shared blocks (reusable blocks are always shared)
-            auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
+            auto const reusableSharedBlocks
+                = std::min({numReusableBlocks, numSharedBlocks, maxRecoverableSharedBlocks});
             numRequiredBlocks -= reusableSharedBlocks;
             // Store on request so the micro batch scheduler can use it for token budget
             req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());

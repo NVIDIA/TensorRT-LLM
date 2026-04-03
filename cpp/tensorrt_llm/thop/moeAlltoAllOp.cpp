@@ -144,7 +144,7 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
 
     // Synchronize among ranks
     cudaDeviceSynchronize();
-    tensorrt_llm::mpi::MpiComm::world().barrier();
+    tensorrt_llm::mpi::MpiComm::session().barrier();
 
     return metainfo;
 }

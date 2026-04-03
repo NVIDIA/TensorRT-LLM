@@ -550,6 +550,9 @@ class KVCacheManager(BaseResourceManager):
                     max_kv_event_entries=self.event_buffer_max_size)
 
         self.impl = KVCacheManagerCpp(**kwargs)
+        # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
+        self._warmup_reused_blocks = 0
+        self._warmup_missed_blocks = 0
 
         self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
@@ -575,6 +578,37 @@ class KVCacheManager(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
         self.blocks_per_window = blocks_per_window
+
+    def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
+        """Probe the KV cache radix tree for prefix match length.
+
+        Returns the number of prefix tokens already cached on this rank.
+        Used by KVCacheAwareADPRouter for cache-aware routing.
+        """
+        if not self.enable_block_reuse:
+            return 0
+        # is_variable_window is only defined on the concrete KVCacheManager
+        # nanobind class, not on BaseKVCacheManager. Use getattr to avoid
+        # AttributeError on other subclasses or mocks.
+        if getattr(self.impl, 'is_variable_window', False):
+            return 0
+        if not input_tokens:
+            return 0
+        from tensorrt_llm.bindings import SamplingConfig
+        from tensorrt_llm.bindings.internal.batch_manager import BlockKey
+        from tensorrt_llm.bindings.internal.batch_manager import \
+            LlmRequest as CppLlmRequest
+        block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
+        unique_tokens = block_key.unique_tokens
+        dummy_req = CppLlmRequest(request_id=0,
+                                  max_new_tokens=0,
+                                  input_tokens=input_tokens,
+                                  sampling_config=SamplingConfig(),
+                                  is_streaming=False,
+                                  lora_task_id=lora_task_id)
+        num_blocks = self.impl.count_reusable_blocks(unique_tokens, dummy_req,
+                                                     False)
+        return num_blocks * self.tokens_per_block
 
     def shutdown(self):
         self.impl.release_pools()
@@ -837,6 +871,26 @@ class KVCacheManager(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
 
+    @staticmethod
+    def _resolve_num_attention_layers(
+        model_config: ModelConfigPython,
+        mapping: Mapping,
+        num_layers: Optional[int] = None,
+    ) -> int:
+        """Compute the effective number of attention layers for cache sizing.
+
+        When *num_layers* is explicitly provided (e.g. for draft models whose
+        HF config layer count differs from runtime), it is used directly
+        without PP distribution.  Otherwise the layer count is derived from
+        the model config and distributed evenly across PP ranks via
+        ``mapping.pp_layers``.
+        """
+        if num_layers is not None:
+            return max(num_layers, 1)
+        # provide at least 1 layer to prevent division by zero cache size
+        return max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfigPython,
@@ -865,18 +919,8 @@ class KVCacheManager(BaseResourceManager):
             head_dim = head_dim * num_key_value_heads // tp_size
             kv_factor = 2
 
-        # When num_layers is explicitly provided (e.g. for draft models
-        # where the HF config layer count differs from runtime), use it
-        # directly without PP distribution.  Draft layers have their own
-        # PP assignment logic (see get_pp_layers) that doesn't match the
-        # standard uniform split, so pp_layers() would give wrong results.
-        if num_layers is not None:
-            num_attention_layers = max(num_layers, 1)
-        else:
-            # provide at least 1 layer to prevent division by zero cache size
-            num_attention_layers = max(
-                len(mapping.pp_layers(model_config.get_num_attention_layers())),
-                1)
+        num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+            model_config, mapping, num_layers)
         # K and V
         mem_per_token = kv_factor * num_attention_layers * head_dim
         # The data type bytes.
@@ -1154,7 +1198,26 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.get_latest_events(timeout_ms)
 
     def get_kv_cache_stats(self):
-        return self.impl.get_kv_cache_stats()
+        stats = self.impl.get_kv_cache_stats()
+        # Subtract warmup baseline so cumulative counters only reflect
+        # real inference traffic, not dummy requests from warmup.
+        stats.reused_blocks -= self._warmup_reused_blocks
+        stats.missed_blocks -= self._warmup_missed_blocks
+        # Recompute cache hit rate from adjusted values.
+        total = stats.reused_blocks + stats.missed_blocks
+        stats.cache_hit_rate = (stats.reused_blocks /
+                                total) if total > 0 else 0.0
+        return stats
+
+    def snapshot_warmup_baseline(self):
+        """Snapshot cumulative reused and missed block counters so they can be subtracted later.
+
+        Must be called after warmup completes so that get_kv_cache_stats()
+        returns values that exclude warmup dummy requests.
+        """
+        raw = self.impl.get_kv_cache_stats()
+        self._warmup_reused_blocks = raw.reused_blocks
+        self._warmup_missed_blocks = raw.missed_blocks
 
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
@@ -2541,18 +2604,8 @@ class KVCacheManagerV2(BaseResourceManager):
             head_dim = head_dim * num_key_value_heads // tp_size
             kv_factor = 2
 
-        # When num_layers is explicitly provided (e.g. for draft models
-        # where the HF config layer count differs from runtime), use it
-        # directly without PP distribution.  Draft layers have their own
-        # PP assignment logic (see get_pp_layers) that doesn't match the
-        # standard uniform split, so pp_layers() would give wrong results.
-        if num_layers is not None:
-            num_attention_layers = max(num_layers, 1)
-        else:
-            # provide at least 1 layer to prevent division by zero cache size
-            num_attention_layers = max(
-                len(mapping.pp_layers(model_config.get_num_attention_layers())),
-                1)
+        num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+            model_config, mapping, num_layers)
         mem_per_token *= num_attention_layers * head_dim
 
         # K and V

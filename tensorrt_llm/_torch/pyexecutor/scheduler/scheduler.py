@@ -502,12 +502,11 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         ):
             all_context_requests_fit = False
 
-        need_chunking = not all_context_requests_fit and contexts_to_be_chunked
         if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
-            need_chunking = True
+            all_context_requests_fit = False
 
         # 3. Apply Chunking Strategy if needed
-        if need_chunking:
+        if not all_context_requests_fit and contexts_to_be_chunked:
             assert ctx_chunk_config is not None, (
                 "If chunking is not enabled, context scheduling should be completed."
             )
@@ -729,19 +728,21 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         Every request is assigned exactly min(context_remaining_length, unit_size) tokens.
         Requests that would exceed the capacity budget are zeroed out.
 
-        This policy is designed for linear attention state caching, which doesn't support estimating
-        reusable tokens, so we don't subtract them from the budget.
+        This policy is designed for linear attention / Mamba2 state caching, which doesn't support
+        estimating reusable tokens, so we don't subtract them from the budget.
         """
+        if self.max_context_length is not None and self.max_context_length < unit_size:
+            raise ValueError(
+                f"The forced chunk size ({unit_size}) exceeds the "
+                f"max context length ({self.max_context_length})"
+            )
         total_tokens = 0
         for req in requests:
             req.context_chunk_size = min(req.context_remaining_length, unit_size)
             if capacity is not None and total_tokens + req.context_chunk_size > capacity:
                 req.context_chunk_size = 0
             total_tokens += req.context_chunk_size
-        if capacity is not None and total_tokens > capacity:
-            logger.warning(
-                f"Total tokens {total_tokens} exceeds capacity {capacity} but FORCE_CHUNK is used"
-            )
+        assert capacity is None or total_tokens <= capacity
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         # capacity is a compute-token budget. Sum actual model tokens per request:

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -73,6 +73,11 @@ class LRUEvictionPolicy : public BaseEvictionPolicy
 public:
     void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> blocksPerCacheLevel,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority) override;
+
+    /// @brief Initialize placeholder block management.
+    /// @param allPlaceholderBlocksById Vector of placeholder blocks indexed by abs(blockId).
+    void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById);
+
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
 
     void releaseBlock(BlockPtr block) override;
@@ -92,56 +97,33 @@ public:
 
     bool verifyQueueIntegrity() override;
 
-protected:
-    /// @brief Map a block ID to the index into mFreeBlockIterators.
-    /// Default: identity (block IDs are 0-based non-negative integers).
-    /// Override for policies managing blocks with non-standard IDs (e.g. negative placeholder IDs).
-    virtual SizeType32 blockIdx(KVCacheBlock::IdType blockId) const
-    {
-        return blockId;
-    }
-
-    // Queues of available leaf blocks, split by cache level and priority level
-    std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
-    // Iterators to block entries in mFreeQueues
-    std::vector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
-    // Amount of free blocks at each cache level
-    std::vector<SizeType32> mNumFreeBlocksPerLevel;
-    // Secondary offload threshold. Blocks below this priority won't be evicted.
-    executor::RetentionPriority mSecondaryOffloadMinPriority;
-    // Heap of block times
-    std::set<BlockPtr, ExpiringBlockComparator> mExpiringBlockHeap;
-};
-
-/// @brief Extends LRUEvictionPolicy to manage pre-allocated placeholder blocks via a dedicated inner
-/// LRUEvictionPolicy (mPlaceholderEvictionPolicy). Placeholder blocks have negative IDs starting at -2.
-/// Normal block operations are delegated to the base LRUEvictionPolicy; placeholder block operations
-/// are delegated to mPlaceholderEvictionPolicy.
-class MaybePlaceholderLRUEvictionPolicy : public LRUEvictionPolicy
-{
-public:
-    /// @brief Initialize the placeholder eviction policy with pre-allocated placeholder blocks.
-    /// @param allPlaceholderBlocksById Vector of placeholder blocks indexed by abs(blockId).
-    ///        Indices 0 and 1 are unused (nullptr); index abs(blockId) holds the block with that ID.
-    /// @param numPlaceholderBlocks Number of placeholder blocks (determines valid index range [2,
-    /// numPlaceholderBlocks+1]).
-    /// @param secondaryOffloadMinPriority Secondary offload priority threshold (passed to inner policy).
-    void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById, SizeType32 numPlaceholderBlocks,
-        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority);
-
-    std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
-
-    void releaseBlock(BlockPtr block, bool toFront) override;
-
-    void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
-        std::optional<std::chrono::milliseconds> durationMs) override;
-
-    void refresh() override;
-
-    bool verifyQueueIntegrity() override;
-
 private:
-    std::shared_ptr<LRUEvictionPolicy> mPlaceholderEvictionPolicy;
+    /// @brief A fixed-size container supporting both non-negative and negative indexing.
+    ///        Non-negative IDs index directly into positive.
+    ///        Negative IDs index into negative by absolute value, i.e. -1 → 1, -2 → 2, etc.
+    template <typename T>
+    struct BidirectionalVector
+    {
+        std::vector<T> positive;
+        std::vector<T> negative;
+
+        T& operator[](KVCacheBlock::IdType id)
+        {
+            return id >= 0 ? positive[id] : negative[-id];
+        }
+    };
+
+    // Queues of available leaf blocks, split by level and priority: [level][priorityIdx]
+    // Levels 0,1 = primary,secondary (real cache); level 2 = placeholder
+    std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
+    // Iterators to block entries in mFreeQueues, indexed by block ID
+    BidirectionalVector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
+    // Amount of free blocks at each level
+    std::vector<SizeType32> mNumFreeBlocksPerLevel;
+    // Secondary offload threshold. Blocks below this priority won't be offloaded.
+    executor::RetentionPriority mSecondaryOffloadMinPriority;
+    // Heap of block expiration times
+    std::set<BlockPtr, ExpiringBlockComparator> mExpiringBlockHeap;
 };
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy

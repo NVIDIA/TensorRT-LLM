@@ -68,7 +68,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 30);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 36);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -259,6 +259,12 @@ public:
     void flushIterationEvents() override
     {
         NB_OVERRIDE_PURE(flushIterationEvents);
+    }
+
+    SizeType32 countReusableBlocks(VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest,
+        bool onlyAllocated = false) const override
+    {
+        NB_OVERRIDE_PURE(countReusableBlocks, uniqueTokens, llmRequest, onlyAllocated);
     }
 };
 

@@ -246,6 +246,7 @@ def create_sampling_params_from_proto(
     bad_token_ids: Optional[List[int]] = None,
     guided_decoding: Optional[pb2.GuidedDecodingParams] = None,
     embedding_bias: Optional[List[float]] = None,
+    include_stop_token_in_output: bool = False,
 ) -> SamplingParams:
     """Convert protobuf configuration to TensorRT-LLM SamplingParams.
 
@@ -332,6 +333,8 @@ def create_sampling_params_from_proto(
         kwargs["stop_token_ids"] = stop_token_ids
     if ignore_eos:
         kwargs["ignore_eos"] = True
+    if include_stop_token_in_output:
+        kwargs["include_stop_str_in_output"] = True
 
     # Bad words (TRT-LLM's _setup() tokenizes bad word strings)
     if bad:
