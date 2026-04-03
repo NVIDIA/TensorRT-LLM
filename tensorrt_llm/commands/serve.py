@@ -1299,9 +1299,8 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
-    os.environ[
-        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
-        value] = secrets.token_hex(32)
+    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
+               value] = secrets.token_hex(32)
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
