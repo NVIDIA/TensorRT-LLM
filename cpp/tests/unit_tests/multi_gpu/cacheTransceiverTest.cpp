@@ -406,6 +406,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     mFutures.clear();
     for (auto& request : requests)
     {
+        mManager->simulatePrefillCompletionOnlyUseForTesting(*request);
         mManager->removeSequence(request->mRequestId, request);
     }
     requests.clear();
@@ -1378,6 +1379,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
+                mManager->simulatePrefillCompletionOnlyUseForTesting(*request->mLlmRequest);
                 mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();
