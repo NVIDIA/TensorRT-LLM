@@ -10,8 +10,6 @@ class MistralWeightMapper(HfWeightMapper):
     def __init__(self):
         super().__init__()
 
-        self._callbacks.append(self._permute_qk)
-
         self.pixtral_mapping = {
             "wq": "q_proj",
             "wk": "k_proj",
@@ -31,8 +29,8 @@ class MistralWeightMapper(HfWeightMapper):
             "qscale_weight": "weight_scale_inv",
             "kv_fake_quantizer.qscale_act": "kv_scale",
             "q_fake_quantizer.qscale_act": "attn.q_scale",
-            "k_fake_quantizer.qscale_act": "k_scale",
-            "v_fake_quantizer.qscale_act": "v_scale",
+            "k_fake_quantizer.qscale_act": "attn.k_scale",
+            "v_fake_quantizer.qscale_act": "attn.v_scale",
             "attention_norm": "input_layernorm",
             "feed_forward": "mlp",
             "ffn_norm": "post_attention_layernorm",
@@ -78,38 +76,37 @@ class MistralWeightMapper(HfWeightMapper):
             return ConsumableWeightsDict(renamed_weights)
         return renamed_weights
 
-    def _permute_qk(self, module: nn.Module, new_name: str, weights: dict):
+    def permute_qk(self, weights: dict, config: dict):
         # Adapted from:
         # https://github.com/vllm-project/vllm/blob/883b42896a9ed9791750d721fad26005b7569eba/vllm/model_executor/models/llama.py#L657
 
-        processed_weights = {}
-        config = self.config.pretrained_config
-
-        def permute(w, n_heads: int, attn_out: int):
-            attn_in = config.head_dim * n_heads
-
+        def permute(w, n_heads: int, head_dim: int, hidden_size: int):
+            attn_in = head_dim * n_heads
             return (
-                w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
+                w.view(n_heads, attn_in // n_heads // 2, 2, hidden_size)
                 .transpose(1, 2)
-                .reshape(attn_in, attn_out)
+                .reshape(attn_in, hidden_size)
             )
 
         # rotary embeds should be sliced
         # If using quantized model in mistral format,
         # quantization scales (qscale_weight) also need to be sliced
-
-        if new_name in ["k_proj", "q_proj"]:
-            n_heads = (
-                config.num_key_value_heads if new_name == "k_proj" else config.num_attention_heads
-            )
-
-            processed_weights["weight"] = permute(weights["weight"], n_heads, config.hidden_size)
-
-            if "qscale_weight" in weights and weights["qscale_weight"].numel() > 1:
-                processed_weights["qscale_weight"] = permute(weights["qscale_weight"], n_heads, 1)
-
-            return processed_weights
-
+        for name in weights.keys():
+            # TODO: add scales if dequant is necessary 
+            if ".wq.weight" in name:
+                weights[name] = permute(
+                    weights[name],
+                    config.num_attention_heads,
+                    config.head_dim,
+                    config.hidden_size
+                )
+            elif ".wk.weight" in name:
+                weights[name] = permute(
+                    weights[name],
+                    config.num_key_value_heads,
+                    config.head_dim,
+                    config.hidden_size
+                )
         return weights
 
 
