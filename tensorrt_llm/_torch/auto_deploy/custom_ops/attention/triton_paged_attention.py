@@ -980,6 +980,8 @@ def triton_paged_context_with_custom_mask(
         q_seq = q[q_start:q_end]
         seq_q_len = q_end - q_start
         seq_kv_len = int(seq_len_with_cache[seq_idx].item())
+        if seq_q_len == 0 or seq_kv_len == 0:
+            continue
         k_seq, v_seq = _gather_paged_kv_for_sequence(
             kv_cache, kv_indices, kv_indptr, seq_idx, seq_kv_len
         )
