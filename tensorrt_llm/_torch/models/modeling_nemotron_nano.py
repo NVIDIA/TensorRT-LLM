@@ -563,16 +563,33 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def apply_evs_per_video(
         self, mm_embed: torch.Tensor, video_sizes: List[Tuple]
     ) -> Tuple[torch.Tensor, List[int]]:
-        """Apply EVS to the multimodal embedding for a single video."""
+        """Apply EVS to the multimodal embedding for a single video.
+
+        mm_embed may be 2D [total_tokens, hidden] (mixed aspect ratios) or
+        3D [total_tiles, spatial_tokens, hidden] (uniform aspect ratios).
+        """
+        is_2d = mm_embed.dim() == 2
+        hidden_size = mm_embed.shape[-1]
         start_idx, mm_embed_list, num_tokens_per_video = 0, [], []
         for video_size in video_sizes:
             # Fetch mm_embed correctly for the flattened temporal/patches dimension.
             t, p, ih, iw = video_size
-            partial_mm_embed = mm_embed[start_idx : start_idx + t * p]
-            # -> [num_frames * num_patches_per_frame, h*w, hidden_size]
+            # Compute spatial token count per tile from pixel dimensions.
+            wh = int(ih // self.patch_size * self.downsample_ratio) * int(
+                iw // self.patch_size * self.downsample_ratio
+            )
+
+            if is_2d:
+                total_tokens = t * p * wh
+                partial_mm_embed = mm_embed[start_idx : start_idx + total_tokens]
+                partial_mm_embed = partial_mm_embed.reshape(t * p, wh, hidden_size)
+                start_idx += total_tokens
+            else:
+                partial_mm_embed = mm_embed[start_idx : start_idx + t * p]
+                # -> [num_frames * num_patches_per_frame, h*w, hidden_size]
+                start_idx += t * p
 
             # Need to expose temporal dimension for EVS.
-            _, wh, hidden_size = partial_mm_embed.shape
             reshaped_partial_mm_embed = partial_mm_embed.reshape(t, p, wh, hidden_size).reshape(
                 t, p * wh, hidden_size
             )
@@ -589,9 +606,6 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             num_tokens_per_frame = original_retention_mask.sum(dim=1)
             retention_mask = original_retention_mask.reshape(t, p, wh).reshape(t * p, wh)
             # -> [num_frames * num_patches_per_frame, h*w]
-
-            # Skip by temporal/patch dimension.
-            start_idx += t * p
 
             partial_mm_embed = partial_mm_embed[retention_mask]
             mm_embed_list.append(partial_mm_embed)
@@ -639,25 +653,34 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def _extract_video_embeddings_temporal(self, video_data: Dict[str, Any]) -> torch.Tensor:
         """Extract video embeddings with temporal compression.
 
-        Each video is processed separately through extract_feature with
-        num_frames, which enables the tubelet embedding path in RADIO.
+        Each video is processed separately through extract_feature with num_frames, which enables
+        the tubelet embedding path in RADIO.
+
+        `pixel_values` may be a single concatenated tensor (all videos share the same frame size)
+        or a list of per-video tensors (mixed aspect ratios).
         """
         pixel_values = video_data["pixel_values"]
         video_size_list = video_data.get("video_size", [])
+        per_video = isinstance(pixel_values, list)
 
         all_embeds = []
         frame_offset = 0
-        for video_size in video_size_list:
-            nf = video_size[0]  # num_frames for this video
+        for idx, video_size in enumerate(video_size_list):
+            num_frames = video_size[0]
             num_tiles_per_frame = video_size[1]
-            total_tiles = nf * num_tiles_per_frame
-            video_frames = pixel_values[frame_offset : frame_offset + total_tiles]
-            frame_offset += total_tiles
+            total_tiles = num_frames * num_tiles_per_frame
+            if per_video:
+                video_frames = pixel_values[idx]
+            else:
+                video_frames = pixel_values[frame_offset : frame_offset + total_tiles]
+                frame_offset += total_tiles
 
-            vit_embeds = self.extract_feature(video_frames, num_frames=nf)
-            all_embeds.append(vit_embeds)
+            vit_embeds = self.extract_feature(video_frames, num_frames=num_frames)
+            # Flatten to 2D [tokens, hidden] so videos with different spatial
+            # resolutions (different dim-1) can be concatenated.
+            all_embeds.append(vit_embeds.reshape(-1, vit_embeds.shape[-1]))
 
-        # Concatenate all videos' embeddings.
+        # Concatenate all videos' embeddings (2D).
         return torch.cat(all_embeds, dim=0)
 
     def forward(
@@ -981,13 +1004,26 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         num_image_tokens += len(self.get_mm_special_token_ids())
         return num_image_tokens
 
-    def _get_video_tokens_per_frame(self) -> int:
-        """Token count per video frame (or tubelet), accounting for
-        video_target_num_patches which may change the frame size."""
+    def _get_video_tokens_per_frame(
+        self, orig_w: Optional[int] = None, orig_h: Optional[int] = None
+    ) -> int:
+        """Token count per video frame (or tubelet).
+
+        This accounts for `video_target_num_patches`, which may change the frame size.
+
+        When `video_maintain_aspect_ratio` is enabled, the result depends on the source frame
+        dimensions, so callers should pass the real `orig_w` and `orig_h`.
+
+        Falls back to `self.image_size` (square) when not provided - correct only for square inputs.
+        """
         if self.video_target_num_patches is not None:
+            if orig_w is None:
+                orig_w = self.image_size
+            if orig_h is None:
+                orig_h = self.image_size
             _, _, feature_size = get_video_target_size_and_feature_size(
-                orig_w=self.image_size,
-                orig_h=self.image_size,
+                orig_w=orig_w,
+                orig_h=orig_h,
                 target_patches=self.video_target_num_patches,
                 maintain_aspect_ratio=self.video_maintain_aspect_ratio,
                 patch_size=self.patch_size,
@@ -1010,7 +1046,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         T = self.video_temporal_patch_size
         num_frames = len(video)
         num_tubelets = math.ceil(num_frames / T) if T > 1 else num_frames
-        tokens_per_unit = self._get_video_tokens_per_frame()
+        # Use actual frame dimensions so aspect-ratio-preserving resize is computed correctly
+        # (instead of assuming square frames).
+        frame = video[0]
+        tokens_per_unit = self._get_video_tokens_per_frame(orig_w=frame.width, orig_h=frame.height)
 
         if video_pruning_rate > 0:
             # TODO(EVS): Verify EVS interaction with temporal compression.
@@ -1178,7 +1217,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 pixel_values_list.append(processed_images["pixel_values"])
                 video_size_list.append([num_frames, t // num_frames, h, w])
 
-        all_pixel_values = torch.cat(pixel_values_list, dim=0)
+        # When aspect-ratio-preserving resize is active, different videos may have different (H, W).
+        # Keep per-video tensors to avoid a concat mismatch; fall back to a flat tensor when all
+        # shapes agree.
+        shapes = {pv.shape[1:] for pv in pixel_values_list}
+        if len(shapes) == 1:
+            all_pixel_values = torch.cat(pixel_values_list, dim=0)
+        else:
+            # Store as a list - `_extract_video_embeddings_temporal` handles both.
+            all_pixel_values = pixel_values_list
         result = {
             "num_patches": torch.tensor(
                 [sum(np) if isinstance(np, torch.Tensor) else np.item() for np in num_patches_list]
@@ -1195,7 +1242,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         """Build per-tubelet (or per-frame when T=1) separator strings.
 
         When video_temporal_patch_size > 1, groups T consecutive frames into a
-        single separator matching vLLM's ``get_video_repl`` format.
+        single separator matching vLLM's `get_video_repl` format.
         """
         T = self.video_temporal_patch_size
         frame_separators_lst = []
@@ -1328,8 +1375,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         """Compute the number of embedding tokens per tubelet (or per frame when T=1).
 
         With video_temporal_patch_size > 1, T consecutive frames are grouped
-        into tubelets, so the returned list has ``ceil(num_frames / T)`` entries
-        instead of ``num_frames``.
+        into tubelets, so the returned list has `ceil(num_frames / T)` entries
+        instead of `num_frames`.
         """
         T = self.video_temporal_patch_size
         num_tokens_per_frame_lst = []
@@ -1435,7 +1482,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             input_ids, evs_ids = self._process_video_prompts(
                 split_text_prompt, num_tokens_per_frame_lst, frame_separators_lst
             )
-            modality_data["pixel_values"] = processed_images["pixel_values"].to(self.dtype)
+            pv = processed_images["pixel_values"]
+            modality_data["pixel_values"] = (
+                [v.to(self.dtype) for v in pv] if isinstance(pv, list) else pv.to(self.dtype)
+            )
             modality_data["num_patches"] = processed_images["num_patches"].sum(dim=0, keepdim=True)
             modality_data["video_size"] = processed_images["video_size"]
             modality_data["evs_ids"] = evs_ids
