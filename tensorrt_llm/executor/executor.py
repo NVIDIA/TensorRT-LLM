@@ -327,6 +327,12 @@ class GenerationExecutor(ABC):
         from any thread (the ``_error_queue`` is a thread-safe
         ``queue.Queue``).
 
+        This method drains the error queue directly rather than calling
+        ``_handle_background_error()`` (which is documented for
+        main-thread use, calls ``shutdown()`` + ``raise``, and can
+        cause re-entrancy issues when invoked from health-check or
+        event-loop threads).
+
         Returns:
             True if healthy, False otherwise.
         """
@@ -336,9 +342,13 @@ class GenerationExecutor(ABC):
         # crash) are detected even when no generate() calls are in flight.
         if not self._error_queue.empty():
             try:
-                self._handle_background_error()
+                e = self._error_queue.get_nowait()
+                self._error_queue.task_done()
+                if not isinstance(e, (str, RequestError)):
+                    self._set_fatal_error(e)
+                    self.shutdown()
             except Exception:
-                pass  # _handle_background_error sets _fatal_error + shutdown
+                pass
             return self._fatal_error is None and not self.doing_shutdown
         return True
 

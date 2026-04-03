@@ -48,6 +48,7 @@ from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .dwdp import DwdpManager
+from .error_classification import classify_error
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -3374,54 +3375,15 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    # Patterns that corrupt the CUDA context beyond recovery.
-    # Matched case-insensitively against the error message.
-    _IMMEDIATE_FATAL_PATTERNS: list[str] = [
-        "cudaerrorillegaladd",
-        "cudaerrorlaunchfailure",
-        "device-side assert",
-        "unrecoverable",
-    ]
-
-    # Patterns that are serious but may be transient (e.g. a single OOM
-    # during a traffic spike).  These drain the error budget 5× faster
-    # than transient errors.
-    _SEVERE_ERROR_PATTERNS: list[str] = [
-        "cuda out of memory",
-        "cuda error",
-        "nccl error",
-    ]
-
     def _classify_error(self, error_msg: str) -> str:
-        """Classify an error message by severity.
-
-        Args:
-            error_msg: The error message string to classify.
-
-        Returns:
-            One of ``"immediate_fatal"``, ``"severe"``, or ``"transient"``.
+        """Classify an error message by severity.  Delegates to the
+        module-level :func:`classify_error` function.
         """
-        error_lower = error_msg.lower()
-        for p in self._IMMEDIATE_FATAL_PATTERNS:
-            if p in error_lower:
-                return "immediate_fatal"
-        for p in self._SEVERE_ERROR_PATTERNS:
-            if p in error_lower:
-                return "severe"
-        return "transient"
+        return classify_error(error_msg)
 
     def _is_fatal_error(self, error_msg: str) -> bool:
-        """Return True if the error corrupts the CUDA context irrecoverably.
-
-        Args:
-            error_msg: The error message string to check.
-
-        Returns:
-            True only for immediate-fatal errors (device-side assert,
-            illegal address, launch failure).  Severe errors like CUDA OOM
-            are handled by the error budget instead.
-        """
-        return self._classify_error(error_msg) == "immediate_fatal"
+        """Return True if the error corrupts the CUDA context irrecoverably."""
+        return classify_error(error_msg) == "immediate_fatal"
 
     def _consume_error_budget(self, error_msg: str) -> bool:
         """Deduct from the error budget and return True if exhausted.
@@ -3495,11 +3457,13 @@ class PyExecutor:
 
         if is_fatal:
             self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
+            self.is_shutdown = True
             logger.error(
                 f"Fatal error detected, initiating shutdown: {error_msg}")
             requests = None
 
-        failed_requests = requests if requests is not None else self.active_requests
+        failed_requests = (list(self.active_requests)
+                           if requests is None else requests)
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE

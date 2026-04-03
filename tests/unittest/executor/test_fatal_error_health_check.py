@@ -15,7 +15,7 @@
 """Unit tests for fatal error detection and health check functionality.
 
 Tests cover:
-- PyExecutor error classification (immediate-fatal / severe / transient)
+- classify_error() module-level function (tested directly, not via mock)
 - PyExecutor token-bucket error budget and _handle_errors()
 - GenerationExecutor.check_health(), _set_fatal_error(), is_shutdown()
 - GenerationExecutorProxy.check_health() with MPI worker liveness
@@ -25,6 +25,10 @@ Tests cover:
 - BaseLLM._check_health() delegation
 """
 
+# Import classify_error directly from the source file to avoid triggering
+# the heavy tensorrt_llm.__init__ (which loads C++ extensions).
+import importlib.util
+import pathlib
 import signal
 import threading
 import time
@@ -34,27 +38,27 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+_mod_path = (
+    pathlib.Path(__file__).resolve().parents[3]
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "error_classification.py"
+)
+_spec = importlib.util.spec_from_file_location("error_classification", _mod_path)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+classify_error = _mod.classify_error
+
 
 # ---------------------------------------------------------------------------
-# PyExecutor mock — mirrors the real _classify_error / _consume_error_budget
-# / _handle_errors logic without pulling in the full PyExecutor dependency.
+# PyExecutor mock — uses the real classify_error() for classification and
+# mirrors the token-bucket / _handle_errors logic from PyExecutor.
 # ---------------------------------------------------------------------------
 class MockPyExecutorForFatalError:
-    _IMMEDIATE_FATAL_PATTERNS: list[str] = [
-        "cudaerrorillegaladd",
-        "cudaerrorlaunchfailure",
-        "device-side assert",
-        "unrecoverable",
-    ]
-
-    _SEVERE_ERROR_PATTERNS: list[str] = [
-        "cuda out of memory",
-        "cuda error",
-        "nccl error",
-    ]
-
     def __init__(self):
         self._fatal_error = None
+        self.is_shutdown: bool = False
         self._error_budget: float = 1.0
         self._last_error_time = None
         self._error_budget_recovery_rate: float = 0.1
@@ -62,22 +66,9 @@ class MockPyExecutorForFatalError:
         self.active_requests = []
         self.executor_request_queue = Mock()
 
-    def _classify_error(self, error_msg: str) -> str:
-        error_lower = error_msg.lower()
-        for p in self._IMMEDIATE_FATAL_PATTERNS:
-            if p in error_lower:
-                return "immediate_fatal"
-        for p in self._SEVERE_ERROR_PATTERNS:
-            if p in error_lower:
-                return "severe"
-        return "transient"
-
-    def _is_fatal_error(self, error_msg: str) -> bool:
-        return self._classify_error(error_msg) == "immediate_fatal"
-
     def _consume_error_budget(self, error_msg: str) -> bool:
         now = time.monotonic()
-        classification = self._classify_error(error_msg)
+        classification = classify_error(error_msg)
         if classification == "immediate_fatal":
             return True
         if self._last_error_time is not None:
@@ -97,8 +88,9 @@ class MockPyExecutorForFatalError:
         is_fatal = self._consume_error_budget(error_msg)
         if is_fatal:
             self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
+            self.is_shutdown = True
             requests = None
-        failed_requests = requests if requests is not None else self.active_requests
+        failed_requests = list(self.active_requests) if requests is None else requests
         for request in failed_requests:
             request.state = "GENERATION_COMPLETE"
         if requests is None:
@@ -132,23 +124,14 @@ class ConcreteExecutor:
             return False
         if not self._error_queue.empty():
             try:
-                self._handle_background_error()
+                e = self._error_queue.get_nowait()
+                self._error_queue.task_done()
+                self._set_fatal_error(e)
+                self.doing_shutdown = True
             except Exception:
                 pass
             return self._fatal_error is None and not self.doing_shutdown
         return True
-
-    def _handle_background_error(self, error=None):
-        if error is not None:
-            self._set_fatal_error(error)
-            self.doing_shutdown = True
-            raise error
-        if not self._error_queue.empty():
-            e = self._error_queue.get()
-            self._error_queue.task_done()
-            self._set_fatal_error(e)
-            self.doing_shutdown = True
-            raise e
 
     def shutdown(self):
         self.doing_shutdown = True
@@ -192,6 +175,8 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                     try:
                         e = self._error_queue.get_nowait()
                         self._error_queue.task_done()
+                        if isinstance(e, str):
+                            continue
                         self._set_fatal_error(e)
                         if not self.doing_shutdown:
                             self.shutdown()
@@ -225,13 +210,9 @@ def _make_request(req_id: int) -> Mock:
 
 
 # ---------------------------------------------------------------------------
-# Error classification
+# classify_error() — tests the real module-level function directly
 # ---------------------------------------------------------------------------
 class TestClassifyError:
-    @pytest.fixture
-    def executor(self):
-        return MockPyExecutorForFatalError()
-
     @pytest.mark.parametrize(
         "error_msg,expected",
         [
@@ -247,34 +228,13 @@ class TestClassifyError:
             ("Invalid sampling parameter: top_k must be > 0", "transient"),
             ("KV cache capacity exceeded", "transient"),
             ("", "transient"),
-        ],
-    )
-    def test_classification(self, executor, error_msg, expected):
-        assert executor._classify_error(error_msg) == expected
-
-    @pytest.mark.parametrize(
-        "error_msg,is_fatal",
-        [
-            ("cudaErrorIllegalAddress", True),
-            ("device-side assert triggered", True),
-            ("CUDA out of memory", False),
-            ("NCCL error", False),
-            ("some random error", False),
-        ],
-    )
-    def test_is_fatal_error(self, executor, error_msg, is_fatal):
-        assert executor._is_fatal_error(error_msg) is is_fatal
-
-    @pytest.mark.parametrize(
-        "error_msg,expected",
-        [
             ("DEVICE-SIDE ASSERT triggered", "immediate_fatal"),
             ("Nccl Error: timeout", "severe"),
             ("cuda OUT OF MEMORY", "severe"),
         ],
     )
-    def test_case_insensitive(self, executor, error_msg, expected):
-        assert executor._classify_error(error_msg) == expected
+    def test_classification(self, error_msg, expected):
+        assert classify_error(error_msg) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +251,10 @@ class TestErrorBudget:
         assert executor._error_budget == 1.0
         executor._handle_errors("device-side assert triggered")
         assert executor._fatal_error is not None
+        assert executor.is_shutdown is True
 
     def test_severe_errors_exhaust_budget_in_two(self, executor):
-        """budget=1.0, severe cost=0.5 → 2 severe errors exhaust it."""
+        """budget=1.0, severe cost=0.5 -> 2 severe errors exhaust it."""
         for i in range(2):
             executor.active_requests = [_make_request(i)]
             executor._handle_errors("CUDA out of memory", requests=executor.active_requests[:])
@@ -301,7 +262,7 @@ class TestErrorBudget:
         executor.executor_request_queue.enqueue_shutdown_request.assert_called()
 
     def test_transient_errors_exhaust_budget_in_four(self, executor):
-        """cost=0.25 → 4 transient errors exhaust budget=1.0."""
+        """cost=0.25 -> 4 transient errors exhaust budget=1.0."""
         executor._error_budget_cost = 0.25
         for i in range(3):
             executor.active_requests = [_make_request(i)]
@@ -315,7 +276,6 @@ class TestErrorBudget:
         executor._handle_errors("transient error", requests=[_make_request(1)])
         budget_after = executor._error_budget
 
-        # Simulate 5 seconds of error-free time (recovery = 0.1/s × 5s)
         executor._last_error_time = time.monotonic() - 5.0
 
         executor._handle_errors("transient error", requests=[_make_request(2)])
@@ -337,6 +297,8 @@ class TestErrorBudget:
         executor._handle_errors("cudaErrorIllegalAddress", requests=[reqs[0]])
         assert executor._fatal_error is not None
         assert len(executor.active_requests) == 0
+        for r in reqs:
+            assert r.state == "GENERATION_COMPLETE"
         executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
 
     def test_fatal_error_with_no_active_requests(self, executor):
@@ -463,6 +425,20 @@ class TestErrorMonitorLoop:
 
         assert not t.is_alive()
         assert executor._fatal_error is not None
+
+    def test_skips_per_request_string_errors(self):
+        """Per-request string errors should not trigger fatal shutdown."""
+        executor = ConcreteProxyExecutor()
+
+        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
+        t.start()
+        time.sleep(0.05)
+        executor._error_queue.put("per-request error string")
+        time.sleep(0.2)
+
+        assert executor._fatal_error is None
+        executor.doing_shutdown = True
+        t.join(timeout=2.0)
 
     def test_stops_on_shutdown_flag(self):
         executor = ConcreteProxyExecutor()

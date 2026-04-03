@@ -26,9 +26,9 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (ErrorResponse, WorkerCommIpcAddrs, create_mpi_comm_session,
-                    get_spawn_proxy_process_env, is_llm_response,
-                    print_alive_threads)
+from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
+                    create_mpi_comm_session, get_spawn_proxy_process_env,
+                    is_llm_response, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -197,6 +197,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                     try:
                         e = self._error_queue.get_nowait()
                         self._error_queue.task_done()
+                        if isinstance(e, (str, RequestError)):
+                            continue
                         self._set_fatal_error(e)
                         logger.error(
                             "Error monitor: background error detected: "
