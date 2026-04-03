@@ -24,7 +24,7 @@ It does not modify that launcher. Instead, it combines:
 ## How It Works
 
 `reproduce.py` reads `env.yaml` and `dwdp_reproduce.yaml`, generates one full
-benchmark config per experiment, writes the config to `generated/`, then
+benchmark config per experiment, writes the config by default to `generated/`, then
 invokes:
 
 ```bash
@@ -90,10 +90,10 @@ reproduction experiments you want to launch.
 
 ## Generated Configs
 
-Generated configs are written to `examples/dwdp/generated/`.
+Generated configs are written by default to `examples/dwdp/generated/`.
 The filenames include both the experiment name and the generated benchmark
 identifier so they can be inspected or reused directly with
 `submit_dwdp.py`.
 
 > **IMPORTANT:** Benchmark run logs are written by default to
-> `examples/dwdp/logs/<timestamp>/...`.
+> `examples/dwdp/logs/`.
