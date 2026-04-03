@@ -297,20 +297,27 @@ Compared with the baseline, DWDP increases TTFT across the evaluated TPS/user ra
 
 ### Reproducing Steps
 
+The reproduction files are provided in `examples/dwdp/`:
+
+- `env.yaml`: cluster/container/model/dataset inputs
+- `dwdp_reproduce.yaml`: DWDP experiment matrix
+- `reproduce.py`: config generator and launcher for `submit_dwdp.py`
+
 The above experiments use:
 
 - GB200 NVL72
 - DeepSeek-R1 NVFP4 checkpoint
 - SemiAnalysis dataset with maximum input length `8K`, output length `1K`, and input ratio `0.8`
 
+Before running, edit `examples/dwdp/env.yaml` for your environment (for example `partition`, `account`, `container_image`, `model_path`, and dataset paths), then launch:
 
-To reproduce the same style of end-to-end comparison in TensorRT-LLM today:
-
-1. Keep the generation-server configuration fixed.
-2. Apply DWDP only to the context server.
-3. Launch the context and generation workers through the DWDP disaggregated serving path.
-4. Compare Pareto points against a DEP baseline by varying the number of context GPUs.
-5. Report TPS/user, output TPS/GPU, and TTFT together rather than reading any one metric in isolation.
+```bash
+python3 -m pip install pyyaml
+python3 examples/dwdp/reproduce.py \
+  --env-config examples/dwdp/env.yaml \
+  --reproduce-config examples/dwdp/dwdp_reproduce.yaml \
+  --output-dir examples/dwdp/generated
+```
 
 ## Summary
 
