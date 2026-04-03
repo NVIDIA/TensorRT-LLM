@@ -41,6 +41,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 from torch import nn
+from torch.fx import GraphModule
 from transformers import AutoConfig, PretrainedConfig, PreTrainedTokenizerFast
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
@@ -716,15 +717,42 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
     def __init__(self, config: Gemma4TextConfig, **kwargs):
         del kwargs
         super().__init__(config)
-        self.model = Gemma4TextModel(config)
+        self.padding_idx = config.pad_token_id
+        self.embed_tokens = Gemma4TextScaledWordEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+            embed_scale=config.hidden_size**0.5,
+        )
+        self.layers = nn.ModuleList(
+            [Gemma4TextDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Keep the text backbone modules directly on the CausalLM wrapper so
+        # checkpoint keys match the HF layout: `language_model.layers.*`
+        # instead of `language_model.model.layers.*`.
+        self.rotary_emb_global = Gemma4RotaryEmbedding(config, "full_attention")
+        self.rotary_emb_local = Gemma4RotaryEmbedding(config, "sliding_attention")
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.register_load_state_dict_post_hook(self._retie_lm_head_weight)
         self.post_init()
+        if getattr(config, "tie_word_embeddings", True):
+            self.lm_head.weight = self.embed_tokens.weight
+
+    @staticmethod
+    def _retie_lm_head_weight(module, incompatible_keys):
+        del incompatible_keys
+        if not hasattr(module, "config") or not hasattr(module, "lm_head"):
+            return
+        if getattr(module.config, "tie_word_embeddings", True):
+            module.lm_head.weight = module.embed_tokens.weight
 
     def get_input_embeddings(self):
-        return self.model.get_input_embeddings()
+        return self.embed_tokens
 
     def set_input_embeddings(self, value):
-        self.model.set_input_embeddings(value)
+        self.embed_tokens = value
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -733,7 +761,7 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
         self.lm_head = value
 
     def get_decoder(self):
-        return self.model
+        return self
 
     def forward(
         self,
@@ -742,13 +770,29 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4CausalLMOutput:
-        outputs = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
-        logits = self.lm_head(outputs.last_hidden_state)
+        del kwargs
+        assert position_ids is not None, "position_ids must be provided"
+
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if input_ids is not None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        assert inputs_embeds is not None
+        pos_emb_global = self.rotary_emb_global(inputs_embeds, position_ids)
+        pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)
+
+        hidden_states = inputs_embeds
+        for decoder_layer in self.layers:
+            if decoder_layer.attention_type == "sliding_attention":
+                pos_emb = pos_emb_local
+            else:
+                pos_emb = pos_emb_global
+            hidden_states = decoder_layer(hidden_states, pos_emb)
+
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
         if self.config.final_logit_softcapping is not None:
             logits = logits / self.config.final_logit_softcapping
             logits = torch.tanh(logits)
@@ -874,6 +918,48 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         return self.model.get_decoder()
 
     @staticmethod
+    def _call_language_model(
+        language_model: nn.Module,
+        input_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.LongTensor],
+        inputs_embeds: Optional[torch.Tensor],
+        **kwargs,
+    ):
+        """Call eager modules and exported FX graphs using their expected input structure."""
+        if not isinstance(language_model, GraphModule):
+            model_kwargs = dict(kwargs)
+            model_kwargs["position_ids"] = position_ids
+            if inputs_embeds is not None:
+                model_kwargs["inputs_embeds"] = inputs_embeds
+            else:
+                model_kwargs["input_ids"] = input_ids
+            return language_model(**model_kwargs)
+
+        available_args = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            **kwargs,
+        }
+        placeholder_names = [
+            node.target for node in language_model.graph.nodes if node.op == "placeholder"
+        ]
+        in_spec = getattr(language_model, "_in_spec", None)
+        if in_spec is not None and in_spec.type is tuple and in_spec.num_children == 2:
+            pos_spec = in_spec.child(0)
+            kw_spec = in_spec.child(1)
+            num_positional = pos_spec.num_children if pos_spec.type is tuple else 0
+            positional_names = placeholder_names[:num_positional]
+            keyword_names = list(kw_spec.context) if kw_spec.type is dict else []
+
+            positional_args = [available_args.get(name) for name in positional_names]
+            keyword_args = {name: available_args.get(name) for name in keyword_names}
+            return language_model(*positional_args, **keyword_args)
+
+        positional_args = [available_args.get(name) for name in placeholder_names]
+        return language_model(*positional_args)
+
+    @staticmethod
     def _build_attention_mask(token_type_ids: torch.Tensor) -> torch.Tensor:
         """Build a bool attention mask from ``token_type_ids``.
 
@@ -926,7 +1012,8 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         else:
             kwargs["custom_attn_mask"] = None
 
-        outputs = self.model.language_model(
+        outputs = self._call_language_model(
+            self.model.language_model,
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
