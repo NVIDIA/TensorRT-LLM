@@ -344,11 +344,7 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
 
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, alignedSize,
-        CUmemAccessDesc{{
-                            CU_MEM_LOCATION_TYPE_DEVICE,
-                            device,
-                        },
-            CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
 
     switch (mConfig->mMode)
     {
@@ -368,7 +364,7 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
 
     mConfig->mManager.add(address, mConfig->mTag,
         std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                             CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, device}},
+                                             CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}},
             alignedSize),
         std::move(configurators));
 
