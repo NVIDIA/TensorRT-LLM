@@ -107,11 +107,18 @@ class AttentionLayerConfig:
     def window_size(self) -> int | None: ...
 
 @dataclass(slots=True)
+class SsmLayerConfig:
+    layer_id: LayerId
+    buffers: list[BufferConfig]
+
+LayerConfig = AttentionLayerConfig | SsmLayerConfig
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     vocab_size: int
     cache_tiers: list[CacheTierConfig]
-    layers: list[AttentionLayerConfig]
+    layers: list[LayerConfig]
     max_util_for_resume: float = ...
     helix_config: HelixConfig | None = None
 
@@ -164,6 +171,9 @@ class _KVCache:
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
+    def get_ssm_block_base_index(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> int: ...
     def get_aggregated_page_indices(
         self,
         layer_group_id: LayerGroupId,

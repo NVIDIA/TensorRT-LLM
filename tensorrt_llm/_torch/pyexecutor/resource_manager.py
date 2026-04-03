@@ -831,6 +831,24 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.remove_sequence(request.py_request_id, request,
                                          pin_on_release)
 
+    def release_prefix_blocks(self, request_id: int, num_blocks: int) -> None:
+        """Release leading blocks from a request's V1 KV cache.
+
+        Used by disaggregated serving to free sender-side KV memory
+        for blocks whose data has already been transferred.  The
+        underlying C++ ``KVCacheManager::releasePrefixBlocks`` frees
+        blocks via the eviction policy so they can be reused.
+
+        Args:
+            request_id: The request whose KV cache to partially free.
+            num_blocks: Number of leading blocks to release
+                (cumulative from the start of the sequence).
+
+        Note:
+            No-op if the sequence does not exist (already removed).
+        """
+        self.impl.release_prefix_blocks(request_id, num_blocks)
+
     def store_blocks_for_reuse(self,
                                request: LlmRequest,
                                pin_blocks: bool = False):
@@ -2356,6 +2374,28 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.stop_committing()
         kv_cache.close()
         self.index_mapper.remove_sequence(request.py_request_id)
+
+    def release_prefix_blocks(self, request_id: int, num_blocks: int) -> None:
+        """Release leading blocks from a request's V2 KV cache.
+
+        Used by disaggregated serving to free sender-side KV memory
+        for blocks whose data has already been transferred.  The
+        underlying ``_KVCache.release_prefix`` returns the physical
+        slots to the pool so they can be reused by other requests.
+
+        Args:
+            request_id: The request whose KV cache to partially free.
+            num_blocks: Number of leading blocks to release
+                (cumulative from the start of the sequence).
+
+        Note:
+            No-op if the request is not found in ``kv_cache_map``
+            (e.g. V1 path or already freed).
+        """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None:
+            return
+        kv_cache.release_prefix(num_blocks)
 
     def get_batch_cache_indices(self,
                                 request_ids: List[int],
