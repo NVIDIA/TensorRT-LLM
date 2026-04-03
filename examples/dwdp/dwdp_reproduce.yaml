@@ -85,6 +85,24 @@ experiments:
     dwdp: false
     dwdp_group: 1
 
+  - name: "e2e_20_40_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 20
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 256
+    gen_max_tokens: 512
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 5
+
   - name: "e2e_20_40_dwdp_minus_1"
     dataset_key: "e2e_ratio_08"
     isl: 8192
@@ -121,6 +139,42 @@ experiments:
     prefetch: 0
     dwdp: false
     dwdp_group: 1
+
+  - name: "e2e_40_60_dep_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 3
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 128
+    gen_max_tokens: 256
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 0
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_40_60_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 16
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 128
+    gen_max_tokens: 256
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 0
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 4
 
   - name: "e2e_40_60_dwdp_minus_1"
     dataset_key: "e2e_ratio_08"
@@ -177,6 +231,24 @@ experiments:
     dwdp: false
     dwdp_group: 1
 
+  - name: "e2e_60_80_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 28
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 64
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 7
+
   - name: "e2e_60_80_dwdp_minus_1"
     dataset_key: "e2e_ratio_08"
     isl: 8192
@@ -232,6 +304,24 @@ experiments:
     dwdp: false
     dwdp_group: 1
 
+  - name: "e2e_80_100_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 16
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 32
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 4
+
   - name: "e2e_80_100_dwdp_minus_1"
     dataset_key: "e2e_ratio_08"
     isl: 8192
@@ -286,3 +376,21 @@ experiments:
     prefetch: 64
     dwdp: true
     dwdp_group: 2
+
+  - name: "e2e_160_180_dwdp_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 4
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 32
+    batch: 2
+    gen_max_tokens: 8
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 0
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 1

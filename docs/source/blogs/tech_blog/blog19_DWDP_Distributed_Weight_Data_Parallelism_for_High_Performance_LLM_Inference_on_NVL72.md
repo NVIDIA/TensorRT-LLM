@@ -310,6 +310,8 @@ The above experiments use:
 - DeepSeek-R1 NVFP4 checkpoint
 - SemiAnalysis dataset with maximum input length `8K`, output length `1K`, and input ratio `0.8`
 
+The end-to-end results reported in this blog are Pareto points selected from these reproduced experiments.
+
 Before running, edit `examples/dwdp/env.yaml` for your environment (for example `partition`, `account`, `container_image`, `model_path`, and dataset paths), then launch:
 
 ```bash
