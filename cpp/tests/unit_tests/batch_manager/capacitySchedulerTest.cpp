@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
@@ -401,7 +402,7 @@ int runTest(CapacityScheduler& capacityScheduler,
 
                 if (llmReq->getContextRemainingLength() == 0)
                 {
-                    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(*llmReq);
+                    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmReq);
                     kvCacheManager->storeContextBlocks(*llmReq);
                     if (crossKvCacheManager)
                     {

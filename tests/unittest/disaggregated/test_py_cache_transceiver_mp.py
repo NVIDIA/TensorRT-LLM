@@ -18,6 +18,8 @@ import torch.multiprocessing as mp
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm.bindings.internal.testing import \
+    simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -799,7 +801,7 @@ def worker_fn(
     # All ranks added all requests, so all need to remove them
     for request in all_requests:
         # remove_sequence(request_id, llm_request, release_blocks)
-        kv_cache_manager.impl.simulate_prefill_completion_only_use_for_testing(request)
+        simulate_prefill_completion_only_use_for_testing(request)
         kv_cache_manager.impl.remove_sequence(request.py_request_id, request, True)
 
     if rank == 0:

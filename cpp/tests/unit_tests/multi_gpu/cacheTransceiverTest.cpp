@@ -32,6 +32,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -408,7 +409,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     mFutures.clear();
     for (auto& request : requests)
     {
-        mManager->simulatePrefillCompletionOnlyUseForTesting(*request);
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
         mManager->removeSequence(request->mRequestId, request);
     }
     requests.clear();
@@ -1407,7 +1408,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
-                mManager->simulatePrefillCompletionOnlyUseForTesting(*request->mLlmRequest);
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
                 mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();

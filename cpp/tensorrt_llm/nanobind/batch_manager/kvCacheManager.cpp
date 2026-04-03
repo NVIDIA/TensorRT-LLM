@@ -68,7 +68,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 37);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 36);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -267,10 +267,6 @@ public:
         NB_OVERRIDE_PURE(countReusableBlocks, uniqueTokens, llmRequest, onlyAllocated);
     }
 
-    void simulatePrefillCompletionOnlyUseForTesting(tb::LlmRequest& llmRequest) const override
-    {
-        NB_OVERRIDE_PURE(simulatePrefillCompletionOnlyUseForTesting, llmRequest);
-    }
 };
 
 // TODO: Deduplicate executor bindings KvCacheStats
@@ -550,10 +546,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>())
         .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>())
         .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId, nb::arg("block_id"),
-            nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
-        .def("simulate_prefill_completion_only_use_for_testing",
-            &BaseKVCacheManager::simulatePrefillCompletionOnlyUseForTesting, nb::arg("llm_request"),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })
