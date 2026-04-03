@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 
 from __future__ import annotations
@@ -1153,10 +1168,15 @@ class Indexer(nn.Module):
         metadata: DSAtrtllmAttentionMetadata,
         position_ids: torch.Tensor,
     ):
-        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(qr, hidden_states, position_ids)
+        """Run indexer projections and sparse attention indexing.
 
-        # Scatter k values into indexer k cache before indexing
-        self._update_k_cache(k_fp8, k_scale, metadata)
+        Note: This method does NOT call ``_update_k_cache``.  Callers are
+        responsible for scattering k values into the indexer k cache (e.g.
+        via ``pre_attn_process``) before invoking this method.  Calling
+        ``_update_k_cache`` here would cause a double scatter when the
+        standard backend flow has already run it in ``pre_attn_process``.
+        """
+        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(qr, hidden_states, position_ids)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8, k_scale, weights)

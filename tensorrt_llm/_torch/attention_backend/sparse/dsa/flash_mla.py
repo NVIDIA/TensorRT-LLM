@@ -14,13 +14,12 @@
 # limitations under the License.
 """DSA sparse attention forward paths for MLA.
 
-Contains the FlashMLA (SM < 100) sparse attention kernel path and the
-short-seq MHA optimization helper.
+Contains the FlashMLA (SM < 100) sparse attention kernel path.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -38,30 +37,6 @@ except ImportError:
 
 if TYPE_CHECKING:
     from ....modules.attention import MLA
-
-
-def should_use_short_mha(
-    mla: MLA,
-    attn_metadata,
-    position_ids: Optional[torch.Tensor],
-) -> bool:
-    """Check if the short-seq MHA optimization should be used for context.
-
-    Uses max_ctx_kv_len (max total KV length per context sequence,
-    including cached tokens) when available, to correctly account for
-    chunked context where the full attention span exceeds the threshold
-    even if the new token count is small.  Falls back to num_ctx_tokens
-    (total new context tokens) when max_ctx_kv_len is not set.
-    """
-    if not (
-        mla.short_seq_mha_threshold > 0
-        and not mla.apply_rotary_emb
-        and mla.mapping.cp_size == 1
-        and position_ids is not None
-    ):
-        return False
-    effective_len = getattr(attn_metadata, "max_ctx_kv_len", attn_metadata.num_ctx_tokens)
-    return effective_len <= mla.short_seq_mha_threshold
 
 
 @nvtx_range("forward_sparse_mla_kvcache_bf16")

@@ -384,7 +384,7 @@ public:
         return mIsMLAEnabled;
     }
 
-    /// Whether sparse attention is active for the generation phase.
+    /// Whether sparse attention is active for both the context and generation phases.
     /// Requires paged KV cache (sparse page gathering operates on KV pages) and XQA
     /// (the XQA kernel path implements per-head sparse page selection).
     [[nodiscard]] bool useSparseAttention() const
@@ -404,7 +404,8 @@ public:
     /// Whether sparse MLA (Multi-head Latent Attention) mode is active.
     /// Unlike useSparseAttention(), this does NOT require mPagedKVCache or mEnableXQA
     /// because sparse MLA uses a dedicated kernel path with direct KV cache pool access
-    /// rather than the standard paged KV + XQA path. Requires Blackwell (sm120) or later.
+    /// rather than the standard paged KV + XQA path. Requires sm100 family
+    /// (mUseTllmGen = true, which excludes sm120).
     [[nodiscard]] bool useSparseMLA() const
     {
         return mUseSparseAttention && mUseTllmGen && mIsMLAEnabled;

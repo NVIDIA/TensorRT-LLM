@@ -1827,6 +1827,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         params.sparse_attn_indices = attn_indices
         params.sparse_attn_offsets = attn_offsets
 
+        # Consistency check: if topk is set but indexing failed, disable sparse.
+        if params.sparse_mla_topk > 0 and params.sparse_attn_indices is None:
+            params.sparse_mla_topk = 0
+
         return params
 
     def use_nvfp4_output(

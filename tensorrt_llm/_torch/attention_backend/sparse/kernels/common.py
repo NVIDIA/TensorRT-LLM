@@ -251,7 +251,7 @@ def triton_bmm(
     BLOCK_N = 256
     BLOCK_K = 64
 
-    grid_bmm = lambda meta: (batch_size, num_q_heads) # noqa: E731
+    grid_bmm = lambda meta: (batch_size, num_q_heads)  # noqa: E731
 
     bmm_kernel[grid_bmm](
         q,
@@ -474,7 +474,7 @@ def triton_flatten_to_batch(
         dtype=input_tensor.dtype,
     )
 
-    grid = lambda meta: (batch_size, num_heads) # noqa: E731
+    grid = lambda meta: (batch_size, num_heads)  # noqa: E731
     flatten_to_batch_kernel[grid](
         input_tensor,
         batched_tensor,

@@ -39,8 +39,9 @@ namespace kernels
 /// direct access to the KV cache pool for the dedicated sparse MLA kernel.
 struct SparseAttentionParams
 {
-    /// Per-head KV token indices for context-phase KV cache compaction.
-    /// Shape: [num_kv_heads, total_sparse_tokens] (ragged, indexed by sparse_kv_offsets).
+    /// KV token indices for context-phase KV cache compaction.
+    /// Shape: [total_sparse_tokens] (ragged, indexed by sparse_kv_offsets). The same indices
+    /// are shared across all KV heads; context compaction does not use per-head index layout.
     int32_t* sparse_kv_indices{nullptr};
 
     /// Per-head KV page/block indices for generation-phase sparse computation.

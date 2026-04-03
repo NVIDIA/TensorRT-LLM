@@ -43,7 +43,7 @@ def mla_dsa_proj(
     Does NOT update the indexer k cache — that happens in Op 2.
 
     Returns [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
-    weights].  Under torch compile _should_use_short_mha returns False
+    weights].  Under torch compile MLA._should_use_short_mha returns False
     so the result is always length 8 for straight-line control flow.
     """
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
@@ -189,3 +189,17 @@ def mla_dsa_attn_inplace(
             latent_cache=latent_cache_gen,
             **gen_kwargs,
         )
+
+
+@mla_dsa_attn_inplace.register_fake
+def _mla_dsa_attn_inplace_fake(
+    q: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+    latent_cache: torch.Tensor,
+    indexer_intermediates: List[torch.Tensor],
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+    output: torch.Tensor,
+) -> None:
+    pass  # in-place mutation of output, no return value

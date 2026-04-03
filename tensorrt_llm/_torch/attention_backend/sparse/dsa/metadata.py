@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -14,6 +29,9 @@ from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.sparse.dsa.indexer import Indexer
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
+    from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+    from tensorrt_llm._torch.speculative.utils import SpecDecodingTensor
 
 
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):

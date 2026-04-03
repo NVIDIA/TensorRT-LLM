@@ -755,8 +755,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
 
     // Sparse attention flags:
-    // - mUseSparseAttention: set when any sparse indices are provided (context or generation phase),
-    //   or when sparse MLA is active (sparse_mla_topk > 0 with sparse_attn_indices).
+    // - mUseSparseAttention: set when any sparse indices are provided (context or generation phase).
+    //   Also covers sparse MLA because sparse_attn_indices are always provided in that case.
     // - mUseTllmGenSparseAttention: set when sparse_attn_indices are provided, indicating
     //   trtllm-gen generation-phase sparse attention is in use.
     op->mUseSparseAttention = false;
@@ -773,12 +773,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     }
     int32_t const sparse_mla_topk_value = sparse_mla_topk.has_value() ? sparse_mla_topk.value() : 0;
 
-    // For sparse MLA, also enable mUseSparseAttention when topk > 0 and sparse_attn_indices present,
-    // even if the generic block above didn't set it (e.g. sparse_kv_indices absent).
-    if (sparse_mla_topk_value > 0 && hasSparseAttnIndices)
-    {
-        op->mUseSparseAttention = true;
-    }
+    // Note: mUseSparseAttention is already set by the block above when hasSparseAttnIndices is true,
+    // which covers the sparse MLA case since sparse_attn_indices are always provided for sparse MLA.
 
     if (is_mla_enable)
     {

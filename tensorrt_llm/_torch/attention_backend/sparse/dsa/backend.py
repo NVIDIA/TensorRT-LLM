@@ -7,9 +7,10 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .flash_mla import forward_sparse_mla_kvcache_bf16, should_use_short_mha
+from .flash_mla import forward_sparse_mla_kvcache_bf16
 from .indexer import Indexer, transform_local_topk_and_prepare_pool_view
 from .metadata import DSAtrtllmAttentionMetadata
 
@@ -149,12 +150,16 @@ class DSATrtllmAttention(TrtllmAttention):
         sparse_attn_predict, fed to the C++ kernel via wrapper.plan).
         SM < 100: FlashMLA path (topk_indices produced here via
         sparse_attn_indexer, fed to the Python FlashMLA kernel).
+
+        Note: short-seq MHA fallback is handled by the caller
+        (MLA.forward_context) before dispatching here.
+
+        Requires q_fp8 in kwargs (produced by pre_attn_process).
         """
-        if should_use_short_mha(mla, attn_metadata, position_ids):
-            mla.forward_context(
-                q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
-            )
-        elif get_sm_version() >= 100:
+        assert kwargs.get("q_fp8") is not None, (
+            "DSA forward_sparse_context requires q_fp8 from pre_attn_process"
+        )
+        if get_sm_version() >= 100:
             mla.forward_absorption_context(
                 q,
                 compressed_kv,
@@ -187,7 +192,13 @@ class DSATrtllmAttention(TrtllmAttention):
         latent_cache: Optional[torch.Tensor],
         **kwargs,
     ) -> None:
-        """Dispatch sparse generation-phase attention for DSA."""
+        """Dispatch sparse generation-phase attention for DSA.
+
+        Requires q_fp8 in kwargs (produced by pre_attn_process).
+        """
+        assert kwargs.get("q_fp8") is not None, (
+            "DSA forward_sparse_generation requires q_fp8 from pre_attn_process"
+        )
         if get_sm_version() >= 100:
             mla.forward_absorption_generation(
                 q,
@@ -248,13 +259,19 @@ class DSATrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: DSAtrtllmAttentionMetadata,
-        is_generation: bool = True,
+        is_generation: bool = False,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run sparse indexing and transform indices for the C++ kernel."""
         q_fp8 = kwargs.get("q_fp8")
         weights = kwargs.get("weights")
         if q_fp8 is None or weights is None:
+            logger.warning(
+                "sparse_attn_predict called with q_fp8=%s, weights=%s; "
+                "skipping sparse indexing and returning (None, None).",
+                type(q_fp8).__name__,
+                type(weights).__name__,
+            )
             return None, None
 
         topk_indices = self.indexer.sparse_attn_indexer(

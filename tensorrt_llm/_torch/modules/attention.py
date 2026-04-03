@@ -1648,6 +1648,29 @@ class MLA(nn.Module):
 
         return attn_output
 
+    def _should_use_short_mha(self, attn_metadata: AttentionMetadata,
+                              position_ids: Optional[torch.Tensor]) -> bool:
+        """Check if the short-seq MHA optimization should be used for context.
+
+        Uses max_ctx_kv_len (max total KV length per context sequence,
+        including cached tokens) when available, to correctly account for
+        chunked context where the full attention span exceeds the threshold
+        even if the new token count is small.  Falls back to num_ctx_tokens
+        (total new context tokens) when max_ctx_kv_len is not set.
+
+        Disabled under torch compile so that the split DSA custom ops
+        (mla_dsa_proj / mla_dsa_attn_inplace) have unconditionally
+        straight-line control flow for CUDA graph capture.
+        """
+        if is_torch_compiling():
+            return False
+        if not (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
+                and self.mapping.cp_size == 1 and position_ids is not None):
+            return False
+        effective_len = getattr(attn_metadata, 'max_ctx_kv_len',
+                                attn_metadata.num_ctx_tokens)
+        return effective_len <= self.short_seq_mha_threshold
+
     def forward_context_with_cached_kv(
         self,
         q: torch.Tensor,
@@ -1939,15 +1962,17 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Sparse attention context dispatch (e.g. DSA).
-        # Check for sparse_intermediates keys (e.g. q_fp8) rather than
-        # bare kwargs truthiness to avoid accidental dispatch.
-        if hasattr(self.mqa, 'forward_sparse_context') and any(
-                v is not None for v in kwargs.values()):
-            return self.mqa.forward_sparse_context(self, q, compressed_kv, k_pe,
-                                                   attn_metadata, output,
-                                                   latent_cache, position_ids,
-                                                   **kwargs)
+        # Sparse attention context dispatch.
+        # The backend (e.g. DSA) implements forward_sparse_context and is
+        # responsible for validating the kwargs it receives.  We only gate on
+        # the presence of sparse_intermediates (non-empty kwargs) and
+        # short-seq MHA; method-specific checks live in the backend.
+        if hasattr(self.mqa, 'forward_sparse_context') and kwargs:
+            if not self._should_use_short_mha(attn_metadata, position_ids):
+                return self.mqa.forward_sparse_context(self, q, compressed_kv,
+                                                       k_pe, attn_metadata,
+                                                       output, latent_cache,
+                                                       position_ids, **kwargs)
 
         # Standard (non-sparse) context dispatch
         if isinstance(self.mha, TrtllmAttention):
@@ -1984,11 +2009,9 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Sparse attention generation dispatch (e.g. DSA).
-        # Check for sparse_intermediates keys (e.g. q_fp8) rather than
-        # bare kwargs truthiness to avoid accidental dispatch.
-        if hasattr(self.mqa, 'forward_sparse_generation') and any(
-                v is not None for v in kwargs.values()):
+        # Sparse attention generation dispatch.
+        # The backend is responsible for validating its own kwargs.
+        if hasattr(self.mqa, 'forward_sparse_generation') and kwargs:
             return self.mqa.forward_sparse_generation(self, q, compressed_kv,
                                                       k_pe, attn_metadata,
                                                       output, latent_cache,
