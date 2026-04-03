@@ -756,6 +756,7 @@ class TestResourceManager(unittest.TestCase):
         stats_initial = kv_cache_manager.get_kv_cache_stats()
         initial_reused_blocks = stats_initial.reused_blocks
 
+        kv_cache_manager.impl.simulate_prefill_completion_only_use_for_testing(req1)
         kv_cache_manager.free_resources(req1)
 
         # Second request with same tokens - should reuse blocks from the reuse tree
@@ -770,6 +771,7 @@ class TestResourceManager(unittest.TestCase):
             f"reused_blocks before: {initial_reused_blocks}, after: {stats_after_reuse.reused_blocks}"
         )
 
+        kv_cache_manager.impl.simulate_prefill_completion_only_use_for_testing(req2)
         kv_cache_manager.free_resources(req2)
 
         # Reset reuse state
@@ -788,6 +790,7 @@ class TestResourceManager(unittest.TestCase):
             f"Third request should NOT reuse blocks after reset. "
             f"reused_blocks after reset: {reused_blocks_after_reset}, after third request: {stats_after_third.reused_blocks}"
         )
+        kv_cache_manager.impl.simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
     def test_kv_cache_manager_with_execution_stream(self):
