@@ -916,6 +916,18 @@ public:
             = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
     }
 
+    /// @brief Fake completion of prefill stage. NEVER call this method in production code, it should solely be used in
+    /// unit tests.
+    void simulatePrefillCompletionOnlyUseForTesting(LlmRequest& llmRequest) const
+    {
+        // NEVER CALL THIS METHOD FROM PRODUCTION CODE, IT IS SOLELY FOR USE IN TESTS.
+        // Update llmRequest state as if prefill stage has just completed.
+        // This is necessary for most unit tests that call BlockManager functions storeContextBlocks and releaseBlocks
+        // to function correctly. Note that these methods are also called indirectly by a number of KVCacheManager and
+        // BlockManager functions like removeSequence and releaseSequence.
+        llmRequest.setContextCurrentPosition(llmRequest.getPromptLen());
+    }
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -1418,6 +1430,18 @@ public:
         }
     }
 
+    /// @brief Fake completion of prefill stage. NEVER call this method in production code, it should solely be used in
+    /// unit tests.
+    void simulatePrefillCompletionOnlyUseForTesting(LlmRequest& llmRequest) const
+    {
+        // NEVER CALL THIS METHOD FROM PRODUCTION CODE, IT IS SOLELY FOR USE IN TESTS.
+        // Just delegate to any window block manager (they all do the same thing)
+        if (!mWindowBlockManagers.empty())
+        {
+            mWindowBlockManagers.begin()->second.simulatePrefillCompletionOnlyUseForTesting(llmRequest);
+        }
+    }
+
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
@@ -1682,6 +1706,10 @@ public:
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+
+    /// @brief Fake completion of prefill stage. NEVER call this method in production code, it should solely be used in
+    /// unit tests.
+    virtual void simulatePrefillCompletionOnlyUseForTesting(LlmRequest& llmRequest) const = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -2030,6 +2058,14 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
+
+    /// @brief Fake completion of prefill stage. NEVER call this method in production code, it should solely be used in
+    /// unit tests.
+    void simulatePrefillCompletionOnlyUseForTesting(LlmRequest& llmRequest) const override
+    {
+        // NEVER CALL THIS METHOD FROM PRODUCTION CODE, IT IS SOLELY FOR USE IN TESTS.
+        mBlockManager.simulatePrefillCompletionOnlyUseForTesting(llmRequest);
+    }
 
 private:
     // Maximum number of sequences

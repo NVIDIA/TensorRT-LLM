@@ -342,6 +342,7 @@ void runPartialCopyTest()
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
     }
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
 
@@ -359,6 +360,7 @@ void runPartialCopyTest()
     auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({0, 1, 6}));
     // store blocks 0, 1 ([0,1,2,3,4,5,6,7], [8,9,10,11,12,13,14,15])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.storeContextBlocks(seq1, *llmRequest1);
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -419,7 +421,9 @@ void runPartialCopyTest()
     EXPECT_TRUE(block2->isPrimary());
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq1.getRequestId());
     blockManager.releaseSequence(seq2.getRequestId());
@@ -654,6 +658,7 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     auto cacheBlockIds = kvCacheManager.getSequence(requestId).getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
 
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(requestId, llmRequest0);
 
     inputTokens->pop_back();
@@ -768,6 +773,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 0, 1, 2 are stored for reuse (blocks contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -793,6 +799,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // block 3 matches block 2 and will be freed (blocks contain [8, 9])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -834,11 +841,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
     // block 2 is stored for reuse (block contains [8]). nb! Last token of last block is never stored
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block is never stored
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -892,9 +901,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // block 5 is not stored since it is last block and has only one token
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq2.getRequestId());
     // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block not stored
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -928,6 +939,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // llmRequest4Short tokens [0, 1, 2, 3, 4, 5, 6, 7, 8]
     // blocks 0 and 1 ([0, 1, 2, 3], [4, 5, 6, 7]) are already stored,
     // block 4 is freed
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4Short);
     blockManager.releaseBlocks(seq4, llmRequest4Short);
     blockManager.releaseSequence(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -954,6 +966,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4_dup, llmRequest4);
     blockManager.releaseSequence(seq4_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -980,6 +993,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), blocksInPrimaryPool);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest5);
     blockManager.releaseBlocks(seq5, llmRequest5);
     blockManager.releaseSequence(seq5.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1006,6 +1020,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 1);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - 1);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest6);
     blockManager.releaseBlocks(seq6, llmRequest6);
     blockManager.releaseSequence(seq6.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1080,6 +1095,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 0, 1, 2 are stored for reuse (block 2 contains [(2, 0), (3, 0)])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1109,6 +1125,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // block 3 matches block 2 and will be freed
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1156,11 +1173,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks + 1);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 2 is stored for reuse (block contains [(2, 0), (3, 0), (4, 0)])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1218,7 +1237,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks * 2);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq2.getRequestId());
     blockManager.releaseSequence(seq3.getRequestId());
@@ -1303,6 +1324,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // Block 0: [100, 101, 102, 103] ← Contains multimodal (102, 103)
     // Block 1: [104, 105, 0, 1]     ← Contains multimodal (104, 105)
     // Block 2: [2, 3, 4]            ← No multimodal
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1331,6 +1353,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // block 3 matches block 2 and will be freed
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1402,7 +1425,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
     // clean up
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq2.getRequestId());
     blockManager.releaseSequence(seq3.getRequestId());
@@ -1474,6 +1499,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // store blocks 0, 1, 2 for reuse ([0,1,2,3], [4,5,6,7], [8,9])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1501,6 +1527,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // store block 3 for reuse ([8,9])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1547,11 +1574,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
     // store block 4 for reuse ([8])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 2 is stored for reuse (block contains [8, 9]). nb! Last token of last block is not stored
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1581,6 +1610,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // store blocks 5, 6, 7 for reuse ([0,1,2,3], [4,5,6,7], [8]) with loraTaskId 1
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq2.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1609,6 +1639,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // store block 7 for reuse ([8,9]) with loraTaskId 1
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1639,6 +1670,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 8 is stored with [4] and loraTaskId 0
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4, llmRequest4);
     blockManager.releaseSequence(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1664,6 +1696,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 9, 10, 11 are stored without loraTaskId
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest5);
     blockManager.releaseBlocks(seq5, llmRequest5);
     blockManager.releaseSequence(seq5.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1738,6 +1771,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 0, 1, 2 are stored for reuse (block 2 contains [(2, 0), (3, 0)] with loraTaskId 1)
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1768,6 +1802,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 3, 4, 5 are stored for reuse (block 5 contains [(2, 0), (3, 0)] with loraTaskId 2)
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1815,10 +1850,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks * 2);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1901,8 +1938,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks * 3);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 3);
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4, llmRequest4);
     blockManager.releaseSequence(seq2.getRequestId());
     blockManager.releaseSequence(seq3.getRequestId());
@@ -1985,6 +2025,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // Release blocks to make them available for reuse
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2019,6 +2060,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // Release blocks
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2052,6 +2094,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // Release blocks
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq2.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2114,7 +2157,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
     // Clean up
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4, llmRequest4);
     blockManager.releaseSequence(seq3.getRequestId());
     blockManager.releaseSequence(seq4.getRequestId());

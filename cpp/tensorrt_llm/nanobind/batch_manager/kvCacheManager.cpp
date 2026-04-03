@@ -67,7 +67,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 30);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 31);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -248,6 +248,11 @@ public:
     void flushIterationEvents() override
     {
         NB_OVERRIDE_PURE(flushIterationEvents);
+    }
+
+    void simulatePrefillCompletionOnlyUseForTesting(tb::LlmRequest& llmRequest) const override
+    {
+        NB_OVERRIDE_PURE(simulatePrefillCompletionOnlyUseForTesting, llmRequest);
     }
 };
 
@@ -491,7 +496,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, nb::call_guard<nb::gil_scoped_release>())
         .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>())
-        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>());
+        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>())
+        .def("simulate_prefill_completion_only_use_for_testing",
+            &BaseKVCacheManager::simulatePrefillCompletionOnlyUseForTesting, nb::arg("llm_request"),
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })
