@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 
 """Slimmed down PyTorch NemotronH model implementation.
 
@@ -616,6 +616,9 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
     def set_input_embeddings(self, new_embeddings):
         return self.backbone.set_input_embeddings(new_embeddings)
 
+    def get_final_normalization(self):
+        return self.backbone.norm_f
+
     def get_output_embeddings(self):
         return self.lm_head
 
@@ -638,3 +641,128 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
 
 
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
+
+
+# =============================================================================
+# Eagle Layer Builder for NemotronH MTP (Multi-Token Prediction)
+# =============================================================================
+
+
+class NemotronHEagleLayer(nn.Module):
+    """Eagle layer for NemotronH models.
+
+    NemotronH does not use RoPE, so position_ids is accepted but ignored.
+    The layer implements the MTP (Multi-Token Prediction) architecture:
+    - First layer fuses embeds + hidden_states via start projections (enorm, hnorm, eh_proj)
+    - All layers have pre-norm residual block with mixer (Attention or MoE)
+    - Last layer applies final_layernorm
+
+    Supported layers are * (Attention with start projections) and E (MoE with final_layernorm)
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        layer_type: str,
+        has_start_projections: bool,
+        has_end_norm: bool,
+    ):
+        super().__init__()
+        eps = getattr(config, "layer_norm_epsilon")
+        if eps is None:
+            raise ValueError("layer_norm_epsilon is not set in the config")
+        self.residual_in_fp32 = config.residual_in_fp32
+        self.has_start_projections = has_start_projections
+        self.has_end_norm = has_end_norm
+
+        # Start projections (only on first layer)
+        # These fuse embeds + hidden_states: eh_proj(cat(enorm(embeds), hnorm(hidden)))
+        if has_start_projections:
+            self.enorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+            self.hnorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+            self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+
+        # Pre-layer norm
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+
+        # Mixer based on layer type
+        if layer_type == "*":
+            self.mixer = NemotronHAttention(config, layer_idx=layer_idx)
+        elif layer_type == "E":
+            self.mixer = NemotronHMOE(config, layer_idx=layer_idx)
+        else:
+            raise ValueError(
+                f"Unsupported MTP layer type in NemotronHEagleLayer. Only * and E are currently supported."
+                f"Layer type: {layer_type}"
+            )
+
+        # Final norm (only on last layer)
+        if has_end_norm:
+            self.final_layernorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Forward pass with unified Eagle interface.
+
+        Args:
+            hidden_states: Hidden states from target model [batch, seq, hidden_size]
+            inputs_embeds: Token embeddings [batch, seq, hidden_size]
+            position_ids: Position IDs (ignored - NemotronH doesn't use RoPE)
+
+        Returns:
+            Updated hidden states [batch, seq, hidden_size]
+        """
+        # Note: position_ids is ignored - NemotronH doesn't use RoPE
+
+        # Fuse embeddings and hidden states (first layer only)
+        if self.has_start_projections:
+            e_normed = self.enorm(inputs_embeds)
+            h_normed = self.hnorm(hidden_states)
+            hidden_states = self.eh_proj(torch.cat([e_normed, h_normed], dim=-1))
+
+        # Standard pre-norm residual block
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
+        if self.residual_in_fp32:
+            residual = residual.to(torch.float32)
+        hidden_states = self.mixer(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # Final layer norm (last layer only)
+        if self.has_end_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states
+
+
+def build_nemotron_eagle_layers(config) -> list[nn.Module]:
+    """Build NemotronH MTP layers for Eagle drafter.
+
+    This function is called by get_eagle_layers() in modeling_eagle.py.
+
+    Args:
+        config: Model configuration with NemotronH-specific parameters
+                (mtp_hybrid_override_pattern, n_routed_experts, etc.)
+
+    Returns:
+        List of NemotronHEagleLayer instances
+    """
+    pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+    if pattern is None:
+        raise ValueError("mtp_hybrid_override_pattern is not set in the config")
+
+    return [
+        NemotronHEagleLayer(
+            config,
+            layer_idx=i,
+            layer_type=char,
+            has_start_projections=(i == 0),
+            has_end_norm=(i == len(pattern) - 1),
+        )
+        for i, char in enumerate(pattern)
+    ]
