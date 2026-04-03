@@ -549,16 +549,20 @@ class Qwen2_5_VLVisionAttention(Attention):
             head_dim=config.hidden_size // config.num_heads,
         )
 
-    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
-                   v: Optional[torch.Tensor], position_ids: torch.IntTensor,
-                   position_embeddings: Tuple[torch.Tensor, torch.Tensor]):
+    def apply_rope(self,
+                   q: torch.Tensor,
+                   k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor],
+                   position_ids: Optional[torch.IntTensor] = None,
+                   position_embeddings: Optional[Tuple[torch.Tensor,
+                                                       torch.Tensor]] = None):
         seq_len, _ = q.size()
         cos, sin = position_embeddings
 
         # FlashInfer fused RoPE assumes head_size is a multiple of 64 (see
         # auto_deploy custom op rope docs / flashinfer tests). Qwen2.5-VL vision
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
-        if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0:
+        if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
                 from ..custom_ops import \
                     flashinfer_apply_rope_with_cos_sin_cache_inplace
@@ -605,10 +609,10 @@ class Qwen2_5_VLVisionAttention(Attention):
 
     def forward(
         self,
-        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        position_ids: Optional[torch.IntTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         # NOTE: Qwen2.5-VL vision attention needs a custom forward: the generic
@@ -673,10 +677,9 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
     @torch.inference_mode()
     def forward(
         self,
-        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -684,10 +687,9 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
         hidden_states = residual + self.attn(
-            position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            rotary_pos_emb=rotary_pos_emb,
+            position_ids=position_ids,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -893,19 +895,19 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
         return cos_thw, sin_thw, window_index_thw, tuple(seq_lens_thw)
 
-    def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
-        batch_size = 1  # NOTE: Qwen2/2.5-VL concats all the pixel_values into a single tensor, so batch_size is 1
-        prompt_lens = seq_lens
-        seq_lens = torch.tensor(seq_lens,
-                                dtype=torch.int,
-                                pin_memory=prefer_pinned())
+    def prepare_attn_metadata(self, batch_size: int, seq_lens: List[int],
+                              attn_metadata: AttentionMetadata):
+        batch_size = len(seq_lens)
+        seq_lens_torch = torch.tensor(seq_lens,
+                                      dtype=torch.int,
+                                      pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.num_contexts = len(seq_lens)
         attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = prompt_lens
-        attn_metadata.seq_lens = seq_lens
-        attn_metadata.max_seq_len = seq_lens.max().item()
+        attn_metadata.prompt_lens = seq_lens
+        attn_metadata.seq_lens = seq_lens_torch
+        attn_metadata.max_seq_len = max(seq_lens)
         attn_metadata.prepare()
         return attn_metadata
 
@@ -955,10 +957,11 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         hidden_states = hidden_states[window_index, :, :].reshape(seq_len, -1)
 
-        full_attn_metadata = self.prepare_attn_metadata(seq_lens,
+        full_attn_metadata = self.prepare_attn_metadata(len(grid_rows),
+                                                        seq_lens,
                                                         self.full_attn_metadata)
         window_attn_metadata = self.prepare_attn_metadata(
-            window_seq_lens, self.window_attn_metadata)
+            len(grid_rows), window_seq_lens, self.window_attn_metadata)
 
         for layer_num, block in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
@@ -966,10 +969,10 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             else:
                 attn_metadata = window_attn_metadata
             hidden_states = block(
-                position_ids=rope_position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 position_embeddings=position_embeddings,
+                position_ids=rope_position_ids,
             )
         hidden_states = self.merger(hidden_states)
         hidden_states = hidden_states[reverse_indices, :]
