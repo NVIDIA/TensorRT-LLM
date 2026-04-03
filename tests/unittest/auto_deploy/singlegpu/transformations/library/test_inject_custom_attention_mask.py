@@ -200,10 +200,16 @@ def test_inject_gemma4_custom_attention_mask_for_torch_backend():
         for node in attn_nodes
     )
 
-    expected_mask = _build_token_type_mask(token_type_ids)
-    expected = model.forward_with_mask(input_ids, expected_mask)
-    actual = gm_transformed(input_ids, position_ids, token_type_ids=token_type_ids)
+    # With outside-graph approach, the graph receives the finished mask, not token_type_ids.
+    custom_attn_mask = _build_token_type_mask(token_type_ids)
+    expected = model.forward_with_mask(input_ids, custom_attn_mask)
+    actual = gm_transformed(input_ids, position_ids, custom_attn_mask=custom_attn_mask)
     torch.testing.assert_close(actual, expected)
+
+    # Verify None mask produces standard causal output
+    actual_none = gm_transformed(input_ids, position_ids, custom_attn_mask=None)
+    expected_none = model(input_ids, position_ids)
+    torch.testing.assert_close(actual_none, expected_none)
 
 
 @torch.inference_mode()
@@ -235,7 +241,8 @@ def test_inject_gemma4_custom_attention_mask_for_triton_paged_backend():
         for node in attn_nodes
     )
 
-    expected_mask = _build_token_type_mask(token_type_ids)
-    expected = model.forward_with_mask(input_ids, expected_mask)
-    actual = gm_transformed(input_ids, position_ids, token_type_ids=token_type_ids)
+    # With outside-graph approach, the graph receives the finished mask, not token_type_ids.
+    custom_attn_mask = _build_token_type_mask(token_type_ids)
+    expected = model.forward_with_mask(input_ids, custom_attn_mask)
+    actual = gm_transformed(input_ids, position_ids, custom_attn_mask=custom_attn_mask)
     torch.testing.assert_close(actual, expected)

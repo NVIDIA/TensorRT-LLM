@@ -873,6 +873,43 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model.get_decoder()
 
+    @staticmethod
+    def _build_attention_mask(token_type_ids: torch.Tensor) -> torch.Tensor:
+        """Build a bool attention mask from ``token_type_ids``.
+
+        Returns a ``[batch, 1, seq, seq]`` bool mask that is causal for text
+        tokens and bidirectional within contiguous media blobs.
+        """
+        batch_size, seq_len = token_type_ids.shape
+        device = token_type_ids.device
+
+        # Identify non-text tokens and detect blob boundaries
+        non_text = token_type_ids.ne(0)
+        prev = torch.cat(
+            [
+                torch.zeros(batch_size, 1, dtype=token_type_ids.dtype, device=device),
+                token_type_ids[:, :-1],
+            ],
+            dim=1,
+        )
+        blob_starts = non_text & token_type_ids.ne(prev)
+        blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+        token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+
+        # Bidirectional within same media blob
+        blob_q = token_blob_ids.unsqueeze(2)  # [B, S, 1]
+        blob_k = token_blob_ids.unsqueeze(1)  # [B, 1, S]
+        bidirectional_media = (blob_q == blob_k) & (blob_q != 0)
+
+        # Standard causal mask
+        positions = torch.arange(seq_len, device=device)
+        causal_mask = positions.unsqueeze(0) <= positions.unsqueeze(1)  # [S, S]
+        causal_mask = causal_mask.unsqueeze(0)  # [1, S, S]
+
+        # Combine: causal OR bidirectional-within-blob
+        combined = causal_mask | bidirectional_media  # [B, S, S]
+        return combined.unsqueeze(1)  # [B, 1, S, S]
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -880,14 +917,14 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4ConditionalOutput:
-        # Ensure token_type_ids is always present for the custom attention mask.
-        # Text-only / decode / warmup steps won't have it in named_args.
-        if "token_type_ids" not in kwargs:
-            ref = input_ids if input_ids is not None else inputs_embeds
-            if ref is not None:
-                kwargs["token_type_ids"] = torch.zeros(
-                    ref.shape[0], ref.shape[1], dtype=torch.int64, device=ref.device
-                )
+        # Compute custom attention mask from token_type_ids outside the graph.
+        # Pass None during warmup / text-only / decode so the attention backend
+        # uses its fast causal kernel instead of the per-sequence fallback.
+        token_type_ids = kwargs.pop("token_type_ids", None)
+        if token_type_ids is not None and token_type_ids.any():
+            kwargs["custom_attn_mask"] = self._build_attention_mask(token_type_ids)
+        else:
+            kwargs["custom_attn_mask"] = None
 
         outputs = self.model.language_model(
             input_ids=input_ids,
