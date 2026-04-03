@@ -387,6 +387,7 @@ class CompletionRequest(OpenAIBaseModel):
     )
     stream_interval: Optional[int] = Field(
         default=None,
+        gt=0,
         description=(
             "The iteration interval to create responses under the streaming mode. "
             "If not set, the engine-level default is used."),
@@ -756,6 +757,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
          ))
     stream_interval: Optional[int] = Field(
         default=None,
+        gt=0,
         description=(
             "The iteration interval to create responses under the streaming mode. "
             "If not set, the engine-level default is used."),
@@ -913,6 +915,7 @@ class ResponsesRequest(OpenAIBaseModel):
     user: Optional[str] = None
     stream_interval: Optional[int] = Field(
         default=None,
+        gt=0,
         description=(
             "The iteration interval to create responses under the streaming mode. "
             "If not set, the engine-level default is used."),

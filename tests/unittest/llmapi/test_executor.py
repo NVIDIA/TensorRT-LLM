@@ -189,8 +189,13 @@ def test_stream_interval_validation():
 
 
 def test_stream_interval_openai_protocol():
-    from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                     CompletionRequest)
+    from pydantic import ValidationError
+
+    from tensorrt_llm.serve.openai_protocol import (
+        ChatCompletionRequest,
+        CompletionRequest,
+        ResponsesRequest,
+    )
 
     # CompletionRequest: valid stream_interval passes through
     req = CompletionRequest(model="m", prompt="hi", stream_interval=5)
@@ -202,10 +207,11 @@ def test_stream_interval_openai_protocol():
     sp = req.to_sampling_params()
     assert sp.stream_interval is None
 
-    # CompletionRequest: invalid stream_interval is caught
-    req = CompletionRequest(model="m", prompt="hi", stream_interval=-1)
-    with pytest.raises(ValueError, match="stream_interval"):
-        req.to_sampling_params()
+    # CompletionRequest: invalid stream_interval rejected at construction
+    with pytest.raises(ValidationError, match="stream_interval"):
+        CompletionRequest(model="m", prompt="hi", stream_interval=-1)
+    with pytest.raises(ValidationError, match="stream_interval"):
+        CompletionRequest(model="m", prompt="hi", stream_interval=0)
 
     # ChatCompletionRequest: valid stream_interval passes through
     req = ChatCompletionRequest(model="m",
@@ -217,15 +223,28 @@ def test_stream_interval_openai_protocol():
     sp = req.to_sampling_params()
     assert sp.stream_interval == 10
 
-    # ChatCompletionRequest: invalid stream_interval is caught
-    req = ChatCompletionRequest(model="m",
-                                messages=[{
-                                    "role": "user",
-                                    "content": "hi"
-                                }],
-                                stream_interval=0)
-    with pytest.raises(ValueError, match="stream_interval"):
-        req.to_sampling_params()
+    # ChatCompletionRequest: invalid stream_interval rejected at construction
+    with pytest.raises(ValidationError, match="stream_interval"):
+        ChatCompletionRequest(model="m",
+                              messages=[{
+                                  "role": "user",
+                                  "content": "hi"
+                              }],
+                              stream_interval=0)
+
+    # ResponsesRequest: valid stream_interval passes through
+    req = ResponsesRequest(model="m", input="hi", stream_interval=5)
+    sp = req.to_sampling_params()
+    assert sp.stream_interval == 5
+
+    # ResponsesRequest: None leaves stream_interval unset
+    req = ResponsesRequest(model="m", input="hi")
+    sp = req.to_sampling_params()
+    assert sp.stream_interval is None
+
+    # ResponsesRequest: invalid stream_interval rejected at construction
+    with pytest.raises(ValidationError, match="stream_interval"):
+        ResponsesRequest(model="m", input="hi", stream_interval=-1)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,
