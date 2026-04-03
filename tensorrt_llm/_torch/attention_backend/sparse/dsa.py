@@ -1392,34 +1392,18 @@ class Indexer(nn.Module):
         if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
             return
 
-        # [num_blocks, block_size, 1, per_token_size ]
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
 
         num_tokens = k_fp8.shape[0]
-        head_dim = k_fp8.shape[1]
-        scale_size = k_scale.shape[1] * 4  # Convert to bytes (float32 = 4 bytes)
 
-        # Convert to bytes: flatten first, then view as uint8, then reshape
-        k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(
-            num_tokens, head_dim)
-
-        # k_scale: for single-element tensors, contiguous() may be no-op
-        # Fix stride(-1) for byte-level view
-        k_scale_flat = k_scale.view(-1)
-        if k_scale_flat.stride(-1) != 1:
-            k_scale_flat = torch.as_strided(k_scale_flat.contiguous(),
-                                            size=(k_scale_flat.numel(), ),
-                                            stride=(1, ))
-        k_scale_bytes = k_scale_flat.view(torch.uint8).view(
-            num_tokens, scale_size)
-
-        # Use CUDA kernel to scatter FP8 and scale bytes into cache
-        flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
-        flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
-        torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
-                                                    k_cache, flat_indices_fp8,
-                                                    flat_indices_scale)
+        # The C++ op reinterprets k_fp8 (FP8) and k_scale (float32) as raw
+        # bytes internally and only reads the first num_tokens entries from
+        # the slot mapping buffers, avoiding Python-side view/slice overhead.
+        torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache,
+                                                    metadata.slot_mapping_fp8,
+                                                    metadata.slot_mapping_scale,
+                                                    num_tokens)
 
     def sparse_attn_indexer(
         self,
