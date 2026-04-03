@@ -2,7 +2,6 @@ import copy
 import dataclasses
 from typing import Any, Dict, List, Tuple
 
-import math
 import torch
 import torchvision
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
@@ -371,7 +370,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
         self._model_path = model_path
-        if model_type in ("mistral_large_3", "mistral3"):
+        if model_type == "mistral_large_3":
             # For mistral large 3, we add chat template in the model forward, and the
             # MistralCommonImageProcessor is used to process the input when both text and images are provided.
             # When the input only contains text, we use the text processor to process the input.
@@ -507,7 +506,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
     def load_tokenizer(model_path: str,
                        config: PretrainedConfig,
                        tokenizer: AutoTokenizer | None = None):
-        if getattr(config, "input_processor_type", None) == "mistral_large_3":
+        if getattr(config, "input_processor_type", None) in ("mistral_large_3"):
             try:
                 return MistralTokenizer.from_pretrained(model_path)
 
