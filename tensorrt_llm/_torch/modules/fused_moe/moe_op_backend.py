@@ -25,8 +25,100 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
+from ...utils import ActType_TrtllmGen
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
+
+
+if triton is not None:
+
+    @triton.jit
+    def pack_topk_ids_kernel(
+        expert_ids_ptr,
+        expert_weights_ptr,
+        output_ptr,
+        local_expert_offset,
+        stride_ids_row,
+        stride_ids_col,
+        stride_weights_row,
+        stride_weights_col,
+        n_rows,
+        n_cols,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        linear_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        row_idx = linear_idx // n_cols
+        col_idx = linear_idx % n_cols
+
+        mask = linear_idx < (n_rows * n_cols)
+
+        ids_offset = row_idx * stride_ids_row + col_idx * stride_ids_col
+        weights_offset = row_idx * stride_weights_row + col_idx * stride_weights_col
+
+        expert_ids = tl.load(expert_ids_ptr + ids_offset, mask=mask)
+        local_ids = expert_ids - local_expert_offset
+
+        expert_weights = tl.load(expert_weights_ptr + weights_offset, mask=mask)
+        expert_weights_bf16 = expert_weights.to(tl.bfloat16)
+        expert_weights_int16 = expert_weights_bf16.to(tl.int16, bitcast=True)
+        expert_weights_int32 = expert_weights_int16.to(tl.int32) & 0xFFFF
+
+        packed_topk_ids = (local_ids.to(tl.int32) << 16) | expert_weights_int32
+        tl.store(output_ptr + linear_idx, packed_topk_ids, mask=mask)
+
+
+def pack_topk_ids(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    local_expert_offset: int,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Pack expert ids and routing weights into TRTLLM-Gen's routed MoE format."""
+    if topk_ids.ndim != 2 or topk_weights.ndim != 2:
+        raise ValueError("Expected 2D top-k ids and weights tensors.")
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            f"Mismatched top-k ids and weights shapes: {topk_ids.shape} vs {topk_weights.shape}."
+        )
+
+    if output is None:
+        output = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+
+    # Fallback to CPU just in case
+    if triton is None or not topk_ids.is_cuda or not topk_weights.is_cuda:
+        packed_topk_ids = ((topk_ids.to(torch.int32) - local_expert_offset) << 16) | (
+            topk_weights.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+        )
+        output.copy_(packed_topk_ids)
+        return output
+
+    n_rows, n_cols = topk_ids.shape
+    n_elements = n_rows * n_cols
+    block_size = 1024
+    grid = (triton.cdiv(n_elements, block_size),)
+
+    pack_topk_ids_kernel[grid](
+        topk_ids,
+        topk_weights,
+        output,
+        local_expert_offset,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        n_rows,
+        n_cols,
+        BLOCK_SIZE=block_size,
+    )
+    return output
 
 
 def register_op_backend(name: str):
@@ -162,6 +254,35 @@ class MoEOpBackend:
         tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation."""
+        raise NotImplementedError
+
+    def run_bf16_moe(
+        self,
+        router_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        gated_act_type: int = 0,
+        output: Optional[torch.Tensor] = None,
+        use_shuffled_weight: bool = False,
+        weight_layout: int = 0,
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
+    ) -> torch.Tensor:
+        """Run BF16 MoE computation."""
         raise NotImplementedError
 
 
@@ -405,6 +526,37 @@ class TRTLLMOpBackend(MoEOpBackend):
                 output=output,
             )
 
+    def run_bf16_moe(
+        self,
+        router_logits,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        topk_weights=None,
+        topk_ids=None,
+        gated_act_type=0,
+        output=None,
+        use_shuffled_weight=False,
+        weight_layout=0,
+        do_finalize=True,
+        enable_pdl=None,
+        tune_max_num_tokens=8192,
+    ):
+        raise NotImplementedError(
+            "TRTLLM native op backend does not support unquantized BF16 TRTLLM-Gen fused MoE. "
+            "Enable FlashInfer fused MoE for TRTLLM backend."
+        )
+
 
 # ==================== Flashinfer Backend ====================
 @register_op_backend("flashinfer")
@@ -545,7 +697,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
+            packed_topk_ids = pack_topk_ids(topk_ids, topk_weights, local_expert_offset)
             # Run with pre-computed routing (packed format)
             return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
                 topk_ids=packed_topk_ids,
@@ -645,9 +797,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
-                torch.int16
-            )
+            packed_tensor = pack_topk_ids(topk_ids, topk_weights, local_expert_offset)
             outputs = self._fused_moe.trtllm_fp4_block_scale_routed_moe(
                 packed_tensor,
                 routing_bias,
@@ -689,3 +839,85 @@ class FlashinferOpBackend(MoEOpBackend):
         else:
             final_hidden_states = outputs[0]
             return final_hidden_states
+
+    def run_bf16_moe(
+        self,
+        router_logits,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        topk_weights=None,
+        topk_ids=None,
+        gated_act_type=0,
+        output=None,
+        use_shuffled_weight=False,
+        weight_layout=0,
+        do_finalize=True,
+        enable_pdl=None,
+        tune_max_num_tokens=8192,
+    ):
+        # FlashInfer BF16 MoE does not expose an activation_type argument.
+        # TRTLLMGen constrains the BF16 path to Swiglu, so reject anything
+        # else here instead of silently calling a mismatched kernel.
+        if gated_act_type != ActType_TrtllmGen.SwiGlu:
+            raise ValueError("FlashInfer BF16 fused MoE only supports Swiglu activation.")
+
+        if router_logits is not None:
+            result = self._fused_moe.trtllm_bf16_moe(
+                routing_logits=router_logits,
+                routing_bias=routing_bias,
+                hidden_states=hidden_states,
+                gemm1_weights=gemm1_weights,
+                gemm2_weights=gemm2_weights,
+                num_experts=num_experts,
+                top_k=top_k,
+                n_group=n_group,
+                topk_group=topk_group,
+                intermediate_size=intermediate_size,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=local_num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.cvt_routing_method_type(routing_method_type),
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                do_finalize=do_finalize,
+                enable_pdl=enable_pdl,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
+        else:
+            packed_topk_ids = pack_topk_ids(topk_ids, topk_weights, local_expert_offset)
+            result = self._fused_moe.trtllm_bf16_routed_moe(
+                packed_topk_ids,
+                hidden_states,
+                gemm1_weights,
+                gemm2_weights,
+                num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                intermediate_size,
+                local_expert_offset,
+                local_num_experts,
+                routed_scaling_factor,
+                self.cvt_routing_method_type(routing_method_type),
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                do_finalize=do_finalize,
+                enable_pdl=enable_pdl,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
+
+        if output is not None and do_finalize:
+            output.copy_(result)
+            return output
+        return result
