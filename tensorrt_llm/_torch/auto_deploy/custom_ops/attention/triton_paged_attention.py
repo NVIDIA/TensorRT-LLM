@@ -941,6 +941,64 @@ def triton_paged_context(
     return output
 
 
+def _gather_paged_kv_for_sequence(
+    kv_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    seq_idx: int,
+    seq_kv_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather one sequence's paged KV cache into contiguous tensors in BSND layout."""
+    page_start = int(kv_indptr[seq_idx].item())
+    page_end = int(kv_indptr[seq_idx + 1].item())
+    page_ids = kv_indices[page_start:page_end].to(dtype=torch.long)
+
+    gathered = kv_cache.index_select(0, page_ids)
+    gathered = gathered.permute(1, 0, 3, 2, 4).reshape(2, -1, kv_cache.shape[2], kv_cache.shape[4])
+    gathered = gathered[:, :seq_kv_len]
+    return gathered[0], gathered[1]
+
+
+def triton_paged_context_with_custom_mask(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
+    custom_attn_mask: torch.Tensor,
+    sm_scale: float,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Prefill fallback for backend-native custom bool masks."""
+    output = out if out is not None else torch.empty_like(q)
+    num_seq = qo_indptr.shape[0] - 1
+
+    for seq_idx in range(num_seq):
+        q_start = int(qo_indptr[seq_idx].item())
+        q_end = int(qo_indptr[seq_idx + 1].item())
+        q_seq = q[q_start:q_end]
+        seq_q_len = q_end - q_start
+        seq_kv_len = int(seq_len_with_cache[seq_idx].item())
+        k_seq, v_seq = _gather_paged_kv_for_sequence(
+            kv_cache, kv_indices, kv_indptr, seq_idx, seq_kv_len
+        )
+        mask_seq = custom_attn_mask[seq_idx : seq_idx + 1, :, :seq_q_len, :seq_kv_len]
+        output[q_start:q_end].copy_(
+            torch.ops.auto_deploy.torch_attention(
+                q_seq.unsqueeze(0),
+                k_seq.unsqueeze(0),
+                v_seq.unsqueeze(0),
+                attn_mask=mask_seq,
+                is_causal=False,
+                scale=sm_scale,
+                layout="bsnd",
+            )[0]
+        )
+
+    return output
+
+
 @torch.library.custom_op("auto_deploy::triton_paged_prepare_metadata", mutates_args=())
 def prepare_triton_paged_metadata(
     position_ids: torch.Tensor,
@@ -999,8 +1057,9 @@ def triton_paged_mha_with_cache(
     triton_positions: torch.Tensor,
     # CACHES - combined KV cache
     kv_cache: torch.Tensor,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     # CONSTANTS
-    scale: Optional[float],
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Triton paged attention with mixed batch support."""
     head_dim = kv_cache.shape[-1]
@@ -1037,17 +1096,30 @@ def triton_paged_mha_with_cache(
     if num_prefill > 0:
         cu_seqlen = cu_seqlen_host[: num_prefill + 1].to(q.device, non_blocking=True)
         seq_len_with_cache = seq_len_with_cache_host[:num_prefill].to(q.device, non_blocking=True)
-        triton_paged_context(
-            q[:num_prefill_tokens],
-            kv_cache,
-            cu_seqlen,
-            cu_num_pages[: num_prefill + 1],
-            cache_loc,
-            last_page_len[:num_prefill],
-            seq_len_with_cache,
-            sm_scale,
-            out=y[:num_prefill_tokens],
-        )
+        if custom_attn_mask is None:
+            triton_paged_context(
+                q[:num_prefill_tokens],
+                kv_cache,
+                cu_seqlen,
+                cu_num_pages[: num_prefill + 1],
+                cache_loc,
+                last_page_len[:num_prefill],
+                seq_len_with_cache,
+                sm_scale,
+                out=y[:num_prefill_tokens],
+            )
+        else:
+            triton_paged_context_with_custom_mask(
+                q[:num_prefill_tokens],
+                kv_cache,
+                cu_seqlen,
+                cu_num_pages[: num_prefill + 1],
+                cache_loc,
+                seq_len_with_cache,
+                custom_attn_mask[:num_prefill],
+                sm_scale,
+                out=y[:num_prefill_tokens],
+            )
 
     # Process decode tokens if any
     if num_decode > 0:
@@ -1080,7 +1152,8 @@ def triton_paged_mha_with_cache_fake(
     triton_batch_indices: torch.Tensor,
     triton_positions: torch.Tensor,
     kv_cache: torch.Tensor,
-    scale: Optional[float],
+    custom_attn_mask: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 
@@ -1150,6 +1223,10 @@ class TritonPagedAttention(AttentionDescriptor):
         }
 
     @classmethod
+    def get_dynamic_inputs(cls, source_attn_node: Node) -> List[Optional[Node]]:
+        return list(extract_op_args(source_attn_node, "attn_mask"))
+
+    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         layout = source_attn_node.kwargs.get("layout", None)
         if (
@@ -1167,7 +1244,7 @@ class TritonPagedAttention(AttentionDescriptor):
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
-        if attn_mask is not None or dropout_p != 0.0 or not is_causal:
+        if dropout_p != 0.0 or not is_causal:
             ad_logger.debug(
                 "Unsupported attention arguments for "
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
