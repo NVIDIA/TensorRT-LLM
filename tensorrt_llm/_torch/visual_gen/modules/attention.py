@@ -86,8 +86,6 @@ class Attention(nn.Module):
 
         self._init_qkv_proj()
 
-        attention_metadata_state = getattr(config, "attention_metadata_state", None)
-
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
             # "per_head": norm over each head independently (e.g. FLUX, dim=head_dim)
@@ -134,8 +132,6 @@ class Attention(nn.Module):
             num_kv_heads=backend_num_kv_heads,
             quant_config=self.quant_config,
             dtype=self.dtype,
-            attention_config=config.attention,
-            attention_metadata_state=attention_metadata_state,
         )
 
         # Wrap with parallelism strategy (orthogonal to backend choice)
@@ -229,12 +225,13 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: Optional[int] = None,
-        seq_len: Optional[int] = None,
-        kv_seq_len: Optional[int] = None,
+        **kwargs,
     ) -> torch.Tensor:
         """
         Call attention backend with appropriate tensor layout.
+
+        Dimensions are derived from tensor shapes. Extra ``**kwargs``
+        (e.g. ``attention_mask``) are forwarded to the backend.
 
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
@@ -242,9 +239,7 @@ class Attention(nn.Module):
         """
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
-        batch_size = batch_size or q.shape[0]
-        seq_len = seq_len or q.shape[1]
-        kv_seq_len = kv_seq_len or k.shape[1]
+        batch_size = q.shape[0]
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:
@@ -256,15 +251,7 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
 
-        # Call backend
-        out = self.attn.forward(
-            q=q,
-            k=k,
-            v=v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            seq_len_kv=kv_seq_len if kv_seq_len != seq_len else None,
-        )
+        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:
@@ -297,6 +284,6 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v, batch_size, seq_len, kv_seq_len)
+        out = self._attn_impl(q, k, v)
         out = self.to_out[0](out)
         return out
