@@ -9,9 +9,9 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .flash_mla import forward_sparse_mla_kvcache_bf16, should_use_short_mha
 from .indexer import Indexer, transform_local_topk_and_prepare_pool_view
 from .metadata import DSAtrtllmAttentionMetadata
-from .sparse_forward import forward_sparse_mla_kvcache_bf16, should_use_short_mha
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig

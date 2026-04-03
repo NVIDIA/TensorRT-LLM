@@ -669,7 +669,7 @@ def test_chunked_context_rejects_when_kv_exceeds_threshold():
     pos_c2 = torch.arange(cached_per_seq[0], total_per_seq[0], device=device, dtype=torch.int32)
 
     # max_ctx_kv_len (96) > threshold (80) -> short MHA should NOT be used.
-    from tensorrt_llm._torch.attention_backend.sparse.dsa.sparse_forward import should_use_short_mha
+    from tensorrt_llm._torch.attention_backend.sparse.dsa.flash_mla import should_use_short_mha
 
     assert not should_use_short_mha(mla, meta_c2, pos_c2)
 
