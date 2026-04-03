@@ -589,7 +589,7 @@ class LTX2Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     def post_load_weights(self) -> None:
-        """Finalize after weight loading: TeaCache, derived attributes."""
+        """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
         # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
@@ -599,6 +599,10 @@ class LTX2Pipeline(BasePipeline):
         #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
         # )
         # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+
+        # Cache-DiT
+        if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
+            self._setup_cache_acceleration(self.transformer, coefficients=None)
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width

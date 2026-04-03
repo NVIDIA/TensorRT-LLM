@@ -31,9 +31,10 @@ except ImportError:
     ParamsModifier = None  # type: ignore[assignment, misc]
     TaylorSeerCalibratorConfig = None  # type: ignore[assignment, misc]
 
-# Batched CFG on Wan (2.1 and 2.2): default enable_separate_cfg False (single cond+uncond batch).
+# Batched CFG: default enable_separate_cfg False (single cond+uncond batch).
 _WAN_CFG_DEFAULT = False
 _FLUX_CFG_DEFAULT = False
+_LTX2_CFG_DEFAULT = False
 
 # Wan 2.2 dual-transformer: stricter caps on the low-noise expert stack (second ParamsModifier).
 _WAN22_LOW_NOISE_MAX_WARMUP_STEPS = 2
@@ -329,11 +330,74 @@ def enable_cache_dit_for_flux(
     )
 
 
+def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> CacheDiTEnableResult:
+    """Native LTX-2: Pattern_0 passes video latents and audio latents.
+
+    Second arg uses cache-dit encoder_hidden_states slot.
+    """
+    if (
+        cache_dit is None
+        or BlockAdapter is None
+        or ForwardPattern is None
+        or ParamsModifier is None
+    ):
+        raise RuntimeError(
+            "cache_dit package is not installed. Install the cache-dit distribution "
+            "for your environment (see https://github.com/vipshop/cache-dit)."
+        )
+
+    calibrator = _maybe_calibrator(cache_dit_cfg)
+    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _LTX2_CFG_DEFAULT)
+    db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=separate)
+
+    if calibrator is not None:
+        logger.info(f"TaylorSeer enabled with order={cache_dit_cfg.taylorseer_order}")
+        modifier = ParamsModifier(cache_config=db_cfg, calibrator_config=calibrator)
+    else:
+        modifier = ParamsModifier(cache_config=db_cfg)
+
+    transformer = pipeline.transformer
+    adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_0],
+        params_modifiers=[modifier],
+        check_forward_pattern=False,
+    )
+
+    logger.info(
+        f"Cache-DiT: LTX2 — Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
+        f"W={db_cfg.max_warmup_steps}, R={cache_dit_cfg.residual_diff_threshold:.3f}",
+    )
+
+    disable_target = cache_dit.enable_cache(
+        adapter,
+        cache_config=db_cfg,
+        calibrator_config=calibrator,
+    )
+
+    def refresh_ltx2(num_inference_steps: int) -> None:
+        _refresh_ctx(
+            cache_dit,
+            transformer,
+            cache_dit_cfg,
+            num_inference_steps,
+            False,
+        )
+
+    return CacheDiTEnableResult(
+        refresh=refresh_ltx2,
+        disable_target=disable_target,
+        summary_modules=[transformer],
+    )
+
+
 CUSTOM_CACHE_DIT_ENABLERS = {
     "WanPipeline": enable_cache_dit_for_wan,
     "WanImageToVideoPipeline": enable_cache_dit_for_wan,
     "FluxPipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=False),
     "Flux2Pipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=True),
+    "LTX2Pipeline": enable_cache_dit_for_ltx2,
 }
 
 
