@@ -500,7 +500,7 @@ executor::ExecutorConfig ModelInstanceState::getExecutorConfigFromParams()
     {
     }
 
-    bool normalizeLogProbs = true;
+    bool normalizeLogProbs = false;
     try
     {
         normalizeLogProbs = model_state_->GetParameter<bool>("normalize_log_probs");
@@ -508,7 +508,7 @@ executor::ExecutorConfig ModelInstanceState::getExecutorConfigFromParams()
     catch (std::exception const& e)
     {
         // If parameter is not specified, just ignore
-        TLLM_LOG_WARNING("normalize_log_probs is not specified, will be set to true");
+        TLLM_LOG_WARNING("normalize_log_probs is not specified, will be set to false");
     }
 
     executor::ExecutorConfig executorConfig;

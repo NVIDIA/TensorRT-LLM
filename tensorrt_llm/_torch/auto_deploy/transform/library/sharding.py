@@ -98,6 +98,53 @@ def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool
     return is_fake_quantized_linear_op(node) and "_scale" in weight_node_key
 
 
+def _make_tp_plan_regex(key: str) -> str:
+    pattern_string = ("*" + key + "*").replace("*", "@")
+    return re.escape(pattern_string).replace("@", ".*")
+
+
+def _matches_tp_plan(weight_name: str, tp_plan: Dict[str, str]) -> bool:
+    return any(re.match(_make_tp_plan_regex(key), weight_name) for key in tp_plan)
+
+
+def _is_unmatched_moe_aux_gate_linear(weight_name: str, tp_plan: Dict[str, str]) -> bool:
+    if _matches_tp_plan(weight_name, tp_plan):
+        return False
+
+    segments = weight_name.split(".")
+    if len(segments) < 2 or segments[-1] != "weight":
+        return False
+
+    # Router gates and shared-expert scalar gates are intentionally replicated in TP config.
+    return segments[-2] in {"gate", "shared_expert_gate"}
+
+
+def _get_config_layer_linear_nodes(gm: GraphModule, tp_plan: Dict[str, str]) -> List[Node]:
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    filtered_linear_nodes = []
+    num_skipped = 0
+
+    for lin_node in linear_nodes:
+        weight_name = extract_weight_name(lin_node)
+        if not weight_name:
+            filtered_linear_nodes.append(lin_node)
+            continue
+
+        if _is_unmatched_moe_aux_gate_linear(weight_name, tp_plan):
+            num_skipped += 1
+            continue
+
+        filtered_linear_nodes.append(lin_node)
+
+    if num_skipped > 0:
+        ad_logger.info(
+            f"Skipping {num_skipped} unmatched MoE auxiliary gate linear nodes during "
+            "config-driven TP layer recovery"
+        )
+
+    return filtered_linear_nodes
+
+
 ########################################################
 #  Helper enums
 ########################################################
@@ -174,6 +221,14 @@ class ShardingTransformConfig(TransformConfig):
         default=False,
         description="When True, apply simple shard (column split + all_gather) to "
         "'leftover' linear nodes that are not part of any layer subgraph.",
+    )
+    simple_shard_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of substrings to filter which unprocessed linear "
+        "nodes are simple-sharded. A node is included if its name contains ANY of the "
+        "listed keywords. Example: 'lm_head,shared_expert'. "
+        "Only effective when shard_all_unprocessed is True. "
+        "When None, all unprocessed linear nodes are sharded.",
     )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
@@ -1007,6 +1062,12 @@ class Sharding(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Draft models are not sharded — they run unsharded inside EagleWrapper.
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
         config = self.config
@@ -1125,6 +1186,12 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Draft models are not sharded — they run unsharded inside EagleWrapper.
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
@@ -1654,15 +1721,26 @@ def _update_node_args(node: Node, args: tuple) -> None:
     if "sharded" in node.meta and node.meta["sharded"]:
         return
 
-    # Build new args: preserve current Node refs, apply stored non-Node values
-    new_args = []
-    for i, stored_arg in enumerate(args):
+    def _merge_arg(current_arg: Any, stored_arg: Any) -> Any:
         if isinstance(stored_arg, Node):
-            # Node args: preserve current value (may have been updated by other transforms)
-            new_args.append(node.args[i])
-        else:
-            # Non-Node args (shapes, sizes, indices): use stored sharded value
-            new_args.append(stored_arg)
+            return current_arg if isinstance(current_arg, Node) else stored_arg
+
+        if isinstance(stored_arg, tuple) and isinstance(current_arg, (tuple, list)):
+            if len(stored_arg) == len(current_arg):
+                return tuple(_merge_arg(cur, old) for cur, old in zip(current_arg, stored_arg))
+            return stored_arg
+
+        if isinstance(stored_arg, list) and isinstance(current_arg, (tuple, list)):
+            if len(stored_arg) == len(current_arg):
+                return [_merge_arg(cur, old) for cur, old in zip(current_arg, stored_arg)]
+            return stored_arg
+
+        return stored_arg
+
+    # Build new args: preserve current Node refs recursively, apply stored non-Node values.
+    new_args = [
+        _merge_arg(current_arg, stored_arg) for current_arg, stored_arg in zip(node.args, args)
+    ]
 
     node.args = tuple(new_args)
     node.meta["sharded"] = True
@@ -1936,7 +2014,21 @@ def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
     layer_type: LayerType = LayerType.UNKNOWN,
+    key_filter: Optional[Callable[[Node], bool]] = None,
 ) -> int:
+    """
+
+    Args:
+        nodes_linear: A dictionary of nodes_linear, or a list of nodes_linear.
+        transform_container: The transform container.
+        layer_type: The layer type.
+        key_filter: A function to filter the nodes.
+    """
+    if key_filter is None:
+
+        def key_filter(n: Node) -> bool:
+            return True
+
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
     # if nodes_linear is a dict, flatten it to a 1D list of nodes
@@ -1946,6 +2038,8 @@ def _process_simple_shard(
 
     num_simple_shards = 0
     for n in nodes_linear:
+        if not key_filter(n):
+            continue
         num_simple_shards += int(
             transform_container.add(
                 WeightShardingInfo.from_node(
@@ -2879,7 +2973,9 @@ def detect_sharding_from_config(
 
     # use layer_subgraphs to determine the layer_type
     # and check the validity of the sharding transform
-    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(
+        gm, linear_nodes=_get_config_layer_linear_nodes(gm, tp_plan)
+    )
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
@@ -2904,12 +3000,7 @@ def detect_sharding_from_config(
 
         # use regex to find if module_name matches any of the keys in sharding_config
         for key in tp_plan.keys():
-            pattern_string = "*" + key + "*"
-            # convert it to regex. Escape dots, replace * with .*
-            # First, we substitute * with an unlikely character, e.g. @
-            # Then we escape dots, and finally we replace @ with .*
-            pattern_string = pattern_string.replace("*", "@")
-            pattern_regex = re.escape(pattern_string).replace("@", ".*")
+            pattern_regex = _make_tp_plan_regex(key)
             if re.match(pattern_regex, weight_name):
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
@@ -3174,7 +3265,16 @@ def detect_column_row_shard(
 
     # simple shard remaining linear nodes
     if config.shard_all_unprocessed:
-        num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
+        shard_filter = None
+        if config.simple_shard_filter is not None:
+            keywords = [k.strip() for k in config.simple_shard_filter.split(",")]
+
+            def shard_filter(n, _kw=keywords):
+                return any(kw in n.name for kw in _kw)
+
+        num_simple_shards += _process_simple_shard(
+            unprocessed_linear_nodes, transform_container, key_filter=shard_filter
+        )
     num_column_row_shards += num_ssm_shards + num_mla_shards
     num_shards = num_simple_shards + num_column_row_shards
     ad_logger.info(

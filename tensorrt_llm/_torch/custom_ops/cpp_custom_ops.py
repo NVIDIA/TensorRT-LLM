@@ -216,7 +216,7 @@ def _register_fake():
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
-        return torch.empty_like(input).to(torch.float8_e4m3fn), scale
+        return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale.clone()
 
     @torch.library.register_fake("trtllm::fp4_quantize")
     def _(
@@ -1105,3 +1105,17 @@ def _register_fake():
           rotary_embedding_scale, rotary_embedding_base, rotary_embedding_dim,
           rotary_scaling_type, rotary_embedding_max_positions):
         return True
+
+    @torch.library.register_fake("trtllm::convert_req_index_to_global")
+    def _(req_id: torch.Tensor, block_table: torch.Tensor,
+          token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
+          stride_factor: int, layer_id: int) -> torch.Tensor:
+        return torch.empty_like(token_indices)
+
+    @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
+    def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,
+          slot_mapping_scale: torch.Tensor, k_token_start: int,
+          num_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        k_fp8 = k_cache.new_empty([num_tokens, 128], dtype=torch.float8_e4m3fn)
+        k_scale = k_cache.new_empty([num_tokens, 1], dtype=torch.float32)
+        return k_fp8, k_scale

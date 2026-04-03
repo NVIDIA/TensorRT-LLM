@@ -158,5 +158,14 @@ perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_deepseek-v32-fp4_8k1k_
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_deepseek-v32-fp4_8k1k_ctx8_gen1_dep32_bs16_eplb288_mtp3_con512_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_kimi-k2-thinking-fp4_1k1k_ctx3_gen1_dep32_bs1024_eplb384_mtp0_con16384_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_kimi-k2-thinking-fp4_8k1k_ctx8_gen1_dep32_bs256_eplb416_mtp0_con8192_ccb-NIXL]
+
+# accuracy cases
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_accuracy-deepseek-r1-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_accuracy-deepseek-r1-fp4_gpqa_diamond_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-wideep_accuracy-kimi-k2-thinking-fp4_1k1k_ctx3_gen1_dep32_bs1024_eplb384_mtp0_ccb-NIXL]
+
+# stress cases
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-wideep_stress-deepseek-r1-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL]
+
 # GB200 supported cases
 # GB300 supported cases

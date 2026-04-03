@@ -278,6 +278,7 @@ class LTX2Pipeline(BasePipeline):
         return [121]
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        # T2V warmup
         self.forward(
             prompt="warmup",
             negative_prompt="",
@@ -287,6 +288,20 @@ class LTX2Pipeline(BasePipeline):
             num_inference_steps=steps,
             guidance_scale=4.0,
             seed=42,
+        )
+        # I2V warmup — use a dummy image to compile the per-token timestep
+        # graph, preventing torch.compile recompilation on first I2V request.
+        dummy_image = torch.zeros(1, 3, height, width, device=self.device)
+        self.forward(
+            prompt="warmup",
+            negative_prompt="",
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=4.0,
+            seed=42,
+            image=dummy_image,
         )
 
     # ------------------------------------------------------------------

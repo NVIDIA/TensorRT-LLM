@@ -190,7 +190,7 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     allow_different_input_scales: false
-    backend: trtllm
+    backend: cutlass
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
@@ -249,6 +249,10 @@ transforms:
   insert_cached_residual_add:
     stage: cache_init
     backend: cached_residual_add
+  initialize_mrope_delta_cache:
+    stage: cache_init
+    run_per_gm: false
+    enabled: false
   initialize_cache:
     stage: cache_init
     expect_mem_change: true

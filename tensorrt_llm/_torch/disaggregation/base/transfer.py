@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import concurrent.futures
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, cast
+
+import numpy as np
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -45,46 +48,54 @@ class KVSlice:
 
     token_range: Optional[TokenRange] = None
     layer_range: Optional[LayerRange] = None
-    block_ids_per_layer_groups: List[List[int]] = field(
+    block_ids_per_layer_groups: List[np.ndarray] = field(
         default_factory=list
-    )  # Physical block IDs per layer group
+    )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
 
 
 class SessionStatus(Enum):
     """Status of a transfer session.
 
-    Represents the various stages/statuses that a file transfer session can go through:
+    Represents the lifecycle stages of a KV cache transfer session:
 
-    - INIT: The session has been initialized but not yet ready.
-    - READY: The session is ready to start transferring.
-    - TRANSFERRING: The session is in progress, currently transferring data.
-    - TRANSFERRED: The primary transfer has completed successfully.
-    - AUX_TRANSFERRED: The auxiliary part (such as tokens) of the transfer has completed successfully.
-    - COMPLETED: The entire session process, including all transfers, has been successfully completed.
-    - CANCELED: The session has been canceled by the user or system.
-    - ERROR: An error occurred during the session. The session could not complete successfully.
+    - INIT: Session initialized; waiting for the remote peer to become ready.
+    - READY: Peer is ready; transfer can begin.
+    - TRANSFERRING: KV cache transfer is in progress.
+    - KV_TRANSFERRED: KV cache transfer completed; auxiliary data transfer may still be pending.
+    - FULLY_TRANSFERRED: Both KV cache and auxiliary data (e.g. tokens) transferred successfully.
+    - ERROR: A transfer error occurred; the session cannot complete.
     """
 
     INIT = "INIT"
     READY = "READY"
     TRANSFERRING = "TRANSFERRING"
-    TRANSFERRED = "TRANSFERRED"
-    AUX_TRANSFERRED = "AUX_TRANSFERRED"
-    COMPLETED = "COMPLETED"
-    CANCELED = "CANCELED"
+    KV_TRANSFERRED = "KV_TRANSFERRED"
+    FULLY_TRANSFERRED = "FULLY_TRANSFERRED"
     ERROR = "ERROR"
 
 
-TaskIdType = int
+class WaitResult(Enum):
+    """Result of waiting for a transfer session to complete."""
+
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    TIMEOUT = "TIMEOUT"
 
 
 @dataclass
-class SessionState:
-    """State of a transfer session."""
+class SessionArgsBase:
+    """Base arguments for transfer sessions."""
 
-    status: SessionStatus
-    finished_tasks: List[TaskIdType]
+    params: DisaggregatedParams
+
+
+def get_unique_rid(request: LlmRequest) -> Optional[int]:
+    return (
+        request.py_disaggregated_params.disagg_request_id
+        if request.py_disaggregated_params
+        else request.request_id
+    )
 
 
 class SenderBase(ABC):
@@ -99,103 +110,46 @@ class ReceiverBase(ABC):
     ...
 
 
-def get_unique_rid(request: LlmRequest) -> Optional[int]:
-    return (
-        request.py_disaggregated_params.disagg_request_id
-        if request.py_disaggregated_params
-        else request.request_id
-    )
+class _SessionBase(ABC):
+    """Shared base for Tx/Rx sessions."""
 
-
-class SessionBase(ABC):
-    def __init__(self, request: LlmRequest):
-        self._request = request
-        self._unique_rid: Optional[int] = get_unique_rid(request)
-        self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
-        self._exception: Optional[Exception] = None
+    def __init__(self, args: SessionArgsBase):
+        self._base_args = args
 
     @property
-    def unique_rid(self) -> Optional[int]:
-        # readonly
-        return self._unique_rid
-
-    @property
-    def disagg_params(self) -> Optional[DisaggregatedParams]:
-        return self._request.py_disaggregated_params if self._request else None
-
-    @property
-    def request(self) -> Optional[LlmRequest]:
-        return self._request
-
-    @property
-    def state(self) -> SessionState:
-        """
-        Returns the current state of the session.
-        """
-        return self._state
-
-    @state.setter
-    def state(self, state: SessionState):
-        """
-        Set the state of the session.
-        :param state: The state to set.
-        """
-        self._state = state
+    def disagg_request_id(self) -> int:
+        return cast(int, self._base_args.params.disagg_request_id)
 
     @abstractmethod
-    def poll_task(self, task_id: TaskIdType) -> SessionStatus:
-        """
-        Polls the status of a specific task by its ID.
-        :param task_id: The task ID to poll.
-        """
-        ...
+    def is_completed(self) -> bool: ...
 
     @abstractmethod
-    def close(self) -> None:
-        """
-        Closes the session and releases any resources.
-        """
-        ...
+    def wait_complete(self) -> Optional[WaitResult]: ...
 
     @property
-    def exception(self) -> Optional[Exception]:
-        """
-        Returns any exception that occurred during the session.
-        """
-        return self._exception
+    @abstractmethod
+    def exception(self) -> Optional[Exception]: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
 
 
-class TxSessionBase(SessionBase):
-    def __init__(self, sender: SenderBase, request: LlmRequest):
-        """
-        Initializes the transmission session.
-        :param sender: The sender instance responsible for sending data.
-        :param request: The LLM request associated with this session.
-        """
+class TxSessionBase(_SessionBase):
+    def __init__(self, sender: SenderBase, args: SessionArgsBase):
+        super().__init__(args)
         self._sender = sender
-        super().__init__(request)
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> TaskIdType:
-        """
-        Sends a slice of KV cache data and returns the task ID.
-        :param slice: The KV slice to send.
-        """
+    def send(self, slice: KVSlice) -> concurrent.futures.Future: ...
 
 
-class RxSessionBase(SessionBase):
-    def __init__(self, receiver: ReceiverBase, request: LlmRequest):
-        """
-        Initializes the reception session.
-        :param receiver: The receiver instance responsible for receiving data.
-        """
-        super().__init__(request)
+class RxSessionBase(_SessionBase):
+    def __init__(self, receiver: ReceiverBase, args: SessionArgsBase):
+        super().__init__(args)
         self._receiver = receiver
 
     @abstractmethod
-    def receive(self, slice: KVSlice) -> TaskIdType:
-        """
-        Receives a slice of KV cache data and returns the task ID.
-        :param slice: The KV slice to receive.
-        """
-        ...
+    def receive(self, slice: KVSlice) -> concurrent.futures.Future: ...
+
+    @abstractmethod
+    def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]: ...

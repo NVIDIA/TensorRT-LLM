@@ -13,12 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import torch
 from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
@@ -26,6 +30,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
+from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ...speculative import SpecMetadata
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -107,6 +112,11 @@ class Mamba2Mixer(nn.Module):
         self.slot_mapping = None
         self.is_paged_state = False
 
+        self.in_proj_lora = None
+        if config.lora_config is not None:
+            self.in_proj_lora = LoraLayer([LoraModuleType.MAMBA_IN_PROJ],
+                                          [d_in_proj // tp_size])
+
         # in_proj
         self.in_proj = Linear(
             d_model,
@@ -117,7 +127,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.in_proj_lora)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -139,8 +150,13 @@ class Mamba2Mixer(nn.Module):
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        supported_head_dim_in_flashinfer = [64, 128]
-        self._use_flashinfer = head_dim in supported_head_dim_in_flashinfer
+        # TODO: Update head_dims and head_group_ratios once flashinfer is updated.
+        supported_head_dims = [64, 128]
+        supported_head_group_ratios = [1, 8, 16]
+        head_group_ratio = (self.tp_nheads //
+                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
+        self._use_flashinfer = (head_dim in supported_head_dims and
+                                head_group_ratio in supported_head_group_ratios)
         # Stochastic rounding requires FlashInfer and fp16 cache
         self._use_stochastic_rounding = (
             config.quant_config.mamba_ssm_stochastic_rounding
@@ -176,8 +192,10 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
-        # Determine if NVFP4 quantization is enabled
-        self.is_nvfp4 = (config.quant_config is not None
+        # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
+        # Disable fused RMSNorm+NVFP4 when LoRA is configured.
+        self.is_nvfp4 = (config.lora_config is None
+                         and config.quant_config is not None
                          and config.quant_config.quant_mode is not None
                          and config.quant_config.quant_mode.has_nvfp4())
 
@@ -193,6 +211,11 @@ class Mamba2Mixer(nn.Module):
             is_nvfp4=self.is_nvfp4,
         )
 
+        self.out_proj_lora = None
+        if config.lora_config is not None:
+            self.out_proj_lora = LoraLayer([LoraModuleType.MAMBA_OUT_PROJ],
+                                           [d_model])
+
         # out_proj
         self.out_proj = Linear(
             d_inner,
@@ -203,7 +226,11 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.out_proj_lora)
+
+        self.aux_steram = torch.cuda.Stream()
+        self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
     def post_load_weights(self):
         """Post-process after loading weights."""
@@ -211,10 +238,8 @@ class Mamba2Mixer(nn.Module):
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
-        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant.
+        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
 
-        Called from post_load_weights (weights don't exist during __init__).
-        """
         if getattr(self.out_proj, 'input_scale', None) is not None:
             self.norm.nvfp4_scale = self.out_proj.input_scale
         else:
@@ -226,6 +251,7 @@ class Mamba2Mixer(nn.Module):
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -257,8 +283,10 @@ class Mamba2Mixer(nn.Module):
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
 
-        # in_proj
-        zxbcdt = self.in_proj(hidden_states)
+        # in_proj (LoRA is applied internally by Linear layer)
+        zxbcdt = self.in_proj(hidden_states,
+                              lora_params=lora_params,
+                              layer_idx=self.layer_idx)
 
         # Split z and dt with views.
         z = zxbcdt[:, :self.tp_d_inner]
@@ -364,36 +392,55 @@ class Mamba2Mixer(nn.Module):
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes,
-                    dtype=torch.int32,
-                    device=state_indices_d.device)
+                intermediate_state_indices = _cached_arange(
+                    attn_metadata.kv_cache_manager.get_max_resource_count(),
+                    state_indices_d.device)[:num_decodes]
 
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
                                             -1).transpose(1, 2)
-                # TODO:support tree structure [TRTLLM-10320]
-                xbc_d_processed = causal_conv1d_update_triton(
-                    xbc_d_reshaped,
-                    conv_states,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_state_indices=state_indices_d[:num_decodes],
-                    intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=self.intermediate_state_indices,
-                )
 
-                xbc_d = xbc_d_processed.transpose(1, 2).view(
-                    num_decode_tokens, -1)
+                def conv1d():
+                    # TODO:support tree structure [TRTLLM-10320]
+                    xbc_d_processed = causal_conv1d_update_triton(
+                        xbc_d_reshaped,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d[:num_decodes],
+                        intermediate_conv_window=intermediate_conv_states,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+
+                    return xbc_d_processed.transpose(1, 2).view(
+                        num_decode_tokens, -1)
 
             else:
-                xbc_d = causal_conv1d_update(xbc_d,
-                                             conv_states,
-                                             self.conv1d.weight,
-                                             self.conv1d.bias,
-                                             activation="silu",
-                                             conv_state_indices=state_indices_d)
+
+                def conv1d():
+                    return causal_conv1d_update(
+                        xbc_d,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d)
+
+            # For flashinfer state update, dt dtype has to match dt_bias and D.
+            def convert_dt():
+                return dt_d.to(dtype=torch.float32)
+
+            # If we're in a cuda graph and using PDL on conv1d, the next kernel
+            # if PDL'd will launch when convert_dt is done and conv1d triggers
+            # dependent kernels.  If these don't happen in parallel, then
+            # convert will go second and we lose PDL, but we're using cuda
+            # graphs for low latency so that seems ok.
+            # If any of the contiguous calls below actually fire, that also breaks PDL.
+            xbc_d, dt_d = maybe_execute_in_parallel(conv1d, convert_dt,
+                                                    self.events[0],
+                                                    self.events[1],
+                                                    self.aux_steram)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
@@ -404,8 +451,6 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
-            dt_d = dt_d.to(dtype=torch.float32)
             # Use .contiguous() to ensure proper 128-byte alignment required by
             # flashinfer's selective_state_update kernel. x_d, B_d, C_d are views
             # into sliced tensors which may not be 128-byte aligned.
@@ -439,7 +484,7 @@ class Mamba2Mixer(nn.Module):
                     disable_state_update=True,
                     intermediate_states_buffer=intermediate_ssm_states,
                     cache_steps=draft_token_num,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                 )
                 if self._use_stochastic_rounding:
                     mtp_kwargs['rand_seed'] = torch.randint(0,
@@ -501,6 +546,16 @@ class Mamba2Mixer(nn.Module):
         hidden_states = self.norm(preallocated_ssm_out, z[:num_actual_tokens])
 
         # out_proj
-        out = self.out_proj(hidden_states)
+        out = self.out_proj(hidden_states,
+                            lora_params=lora_params,
+                            layer_idx=self.layer_idx)
 
         return out[:num_actual_tokens]
+
+
+# We want to cache the largest indexing vector we'd ever need and mask it, vs
+# recreating it.  But we don't know the size at __init__, and it could even
+# change later if the mamba cache manager changes.
+@functools.cache
+def _cached_arange(n: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(n, dtype=torch.int32, device=device)

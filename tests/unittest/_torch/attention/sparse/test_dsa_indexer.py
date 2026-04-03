@@ -69,6 +69,7 @@ def create_dsa_cache_manager(
             self.index_n_heads = index_n_heads
             self.index_topk = index_topk
             self.prompt_budget = 1024
+            self.use_cute_dsl_topk = False
 
     sparse_attn_config = SparseAttentionConfig(
         index_head_dim=head_dim,

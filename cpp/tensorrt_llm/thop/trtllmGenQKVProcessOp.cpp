@@ -41,6 +41,7 @@ using tensorrt_llm::kernels::KvCacheDataType;
 using tensorrt_llm::kernels::PositionEmbeddingType;
 using tensorrt_llm::kernels::QKVPreprocessingParams;
 using tensorrt_llm::kernels::RotaryScalingType;
+using tensorrt_llm::kernels::cacheTypeFromQuantMode;
 using tensorrt_llm::runtime::TorchUtils;
 
 namespace
@@ -212,53 +213,19 @@ void qkv_processing(
     TORCH_CHECK(qkv_input.has_value(), "qkv_input is required");
     auto qkvDtype = TorchUtils::dataType(qkv_input->scalar_type());
 
-    // Build KV cache buffers if KV cache is used.
     auto quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
-    KVBlockArray kvCacheBuffer;
-    KVBlockArray kvScaleCacheBuffer;
-
-    bool const useKvCache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
-        && host_kv_cache_pool_mapping.has_value();
-    if (useKvCache)
-    {
-        int32_t const poolIndex
-            = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 0}).item<int32_t>();
-        int32_t const layerIdxInCachePool
-            = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 1}).item<int32_t>();
-        auto* blockOffsets = static_cast<KVBlockArray::DataType*>(
-            kv_cache_block_offsets->index({poolIndex, static_cast<int64_t>(seq_offset)}).data_ptr());
-
-        int cacheElemBits
-            = AttentionOp::getKvCacheElemSizeInBits(quantMode, static_cast<size_t>(qkv_input->element_size()));
-
-        auto const blockSize = tokens_per_block * kv_head_num * size_per_head;
-        auto const bytesPerBlock = blockSize * cacheElemBits / CHAR_BIT;
-        int32_t const kvFactor = is_mla_enable ? 1 : 2;
-        auto const intraPoolOffset = layerIdxInCachePool * kvFactor * bytesPerBlock;
-        auto const sizePerToken = static_cast<int32_t>(kv_head_num * size_per_head * cacheElemBits / 8);
-
-        auto poolPointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), poolIndex, intraPoolOffset,
-            blockSize, layerIdxInCachePool, kvFactor, quantMode.hasFp4KvCache());
-
-        int32_t const maxBlocksPerSequence = static_cast<int32_t>(kv_cache_block_offsets->size(-1));
-        auto arrays = AttentionOp::buildKvCacheBlockArrays(static_cast<int32_t>(batch_size), maxBlocksPerSequence,
-            static_cast<int32_t>(tokens_per_block), sizePerToken, static_cast<int32_t>(cyclic_attention_window_size),
-            static_cast<int32_t>(std::max(cyclic_attention_window_size, max_attention_window_size)),
-            static_cast<int32_t>(sink_token_length), beam_width > 1, poolPointers.primaryPoolPtr,
-            poolPointers.secondaryPoolPtr, poolPointers.primaryBlockScalePoolPtr,
-            poolPointers.secondaryBlockScalePoolPtr, blockOffsets, quantMode.hasFp4KvCache());
-
-        kvCacheBuffer = arrays.kvCacheBuffer;
-        kvScaleCacheBuffer = arrays.kvScaleCacheBuffer;
-    }
+    auto kvArrays = buildPagedKvCacheBuffers(kv_cache_block_offsets, host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping, quantMode, layer_idx, batch_size, tokens_per_block, kv_head_num, size_per_head,
+        cyclic_attention_window_size, max_attention_window_size, sink_token_length, beam_width, seq_offset,
+        is_mla_enable, static_cast<size_t>(qkv_input->element_size()));
 
     QKVPreprocessingParams<void, KVBlockArray> p{};
     p.qkv_input = qkv_input.has_value() ? qkv_input->data_ptr() : nullptr;
     p.cross_kv_input = cross_kv_input.has_value() ? cross_kv_input->data_ptr() : nullptr;
     p.quantized_qkv_output = optPtr<void>(quantized_qkv_output);
     p.q_output = q_output.has_value() ? q_output->data_ptr() : nullptr;
-    p.kv_cache_buffer = kvCacheBuffer;
-    p.kv_cache_block_scales_buffer = kvScaleCacheBuffer;
+    p.kv_cache_buffer = kvArrays.kvCacheBuffer;
+    p.kv_cache_block_scales_buffer = kvArrays.kvScaleCacheBuffer;
     p.qkv_bias = qkv_bias.has_value() ? static_cast<void const*>(qkv_bias->data_ptr()) : nullptr;
     p.qkv_scale_quant_orig = optPtr<float>(qkv_scale_quant_orig);
     p.qkv_scale_orig_quant = optPtr<float>(qkv_scale_orig_quant);
@@ -301,14 +268,7 @@ void qkv_processing(
     p.rotary_embedding_max_positions = static_cast<int>(rotary_embedding_max_positions);
     p.position_embedding_type = static_cast<PositionEmbeddingType>(position_embedding_type);
     p.position_shift_enabled = position_shift_enabled;
-    if (quantMode.hasInt8KvCache())
-        p.cache_type = KvCacheDataType::INT8;
-    else if (quantMode.hasFp8KvCache())
-        p.cache_type = KvCacheDataType::FP8;
-    else if (quantMode.hasFp4KvCache())
-        p.cache_type = KvCacheDataType::NVFP4;
-    else
-        p.cache_type = KvCacheDataType::BASE;
+    p.cache_type = cacheTypeFromQuantMode(quantMode);
     p.separate_q_kv_output = separate_q_kv_output;
     p.quantized_fp8_output = quantized_fp8_output;
     p.generation_phase = generation_phase;
