@@ -98,6 +98,11 @@ def _gemma4_torch_paged_mask_provider(ctx, source_attn_node):
     return _build_or_reuse_gemma4_token_type_mask(ctx, source_attn_node)
 
 
+@AttentionMaskProviderRegistry.register("gemma4", "triton_paged")
+def _gemma4_triton_paged_mask_provider(ctx, source_attn_node):
+    return _build_or_reuse_gemma4_token_type_mask(ctx, source_attn_node)
+
+
 @AttentionMaskProviderRegistry.register("gemma4", "torch_attention")
 def _gemma4_torch_attention_mask_provider(ctx, source_attn_node):
     return _build_or_reuse_gemma4_token_type_mask(ctx, source_attn_node)
