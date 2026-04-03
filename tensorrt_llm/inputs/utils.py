@@ -163,20 +163,25 @@ def _safe_request_get(url: str,
 
 
 async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
-    """``aiohttp`` GET wrapper that validates URLs before and after redirects."""
+    """aiohttp GET wrapper that validates every redirect hop before following."""
     _validate_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    current_url = url
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url,
-                               max_redirects=_MAX_REDIRECTS,
-                               allow_redirects=True) as response:
-            # Validate the final (possibly redirected) URL.
-            _validate_url(str(response.url))
-            response.raise_for_status()
-            data = await response.content.read(_MAX_RESPONSE_BYTES + 1)
-            if len(data) > _MAX_RESPONSE_BYTES:
-                raise ValueError("Response exceeds maximum allowed size")
-            return data
+        for _ in range(_MAX_REDIRECTS + 1):
+            async with session.get(current_url,
+                                   allow_redirects=False) as response:
+                if response.status in (301, 302, 303, 307, 308):
+                    redirect_url = response.headers.get("Location", "")
+                    _validate_url(redirect_url)
+                    current_url = redirect_url
+                    continue
+                response.raise_for_status()
+                data = await response.content.read(_MAX_RESPONSE_BYTES + 1)
+                if len(data) > _MAX_RESPONSE_BYTES:
+                    raise ValueError("Response exceeds maximum allowed size")
+                return data
+    raise ValueError("Too many redirects")
 
 
 def _load_and_convert_image(image):
@@ -358,8 +363,13 @@ def load_video(video: str,
     parsed_url = urlparse(video)
     results = None
     if parsed_url.scheme in ["http", "https"]:
-        _validate_url(video)
-        results = _load_video_by_cv2(video, num_frames, fps, format, device)
+        resp = _safe_request_get(video, stream=False)
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix=".mp4") as tmp_file:
+            tmp_file.write(resp.content)
+            tmp_file.flush()
+            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
+                                         device)
     elif parsed_url.scheme in ("", "file"):
         results = _load_video_by_cv2(video, num_frames, fps, format, device)
     elif parsed_url.scheme == "data":
