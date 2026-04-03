@@ -33,12 +33,15 @@ Key architectural features of Gemma 4 vs standard transformers:
 """
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from tokenizers import Tokenizer
 from torch import nn
 from torch.fx import GraphModule
@@ -1032,8 +1035,51 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
 # ---------------------------------------------------------------------------
 
 _TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+_PROCESSOR_CONFIG_FILE = "processor_config.json"
 _CHAT_TEMPLATE_FILE = "chat_template.jinja"
 _TOKENIZER_FILE = "tokenizer.json"
+_SUPPORTED_GEMMA4_SOFT_TOKENS = (70, 140, 280, 560, 1120)
+
+
+def get_aspect_ratio_preserving_size(
+    height: int,
+    width: int,
+    patch_size: int,
+    max_patches: int,
+    pooling_kernel_size: int,
+) -> Tuple[int, int]:
+    """Resize within the Gemma4 patch budget while preserving aspect ratio."""
+    total_px = height * width
+    target_px = max_patches * (patch_size**2)
+    factor = (target_px / total_px) ** 0.5
+    ideal_height = factor * height
+    ideal_width = factor * width
+    side_multiple = pooling_kernel_size * patch_size
+
+    target_height = int(ideal_height // side_multiple) * side_multiple
+    target_width = int(ideal_width // side_multiple) * side_multiple
+
+    if target_height == 0 and target_width == 0:
+        raise ValueError(
+            "Attempting to resize to a 0 x 0 image. "
+            f"Resized height should be divisible by `pooling_kernel_size * patch_size`={side_multiple}."
+        )
+
+    max_side_length = (max_patches // pooling_kernel_size**2) * side_multiple
+    if target_height == 0:
+        target_height = side_multiple
+        target_width = min((width // height) * side_multiple, max_side_length)
+    elif target_width == 0:
+        target_width = side_multiple
+        target_height = min((height // width) * side_multiple, max_side_length)
+
+    if target_height * target_width > target_px:
+        raise ValueError(
+            f"Resizing [{height}x{width}] to [{target_height}x{target_width}] "
+            f"exceeds {max_patches} patches with patch_size {patch_size}."
+        )
+
+    return target_height, target_width
 
 
 class ADGemma4Tokenizer(PreTrainedTokenizerFast):
@@ -1083,6 +1129,13 @@ class ADGemma4Tokenizer(PreTrainedTokenizerFast):
             truncation_side=config.get("truncation_side", "left"),
         )
 
+        tokenizer.image_token = config.get("image_token", "<|image|>")
+        tokenizer.boi_token = config.get("boi_token", "<|image>")
+        tokenizer.eoi_token = config.get("eoi_token", "<image|>")
+        tokenizer.image_token_id = tokenizer.convert_tokens_to_ids(tokenizer.image_token)
+        tokenizer.boi_token_id = tokenizer.convert_tokens_to_ids(tokenizer.boi_token)
+        tokenizer.eoi_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eoi_token)
+
         template_path = cached_file(
             pretrained_model_name_or_path,
             _CHAT_TEMPLATE_FILE,
@@ -1095,12 +1148,417 @@ class ADGemma4Tokenizer(PreTrainedTokenizerFast):
         return tokenizer
 
 
+class ADGemma4ImageProcessor:
+    """Minimal Gemma4 image processor compatible with the local transformers version."""
+
+    def __init__(
+        self,
+        *,
+        patch_size: int = 16,
+        max_soft_tokens: int = 280,
+        pooling_kernel_size: int = 3,
+        do_convert_rgb: bool = True,
+        do_resize: bool = True,
+        do_rescale: bool = True,
+        rescale_factor: float = 1 / 255,
+        do_normalize: bool = False,
+        image_mean: Optional[List[float]] = None,
+        image_std: Optional[List[float]] = None,
+        resample: int = Image.BICUBIC,
+    ) -> None:
+        if max_soft_tokens not in _SUPPORTED_GEMMA4_SOFT_TOKENS:
+            raise ValueError(
+                f"`max_soft_tokens` must be one of {_SUPPORTED_GEMMA4_SOFT_TOKENS}, got {max_soft_tokens}."
+            )
+        self.patch_size = patch_size
+        self.max_soft_tokens = max_soft_tokens
+        self.pooling_kernel_size = pooling_kernel_size
+        self.do_convert_rgb = do_convert_rgb
+        self.do_resize = do_resize
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
+        self.do_normalize = do_normalize
+        self.image_mean = image_mean or [0.0, 0.0, 0.0]
+        self.image_std = image_std or [1.0, 1.0, 1.0]
+        self.resample = resample
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        **kwargs,
+    ) -> "ADGemma4ImageProcessor":
+        for key in ("_from_auto", "_commit_hash", "trust_remote_code"):
+            kwargs.pop(key, None)
+
+        config_path = cached_file(pretrained_model_name_or_path, _PROCESSOR_CONFIG_FILE, **kwargs)
+        assert config_path is not None
+        processor_config = json.loads(Path(config_path).read_text())
+        image_config = processor_config.get("image_processor", {})
+        allowed_keys = {
+            "patch_size",
+            "max_soft_tokens",
+            "pooling_kernel_size",
+            "do_convert_rgb",
+            "do_resize",
+            "do_rescale",
+            "rescale_factor",
+            "do_normalize",
+            "image_mean",
+            "image_std",
+            "resample",
+        }
+        filtered_config = {key: value for key, value in image_config.items() if key in allowed_keys}
+        return cls(**filtered_config)
+
+    @staticmethod
+    def fetch_images(images):
+        return images
+
+    @staticmethod
+    def _to_tensor(image, do_convert_rgb: bool) -> torch.Tensor:
+        if isinstance(image, Image.Image):
+            if do_convert_rgb:
+                image = image.convert("RGB")
+            array = np.array(image, copy=True)
+            tensor = torch.from_numpy(array)
+            if tensor.ndim == 2:
+                tensor = tensor.unsqueeze(-1)
+            return tensor.permute(2, 0, 1).contiguous().to(torch.float32)
+
+        if torch.is_tensor(image):
+            tensor = image.detach().cpu()
+            if tensor.ndim != 3:
+                raise ValueError(f"Expected a 3D image tensor, got shape {tuple(tensor.shape)}")
+            if tensor.shape[0] in (1, 3):
+                return tensor.to(torch.float32)
+            if tensor.shape[-1] in (1, 3):
+                return tensor.permute(2, 0, 1).contiguous().to(torch.float32)
+            raise ValueError(f"Unsupported tensor image shape {tuple(tensor.shape)}")
+
+        array = np.asarray(image)
+        if array.ndim == 2:
+            array = array[..., None]
+        if array.ndim != 3:
+            raise ValueError(f"Unsupported image with shape {array.shape}")
+        tensor = torch.from_numpy(array)
+        if tensor.shape[0] not in (1, 3):
+            tensor = tensor.permute(2, 0, 1)
+        return tensor.contiguous().to(torch.float32)
+
+    @staticmethod
+    def _convert_image_to_patches(image: torch.Tensor, patch_size: int) -> torch.Tensor:
+        channels, image_height, image_width = image.shape
+        num_patches_height = image_height // patch_size
+        num_patches_width = image_width // patch_size
+        patched = image.reshape(
+            channels,
+            num_patches_height,
+            patch_size,
+            num_patches_width,
+            patch_size,
+        )
+        patched = patched.permute(1, 3, 2, 4, 0)
+        return patched.reshape(num_patches_height * num_patches_width, -1)
+
+    @staticmethod
+    def _pad_along_first_dim(
+        image: torch.Tensor, positions: torch.Tensor, target_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        current_length = image.shape[0]
+        padding_length = target_length - current_length
+        if padding_length <= 0:
+            return image, positions
+        image_padding = torch.zeros(
+            (padding_length, image.shape[1]), dtype=image.dtype, device=image.device
+        )
+        pos_padding = torch.full(
+            (padding_length, 2), -1, dtype=positions.dtype, device=positions.device
+        )
+        return torch.cat([image, image_padding], dim=0), torch.cat([positions, pos_padding], dim=0)
+
+    def _aspect_ratio_preserving_resize(self, image: torch.Tensor) -> torch.Tensor:
+        height, width = image.shape[-2], image.shape[-1]
+        max_patches = self.max_soft_tokens * self.pooling_kernel_size**2
+        target_height, target_width = get_aspect_ratio_preserving_size(
+            height=height,
+            width=width,
+            patch_size=self.patch_size,
+            max_patches=max_patches,
+            pooling_kernel_size=self.pooling_kernel_size,
+        )
+        if target_height == height and target_width == width:
+            return image
+        return F.interpolate(
+            image.unsqueeze(0),
+            size=(target_height, target_width),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0)
+
+    def __call__(
+        self,
+        images,
+        *,
+        do_convert_rgb: Optional[bool] = None,
+        do_resize: Optional[bool] = None,
+        do_rescale: Optional[bool] = None,
+        rescale_factor: Optional[float] = None,
+        do_normalize: Optional[bool] = None,
+        image_mean: Optional[List[float]] = None,
+        image_std: Optional[List[float]] = None,
+        return_tensors: Optional[str] = None,
+        **_kwargs,
+    ) -> dict[str, Any]:
+        del return_tensors
+        do_convert_rgb = self.do_convert_rgb if do_convert_rgb is None else do_convert_rgb
+        do_resize = self.do_resize if do_resize is None else do_resize
+        do_rescale = self.do_rescale if do_rescale is None else do_rescale
+        rescale_factor = self.rescale_factor if rescale_factor is None else rescale_factor
+        do_normalize = self.do_normalize if do_normalize is None else do_normalize
+        image_mean = self.image_mean if image_mean is None else image_mean
+        image_std = self.image_std if image_std is None else image_std
+
+        if not isinstance(images, list):
+            images = [images]
+
+        max_patches = self.max_soft_tokens * self.pooling_kernel_size**2
+        pixel_values = []
+        position_ids = []
+        num_soft_tokens_per_image = []
+        mean = torch.tensor(image_mean, dtype=torch.float32).view(-1, 1, 1)
+        std = torch.tensor(image_std, dtype=torch.float32).view(-1, 1, 1)
+
+        for image in images:
+            tensor = self._to_tensor(image, do_convert_rgb=do_convert_rgb)
+            if do_resize:
+                tensor = self._aspect_ratio_preserving_resize(tensor)
+            if do_rescale:
+                tensor = tensor * rescale_factor
+            if do_normalize:
+                tensor = (tensor - mean) / std
+
+            patches = self._convert_image_to_patches(tensor, self.patch_size)
+            num_soft_tokens_per_image.append(patches.shape[0] // self.pooling_kernel_size**2)
+
+            patch_height = tensor.shape[-2] // self.patch_size
+            patch_width = tensor.shape[-1] // self.patch_size
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(patch_height, dtype=torch.int64),
+                torch.arange(patch_width, dtype=torch.int64),
+                indexing="ij",
+            )
+            positions = torch.stack([grid_x, grid_y], dim=-1).reshape(patches.shape[0], 2)
+            patches, positions = self._pad_along_first_dim(patches, positions, max_patches)
+
+            pixel_values.append(patches)
+            position_ids.append(positions)
+
+        return {
+            "pixel_values": torch.stack(pixel_values, dim=0),
+            "image_position_ids": torch.stack(position_ids, dim=0),
+            "num_soft_tokens_per_image": num_soft_tokens_per_image,
+        }
+
+
+class ADGemma4Processor:
+    """Minimal Gemma4 multimodal processor for image-text requests."""
+
+    def __init__(
+        self,
+        *,
+        tokenizer: ADGemma4Tokenizer,
+        image_processor: ADGemma4ImageProcessor,
+        image_seq_length: int = 280,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.image_seq_length = image_seq_length
+        self.image_token = tokenizer.image_token
+        self.boi_token = tokenizer.boi_token
+        self.eoi_token = tokenizer.eoi_token
+        self.image_token_id = tokenizer.image_token_id
+        self.boi_token_id = tokenizer.boi_token_id
+        self.eoi_token_id = tokenizer.eoi_token_id
+        self.chat_template = getattr(tokenizer, "chat_template", None)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        **kwargs,
+    ) -> "ADGemma4Processor":
+        tokenizer = ADGemma4Tokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        image_processor = ADGemma4ImageProcessor.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        config_path = cached_file(pretrained_model_name_or_path, _PROCESSOR_CONFIG_FILE, **kwargs)
+        assert config_path is not None
+        processor_config = json.loads(Path(config_path).read_text())
+        return cls(
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            image_seq_length=processor_config.get(
+                "image_seq_length", image_processor.max_soft_tokens
+            ),
+        )
+
+    @staticmethod
+    def _ensure_text_list(text) -> List[str]:
+        if text is None:
+            return []
+        if isinstance(text, str):
+            return [text]
+        return list(text)
+
+    @staticmethod
+    def _normalize_batched_images(images) -> List[List[Any]]:
+        if images is None:
+            return []
+        if not isinstance(images, list):
+            return [[images]]
+        if not images:
+            return []
+        if isinstance(images[0], list):
+            return [list(batch) for batch in images]
+        return [list(images)]
+
+    def _expand_image_placeholders(
+        self, text: List[str], batched_images: List[List[Any]], image_inputs: dict[str, Any]
+    ) -> List[str]:
+        num_soft_tokens = image_inputs.pop("num_soft_tokens_per_image")
+        if not text:
+            text = [" ".join([self.image_token] * len(images)) for images in batched_images]
+        if len(text) != len(batched_images):
+            raise ValueError(
+                f"Received inconsistently sized batches of images ({len(batched_images)}) and text ({len(text)})."
+            )
+
+        replacements = [
+            f"{self.boi_token}{self.image_token * num_tokens}{self.eoi_token}"
+            for num_tokens in num_soft_tokens
+        ]
+        replacements_iter = iter(replacements)
+        pattern = re.escape(self.image_token)
+        return [re.sub(pattern, lambda _match: next(replacements_iter), prompt) for prompt in text]
+
+    def _build_token_type_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        token_type_ids = torch.zeros_like(input_ids)
+        next_blob_id = 1
+        for batch_idx in range(input_ids.shape[0]):
+            in_blob = False
+            current_blob_id = 0
+            for token_idx, token in enumerate(input_ids[batch_idx].tolist()):
+                if token == self.boi_token_id:
+                    in_blob = True
+                    current_blob_id = next_blob_id
+                    next_blob_id += 1
+                    token_type_ids[batch_idx, token_idx] = current_blob_id
+                elif token == self.eoi_token_id and in_blob:
+                    token_type_ids[batch_idx, token_idx] = current_blob_id
+                    in_blob = False
+                    current_blob_id = 0
+                elif in_blob:
+                    token_type_ids[batch_idx, token_idx] = current_blob_id
+        return token_type_ids
+
+    def _render_messages(self, messages) -> Tuple[List[str], List[List[Any]]]:
+        batched_messages = messages if messages and isinstance(messages[0], list) else [messages]
+        rendered_prompts: List[str] = []
+        batched_images: List[List[Any]] = []
+
+        for conversation in batched_messages:
+            parts: List[str] = []
+            conversation_images: List[Any] = []
+            for message in conversation:
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    parts.append(content)
+                    continue
+                for item in content:
+                    item_type = item.get("type")
+                    if item_type == "text":
+                        parts.append(item.get("text", ""))
+                    elif item_type == "image":
+                        parts.append(self.image_token)
+                        conversation_images.append(item.get("image"))
+            rendered_prompts.append(" ".join(part for part in parts if part))
+            batched_images.append(conversation_images)
+
+        return rendered_prompts, batched_images
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize: bool = False,
+        return_dict: bool = False,
+        return_tensors: Optional[str] = None,
+        add_generation_prompt: bool = True,
+        **kwargs,
+    ):
+        del add_generation_prompt
+        text, batched_images = self._render_messages(messages)
+        if not tokenize:
+            if messages and isinstance(messages[0], list):
+                return text
+            return text[0]
+
+        result = self(
+            text=text,
+            images=batched_images,
+            return_dict=True,
+            return_tensors=return_tensors,
+            **kwargs,
+        )
+        if return_dict:
+            return result
+        return result["input_ids"]
+
+    def __call__(
+        self,
+        *,
+        images=None,
+        text=None,
+        return_dict: bool = True,
+        return_tensors: Optional[str] = None,
+        return_attention_mask: bool = False,
+        **kwargs,
+    ):
+        del return_dict
+        batched_images = self._normalize_batched_images(images)
+        flat_images = [image for batch in batched_images for image in batch]
+        text_list = self._ensure_text_list(text)
+
+        image_inputs = {}
+        if flat_images:
+            image_inputs = self.image_processor(
+                flat_images,
+                return_tensors=return_tensors,
+                **kwargs,
+            )
+            text_list = self._expand_image_placeholders(text_list, batched_images, image_inputs)
+
+        tokenizer_kwargs = dict(kwargs)
+        tokenizer_kwargs.pop("do_rescale", None)
+        tokenizer_kwargs.pop("do_convert_rgb", None)
+        tokenizer_kwargs.pop("rescale_factor", None)
+        tokenizer_kwargs.pop("do_resize", None)
+        tokenizer_kwargs.pop("do_normalize", None)
+        tokenizer_kwargs["return_tensors"] = return_tensors
+        tokenizer_kwargs["return_attention_mask"] = return_attention_mask
+        text_inputs = self.tokenizer(text=text_list, **tokenizer_kwargs)
+        text_inputs["token_type_ids"] = self._build_token_type_ids(text_inputs["input_ids"])
+        return {**text_inputs, **image_inputs}
+
+
 class Gemma4ADInputProcessor:
     """Input processor that ensures ``token_type_ids`` is always present.
 
     Every request (text-only or multimodal) gets a ``token_type_ids`` tensor in
     its multimodal data.  For text-only requests this is all-zeros (standard
-    causal attention).  For multimodal requests the HF processor already
+    causal attention).  For multimodal requests the local Gemma4 processor
     provides it with per-blob IDs.  This guarantees the batched
     ``token_type_ids`` tensor in ``extra_args`` always covers the full
     flattened batch, including mixed image + text-only batches.
@@ -1155,10 +1613,10 @@ class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
         return ADGemma4Tokenizer.from_pretrained(self.tokenizer)
 
     def init_processor(self) -> Optional[Any]:
-        """Return the tokenizer as the processor for ADInputProcessor."""
+        """Return the local Gemma4 multimodal processor."""
         if self.tokenizer is None:
             return None
-        return ADGemma4Tokenizer.from_pretrained(self.tokenizer)
+        return ADGemma4Processor.from_pretrained(self.tokenizer)
 
     def init_input_processor(self, base):
         return Gemma4ADInputProcessor(base)
