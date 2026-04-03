@@ -29,9 +29,10 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.utils import ActivationType, relu2
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_helper import LoraConfig
 
 from ..attention_backend import AttentionMetadata
-from ..distributed import AllReduce
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -42,6 +43,7 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
@@ -59,6 +61,7 @@ class MLPLayer(MLP):
         self,
         model_config: ModelConfig[NemotronHConfig],
         layer_idx: int,
+        reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
         if isinstance(config.intermediate_size, list):
@@ -76,6 +79,7 @@ class MLPLayer(MLP):
             activation=relu2,
             dtype=config.torch_dtype,
             config=model_config,
+            reduce_output=reduce_output,
         )
         self.layer_idx = layer_idx
 
@@ -83,9 +87,10 @@ class MLPLayer(MLP):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        return super().forward(hidden_states)
+        return super().forward(hidden_states, lora_params=lora_params)
 
 
 class TransformerLayer(Attention):
@@ -115,11 +120,14 @@ class TransformerLayer(Attention):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         return super().forward(position_ids=None,
                                hidden_states=hidden_states,
-                               attn_metadata=attn_metadata)
+                               attn_metadata=attn_metadata,
+                               lora_params=lora_params,
+                               **kwargs)
 
 
 # Ref code: https://huggingface.co/nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024/blob/main/modeling_nemotron_h.py#L818
@@ -130,6 +138,7 @@ class NemotronHMOE(nn.Module):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
+        reduce_output: bool = False,
     ):
         super().__init__()
 
@@ -182,6 +191,9 @@ class NemotronHMOE(nn.Module):
                 reduce_output=False,
                 overridden_tp_size=1
                 if model_config.mapping.enable_attention_dp else None,
+                # Use shared expert LoRA types (distinct dimensions from routed MoE experts)
+                lora_up_module_type=LoraModuleType.SHARED_EXPERT_H_TO_4H,
+                lora_down_module_type=LoraModuleType.SHARED_EXPERT_4H_TO_H,
             )
         # Setup MoE gate.
         self.gate = DeepseekV3Gate(
@@ -226,8 +238,7 @@ class NemotronHMOE(nn.Module):
             activation_type=self.activation_type,
         )
 
-        if not model_config.mapping.enable_attention_dp:
-            # AllReduce for combining shared and routed expert outputs in multi-GPU settings.
+        if reduce_output:
             self.allreduce = AllReduce(
                 mapping=model_config.mapping,
                 strategy=model_config.allreduce_strategy,
@@ -239,6 +250,10 @@ class NemotronHMOE(nn.Module):
         # These layers should NOT be TP-sharded to ensure MoE receives
         # full latent representation. They are replicated across all GPUs.
         if self.use_latent_moe:
+            self.fc1_latent_lora = None
+            if model_config.lora_config is not None:
+                self.fc1_latent_lora = LoraLayer(
+                    [LoraModuleType.MOE_LATENT_FC1], [self.moe_hidden_size])
             self.fc1_latent_proj = Linear(
                 in_features=self.hidden_size,
                 out_features=self.moe_hidden_size,
@@ -247,7 +262,12 @@ class NemotronHMOE(nn.Module):
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                lora=self.fc1_latent_lora,
             )
+            self.fc2_latent_lora = None
+            if model_config.lora_config is not None:
+                self.fc2_latent_lora = LoraLayer(
+                    [LoraModuleType.MOE_LATENT_FC2], [self.hidden_size])
             self.fc2_latent_proj = Linear(
                 in_features=self.moe_hidden_size,
                 out_features=self.hidden_size,
@@ -256,10 +276,13 @@ class NemotronHMOE(nn.Module):
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                lora=self.fc2_latent_lora,
             )
         else:
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
+            self.fc1_latent_lora = None
+            self.fc2_latent_lora = None
 
         self.aux_stream_shared = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
@@ -272,6 +295,7 @@ class NemotronHMOE(nn.Module):
         hidden_states: torch.Tensor
         | tuple[torch.Tensor | Fp4QuantizedTensor, torch.Tensor],
         attn_metadata: AttentionMetadata,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if isinstance(hidden_states, tuple):
@@ -289,7 +313,8 @@ class NemotronHMOE(nn.Module):
 
         def _compute_shared_output():
             if self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states_hp)
+                shared_expert_output = self.shared_experts(
+                    hidden_states_hp, lora_params=lora_params)
             else:
                 shared_expert_output = 0
             return shared_expert_output
@@ -298,8 +323,13 @@ class NemotronHMOE(nn.Module):
             # Gate uses high precision input for accurate routing decisions.
             router_logits = self.gate(hidden_states_hp_2d)
 
-            routed_hidden_states = self.fc1_latent_proj(
-                hidden_states_hp) if self.use_latent_moe else hidden_states
+            if self.use_latent_moe:
+                routed_hidden_states = self.fc1_latent_proj(
+                    hidden_states_hp,
+                    lora_params=lora_params,
+                    layer_idx=self.layer_idx)
+            else:
+                routed_hidden_states = hidden_states
 
             final_hidden_states = self.experts(
                 routed_hidden_states,
@@ -309,7 +339,10 @@ class NemotronHMOE(nn.Module):
             )
 
             if self.use_latent_moe:
-                final_hidden_states = self.fc2_latent_proj(final_hidden_states)
+                final_hidden_states = self.fc2_latent_proj(
+                    final_hidden_states,
+                    lora_params=lora_params,
+                    layer_idx=self.layer_idx)
 
             return final_hidden_states
 
@@ -324,8 +357,10 @@ class NemotronHMOE(nn.Module):
         final_hidden_states = shared_output + routed_output
 
         # Perform all-reduce after combining outputs for multi-GPU support.
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
-            final_hidden_states = self.allreduce(final_hidden_states)
+        if self.allreduce is not None:
+            final_hidden_states = self.allreduce(
+                final_hidden_states,
+                all_reduce_params=kwargs.get('all_reduce_params'))
 
         return final_hidden_states.view(orig_shape)
 
@@ -341,6 +376,7 @@ class NemotronHLayer(DecoderLayer):
         # * -> TransformerLayer
         layer_type: str,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
+        fuse_allreduce_norm: bool = False,
     ):
         super().__init__()
 
@@ -372,6 +408,17 @@ class NemotronHLayer(DecoderLayer):
                 key=f"disable_nvfp4_rmsnorm_with_{config.hidden_size}",
             )
             self.is_nvfp4 = False
+        # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
+        # Disable fused RMSNorm+NVFP4 when LoRA is configured.
+        if self.is_nvfp4 and model_config.lora_config is not None:
+            self.is_nvfp4 = False
+
+        # fuse_allreduce_norm is the model-level flag.  When enabled, ALL
+        # layers defer mixer AllReduce to the next layer's pre_allreduce (or
+        # the model's final_allreduce).  Only layers 1+ create a pre_allreduce
+        # module; layer 0's input is already reduced from the embedding.
+        self.fuse_allreduce_norm = fuse_allreduce_norm
+        self.is_moe_layer = (layer_type == "E")
 
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -382,8 +429,21 @@ class NemotronHLayer(DecoderLayer):
             quantize_type="nvfp4" if self.is_nvfp4 else None,
             # Enable high precision output for MoE layer (only with NVFP4).
             # It might be overridden in `_try_attach_nvfp4_scale` function.
-            return_hp_output=layer_type == "E" and self.is_nvfp4,
+            return_hp_output=self.is_moe_layer and self.is_nvfp4,
         )
+
+        if fuse_allreduce_norm and layer_idx > 0:
+            self.pre_allreduce = AllReduce(
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+            )
+
+        # Mixer creation.  The fuse_allreduce_norm optimization is orthogonal
+        # to AllReduce topology: Transformer/MoE gate it at forward time via
+        # AllReduceParams; MLP/Mamba gate it at init time via reduce_output
+        # (their base classes don't thread all_reduce_params through forward).
+        has_tp_allreduce = (not model_config.mapping.enable_attention_dp
+                            and model_config.mapping.tp_size > 1)
 
         if layer_type == "M":
             self.mixer = Mamba2Mixer(
@@ -399,19 +459,27 @@ class NemotronHLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 config=model_config,
             )
+            if fuse_allreduce_norm:
+                self.mixer.out_proj.reduce_output = False
         elif layer_type == "-":
-            self.mixer = MLPLayer(model_config, layer_idx)
+            self.mixer = MLPLayer(
+                model_config,
+                layer_idx,
+                reduce_output=not fuse_allreduce_norm,
+            )
         elif layer_type == "*":
             self.mixer = TransformerLayer(
                 model_config,
                 layer_idx,
-                reduce_output=not model_config.mapping.enable_attention_dp
-                and model_config.mapping.tp_size > 1,
+                reduce_output=has_tp_allreduce,
             )
         elif layer_type == "E":
-            self.mixer = NemotronHMOE(model_config,
-                                      layer_idx=layer_idx,
-                                      aux_stream_dict=aux_stream_dict)
+            self.mixer = NemotronHMOE(
+                model_config,
+                layer_idx=layer_idx,
+                aux_stream_dict=aux_stream_dict,
+                reduce_output=has_tp_allreduce,
+            )
         else:
             raise ValueError(f"{layer_type} is not supported")
 
@@ -436,7 +504,7 @@ class NemotronHLayer(DecoderLayer):
 
         # Special handling for MoE layer: fetch shared_expert.up_proj.input_scale
         # as representation of the input scale.
-        if self.layer_type == "E":
+        if self.is_moe_layer:
             if (hasattr(self.mixer, "shared_experts")
                     and self.mixer.shared_experts is not None
                     and hasattr(self.mixer.shared_experts, "up_proj")
@@ -458,21 +526,58 @@ class NemotronHLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor | None = None,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = torch.zeros_like(hidden_states)
 
-        if self.norm.return_hp_output:
+        if hasattr(self, 'pre_allreduce'):
+            norm = self.norm
+            has_nvfp4_scale = hasattr(norm, 'nvfp4_scale')
+            if norm.is_nvfp4 and has_nvfp4_scale and norm.return_hp_output:
+                fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+            elif norm.is_nvfp4 and has_nvfp4_scale:
+                fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
+            else:
+                fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+            all_reduce_params = AllReduceParams(
+                fusion_op=fusion_op,
+                residual=residual,
+                norm_weight=norm.weight,
+                eps=norm.variance_epsilon,
+                trigger_completion_at_end=False,
+                **(dict(scale=norm.nvfp4_scale)
+                   if has_nvfp4_scale and norm.is_nvfp4 else {}),
+            )
+            result = self.pre_allreduce(hidden_states,
+                                        all_reduce_params=all_reduce_params)
+            if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+                norm_out, act_fp4, act_sf, residual = result
+                hidden_states = (Fp4QuantizedTensor(act_fp4, act_sf), norm_out)
+            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                act_fp4, act_sf, residual = result
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = result
+        elif self.norm.return_hp_output:
             hidden_states, residual, high_precision_normed_output = self.norm(
                 hidden_states, residual)
             hidden_states = (hidden_states, high_precision_normed_output)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
-        hidden_states = self.mixer(hidden_states,
-                                   attn_metadata,
-                                   spec_metadata=spec_metadata,
-                                   **kwargs)
+
+        # When fuse_allreduce_norm is active, tell Transformer/MoE mixers to
+        # skip their own AllReduce (it is handled by pre_allreduce /
+        # final_allreduce instead).  MLP/Mamba ignore this kwarg; their
+        # reduce_output was set at init time.
+        mixer_kwargs = dict(spec_metadata=spec_metadata,
+                            lora_params=lora_params,
+                            **kwargs)
+        if self.fuse_allreduce_norm:
+            mixer_kwargs['all_reduce_params'] = AllReduceParams(
+                enable_allreduce=False)
+        hidden_states = self.mixer(hidden_states, attn_metadata, **mixer_kwargs)
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
@@ -519,14 +624,20 @@ class NemotronHModel(DecoderModel):
                 gather_output=True,
             )
 
+        self.fuse_allreduce_norm = (not model_config.mapping.enable_attention_dp
+                                    and model_config.mapping.tp_size > 1)
+
         # create layers
         layers = []
         for layer_idx, layer_type in enumerate(config.hybrid_override_pattern):
             layers.append(
-                NemotronHLayer(model_config,
-                               layer_idx,
-                               layer_type,
-                               aux_stream_dict=self.aux_stream_dict))
+                NemotronHLayer(
+                    model_config,
+                    layer_idx,
+                    layer_type,
+                    aux_stream_dict=self.aux_stream_dict,
+                    fuse_allreduce_norm=self.fuse_allreduce_norm,
+                ))
         self.layers = nn.ModuleList(layers)
         self.num_hidden_layers = config.num_hidden_layers
 
@@ -537,6 +648,13 @@ class NemotronHModel(DecoderModel):
             dtype=config.torch_dtype,
         )
 
+        # AllReduce for fusing with final norm (after last layer's mixer)
+        if self.fuse_allreduce_norm:
+            self.final_allreduce = AllReduce(
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+            )
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -544,6 +662,7 @@ class NemotronHModel(DecoderModel):
         position_ids: torch.IntTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -565,9 +684,22 @@ class NemotronHModel(DecoderModel):
                 residual=residual,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
                 mamba_metadata=mamba_metadata,
             )
-        hidden_states, _ = self.norm_f(hidden_states, residual)
+
+        if self.fuse_allreduce_norm:
+            hidden_states, _ = self.final_allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.norm_f.weight,
+                    eps=self.norm_f.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ))
+        else:
+            hidden_states, _ = self.norm_f(hidden_states, residual)
         return hidden_states
 
 
@@ -656,6 +788,40 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         # TODO: Remove enable_block_reuse=False once KV cache block reuse
         # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
+
+    @staticmethod
+    def lora_config(model_dir: str):
+        """Nemotron-H-specific LoRA configuration.
+
+        Nemotron-H is a hybrid Mamba-Attention-MoE model. The LoRA targets
+        cover attention (q/k/v/o), Mamba (in/out proj), shared expert MLP.
+        """
+        return LoraConfig(
+            lora_target_modules=[
+                "attn_q",
+                "attn_k",
+                "attn_v",
+                "attn_dense",
+                "mamba_in_proj",
+                "mamba_out_proj",
+                "shared_expert_h_to_4h",
+                "shared_expert_4h_to_h",
+                "moe_latent_fc1",
+                "moe_latent_fc2",
+            ],
+            trtllm_modules_to_hf_modules={
+                "attn_q": "q_proj",
+                "attn_k": "k_proj",
+                "attn_v": "v_proj",
+                "attn_dense": "o_proj",
+                "mamba_in_proj": "in_proj",
+                "mamba_out_proj": "out_proj",
+                "shared_expert_h_to_4h": "shared_experts.up_proj",
+                "shared_expert_4h_to_h": "shared_experts.down_proj",
+                "moe_latent_fc1": "fc1_latent_proj",
+                "moe_latent_fc2": "fc2_latent_proj",
+            },
+        )
 
 
 class NemotronHMTPDecoderLayer(NemotronHLayer):
@@ -761,6 +927,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.has_start_projections:
@@ -790,6 +957,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states = self.mixer(
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -885,6 +1053,7 @@ class NemotronHMTP(nn.Module):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: list[int] | None = None,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         inputs_embeds = embed_tokens(input_ids)
@@ -898,6 +1067,7 @@ class NemotronHMTP(nn.Module):
                 residual=residual,
                 attn_metadata=attn_metadata,
                 all_rank_num_tokens=all_rank_num_tokens,
+                lora_params=lora_params,
             )
         return hidden_states
 

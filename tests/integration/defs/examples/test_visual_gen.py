@@ -38,7 +38,7 @@ WAN_T2V_WIDTH = 832
 WAN_T2V_NUM_FRAMES = 165
 
 # LTX-2 configuration
-LTX2_MODEL_SUBPATH = "ltx-video-2-0.9.7"
+LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
 LTX2_T2V_PROMPT = (
     "A woman with long brown hair and light skin smiles at the camera while "
@@ -324,12 +324,12 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
     from tensorrt_llm.serve.media_storage import MediaStorage
 
     scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, LTX2_MODEL_SUBPATH)
+    model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
     text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
-    if not os.path.isdir(model_path):
+    if not os.path.isfile(model_path):
         pytest.skip(
-            f"LTX-2 model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {LTX2_MODEL_SUBPATH} under scratch)"
+            f"LTX-2 checkpoint not found: {model_path} "
+            f"(set LLM_MODELS_ROOT or place {LTX2_MODEL_CHECKPOINT_PATH} under models root)"
         )
     if not os.path.isdir(text_encoder_path):
         pytest.skip(

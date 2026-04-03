@@ -26,7 +26,8 @@ import yaml
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
-from ..conftest import get_llm_root, llm_models_root, trt_environment
+from ..conftest import (get_device_count, get_llm_root, llm_models_root,
+                        trt_environment)
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
@@ -974,6 +975,15 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
+        try:
+            available_gpus = get_device_count()
+        except Exception:
+            available_gpus = None
+        if available_gpus is not None and self.num_gpus > available_gpus:
+            pytest.skip(
+                f"Test requires {self.num_gpus} GPUs but only {available_gpus} available"
+            )
+
     def get_model_family(self) -> str:
         """
         Get the model family of the current model.
@@ -1213,17 +1223,31 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                             llm_models_root(), actual_lora_path)
                 lora_dir = os.path.join(engine_dir, "loras")
                 data_cmd += [f"mkdir -p {lora_dir}", ";"]
-                if len(actual_lora_paths) != nloras:
+                if len(actual_lora_paths) < nloras:
+                    # Replicate paths cyclically to match the requested count
+                    actual_lora_paths = [
+                        actual_lora_paths[i % len(actual_lora_paths)]
+                        for i in range(nloras)
+                    ]
+                elif len(actual_lora_paths) > nloras:
                     raise ValueError(
-                        f"Number of LoRA paths ({len(actual_lora_paths)}) does not match requested number of LoRAs ({nloras})"
+                        f"Number of LoRA paths ({len(actual_lora_paths)}) exceeds requested number of LoRAs ({nloras})"
                     )
                 for i, lora_path in enumerate(actual_lora_paths):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
                     data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
                 data_cmd += [
-                    "trtllm-bench", f"--model={tokenizer_dir}",
-                    "prepare-dataset", "--output", f"{dataset_path}",
-                    f"--rand-task-id 0 {nloras-1}", f"--lora-dir={lora_dir}",
+                    "trtllm-bench",
+                    f"--model={tokenizer_dir}",
+                    "prepare-dataset",
+                    "--output",
+                    f"{dataset_path}",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--lora-dir={lora_dir}",
+                ]
+                if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+                    data_cmd += ["--trust-remote-code"]
+                data_cmd += [
                     f"token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
@@ -1240,8 +1264,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             if self._build_script == 'trtllm-bench':
                 data_cmd += [
-                    "trtllm-bench", f"--model={tokenizer_dir}",
-                    "prepare-dataset", "--output", f"{dataset_path}",
+                    "trtllm-bench",
+                    f"--model={tokenizer_dir}",
+                    "prepare-dataset",
+                    "--output",
+                    f"{dataset_path}",
+                ]
+                if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+                    data_cmd += ["--trust-remote-code"]
+                data_cmd += [
                     "token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",

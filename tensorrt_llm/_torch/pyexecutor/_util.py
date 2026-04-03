@@ -31,6 +31,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid)
+from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -333,6 +334,14 @@ class KvCacheCreator:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += ceil_div(num_req_tokens, self._tokens_per_block)
+
+        # With ADP enabled, _create_dummy_context_requests produces tp_size
+        # copies so each rank gets work during the estimation warmup. But the
+        # scheduler distributes them evenly (1 per rank), so each rank's KV
+        # cache only needs capacity for its own share, not all of them.
+        if self._mapping.enable_attention_dp and self._mapping.tp_size > 1:
+            num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
+                                1) // self._mapping.tp_size
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
@@ -1027,6 +1036,17 @@ def _create_kv_cache_manager(
             )
         hybrid_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
             config)
+        # For hybrid models, hybrid_layer_mask is always passed as
+        # layer_mask to KVCacheManager, which means get_pp_layers
+        # sees a non-None layer_mask and won't auto-add spec layers.
+        # Extend the masks here to include MTP spec layers (full
+        # attention, no linear states) so they get KV cache entries.
+        if spec_config is not None:
+            from ..speculative.utils import get_num_spec_layers
+            num_spec_layers = get_num_spec_layers(spec_config)
+            if num_spec_layers > 0:
+                hybrid_layer_mask.extend([True] * num_spec_layers)
+                mamba_layer_mask.extend([False] * num_spec_layers)
         num_layers = sum(hybrid_layer_mask)
         num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(
@@ -1114,6 +1134,7 @@ def create_py_executor_instance(
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
+    dwdp_manager: Optional[DwdpManager] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -1133,6 +1154,8 @@ def create_py_executor_instance(
 
     peft_cache_manager = None
     if lora_config is not None:
+        # TODO: Refactor dimension resolution into a LoraModuleDimensions
+        # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
@@ -1180,6 +1203,26 @@ def create_py_executor_instance(
         if moe_intermediate is not None and moe_intermediate > 0:
             moe_hidden_size = moe_intermediate // mapping.tp_size
 
+        # Mamba dimensions for hybrid models (e.g., Nemotron-H)
+        # d_inner = mamba_head_dim * mamba_num_heads
+        # d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
+        mamba_in_proj_size = 0
+        mamba_inner_size = 0
+        mamba_head_dim = getattr(pretrained_config, 'mamba_head_dim', 0)
+        mamba_num_heads = getattr(pretrained_config, 'mamba_num_heads', 0)
+        if mamba_head_dim > 0 and mamba_num_heads > 0:
+            d_inner = mamba_head_dim * mamba_num_heads
+            mamba_inner_size = d_inner // mapping.tp_size
+            n_groups = getattr(pretrained_config, 'n_groups', 1)
+            d_state = getattr(pretrained_config, 'ssm_state_size', 128)
+            d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
+            mamba_in_proj_size = d_in_proj // mapping.tp_size
+
+        # MoE latent size for latent MoE models (e.g., Nemotron-H SuperV3).
+        # Latent projections are replicated (not TP-sharded), so pass the
+        # raw config value without dividing by tp_size.
+        moe_latent_size = getattr(pretrained_config, 'moe_latent_size', 0) or 0
+
         # For MoE models with shared experts: replace mlp_* target modules with
         # shared_expert_* equivalents. The shared expert uses different LoRA
         # module types with their own intermediate size. For pure MoE models
@@ -1210,7 +1253,10 @@ def create_py_executor_instance(
             tp_size=mapping.tp_size,
             num_experts=num_experts,
             shared_expert_hidden_size=shared_expert_hidden_size,
-            moe_hidden_size=moe_hidden_size)
+            moe_hidden_size=moe_hidden_size,
+            mamba_in_proj_size=mamba_in_proj_size,
+            mamba_inner_size=mamba_inner_size,
+            moe_latent_size=moe_latent_size)
 
         model_binding_config.use_lora_plugin = True
         model_binding_config.lora_modules = lora_modules
@@ -1327,6 +1373,7 @@ def create_py_executor_instance(
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
+
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -1351,7 +1398,9 @@ def create_py_executor_instance(
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
-        waiting_queue_policy=waiting_queue_policy)
+        waiting_queue_policy=waiting_queue_policy,
+        dwdp_manager=dwdp_manager,
+    )
 
 
 def create_torch_sampler_args(
@@ -1421,9 +1470,10 @@ def instantiate_sampler(
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if llm_args.sampler_type == SamplerType.TRTLLMSampler or (
-            llm_args.sampler_type == SamplerType.auto
-            and decoding_mode.isBeamSearch()):
+    if llm_args.sampler_type == SamplerType.TRTLLMSampler:
+        logger.warning(
+            "TRTLLMSampler is deprecated and will be removed in release 1.4. Please use TorchSampler instead."
+        )
         logger.debug(f"DecodingMode: {decoding_mode.name}")
         return TRTLLMSampler(engine.model,
                              engine.dtype,

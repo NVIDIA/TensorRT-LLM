@@ -165,6 +165,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_mixed.yaml",
         "overlap":
         f"{test_configs_root}/disagg_config_overlap.yaml",
+        "overlap_gen_first":
+        f"{test_configs_root}/disagg_config_overlap_gen_first.yaml",
+        "overlap_gen_first_pp4":
+        f"{test_configs_root}/disagg_config_overlap_gen_first_pp4.yaml",
         "overlap_transceiver_runtime_python":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
         "tool_calls":
@@ -299,7 +303,7 @@ def get_client_test_set(test_desc):
                              verify_streaming_completion=True,
                              verify_chat=False,
                              verify_streaming_chat=False)
-    if test_desc in ("overlap", "trtllm_sampler"):
+    if test_desc.startswith("overlap") or test_desc == "trtllm_sampler":
         return ClientTestSet(completion=True,
                              completion_streaming=True,
                              chat=True,
@@ -454,6 +458,7 @@ def setup_disagg_cluster(
     env: dict[str, str] | None = None,
     cwd: str | None = None,
     server_start_timeout: int = 300,
+    schedule_style: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -463,6 +468,7 @@ def setup_disagg_cluster(
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
         server_start_timeout: Timeout in seconds for server to become ready
+        schedule_style: Disagg schedule style ('context_first' or 'generation_first')
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -554,6 +560,8 @@ def setup_disagg_cluster(
             "perf_metrics_max_requests":
             config.get("perf_metrics_max_requests", 0),
         }
+        if schedule_style:
+            server_config["schedule_style"] = schedule_style
         disagg_server = run_disagg_server(server_config,
                                           work_dir,
                                           server_port,
@@ -578,7 +586,8 @@ def run_disaggregated_test(example_dir,
                            prompt_file="prompts.json",
                            extra_endpoints_test=None,
                            model_path=None,
-                           cwd=None):
+                           cwd=None,
+                           disagg_schedule_style=None):
     """Run disaggregated test using service discovery instead of MPI."""
 
     if mpi_disabled():
@@ -589,7 +598,8 @@ def run_disaggregated_test(example_dir,
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=env, cwd=cwd)
+        setup_disagg_cluster(config_file, model_name=model_path, env=env, cwd=cwd,
+                             schedule_style=disagg_schedule_style)
 
     server_host = config.get("hostname", "localhost")
 
@@ -851,6 +861,29 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
                            "overlap",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
+def test_disaggregated_overlap_gen_first(disaggregated_test_root,
+                                         disaggregated_example_root, llm_venv,
+                                         llama_model_root, ctx_pp):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        disagg_schedule_style="generation_first")
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
