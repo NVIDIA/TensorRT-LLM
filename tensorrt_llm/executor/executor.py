@@ -291,22 +291,28 @@ class GenerationExecutor(ABC):
                 self.shutdown()
             raise error
 
-        # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
-        # more than one error.
+        # Drain the first error from the queue.  Per-request errors
+        # (str / RequestError) are re-raised without marking the executor
+        # fatal; only system-level errors trigger shutdown.
         if not self._error_queue.empty():
             e = self._error_queue.get()
             self._error_queue.task_done()
-            self._set_fatal_error(e)
-            self.shutdown()
-            # We can catch some exceptions here.
+            if isinstance(e, str):
+                e = RequestError(e)
+            elif not isinstance(e, BaseException):
+                e = RuntimeError(repr(e))
+            if not isinstance(e, RequestError):
+                self._set_fatal_error(e)
+                self.shutdown()
             raise e
 
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record an unrecoverable engine error.
 
         Only the first error is kept; subsequent calls are no-ops.
-        Thread-safe under CPython's GIL (single-bytecode reference
-        assignment).
+        A narrow TOCTOU race exists (two threads could both pass the
+        ``is None`` check), but the consequence is merely a different
+        error in the log — both are fatal and both trigger shutdown.
 
         Args:
             error: The exception to record as the fatal error.

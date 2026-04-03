@@ -33,7 +33,7 @@ import signal
 import threading
 import time
 from concurrent.futures import Future
-from queue import Queue
+from queue import Empty, Queue
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -129,7 +129,7 @@ class ConcreteExecutor:
                 if not isinstance(e, str):
                     self._set_fatal_error(e)
                     self.doing_shutdown = True
-            except Exception:
+            except Empty:
                 pass
             return self._fatal_error is None and not self.doing_shutdown
         return True
@@ -144,7 +144,7 @@ class ConcreteProxyExecutor(ConcreteExecutor):
     def __init__(self):
         super().__init__()
         self.mpi_futures: list = []
-        self._shutdown_called: bool = False
+        self._pre_shutdown_called: bool = False
 
     def check_health(self) -> bool:
         if not super().check_health():
@@ -156,7 +156,7 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                     error = exc or RuntimeError("MPI worker exited unexpectedly")
                     self._set_fatal_error(error)
                     if not self.doing_shutdown:
-                        self.shutdown()
+                        self.pre_shutdown()
                     return False
         return True
 
@@ -170,7 +170,7 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                             error = exc or RuntimeError("MPI worker exited unexpectedly")
                             self._set_fatal_error(error)
                             if not self.doing_shutdown:
-                                self.shutdown()
+                                self.pre_shutdown()
                             return
                 if not self._error_queue.empty():
                     try:
@@ -180,8 +180,8 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                             continue
                         self._set_fatal_error(e)
                         if not self.doing_shutdown:
-                            self.shutdown()
-                    except Exception:
+                            self.pre_shutdown()
+                    except Empty:
                         pass
                     if self._fatal_error is not None:
                         return
@@ -192,9 +192,9 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                     return
                 time.sleep(0.01)
 
-    def shutdown(self):
+    def pre_shutdown(self):
         self.doing_shutdown = True
-        self._shutdown_called = True
+        self._pre_shutdown_called = True
 
 
 # ===========================================================================
@@ -414,7 +414,7 @@ class TestErrorMonitorLoop:
 
         assert not t.is_alive()
         assert executor._fatal_error is not None
-        assert executor._shutdown_called
+        assert executor._pre_shutdown_called
 
     def test_detects_error_queue_item(self):
         executor = ConcreteProxyExecutor()

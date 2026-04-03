@@ -137,8 +137,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         Extends the base ``check_health()`` with MPI worker future
         inspection.  If any worker future has completed (indicating a
-        crash or unexpected exit), the error is recorded and shutdown
-        is initiated.
+        crash or unexpected exit), the error is recorded and
+        ``pre_shutdown()`` is called (not ``shutdown()``, which would
+        block on ``f.result()`` for surviving workers).
 
         Returns:
             True if the executor and all MPI workers are healthy.
@@ -153,7 +154,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                         "MPI worker exited unexpectedly")
                     self._set_fatal_error(error)
                     if not self.doing_shutdown:
-                        self.shutdown()
+                        self.pre_shutdown()
                     return False
         return True
 
@@ -168,9 +169,10 @@ class GenerationExecutorProxy(GenerationExecutor):
            ``_handle_background_error``, which is intended for the main
            thread and calls ``shutdown()`` + ``raise``).
 
-        On detection, sets ``_fatal_error`` and calls ``shutdown()``.
-        The thread exits when ``doing_shutdown`` or ``_fatal_error`` is
-        set.
+        On detection, sets ``_fatal_error`` and calls ``pre_shutdown()``
+        (not ``shutdown()``, which would block on ``f.result()`` for
+        surviving workers).  The thread exits when ``doing_shutdown`` or
+        ``_fatal_error`` is set.
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
@@ -186,7 +188,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                                 "Error monitor: MPI worker crash detected, "
                                 "shutting down")
                             if not self.doing_shutdown:
-                                self.shutdown()
+                                self.pre_shutdown()
                             return
 
                 # Drain the error queue directly instead of calling
@@ -204,7 +206,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                             "Error monitor: background error detected: "
                             f"{repr(e)}")
                         if not self.doing_shutdown:
-                            self.shutdown()
+                            self.pre_shutdown()
                     except Exception:
                         pass
                     if self._fatal_error is not None:
@@ -392,8 +394,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self._abort_all_requests()
 
-        # notify the workers to quit
-        if all(not f.done() for f in self.mpi_futures):
+        # Notify surviving workers to quit.  Use any() instead of all()
+        # so the sentinel is sent even when some workers have already died.
+        if any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
