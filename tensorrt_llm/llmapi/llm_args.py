@@ -179,12 +179,13 @@ class CudaGraphConfig(StrictBaseModel):
             batch_sizes += [
                 2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
             ]
-            # Filter and sort batch sizes
-            batch_sizes = sorted(
-                [size for size in batch_sizes if size <= max_batch_size])
+
+        # Filter and sort batch sizes for both branches
+        batch_sizes = sorted(
+            [size for size in batch_sizes if size <= max_batch_size])
 
         # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
+        if not batch_sizes or max_batch_size != batch_sizes[-1]:
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
