@@ -641,6 +641,16 @@ public:
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    //! \details Makes blocks reusable immediately so concurrent requests sharing the same
+    //! prefix can find them before the full context finishes processing. SWA windows are
+    //! skipped because their block boundaries shift as the context grows.
+    //! \param sequence The generation request whose chunk just completed.
+    //! \param llmRequest The LLM request with token data and metadata.
+    //! \param processedTokens Token count after the chunk end (i.e. getContextCurrentPosition()).
+    void storeChunkedContextBlocks(
+        GenerationRequest& sequence, LlmRequest const& llmRequest, SizeType32 processedTokens);
+
     //! \brief Pin blocks associated with a sequence to prevent eviction.
     void pinBlocks(GenerationRequest& sequence);
 
@@ -681,6 +691,7 @@ public:
 
     // Get num free blocks in the primary memory pool
     [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
+    [[nodiscard]] SizeType32 getNumTrulyFreeBlocks() const noexcept;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
@@ -1182,6 +1193,23 @@ public:
         return numFreeBlocksPerWindowSize;
     }
 
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumTrulyFreeBlocksPerWindowSize() const
+    {
+        std::map<SizeType32, SizeType32> result;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            // In variable-window (multi-window) configs, SWA windows are excluded from
+            // the truly-free count since their eviction behavior differs from full-attention
+            // windows. In single-window configs, even SWA windows are included normally.
+            if (mIsVariableWindow && manager.isSWA())
+            {
+                continue;
+            }
+            result[windowSize] = manager.getNumTrulyFreeBlocks();
+        }
+        return result;
+    }
+
     [[nodiscard]] SizeType32 getNumFreeBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumFreeBlocks(); });
@@ -1365,6 +1393,11 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    //! \details Delegates to each non-SWA WindowBlockManager.
+    void storeChunkedContextBlocks(
+        GenerationRequest& sequence, LlmRequest const& llmRequest, SizeType32 processedTokens);
+
     //! \brief Store newest block for reuse
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
@@ -1529,6 +1562,11 @@ public:
 
     [[nodiscard]] virtual SizeType32 getNumFreeBlocks() const = 0;
 
+    [[nodiscard]] virtual std::map<SizeType32, SizeType32> getNumTrulyFreeBlocksPerWindowSize() const
+    {
+        return {};
+    }
+
     [[nodiscard]] virtual SizeType32 getNumPools() const = 0;
 
     // only used by test
@@ -1633,6 +1671,13 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
+
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    //! \details Called after each non-final context chunk. Blocks become reusable
+    //! immediately, enabling prefix sharing with concurrent requests before the full
+    //! context finishes. Implementations that do not support chunked prefill may
+    //! leave this as a no-op.
+    virtual void storeChunkedContextBlocks([[maybe_unused]] LlmRequest const& llmRequest) {}
 
     //! \brief Store newest block for reuse.
     //! \details This block become reusable from next step.
@@ -1859,6 +1904,8 @@ public:
         return mBlockManager.getNumFreeBlocksPerWindowSize();
     }
 
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumTrulyFreeBlocksPerWindowSize() const override;
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
@@ -2007,6 +2054,9 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     void storeContextBlocks(LlmRequest const& llmRequest) override;
+
+    //! \brief Store full blocks from a completed context chunk for early reuse.
+    void storeChunkedContextBlocks(LlmRequest const& llmRequest) override;
 
     //! \brief Store newest blocks for reuse
     void storeNewBlock(LlmRequest const& llmRequest) override;

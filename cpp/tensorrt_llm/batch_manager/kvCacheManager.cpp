@@ -806,6 +806,23 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
     }
 }
 
+void BlockManager::storeChunkedContextBlocks(
+    GenerationRequest& sequence, LlmRequest const& llmRequest, SizeType32 processedTokens)
+{
+    // Iterate in descending window-size order to match storeContextBlocks convention.
+    for (auto it = mWindowBlockManagers.rbegin(); it != mWindowBlockManagers.rend(); ++it)
+    {
+        auto& [windowSize, manager] = *it;
+        // Intermediate storage is only valid for full-attention windows. SWA windows evict
+        // out-of-window blocks as context grows, making intermediate block boundaries unstable.
+        if (manager.isSWA())
+        {
+            continue;
+        }
+        manager.storeChunkedContextBlocks(sequence, llmRequest, processedTokens);
+    }
+}
+
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
 {
     SizeType32 const numEltsPerContainer = getNumEltsPerContainer();
@@ -1786,6 +1803,11 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
     return mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
 }
 
+SizeType32 WindowBlockManager::getNumTrulyFreeBlocks() const noexcept
+{
+    return mEvictionPolicy->getNumTrulyFreeBlocks(kPrimaryLevel);
+}
+
 std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::chrono::milliseconds> timeout) const
 {
     return mEventManager ? mEventManager->getEvents(timeout) : std::deque<tle::KVCacheEvent>{};
@@ -1948,6 +1970,54 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
         return;
     }
     TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
+    (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+}
+
+void WindowBlockManager::storeChunkedContextBlocks(
+    GenerationRequest& sequence, LlmRequest const& llmRequest, SizeType32 processedTokens)
+{
+    // isSWA() is checked by BlockManager::storeChunkedContextBlocks before calling here,
+    // but guard defensively in case this method is called directly.
+    TLLM_CHECK_WITH_INFO(!mIsSWA, "storeChunkedContextBlocks must not be called for SWA windows");
+
+    auto const requestId = sequence.getRequestId();
+
+    // If a block was evicted from this sequence mid-flight, its KV data may have been
+    // overwritten. Honour the same validity guard used by releaseBlocks.
+    if (!isSequenceValidForStoreForReuse(requestId))
+    {
+        TLLM_LOG_DEBUG("%s::storeChunkedContextBlocks - sequence %lu not valid for store for reuse, skipping",
+            mLogPrefix.c_str(), requestId);
+        return;
+    }
+
+    constexpr int beamIdx = 0;
+    auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+
+    // processedTokens is the position after the chunk completes (getContextCurrentPosition()).
+    // Apply the same -1 convention as storeContextBlocks and storeNewBlock: the last
+    // processed token's KV state is written during the next forward pass, so exclude it.
+    auto const numStorableTokens = std::min(static_cast<SizeType32>(uniqueTokens.size()), processedTokens) - 1;
+
+    if (numStorableTokens <= 0)
+    {
+        return;
+    }
+
+    TLLM_LOG_DEBUG("%s::storeChunkedContextBlocks for request %lu, %d storable tokens (processedTokens=%d)",
+        mLogPrefix.c_str(), requestId, numStorableTokens, processedTokens);
+
+    // allowPartial=false: only complete blocks are stored. The partial block at the end of a
+    // chunk (with fewer than mTokensPerBlock tokens) is not yet stable and will be completed
+    // by a subsequent chunk or left to storeContextBlocks at context completion.
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, numStorableTokens, mTokensPerBlock, false);
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+
+    // storeBlocks is idempotent for already-stored blocks: findMatchingBlock returns the
+    // existing block and the function simply traverses past it without re-insertion.
+    // This means the final storeContextBlocks call will safely re-traverse the same prefix.
     (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
 }
 
@@ -2229,6 +2299,11 @@ void KVCacheManager::releasePools()
 void KVCacheManager::startScheduling()
 {
     mBlockManager.startScheduling();
+}
+
+std::map<SizeType32, SizeType32> KVCacheManager::getNumTrulyFreeBlocksPerWindowSize() const
+{
+    return mBlockManager.getNumTrulyFreeBlocksPerWindowSize();
 }
 
 SizeType32 KVCacheManager::getNeededBlocksOneStep(
@@ -2609,6 +2684,34 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     {
         TLLM_LOG_WARNING("[kv cache manager] storeContextBlocks: Can not find sequence for request %lu", requestId);
     }
+}
+
+void KVCacheManager::storeChunkedContextBlocks(LlmRequest const& llmRequest)
+{
+    auto const requestId = llmRequest.mRequestId;
+    bool found = false;
+    {
+        std::scoped_lock lock(mSequencesMtx);
+        found = mSequences.find(requestId) != mSequences.end();
+    }
+    if (!found)
+    {
+        TLLM_LOG_WARNING(
+            "[kv cache manager] storeChunkedContextBlocks: Can not find sequence for request %lu", requestId);
+        return;
+    }
+    if (!mEnableBlockReuse || llmRequest.isDummyRequest())
+    {
+        return;
+    }
+    auto& sequence = getSequence(requestId);
+    // getContextCurrentPosition() has already been advanced by moveToNextContextChunk()
+    // at the call site, so it equals the token count after the chunk end.
+    auto const processedTokens = llmRequest.getContextCurrentPosition();
+    TLLM_CHECK_WITH_INFO(processedTokens > 0,
+        "storeChunkedContextBlocks called with processedTokens=0; "
+        "moveToNextContextChunk() must be called before this method");
+    mBlockManager.storeChunkedContextBlocks(sequence, llmRequest, processedTokens);
 }
 
 void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)

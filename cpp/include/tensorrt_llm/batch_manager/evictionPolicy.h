@@ -45,6 +45,9 @@ public:
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
     /// @brief Get the amount of free blocks in the primary memory pool
     virtual SizeType32 getNumFreeBlocks(SizeType32 cacheLevel) = 0;
+    /// @brief Get the amount of free blocks in the primary memory pool that are NOT in the radix tree
+    /// (i.e. blocks at priority < kRadixTreeBlockPriority that will be evicted before cached blocks)
+    virtual SizeType32 getNumTrulyFreeBlocks(SizeType32 cacheLevel) = 0;
     /// @brief Claim a free block. Called when the cache manager allocates or reuses a new block
     virtual void claimBlock(BlockPtr block) = 0;
     virtual void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
@@ -78,6 +81,7 @@ public:
     void releaseBlock(BlockPtr block, bool toFront) override;
 
     SizeType32 getNumFreeBlocks(SizeType32 cacheLevel) override;
+    SizeType32 getNumTrulyFreeBlocks(SizeType32 cacheLevel) override;
 
     void claimBlock(BlockPtr block) override;
     void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
