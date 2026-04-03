@@ -25,11 +25,16 @@ from .attention_mask_provider import AttentionMaskProviderRegistry
 def _build_gemma4_token_type_mask(ctx, source_attn_node):
     q_meta = source_attn_node.args[0].meta["val"]
     batch_size, seq_len = q_meta.shape[:2]
+    # Build a FakeTensor with the query's (possibly symbolic) batch/seq dims so that
+    # the placeholder inherits the correct dynamic shape metadata.
+    fake_val = q_meta.new_zeros(batch_size, seq_len, dtype=torch.int64)
     token_type_ids = ctx.add_or_retrieve_input(
         "token_type_ids",
         activate_arg=False,
-        val=torch.zeros(batch_size, seq_len, dtype=torch.int64),
     )
+    # Set fake tensor meta directly — add_graph_input's static_shapes=True would
+    # concretise symbolic dims, but we need them to stay dynamic.
+    token_type_ids.meta["val"] = fake_val
     zeros = ctx.gm.graph.call_function(torch.ops.aten.zeros_like.default, args=(token_type_ids,))
     non_text = ctx.gm.graph.call_function(torch.ops.aten.ne.Scalar, args=(token_type_ids, 0))
 
