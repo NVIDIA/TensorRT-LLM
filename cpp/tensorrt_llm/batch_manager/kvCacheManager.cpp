@@ -1688,6 +1688,15 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             }
             if (pinBlocks)
             {
+                // If the block has no refs it sits in the eviction policy's free
+                // queue. Claim it first so that the later unpinBlocksById /
+                // releaseBlock cycle does not create a duplicate queue entry.
+                // Pass the block's existing priority and duration so that
+                // claimBlock does not clear its retention/expiry metadata.
+                if (!searchRoot->hasRefs())
+                {
+                    mEvictionPolicy->claimBlock(searchRoot, searchRoot->getPriority(), searchRoot->getDurationMs());
+                }
                 searchRoot->incRefCount();
                 pinnedBlockIds.push_back(searchRoot->getBlockId());
             }
@@ -2255,10 +2264,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
             && !req.isDisaggGenerationInitState())
         {
-            auto const uniqueTokens = req.getUniqueTokens(0);
+            auto const& uniqueTokens = req.getUniqueTokens(0);
             auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
+            auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
+            // `addSequence()` ignores the last prompt token because its KV cannot be recovered.
+            // When the prompt lands exactly on a block boundary, counting reusable full blocks from
+            // all unique tokens can over-credit one extra shared block.
+            TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
+            auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
             // Only subtract from shared blocks (reusable blocks are always shared)
-            auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
+            auto const reusableSharedBlocks
+                = std::min({numReusableBlocks, numSharedBlocks, maxRecoverableSharedBlocks});
             numRequiredBlocks -= reusableSharedBlocks;
             // Store on request so the micro batch scheduler can use it for token budget
             req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());

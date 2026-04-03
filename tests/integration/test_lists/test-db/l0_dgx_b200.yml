@@ -324,6 +324,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-attn_dp_on-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-4-attn_dp_on-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-NVFP4-True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[4]
   # ------------- AutoDeploy Perf Sanity ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws4_1k1k] TIMEOUT (120)
 - condition:

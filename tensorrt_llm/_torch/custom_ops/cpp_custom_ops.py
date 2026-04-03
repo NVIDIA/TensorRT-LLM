@@ -1131,3 +1131,9 @@ def _register_fake():
           rotary_embedding_scale, rotary_embedding_base, rotary_embedding_dim,
           rotary_scaling_type, rotary_embedding_max_positions):
         return True
+
+    @torch.library.register_fake("trtllm::convert_req_index_to_global")
+    def _(req_id: torch.Tensor, block_table: torch.Tensor,
+          token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
+          stride_factor: int, layer_id: int) -> torch.Tensor:
+        return torch.empty_like(token_indices)

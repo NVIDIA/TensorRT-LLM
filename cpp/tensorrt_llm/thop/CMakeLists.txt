@@ -90,8 +90,8 @@ add_library(
   noAuxTcOp.cpp
   fusedCatFp8Op.cpp
   FusedCatFp8ScatterOp.cpp
-  IndexerKCacheScatterOp.cpp
   IndexerKCacheGatherOp.cpp
+  IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
@@ -113,6 +113,7 @@ add_library(
   tinygemm2.cpp
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
+  convertReqIndexToGlobalOp.cpp
   trtllmGenQKVProcessOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(

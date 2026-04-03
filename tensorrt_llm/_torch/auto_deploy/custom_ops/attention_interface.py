@@ -1686,6 +1686,79 @@ class CausalConvResourceHandler(StateResourceHandler):
         return (self.conv_dim, self.d_conv - 1)
 
 
+class SpecSSMResourceHandler(StateResourceHandler):
+    """Intermediate SSM state cache descriptor for speculative decoding.
+
+    Acts as a type marker conveying the per-layer SSM shape to the cache interface.
+    The actual buffer shape (including cache_steps = max_draft_len + 1) is determined
+    by the MambaHybridCacheManager using spec_config, not by this handler.
+
+    Inherits from StateResourceHandler (not SSMResourceHandler) so that
+    isinstance(h, SSMResourceHandler) returns False for spec handlers, eliminating
+    the need for exclusion guards throughout the codebase.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        d_state: int,
+        dtype: torch.dtype,
+    ) -> None:
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.d_state = d_state
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int, int]:
+        return (self.num_heads, self.head_dim, self.d_state)
+
+    @classmethod
+    def from_base(cls, base: Optional["SSMResourceHandler"]) -> Optional["SpecSSMResourceHandler"]:
+        """Create a spec handler from a base SSM handler, or return None."""
+        if base is None:
+            return None
+        return cls(
+            num_heads=base.num_heads, head_dim=base.head_dim, d_state=base.d_state, dtype=base.dtype
+        )
+
+
+class SpecCausalConvResourceHandler(StateResourceHandler):
+    """Intermediate conv state cache descriptor for speculative decoding.
+
+    Acts as a type marker conveying the per-layer conv shape to the cache interface.
+    The actual buffer shape (including cache_steps = max_draft_len + 1) is determined
+    by the MambaHybridCacheManager using spec_config, not by this handler.
+
+    Inherits from StateResourceHandler (not CausalConvResourceHandler) so that
+    isinstance(h, CausalConvResourceHandler) returns False for spec handlers.
+    """
+
+    def __init__(
+        self,
+        conv_dim: int,
+        d_conv: int,
+        dtype: torch.dtype,
+    ) -> None:
+        self.conv_dim = conv_dim
+        self.d_conv = d_conv
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int]:
+        return (self.conv_dim, self.d_conv - 1)
+
+    @classmethod
+    def from_base(
+        cls, base: Optional["CausalConvResourceHandler"]
+    ) -> Optional["SpecCausalConvResourceHandler"]:
+        """Create a spec handler from a base conv handler, or return None."""
+        if base is None:
+            return None
+        return cls(conv_dim=base.conv_dim, d_conv=base.d_conv, dtype=base.dtype)
+
+
 class UnpagedResourceHandler(ResourceHandler):
     """Handler for per-token unpaged resources (e.g., unpaged KV caches).
 
