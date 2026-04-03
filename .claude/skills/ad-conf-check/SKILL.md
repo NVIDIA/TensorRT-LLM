@@ -1,32 +1,38 @@
 ---
 name: ad-conf-check
 description: >
-  Check whether AutoDeploy YAML configs were actually applied by analyzing server logs.
-  Use when the user wants to verify config application, debug config issues, or check if
-  AutoDeploy transforms (piecewise CUDA graph, multi-stream, sharding, fusion, etc.) were
-  applied or fell back. Triggers on: "check config", "verify config", "ad-conf-check",
-  "were my configs applied", "config not working", "check if piecewise is enabled",
-  "check log for config", or any request to compare AD YAML settings against runtime behavior.
+  Check whether AutoDeploy YAML configs were actually applied by analyzing server logs
+  and optionally graph dumps (AD_DUMP_GRAPHS_DIR). Use when the user wants to verify
+  config application, debug config issues, or check if AutoDeploy transforms (piecewise
+  CUDA graph, multi-stream, sharding, fusion, etc.) were applied or fell back. Triggers
+  on: "check config", "verify config", "ad-conf-check", "were my configs applied",
+  "config not working", "check if piecewise is enabled", "check log for config", or any
+  request to compare AD YAML settings against runtime behavior.
 ---
 
 # AutoDeploy Config Checker
 
-Verify that AutoDeploy YAML configs were applied at runtime by cross-referencing with server logs.
+Verify that AutoDeploy YAML configs were applied at runtime by cross-referencing with server logs and optionally graph dumps.
 
 ## Workflow
 
-1. Ask the user for two inputs:
-   - **YAML config file path(s)** — one or more AutoDeploy configs used for the run. When multiple YAMLs are provided, they are deep-merged left-to-right: **later files override earlier ones** for overlapping keys. Tell the user: *"If you have multiple configs (e.g., a default config and a user override), list them in priority order — lowest priority first, highest priority last."*
-   - **Server log file path** — the log output from the server
+1. Ask the user for three inputs:
+   - **YAML config file path(s)** (required) — one or more AutoDeploy configs used for the run. When multiple YAMLs are provided, they are deep-merged left-to-right: **later files override earlier ones** for overlapping keys. Tell the user: *"If you have multiple configs (e.g., a default config and a user override), list them in priority order — lowest priority first, highest priority last."*
+   - **Server log file path** (required) — the log output from the server
+   - **Graph dump directory** (optional but recommended) — the `AD_DUMP_GRAPHS_DIR` output directory containing per-transform graph snapshots. Files are named `NNN_stage_transform.txt` and show the graph AFTER each transform. When provided, the checker uses graph analysis to provide additional evidence (e.g., verifying sharded weights, collective ops, fused ops). This is especially useful for resolving UNKNOWN results.
    - Example configs: `examples/auto_deploy/model_registry/configs/*.yaml`
 
 2. Run the checker script:
    ```bash
    python3 <skill_dir>/scripts/check_config.py <yaml_path1> [<yaml_path2> ...] --log <log_path>
    ```
+   With graph dump directory:
+   ```bash
+   python3 <skill_dir>/scripts/check_config.py <yaml_path1> [<yaml_path2> ...] --log <log_path> --graph-dir <graph_dir>
+   ```
    To save results to file (if requested):
    ```bash
-   python3 <skill_dir>/scripts/check_config.py <yaml_path1> [<yaml_path2> ...] --log <log_path> --output <output_path>
+   python3 <skill_dir>/scripts/check_config.py <yaml_path1> [<yaml_path2> ...] --log <log_path> --graph-dir <graph_dir> --output <output_path>
    ```
 
 3. **ALWAYS show the full detailed table to the user.** Do NOT summarize or condense the script output. Present the complete table as-is with all rows. The table has 3 columns:
@@ -64,3 +70,11 @@ Verify that AutoDeploy YAML configs were applied at runtime by cross-referencing
 - **Runtime may adjust configured values.** For example, `max_seq_len` may be configured as 262144 but adjusted down to 16384 at runtime due to memory constraints. The script reports this as APPLIED with a WARNING annotation.
 - The script handles ANSI color codes in logs (AutoDeploy uses colored log output).
 - For configs where the generic fallback marks UNKNOWN, manually grep the log using patterns from [references/config_log_patterns.md](references/config_log_patterns.md).
+
+### Graph Dump Analysis
+
+- **Graph evidence upgrades UNKNOWN.** When a config is UNKNOWN from log analysis alone, graph evidence can upgrade it to APPLIED (e.g., `simple_shard_filter` confirmed by seeing collective ops after lm_head in the post-sharding graph).
+- **Graph evidence supplements APPLIED.** For configs already confirmed by logs, graph analysis appends additional proof (e.g., "120 all_reduce ops use SYMM_MEM") separated by `|` in the Evidence column.
+- **Graph files are named `NNN_stage_transform.txt`.** Each file contains the FX graph AFTER that transform. The script compares before/after graphs by reading consecutive files.
+- **Graph analysis verifies**: sharding (collective ops, weight shape changes), attention backend (op types), MoE fusion (fused op presence), GEMM fusion (linear op count changes), RMSNorm/SwiGLU/RoPE pattern matching (custom op presence).
+- **Graph dir is optional.** The script works without it — graph analysis only adds supplementary evidence when available. See [references/graph_verification_patterns.md](references/graph_verification_patterns.md) for the full list of graph-based checks.

@@ -2,11 +2,16 @@
 """Check whether AutoDeploy YAML configs were actually applied based on server log.
 
 Usage:
-    python3 check_config.py <yaml_path> [<yaml_path2> ...] <log_path> [--output <output_path>]
+    python3 check_config.py <yaml_path> [<yaml_path2> ...] --log <log_path> [--graph-dir <dir>] [--output <output_path>]
 
 Accepts one or more YAML config files. When multiple YAMLs are provided,
 they are deep-merged left-to-right: later files override earlier ones for
 overlapping keys (like AutoDeploy's own layering of default + user configs).
+
+Optionally accepts a graph dump directory (AD_DUMP_GRAPHS_DIR) containing
+per-transform graph snapshots. Files are named NNN_stage_transform.txt and
+show the graph AFTER that transform. Used to provide additional evidence
+for config application by comparing graph state before/after transforms.
 
 Parses the merged config and searches the log for evidence that each config
 was applied, skipped, disabled, or failed. Outputs a summary table.
@@ -26,6 +31,307 @@ FAILED = "FAILED"
 SKIPPED = "SKIPPED"
 DISABLED = "DISABLED"
 UNKNOWN = "UNKNOWN"  # no log evidence found
+
+
+# ── Graph dump analyzer ──────────────────────────────────────────────────────
+
+
+class GraphAnalyzer:
+    """Analyze AD_DUMP_GRAPHS_DIR graph dumps for transform application evidence.
+
+    Graph files are named NNN_stage_transform.txt and contain the FX graph
+    AFTER that transform. By comparing sequential graphs or inspecting the
+    final graph, we can verify whether transforms actually modified the graph.
+    """
+
+    def __init__(self, graph_dir: str):
+        self.graph_dir = Path(graph_dir)
+        self._files: Dict[str, Path] = {}  # transform_name -> path
+        self._file_list: List[Tuple[int, str, str, Path]] = []  # (idx, stage, transform, path)
+        self._cache: Dict[str, str] = {}  # path_str -> content
+        self._parse_dir()
+
+    def _parse_dir(self):
+        """Parse graph dump directory to index files by transform name."""
+        for f in sorted(self.graph_dir.glob("*.txt")):
+            m = re.match(r"(\d+)_(\w+?)_(.+)\.txt$", f.name)
+            if m:
+                idx, stage, transform = int(m.group(1)), m.group(2), m.group(3)
+                self._files[transform] = f
+                self._file_list.append((idx, stage, transform, f))
+
+    def _read(self, path: Path) -> str:
+        """Read and cache a graph file."""
+        key = str(path)
+        if key not in self._cache:
+            self._cache[key] = path.read_text(errors="replace")
+        return self._cache[key]
+
+    def get_final_graph(self) -> Optional[str]:
+        """Return the content of the last graph dump (final state)."""
+        if not self._file_list:
+            return None
+        return self._read(self._file_list[-1][3])
+
+    def get_graph_after(self, transform: str) -> Optional[str]:
+        """Return the graph content after a specific transform."""
+        if transform in self._files:
+            return self._read(self._files[transform])
+        return None
+
+    def get_graph_before(self, transform: str) -> Optional[str]:
+        """Return the graph content before a specific transform (i.e., the previous graph)."""
+        for i, (_, _, t, _) in enumerate(self._file_list):
+            if t == transform and i > 0:
+                return self._read(self._file_list[i - 1][3])
+        return None
+
+    def has_transform(self, transform: str) -> bool:
+        """Check if a transform's graph dump exists."""
+        return transform in self._files
+
+    def count_pattern(self, graph_text: str, pattern: str) -> int:
+        """Count occurrences of a regex pattern in graph text."""
+        return len(re.findall(pattern, graph_text))
+
+    def find_pattern(self, graph_text: str, pattern: str) -> List[str]:
+        """Find all matches of a pattern in graph text."""
+        return re.findall(pattern, graph_text)
+
+    # ── Transform-specific verifiers ────────────────────────────────────
+
+    def verify_sharding(self) -> Optional[Tuple[str, str]]:
+        """Verify sharding was applied by checking for collective ops in final graph."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        collectives = self.count_pattern(
+            final, r"auto_deploy\.trtllm_dist_(all_reduce|all_gather|reduce_scatter)"
+        )
+        if collectives > 0:
+            return (
+                APPLIED,
+                f"Graph has {collectives} collective ops (all_reduce/all_gather/reduce_scatter)",
+            )
+        return None
+
+    def verify_simple_shard_filter(self, filter_target: str) -> Optional[Tuple[str, str]]:
+        """Verify simple_shard_filter by checking collective ops around the target in final graph."""
+        after = self.get_graph_after("sharding_transform_executor")
+        if not after:
+            after = self.get_final_graph()
+        if not after:
+            return None
+
+        # Check if the filter target has a collective (all_gather or all_reduce) nearby
+        target_lines = [ln for ln in after.splitlines() if filter_target in ln]
+        if not target_lines:
+            return None
+
+        # Look for the target's linear op and a subsequent collective
+        # e.g., lm_head linear -> all_gather
+        target_linear = None
+        for line in target_lines:
+            if "linear_simple" in line or "linear" in line.lower():
+                target_linear = line.strip()
+                break
+
+        if not target_linear:
+            return None
+
+        # Extract the node name from the linear op
+        node_match = re.match(r"%(\S+)", target_linear)
+        if not node_match:
+            return None
+        node_name = node_match.group(1)
+
+        # Find lines that consume this node (collective ops)
+        consumers = [
+            ln.strip()
+            for ln in after.splitlines()
+            if node_name in ln
+            and ln.strip() != target_linear
+            and ("all_gather" in ln or "all_reduce" in ln or "reduce_scatter" in ln)
+        ]
+        if consumers:
+            # Extract weight shape from linear line to show sharding
+            shape_match = re.search(r"(\d+x\d+)\s*:", target_linear)
+            shape_info = f", sharded weight {shape_match.group(1)}" if shape_match else ""
+            return APPLIED, f"Graph: {filter_target} has collective op downstream{shape_info}"
+
+        # Also check: compare weight shape before/after sharding
+        before = self.get_graph_before("sharding_transform_executor")
+        if before:
+            before_lines = [
+                ln for ln in before.splitlines() if filter_target in ln and "weight" in ln
+            ]
+            after_lines = [
+                ln for ln in after.splitlines() if filter_target in ln and "weight" in ln
+            ]
+            if before_lines and after_lines:
+                before_shape = re.search(r"(\d+)x(\d+)", before_lines[0])
+                after_shape = re.search(r"(\d+)x(\d+)", after_lines[0])
+                if before_shape and after_shape:
+                    b0, a0 = int(before_shape.group(1)), int(after_shape.group(1))
+                    if b0 != a0:
+                        b_dim = before_shape.group(2)
+                        a_dim = after_shape.group(2)
+                        msg = f"Graph: {filter_target} weight sharded {b0}x{b_dim} -> {a0}x{a_dim}"
+                        return APPLIED, msg
+
+        return None
+
+    def verify_allreduce_strategy(self, strategy: str) -> Optional[Tuple[str, str]]:
+        """Verify allreduce strategy by checking collective ops in the final graph."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        matches = self.find_pattern(
+            final, rf"trtllm_dist_all_reduce\.default\([^)]*{re.escape(strategy)}"
+        )
+        if matches:
+            return APPLIED, f"Graph: {len(matches)} all_reduce ops use {strategy}"
+        return None
+
+    def verify_dist_mapping(self, mapping: dict) -> Optional[Tuple[str, str]]:
+        """Verify dist_mapping by checking collective op counts match expected TP/EP config."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        n_allreduce = self.count_pattern(final, r"auto_deploy\.trtllm_dist_all_reduce")
+        n_allgather = self.count_pattern(final, r"auto_deploy\.trtllm_dist_all_gather")
+        if n_allreduce > 0 or n_allgather > 0:
+            return APPLIED, f"Graph: {n_allreduce} all_reduce + {n_allgather} all_gather ops"
+        return None
+
+    def verify_fuse_nvfp4_moe(self) -> Optional[Tuple[str, str]]:
+        """Verify fuse_nvfp4_moe by checking for fused MoE ops in graph."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        n = self.count_pattern(final, r"auto_deploy\.torch_quant_nvfp4_moe")
+        if n > 0:
+            return APPLIED, f"Graph: {n} fused nvfp4_moe ops"
+        return None
+
+    def verify_fuse_gemms_mixed_children(self) -> Optional[Tuple[str, str]]:
+        """Verify GEMM fusion by comparing linear op counts before/after."""
+        before = self.get_graph_before("fuse_gemms_mixed_children")
+        after = self.get_graph_after("fuse_gemms_mixed_children")
+        if not before or not after:
+            return None
+        n_before = self.count_pattern(before, r"auto_deploy\.torch_linear_simple")
+        n_after = self.count_pattern(after, r"auto_deploy\.torch_linear_simple")
+        if n_before > n_after:
+            return (
+                APPLIED,
+                f"Graph: linear ops reduced {n_before} -> {n_after} (fused {n_before - n_after})",
+            )
+        elif n_before == n_after:
+            return SKIPPED, f"Graph: linear op count unchanged ({n_before})"
+        return None
+
+    def verify_attn_backend(self, backend: str) -> Optional[Tuple[str, str]]:
+        """Verify attention backend by checking attention op types in graph."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        if backend == "trtllm":
+            n = self.count_pattern(final, r"auto_deploy\.torch_attention")
+            if n > 0:
+                return APPLIED, f"Graph: {n} torch_attention ops (trtllm backend)"
+        elif backend == "flashinfer":
+            n = self.count_pattern(final, r"auto_deploy\.flashinfer_attention")
+            if n > 0:
+                return APPLIED, f"Graph: {n} flashinfer_attention ops"
+        return None
+
+    def verify_rmsnorm_pattern(self) -> Optional[Tuple[str, str]]:
+        """Verify RMSNorm pattern matching by checking for custom rmsnorm ops."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        n = self.count_pattern(final, r"auto_deploy\.torch_rmsnorm")
+        if n > 0:
+            return APPLIED, f"Graph: {n} fused rmsnorm ops"
+        return None
+
+    def verify_swiglu_pattern(self) -> Optional[Tuple[str, str]]:
+        """Verify SwiGLU pattern matching by checking for custom swiglu ops."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        n_swiglu = self.count_pattern(final, r"auto_deploy\.torch_swiglu_mlp")
+        n_nvfp4 = self.count_pattern(final, r"auto_deploy\.torch_nvfp4_swiglu")
+        total = n_swiglu + n_nvfp4
+        if total > 0:
+            parts = []
+            if n_swiglu:
+                parts.append(f"{n_swiglu} swiglu_mlp")
+            if n_nvfp4:
+                parts.append(f"{n_nvfp4} nvfp4_swiglu")
+            return APPLIED, f"Graph: {' + '.join(parts)} ops"
+        return None
+
+    def verify_rope_pattern(self) -> Optional[Tuple[str, str]]:
+        """Verify RoPE pattern matching by checking for custom rope ops."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        n = self.count_pattern(final, r"auto_deploy\.(flashinfer_rope|fused_rope)")
+        if n > 0:
+            return APPLIED, f"Graph: {n} fused rope ops"
+        return None
+
+    def verify_gather_logits_before_lm_head(self) -> Optional[Tuple[str, str]]:
+        """Verify gather_logits by checking if all_gather appears before lm_head in graph."""
+        final = self.get_final_graph()
+        if not final:
+            return None
+        lines = final.splitlines()
+        lm_head_idx = None
+        gather_before_lm_head = False
+        for i, line in enumerate(lines):
+            if "lm_head" in line and "linear" in line.lower():
+                lm_head_idx = i
+            if lm_head_idx is not None:
+                break
+        if lm_head_idx is not None:
+            # Check for gather/index_select operations before lm_head
+            for i in range(max(0, lm_head_idx - 10), lm_head_idx):
+                if "gather" in lines[i].lower() or "index_select" in lines[i].lower():
+                    gather_before_lm_head = True
+                    break
+        if gather_before_lm_head:
+            return APPLIED, "Graph: gather/index_select found before lm_head"
+        return None
+
+    def verify_export_to_gm(self) -> Optional[Tuple[str, str]]:
+        """Verify export_to_gm by checking the export graph exists."""
+        if self.has_transform("export_to_gm"):
+            graph = self.get_graph_after("export_to_gm")
+            if graph:
+                # Count total ops as a sanity check
+                n_ops = len([ln for ln in graph.splitlines() if ln.strip().startswith("%")])
+                return APPLIED, f"Graph: export_to_gm produced graph with {n_ops} ops"
+        return None
+
+    def verify_transform_applied(self, transform_name: str) -> Optional[Tuple[str, str]]:
+        """Generic: verify a transform by comparing before/after graph op counts."""
+        before = self.get_graph_before(transform_name)
+        after = self.get_graph_after(transform_name)
+        if not before or not after:
+            if after:
+                return APPLIED, f"Graph: {transform_name} graph dump exists"
+            return None
+        n_before = len([ln for ln in before.splitlines() if ln.strip().startswith("%")])
+        n_after = len([ln for ln in after.splitlines() if ln.strip().startswith("%")])
+        if n_before != n_after:
+            return (
+                APPLIED,
+                f"Graph: op count changed {n_before} -> {n_after} after {transform_name}",
+            )
+        return None
 
 
 # ── Per-config checkers ───────────────────────────────────────────────────────
@@ -316,11 +622,16 @@ def flatten_yaml(cfg: dict, prefix: str = "") -> List[Tuple[str, str, object]]:
     return items
 
 
-def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
+def check_config(
+    yaml_paths: List[str], log_path: str, graph_dir: Optional[str] = None
+) -> List[Dict]:
     """Parse YAML(s) and log, return list of {config, value, status, evidence} dicts.
 
     When multiple *yaml_paths* are given they are deep-merged left-to-right
     so that later files override earlier ones for overlapping keys.
+
+    If *graph_dir* is provided, also analyzes graph dumps for additional evidence.
+    Graph evidence can upgrade UNKNOWN results or supplement existing evidence.
     """
     cfg: dict = {}
     for yp in yaml_paths:
@@ -329,6 +640,10 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
         deep_merge(cfg, layer)
     with open(log_path) as f:
         log = f.read()
+
+    ga: Optional[GraphAnalyzer] = None
+    if graph_dir and Path(graph_dir).is_dir():
+        ga = GraphAnalyzer(graph_dir)
 
     results = []
 
@@ -342,6 +657,38 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
             }
         )
 
+    def add_with_graph(
+        config_key: str,
+        value,
+        status: str,
+        evidence: Optional[str],
+        graph_result: Optional[Tuple[str, str]] = None,
+    ):
+        """Add result, using graph evidence to upgrade UNKNOWN or supplement."""
+        if graph_result and status == UNKNOWN:
+            # Graph evidence upgrades UNKNOWN
+            results.append(
+                {
+                    "config": config_key,
+                    "value": str(value),
+                    "status": graph_result[0],
+                    "evidence": graph_result[1],
+                }
+            )
+        elif graph_result and status in (APPLIED, SKIPPED):
+            # Append graph evidence as supplementary
+            combined = (evidence or "-") + f" | {graph_result[1]}"
+            results.append(
+                {
+                    "config": config_key,
+                    "value": str(value),
+                    "status": status,
+                    "evidence": combined,
+                }
+            )
+        else:
+            add(config_key, value, status, evidence)
+
     # ── Top-level parameters ──────────────────────────────────────────────
     if "compile_backend" in cfg:
         s, e = check_compile_backend(log, cfg["compile_backend"])
@@ -350,7 +697,8 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
     if "attn_backend" in cfg:
         # Check insert_cached_attention transform for backend
         s, e = _check_transform_summary(log, "insert_cached_attention")
-        add("attn_backend", cfg["attn_backend"], s, e)
+        gr = ga.verify_attn_backend(cfg["attn_backend"]) if ga else None
+        add_with_graph("attn_backend", cfg["attn_backend"], s, e, gr)
 
     if "cuda_graph_batch_sizes" in cfg:
         s, e = check_cuda_graph_batch_sizes(log, cfg["cuda_graph_batch_sizes"])
@@ -491,7 +839,8 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
             ars = t_cfg.get("allreduce_strategy")
             if ars:
                 s, e = check_allreduce_strategy(log, ars)
-                add("transforms.detect_sharding.allreduce_strategy", ars, s, e)
+                gr = ga.verify_allreduce_strategy(ars) if ga else None
+                add_with_graph("transforms.detect_sharding.allreduce_strategy", ars, s, e, gr)
             ss = t_cfg.get("sharding_source")
             if ss:
                 s, e = check_sharding_source(log, ss)
@@ -525,16 +874,23 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
                         ) or re.search(
                             r"\[TP, MoE_TP, MoE_EP\]\s*=\s*\[(\d+),\s*(\d+),\s*(\d+)\]", grid_ev
                         )
+                        gr = ga.verify_dist_mapping(v) if ga else None
                         if tp_match:
-                            add(f"transforms.detect_sharding.{k}", v, APPLIED, grid_ev)
+                            add_with_graph(
+                                f"transforms.detect_sharding.{k}", v, APPLIED, grid_ev, gr
+                            )
                         else:
-                            add(f"transforms.detect_sharding.{k}", v, APPLIED, grid_ev)
+                            add_with_graph(
+                                f"transforms.detect_sharding.{k}", v, APPLIED, grid_ev, gr
+                            )
                     else:
-                        add(
+                        gr = ga.verify_dist_mapping(v) if ga else None
+                        add_with_graph(
                             f"transforms.detect_sharding.{k}",
                             v,
                             UNKNOWN,
                             "Check detect_sharding transform summary",
+                            gr,
                         )
                 elif k == "shard_all_unprocessed":
                     # If sharding SUMMARY has high match count, it's likely applied
@@ -559,17 +915,20 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
                     # Check if the filter target was sharded
                     ev = _search(log, rf"SHARD_DEBUG.*param_key={re.escape(str(v))}.*sharded_shape")
                     if ev:
-                        add(f"transforms.detect_sharding.{k}", v, APPLIED, ev)
+                        gr = ga.verify_simple_shard_filter(str(v)) if ga else None
+                        add_with_graph(f"transforms.detect_sharding.{k}", v, APPLIED, ev, gr)
                     else:
                         ev2 = _search(log, rf"{re.escape(str(v))}.*shard")
+                        gr = ga.verify_simple_shard_filter(str(v)) if ga else None
                         if ev2:
-                            add(f"transforms.detect_sharding.{k}", v, APPLIED, ev2)
+                            add_with_graph(f"transforms.detect_sharding.{k}", v, APPLIED, ev2, gr)
                         else:
-                            add(
+                            add_with_graph(
                                 f"transforms.detect_sharding.{k}",
                                 v,
                                 UNKNOWN,
                                 "Check detect_sharding transform summary",
+                                gr,
                             )
                 else:
                     add(
@@ -604,7 +963,8 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
         if t_name == "fuse_gemms_mixed_children":
             if t_cfg.get("enabled"):
                 s, e = check_fuse_gemms_mixed_children(log)
-                add("transforms.fuse_gemms_mixed_children.enabled", True, s, e)
+                gr = ga.verify_fuse_gemms_mixed_children() if ga else None
+                add_with_graph("transforms.fuse_gemms_mixed_children.enabled", True, s, e, gr)
             else:
                 add(
                     "transforms.fuse_gemms_mixed_children.enabled",
@@ -619,7 +979,8 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
         if enabled is not None:
             if enabled:
                 s, e = _check_transform_summary(log, t_name)
-                add(f"transforms.{t_name}.enabled", True, s, e)
+                gr = ga.verify_transform_applied(t_name) if ga else None
+                add_with_graph(f"transforms.{t_name}.enabled", True, s, e, gr)
             else:
                 add(f"transforms.{t_name}.enabled", False, DISABLED, "Disabled in config")
 
@@ -630,18 +991,22 @@ def check_config(yaml_paths: List[str], log_path: str) -> List[Dict]:
             # Try to find evidence via the transform's SUMMARY or APPLY lines
             ts, te = _check_transform_summary(log, t_name)
             if ts == APPLIED:
-                add(
+                gr = ga.verify_transform_applied(t_name) if ga else None
+                add_with_graph(
                     f"transforms.{t_name}.{k}",
                     v,
                     APPLIED,
                     f"{t_name} transform applied ({te})" if te else f"{t_name} transform applied",
+                    gr,
                 )
             else:
-                add(
+                gr = ga.verify_transform_applied(t_name) if ga else None
+                add_with_graph(
                     f"transforms.{t_name}.{k}",
                     v,
                     UNKNOWN,
                     f"Check {t_name} transform logs for details",
+                    gr,
                 )
 
     # ── Catch-all: pick up any YAML keys not already covered ────────────
@@ -732,6 +1097,11 @@ def main():
         help="One or more YAML config files (later files override earlier for overlapping keys)",
     )
     parser.add_argument("--log", "-l", required=True, help="Path to the server log file")
+    parser.add_argument(
+        "--graph-dir",
+        "-g",
+        help="Path to AD_DUMP_GRAPHS_DIR graph dump directory (optional, for additional evidence)",
+    )
     parser.add_argument("--output", "-o", help="Optional output file path for results")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     args = parser.parse_args()
@@ -742,6 +1112,9 @@ def main():
             sys.exit(1)
     if not Path(args.log).exists():
         print(f"Error: Log file not found: {args.log}", file=sys.stderr)
+        sys.exit(1)
+    if args.graph_dir and not Path(args.graph_dir).is_dir():
+        print(f"Error: Graph dump directory not found: {args.graph_dir}", file=sys.stderr)
         sys.exit(1)
 
     if len(args.yaml_paths) > 1:
@@ -759,7 +1132,11 @@ def main():
             )
         print()
 
-    results = check_config(args.yaml_paths, args.log)
+    if args.graph_dir:
+        n_graphs = len(list(Path(args.graph_dir).glob("*.txt")))
+        print(f"Using graph dump directory: {args.graph_dir} ({n_graphs} graph files)\n")
+
+    results = check_config(args.yaml_paths, args.log, graph_dir=args.graph_dir)
     use_color = not args.no_color and sys.stdout.isatty()
 
     table = format_table(results, use_color=use_color)
