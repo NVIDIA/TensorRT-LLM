@@ -391,7 +391,7 @@ def _run_forward(
     kwargs = {}
     if sparse_intermediates:
         kwargs = {k: v[: q.shape[0]] for k, v in sparse_intermediates.items()}
-    mla.sparse_method.dispatch_context(
+    mla.mqa.forward_sparse_context(
         mla,
         q=q.clone(),
         compressed_kv=compressed_kv.clone(),
@@ -474,8 +474,7 @@ def test_standard_path_when_exceeds_threshold():
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
 
     metadata = _make_metadata(attn_cls, seq_lens, kv_mgr, mapping, sparse_config)
-    sparse_intermediates = mla.sparse_method.pre_attn_process(
-        mla,
+    sparse_intermediates = mla.mqa.pre_attn_process(
         metadata,
         hidden_states,
         qr,
@@ -532,8 +531,7 @@ def test_agrees_with_absorption_path():
         )
         intermediates = None
         if not use_short:
-            intermediates = mla_module.sparse_method.pre_attn_process(
-                mla_module,
+            intermediates = mla_module.mqa.pre_attn_process(
                 meta,
                 hidden_states.clone(),
                 qr.clone(),
@@ -671,12 +669,12 @@ def test_chunked_context_rejects_when_kv_exceeds_threshold():
     pos_c2 = torch.arange(cached_per_seq[0], total_per_seq[0], device=device, dtype=torch.int32)
 
     # max_ctx_kv_len (96) > threshold (80) -> short MHA should NOT be used.
-    from tensorrt_llm._torch.attention_backend.sparse.dsa_method import _should_use_short_mha
+    from tensorrt_llm._torch.attention_backend.sparse.dsa.sparse_forward import should_use_short_mha
 
-    assert not _should_use_short_mha(mla, meta_c2, pos_c2)
+    assert not should_use_short_mha(mla, meta_c2, pos_c2)
 
     # With threshold large enough for the full KV -> short MHA IS used.
     mla.short_seq_mha_threshold = total_per_seq[0] + 100
-    assert _should_use_short_mha(mla, meta_c2, pos_c2)
+    assert should_use_short_mha(mla, meta_c2, pos_c2)
 
     kv_mgr.shutdown()

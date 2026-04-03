@@ -680,8 +680,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
     num_ctx_tokens = sum(query_lens[i] for i in ctx_indices)
 
     # Pre-attention processing: run indexer projections + k-cache scatter
-    sparse_intermediates = mla.sparse_method.pre_attn_process(
-        mla,
+    sparse_intermediates = mla.mqa.pre_attn_process(
         attn_metadata,
         hidden_states,
         qr,
@@ -693,7 +692,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             k: v[:num_ctx_tokens]
             for k, v in sparse_intermediates.items()
         }
-        mla.sparse_method.dispatch_context(
+        mla.mqa.forward_sparse_context(
             mla,
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
@@ -714,7 +713,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             k: v[num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
             for k, v in sparse_intermediates.items()
         }
-        mla.sparse_method.dispatch_generation(
+        mla.mqa.forward_sparse_generation(
             mla,
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],

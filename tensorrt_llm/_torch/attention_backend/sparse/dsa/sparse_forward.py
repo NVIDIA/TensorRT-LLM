@@ -12,11 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DSA (Dynamic Sparse Attention) method for MLA.
+"""DSA sparse attention forward paths for MLA.
 
-Implements the SparseAttentionMethod protocol with DSA-specific dispatch:
-short-seq MHA optimization, absorption path (SM100+), and sparse FlashMLA
-kernels (SM90).
+Contains the FlashMLA (SM < 100) sparse attention kernel path and the
+short-seq MHA optimization helper.
 """
 
 from __future__ import annotations
@@ -28,8 +27,8 @@ import torch
 from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
-from ..interface import AttentionMetadata
-from .dsa import DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view
+from .indexer import transform_local_topk_and_prepare_pool_view
+from .metadata import DSAtrtllmAttentionMetadata
 
 # Import FlashMLA sparse attention kernel
 try:
@@ -38,12 +37,12 @@ except ImportError:
     flash_mla_sparse_fwd = None
 
 if TYPE_CHECKING:
-    from ...modules.attention import MLA
+    from ....modules.attention import MLA
 
 
-def _should_use_short_mha(
+def should_use_short_mha(
     mla: MLA,
-    attn_metadata: AttentionMetadata,
+    attn_metadata,
     position_ids: Optional[torch.Tensor],
 ) -> bool:
     """Check if the short-seq MHA optimization should be used for context.
@@ -65,35 +64,8 @@ def _should_use_short_mha(
     return effective_len <= mla.short_seq_mha_threshold
 
 
-def _run_sparse_attn_indexer(
-    mla: MLA,
-    q: torch.Tensor,
-    attn_metadata: AttentionMetadata,
-    is_generation: bool = False,
-    **kwargs,
-) -> torch.Tensor:
-    """Run sparse_attn_indexer using intermediates from pre_attn_process.
-
-    Used by the FlashMLA path (SM < 100) which needs topk_indices at the
-    Python level rather than inside the trtllm C++ kernel.
-    """
-    q_fp8 = kwargs.get("q_fp8")
-    k_fp8 = kwargs.get("k_fp8")
-    k_scale = kwargs.get("k_scale")
-    weights = kwargs.get("weights")
-    return mla.mqa.indexer.sparse_attn_indexer(
-        attn_metadata,
-        q,
-        q_fp8,
-        k_fp8,
-        k_scale,
-        weights,
-        is_generation=is_generation,
-    )
-
-
 @nvtx_range("forward_sparse_mla_kvcache_bf16")
-def _forward_sparse_mla_kvcache_bf16(
+def forward_sparse_mla_kvcache_bf16(
     mla: MLA,
     q: torch.Tensor,
     latent_cache: torch.Tensor,
@@ -110,7 +82,7 @@ def _forward_sparse_mla_kvcache_bf16(
     2. Load full kv cache from paged memory (with k rope applied)
     3. Call FlashMLA sparse attention kernel for sparse prefill/decode
     """
-    from ...modules.attention import fp8_block_scaling_bmm_out
+    from ....modules.attention import fp8_block_scaling_bmm_out
 
     assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), (
         "DSA requires DSAtrtllmAttentionMetadata"
@@ -214,133 +186,3 @@ def _forward_sparse_mla_kvcache_bf16(
     else:
         raise NotImplementedError(f"Missing bmm impl for dtype: {mla.v_b_proj.dtype}.")
     return output
-
-
-class DSASparseMethod:
-    """DSA (Dynamic Sparse Attention) implementation of SparseAttentionMethod.
-
-    Handles context/generation dispatch for DSA: short-seq MHA optimization,
-    absorption path (SM100+), and sparse FlashMLA kernels (SM90).
-
-    The workflow is:
-    1. ``pre_attn_process()`` runs pre_indexer_proj + _update_k_cache on ALL
-       tokens (token-parallel, before ctx/gen split).
-    2. ``dispatch_context()`` / ``dispatch_generation()`` pass intermediates
-       through to the trtllm backend where ``sparse_attn_predict()`` runs
-       the actual sparse indexing per phase.
-    """
-
-    def __init__(self, short_seq_mha_threshold: int = 0):
-        self.short_seq_mha_threshold = short_seq_mha_threshold
-
-    @torch.inference_mode()
-    def pre_attn_process(
-        self,
-        mla: MLA,
-        attn_metadata: AttentionMetadata,
-        hidden_states: torch.Tensor,
-        qr: Optional[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-    ) -> dict:
-        """Run pre_indexer_proj and _update_k_cache on all tokens.
-
-        Returns dict of intermediates (q_fp8, k_fp8, k_scale, weights)
-        that will be sliced per ctx/gen and forwarded to the backend.
-        """
-        indexer = mla.mqa.indexer
-        q_fp8, k_fp8, k_scale, weights = indexer.pre_indexer_proj(
-            qr,
-            hidden_states,
-            position_ids,
-        )
-        # Scatter k values into indexer k cache for ALL tokens before
-        # ctx/gen split — the backend's sparse_attn_predict will read
-        # from this cache during indexing.
-        indexer._update_k_cache(k_fp8, k_scale, attn_metadata)
-        return {
-            "q_fp8": q_fp8,
-            "k_fp8": k_fp8,
-            "k_scale": k_scale,
-            "weights": weights,
-        }
-
-    def dispatch_context(
-        self,
-        mla: MLA,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-        **kwargs,
-    ) -> None:
-        """Dispatch context-phase attention for DSA."""
-        if _should_use_short_mha(mla, attn_metadata, position_ids):
-            mla.forward_context(
-                q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
-            )
-        elif get_sm_version() >= 100:
-            mla.forward_absorption_context(
-                q,
-                compressed_kv,
-                k_pe,
-                attn_metadata,
-                output,
-                latent_cache=latent_cache,
-                **kwargs,
-            )
-        else:
-            # FlashMLA path (SM < 100): run sparse indexing here since this
-            # path doesn't go through the trtllm C++ wrapper.plan().
-            topk_indices = _run_sparse_attn_indexer(
-                mla, q, attn_metadata, is_generation=False, **kwargs
-            )
-            _forward_sparse_mla_kvcache_bf16(
-                mla,
-                q,
-                latent_cache,
-                attn_metadata,
-                output,
-                topk_indices,
-                is_generation=False,
-            )
-
-    def dispatch_generation(
-        self,
-        mla: MLA,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor],
-        **kwargs,
-    ) -> None:
-        """Dispatch generation-phase attention for DSA."""
-        if get_sm_version() >= 100:
-            mla.forward_absorption_generation(
-                q,
-                compressed_kv,
-                k_pe,
-                attn_metadata,
-                output,
-                latent_cache=latent_cache,
-                **kwargs,
-            )
-        else:
-            # FlashMLA path (SM < 100): run sparse indexing here since this
-            # path doesn't go through the trtllm C++ wrapper.plan().
-            topk_indices = _run_sparse_attn_indexer(
-                mla, q, attn_metadata, is_generation=True, **kwargs
-            )
-            _forward_sparse_mla_kvcache_bf16(
-                mla,
-                q,
-                latent_cache,
-                attn_metadata,
-                output,
-                topk_indices,
-                is_generation=True,
-            )

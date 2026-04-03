@@ -1,16 +1,22 @@
-from typing import TYPE_CHECKING, Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .indexer import Indexer, transform_local_topk_and_prepare_pool_view
 from .metadata import DSAtrtllmAttentionMetadata
+from .sparse_forward import forward_sparse_mla_kvcache_bf16, should_use_short_mha
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
+    from ....modules.attention import MLA
 
 
 class DSATrtllmAttention(TrtllmAttention):
@@ -64,6 +70,138 @@ class DSATrtllmAttention(TrtllmAttention):
             aux_stream,
         )
 
+    # ------------------------------------------------------------------
+    # Sparse attention lifecycle methods called by MLA
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def pre_attn_process(
+        self,
+        attn_metadata: DSAtrtllmAttentionMetadata,
+        hidden_states: torch.Tensor,
+        qr: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Run pre_indexer_proj and _update_k_cache on all tokens.
+
+        Called once on ALL tokens before the ctx/gen split.  Returns
+        intermediates that will be sliced per ctx/gen and forwarded to
+        forward_sparse_context / forward_sparse_generation.
+        """
+        q_fp8, k_fp8, k_scale, weights = self.indexer.pre_indexer_proj(
+            qr,
+            hidden_states,
+            position_ids,
+        )
+        self.indexer._update_k_cache(k_fp8, k_scale, attn_metadata)
+        return {
+            "q_fp8": q_fp8,
+            "k_fp8": k_fp8,
+            "k_scale": k_scale,
+            "weights": weights,
+        }
+
+    def forward_sparse_context(
+        self,
+        mla: MLA,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: DSAtrtllmAttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        """Dispatch sparse context-phase attention for DSA.
+
+        SM >= 100: absorption path (topk_indices produced inside
+        sparse_attn_predict, fed to the C++ kernel via wrapper.plan).
+        SM < 100: FlashMLA path (topk_indices produced here via
+        sparse_attn_indexer, fed to the Python FlashMLA kernel).
+        """
+        if should_use_short_mha(mla, attn_metadata, position_ids):
+            mla.forward_context(
+                q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
+            )
+        elif get_sm_version() >= 100:
+            mla.forward_absorption_context(
+                q,
+                compressed_kv,
+                k_pe,
+                attn_metadata,
+                output,
+                latent_cache=latent_cache,
+                **kwargs,
+            )
+        else:
+            topk_indices = self._run_sparse_indexer(q, attn_metadata, is_generation=False, **kwargs)
+            forward_sparse_mla_kvcache_bf16(
+                mla,
+                q,
+                latent_cache,
+                attn_metadata,
+                output,
+                topk_indices,
+                is_generation=False,
+            )
+
+    def forward_sparse_generation(
+        self,
+        mla: MLA,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: DSAtrtllmAttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        """Dispatch sparse generation-phase attention for DSA."""
+        if get_sm_version() >= 100:
+            mla.forward_absorption_generation(
+                q,
+                compressed_kv,
+                k_pe,
+                attn_metadata,
+                output,
+                latent_cache=latent_cache,
+                **kwargs,
+            )
+        else:
+            topk_indices = self._run_sparse_indexer(q, attn_metadata, is_generation=True, **kwargs)
+            forward_sparse_mla_kvcache_bf16(
+                mla,
+                q,
+                latent_cache,
+                attn_metadata,
+                output,
+                topk_indices,
+                is_generation=True,
+            )
+
+    def _run_sparse_indexer(
+        self,
+        q: torch.Tensor,
+        attn_metadata: DSAtrtllmAttentionMetadata,
+        is_generation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run sparse_attn_indexer using intermediates from pre_attn_process."""
+        return self.indexer.sparse_attn_indexer(
+            attn_metadata,
+            q,
+            kwargs.get("q_fp8"),
+            kwargs.get("k_fp8"),
+            kwargs.get("k_scale"),
+            kwargs.get("weights"),
+            is_generation=is_generation,
+        )
+
+    # ------------------------------------------------------------------
+    # Sparse prediction methods called by _prepare_sparse_params
+    # ------------------------------------------------------------------
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -74,24 +212,19 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run sparse indexing and transform indices for the C++ kernel.
 
-        Expects ``q_fp8`` and ``weights`` in kwargs (produced by
-        ``pre_attn_process`` and sliced per ctx/gen by MLA).
-        Calls ``sparse_attn_indexer`` to compute topk_indices, then
-        transforms them to global paged KV cache indices.
+        Called by _prepare_sparse_params in the absorption path (SM >= 100).
         """
         q_fp8 = kwargs.get("q_fp8")
-        k_fp8 = kwargs.get("k_fp8")
-        k_scale = kwargs.get("k_scale")
         weights = kwargs.get("weights")
         if q_fp8 is None or weights is None:
             return None, None
 
         topk_indices = self.indexer.sparse_attn_indexer(
             metadata,
-            q,  # q used for shape/device in buffer allocation
+            q,
             q_fp8,
-            k_fp8,
-            k_scale,
+            kwargs.get("k_fp8"),
+            kwargs.get("k_scale"),
             weights,
             is_generation=is_generation,
         )
@@ -107,11 +240,13 @@ class DSATrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: DSAtrtllmAttentionMetadata,
-        hidden_states: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return None, None
+
+    # ------------------------------------------------------------------
+    # MLA RoPE + paged KV cache ops
+    # ------------------------------------------------------------------
 
     def mla_rope_append_paged_kv_assign_q(
         self,

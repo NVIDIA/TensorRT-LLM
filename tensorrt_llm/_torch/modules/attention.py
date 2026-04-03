@@ -20,7 +20,6 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
-from ..attention_backend.sparse import get_sparse_attention_method
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -1081,10 +1080,8 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
-        # Create sparse attention method if applicable (e.g. DSA).
-        # This object encapsulates all algorithm-specific dispatch logic
-        # so the MLA module itself stays algorithm-agnostic.
-        self.sparse_method = None
+        # Flag for sparse attention — set after MQA backend is created.
+        self.has_sparse_attn = False
 
         # tensor parallel
         config = config or ModelConfig()
@@ -1303,20 +1300,15 @@ class MLA(nn.Module):
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
                 f"got '{_threshold_str}'") from err
 
-        # Initialize sparse attention method (e.g. DSA) now that threshold is known.
-        if config is not None and config.sparse_attention_config is not None:
-            self.sparse_method = get_sparse_attention_method(
-                config.sparse_attention_config,
-                short_seq_mha_threshold=self.short_seq_mha_threshold,
-            )
+        # Detect sparse attention from backend (e.g. DSATrtllmAttention).
+        self.has_sparse_attn = hasattr(self.mqa, 'pre_attn_process')
 
-        _has_sparse_method = self.sparse_method is not None
         # MHA attention backend: used by non-sparse (standard MLA) and optionally
         # by sparse methods for the short-seq path (dense attention, no sparse config).
-        _short_seq_mha = (_has_sparse_method
+        _short_seq_mha = (self.has_sparse_attn
                           and self.short_seq_mha_threshold > 0
                           and not self.apply_rotary_emb)
-        if not _has_sparse_method or _short_seq_mha:
+        if not self.has_sparse_attn or _short_seq_mha:
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -1496,7 +1488,7 @@ class MLA(nn.Module):
         """
         Unified forward pass for the MLA module. Writes result into output
         tensor in-place. Handles both standard MLA and DSA sparse attention
-        via the sparse_method's pre_attn_process() and dispatch hooks.
+        via the backend's pre_attn_process() and forward_sparse_* hooks.
 
         Args:
             position_ids (Optional[torch.IntTensor]): The position IDs.
@@ -1535,7 +1527,7 @@ class MLA(nn.Module):
             )
 
         # For sparse methods, capture qr (compressed query before q_b_proj) for the indexer
-        qr = q if self.sparse_method is not None else None
+        qr = q if self.has_sparse_attn else None
 
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
@@ -1548,9 +1540,9 @@ class MLA(nn.Module):
         # Pre-attention processing for sparse methods: run indexer projections
         # and k-cache scatter on ALL tokens before ctx/gen split.
         sparse_intermediates = {}
-        if self.sparse_method is not None:
-            sparse_intermediates = self.sparse_method.pre_attn_process(
-                self, attn_metadata, hidden_states, qr, position_ids)
+        if self.has_sparse_attn:
+            sparse_intermediates = self.mqa.pre_attn_process(
+                attn_metadata, hidden_states, qr, position_ids)
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
@@ -1570,28 +1562,20 @@ class MLA(nn.Module):
                 q_ctx = self._attention_scaling(
                     q_ctx, position_ids[..., :num_ctx_tokens])
 
-            if self.sparse_method is not None and sparse_intermediates:
-                # Slice intermediates for context tokens
-                ctx_kwargs = {
-                    k: v[:num_ctx_tokens]
-                    for k, v in sparse_intermediates.items()
-                }
-                self.sparse_method.dispatch_context(self, q_ctx,
-                                                    compressed_kv_ctx, k_pe_ctx,
-                                                    attn_metadata,
-                                                    output[:num_ctx_tokens, :],
-                                                    latent_cache_ctx,
-                                                    position_ids, **ctx_kwargs)
-            else:
-                self.forward_context(
-                    q_ctx,
-                    compressed_kv_ctx,
-                    k_pe_ctx,
-                    position_ids,
-                    attn_metadata,
-                    output[:num_ctx_tokens, :],
-                    latent_cache_ctx,
-                )
+            ctx_kwargs = {
+                k: v[:num_ctx_tokens]
+                for k, v in sparse_intermediates.items()
+            } if sparse_intermediates else {}
+            self.forward_context(
+                q_ctx,
+                compressed_kv_ctx,
+                k_pe_ctx,
+                position_ids,
+                attn_metadata,
+                output[:num_ctx_tokens, :],
+                latent_cache_ctx,
+                **ctx_kwargs,
+            )
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
@@ -1607,26 +1591,20 @@ class MLA(nn.Module):
                 q_gen = self._attention_scaling(
                     q_gen, position_ids[..., num_ctx_tokens:])
 
-            if self.sparse_method is not None and sparse_intermediates:
-                # Slice intermediates for generation tokens
-                gen_kwargs = {
-                    k: v[num_ctx_tokens:num_tokens]
-                    for k, v in sparse_intermediates.items()
-                }
-                self.sparse_method.dispatch_generation(
-                    self, q_gen, compressed_kv_gen, k_pe_gen, attn_metadata,
-                    output[num_ctx_tokens:num_tokens, :], latent_cache_gen,
-                    **gen_kwargs)
-            else:
-                self.forward_absorption_generation(
-                    q_gen,
-                    compressed_kv_gen,
-                    k_pe_gen,
-                    attn_metadata,
-                    output[num_ctx_tokens:num_tokens, :],
-                    position_ids=position_ids,
-                    latent_cache=latent_cache_gen,
-                )
+            gen_kwargs = {
+                k: v[num_ctx_tokens:num_tokens]
+                for k, v in sparse_intermediates.items()
+            } if sparse_intermediates else {}
+            self.forward_generation(
+                q_gen,
+                compressed_kv_gen,
+                k_pe_gen,
+                attn_metadata,
+                output[num_ctx_tokens:num_tokens, :],
+                position_ids=position_ids,
+                latent_cache=latent_cache_gen,
+                **gen_kwargs,
+            )
 
     def forward_context_default(
         self,
@@ -1965,7 +1943,16 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
+        # Sparse attention context dispatch (e.g. DSA)
+        if self.has_sparse_attn and kwargs:
+            return self.mqa.forward_sparse_context(self, q, compressed_kv, k_pe,
+                                                   attn_metadata, output,
+                                                   latent_cache, position_ids,
+                                                   **kwargs)
+
+        # Standard (non-sparse) context dispatch
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
@@ -1988,6 +1975,33 @@ class MLA(nn.Module):
         return self.forward_context_default(q, compressed_kv, k_pe,
                                             position_ids, attn_metadata, output,
                                             latent_cache)
+
+    def forward_generation(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        latent_cache: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # Sparse attention generation dispatch (e.g. DSA)
+        if self.has_sparse_attn and kwargs:
+            return self.mqa.forward_sparse_generation(self, q, compressed_kv,
+                                                      k_pe, attn_metadata,
+                                                      output, latent_cache,
+                                                      **kwargs)
+
+        # Standard (non-sparse) generation dispatch
+        return self.forward_absorption_generation(q,
+                                                  compressed_kv,
+                                                  k_pe,
+                                                  attn_metadata,
+                                                  output,
+                                                  position_ids=position_ids,
+                                                  latent_cache=latent_cache)
 
     def forward_absorption_generation(
         self,
@@ -2305,7 +2319,7 @@ class MLA(nn.Module):
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(
                 hidden_states, position_ids, self.layer_idx_str, attn_output,
-                None if self.sparse_method is not None else latent_cache_gen)
+                None if self.has_sparse_attn else latent_cache_gen)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
