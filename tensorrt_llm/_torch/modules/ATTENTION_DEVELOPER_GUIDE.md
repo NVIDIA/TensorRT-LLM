@@ -101,10 +101,10 @@ context goes through the same handler.
 are separated, context and generation paths are separated, and a short-seq
 gate inside the context path can route to a dense MHA fallback.
 
-**For both DSA and non-DSA MLA:** the short-seq MHA path should stay inside
-`forward_context()`. Do not bypass the dispatcher and call
-`forward_context_default()` directly — it only handles fresh context, not
-cached-KV or chunked-context cases.
+For both DSA and non-DSA MLA, keep context routing inside `forward_context()`.
+For DSA, the short-seq MHA fallback should also stay inside that dispatcher. Do
+not bypass it and call `forward_context_default()` directly; that handler only
+covers fresh context, not cached-KV or chunked-context cases.
 
 **Practical notes:**
 
@@ -115,16 +115,8 @@ cached-KV or chunked-context cases.
 
 ### 2.1 Backend selection
 
-Backends are created by:
-
-- `get_attention_backend()`
-- `create_attention()`
-
-The backend is chosen from:
-
-- `config.attn_backend`
-- optional `sparse_attention_config`
-- optional MLA parameters
+The backend is chosen from `config.attn_backend`, optional
+`sparse_attention_config`, and optional MLA parameters.
 
 Base backend families:
 
@@ -178,15 +170,6 @@ required operator or sparse path already exists.
 Sparse subclasses inherit the base backend family and then add sparse-specific
 metadata and cache behavior.
 
-### 2.5 `TRTLLM` internal kernel paths
-
-`TrtllmAttention` can dispatch to `trtllm_gen.py` for supported dense cases.
-That is an internal fast path, not a separate top-level backend selection. It
-is disabled by default and gated by `TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION`.
-
-It only applies to a narrow subset of dense cases. If it does not apply or is
-not enabled, `TrtllmAttention` stays on its regular runtime path.
-
 ## 3. Runtime Contract Reference
 
 ### 3.1 Metadata families
@@ -231,27 +214,30 @@ update pattern.
 
 #### 3.2.1 Common paged-KV model
 
-All current `_torch` backends are built on top of paged KV cache.
-`KVCacheManager.get_buffers()` exposes a per-layer view of the primary pool:
+When KV cache is enabled, all current `_torch` backends use paged KV cache.
+`VanillaAttention` also has a separate no-KV-cache path for models that do not
+use cache. `KVCacheManager.get_buffers()` exposes a per-layer view of the
+primary pool:
 
 - For standard dense attention, `kv_factor = 2` (separate K and V planes).
 - For MLA-style cache, `kv_factor = 1` (one latent-cache tensor per token).
 
 The main differences across backends:
 
-| Backend | Cache write | Cache read | Notes |
-|---|---|---|---|
-| `TRTLLM` | Backend-managed (C++ ops like `qkv_preprocessing`) | Block-table + pool pointers | Python does not call `index_copy_` in the regular path |
-| `VANILLA` | Python-side (`index_copy_`) | Python-side slicing from same cache tensor | Most direct path for inspecting what is written to cache |
-| `FlashInfer` | Python-side (explicit append) | Page-table metadata | Requires a planning step and its own page-table shape |
+| Backend | Cache write | Cache read |
+|---|---|---|
+| `TRTLLM` | Backend-managed (C++ ops) | Block-table + pool pointers |
+| `VANILLA` | Python-side | Python-side slicing |
+| `FlashInfer` | Python-side (explicit append) | Page-table metadata |
 
 #### 3.2.2 `TRTLLM` internal `trtllm_gen` path
 
-`trtllm_gen.py` is not a separate backend, but it has its own KV view
-assumptions. It bridges the TRTLLM block-offset format into the page-table
-shape expected by its kernels. This path is narrower than the main `TRTLLM`
-backend (dense only, no MLA, no sparse, fused QKV only). If `trtllm_gen` does
-not fit, that does not rule out the main `TRTLLM` backend.
+`trtllm_gen.py` integrates trtllm-gen kernels from FlashInfer into the
+`TRTLLM` backend. It is not a separate backend — it is an internal fast path
+disabled by default (`TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION`). It bridges the
+TRTLLM block-offset format into the page-table shape expected by those kernels.
+This path is under active development and its supported scope is expanding. If
+it does not apply, `TrtllmAttention` stays on its regular runtime path.
 
 #### 3.2.3 MLA cached-context semantics
 
@@ -286,8 +272,8 @@ For a new model, compare it against the current stack in four parts:
 
 1. **Module math**: can `Attention` or `MLA` express the new math with
    module-side code only?
-2. **Backend execution**: can `TrtllmAttention.forward(...)` handle the needed
-   call shape (fused/split QKV, dense/sparse, RoPE/mRoPE, MLA/non-MLA)?
+2. **Backend execution**: can the current `TRTLLM` backend family handle the
+   needed call shape (fused/split QKV, dense/sparse, RoPE/mRoPE, MLA/non-MLA)?
 3. **Metadata**: can the runtime state fit in `TrtllmAttentionMetadata` or a
    known sparse subclass?
 4. **KV-cache**: can the cache behavior stay inside the current paged-KV and
