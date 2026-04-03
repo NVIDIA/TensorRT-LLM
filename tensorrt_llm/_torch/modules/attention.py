@@ -1080,8 +1080,10 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
-        # Flag for sparse attention — set after MQA backend is created.
-        self.has_sparse_attn = False
+        # DSA sparse attention flag — used for MHA creation and short-seq optimization.
+        self.is_dsa = (config is not None
+                       and config.sparse_attention_config is not None
+                       and config.sparse_attention_config.algorithm == "dsa")
 
         # tensor parallel
         config = config or ModelConfig()
@@ -1300,18 +1302,11 @@ class MLA(nn.Module):
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
                 f"got '{_threshold_str}'") from err
 
-        # Detect sparse attention from backend (e.g. DSATrtllmAttention).
-        self.has_sparse_attn = hasattr(self.mqa, 'pre_attn_process')
-        if self.has_sparse_attn:
-            # Register piecewise CUDA graph custom ops
-            import tensorrt_llm._torch.attention_backend.sparse.dsa.custom_ops  # noqa: F401
-
         # MHA attention backend: used by non-sparse (standard MLA) and optionally
-        # by sparse methods for the short-seq path (dense attention, no sparse config).
-        _short_seq_mha = (self.has_sparse_attn
-                          and self.short_seq_mha_threshold > 0
+        # by DSA for the short-seq path (dense attention, no sparse config).
+        _short_seq_mha = (self.is_dsa and self.short_seq_mha_threshold > 0
                           and not self.apply_rotary_emb)
-        if not self.has_sparse_attn or _short_seq_mha:
+        if not self.is_dsa or _short_seq_mha:
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -1530,7 +1525,7 @@ class MLA(nn.Module):
             )
 
         # For sparse methods, capture qr (compressed query before q_b_proj) for the indexer
-        qr = q if self.has_sparse_attn else None
+        qr = q if hasattr(self.mqa, 'pre_attn_process') else None
 
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
@@ -1543,7 +1538,7 @@ class MLA(nn.Module):
         # Pre-attention processing for sparse methods: run indexer projections
         # and k-cache scatter on ALL tokens before ctx/gen split.
         sparse_intermediates = {}
-        if self.has_sparse_attn:
+        if hasattr(self.mqa, 'pre_attn_process'):
             sparse_intermediates = self.mqa.pre_attn_process(
                 attn_metadata, hidden_states, qr, position_ids)
 
@@ -1949,7 +1944,7 @@ class MLA(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         # Sparse attention context dispatch (e.g. DSA)
-        if self.has_sparse_attn and kwargs:
+        if hasattr(self.mqa, 'forward_sparse_context') and kwargs:
             return self.mqa.forward_sparse_context(self, q, compressed_kv, k_pe,
                                                    attn_metadata, output,
                                                    latent_cache, position_ids,
@@ -1991,7 +1986,7 @@ class MLA(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         # Sparse attention generation dispatch (e.g. DSA)
-        if self.has_sparse_attn and kwargs:
+        if hasattr(self.mqa, 'forward_sparse_generation') and kwargs:
             return self.mqa.forward_sparse_generation(self, q, compressed_kv,
                                                       k_pe, attn_metadata,
                                                       output, latent_cache,
@@ -2320,14 +2315,9 @@ class MLA(nn.Module):
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
         if self.register_to_config:
-            if self.has_sparse_attn:
-                proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                    hidden_states, position_ids, self.layer_idx_str)
-                q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
-                indexer_intermediates = proj_outputs[4:]
-                torch.ops.trtllm.mla_dsa_attn_inplace(
-                    q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
-                    position_ids, self.layer_idx_str, attn_output)
+            if hasattr(self.mqa, 'sparse_attn_inplace'):
+                self.mqa.sparse_attn_inplace(hidden_states, position_ids,
+                                             self.layer_idx_str, attn_output)
             else:
                 torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
                                                        position_ids,

@@ -74,6 +74,35 @@ class DSATrtllmAttention(TrtllmAttention):
     # Sparse attention lifecycle methods called by MLA
     # ------------------------------------------------------------------
 
+    def sparse_attn_inplace(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids,
+        layer_idx_str: str,
+        output: torch.Tensor,
+    ) -> None:
+        """Piecewise CUDA graph support for DSA MLA.
+
+        Splits the forward into graph-capturable Op1 (mla_dsa_proj)
+        and non-capturable Op2 (mla_dsa_attn_inplace).
+        Called from MLA.forward() when register_to_config is True.
+        """
+        # Ensure custom ops are registered
+
+        proj_outputs = torch.ops.trtllm.mla_dsa_proj(hidden_states, position_ids, layer_idx_str)
+        q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
+        indexer_intermediates = proj_outputs[4:]
+        torch.ops.trtllm.mla_dsa_attn_inplace(
+            q,
+            compressed_kv,
+            k_pe,
+            latent_cache,
+            indexer_intermediates,
+            position_ids,
+            layer_idx_str,
+            output,
+        )
+
     @torch.inference_mode()
     def pre_attn_process(
         self,
