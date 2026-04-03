@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -3128,22 +3128,24 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,enable_heuristic_topk",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False),
-            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
-            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True),
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, False),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False, False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False),
+            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "latency_default", "disable_skip_indexer"
+            "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1"
         ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size, moe_backend, disable_skip_indexer):
+                            max_batch_size, moe_backend, disable_skip_indexer,
+                            enable_heuristic_topk):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -3167,10 +3169,16 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 )
             kv_cache_config.dtype = "fp8"
 
+        if enable_heuristic_topk and get_sm_version() < 100:
+            pytest.skip("Heuristic TopK requires Blackwell (SM >= 100)")
+
         dsa_config = None
         if disable_skip_indexer:
             dsa_config = DeepSeekSparseAttentionConfig(
                 skip_indexer_for_short_seqs=False)
+        if enable_heuristic_topk:
+            dsa_config = DeepSeekSparseAttentionConfig(
+                enable_heuristic_topk=True)
 
         mtp_config = None
         if mtp_nextn > 0:
@@ -5941,6 +5949,66 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             mocker.patch.object(GSM8K, "NUM_SAMPLES", num_samples)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(2)
+    def test_bf16_2gpu_mtp_ar(self):
+        max_draft_len = 3
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
+        model_path = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
+
+        llm_common_config = dict(
+            model=model_path,
+            tensor_parallel_size=2,
+            moe_expert_parallel_size=2,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.8,
+            ),
+            max_batch_size=4,
+            enable_attention_dp=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
+                                              enable_padding=True),
+            disable_overlap_scheduler=False,
+            moe_config=MoeConfig(backend="TRTLLM"),
+        )
+
+        llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
+
+        raw_prompts = [
+            "The capital of France is",
+            "The president of the United States is",
+            "The future of AI is",
+        ]
+        prompts = [
+            llm_spec.tokenizer.apply_chat_template(
+                [{
+                    "role": "user",
+                    "content": p
+                }],
+                tokenize=False,
+                add_generation_prompt=True,
+            ) for p in raw_prompts
+        ]
+        tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
+
+        sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
+        for i in range(len(tok_ids)):
+            num_tokens = 0
+            num_drafted = 0
+            num_accepted = 0
+            for output in llm_spec.generate_async(tok_ids[i],
+                                                  sampling_params,
+                                                  streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_drafted += max_draft_len
+                num_accepted += len(new_tokens) - num_tokens - 1
+                num_tokens = len(new_tokens)
+
+            accept_rate = num_accepted / num_drafted
+            assert accept_rate > 0.2, \
+                f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
 
 @pytest.mark.skip_less_device_memory(80000)

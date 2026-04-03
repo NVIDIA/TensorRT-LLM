@@ -337,6 +337,12 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     indexer_rope_interleave: bool = Field(
         default=False,
         description="Whether to use interleaved RoPE layout for the indexer.")
+    enable_heuristic_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to reuse previous step's TopK indices as heuristic hints "
+        "for the decode indexer TopK kernel, reducing threshold search iterations."
+    )
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"

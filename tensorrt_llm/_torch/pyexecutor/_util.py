@@ -1037,6 +1037,17 @@ def _create_kv_cache_manager(
             )
         full_attention_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
             config)
+        # For hybrid models, full_attention_layer_mask is always passed as
+        # layer_mask to KVCacheManager, which means get_pp_layers
+        # sees a non-None layer_mask and won't auto-add spec layers.
+        # Extend the masks here to include MTP spec layers (full
+        # attention, no linear states) so they get KV cache entries.
+        if spec_config is not None:
+            from ..speculative.utils import get_num_spec_layers
+            num_spec_layers = get_num_spec_layers(spec_config)
+            if num_spec_layers > 0:
+                full_attention_layer_mask.extend([True] * num_spec_layers)
+                mamba_layer_mask.extend([False] * num_spec_layers)
         num_full_attention_layers = sum(full_attention_layer_mask)
         num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(

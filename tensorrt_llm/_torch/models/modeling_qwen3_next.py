@@ -25,24 +25,17 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
-from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import \
-    fused_sigmoid_gating_delta_rule_update
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.mapping import Mapping
 
+from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
@@ -55,28 +48,14 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                                  RoutingMethodType, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
-from ..modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-from ..modules.mamba.layernorm_gated import RMSNorm as RMSNormGated
+from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType
+from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
-
-
-def ensure_divisibility(numerator, denominator):
-    """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, "{} is not divisible by {}".format(
-        numerator, denominator)
-
-
-def divide(numerator, denominator):
-    """Ensure that numerator is divisible by the denominator and return
-    the division value."""
-    ensure_divisibility(numerator, denominator)
-    return numerator // denominator
 
 
 class Qwen3NextGate(nn.Module):
@@ -992,6 +971,7 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
             hidden_states = self.linear_attn(
                 hidden_states,
                 attn_metadata,
+                spec_metadata=spec_metadata,
                 all_reduce_params=AllReduceParams(
                     enable_allreduce=not self.disable_attn_allreduce),
                 **kwargs)
@@ -1230,6 +1210,164 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         return hidden_states, residual
 
 
+class Qwen3NextMTPHead(nn.Module):
+
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+        self.mapping_lm_head_tp = None
+
+    @torch.compile(options={"max-autotune": True})
+    def get_last_token_states(self, hidden_states, attn_metadata):
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda,
+            dim=0,
+            dtype=torch.long,
+        ) - 1
+        return hidden_states[last_tokens]
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                lm_head: Linear,
+                attn_metadata: AttentionMetadata,
+                return_context_logits: bool = False) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = self.get_last_token_states(
+                    hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
+
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+        enable_lm_head_tp_in_adp = enable_attention_dp and self.model_config.mapping.enable_lm_head_tp_in_adp
+
+        if enable_lm_head_tp_in_adp:
+            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
+                self.model_config.mapping, hidden_states.shape[0])
+            hidden_states = allgather(hidden_states,
+                                      self.mapping_lm_head_tp,
+                                      dim=0)
+
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+            lm_head.gather_output = False
+        logits = lm_head(hidden_states,
+                         mapping_lm_head_tp=self.mapping_lm_head_tp,
+                         is_spec_decoding_head=True)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+            lm_head.gather_output = True
+        return logits
+
+
+class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
+
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
+                                                       torch.cuda.Stream]):
+        super().__init__(model_config, layer_idx,
+                         aux_stream_dict[AuxStreamType.Attention])
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeShared]
+        }
+
+        self.pre_fc_norm_embedding = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+        self.pre_fc_norm_hidden = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+
+        if model_config.mapping.enable_attention_dp:
+            self.fc = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=False,
+            )
+        else:
+            self.fc = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=True,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=False,
+            )
+        self.shared_head = Qwen3NextMTPHead(model_config)
+
+    def forward(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        embed_tokens: Embedding,
+        attn_metadata: AttentionMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del all_rank_num_tokens
+
+        def norm_embeds():
+            return self.pre_fc_norm_embedding(embed_tokens(input_ids))
+
+        def norm_hidden():
+            return self.pre_fc_norm_hidden(hidden_states)
+
+        inputs_embeds, hidden_states = maybe_execute_in_parallel(
+            norm_embeds,
+            norm_hidden,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+        )
+        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
+        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+
+        hidden_states = self.fc(hidden_states)
+
+        hidden_states, residual = super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            residual=None,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+
+        return hidden_states
+
+
 ALL_DECODER_LAYER_TYPES = {
     "full_attention": Qwen3NextFullAttentionDecoderLayer,
     "linear_attention": Qwen3NextLinearDecoderLayer,
@@ -1242,7 +1380,15 @@ class Qwen3NextModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
         pretrained_config = self.model_config.pretrained_config
-        self.aux_stream = torch.cuda.Stream()
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        self.aux_stream_dict = {
+            AuxStreamType.Attention: aux_stream_list[0],
+            AuxStreamType.MoeShared: aux_stream_list[0],
+            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
+            AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
+        }
+        self.aux_stream = self.aux_stream_dict[AuxStreamType.Attention]
         self.preload_weight_modules = []
         if config.moe_backend == "TRTLLM":
             self.preload_weight_modules = [
@@ -1275,6 +1421,7 @@ class Qwen3NextModel(DecoderModel):
                                                             self.aux_stream)
             for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
+        self.num_hidden_layers = pretrained_config.num_hidden_layers
 
         self.norm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
@@ -1308,7 +1455,7 @@ class Qwen3NextModel(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
-        for decoder_layer in self.layers:
+        for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -1328,11 +1475,28 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         self,
         model_config: ModelConfig[Qwen3NextConfig],
     ):
+        if (model_config.spec_config is not None
+                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
+            ckpt_num_nextn = getattr(model_config.pretrained_config,
+                                     "num_nextn_predict_layers", None)
+            if ckpt_num_nextn not in (None, 1):
+                logger.warning(
+                    "Qwen3Next one-model MTP uses one shared MTP layer, but "
+                    f"checkpoint/config reports num_nextn_predict_layers={ckpt_num_nextn}. "
+                    "Forcing num_nextn_predict_layers=1 to keep eagle-style recurrence."
+                )
+            model_config.pretrained_config.num_nextn_predict_layers = 1
+
         super().__init__(
             Qwen3NextModel(model_config),
             model_config,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
+
+        if (model_config.spec_config is not None
+                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
+
+            self.model.layers.extend(self.draft_model.mtp_layers)
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
