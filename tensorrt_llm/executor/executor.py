@@ -301,21 +301,34 @@ class GenerationExecutor(ABC):
             # We can catch some exceptions here.
             raise e
 
-    def _set_fatal_error(self, error: BaseException):
-        """Record an unrecoverable engine error. Only the first error is kept."""
+    def _set_fatal_error(self, error: BaseException) -> None:
+        """Record an unrecoverable engine error.
+
+        Only the first error is kept; subsequent calls are no-ops.
+        Thread-safe under CPython's GIL (single-bytecode reference
+        assignment).
+
+        Args:
+            error: The exception to record as the fatal error.
+        """
         if self._fatal_error is None:
             self._fatal_error = error
             logger.error(f"Fatal engine error recorded: {repr(error)}")
 
     def is_shutdown(self) -> bool:
+        """Return True if the executor is shutting down or fatally errored."""
         return self.doing_shutdown or self._fatal_error is not None
 
     def check_health(self) -> bool:
-        """Check if the executor is healthy.
+        """Check whether the executor is healthy and able to process requests.
 
-        Returns False if the executor has been shut down, has a fatal error,
-        or has pending fatal errors in the error queue. Safe to call from
-        any thread.
+        Returns False if the executor has been shut down, has a fatal
+        error, or has pending errors in the error queue.  Safe to call
+        from any thread (the ``_error_queue`` is a thread-safe
+        ``queue.Queue``).
+
+        Returns:
+            True if healthy, False otherwise.
         """
         if self.doing_shutdown or self._fatal_error is not None:
             return False

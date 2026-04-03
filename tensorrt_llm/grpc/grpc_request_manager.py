@@ -176,9 +176,7 @@ class GrpcRequestManager:
                 if not self.llm._executor.check_health():
                     error_msg = "Executor is unhealthy"
                     if self.llm._executor._fatal_error is not None:
-                        error_msg = (
-                            f"Fatal error: "
-                            f"{self.llm._executor._fatal_error}")
+                        error_msg = f"Fatal error: {self.llm._executor._fatal_error}"
                     return False, error_msg
 
             return True, "OK"

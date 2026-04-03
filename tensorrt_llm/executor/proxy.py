@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import os
 import threading
+import time
 import weakref
 from typing import Dict, List, Optional
 
@@ -132,10 +133,18 @@ class GenerationExecutorProxy(GenerationExecutor):
             atexit.register(self.pre_shutdown)
 
     def check_health(self) -> bool:
-        """Check executor health including MPI worker liveness."""
+        """Check executor health including MPI worker liveness.
+
+        Extends the base ``check_health()`` with MPI worker future
+        inspection.  If any worker future has completed (indicating a
+        crash or unexpected exit), the error is recorded and shutdown
+        is initiated.
+
+        Returns:
+            True if the executor and all MPI workers are healthy.
+        """
         if not super().check_health():
             return False
-        # Check if any MPI worker process has exited (indicating a crash).
         if hasattr(self, 'mpi_futures') and self.mpi_futures:
             for f in self.mpi_futures:
                 if f.done():
@@ -148,9 +157,21 @@ class GenerationExecutorProxy(GenerationExecutor):
                     return False
         return True
 
-    def _error_monitor_loop(self):
-        """Background thread that detects fatal errors every ~5 seconds."""
-        import time
+    def _error_monitor_loop(self) -> None:
+        """Background thread that polls for fatal errors every ~5 seconds.
+
+        Checks two sources:
+
+        1. **MPI worker futures** — if any future is done, the worker has
+           crashed or exited unexpectedly.
+        2. **Error queue** — drained directly (not via
+           ``_handle_background_error``, which is intended for the main
+           thread and calls ``shutdown()`` + ``raise``).
+
+        On detection, sets ``_fatal_error`` and calls ``shutdown()``.
+        The thread exits when ``doing_shutdown`` or ``_fatal_error`` is
+        set.
+        """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
                 # Check MPI worker futures

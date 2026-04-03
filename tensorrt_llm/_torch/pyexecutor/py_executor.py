@@ -463,6 +463,12 @@ class PyExecutor:
 
         self.is_shutdown = False
         self._fatal_error: Optional[BaseException] = None
+
+        # Token-bucket error budget: starts at 1.0, each error deducts a
+        # cost (0.1 for transient, 0.5 for severe), and the budget recovers
+        # at 0.1 per second of error-free wall time.  When the budget drops
+        # below zero the error is promoted to fatal.  Immediate-fatal errors
+        # (corrupted CUDA context) bypass the budget entirely.
         self._error_budget: float = 1.0
         self._last_error_time: Optional[float] = None
         self._error_budget_recovery_rate: float = 0.1
@@ -3368,26 +3374,33 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    # Errors matching these patterns corrupt the CUDA context or system
-    # state beyond recovery — crash immediately on the first occurrence.
-    _IMMEDIATE_FATAL_PATTERNS = [
+    # Patterns that corrupt the CUDA context beyond recovery.
+    # Matched case-insensitively against the error message.
+    _IMMEDIATE_FATAL_PATTERNS: list[str] = [
         "cudaerrorillegaladd",
         "cudaerrorlaunchfailure",
         "device-side assert",
         "unrecoverable",
     ]
 
-    # Errors matching these patterns are serious but *might* be transient
-    # (e.g., a one-off OOM under a memory spike).  They drain the error
-    # budget faster (×5) but still allow a brief window for recovery.
-    _SEVERE_ERROR_PATTERNS = [
+    # Patterns that are serious but may be transient (e.g. a single OOM
+    # during a traffic spike).  These drain the error budget 5× faster
+    # than transient errors.
+    _SEVERE_ERROR_PATTERNS: list[str] = [
         "cuda out of memory",
         "cuda error",
         "nccl error",
     ]
 
     def _classify_error(self, error_msg: str) -> str:
-        """Classify an error as 'immediate_fatal', 'severe', or 'transient'."""
+        """Classify an error message by severity.
+
+        Args:
+            error_msg: The error message string to classify.
+
+        Returns:
+            One of ``"immediate_fatal"``, ``"severe"``, or ``"transient"``.
+        """
         error_lower = error_msg.lower()
         for p in self._IMMEDIATE_FATAL_PATTERNS:
             if p in error_lower:
@@ -3398,19 +3411,37 @@ class PyExecutor:
         return "transient"
 
     def _is_fatal_error(self, error_msg: str) -> bool:
-        """Check if an error message indicates an unrecoverable error."""
+        """Return True if the error corrupts the CUDA context irrecoverably.
+
+        Args:
+            error_msg: The error message string to check.
+
+        Returns:
+            True only for immediate-fatal errors (device-side assert,
+            illegal address, launch failure).  Severe errors like CUDA OOM
+            are handled by the error budget instead.
+        """
         return self._classify_error(error_msg) == "immediate_fatal"
 
     def _consume_error_budget(self, error_msg: str) -> bool:
-        """Consume error budget and return True if the budget is exhausted.
+        """Deduct from the error budget and return True if exhausted.
 
-        Uses a token-bucket scheme: the budget (starting at 1.0) recovers
-        at ``_error_budget_recovery_rate`` per second of *error-free* wall
-        time, and each error costs ``_error_budget_cost`` (transient) or
-        ``5 * _error_budget_cost`` (severe).  Immediate-fatal errors
-        bypass the budget entirely.
+        Uses a token-bucket scheme:
+
+        * **Immediate-fatal** errors bypass the budget and return True.
+        * **Severe** errors cost ``5 * _error_budget_cost`` (default 0.5).
+        * **Transient** errors cost ``_error_budget_cost`` (default 0.1).
+        * The budget (starting at 1.0, capped at 1.0) recovers at
+          ``_error_budget_recovery_rate`` per second of error-free wall
+          time.
+
+        Args:
+            error_msg: The error message to classify and budget.
+
+        Returns:
+            True if the error should be treated as fatal (budget exhausted
+            or immediate-fatal pattern matched).
         """
-        import time
         now = time.monotonic()
 
         classification = self._classify_error(error_msg)
@@ -3442,7 +3473,21 @@ class PyExecutor:
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
                        *,
-                       requests: Optional[List[LlmRequest]] = None):
+                       requests: Optional[List[LlmRequest]] = None) -> None:
+        """Fail requests and optionally initiate shutdown on fatal errors.
+
+        Classifies the error via ``_consume_error_budget``.  If deemed
+        fatal (immediate-fatal pattern or budget exhausted), **all** active
+        requests are failed and a shutdown is enqueued.  Otherwise only
+        the requests in *requests* are failed.
+
+        Args:
+            error_msg: Human-readable error description.  Defaults to
+                ``"error"`` when ``None``.
+            requests: Subset of active requests to fail.  When ``None``
+                (or when the error is fatal), all ``active_requests`` are
+                failed.
+        """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
 

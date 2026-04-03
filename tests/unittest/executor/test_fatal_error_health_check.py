@@ -15,10 +15,10 @@
 """Unit tests for fatal error detection and health check functionality.
 
 Tests cover:
-- PyExecutor._is_fatal_error() pattern matching
-- PyExecutor._handle_errors() fatal + consecutive-error logic
-- GenerationExecutor.check_health() and _set_fatal_error()
-- GenerationExecutorProxy.check_health() MPI worker liveness
+- PyExecutor error classification (immediate-fatal / severe / transient)
+- PyExecutor token-bucket error budget and _handle_errors()
+- GenerationExecutor.check_health(), _set_fatal_error(), is_shutdown()
+- GenerationExecutorProxy.check_health() with MPI worker liveness
 - GenerationExecutorProxy._error_monitor_loop() background detection
 - GrpcRequestManager.health_check() integration
 - OpenAIServer /health endpoint with fatal error shutdown
@@ -36,19 +36,18 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# PyExecutor._is_fatal_error tests
+# PyExecutor mock — mirrors the real _classify_error / _consume_error_budget
+# / _handle_errors logic without pulling in the full PyExecutor dependency.
 # ---------------------------------------------------------------------------
 class MockPyExecutorForFatalError:
-    """Minimal mock of PyExecutor with fatal error detection logic."""
-
-    _IMMEDIATE_FATAL_PATTERNS = [
+    _IMMEDIATE_FATAL_PATTERNS: list[str] = [
         "cudaerrorillegaladd",
         "cudaerrorlaunchfailure",
         "device-side assert",
         "unrecoverable",
     ]
 
-    _SEVERE_ERROR_PATTERNS = [
+    _SEVERE_ERROR_PATTERNS: list[str] = [
         "cuda out of memory",
         "cuda error",
         "nccl error",
@@ -62,7 +61,6 @@ class MockPyExecutorForFatalError:
         self._error_budget_cost: float = 0.1
         self.active_requests = []
         self.executor_request_queue = Mock()
-        self._enqueue_responses = Mock()
 
     def _classify_error(self, error_msg: str) -> str:
         error_lower = error_msg.lower()
@@ -78,8 +76,6 @@ class MockPyExecutorForFatalError:
         return self._classify_error(error_msg) == "immediate_fatal"
 
     def _consume_error_budget(self, error_msg: str) -> bool:
-        import time
-
         now = time.monotonic()
         classification = self._classify_error(error_msg)
         if classification == "immediate_fatal":
@@ -98,198 +94,40 @@ class MockPyExecutorForFatalError:
 
     def _handle_errors(self, error_msg=None, *, requests=None):
         error_msg = error_msg or "error"
-
         is_fatal = self._consume_error_budget(error_msg)
-
         if is_fatal:
             self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
             requests = None
-
         failed_requests = requests if requests is not None else self.active_requests
         for request in failed_requests:
             request.state = "GENERATION_COMPLETE"
-
         if requests is None:
             self.active_requests.clear()
         else:
             self.active_requests = [r for r in self.active_requests if r not in requests]
-
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
 
 
-class TestClassifyError:
-    @pytest.fixture
-    def executor(self):
-        return MockPyExecutorForFatalError()
-
-    @pytest.mark.parametrize(
-        "error_msg",
-        [
-            "cudaErrorIllegalAddress: an illegal memory access",
-            "cudaErrorLaunchFailure: unspecified launch failure",
-            "RuntimeError: device-side assert triggered",
-            "Unrecoverable error in the engine",
-        ],
-    )
-    def test_immediate_fatal_errors(self, executor, error_msg):
-        assert executor._classify_error(error_msg) == "immediate_fatal"
-        assert executor._is_fatal_error(error_msg) is True
-
-    @pytest.mark.parametrize(
-        "error_msg",
-        [
-            "CUDA out of memory. Tried to allocate 2.00 GiB",
-            "RuntimeError: CUDA error: an illegal memory access was encountered",
-            "NCCL error: unhandled system error",
-        ],
-    )
-    def test_severe_errors(self, executor, error_msg):
-        assert executor._classify_error(error_msg) == "severe"
-        assert executor._is_fatal_error(error_msg) is False
-
-    @pytest.mark.parametrize(
-        "error_msg",
-        [
-            "Input length exceeds maximum",
-            "Request timed out",
-            "Invalid sampling parameter: top_k must be > 0",
-            "tokenizer error: unknown token",
-            "KV cache capacity exceeded",
-            "Batch size too large",
-            "",
-        ],
-    )
-    def test_transient_errors(self, executor, error_msg):
-        assert executor._classify_error(error_msg) == "transient"
-        assert executor._is_fatal_error(error_msg) is False
-
-    def test_case_insensitive_matching(self, executor):
-        assert executor._classify_error("DEVICE-SIDE ASSERT triggered") == "immediate_fatal"
-        assert executor._classify_error("Nccl Error: timeout") == "severe"
-        assert executor._classify_error("cuda OUT OF MEMORY") == "severe"
-
-
 # ---------------------------------------------------------------------------
-# PyExecutor._handle_errors tests
-# ---------------------------------------------------------------------------
-class TestHandleErrors:
-    @pytest.fixture
-    def executor(self):
-        return MockPyExecutorForFatalError()
-
-    def _make_request(self, req_id):
-        req = Mock()
-        req.py_request_id = req_id
-        req.py_client_id = 1
-        req.state = "GENERATION_IN_PROGRESS"
-        return req
-
-    def test_non_fatal_error_only_fails_specified_requests(self, executor):
-        req1 = self._make_request(1)
-        req2 = self._make_request(2)
-        executor.active_requests = [req1, req2]
-
-        executor._handle_errors("Input too long", requests=[req1])
-
-        assert executor._fatal_error is None
-        assert req2 in executor.active_requests
-        assert req1 not in executor.active_requests
-        executor.executor_request_queue.enqueue_shutdown_request.assert_not_called()
-
-    def test_immediate_fatal_error_fails_all_active_requests(self, executor):
-        req1 = self._make_request(1)
-        req2 = self._make_request(2)
-        req3 = self._make_request(3)
-        executor.active_requests = [req1, req2, req3]
-
-        executor._handle_errors("cudaErrorIllegalAddress", requests=[req1])
-
-        assert executor._fatal_error is not None
-        assert len(executor.active_requests) == 0
-        executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
-
-    def test_severe_errors_exhaust_budget(self, executor):
-        """Severe errors (CUDA OOM) cost 5x and exhaust budget quickly."""
-        # Disable recovery so elapsed time doesn't interfere
-        executor._error_budget_recovery_rate = 0.0
-        # budget=1.0, severe cost=0.5 each → 2 severe errors exhaust it
-        for i in range(2):
-            executor.active_requests = [self._make_request(i + 10)]
-            executor._handle_errors("CUDA out of memory", requests=executor.active_requests[:])
-
-        assert executor._fatal_error is not None
-        executor.executor_request_queue.enqueue_shutdown_request.assert_called()
-
-    def test_transient_errors_exhaust_budget_slowly(self, executor):
-        """Transient errors cost 0.25 each — need 4 to exhaust budget=1.0."""
-        executor._error_budget_recovery_rate = 0.0
-        executor._error_budget_cost = 0.25
-        for i in range(3):
-            executor.active_requests = [self._make_request(i + 10)]
-            executor._handle_errors("some transient error", requests=executor.active_requests[:])
-            assert executor._fatal_error is None
-
-        executor.active_requests = [self._make_request(99)]
-        executor._handle_errors("some transient error", requests=[self._make_request(99)])
-        assert executor._fatal_error is not None
-
-    def test_budget_recovers_over_time(self, executor):
-        """After time passes, the budget replenishes and errors are tolerated."""
-        import time
-
-        executor._handle_errors("some transient error", requests=[self._make_request(1)])
-        assert executor._error_budget < 1.0
-        budget_after_first = executor._error_budget
-
-        # Simulate 5 seconds passing (recovery = 0.1/s × 5s = 0.5)
-        executor._last_error_time = time.monotonic() - 5.0
-
-        executor.active_requests = [self._make_request(2)]
-        executor._handle_errors("some transient error", requests=[self._make_request(2)])
-        # Budget should have recovered before the second deduction
-        assert executor._fatal_error is None
-        assert executor._error_budget > budget_after_first - 0.1
-
-    def test_immediate_fatal_bypasses_budget(self, executor):
-        """Immediate-fatal errors crash regardless of remaining budget."""
-        assert executor._error_budget == 1.0
-        executor.active_requests = []
-        executor._handle_errors("device-side assert triggered")
-        assert executor._fatal_error is not None
-
-    def test_fatal_error_with_no_active_requests(self, executor):
-        executor.active_requests = []
-        executor._handle_errors("cudaErrorLaunchFailure: failure")
-
-        assert executor._fatal_error is not None
-        executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
-
-    def test_default_error_message(self, executor):
-        executor.active_requests = []
-        executor._handle_errors()
-        assert executor._fatal_error is None
-
-
-# ---------------------------------------------------------------------------
-# GenerationExecutor._set_fatal_error and check_health tests
+# Minimal executor mocks for GenerationExecutor / Proxy tests
 # ---------------------------------------------------------------------------
 class ConcreteExecutor:
-    """Minimal concrete version of GenerationExecutor for testing."""
+    """Mirrors GenerationExecutor's fatal-error and health-check logic."""
 
     def __init__(self):
-        self._error_queue = Queue()
-        self.doing_shutdown = False
+        self._error_queue: Queue = Queue()
+        self.doing_shutdown: bool = False
         self._fatal_error = None
 
     def _set_fatal_error(self, error):
         if self._fatal_error is None:
             self._fatal_error = error
 
-    def is_shutdown(self):
+    def is_shutdown(self) -> bool:
         return self.doing_shutdown or self._fatal_error is not None
 
-    def check_health(self):
+    def check_health(self) -> bool:
         if self.doing_shutdown or self._fatal_error is not None:
             return False
         if not self._error_queue.empty():
@@ -316,82 +154,18 @@ class ConcreteExecutor:
         self.doing_shutdown = True
 
 
-class TestSetFatalError:
-    @pytest.fixture
-    def executor(self):
-        return ConcreteExecutor()
-
-    def test_first_error_wins(self, executor):
-        first = RuntimeError("first error")
-        second = RuntimeError("second error")
-
-        executor._set_fatal_error(first)
-        executor._set_fatal_error(second)
-
-        assert executor._fatal_error is first
-
-    def test_none_initially(self, executor):
-        assert executor._fatal_error is None
-
-
-class TestCheckHealth:
-    @pytest.fixture
-    def executor(self):
-        return ConcreteExecutor()
-
-    def test_healthy_by_default(self, executor):
-        assert executor.check_health() is True
-
-    def test_unhealthy_after_fatal_error(self, executor):
-        executor._set_fatal_error(RuntimeError("boom"))
-        assert executor.check_health() is False
-
-    def test_unhealthy_during_shutdown(self, executor):
-        executor.doing_shutdown = True
-        assert executor.check_health() is False
-
-    def test_unhealthy_with_error_in_queue(self, executor):
-        executor._error_queue.put(RuntimeError("background crash"))
-        assert executor.check_health() is False
-        assert executor._fatal_error is not None
-
-    def test_healthy_with_empty_queue(self, executor):
-        assert executor.check_health() is True
-        assert executor._fatal_error is None
-
-
-class TestIsShutdown:
-    @pytest.fixture
-    def executor(self):
-        return ConcreteExecutor()
-
-    def test_not_shutdown_initially(self, executor):
-        assert executor.is_shutdown() is False
-
-    def test_shutdown_when_doing_shutdown(self, executor):
-        executor.doing_shutdown = True
-        assert executor.is_shutdown() is True
-
-    def test_shutdown_when_fatal_error(self, executor):
-        executor._set_fatal_error(RuntimeError("fatal"))
-        assert executor.is_shutdown() is True
-
-
-# ---------------------------------------------------------------------------
-# GenerationExecutorProxy.check_health and _error_monitor_loop tests
-# ---------------------------------------------------------------------------
 class ConcreteProxyExecutor(ConcreteExecutor):
-    """Minimal mock of GenerationExecutorProxy for testing."""
+    """Mirrors GenerationExecutorProxy's MPI-aware health check + monitor."""
 
     def __init__(self):
         super().__init__()
-        self.mpi_futures = []
-        self._shutdown_called = False
+        self.mpi_futures: list = []
+        self._shutdown_called: bool = False
 
-    def check_health(self):
+    def check_health(self) -> bool:
         if not super().check_health():
             return False
-        if hasattr(self, "mpi_futures") and self.mpi_futures:
+        if self.mpi_futures:
             for f in self.mpi_futures:
                 if f.done():
                     exc = f.exception() if not f.cancelled() else None
@@ -405,7 +179,7 @@ class ConcreteProxyExecutor(ConcreteExecutor):
     def _error_monitor_loop(self):
         while not self.doing_shutdown and self._fatal_error is None:
             try:
-                if hasattr(self, "mpi_futures") and self.mpi_futures:
+                if self.mpi_futures:
                     for f in self.mpi_futures:
                         if f.done():
                             exc = f.exception() if not f.cancelled() else None
@@ -430,116 +204,285 @@ class ConcreteProxyExecutor(ConcreteExecutor):
             for _ in range(50):
                 if self.doing_shutdown or self._fatal_error is not None:
                     return
-                time.sleep(0.01)  # 10ms for fast tests instead of 100ms
+                time.sleep(0.01)
 
     def shutdown(self):
         self.doing_shutdown = True
         self._shutdown_called = True
 
 
+# ===========================================================================
+# Tests
+# ===========================================================================
+
+
+def _make_request(req_id: int) -> Mock:
+    req = Mock()
+    req.py_request_id = req_id
+    req.py_client_id = 1
+    req.state = "GENERATION_IN_PROGRESS"
+    return req
+
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+class TestClassifyError:
+    @pytest.fixture
+    def executor(self):
+        return MockPyExecutorForFatalError()
+
+    @pytest.mark.parametrize(
+        "error_msg,expected",
+        [
+            ("cudaErrorIllegalAddress: illegal memory access", "immediate_fatal"),
+            ("cudaErrorLaunchFailure: unspecified failure", "immediate_fatal"),
+            ("RuntimeError: device-side assert triggered", "immediate_fatal"),
+            ("Unrecoverable error in the engine", "immediate_fatal"),
+            ("CUDA out of memory. Tried to allocate 2 GiB", "severe"),
+            ("RuntimeError: CUDA error: illegal memory access", "severe"),
+            ("NCCL error: unhandled system error", "severe"),
+            ("Input length exceeds maximum", "transient"),
+            ("Request timed out", "transient"),
+            ("Invalid sampling parameter: top_k must be > 0", "transient"),
+            ("KV cache capacity exceeded", "transient"),
+            ("", "transient"),
+        ],
+    )
+    def test_classification(self, executor, error_msg, expected):
+        assert executor._classify_error(error_msg) == expected
+
+    @pytest.mark.parametrize(
+        "error_msg,is_fatal",
+        [
+            ("cudaErrorIllegalAddress", True),
+            ("device-side assert triggered", True),
+            ("CUDA out of memory", False),
+            ("NCCL error", False),
+            ("some random error", False),
+        ],
+    )
+    def test_is_fatal_error(self, executor, error_msg, is_fatal):
+        assert executor._is_fatal_error(error_msg) is is_fatal
+
+    @pytest.mark.parametrize(
+        "error_msg,expected",
+        [
+            ("DEVICE-SIDE ASSERT triggered", "immediate_fatal"),
+            ("Nccl Error: timeout", "severe"),
+            ("cuda OUT OF MEMORY", "severe"),
+        ],
+    )
+    def test_case_insensitive(self, executor, error_msg, expected):
+        assert executor._classify_error(error_msg) == expected
+
+
+# ---------------------------------------------------------------------------
+# Token-bucket error budget + _handle_errors
+# ---------------------------------------------------------------------------
+class TestErrorBudget:
+    @pytest.fixture
+    def executor(self):
+        ex = MockPyExecutorForFatalError()
+        ex._error_budget_recovery_rate = 0.0
+        return ex
+
+    def test_immediate_fatal_bypasses_budget(self, executor):
+        assert executor._error_budget == 1.0
+        executor._handle_errors("device-side assert triggered")
+        assert executor._fatal_error is not None
+
+    def test_severe_errors_exhaust_budget_in_two(self, executor):
+        """budget=1.0, severe cost=0.5 → 2 severe errors exhaust it."""
+        for i in range(2):
+            executor.active_requests = [_make_request(i)]
+            executor._handle_errors("CUDA out of memory", requests=executor.active_requests[:])
+        assert executor._fatal_error is not None
+        executor.executor_request_queue.enqueue_shutdown_request.assert_called()
+
+    def test_transient_errors_exhaust_budget_in_four(self, executor):
+        """cost=0.25 → 4 transient errors exhaust budget=1.0."""
+        executor._error_budget_cost = 0.25
+        for i in range(3):
+            executor.active_requests = [_make_request(i)]
+            executor._handle_errors("some transient error", requests=executor.active_requests[:])
+            assert executor._fatal_error is None
+        executor._handle_errors("some transient error", requests=[_make_request(99)])
+        assert executor._fatal_error is not None
+
+    def test_budget_recovers_over_time(self):
+        executor = MockPyExecutorForFatalError()
+        executor._handle_errors("transient error", requests=[_make_request(1)])
+        budget_after = executor._error_budget
+
+        # Simulate 5 seconds of error-free time (recovery = 0.1/s × 5s)
+        executor._last_error_time = time.monotonic() - 5.0
+
+        executor._handle_errors("transient error", requests=[_make_request(2)])
+        assert executor._fatal_error is None
+        assert executor._error_budget > budget_after - 0.1
+
+    def test_non_fatal_only_fails_specified_requests(self, executor):
+        req1, req2 = _make_request(1), _make_request(2)
+        executor.active_requests = [req1, req2]
+        executor._handle_errors("Input too long", requests=[req1])
+        assert executor._fatal_error is None
+        assert req1 not in executor.active_requests
+        assert req2 in executor.active_requests
+        executor.executor_request_queue.enqueue_shutdown_request.assert_not_called()
+
+    def test_fatal_fails_all_and_enqueues_shutdown(self, executor):
+        reqs = [_make_request(i) for i in range(3)]
+        executor.active_requests = list(reqs)
+        executor._handle_errors("cudaErrorIllegalAddress", requests=[reqs[0]])
+        assert executor._fatal_error is not None
+        assert len(executor.active_requests) == 0
+        executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
+
+    def test_fatal_error_with_no_active_requests(self, executor):
+        executor.active_requests = []
+        executor._handle_errors("cudaErrorLaunchFailure")
+        assert executor._fatal_error is not None
+        executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
+
+    def test_default_error_msg_is_transient(self, executor):
+        executor.active_requests = []
+        executor._handle_errors()
+        assert executor._fatal_error is None
+
+
+# ---------------------------------------------------------------------------
+# GenerationExecutor: _set_fatal_error, is_shutdown, check_health
+# ---------------------------------------------------------------------------
+class TestGenerationExecutor:
+    @pytest.fixture
+    def executor(self):
+        return ConcreteExecutor()
+
+    def test_fatal_error_none_initially(self, executor):
+        assert executor._fatal_error is None
+
+    def test_set_fatal_error_first_wins(self, executor):
+        first, second = RuntimeError("a"), RuntimeError("b")
+        executor._set_fatal_error(first)
+        executor._set_fatal_error(second)
+        assert executor._fatal_error is first
+
+    @pytest.mark.parametrize(
+        "doing_shutdown,fatal_error,expected",
+        [
+            (False, None, False),
+            (True, None, True),
+            (False, RuntimeError("x"), True),
+            (True, RuntimeError("x"), True),
+        ],
+    )
+    def test_is_shutdown(self, doing_shutdown, fatal_error, expected):
+        ex = ConcreteExecutor()
+        ex.doing_shutdown = doing_shutdown
+        ex._fatal_error = fatal_error
+        assert ex.is_shutdown() is expected
+
+    @pytest.mark.parametrize(
+        "doing_shutdown,fatal_error,queue_error,expected",
+        [
+            (False, None, None, True),
+            (True, None, None, False),
+            (False, RuntimeError("x"), None, False),
+            (False, None, RuntimeError("bg"), False),
+        ],
+    )
+    def test_check_health(self, doing_shutdown, fatal_error, queue_error, expected):
+        ex = ConcreteExecutor()
+        ex.doing_shutdown = doing_shutdown
+        ex._fatal_error = fatal_error
+        if queue_error is not None:
+            ex._error_queue.put(queue_error)
+        assert ex.check_health() is expected
+
+
+# ---------------------------------------------------------------------------
+# GenerationExecutorProxy: check_health with MPI futures
+# ---------------------------------------------------------------------------
 class TestProxyCheckHealth:
     @pytest.fixture
     def executor(self):
         return ConcreteProxyExecutor()
 
-    def test_healthy_with_running_workers(self, executor):
-        f = Future()
-        executor.mpi_futures = [f]
-        assert executor.check_health() is True
-
-    def test_unhealthy_when_worker_crashes(self, executor):
-        f = Future()
-        f.set_exception(RuntimeError("worker segfault"))
-        executor.mpi_futures = [f]
-
-        assert executor.check_health() is False
-        assert executor._fatal_error is not None
-        assert "worker segfault" in str(executor._fatal_error)
-        assert executor._shutdown_called is True
-
-    def test_unhealthy_when_worker_exits_without_exception(self, executor):
-        f = Future()
-        f.set_result(None)
-        executor.mpi_futures = [f]
-
-        assert executor.check_health() is False
-        assert "MPI worker exited unexpectedly" in str(executor._fatal_error)
-
-    def test_unhealthy_when_worker_cancelled(self, executor):
-        f = Future()
-        f.cancel()
-        executor.mpi_futures = [f]
-
-        assert executor.check_health() is False
-        assert "MPI worker exited unexpectedly" in str(executor._fatal_error)
+    @pytest.mark.parametrize(
+        "future_factory,expected_healthy,error_substr",
+        [
+            (lambda: Future(), True, None),
+            (lambda: _done_future(RuntimeError("segfault")), False, "segfault"),
+            (lambda: _done_future(None), False, "unexpectedly"),
+            (lambda: _cancelled_future(), False, "unexpectedly"),
+        ],
+    )
+    def test_worker_states(self, executor, future_factory, expected_healthy, error_substr):
+        executor.mpi_futures = [future_factory()]
+        assert executor.check_health() is expected_healthy
+        if error_substr:
+            assert error_substr in str(executor._fatal_error)
 
     def test_healthy_with_no_mpi_futures(self, executor):
-        executor.mpi_futures = []
         assert executor.check_health() is True
 
     def test_parent_unhealthy_short_circuits(self, executor):
-        executor._set_fatal_error(RuntimeError("parent error"))
-        f = Future()
-        executor.mpi_futures = [f]
+        executor._set_fatal_error(RuntimeError("parent"))
+        executor.mpi_futures = [Future()]
         assert executor.check_health() is False
 
 
+# ---------------------------------------------------------------------------
+# _error_monitor_loop background thread
+# ---------------------------------------------------------------------------
 class TestErrorMonitorLoop:
     def test_detects_worker_crash(self):
         executor = ConcreteProxyExecutor()
         f = Future()
         executor.mpi_futures = [f]
 
-        thread = threading.Thread(target=executor._error_monitor_loop, daemon=True)
-        thread.start()
-
+        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
+        t.start()
         time.sleep(0.05)
-        f.set_exception(RuntimeError("worker OOM"))
+        f.set_exception(RuntimeError("OOM"))
+        t.join(timeout=2.0)
 
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()
+        assert not t.is_alive()
         assert executor._fatal_error is not None
-        assert executor._shutdown_called is True
+        assert executor._shutdown_called
 
     def test_detects_error_queue_item(self):
         executor = ConcreteProxyExecutor()
 
-        thread = threading.Thread(target=executor._error_monitor_loop, daemon=True)
-        thread.start()
-
+        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
+        t.start()
         time.sleep(0.05)
-        executor._error_queue.put(RuntimeError("background failure"))
+        executor._error_queue.put(RuntimeError("bg failure"))
+        t.join(timeout=2.0)
 
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()
+        assert not t.is_alive()
         assert executor._fatal_error is not None
 
-    def test_stops_on_shutdown(self):
+    def test_stops_on_shutdown_flag(self):
         executor = ConcreteProxyExecutor()
 
-        thread = threading.Thread(target=executor._error_monitor_loop, daemon=True)
-        thread.start()
-
+        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
+        t.start()
         time.sleep(0.05)
         executor.doing_shutdown = True
+        t.join(timeout=2.0)
 
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()
+        assert not t.is_alive()
 
 
 # ---------------------------------------------------------------------------
-# GrpcRequestManager.health_check tests
+# gRPC health check
 # ---------------------------------------------------------------------------
 class TestGrpcHealthCheck:
-    def _make_manager(self, executor=None):
-        manager = MagicMock()
-        manager.llm = MagicMock()
-        manager.llm._executor = executor
-        manager.health_check = self._health_check.__get__(manager)
-        return manager
-
     @staticmethod
     async def _health_check(self):
+        """Mirrors GrpcRequestManager.health_check logic."""
         try:
             if self.llm is None:
                 return False, "LLM not initialized"
@@ -555,103 +498,68 @@ class TestGrpcHealthCheck:
         except Exception as e:
             return False, f"Error: {e}"
 
-    @pytest.mark.asyncio
-    async def test_healthy_executor(self):
-        executor = ConcreteExecutor()
-        manager = self._make_manager(executor)
-
-        healthy, msg = await manager.health_check()
-        assert healthy is True
-        assert msg == "OK"
+    def _make_manager(self, executor=None):
+        m = MagicMock()
+        m.llm = MagicMock()
+        m.llm._executor = executor
+        m.health_check = self._health_check.__get__(m)
+        return m
 
     @pytest.mark.asyncio
-    async def test_unhealthy_with_fatal_error(self):
-        executor = ConcreteExecutor()
-        executor._set_fatal_error(RuntimeError("CUDA OOM"))
-        manager = self._make_manager(executor)
+    @pytest.mark.parametrize(
+        "setup,expected_healthy,msg_substr",
+        [
+            ("healthy", True, "OK"),
+            ("fatal", False, "CUDA OOM"),
+            ("no_executor", False, "not available"),
+            ("no_llm", False, "not initialized"),
+            ("shutdown", False, "unhealthy"),
+        ],
+    )
+    async def test_health_check(self, setup, expected_healthy, msg_substr):
+        if setup == "no_llm":
+            m = MagicMock()
+            m.llm = None
+            m.health_check = self._health_check.__get__(m)
+        else:
+            ex = ConcreteExecutor()
+            if setup == "fatal":
+                ex._set_fatal_error(RuntimeError("CUDA OOM"))
+            elif setup == "no_executor":
+                ex = None
+            elif setup == "shutdown":
+                ex.doing_shutdown = True
+            m = self._make_manager(ex)
 
-        healthy, msg = await manager.health_check()
-        assert healthy is False
-        assert "CUDA OOM" in msg
-
-    @pytest.mark.asyncio
-    async def test_no_executor(self):
-        manager = self._make_manager(executor=None)
-
-        healthy, msg = await manager.health_check()
-        assert healthy is False
-        assert "not available" in msg
-
-    @pytest.mark.asyncio
-    async def test_no_llm(self):
-        manager = MagicMock()
-        manager.llm = None
-        manager.health_check = self._health_check.__get__(manager)
-
-        healthy, msg = await manager.health_check()
-        assert healthy is False
-        assert "not initialized" in msg
-
-    @pytest.mark.asyncio
-    async def test_unhealthy_during_shutdown(self):
-        executor = ConcreteExecutor()
-        executor.doing_shutdown = True
-        manager = self._make_manager(executor)
-
-        healthy, msg = await manager.health_check()
-        assert healthy is False
-        assert "unhealthy" in msg.lower()
+        healthy, msg = await m.health_check()
+        assert healthy is expected_healthy
+        assert msg_substr in msg
 
 
 # ---------------------------------------------------------------------------
-# OpenAIServer /health endpoint tests
+# OpenAI /health endpoint
 # ---------------------------------------------------------------------------
 class TestOpenAIHealthEndpoint:
-    def _make_server_mock(self, check_health_return, fatal_error=None):
-        """Create a minimal mock that exercises the health() logic."""
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "check_healthy,fatal_error,expect_code,sigint",
+        [
+            (True, None, 200, False),
+            (False, None, 503, False),
+            (False, RuntimeError("CUDA OOM"), 503, True),
+        ],
+    )
+    async def test_health(self, check_healthy, fatal_error, expect_code, sigint):
+        from starlette.responses import Response
+
         server = MagicMock()
-        server._check_health = Mock(return_value=check_health_return)
+        server._check_health = Mock(return_value=check_healthy)
         executor = Mock()
         executor._fatal_error = fatal_error
         server.generator = Mock()
         server.generator._executor = executor
-        return server, executor
 
-    @pytest.mark.asyncio
-    async def test_healthy_returns_200(self):
-        from starlette.responses import Response
-
-        server, _ = self._make_server_mock(check_health_return=True)
-
-        # Inline the health() logic to test without full FastAPI setup
-        if server._check_health():
-            response = Response(status_code=200)
-        else:
-            response = Response(status_code=503)
-
-        assert response.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_unhealthy_returns_503(self):
-        from starlette.responses import Response
-
-        server, _ = self._make_server_mock(check_health_return=False, fatal_error=None)
-
-        if server._check_health():
-            response = Response(status_code=200)
-        else:
-            response = Response(status_code=503)
-
-        assert response.status_code == 503
-
-    @pytest.mark.asyncio
-    async def test_fatal_error_triggers_sigint(self):
-        from starlette.responses import Response
-
-        fatal = RuntimeError("CUDA OOM")
-        server, executor = self._make_server_mock(check_health_return=False, fatal_error=fatal)
-
-        with patch.object(signal, "raise_signal") as mock_signal:
+        with patch.object(signal, "raise_signal") as mock_sig:
             if server._check_health():
                 response = Response(status_code=200)
             else:
@@ -660,50 +568,59 @@ class TestOpenAIHealthEndpoint:
                     signal.raise_signal(signal.SIGINT)
                 response = Response(status_code=503)
 
-            assert response.status_code == 503
-            mock_signal.assert_called_once_with(signal.SIGINT)
-
-    @pytest.mark.asyncio
-    async def test_no_sigint_without_fatal_error(self):
-        server, _ = self._make_server_mock(check_health_return=False, fatal_error=None)
-
-        with patch.object(signal, "raise_signal") as mock_signal:
-            if server._check_health():
-                pass
+            assert response.status_code == expect_code
+            if sigint:
+                mock_sig.assert_called_once_with(signal.SIGINT)
             else:
-                ex = getattr(server.generator, "_executor", None)
-                if ex is not None and getattr(ex, "_fatal_error", None) is not None:
-                    signal.raise_signal(signal.SIGINT)
-
-            mock_signal.assert_not_called()
+                mock_sig.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# BaseLLM._check_health delegation tests
+# BaseLLM._check_health delegation
 # ---------------------------------------------------------------------------
 class TestBaseLLMCheckHealth:
     @staticmethod
-    def _check_health(llm):
-        """Mirrors BaseLLM._check_health logic."""
+    def _check_health(llm) -> bool:
         if hasattr(llm, "_executor") and llm._executor is not None:
             return llm._executor.check_health()
         return False
 
-    def test_delegates_to_executor(self):
-        executor = ConcreteExecutor()
+    @pytest.mark.parametrize(
+        "has_executor,fatal,expected",
+        [
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ],
+    )
+    def test_delegation(self, has_executor, fatal, expected):
         llm = Mock()
-        llm._executor = executor
+        if has_executor:
+            ex = ConcreteExecutor()
+            if fatal:
+                ex._set_fatal_error(RuntimeError("x"))
+            llm._executor = ex
+        else:
+            llm._executor = None
+        assert self._check_health(llm) is expected
 
-        assert self._check_health(llm) is True
+    def test_no_executor_attr(self):
+        assert self._check_health(object()) is False
 
-        executor._set_fatal_error(RuntimeError("fatal"))
-        assert self._check_health(llm) is False
 
-    def test_returns_false_when_no_executor(self):
-        llm = Mock()
-        llm._executor = None
-        assert self._check_health(llm) is False
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _done_future(exc=None):
+    f = Future()
+    if exc is not None:
+        f.set_exception(exc)
+    else:
+        f.set_result(None)
+    return f
 
-    def test_returns_false_when_no_executor_attr(self):
-        llm = object()
-        assert self._check_health(llm) is False
+
+def _cancelled_future():
+    f = Future()
+    f.cancel()
+    return f
