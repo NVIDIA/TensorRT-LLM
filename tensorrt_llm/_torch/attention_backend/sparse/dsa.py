@@ -1,3 +1,4 @@
+"""Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -95,6 +96,7 @@ def _compute_slot_mappings(
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    """Apply Hadamard rotation to activation tensor for DSA sparse attention."""
     assert x.dtype == torch.bfloat16
 
     if not HAS_FAST_HADAMARD:
@@ -296,6 +298,8 @@ class IndexerPrefillChunkMetadata:
 
 
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
+    """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
+
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
@@ -318,6 +322,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     use_expanded_buffers_for_mtp: bool = False
 
     def __init__(self, *args, **kwargs):
+        """Initialize DSA metadata with SM count and indexer chunk size."""
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
         # Cached step-invariant values for transform_local_topk_and_prepare_pool_view.
         # These are recomputed once per step in _ensure_pool_view_cached() and
@@ -340,6 +345,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
 
     def __post_init__(self):
+        """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
 
         self.sparse_mla_topk = self.sparse_attention_config.index_topk
@@ -493,11 +499,47 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
+        # Per-layer persistent buffers for heuristic TopK pre_idx.
+        # Indexed by [local_layer_idx, generation_position, :].
+        # The graph captures reads/writes on these stable-address buffers;
+        # each replay's write becomes the next replay's read (feedback loop).
+        self.enable_heuristic_topk = (
+            self.sparse_attention_config.enable_heuristic_topk
+            and get_sm_version() >= 100)
+        if self.enable_heuristic_topk:
+            num_local_layers = self.kv_cache_manager.num_local_layers
+            self.heuristic_prev_topk = self.get_empty(
+                self.cuda_graph_buffers,
+                (num_local_layers, self.max_num_sequences,
+                 self.sparse_mla_topk),
+                cache_name="heuristic_prev_topk",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            # Zero-initialize so the first decode step's pre_idx (kernel
+            # adds +1 offset) points to index 1 — a valid but benign candidate.
+            # Without this, uninitialized memory produces random hint indices.
+            self.heuristic_prev_topk.zero_()
+            # Scratch buffer for heuristic TopK kernel output values.
+            # Pre-allocated with stable address for CUDA Graph compatibility
+            # (replaces cudaMallocAsync/cudaFreeAsync inside the kernel launcher).
+            # Shape: [max_gen_tokens, topK] where max_gen_tokens = max_batch * (1 + max_draft).
+            max_gen_tokens = self.max_num_sequences * (1 +
+                                                       self.max_draft_tokens)
+            self.heuristic_scratch_values = self.get_empty(
+                self.cuda_graph_buffers,
+                (max_gen_tokens, self.sparse_mla_topk),
+                cache_name="heuristic_scratch_values",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
+            )
+
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
     # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
     def create_expanded_buffers(self, capture_graph=False):
+        """Create expanded KV-length and block-table buffers for speculative decoding."""
         self.kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_sequences * (1 + self.max_draft_tokens), ),
@@ -557,6 +599,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         spec_tree_manager: Optional['SpecTreeManager'] = None,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
+        """Update speculative decoding parameters and create expanded buffers."""
         super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
                                       is_spec_dec_dynamic_tree, max_draft_len,
@@ -568,6 +611,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             capture_graph = self.is_cuda_graph
             self.create_expanded_buffers(capture_graph=capture_graph)
+            # Resize heuristic scratch buffer for new max_draft_tokens.
+            if self.enable_heuristic_topk:
+                max_gen_tokens = self.max_num_sequences * (
+                    1 + self.max_draft_tokens)
+                self.heuristic_scratch_values = self.get_empty(
+                    self.cuda_graph_buffers,
+                    (max_gen_tokens, self.sparse_mla_topk),
+                    cache_name="heuristic_scratch_values",
+                    dtype=torch.float32,
+                    capture_graph=capture_graph,
+                )
 
     def _invalidate_pool_view_cache(self):
         """Invalidate the cached pool view and related step-invariant values.
@@ -634,6 +688,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_dense_topk_indices(self,
                                    kv_lens,
                                    device=False):  # device=False means use CPU
+        """Prepare dense TopK indices for short sequences that skip the indexer."""
 
         if self.num_contexts > 0 and self.skip_indexer_for_ctx_reqs:
             ctx_range = slice(self.num_ctx_tokens)
@@ -700,6 +755,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return pool_indices
 
     def prepare(self):
+        """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
 
@@ -879,6 +935,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         Indexer.prepare(metadata=self)
 
     def on_update_kv_lens(self):
+        """Refresh indexer slot mappings after KV lengths change at runtime."""
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -963,6 +1020,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
+        """Reset context/generation counters and refresh slot mappings for speculative decoding."""
         super().update_for_spec_dec()
         # host
         self.max_ctx_kv_len = 0
@@ -976,15 +1034,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 @maybe_compile(dynamic=True)
 def _scale(weights: torch.Tensor, q_scale: torch.Tensor,
            s: float) -> torch.Tensor:
+    """Scale attention weights by quantization scale and constant factor."""
     return weights * q_scale.squeeze(-1) * s
 
 
 @maybe_compile(dynamic=True)
 def _to_float(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Cast hidden states to float32 for TF32 GEMM computation."""
     return hidden_states.float()
 
 
 class Indexer(nn.Module):
+    """DSA sparse attention indexer that selects top-K KV cache entries per token."""
 
     def __init__(self,
                  quant_config: Optional[QuantConfig],
@@ -995,6 +1056,7 @@ class Indexer(nn.Module):
                  dtype: Optional[torch.dtype],
                  layer_idx: int = 0,
                  aux_stream: Optional[torch.cuda.Stream] = None):
+        """Initialize indexer with projection weights, norms, and TopK configuration."""
         super().__init__()
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
@@ -1050,6 +1112,10 @@ class Indexer(nn.Module):
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
                                   and IS_CUTLASS_DSL_AVAILABLE)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
+
+        self._enable_heuristic_topk = (
+            sparse_attention_config.enable_heuristic_topk
+            and get_sm_version() >= 100)
 
         if self.use_cute_dsl_topk and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
@@ -1481,6 +1547,7 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
+        """Run the indexer TopK kernel for both prefill and decode phases."""
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size == 128, \
             "Only support quant_block_size = 128 for now"
@@ -1680,6 +1747,20 @@ class Indexer(nn.Module):
                 # This is because rowEnd = seq_len - next_n + offset + 1
                 gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
+
+                pre_idx = None
+                heuristic_scratch = None
+                if self._enable_heuristic_topk:
+                    local_layer = metadata.kv_cache_manager.layer_offsets[
+                        self.layer_idx]
+                    # Pass prev_topk directly; the +1 temporal offset is
+                    # handled inside the C++ kernel (preIdxOffset += 1).
+                    pre_idx = metadata.heuristic_prev_topk[
+                        local_layer, :num_generations]
+                    heuristic_scratch = \
+                        metadata.heuristic_scratch_values[
+                            :num_gen_tokens]
+
                 # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
                 # memory. Beyond 256 tokens the extra memory becomes significant,
                 # so we cap it at 256 for now and fall back to the CUDA C++
@@ -1693,10 +1774,14 @@ class Indexer(nn.Module):
                         next_n)
                 else:
                     torch.ops.trtllm.indexer_topk_decode(
-                        logits_decode, gen_kv_lens_cuda,
+                        logits_decode,
+                        gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                            num_gen_tokens, :], next_n,
-                        self.index_topk)
+                                            num_gen_tokens, :],
+                        next_n,
+                        self.index_topk,
+                        pre_idx=pre_idx,
+                        heuristic_scratch=heuristic_scratch)
             else:
                 # padded
                 positions = torch.arange(
@@ -1729,6 +1814,16 @@ class Indexer(nn.Module):
                                     num_gen_tokens, :topk_indices_decode.
                                     shape[-1]] = topk_indices_decode.to(
                                         dtype=torch.int32)
+
+            if self._enable_heuristic_topk:
+                local_layer = metadata.kv_cache_manager.layer_offsets[
+                    self.layer_idx]
+                decode_topk = topk_indices_buffer[
+                    num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
+                last_mtp_topk = decode_topk[next_n - 1::next_n]
+                metadata.heuristic_prev_topk[
+                    local_layer, :num_generations].copy_(last_mtp_topk)
+
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
@@ -1867,6 +1962,8 @@ class Indexer(nn.Module):
 
 
 class DSATrtllmAttention(TrtllmAttention):
+    """TRT-LLM attention layer with DSA sparse indexer for MLA models."""
+
     Metadata = DSAtrtllmAttentionMetadata
 
     def __init__(
@@ -1885,6 +1982,7 @@ class DSATrtllmAttention(TrtllmAttention):
             dtype: Optional[torch.dtype] = None,
             aux_stream: Optional[torch.cuda.Stream] = None,
             **kwargs):
+        """Initialize DSA attention with an Indexer sub-module for sparse TopK selection."""
         if sparse_attention_config is None:
             raise ValueError(
                 "sparse_attention_config is required for DSATrtllmAttention and cannot be None"
@@ -1921,6 +2019,7 @@ class DSATrtllmAttention(TrtllmAttention):
         is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Transform local TopK indices to global paged KV cache indices."""
         # Transform the local topk indices to global topk indices in paged kv cache
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, self.get_local_layer_idx(metadata),
@@ -1939,6 +2038,7 @@ class DSATrtllmAttention(TrtllmAttention):
         qr: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """No-op KV prediction; DSA uses indexer-based selection instead."""
         return None, None
 
     def mla_rope_append_paged_kv_assign_q(
@@ -1949,6 +2049,7 @@ class DSATrtllmAttention(TrtllmAttention):
         is_generation: bool = False,
         **kwargs,
     ) -> None:
+        """Apply RoPE, append latent cache to paged KV, and assign query for MLA."""
         if is_generation:
             cached_token_indptr = metadata.gen_cached_token_indptr
             kv_indptr = metadata.gen_kv_indptr
@@ -1995,6 +2096,7 @@ class DSATrtllmAttention(TrtllmAttention):
 
 
 class DSACacheManager(KVCacheManager):
+    """KV cache manager for DSA with additional indexer K-cache pools."""
 
     def __init__(
         self,
@@ -2019,6 +2121,7 @@ class DSACacheManager(KVCacheManager):
         sparse_attn_config: "SparseAttentionConfig",
         **kwargs,
     ) -> None:
+        """Initialize cache manager with indexer K-cache pool per layer."""
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
 
@@ -2063,6 +2166,7 @@ class DSACacheManager(KVCacheManager):
             self.num_blocks, block_size, 1, per_token_size)
 
     def shutdown(self):
+        """Release indexer K-cache pool references before C++ buffer cleanup."""
         # Clear Python references BEFORE C++ frees the underlying CUDA buffers
         self.indexer_k_cache_pool_per_layer = []
         super().shutdown()
@@ -2072,6 +2176,7 @@ class DSACacheManager(KVCacheManager):
                                  mapping: Mapping,
                                  num_layers: Optional[int] = None,
                                  **kwargs):
+        """Estimate total cache bytes per token including indexer K-cache overhead."""
         config = model_config.pretrained_config
         sparse_attn_config = model_config.sparse_attention_config
         index_head_dim = sparse_attn_config.index_head_dim
@@ -2099,6 +2204,7 @@ class DSACacheManager(KVCacheManager):
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
+        """Compute actual cache bytes per token from instance configuration."""
         # self.kv_factor for K, others for indexer K cache
         head_dim_factor = (self.index_head_dim + self.index_head_dim //
                            self.quant_block_size * 4) / self.head_dim

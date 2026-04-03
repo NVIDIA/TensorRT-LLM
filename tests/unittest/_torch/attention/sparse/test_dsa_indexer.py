@@ -37,6 +37,7 @@ from tensorrt_llm.quantization.utils import fp8_utils
 
 
 def has_deep_gemm():
+    """Return True if the DeepGEMM library is available."""
     try:
         return deep_gemm is not None
     except Exception:
@@ -44,6 +45,7 @@ def has_deep_gemm():
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
+    """Round tensor values up to the nearest power of two (UE8M0 format)."""
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
@@ -63,13 +65,16 @@ def create_dsa_cache_manager(
 
     # Create a minimal sparse attention config
     class SparseAttentionConfig:
+        """Minimal mock of SparseAttentionConfig for testing."""
 
         def __init__(self, index_head_dim, index_n_heads, index_topk):
+            """Initialize sparse attention config with indexer parameters."""
             self.index_head_dim = index_head_dim
             self.index_n_heads = index_n_heads
             self.index_topk = index_topk
             self.prompt_budget = 1024
             self.use_cute_dsl_topk = False
+            self.enable_heuristic_topk = False
 
     sparse_attn_config = SparseAttentionConfig(
         index_head_dim=head_dim,
@@ -120,8 +125,10 @@ def create_indexer(sparse_attn_config, layer_idx=0):
 
     # Create MLAParams
     class MLAParams:
+        """Mock MLA parameters for indexer creation."""
 
         def __init__(self, head_dim):
+            """Initialize MLA params with example hidden size and lora rank."""
             self.hidden_size = 4096  # Example hidden size
             self.q_lora_rank = 512  # Example q_lora_rank
             self.qk_rope_head_dim = 64
@@ -396,13 +403,17 @@ def _create_mock_metadata(request_ids,
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
+        """Mock KV cache parameters holding per-sequence cached token counts."""
 
         def __init__(self):
+            """Initialize with the provided num_cached_tokens."""
             self.num_cached_tokens_per_seq = num_cached_tokens
 
     class MockMetadata(DSAtrtllmAttentionMetadata):
+        """Mock DSA attention metadata for unit testing indexer operations."""
 
         def __init__(self):
+            """Initialize mock metadata with buffers, block tables, and indexer state."""
             self.num_sms = deep_gemm.get_num_sms()
             self.request_ids = request_ids
             self.num_contexts = num_contexts
@@ -512,8 +523,10 @@ def _create_mock_metadata(request_ids,
 
             # Add runtime_features for chunked prefill detection
             class RuntimeFeatures:
+                """Mock runtime features for chunked prefill detection."""
 
                 def __init__(self):
+                    """Initialize runtime features from outer scope parameters."""
                     self.chunked_prefill = enable_context_mla_with_cached_kv
                     self.cache_reuse = False
                     self.has_speculative_draft_tokens = False
@@ -730,7 +743,7 @@ def test_indexer_k_cache_scatter_custom_op():
     k_cache_python.zero_()
 
     # Print cache properties
-    print(f"\n=== Cache Properties ===")
+    print("\n=== Cache Properties ===")
     print(f"  CUDA (layer {layer_idx_cuda}):")
     print(f"    Shape: {k_cache_cuda.shape}")
     print(f"    Stride: {k_cache_cuda.stride()}")
@@ -741,17 +754,18 @@ def test_indexer_k_cache_scatter_custom_op():
     print(f"    is_contiguous: {k_cache_python.is_contiguous()}")
 
     # ========== Path 1: CUDA Kernel ==========
-    print(f"\n=== Path 1: CUDA Kernel ===")
+    print("\n=== Path 1: CUDA Kernel ===")
     torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
                                                 k_cache_cuda, flat_indices_fp8,
                                                 flat_indices_scale)
     torch.cuda.synchronize()
-    print(f"✓ CUDA kernel completed")
+    print("✓ CUDA kernel completed")
 
     # ========== Path 2: Python Reference ==========
-    print(f"\n=== Path 2: Python Reference ===")
+    print("\n=== Path 2: Python Reference ===")
 
     def _unravel_indices(flat_indices, shape):
+        """Convert flat indices to multi-dimensional indices for a 4D tensor."""
         d3 = shape[3]
         i3 = flat_indices % d3
         flat_indices = flat_indices // d3
@@ -781,13 +795,13 @@ def test_indexer_k_cache_scatter_custom_op():
     k_cache_python[scatter_indices_scale] = k_scale_bytes
 
     # ========== Validation: Byte-for-Byte Comparison ==========
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
 
     total_bytes = k_cache_cuda.numel()
 
     # Compare entire cache tensors
     if torch.equal(k_cache_cuda, k_cache_python):
-        print(f"✅ PERFECT MATCH! CUDA and Python produce identical cache")
+        print("✅ PERFECT MATCH! CUDA and Python produce identical cache")
         print(f"  Total bytes compared: {total_bytes}")
         print(
             f"  Tokens: {num_tokens}, head_dim: {head_dim}, block_size: {block_size}"
@@ -936,7 +950,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     final_lens = context_lens_context + num_gen_tokens
     max_seq_len = final_lens.max().item()
 
-    print(f"\n=== Test Config ===")
+    print("\n=== Test Config ===")
     print(
         f"  Batch: {batch_size}, Next_N: {next_n}, Heads: {heads}, Head_dim: {head_dim}"
     )
@@ -976,7 +990,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
                              dtype=torch.bfloat16)
 
     # Phase 1: Write context tokens (variable per sequence) as FP8
-    print(f"\n=== Phase 1: Context (variable tokens/seq) ===")
+    print("\n=== Phase 1: Context (variable tokens/seq) ===")
     metadata_context = _create_mock_metadata(
         request_ids,
         batch_size,
@@ -1025,7 +1039,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         f"✓ Wrote {batch_size * num_gen_tokens} FP8 generation tokens to cache")
 
     # Run kernel: FP8 paged MQA with actual cache
-    print(f"\n=== Kernel Execution ===")
+    print("\n=== Kernel Execution ===")
     kv_cache_fp8_pool = cache_manager.get_indexer_k_cache_buffers(layer_idx)
     q_fp8 = q.to(torch.float8_e4m3fn)
 
@@ -1050,7 +1064,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     print(f"✓ Kernel output shape: {logits.shape}")
 
     # Reference: Reconstruct BF16 cache from original values
-    print(f"\n=== Reference Computation ===")
+    print("\n=== Reference Computation ===")
     num_blocks = kv_cache_fp8_pool.shape[0]
     kv_cache_bf16 = torch.zeros((num_blocks, block_size, 1, head_dim),
                                 device="cuda",
@@ -1093,7 +1107,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     print(f"✓ Reference output shape: {ref_logits.shape}")
 
     # Validate: Compare masked outputs (handle variable lengths and next_n)
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
     context_lens_cuda = metadata_gen.kv_lens_cuda_runtime  # [batch_size]
 
     # Expand context lens for each query: each sequence has next_n queries
@@ -1418,7 +1432,7 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
         assert chunk_groups[i] == expected, \
             f"Chunk {i} mismatch:\nGot:      {chunk_groups[i]}\nExpected: {expected}"
 
-    print(f"✅ test_split_prefill_chunks passed")
+    print("✅ test_split_prefill_chunks passed")
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -1491,7 +1505,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
                           for i, seq_len in enumerate(seq_lens_list)
                           if seq_len > chunk_size]
         if large_requests:
-            print(f"  Large requests (Q-block splitting):")
+            print("  Large requests (Q-block splitting):")
             for req_idx, seq_len in large_requests:
                 num_q_blocks = (seq_len + chunk_size - 1) // chunk_size
                 print(
@@ -1534,7 +1548,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
 
     # ========== Test Path 1: Chunked Prefill ==========
-    print(f"\n=== Chunked Path ===")
+    print("\n=== Chunked Path ===")
 
     metadata_chunked = _create_mock_metadata(
         request_ids,
@@ -1572,7 +1586,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     print(f"✓ Chunked execution completed, shape: {topk_indices_chunked.shape}")
 
     # ========== Test Path 2: Non-chunked Baseline ==========
-    print(f"\n=== Non-chunked Baseline ===")
+    print("\n=== Non-chunked Baseline ===")
 
     metadata_baseline = _create_mock_metadata(
         request_ids,
@@ -1606,7 +1620,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     )
 
     # ========== Validation ==========
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
 
     # Use Jaccard similarity to handle ties (multiple indices with same value)
     num_exact_matches = 0
@@ -1646,7 +1660,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     high_similarity_ratio = (num_exact_matches +
                              num_high_similarity) / total_tokens
 
-    print(f"  Results:")
+    print("  Results:")
     print(
         f"    Exact matches: {num_exact_matches}/{total_tokens} ({exact_match_ratio:.1%})"
     )
@@ -2246,7 +2260,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
     total_kv_lens = [seq_lens[i] + cached_tokens[i] for i in range(batch_size)]
     total_tokens = sum(seq_lens)
 
-    print(f"\n=== Test: Multi-request with different cache ===")
+    print("\n=== Test: Multi-request with different cache ===")
     print(
         f"  Req0: {cached_tokens[0]} cached + {seq_lens[0]} new = {total_kv_lens[0]} total"
     )
@@ -2351,9 +2365,9 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
                                                         use_custom_topk=True)
 
     # Validate: custom and fallback should match
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
 
-    print(f"Checking for invalid negative indices:")
+    print("Checking for invalid negative indices:")
     for tok_id in [0, 255, 256, 492]:  # First/last of each request
         num_valid_custom = (topk_custom[tok_id] >= 0).sum().item()
         num_valid_fallback = (topk_fallback[tok_id] >= 0).sum().item()
@@ -2370,11 +2384,11 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
             )
             if has_invalid:
                 print(
-                    f"    ⚠️ INVALID: Custom has negative indices < -1 (kernel bug!)"
+                    "    ⚠️ INVALID: Custom has negative indices < -1 (kernel bug!)"
                 )
 
     # Check tokens with large windows (>= 2048) should have exactly 2048 valid indices
-    print(f"\n=== Check: Large windows must have 2048 valid ===")
+    print("\n=== Check: Large windows must have 2048 valid ===")
     from tensorrt_llm._torch.attention_backend.sparse.dsa import \
         compute_cu_seqlen_kv_bounds_with_cache
     host_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device='cpu')
@@ -2649,6 +2663,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
     @staticmethod
     def _make_mock_metadata():
+        """Create a mock attention metadata object with KV cache block offsets."""
         meta = Mock()
         meta.kv_cache_manager = Mock(name="target_kv_cache_manager")
         meta.kv_cache_block_offsets = torch.tensor([10, 20, 30])
@@ -2658,11 +2673,13 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
     @staticmethod
     def _make_mock_draft_manager():
+        """Create a mock draft KV cache manager with host block offsets."""
         mgr = Mock(name="draft_kv_cache_manager")
         mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
         return mgr
 
     def test_prepare_swaps_and_restore_recovers(self):
+        """Test that prepare swaps KV manager and restore recovers original state."""
         from tensorrt_llm._torch.attention_backend.trtllm import \
             TrtllmAttentionMetadata
 
