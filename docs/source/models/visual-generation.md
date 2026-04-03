@@ -1,7 +1,7 @@
-# Visual Generation (Prototype)
+# Visual Generation (Beta)
 
 ```{note}
-This feature is in **prototype** stage. APIs, supported models, and optimization options are
+This feature is in **beta** stage. APIs, supported models, and optimization options are
 actively evolving and may change in future releases.
 ```
 
@@ -30,7 +30,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
-| `Lightricks/LTX-Video` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+| `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
@@ -50,9 +50,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 Here is a simple example to generate a video with Wan 2.1:
 
-```{literalinclude} ../../../examples/visual_gen/quickstart_example.py
-    :language: python
-    :linenos:
+```bash
+python examples/visual_gen/quickstart_example.py
 ```
 
 To learn more about VisualGen, see [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen) for more examples including text-to-image, image-to-video, and batch generation.
@@ -134,7 +133,7 @@ Key components:
 
 | Component | Location | Role |
 |---|---|---|
-| `VisualGen` | `tensorrt_llm/llmapi/visual_gen.py` | High-level API: manages workers, `generate()` / `generate_async()` |
+| `VisualGen` | `tensorrt_llm/visual_gen/__init__.py` | High-level API: manages workers, `generate()` / `generate_async()` |
 | `DiffusionExecutor` | `visual_gen/executor.py` | Worker process: loads pipeline, processes requests via ZeroMQ |
 | `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, TeaCache, CUDA graph |
 | `AutoPipeline` | `visual_gen/pipeline_registry.py` | Factory: auto-detects model type, selects pipeline class |

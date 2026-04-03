@@ -183,12 +183,11 @@ class FluxJointAttention(Attention):
             key = apply_rotary_emb(key, freqs_cos, freqs_sin)
 
         # Flatten 4D->3D for base _attn_impl
-        seq_len = query.shape[1]
         query = query.flatten(2)
         key = key.flatten(2)
         value = value.flatten(2)
 
-        hidden_states = self._attn_impl(query, key, value, batch_size, seq_len)
+        hidden_states = self._attn_impl(query, key, value)
         hidden_states = hidden_states.to(query.dtype)
 
         # Split and project outputs
@@ -315,11 +314,10 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             k = apply_rotary_emb(k, freqs_cos, freqs_sin)
 
         # Flatten 4D->3D for _attn_impl
-        seq_len = q.shape[1]
         q, k, v = q.flatten(2), k.flatten(2), v.flatten(2)
 
         # Backend dispatch (inherited — handles layout, Ulysses, etc.)
-        attn_out = self._attn_impl(q, k, v, batch_size, seq_len)
+        attn_out = self._attn_impl(q, k, v)
         attn_out = attn_out.to(q.dtype)
 
         # Parallel MLP path (reshape to 2D for Triton kernel, then back)
