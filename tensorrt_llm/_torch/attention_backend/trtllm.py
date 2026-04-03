@@ -29,9 +29,9 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         RopeParams)
 from .trtllm_gen import trtllm_gen_attention
 
-# Enable TRTLLM-Gen attention backend via environment variable.
-_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
+# Enable TRTLLM-Gen attention backend via environment variable (default: off).
+_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
 
 @dataclass(kw_only=True, init=False)
@@ -407,10 +407,6 @@ class TrtllmAttentionWrapper:
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
-        sage_attn_num_elts_per_blk_q: int = 0,
-        sage_attn_num_elts_per_blk_k: int = 0,
-        sage_attn_num_elts_per_blk_v: int = 0,
-        sage_attn_qk_int8: bool = False,
     ):
         """
         Run the attention operation.
@@ -645,13 +641,6 @@ class TrtllmAttentionWrapper:
                 global_layer_idx=self.global_layer_idx,
             )
         else:
-            use_sage_attn = any(sf > 0 for sf in [
-                sage_attn_num_elts_per_blk_q, sage_attn_num_elts_per_blk_k,
-                sage_attn_num_elts_per_blk_v
-            ])
-
-            assert not use_sage_attn or not is_fused_qkv, "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false)."
-
             thop.attention(
                 q,
                 k,
@@ -733,10 +722,6 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.flash_mla_tile_scheduler_metadata,
                 self.flash_mla_num_splits,
-                sage_attn_num_elts_per_blk_q,
-                sage_attn_num_elts_per_blk_k,
-                sage_attn_num_elts_per_blk_v,
-                sage_attn_qk_int8,
             )
 
         if self.print_skip_softmax_stat:
@@ -1884,10 +1869,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
-        sage_attn_num_elts_per_blk_q: int = 0,
-        sage_attn_num_elts_per_blk_k: int = 0,
-        sage_attn_num_elts_per_blk_v: int = 0,
-        sage_attn_qk_int8: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -2055,25 +2036,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         self.wrapper.global_layer_idx = self.layer_idx
 
-        self.wrapper.run(
-            q,
-            output,
-            output_sf,
-            k,
-            v,
-            is_fused_qkv=not metadata.is_cross and k is None,
-            update_kv_cache=not metadata.is_cross or k is not None,
-            attention_mask=attention_mask,
-            cu_q_seqlens=cu_q_seqlens,
-            cu_kv_seqlens=cu_kv_seqlens,
-            fmha_scheduler_counter=fmha_scheduler_counter,
-            mla_bmm1_scale=mla_bmm1_scale,
-            mla_bmm2_scale=mla_bmm2_scale,
-            quant_q_buffer=quant_q_buffer,
-            sage_attn_num_elts_per_blk_q=sage_attn_num_elts_per_blk_q,
-            sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
-            sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v,
-            sage_attn_qk_int8=sage_attn_qk_int8)
+        self.wrapper.run(q,
+                         output,
+                         output_sf,
+                         k,
+                         v,
+                         is_fused_qkv=not metadata.is_cross and k is None,
+                         update_kv_cache=not metadata.is_cross or k is not None,
+                         attention_mask=attention_mask,
+                         cu_q_seqlens=cu_q_seqlens,
+                         cu_kv_seqlens=cu_kv_seqlens,
+                         fmha_scheduler_counter=fmha_scheduler_counter,
+                         mla_bmm1_scale=mla_bmm1_scale,
+                         mla_bmm2_scale=mla_bmm2_scale,
+                         quant_q_buffer=quant_q_buffer)
 
         if output_sf is None:
             return output

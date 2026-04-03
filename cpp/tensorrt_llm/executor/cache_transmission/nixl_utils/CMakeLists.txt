@@ -96,15 +96,16 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
     message(STATUS "Transfer agent binding: NIXL support enabled")
   endif()
 
-  # Conditionally add Mooncake support
+  # Conditionally add Mooncake support NOTE: We intentionally do NOT link
+  # against tensorrt_llm_mooncake_wrapper here. The mooncake wrapper (and its
+  # dependency libtransfer_engine.so) is loaded lazily via DynLibLoader::dlopen
+  # in makeTransferAgent("mooncake", ...) at runtime. This allows the binding
+  # module to be imported even when Mooncake is not installed.
   if(MOONCAKE_ENABLED)
     target_compile_definitions(${TRANSFER_AGENT_BINDING_TARGET}
                                PRIVATE ENABLE_MOONCAKE)
-    target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
-                               PRIVATE ${TRANSFER_ENGINE_INCLUDE_DIR})
-    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
-                          PRIVATE tensorrt_llm_mooncake_wrapper)
-    message(STATUS "Transfer agent binding: Mooncake support enabled")
+    message(
+      STATUS "Transfer agent binding: Mooncake support enabled (lazy loading)")
   endif()
 
   # Common dependencies
