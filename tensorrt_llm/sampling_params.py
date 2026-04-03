@@ -289,8 +289,6 @@ class SamplingParams:
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     stream_interval: Optional[int] = None
-    # _stream_interval is the resolved value (per-request or engine default), used internally.
-    _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.pad_id is None:

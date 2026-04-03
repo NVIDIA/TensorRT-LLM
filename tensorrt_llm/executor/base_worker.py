@@ -568,7 +568,7 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
-            executor_request.py_stream_interval = request.sampling_params._stream_interval
+            executor_request.py_stream_interval = request.sampling_params.stream_interval
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
