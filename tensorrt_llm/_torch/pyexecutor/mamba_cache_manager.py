@@ -955,13 +955,12 @@ class LinearHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         self.iter = 0
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
-    def __del__(self):
-        # Release references to large buffers and mappings before impl is destroyed.
+    def shutdown(self):
+        # Release tensor views into the pool before the pool memory is freed,
+        # so their deleters don't see stale pointers.
         self.ssm_states_mapping = None
         self.conv_states_mapping = None
-        self.pool = None
-        self.impl = None
-        # It's also a good practice to release other large tensors if needed, for GC.
+        super().shutdown()
 
     def add_dummy_requests(
         self,
