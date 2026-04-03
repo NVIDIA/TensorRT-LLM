@@ -1873,10 +1873,8 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    @parametrize_with_ids("use_python_transceiver", [True, False])
-    def test_auto_dtype(self, use_python_transceiver):
-        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            "UCX", use_python_transceiver)
+    def test_auto_dtype(self):
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("UCX")
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
