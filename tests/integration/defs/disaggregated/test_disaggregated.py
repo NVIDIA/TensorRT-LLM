@@ -25,7 +25,7 @@ import yaml
 from defs.common import (revise_disagg_config_file_with_free_ports,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper)
+                           skip_no_hopper, skip_pre_blackwell)
 from defs.trt_test_alternative import check_call, check_output, popen
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
