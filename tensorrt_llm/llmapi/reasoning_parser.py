@@ -182,6 +182,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
     "nemotron_h": "nano-v3",
+    "nemotron_h_puzzle": "nano-v3",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({

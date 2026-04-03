@@ -224,7 +224,32 @@ class NVLinkOneSided(Communication):
         # Initialize or reuse workspace
         MnnvlMemory.initialize()
 
-        if self._WORKSPACE is None:
+        need_alloc = self._WORKSPACE is None
+        if not need_alloc:
+            # Models with per-layer MoE params may request different workspace sizes across layers.
+            # Reallocate when a larger workspace is needed; reuse otherwise.
+            if self._WORKSPACE["workspace_size_per_rank"] < self.workspace_size_per_rank:
+                tllm_logger.info(
+                    f"NVLinkOneSided: Reallocating workspace "
+                    f"{self._WORKSPACE['workspace_size_per_rank']} -> "
+                    f"{self.workspace_size_per_rank} bytes."
+                )
+                need_alloc = True
+            else:
+                assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, (
+                    "reuse workspace with different max_num_tokens_per_rank"
+                )
+                assert self._WORKSPACE["ep_rank"] == self.ep_rank, (
+                    "reuse workspace with different ep_rank"
+                )
+                assert self._WORKSPACE["ep_size"] == self.ep_size, (
+                    "reuse workspace with different ep_size"
+                )
+                assert self._WORKSPACE["eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
+                    "reuse workspace with different eplb_stats_num_experts"
+                )
+
+        if need_alloc:
             tllm_logger.info(
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
@@ -248,26 +273,8 @@ class NVLinkOneSided(Communication):
                 "workspace": workspace,
                 "metainfo": metainfo,
             }
-        else:
-            assert self._WORKSPACE["workspace_size_per_rank"] == self.workspace_size_per_rank, (
-                "reuse workspace with different workspace_size_per_rank"
-            )
-            assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, (
-                "reuse workspace with different max_num_tokens_per_rank"
-            )
-            assert self._WORKSPACE["ep_rank"] == self.ep_rank, (
-                "reuse workspace with different ep_rank"
-            )
-            assert self._WORKSPACE["ep_size"] == self.ep_size, (
-                "reuse workspace with different ep_size"
-            )
-            assert self._WORKSPACE["eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
-                "reuse workspace with different eplb_stats_num_experts"
-            )
 
-        self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
-        self.workspace = self._WORKSPACE["workspace"]
-        self.moe_a2a_metainfo = self._WORKSPACE["metainfo"]
+        # Read max_num_tokens_per_rank from the (possibly grown) workspace.
         self.max_num_tokens_per_rank = self._WORKSPACE["max_num_tokens_per_rank"]
 
         # Initialize dispatch state
@@ -275,6 +282,21 @@ class NVLinkOneSided(Communication):
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
+
+    # Properties delegate to _WORKSPACE so all instances see the latest
+    # allocation (workspace may be reallocated when layers need more space).
+
+    @property
+    def mnnvl_mem(self):
+        return self._WORKSPACE["mnnvl_mem"]
+
+    @property
+    def workspace(self):
+        return self._WORKSPACE["workspace"]
+
+    @property
+    def moe_a2a_metainfo(self):
+        return self._WORKSPACE["metainfo"]
 
     @staticmethod
     def is_platform_supported() -> bool:

@@ -7,6 +7,7 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
 
 
+@register_mapper("HF", "NemotronHPuzzleForCausalLM")
 @register_mapper("HF", "NemotronHForCausalLM")
 class NemotronHHfWeightMapper(HfWeightMapper):
 
