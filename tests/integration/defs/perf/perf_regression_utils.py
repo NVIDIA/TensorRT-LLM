@@ -99,13 +99,9 @@ def get_job_info():
 
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
-        artifact_url = (
-            f"{_URM_BASE}/L0_MergeRequest_PR/{job_id}" if job_id else ""
-        )
+        artifact_url = f"{_URM_BASE}/L0_MergeRequest_PR/{job_id}" if job_id else ""
     else:
-        artifact_url = (
-            f"{_URM_BASE}/L0_PostMerge/{job_id}" if job_id else ""
-        )
+        artifact_url = f"{_URM_BASE}/L0_PostMerge/{job_id}" if job_id else ""
 
     return {
         "b_is_baseline": False,
