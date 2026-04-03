@@ -135,6 +135,37 @@ def _load_lora_deltas(
         delta = (B.float() @ A.float()) * scale
         deltas[param_name] = delta
 
+    # Fuse separate to_q / to_k / to_v deltas into a single qkv_proj
+    # delta when the transformer uses QKV fusion (FUSE_QKV mode).
+    model_params = {n for n, _ in transformer.named_parameters()}
+    _QKV_SUFFIXES = (".to_q", ".to_k", ".to_v")
+    fused_keys: set = set()
+    qkv_groups: Dict[str, List[str]] = {}
+    for key in list(deltas.keys()):
+        for suffix in _QKV_SUFFIXES:
+            if key.endswith(suffix):
+                attn_prefix = key[: -len(suffix)]
+                qkv_groups.setdefault(attn_prefix, []).append(key)
+                break
+
+    for attn_prefix, keys in qkv_groups.items():
+        q_key = f"{attn_prefix}.to_q"
+        k_key = f"{attn_prefix}.to_k"
+        v_key = f"{attn_prefix}.to_v"
+        fused_key = f"{attn_prefix}.qkv_proj"
+
+        if not (q_key in deltas and k_key in deltas and v_key in deltas):
+            continue
+
+        if f"{fused_key}.weight" not in model_params:
+            continue
+
+        deltas[fused_key] = torch.cat([deltas[q_key], deltas[k_key], deltas[v_key]], dim=0)
+        fused_keys.update((q_key, k_key, v_key))
+
+    for key in fused_keys:
+        del deltas[key]
+
     logger.info(f"Loaded {len(deltas)} LoRA deltas from {lora_path} (strength={strength})")
     return deltas
 
