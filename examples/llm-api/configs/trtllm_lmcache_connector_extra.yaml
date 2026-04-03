@@ -11,9 +11,6 @@
 #   PYTHONHASHSEED=0 trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
 #     --trust_remote_code \
 #     --extra_llm_api_options /path/to/this/file
-#
-# Or use the CLI shorthand (no YAML needed):
-#   PYTHONHASHSEED=0 trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --kv-connector lmcache
 
 kv_cache_config:
   enable_block_reuse: true

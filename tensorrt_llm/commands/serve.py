@@ -677,15 +677,6 @@ class ChoiceWithAlias(click.Choice):
         "Can be specified as either --config or --extra_llm_api_options.",
         "prototype"))
 @click.option(
-    "--kv-connector",
-    "kv_connector",
-    type=str,
-    default=None,
-    help=help_info_with_stability_tag(
-        "Named KV cache connector preset (e.g. 'lmcache'). "
-        "Enables external KV cache sharing via the connector plugin system. "
-        "Automatically sets enable_block_reuse=True.", "prototype"))
-@click.option(
     "--reasoning_parser",
     type=click.Choice(["auto"] + list(ReasoningParserFactory.keys())),
     default=None,
@@ -795,9 +786,8 @@ def serve(
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
         num_postprocess_workers: int, trust_remote_code: bool,
         revision: Optional[str], extra_llm_api_options: Optional[str],
-        kv_connector: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
+        reasoning_parser: Optional[str], tool_parser: Optional[str],
+        metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
@@ -897,20 +887,6 @@ def serve(
                 llm_args_extra_dict = yaml.safe_load(f)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
-
-        # Apply --kv-connector preset if specified
-        if kv_connector is not None:
-            from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
-            llm_args['kv_connector_config'] = KvCacheConnectorConfig(
-                connector=kv_connector)
-            # Ensure block reuse is enabled (required for connectors)
-            if 'kv_cache_config' not in llm_args:
-                llm_args['kv_cache_config'] = {}
-            kv_cc = llm_args['kv_cache_config']
-            if isinstance(kv_cc, KvCacheConfig):
-                kv_cc = kv_cc.model_dump(exclude_unset=True)
-                llm_args['kv_cache_config'] = kv_cc
-            kv_cc.setdefault('enable_block_reuse', True)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)

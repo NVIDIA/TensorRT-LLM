@@ -966,7 +966,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
-        from tensorrt_llm.connectors.registry import CONNECTOR_REGISTRY
+        from tensorrt_llm._torch.pyexecutor.connectors.registry import \
+            CONNECTOR_REGISTRY
         if self.connector is not None:
             preset = CONNECTOR_REGISTRY.get(self.connector)
             if preset is None:
