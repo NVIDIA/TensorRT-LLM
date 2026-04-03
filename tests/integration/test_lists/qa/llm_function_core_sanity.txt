@@ -235,3 +235,4 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx
 
 # AutoDeploy text generation accuracy tests
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[4]

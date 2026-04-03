@@ -1477,6 +1477,7 @@ follow_imports = "silent"
 explicit_package_bases = true
 namespace_packages = true
 strict = true
+warn_unused_ignores = false
 show_error_codes = true
 # NB:
 #   .   -> 'tensorrt_llm'

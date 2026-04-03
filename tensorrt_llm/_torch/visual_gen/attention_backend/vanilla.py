@@ -26,14 +26,13 @@ import math
 from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from ...attention_backend.interface import PredefinedAttentionMask
-from .interface import AttentionTensorLayout
+from .interface import AttentionBackend, AttentionTensorLayout
 
 
-class VanillaAttention(nn.Module):
+class VanillaAttention(AttentionBackend):
     """
     Vanilla Attention for diffusion models using torch SDPA.
 
@@ -55,8 +54,6 @@ class VanillaAttention(nn.Module):
         dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
-        super().__init__()
-
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -72,48 +69,36 @@ class VanillaAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: int,
-        seq_len: int,
-        seq_len_kv: Optional[int] = None,
+        *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass using torch SDPA.
 
+        Dimensions are derived from tensor shapes (HND layout: ``[B, H, S, D]``).
+
         Args:
-            q: Query tensor [num_tokens, num_heads * head_dim]
-            k: Key tensor [num_kv_tokens, num_kv_heads * head_dim]
-            v: Value tensor [num_kv_tokens, num_kv_heads * head_dim]
-            batch_size: Batch size
-            seq_len: Query sequence length
-            seq_len_kv: KV sequence length (for cross-attention)
+            q: Query tensor [batch_size, num_heads, seq_len, head_dim]
+            k: Key tensor [batch_size, num_kv_heads, seq_len_kv, head_dim]
+            v: Value tensor [batch_size, num_kv_heads, seq_len_kv, head_dim]
             attention_mask: Attention mask type (CAUSAL or FULL)
 
         Returns:
-            Output tensor [num_tokens, num_heads * head_dim]
+            Output tensor [batch_size, num_heads, seq_len, head_dim]
         """
         is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
 
-        # Validate tensor shapes - flexible for Ulysses head sharding
-        # Expected: [batch_size, num_heads, seq_len, head_dim]
-        # Note: num_heads may be sharded (num_heads // ulysses_size) when using Ulysses
-        assert (
-            q.dim() == 4
-            and q.shape[0] == batch_size
-            and q.shape[2] == seq_len
-            and q.shape[3] == self.head_dim
-        ), (
-            f"Invalid q shape: expected [B={batch_size}, H, S={seq_len}, D={self.head_dim}], got {q.shape}"
+        assert q.dim() == 4 and q.shape[3] == self.head_dim, (
+            f"Invalid q shape: expected [B, H, S, D={self.head_dim}], got {q.shape}"
         )
-        assert k.dim() == 4 and k.shape[0] == batch_size and k.shape[3] == self.head_dim, (
-            f"Invalid k shape: expected [B={batch_size}, H_kv, S_kv, D={self.head_dim}], got {k.shape}"
+        assert k.dim() == 4 and k.shape[0] == q.shape[0] and k.shape[3] == self.head_dim, (
+            f"Invalid k shape: expected [B={q.shape[0]}, H_kv, S_kv, D={self.head_dim}], got {k.shape}"
         )
-        assert v.dim() == 4 and v.shape[0] == batch_size and v.shape[3] == self.head_dim, (
-            f"Invalid v shape: expected [B={batch_size}, H_kv, S_kv, D={self.head_dim}], got {v.shape}"
+        assert v.dim() == 4 and v.shape[0] == q.shape[0] and v.shape[3] == self.head_dim, (
+            f"Invalid v shape: expected [B={q.shape[0]}, H_kv, S_kv, D={self.head_dim}], got {v.shape}"
         )
 
-        # TODO: Maybe we need to enforce cuDNN backend here
         return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, scale=self.scale)
 
     @property
