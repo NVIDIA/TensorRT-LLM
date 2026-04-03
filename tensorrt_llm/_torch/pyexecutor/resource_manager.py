@@ -824,8 +824,7 @@ class KVCacheManager(BaseResourceManager):
         # storing, so that SWA windows are safe to store — blocks won't go out-of-window
         # and be evicted while the context is still in-flight.
         for request in scheduled_batch.context_requests:
-            if request.context_remaining_length == 0:
-                self.impl.store_context_blocks(request)
+            self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,
