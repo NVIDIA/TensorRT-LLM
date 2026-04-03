@@ -939,10 +939,10 @@ def are_groups_valid(top_k_groups, n_groups):
     return True
 
 
-# @pytest.mark.skip(
-#     reason=
-#     "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
-# )
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -1077,10 +1077,10 @@ class TestMoeFP8:
                        percent=0.925)
 
 
-# @pytest.mark.skip(
-#     reason=
-#     "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
-# )
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -2076,10 +2076,10 @@ class TestMoeFp4:
                        percent=0.925)
 
 
-# @pytest.mark.skip(
-#     reason=
-#     "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
-# )
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -2305,10 +2305,10 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                    percent=0.925)
 
 
-# @pytest.mark.skip(
-#     reason=
-#     "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
-# )
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() != 100,
     reason="The kernel only supports Blackwell. Current SM is %d." %
