@@ -266,7 +266,6 @@ public:
     {
         NB_OVERRIDE_PURE(countReusableBlocks, uniqueTokens, llmRequest, onlyAllocated);
     }
-
 };
 
 // TODO: Deduplicate executor bindings KvCacheStats

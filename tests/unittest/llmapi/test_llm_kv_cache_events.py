@@ -6,11 +6,11 @@ from utils.util import skip_single_gpu
 
 import tensorrt_llm
 from tensorrt_llm import LLM
-from tensorrt_llm.bindings.internal.testing import \
-    simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
+from tensorrt_llm.bindings.internal.testing import \
+    simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams

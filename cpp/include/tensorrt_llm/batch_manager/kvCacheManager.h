@@ -1906,7 +1906,6 @@ public:
     [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const
         = 0;
-
 };
 
 class KVCacheManager : public BaseKVCacheManager

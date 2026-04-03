@@ -21,7 +21,6 @@
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
-#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
@@ -29,6 +28,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <NvInferPlugin.h>
 

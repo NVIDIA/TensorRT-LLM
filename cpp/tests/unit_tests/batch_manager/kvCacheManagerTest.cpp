@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
-#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
@@ -32,6 +31,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include "gtest/gtest.h"
 #include <cstdint>
