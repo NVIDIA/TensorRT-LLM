@@ -250,10 +250,10 @@ def _build_rope_cache(
 
 
 class Gemma4RMSNorm(nn.Module):
-    """RMSNorm with Gemma4-style (weight + scale_shift) semantics.
+    """RMSNorm matching HF Gemma4 (transformers >= 5.5).
 
-    For AD export, we store the *effective* weight = checkpoint_weight + scale_shift
-    via a load hook, then use the standard torch_rmsnorm op.
+    The checkpoint stores effective weights directly — no ``+1.0`` offset.
+    Uses the ``torch_rmsnorm`` canonical op for AD transform compatibility.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
@@ -264,16 +264,6 @@ class Gemma4RMSNorm(nn.Module):
             self.weight = nn.Parameter(torch.ones(dim))
         else:
             self.register_buffer("weight", torch.ones(dim), persistent=False)
-        if with_scale:
-            self._register_load_state_dict_pre_hook(self._apply_scale_shift)
-
-    @staticmethod
-    def _apply_scale_shift(state_dict, prefix, *_args, **_kwargs):
-        """Gemma4 RMSNorm stores weight that is used as (weight + 1.0).
-        Convert to effective weight at load time so torch_rmsnorm works directly."""
-        key = prefix + "weight"
-        if key in state_dict:
-            state_dict[key] = state_dict[key] + 1.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.auto_deploy.torch_rmsnorm(x, self.weight, self.eps)
