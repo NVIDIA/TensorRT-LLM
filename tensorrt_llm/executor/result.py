@@ -177,6 +177,7 @@ class GenerationResultBase:
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
+        self._aborted = False
         self.metrics_dict = {}
         self.trace_headers: Optional[dict[str, str]] = None
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
@@ -196,6 +197,8 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
+        # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
+        self.time_breakdown_metrics: Optional[Dict] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -209,6 +212,22 @@ class GenerationResultBase:
         # request. SamplingParams is necessary for creating dummy
         # GenerationResultBase instances on postprocess worker processes.
         self._params_transmitted = False
+
+    def abort(self) -> None:
+        """Abort the generation request.
+
+        Base implementation sets the aborted flag. Subclasses with executor
+        access (e.g. GenerationResult) override to also cancel on the executor.
+        """
+        self._aborted = True
+
+    def aborted(self) -> bool:
+        """Return whether the generation request is aborted.
+
+        Returns:
+            bool: whether the generation request is aborted.
+        """
+        return self._aborted
 
     @property
     def outputs(self) -> List[CompletionOutput]:
@@ -287,16 +306,33 @@ class GenerationResultBase:
                 output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
-            if finish_reasons[
-                    src_idx] != tllm.FinishReason.CANCELLED and self.use_trtllm_sampler:
-                # Check if logprobs is a list (not a dict or other structure)
-                if len(output.logprobs) > output.length:
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                if self.use_trtllm_sampler and len(
+                        output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-            assert len(
-                output.logprobs
-            ) == output.length, f"logprobs length: {len(output.logprobs)} != output.length: {output.length}"
+
+                is_generation_only = (self.disaggregated_params is not None
+                                      and self.disaggregated_params.request_type
+                                      == "generation_only")
+                if is_generation_only:
+                    assert len(output.logprobs) >= output.length - 1, (
+                        f"logprobs length: {len(output.logprobs)} < "
+                        f"output.length - 1: {output.length - 1}")
+                    if len(output.logprobs) < output.length:
+                        logger.warning(
+                            "Disaggregated serving: the response contains "
+                            "%d logprob entries instead of %d because "
+                            "logprobs for the first generated token were "
+                            "not transferred from the context server. "
+                            "Enable logprobs on both the prefill and "
+                            "decode servers to receive complete results.",
+                            len(output.logprobs), output.length)
+                else:
+                    assert len(output.logprobs) == output.length, (
+                        f"logprobs length: {len(output.logprobs)} != "
+                        f"output.length: {output.length}")
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -318,6 +354,11 @@ class GenerationResultBase:
 
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
+
+        # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
+        if hasattr(response_tensors, 'time_breakdown_metrics'
+                   ) and response_tensors.time_breakdown_metrics is not None:
+            self.time_breakdown_metrics = response_tensors.time_breakdown_metrics
 
         # Check if this specific sequence is finished (not just if the entire request is done)
         # This is important for best_of > n sampling where sequences finish at different times
@@ -394,6 +435,9 @@ class GenerationResultBase:
             if response.metrics:
                 self.metrics_dict.update(response.metrics)
 
+            if response.should_abort and not self._aborted:
+                self.abort()
+
             if response.error:
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
@@ -443,6 +487,26 @@ class GenerationResultBase:
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 
+            # For context_only responses, carry the first gen token's
+            # logprobs and generation logits so the generation_only side
+            # can prepend them.
+            if (context_phase_params is not None
+                    and self._disaggregated_params is not None):
+                first_gen_lp = [
+                    out.logprobs[0] for out in self._outputs if out.logprobs
+                ]
+                if first_gen_lp:
+                    self._disaggregated_params.first_gen_log_probs = \
+                        first_gen_lp
+
+                first_gen_logits = [
+                    out.generation_logits for out in self._outputs
+                    if out.generation_logits is not None
+                ]
+                if first_gen_logits:
+                    self._disaggregated_params.first_gen_logits = \
+                        first_gen_logits
+
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
@@ -474,6 +538,7 @@ class GenerationResultBase:
                     handler := self._background_error_handler()):
                 handler()
         elif isinstance(response, ErrorResponse):
+            self._done = True
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
                 handler(response.error_msg)
@@ -720,7 +785,6 @@ class GenerationResult(GenerationResultBase):
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
-        self._aborted = False
 
         # Pipelined multimodal hashes from request to result
         mm_hashes = getattr(
@@ -741,15 +805,7 @@ class GenerationResult(GenerationResultBase):
         """
         assert self._executor is not None, "The executor is not set for this result."
         self._executor().abort_request(self.request_id)
-        self._aborted = True
-
-    def aborted(self) -> bool:
-        """Return whether the generation request is aborted.
-
-        Returns:
-            bool: whether the generation request is aborted.
-        """
-        return self._aborted
+        super().abort()
 
     @property
     def finished(self) -> bool:
@@ -911,6 +967,7 @@ def compute_logprobs(
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
+    prompt_token_ids: Optional[list[int]] = None,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -977,8 +1034,8 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs,
-        None) if k_prompt_logprobs and context_logits is not None else None
+        context_logits, k_prompt_logprobs, prompt_token_ids
+    ) if k_prompt_logprobs is not None and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
     ) if k_logprobs is not None and generation_logits is not None else None

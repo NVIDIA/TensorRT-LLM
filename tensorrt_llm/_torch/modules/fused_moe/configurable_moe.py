@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,6 +36,7 @@ from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
+from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -53,6 +54,7 @@ from .communication import (
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 
 
@@ -100,25 +102,25 @@ class ConfigurableMoE(MoE):
         cls,
         quant_algo,
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ):
         """
         ConfigurableMoE is a wrapper class that delegates to specific backends.
 
         To check capability, query the specific backend class directly:
-        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, gptoss_style)
-        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, gptoss_style)
+        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
+        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
         - etc.
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
 
         Returns:
             Tuple[bool, Optional[str]]: Always returns (False, reason)
         """
-        del quant_algo, dtype_activation, gptoss_style  # Unused - wrapper class
+        del quant_algo, dtype_activation, swiglu_gptoss_style  # Unused - wrapper class
         return False, (
             "ConfigurableMoE is a wrapper class. "
             "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly."
@@ -202,7 +204,7 @@ class ConfigurableMoE(MoE):
 
         self.validate_backend(backend)
         self.backend = backend
-
+        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
         # Sync critical attributes from ConfigurableMoE to backend
         # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
         # Backend was created with init_load_balancer=False and without_comm=True to avoid
@@ -253,6 +255,19 @@ class ConfigurableMoE(MoE):
         # Validate configuration
         self.validate_config()
 
+        # ========== Optional DWDP integration ==========
+        self.dwdp_manager = get_global_dwdp_manager()
+        self.dwdp_handle_collector = None
+        self.dwdp_rank = None
+        self.enable_dwdp = False
+        if self.dwdp_manager is not None and self._should_enable_dwdp():
+            self.enable_dwdp = True
+            self.dwdp_handle_collector = self.dwdp_manager.add_layer(
+                layer_idx=self.layer_idx,
+            )
+            self.dwdp_rank = self.dwdp_manager.dwdp_rank
+            self.backend.dwdp_handle_collector = self.dwdp_handle_collector
+
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
         # This avoids duplicate post_load_weights calls (once for ConfigurableMoE, once for backend)
@@ -278,6 +293,22 @@ class ConfigurableMoE(MoE):
             assert self.routing_method.top_k == 1, (
                 "apply_router_weight_on_input only supports top-1 routing"
             )
+
+    def _should_enable_dwdp(self) -> bool:
+        # DWDP is currently supported only for CuteDslFusedMoE with NVFP4 quantization.
+        if not isinstance(self.backend, CuteDslFusedMoE):
+            return False
+
+        quant_config = getattr(self.backend, "quant_config", None)
+        if quant_config is None:
+            quant_config = getattr(self.model_config, "quant_config", None)
+        if quant_config is None:
+            return False
+
+        quant_mode = getattr(quant_config, "layer_quant_mode", None)
+        return bool(
+            quant_mode is not None and hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4()
+        )
 
     def _create_comm_strategy(self, model_config: ModelConfig) -> Optional[Communication]:
         """
@@ -367,7 +398,6 @@ class ConfigurableMoE(MoE):
         feasible_workload = self.comm.is_workload_feasible(all_rank_num_tokens, num_chunks)
 
         if not feasible_workload:
-            # Current comm cannot be used, fallback to AllGather
             all_rank_max_num_tokens = max(all_rank_num_tokens)
             logger.info(
                 f"Communication strategy {self.comm.__class__.__name__} "
@@ -375,8 +405,29 @@ class ConfigurableMoE(MoE):
                 f"Falling back to AllGatherReduceScatter."
             )
 
-            # Switch to AllGather (always works)
+            self.comm.destroy()
             self.comm = AllGatherReduceScatter(mapping=self.mapping)
+
+    def destroy(self):
+        """Release communication resources.
+
+        Must be called on ALL ranks before the module is discarded.
+        DeepEP Buffer.__del__ calls intranode::barrier (a collective op);
+        without an explicit, synchronous release, non-deterministic GC
+        timing across ranks causes some to enter the barrier while others
+        proceed, resulting in an indefinite hang.
+
+        Prefer using ConfigurableMoE as a context manager (``with``) so
+        that destroy() is called automatically on scope exit.
+        """
+        if self.comm is not None:
+            self.comm.destroy()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.destroy()
 
     def _create_comm_strategy_auto(self) -> Communication:
         """
@@ -395,6 +446,7 @@ class ConfigurableMoE(MoE):
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
+            use_flashinfer=self.use_flashinfer,
         )
 
     def forward_impl(
@@ -462,6 +514,10 @@ class ConfigurableMoE(MoE):
                 do_finalize,
             )
 
+        # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk)
+        if self.enable_dwdp:
+            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+
         # ========== Step 4: Handle output truncation and EPLB repeat ==========
         if self.use_dp and self.parallel_size > 1:
             outputs = outputs[: all_rank_num_tokens[self.mapping.tp_rank]]
@@ -495,7 +551,13 @@ class ConfigurableMoE(MoE):
             # When using communication, dispatch will create tensors with shape:
             # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
             # So we need to allocate workspace based on this size
-            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+            if isinstance(self.comm, DeepEPLowLatency):
+                # deeptplowlatency dispatch outputs shape is
+                # [#local_experts * moe_ep_size * max_tokens_per_rank, hidden size]
+                # local_experts = self.num_slots / moe_ep_size
+                num_rows = self.num_slots * max(all_rank_num_tokens)
+            else:
+                num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
 
         workspaces = self.backend.get_workspaces([num_rows])
         return workspaces[0]
@@ -578,8 +640,8 @@ class ConfigurableMoE(MoE):
 
             assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
-            # CutlassFusedMoE expects float32, while TRTLLMGenFusedMoE uses bfloat16
-            if isinstance(self.backend, CutlassFusedMoE):
+            # CutlassFusedMoE and DenseGEMMFusedMoE expect float32, while TRTLLMGenFusedMoE uses bfloat16
+            if isinstance(self.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
                 assert token_final_scales.dtype == torch.float32
             assert token_selected_experts.dtype == torch.int32
 
@@ -688,6 +750,10 @@ class ConfigurableMoE(MoE):
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
 
+            dispatch_kwargs = dict(eplb_dispatch_kwargs)
+            if isinstance(self.comm, DeepEP) and isinstance(self.backend, TRTLLMGenFusedMoE):
+                dispatch_kwargs["enable_sanitize_expert_ids"] = True
+
             if supports_post_quant:
                 # ===== Post-quant flow: Quantize → Dispatch =====
 
@@ -697,7 +763,6 @@ class ConfigurableMoE(MoE):
                 # Step 4b: Dispatch AFTER quantization
                 # Get pre_quant_scale for W4AFP8 if available (only DeepEPLowLatency needs it)
                 # Other strategies will ignore this via **kwargs, so it's safe to pass unconditionally
-                dispatch_kwargs = dict(eplb_dispatch_kwargs)
                 if hasattr(self, "quant_scales") and self.quant_scales is not None:
                     if hasattr(self.quant_scales, "pre_quant_scale_1"):
                         dispatch_kwargs["pre_quant_scale"] = self.quant_scales.pre_quant_scale_1
@@ -724,10 +789,11 @@ class ConfigurableMoE(MoE):
                     token_final_scales=token_final_scales,
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=use_dp_padding,
+                    **dispatch_kwargs,
                 )
 
                 # Step 4b: Quantization AFTER dispatch
-                x, x_sf = self.backend.quantize_input(x)
+                x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No communication, just quantize
             # (use non-post-quant-comm path for TRTLLMGenFusedMoE)
@@ -758,7 +824,8 @@ class ConfigurableMoE(MoE):
             # Use unified combine interface (reads dispatch state from strategy)
             all_rank_max_num_tokens = max(all_rank_num_tokens)
             final_hidden_states = self.comm.combine(
-                final_hidden_states, all_rank_max_num_tokens=all_rank_max_num_tokens
+                final_hidden_states,
+                all_rank_max_num_tokens=all_rank_max_num_tokens,
             )
         else:
             # For non-comm case, It should be attention TP or single rank.
@@ -1085,7 +1152,12 @@ class ConfigurableMoE(MoE):
         kwargs = {}
 
         # Common parameters for Cutlass and DeepGemm
-        if self.backend.__class__ in (CutlassFusedMoE, DeepGemmFusedMoE, CuteDslFusedMoE):
+        if self.backend.__class__ in (
+            CutlassFusedMoE,
+            DeepGemmFusedMoE,
+            CuteDslFusedMoE,
+            DenseGEMMFusedMoE,
+        ):
             pass
 
         # Cutlass-specific parameters
@@ -1124,6 +1196,11 @@ class ConfigurableMoE(MoE):
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
+
+            if self.enable_dwdp:
+                kwargs["dwdp_weight_view"] = self.dwdp_manager.build_weight_view(
+                    self.layer_idx, self.backend
+                )
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:

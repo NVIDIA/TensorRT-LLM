@@ -1,0 +1,9 @@
+name: my-dependency
+description: Brief description of the dependency (minimum 10 characters)
+source: ''  # submodule, container, or fetched
+basename_matches:
+- libexample.so
+- libexample.a
+directory_matches:
+- example_dir          # Single component
+- 3rdparty/example     # Multi-directory (if bundled in vendor dir)

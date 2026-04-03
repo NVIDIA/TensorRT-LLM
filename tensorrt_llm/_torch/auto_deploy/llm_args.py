@@ -11,6 +11,7 @@ from tensorrt_llm.mapping import Mapping
 from ...llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
+    MTPDecodingConfig,
     SamplerType,
     TorchLlmArgs,
     _ParallelConfig,
@@ -115,15 +116,39 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     @model_validator(mode="after")
     def setup_hidden_state_capture(self):
-        if self.speculative_config is None or not isinstance(
-            self.speculative_config, EagleDecodingConfig
-        ):
+        spec_config = self.speculative_config
+        if spec_config is None:
             return self
 
-        self.transforms["detect_hidden_states_for_capture"]["capture_hidden_states"] = True
+        if isinstance(spec_config, MTPDecodingConfig):
+            if not spec_config.mtp_eagle_one_model:
+                return self
+            if spec_config.use_mtp_vanilla:
+                raise ValueError("mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled")
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
+                    "enabled. Ensure num_nextn_predict_layers is set in the model config."
+                )
+            capture_layers = {-1}
+            self.model_factory = "eagle_one_model"
+        elif isinstance(spec_config, EagleDecodingConfig):
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "EagleDecodingConfig.max_draft_len must not be None. "
+                    "Provide a positive integer for max_draft_len."
+                )
+            capture_layers = spec_config.eagle3_layers_to_capture
+            if spec_config.eagle3_one_model:
+                self.model_factory = "eagle_one_model"
+        else:
+            return self
+
+        self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
-            self.speculative_config.eagle3_layers_to_capture
+            capture_layers
         )
+
         return self
 
     @model_validator(mode="after")
@@ -165,6 +190,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         "model config class, it will be ignored.",
     )
 
+    speculative_model_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra kwargs for the speculative (draft) model config class. Same semantics "
+        "as model_kwargs but applied to the draft model when using one-model Eagle speculative "
+        "decoding.",
+    )
+
     skip_loading_weights: bool = Field(
         default=False,
         description="Whether to skip loading model weights during initialization. "
@@ -187,7 +219,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         " no processes are spawned and the model is run on a single GPU (only for ``demollm``).",
     )
 
-    runtime: Literal["demollm", "trtllm"] = Field(default="trtllm")
+    runtime: Literal["demollm", "trtllm"] = Field(
+        default="trtllm",
+        description="The runtime backend to use. 'trtllm' is a production-grade runtime optimized for "
+        "high-performance inference. 'demollm' is a lightweight runtime for development and testing "
+        "with a simplified scheduler and KV-cache manager for easier debugging.",
+    )
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
@@ -325,6 +362,9 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
+            # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
+            speculative_config=self.speculative_config,
+            speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
 
     def is_cuda_graph_enabled(self) -> bool:

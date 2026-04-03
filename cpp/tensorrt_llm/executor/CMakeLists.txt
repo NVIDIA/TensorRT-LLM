@@ -23,6 +23,7 @@ set(SRCS
     cache_transmission/agent_utils/connection.cpp
     cache_transmission/transferAgent.cpp
     cache_transmission/cacheSplitConcat.cu
+    cache_transmission/rnnCacheSplitConcat.cu
     contextPhaseParams.cpp
     debugConfig.cpp
     decodingConfig.cpp

@@ -236,18 +236,6 @@ __device__ __forceinline__ HelixFifoInfo* getReceiverHelixFifoInfo(
     return reinterpret_cast<HelixFifoInfo*>(mappedMemory);
 }
 
-__device__ __forceinline__ void startWorkspaceS2G(
-    uint64_t* fifoEntry, uint8_t* shmemBase, int send128ByteCount, int fifo128ByteOffset, int laneId)
-{
-    int copyByteCount = send128ByteCount * BYTES_PER_128B_BLOCK;
-    if (laneId == 0)
-    {
-        cp_async_bulk_s2g(
-            fifoEntry + fifo128ByteOffset * BYTES_PER_128B_BLOCK / sizeof(uint64_t), shmemBase, copyByteCount);
-    }
-    cp_async_bulk_commit_group();
-}
-
 __device__ __forceinline__ void startWorkspaceS2GReg(
     uint64_t* fifoEntry, uint8_t* sharedMemoryBase, int send128ByteCount, int fifo128ByteOffset, int laneId)
 {

@@ -238,6 +238,13 @@ class KvCacheConnectorScheduler(ABC):
             block_ids: The KV cacheblock IDs that were allocated.
         """
 
+    def wait_for_initialization(self):
+        """
+        Some connectors need to wait for some resources to be initialized.
+        For example, FlexKV needs to wait for the FlexKV manager to be initialized.
+        """
+        return
+
 
 # An internal dataclass to handle async saving/loading requests.
 @dataclass
@@ -447,6 +454,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.scheduler_output_manager.record_new_matched_tokens(
             request, num_tokens)
 
+        request.py_num_connector_matched_tokens = num_tokens
+
         return num_tokens
 
     def should_add_sequence(self, request: LlmRequest) -> bool:
@@ -470,23 +479,25 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The scheduled requests with the context requests that are being loaded asynchronously removed.
         """
-        allowed_context_requests = []
 
-        for req in scheduled_requests.context_requests:
-            # If this request is being loaded asynchronously, in addition to removing it from the list of scheduled requests,
-            # we also need to update it's state.
-            if req.request_id in self.new_async_requests.loading.keys():
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        for key in ["context_requests_chunking", "context_requests_last_chunk"]:
+            allowed_context_requests = []
+            for req in getattr(scheduled_requests, key):
+                # If this request is being loaded asynchronously, in addition to removing it from the list of scheduled requests,
+                # we also need to update it's state.
+                if req.request_id in self.new_async_requests.loading.keys():
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 
-                # Replace the request with the canonical request.
-                self.new_async_requests.loading[req.request_id] = req
-            else:
-                allowed_context_requests.append(req)
-
-        # Update the list of scheduled requests.
-        scheduled_requests.context_requests = allowed_context_requests
+                    # Replace the request with the canonical request.
+                    self.new_async_requests.loading[req.request_id] = req
+                else:
+                    allowed_context_requests.append(req)
+            setattr(scheduled_requests, key, allowed_context_requests)
 
     def handle_metadata(self) -> object:
+        if self._scheduler_output is None:
+            return
+
         metadata = self._run_on_leader(
             lambda: self.scheduler.build_connector_meta(self._scheduler_output))
 
@@ -584,3 +595,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def layer_post_hook(self, module, *args):
         self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
+
+    def wait_for_initialization(self):
+        if self.scheduler is not None:
+            self.scheduler.wait_for_initialization()

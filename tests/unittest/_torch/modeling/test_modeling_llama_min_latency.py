@@ -271,10 +271,7 @@ class TestLlama4MinLatency(unittest.TestCase):
                 "The transformers between 4.55.0 and 4.56.1 have accuracy "
                 "issues for Llama4. See: "
                 "https://github.com/huggingface/transformers/pull/40609")
-        elif transformers.__version__ >= "4.57.1":
-            self.skipTest(
-                "Bumping transformers version to 4.57.1 has accuracy issues for Llama4. See: "
-                "http://nvbugs/5732958")
+
         torch.random.manual_seed(0)
         config_dict = deepcopy(LLAMA_4_MAVERICK_TWO_LAYER_CONFIG)
         # 17B * sizeof(float16) plus some extra for activations
@@ -301,6 +298,7 @@ class TestLlama4MinLatency(unittest.TestCase):
             weight_mapper.init_model_and_config(llama, model_config)
             llama.load_weights(hf_llama.state_dict(),
                                weight_mapper=weight_mapper)
+            llama.post_load_weights()
 
         num_blocks = 1
         tokens_per_block = 128

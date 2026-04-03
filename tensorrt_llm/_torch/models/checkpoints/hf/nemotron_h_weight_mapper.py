@@ -124,7 +124,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                         w1_key = key.replace("up_proj", "w1")
                         w3_key = key.replace("up_proj", "w3")
                         # Don't need to handle with input_scale and weight_scale_2 since they are scalar for fp8 and nvfp4 models.
-                        if "input_scale" in key or "weight_scale_2" in key:
+                        if "input_scale" in key or "weight_scale_2" in key or "input_quantizer" in key or "weight_quantizer" in key:
                             new_weights[w3_key] = weights[name]
                             new_weights[w1_key] = weights[name]
                         elif "weight_scale" in key:

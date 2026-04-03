@@ -1,5 +1,11 @@
 # HyperCLOVAX
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a [HyperCLOVAX](https://huggingface.co/naver/hyperclovax) model in TensorRT-LLM.
 
 
@@ -224,7 +230,7 @@ trtllm-build \
 ```
 
 ### Run Engine
-Test your engine with the [run.py](../run.py) script:
+Test your engine with the [run.py](../../../run.py) script:
 
 ```bash
 python3 ../../../run.py \

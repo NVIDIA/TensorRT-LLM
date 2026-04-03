@@ -29,28 +29,75 @@ SchedulerOutput = namedtuple(
 
 
 class ScheduledRequests:
-    # to be aligned with ScheduledRequests in cpp/tensorrt_llm/batch_manager/common.h
+    """Scheduled requests separated into disjoint sets.
+
+    The reason for the separation is that requests are handled differently in different phases.
+    For example,
+    - context requests and generation requests execute different attention kernels.
+    - only context requests that are at the last chunk and generation requests sample new tokens.
+    """
+
+    context_requests_chunking: RequestList
+    """Requests that are in the middle of the context phase."""
+    context_requests_last_chunk: RequestList
+    """Requests that are in the last chunk of the context phase."""
+    generation_requests: RequestList
+    """Requests that are in the generation phase."""
+    paused_requests: RequestList
+    """Requests that are paused."""
+
     def __init__(self):
-        self.context_requests: RequestList = []
+        self.context_requests_chunking: RequestList = []
+        self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
 
     @property
     def is_generation_only(self) -> bool:
-        return not self.context_requests and all(
+        return self.num_context_requests == 0 and all(
             len(req.draft_tokens) == 0 for req in self.generation_requests
         )
 
     @property
     def can_run_cuda_graph(self) -> bool:
-        return not self.context_requests
+        return self.num_context_requests == 0
 
     @property
     def batch_size(self) -> int:
-        return len(self.context_requests) + len(self.generation_requests)
+        return self.num_context_requests + len(self.generation_requests)
 
-    def all_requests(self) -> list[LlmRequest]:
+    @property
+    def num_context_requests(self) -> int:
+        return len(self.context_requests_chunking) + len(self.context_requests_last_chunk)
+
+    @property
+    def num_generation_requests(self) -> int:
+        return len(self.generation_requests)
+
+    @property
+    def context_requests(self) -> RequestList:
+        return self.context_requests_chunking + self.context_requests_last_chunk
+
+    def all_requests(self) -> RequestList:
         return self.context_requests + self.generation_requests
+
+    def append_context_request(self, request: LlmRequest) -> None:
+        if request.is_last_context_chunk:
+            self.context_requests_last_chunk.append(request)
+        else:
+            self.context_requests_chunking.append(request)
+
+    def append_generation_request(self, request: LlmRequest) -> None:
+        self.generation_requests.append(request)
+
+    def reset_context_requests(self, context_requests: RequestList | None = None) -> None:
+        context_requests = (
+            context_requests if context_requests is not None else self.context_requests
+        )
+        self.context_requests_chunking = []
+        self.context_requests_last_chunk = []
+        for req in context_requests:
+            self.append_context_request(req)
 
 
 class RequestScheduler(ABC):
@@ -80,10 +127,13 @@ class RequestScheduler(ABC):
 class SerializableSchedulerOutput:
     """
     Serializable version of SchedulerOutput, used for sending schedule result to other ranks.
+
+    Analogous to ScheduledRequests the lists are disjoint sets of request IDs.
     Need this class because LlmRequest is not serializable by pickle.
     """
 
-    context_requests: list[int]  # request ids of context requests
+    context_requests_chunking: list[int]  # request ids of context requests chunking
+    context_requests_last_chunk: list[int]  # request ids of context requests last chunk
     generation_requests: list[int]  # request ids of generation requests
     paused_requests: list[int]  # request ids of paused requests
     fitting_disagg_gen_init_requests: list[
@@ -99,7 +149,12 @@ class SerializableSchedulerOutput:
         num_fitting_requests: int,
     ) -> "SerializableSchedulerOutput":
         return cls(
-            context_requests=[req.request_id for req in scheduled_requests.context_requests],
+            context_requests_chunking=[
+                req.request_id for req in scheduled_requests.context_requests_chunking
+            ],
+            context_requests_last_chunk=[
+                req.request_id for req in scheduled_requests.context_requests_last_chunk
+            ],
             generation_requests=[req.request_id for req in scheduled_requests.generation_requests],
             paused_requests=[req.request_id for req in scheduled_requests.paused_requests],
             fitting_disagg_gen_init_requests=[
@@ -113,8 +168,11 @@ class SerializableSchedulerOutput:
     ) -> tuple[ScheduledRequests, RequestList, int]:
         id_to_request = {req.request_id: req for req in active_requests}
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests = [
-            id_to_request[req_id] for req_id in self.context_requests
+        scheduled_requests.context_requests_chunking = [
+            id_to_request[req_id] for req_id in self.context_requests_chunking
+        ]
+        scheduled_requests.context_requests_last_chunk = [
+            id_to_request[req_id] for req_id in self.context_requests_last_chunk
         ]
         scheduled_requests.generation_requests = [
             id_to_request[req_id] for req_id in self.generation_requests
@@ -167,68 +225,6 @@ class BindCapacityScheduler(CapacityScheduler):
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
         return self.impl(active_requests, self.kv_cache_manager, self.peft_cache_manager)
-
-
-class KVCacheV2DummyScheduler(CapacityScheduler):
-    # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
-    no_schedule_until_state = LlmRequestState.CONTEXT_INIT
-    no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
-
-    def __init__(self, max_num_requests: int, kv_cache_manager):
-        super(KVCacheV2DummyScheduler, self).__init__()
-        self.max_num_requests = max_num_requests
-        self.kv_cache_manager = kv_cache_manager
-
-    def schedule_request(
-        self, active_requests: RequestList
-    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
-        scheduled_requests = []
-        scheduled_disagg_gen_init_requests = []
-        pending_requests = []
-        reserved_blocks = 0
-        max_blocks = self.kv_cache_manager.get_max_resource_count()
-        for request in active_requests:
-            req_state = request.state
-            # if request cannot be scheduled yet or request should no longer be scheduled, skip
-            if not req_state == LlmRequestState.DISAGG_GENERATION_INIT and (
-                req_state.value < self.no_schedule_until_state.value
-                or req_state.value >= self.no_schedule_after_state.value
-            ):
-                continue
-
-            if len(scheduled_requests) >= self.max_num_requests or reserved_blocks >= max_blocks:
-                break
-            elif (
-                req_state == LlmRequestState.GENERATION_IN_PROGRESS
-                or req_state == LlmRequestState.GENERATION_TO_COMPLETE
-            ):
-                scheduled_requests.append(request)
-                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(request)
-            elif req_state == LlmRequestState.DISAGG_GENERATION_INIT:
-                scheduled_disagg_gen_init_requests.append(request)
-                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(request)
-            else:
-                pending_requests.append(request)
-
-        avaiable_blocks = max_blocks - reserved_blocks
-        for request in pending_requests:
-            req_state = request.state
-            if len(scheduled_requests) >= self.max_num_requests:
-                break
-            elif req_state == LlmRequestState.CONTEXT_INIT:
-                needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(request)
-                if needed_blocks <= avaiable_blocks:
-                    scheduled_requests.append(request)
-                    avaiable_blocks -= needed_blocks
-                elif needed_blocks > avaiable_blocks:
-                    # If one requests fails to be scheduled, break
-                    break
-
-        assert len(scheduled_requests) + len(scheduled_disagg_gen_init_requests) > 0, (
-            "no pending request can get enough resource to complete, "
-            "please increase KV cache pool size."
-        )
-        return scheduled_requests, scheduled_disagg_gen_init_requests, []
 
 
 class MicroBatchScheduler(ABC):
@@ -309,6 +305,7 @@ class SimpleScheduler(RequestScheduler):
 class ChunkingPolicy(Enum):
     EQUAL_PROGRESS = 1
     FIRST_COME_FIRST_SERVED = 2
+    FORCE_CHUNK = 3
 
 
 @dataclasses.dataclass
@@ -364,14 +361,14 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         context_requests: RequestList = []
         generation_requests: RequestList = []
 
-        # Current total tokens in the scheduled batch (Generation + Context)
+        # Current compute tokens in the scheduled batch (non-reusable only)
         batch_num_tokens = 0
         scheduled_req_size = 0
         scheduled_beam_width = 0
 
         contexts_to_be_chunked: RequestList = []
-        # Total tokens required by chunked requests (calculated tentatively)
-        num_chunked_tokens = 0
+        # Compute tokens required by chunked requests (non-reusable only)
+        num_chunked_compute_tokens = 0
         all_context_requests_fit = True
 
         # Cache instance attributes as locals for faster access in loop
@@ -379,7 +376,6 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         max_num_tokens = self.max_num_tokens
         max_context_length = self.max_context_length
         ctx_chunk_config = self.ctx_chunk_config
-
         # 1. Main Scheduling Loop
         for req in active_requests:
             req_state_value = req.state_value
@@ -416,6 +412,10 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
             # --- B. Context Request Handling ---
             elif req_state_value == self._context_init_state_value:
+                # Reusable tokens set by capacity scheduler (from radix tree lookup).
+                # Only valid for the first context chunk; subsequent chunks must compute all remaining tokens.
+                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
+
                 if not ctx_chunk_config:
                     # No Chunking: Schedule full context
                     # C++ uses getNumTokens(beam=0) which is tokens.size() - numPreDecodedTokens
@@ -423,18 +423,23 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
                     req_num_tokens = base_tokens + draft_tokens
 
-                    assert max_context_length is None or req_num_tokens <= max_context_length, (
-                        f"Context tokens ({req_num_tokens}) exceeds limit ({max_context_length})"
+                    compute_tokens = max(1, req_num_tokens - reusable)
+
+                    assert max_context_length is None or compute_tokens <= max_context_length, (
+                        f"Context compute tokens ({compute_tokens}) exceeds limit ({max_context_length})"
                     )
 
                     if max_num_tokens is not None and (
-                        batch_num_tokens + req_num_tokens > max_num_tokens
+                        batch_num_tokens + compute_tokens > max_num_tokens
                     ):
                         break
 
-                    logger.debug(f"context request scheduled: ID {req.request_id}")
+                    logger.debug(
+                        f"context request scheduled: ID {req.request_id}"
+                        + (f" (reusable {reusable})" if reusable > 0 else "")
+                    )
                     context_requests.append(req)
-                    batch_num_tokens += req_num_tokens
+                    batch_num_tokens += compute_tokens
                 else:
                     # Chunking Enabled: Tentative schedule
                     req.context_chunk_size = req.context_remaining_length
@@ -444,16 +449,22 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                         if (req.is_last_context_chunk and req.has_draft_tokens)
                         else 0
                     )
-                    req_num_tokens = req.context_chunk_size + draft_tokens
+                    # Compute cost: context compute + draft tokens
+                    # (reusable tokens only offset context tokens, not draft tokens)
+                    context_compute = max(0, req.context_chunk_size - reusable)
+                    compute_tokens = context_compute + draft_tokens
 
                     if max_context_length is not None:
-                        if max_context_length < req_num_tokens:
-                            req_num_tokens = max_context_length
+                        if max_context_length < compute_tokens:
+                            compute_tokens = max_context_length
                             all_context_requests_fit = False
 
-                    logger.debug(f"contexts-to-be-chunked request scheduled: ID {req.request_id}")
+                    logger.debug(
+                        f"contexts-to-be-chunked request scheduled: ID {req.request_id}"
+                        + (f" (reusable {reusable})" if reusable > 0 else "")
+                    )
                     contexts_to_be_chunked.append(req)
-                    num_chunked_tokens += req_num_tokens
+                    num_chunked_compute_tokens += compute_tokens
 
             # --- C. Generation Request Handling ---
             else:
@@ -485,8 +496,13 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             if scheduled_req_size >= max_batch_size:
                 break
 
-        # 2. Verify Chunking Fits
-        if max_num_tokens is not None and num_chunked_tokens > (max_num_tokens - batch_num_tokens):
+        # 2. Verify Chunking Fits (using compute tokens, not total)
+        if max_num_tokens is not None and num_chunked_compute_tokens > (
+            max_num_tokens - batch_num_tokens
+        ):
+            all_context_requests_fit = False
+
+        if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
             all_context_requests_fit = False
 
         # 3. Apply Chunking Strategy if needed
@@ -504,10 +520,14 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         for req in contexts_to_be_chunked:
             if req.context_chunk_size > 0:
                 context_requests.append(req)
-                batch_num_tokens += req.context_chunk_size
+                # Reusable credit only applies to the first context chunk.
+                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
+                compute_tokens = max(0, req.context_chunk_size - reusable)
+                batch_num_tokens += compute_tokens
                 logger.debug(
                     f"context request scheduled: ID {req.request_id}, "
                     f"chunk size {req.context_chunk_size}"
+                    + (f", reusable {reusable}" if reusable > 0 else "")
                 )
 
         # Sort requests for consistency with C++
@@ -519,7 +539,10 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             f"batchSize (num ctx/enc requests + num gen requests): "
             f"{len(context_requests) + len(generation_requests)}"
         )
-        logger.debug(f"batchNumTokens / maxNumTokens: {batch_num_tokens} / {max_num_tokens or 0}")
+        logger.debug(
+            f"batchNumTokens (num ctx/enc input tokens + num gen input tokens) "
+            f"/ maxNumTokens: {batch_num_tokens} / {max_num_tokens or 0}"
+        )
 
         return context_requests, generation_requests
 
@@ -559,8 +582,16 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
         generation_requests.sort(key=get_lora_task_id)
 
-    def _set_ctx_requests_chunk_size(self, requests: RequestList, capacity: Optional[int]):
-        # C++: Resets all chunk sizes to 0 at start
+    def _set_ctx_requests_chunk_size(
+        self,
+        requests: RequestList,
+        capacity: Optional[int],
+    ):
+        """
+        Mirrors MicroBatchScheduler::setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        Structure: reset all chunk sizes to 0, dispatch to policy, then trim draft tokens.
+        """
         for req in requests:
             req.context_chunk_size = 0
 
@@ -571,17 +602,29 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             self._chunk_equal_progress(requests, capacity, unit_size)
         elif policy == ChunkingPolicy.FIRST_COME_FIRST_SERVED:
             self._chunk_fcfs(requests, capacity, unit_size)
+        elif policy == ChunkingPolicy.FORCE_CHUNK:
+            self._chunk_forced(requests, capacity, unit_size)
         else:
             raise ValueError(f"Invalid chunking policy: {policy}")
 
         self._fit_draft_tokens(requests, capacity, unit_size)
 
     def _chunk_equal_progress(self, requests: RequestList, capacity: Optional[int], unit_size: int):
-        num_ctx_tokens = 0
+        """
+        Mirrors the kEQUAL_PROGRESS specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        All requests advance in lock-step: each while-loop iteration offers every request one
+        additional unit_size worth of tokens, until the compute budget (capacity) is exhausted
+        or no request can make further progress.
+
+        capacity is a compute-token budget (non-reusable only). Tokens covered by the reusable
+        KV-cache prefix are not charged against it.
+        """
+        num_compute_tokens = 0
         num_tokens_single_loop = 1
 
         # C++ Loop: while ((!capacity || numCtxTokens < capacity) && numTokensSingleLoop)
-        while (capacity is None or num_ctx_tokens < capacity) and num_tokens_single_loop > 0:
+        while (capacity is None or num_compute_tokens < capacity) and num_tokens_single_loop > 0:
             num_tokens_single_loop = 0
             for req in requests:
                 past_size = req.context_chunk_size
@@ -589,18 +632,27 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 # C++ logic: suggested = past + unit
                 suggested_size = past_size + unit_size
 
-                # Ensure we don't exceed what the request actually needs
+                # In C++, setContextChunkSize() clamps to getContextRemainingLength() internally.
+                # Python's setter does not clamp, so we replicate that clamp here explicitly.
                 remaining_total = req.context_remaining_length
                 suggested_size = min(suggested_size, remaining_total)
 
                 req.context_chunk_size = suggested_size
 
+                # In C++, getContextChunkSize() is called after the setter to observe the
+                # clamped value. In Python the setter does not re-clamp, so actual_size ==
+                # suggested_size; the readback is kept for structural symmetry with C++.
                 actual_size = req.context_chunk_size
-                actual_increment = actual_size - past_size
 
-                # Check Constraints
-                # 1. Capacity
-                if capacity is not None and (num_ctx_tokens + actual_increment > capacity):
+                # Compute the compute-token increment (reusable tokens don't consume budget).
+                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
+                past_compute = max(0, past_size - min(reusable, past_size))
+                actual_compute = max(0, actual_size - min(reusable, actual_size))
+                compute_increment = actual_compute - past_compute
+
+                # Check Constraints — mirrors the if-block guard in C++ before numCtxTokens +=
+                # 1. Capacity (in compute tokens)
+                if capacity is not None and (num_compute_tokens + compute_increment > capacity):
                     req.context_chunk_size = past_size  # Revert
                     continue
 
@@ -609,35 +661,107 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     req.context_chunk_size = past_size  # Revert
                     continue
 
-                num_ctx_tokens += actual_increment
-                num_tokens_single_loop += actual_increment
+                num_compute_tokens += compute_increment
+                # Keep raw increment (actual_size - past_size) including reusable tokens for loop-termination detection,
+                # not compute_increment.
+                num_tokens_single_loop += actual_size - past_size
 
-    def _chunk_fcfs(self, requests: RequestList, capacity: Optional[int], unit_size: int):
-        current_capacity = capacity if capacity is not None else float("inf")
+    def _chunk_fcfs(
+        self,
+        requests: RequestList,
+        capacity: Optional[int],
+        unit_size: int,
+    ):
+        """Mirrors the kFIRST_COME_FIRST_SERVED specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        Requests are processed in order; each greedily claims as much of the remaining compute
+        budget as possible before the next request is considered — hence "first come, first served".
+
+        capacity represents the COMPUTE budget (non-reusable tokens).
+        Reusable tokens are "free" — they don't consume forward-pass compute.
+        """
+        current_compute_capacity = capacity if capacity is not None else float("inf")
 
         for req in requests:
             suggested_size = req.context_remaining_length
+            # Only the first context chunk can reuse cached KV blocks;
+            # subsequent chunks must compute all remaining tokens.
+            reusable = min(
+                req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
+                suggested_size,
+            )
+            compute_cost = suggested_size - reusable
+
+            # Start with full context as the allocation target.
             actual_size = suggested_size
 
-            if current_capacity < actual_size:
-                actual_size = current_capacity
+            # Constraint 1: compute capacity.
+            if current_compute_capacity < compute_cost:
+                # Model processes min(chunk_size, P - reusable) tokens from position reusable,
+                # where P = suggested_size = context_remaining_length (full prompt on first chunk).
+                # To keep model tokens within budget: chunk_size = capacity (not reusable + capacity),
+                actual_size = int(current_compute_capacity)
 
+            # Constraint 2: max_context_length (applies to compute portion only).
             if self.max_context_length is not None:
-                actual_size = min(self.max_context_length, actual_size)
+                actual_compute = max(0, actual_size - reusable)
+                if actual_compute > self.max_context_length:
+                    actual_size = reusable + self.max_context_length
+                    actual_size = min(actual_size, suggested_size)
 
-            # Round down to unit size if we had to truncate
+            # Align down to unit_size when either constraint trimmed the chunk, to avoid
+            # KV-cache fragmentation.
             if actual_size < suggested_size:
                 actual_size = (int(actual_size) // unit_size) * unit_size
 
             req.context_chunk_size = int(actual_size)
 
-            # C++: ctxTokensCapacity = ctxTokensCapacity - actualChunkSize
+            # Decrement budget by actual model token count: min(chunk_size, P - reusable).
+            # where P = suggested_size =context_remaining_length (full prompt on first chunk)
+            actual_model_cost = min(req.context_chunk_size, max(0, int(suggested_size) - reusable))
             if capacity is not None:
-                current_capacity -= req.context_chunk_size
+                current_compute_capacity -= actual_model_cost
+
+    def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+        """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
+
+        Every request is assigned exactly min(context_remaining_length, unit_size) tokens.
+        Requests that would exceed the capacity budget are zeroed out.
+
+        This policy is designed for linear attention / Mamba2 state caching, which doesn't support
+        estimating reusable tokens, so we don't subtract them from the budget.
+        """
+        if self.max_context_length is not None and self.max_context_length < unit_size:
+            raise ValueError(
+                f"The forced chunk size ({unit_size}) exceeds the "
+                f"max context length ({self.max_context_length})"
+            )
+        total_tokens = 0
+        for req in requests:
+            req.context_chunk_size = min(req.context_remaining_length, unit_size)
+            if capacity is not None and total_tokens + req.context_chunk_size > capacity:
+                req.context_chunk_size = 0
+            total_tokens += req.context_chunk_size
+        assert capacity is None or total_tokens <= capacity
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
-        # Calculate tokens already taken by the batch so far
-        num_ctx_tokens = sum(req.context_chunk_size for req in requests)
+        # capacity is a compute-token budget. Sum actual model tokens per request:
+        # min(chunk_size, P - reusable), where P = context_remaining_length
+        # (the full prompt length on the first context chunk).
+        num_ctx_tokens = sum(
+            min(
+                req.context_chunk_size,
+                max(
+                    0,
+                    req.context_remaining_length
+                    - min(
+                        req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
+                        req.context_remaining_length,
+                    ),
+                ),
+            )
+            for req in requests
+        )
 
         for req in requests:
             if req.is_last_context_chunk and req.has_draft_tokens:
@@ -655,8 +779,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 draft_discard = req.num_draft_tokens - remaining_space
                 if draft_discard > 0:
                     logger.debug(f"Discarding {draft_discard} draft tokens")
-                    if hasattr(req, "discard_draft_tokens"):
-                        req.discard_draft_tokens(draft_discard)
+                    req.discard_draft_tokens(draft_discard)
 
 
 class SchedulerPolicyBase(ABC):
@@ -1346,6 +1469,8 @@ class SimpleUnifiedScheduler(RequestScheduler):
 
             if "EQUAL_PROGRESS" in str(input_policy):
                 policy_enum = ChunkingPolicy.EQUAL_PROGRESS
+            elif "FORCE_CHUNK" in str(input_policy):
+                policy_enum = ChunkingPolicy.FORCE_CHUNK
             else:
                 # Default to FCFS for FIRST_COME_FIRST_SERVED or others
                 policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED

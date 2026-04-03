@@ -1,5 +1,11 @@
 # Skywork
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document elaborates how to build the [Skywork](https://huggingface.co/Skywork/) model to runnable engines on single GPU node and perform a summarization task using these engines.
 
 ## Overview
@@ -7,7 +13,7 @@ The TensorRT LLM Skywork implementation is based on the LLaMA model. The impleme
 be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
 The TensorRT LLM Skywork example code lies in [`examples/models/contrib/skywork`](./):
 
-* [`convert_checkpoint.py`](../llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT LLM checkpoint.
+* [`convert_checkpoint.py`](../../core/llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT LLM checkpoint.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -81,10 +82,11 @@ public:
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
-        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
+        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
+        , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
@@ -139,8 +141,19 @@ public:
         return mLastBlockKey;
     }
 
+    [[nodiscard]] std::vector<SizeType32> const& getCounterPartRanks() const
+    {
+        return mCounterPartRanks;
+    }
+
+    void setCounterPartRanks(std::vector<SizeType32> ranks)
+    {
+        mCounterPartRanks = std::move(ranks);
+    }
+
 private:
     std::vector<Connection const*> mConnections;
+    std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
     executor::DataTransceiverState mOtherState;
@@ -235,8 +248,10 @@ class CacheSender
 {
 public:
     /// @brief Constructor.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheSender() = default;
 
@@ -290,8 +305,10 @@ class CacheReceiver
 {
 public:
     /// @brief Constructor.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheReceiver() = default;
 

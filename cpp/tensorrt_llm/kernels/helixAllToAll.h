@@ -42,7 +42,7 @@ struct HelixAllToAllParams
     HelixFieldInfo recvFields[2];
     int entryCount; // Number of entries per peer rank to process
     uint64_t* workspace;
-    int workspaceStrideInU64;
+    size_t workspaceStrideInU64;
     int cpRank;
     int cpSize;
     int channelCount; // use 0 to auto-compute

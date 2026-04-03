@@ -22,8 +22,10 @@ import mpi4py
 import pytest
 
 from tensorrt_llm import mpi_rank
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
-    KvCacheConnectorManager
+from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
+    AsyncRequests, KvCacheConnectorManager,
+    KvCacheConnectorSchedulerOutputManager)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -111,6 +113,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
         req = MagicMock()
 
         req.request_id = 42
+        req.is_generation_only_request = False
 
         assert manager.get_num_new_matched_tokens(req, 32) == 16
 
@@ -139,9 +142,11 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
 
         req0 = MagicMock()
         req0.request_id = 0
+        req0.is_generation_only_request = False
 
         req1 = MagicMock()
         req1.request_id = 1
+        req1.is_generation_only_request = False
 
         if mpi_rank() == 0:
             scheduler.get_num_new_matched_tokens.return_value = (16, True)
@@ -161,10 +166,41 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
             assert scheduler.get_num_new_matched_tokens.call_args[0] == (req1,
                                                                          0)
 
-        scheduled_requests.context_requests = [req0, req1]
+        scheduled_requests.context_requests_last_chunk = [req0, req1]
 
         manager.take_scheduled_requests_pending_load(scheduled_requests)
 
-        assert scheduled_requests.context_requests == [req1]
+        assert scheduled_requests.context_requests_last_chunk == [req1]
 
     run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_scheduler_output_num_scheduled_tokens_with_mtp():
+    """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
+    NUM_DRAFT_TOKENS = 3
+
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+
+    # Create a mock request in generation state with draft tokens
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.get_tokens.return_value = [1, 2, 3, 4, 5]  # 5 tokens already generated
+    req.py_draft_tokens = [100, 101, 102]  # 3 MTP draft tokens
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = KvCacheConnectorSchedulerOutputManager()
+    scheduler_output = manager.build_scheduler_output(scheduled_batch,
+                                                      AsyncRequests({}, {}),
+                                                      kv_cache_manager)
+
+    assert len(scheduler_output.cached_requests) == 1
+    request_data = scheduler_output.cached_requests[0]
+
+    # For generation requests: num_scheduled_tokens = 1 + draft_token_length
+    expected_num_scheduled_tokens = 1 + NUM_DRAFT_TOKENS
+    assert request_data.num_scheduled_tokens == expected_num_scheduled_tokens, \
+        f"Expected {expected_num_scheduled_tokens}, got {request_data.num_scheduled_tokens}"

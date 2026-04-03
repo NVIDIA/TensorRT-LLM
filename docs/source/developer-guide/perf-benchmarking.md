@@ -140,11 +140,11 @@ The throughput benchmark utilizes a fixed JSON schema to specify requests. The s
 | :-------------- | :------: | :-----------: | :---------------------------------------------- |
 | `task_id`       |    Y     |    String     | Unique identifier for the request.              |
 | `prompt`        |    N*    |    String     | Input text for a generation request.            |
-| `input_ids`     |    Y*    | List[Integer] | List of logits that make up the request prompt. |
+| `input_ids`     |    Y*    | List[Integer] | List of token IDs that make up the request prompt. |
 | `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
 
 ```{tip}
-\* Specifying `prompt` or `input_ids` is required. However, you can not have both prompts and logits (`input_ids`)
+\* Specifying `prompt` or `input_ids` is required. However, you cannot have both prompts and token IDs (`input_ids`)
 defined at the same time. If you specify `input_ids`, the `prompt` entry is ignored for request generation.
 ```
 
@@ -338,7 +338,7 @@ First, prepare the dataset:
 trtllm-bench \
   --model Qwen/Qwen2-VL-2B-Instruct \
   prepare-dataset \
-  --output mm_data.jsonl
+  --output mm_data.jsonl \
   real-dataset
   --dataset-name lmms-lab/MMMU \
   --dataset-split test \
@@ -359,7 +359,7 @@ Sample dataset for multimodal:
 ```
 
 Run the benchmark:
-```python
+```shell
 trtllm-bench --model Qwen/Qwen2-VL-2B-Instruct \
   throughput \
   --dataset mm_data.jsonl \

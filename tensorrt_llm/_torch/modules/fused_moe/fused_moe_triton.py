@@ -103,7 +103,7 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         shifted = tl.where(start_bit == 0, v1,
                            (v1 >> start_bit) | (v2 << (32 - start_bit)))
 
-        # write back in place; bits past the region are already zero
+        # write back in place; _routing_clear_bitmatrix zeroes stale bits after
         tl.store(Bitmatrix + pid_m * stride_bm + w * stride_bn,
                  shifted.to(tl.int32),
                  mask=dst_mask)
@@ -123,38 +123,61 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         tl.store(ptr, yi, mask=mask_i)
 
 
+# After shifting the bitmatrix so that the local expert slice starts at bit 0,
+# clear all bits at positions >= cutoff (n_expts_local).  Without this, stale
+# bits from out-of-slice experts remain set and corrupt the subsequent
+# compaction and routing.
+# This kernel was removed from triton_kernels in 3.6.0, so we keep a local
+# copy here.
+@triton.jit
+def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn, cutoff,
+                             BLOCK_N: tl.constexpr):
+    pid_m = tl.program_id(0)
+    cutoff_word = cutoff // 32
+    cutoff_bit = cutoff % 32
+    cutoff_mask = (1 << (cutoff_bit)) - 1
+    for start_n in range(0, shape_bn, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        values = tl.load(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                         mask=offs_n < shape_bn)
+        values = tl.where(offs_n == cutoff_word, values & cutoff_mask, values)
+        values = tl.where(offs_n > cutoff_word, 0, values)
+        tl.store(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                 values,
+                 mask=offs_n < shape_bn)
+
+
 class TritonEPRouter():
 
     def prune_routing_ep(self, expt_scal, expt_indx, bitmatrix, n_expts_tot,
                          slice_start, slice_end):
         from triton_kernels.compaction import compaction
-        from triton_kernels.routing import _routing_clear_bitmatrix
         n_tokens_pad = expt_scal.shape[0]
+        bitmask_data = bitmatrix.mask.storage.data
         _routing_shift_bitmatrix_range[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
             expt_indx,
             expt_indx.stride(0),
             expt_indx.stride(1),
-            bitmatrix.storage.data.shape[1],
+            bitmask_data.shape[1],
             expt_indx.shape[1],
             slice_start,
             slice_end,
             BLOCK_N=512,
         )
         _routing_clear_bitmatrix[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
-            bitmatrix.storage.data.shape[1],
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
+            bitmask_data.shape[1],
             slice_end - slice_start,
             BLOCK_N=512,
         )
-        # perform compaction to update expt_scal / expt_indx
-        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
+        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix.mask)
         n_expts_tot = slice_end - slice_start
-        bitmatrix.shape[-1] = n_expts_tot
+        bitmatrix.mask.shape[-1] = n_expts_tot
         return expt_scal, expt_indx, bitmatrix
 
     def __call__(self,
@@ -165,27 +188,59 @@ class TritonEPRouter():
                  ep=1,
                  node_idx=0,
                  n_rows=None):
+        from triton_kernels.matmul_ogs import (GatherIndx, RoutingData,
+                                               ScatterIndx)
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+        from triton_kernels.topk import topk
+
         n_expts_tot = logits.shape[-1]
         n_expts_local = n_expts_tot // ep
         slice_start = node_idx * n_expts_local
         slice_end = slice_start + n_expts_local
 
-        from triton_kernels.routing import routing_from_bitmatrix
-        from triton_kernels.topk import topk
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
-        expt_scal, expt_indx, bitmatrix = topk(logits,
-                                               n_expts_act,
-                                               apply_softmax=not sm_first,
-                                               y_indx=expt_indx,
-                                               n_rows=n_rows)
-        # mutate bitmatrix
+
+        bitmatrix = topk(logits,
+                         n_expts_act,
+                         apply_softmax=not sm_first,
+                         y_indx=expt_indx,
+                         n_rows=n_rows)
+        expt_scal = bitmatrix.vals
+        expt_indx = bitmatrix.indx
+
         if ep > 1:
             expt_scal, expt_indx, bitmatrix = self.prune_routing_ep(
                 expt_scal, expt_indx, bitmatrix, n_expts_tot, slice_start,
                 slice_end)
-        return routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx,
-                                      n_expts_local, n_expts_act)
+            # mask_metadata was computed eagerly in SparseMatrix.__post_init__
+            # before pruning mutated the bitmatrix.  Recompute it now.
+            from triton_kernels.tensor_details.bitmatrix import \
+                make_bitmatrix_metadata
+            metadata = make_bitmatrix_metadata(expt_indx, bitmatrix.mask)
+        else:
+            metadata = bitmatrix.mask_metadata
+
+        expt_data = make_ragged_tensor_metadata(metadata.col_sum,
+                                                logits.shape[0] * n_expts_act)
+        gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
+
+        rdata = RoutingData(
+            gate_scal=gate_scal_sorted,
+            expt_hist=metadata.col_sum,
+            n_expts_tot=n_expts_local,
+            n_expts_act=n_expts_act,
+            expt_data=expt_data,
+        )
+        gather_indx = GatherIndx(
+            src_indx=metadata.col_sorted_indx,
+            dst_indx=metadata.row_sorted_indx,
+        )
+        scatter_indx = ScatterIndx(
+            src_indx=metadata.row_sorted_indx,
+            dst_indx=metadata.col_sorted_indx,
+        )
+        return rdata, gather_indx, scatter_indx
 
 
 def maybe_update_stride(weight):
@@ -346,8 +401,9 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -581,8 +637,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -1214,8 +1271,9 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         hidden_states = _maybe_pad_activation(hidden_states)
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
 
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
@@ -1283,12 +1341,12 @@ class TritonFusedMoE(MoE):
         cls,
         quant_algo: Optional["QuantAlgo"],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if TritonFusedMoE can implement the given quantization algorithm.
 
-        TritonFusedMoE supports (SM90 only, gptoss_style=True only):
+        TritonFusedMoE supports (SM90 only, swiglu_gptoss_style=True only):
         - Unquantized (BF16 only)
         - FP8 per-tensor (QDQ)
         - W4A8_MXFP4_FP8
@@ -1298,8 +1356,8 @@ class TritonFusedMoE(MoE):
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type. In unquantized mode, activation,
                 weight, and output dtypes must all match (only bfloat16 supported).
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                TritonFusedMoE ONLY supports gptoss_style=True.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                TritonFusedMoE ONLY supports swiglu_gptoss_style=True.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -1316,10 +1374,10 @@ class TritonFusedMoE(MoE):
             return _warn_and_return(
                 f"TritonFusedMoE only supports SM90, got SM{sm_version}")
 
-        # TritonFusedMoE ONLY supports gptoss_style=True
-        if not gptoss_style:
+        # TritonFusedMoE ONLY supports swiglu_gptoss_style=True
+        if not swiglu_gptoss_style:
             return _warn_and_return(
-                "TritonFusedMoE only supports gptoss_style=True")
+                "TritonFusedMoE only supports swiglu_gptoss_style=True")
 
         # Unquantized mode - only bfloat16 is supported
         if quant_algo is None:

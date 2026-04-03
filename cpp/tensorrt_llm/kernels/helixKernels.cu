@@ -233,7 +233,6 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 
     int tok_idx = blockIdx.x;
     int head_idx = blockIdx.y;
-    int num_tokens = gridDim.x;
     int num_heads = gridDim.y;
 
     int const cp_size_aligned = ((cp_size + NUM_PRE_LOAD - 1) / NUM_PRE_LOAD) * NUM_PRE_LOAD;
@@ -378,7 +377,6 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 
     int tok_idx = blockIdx.x;
     int head_idx = blockIdx.y;
-    int num_tokens = gridDim.x;
     int num_heads = gridDim.y;
 
     int const cp_size_aligned = ((cp_size + NUM_PRE_LOAD - 1) / NUM_PRE_LOAD) * NUM_PRE_LOAD;
@@ -548,7 +546,7 @@ void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t
         "gathered_o must be 16-byte aligned for async memcpy");
     // TODO: Figure out why this constraint is specific to this implementation and not the legacy one.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) <= MAX_KV_LORA_BYTES,
-        "kv_lora_rank * sizeof(T) must be <= %zu bytes", MAX_KV_LORA_BYTES);
+        "kv_lora_rank * sizeof(T) must be <= %zu bytes", static_cast<size_t>(MAX_KV_LORA_BYTES));
     // Check that kv_lora_rank * sizeof(T) is a multiple of 16.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) % 16 == 0,
         "kv_lora_rank * sizeof(T) must be a multiple of 16 for async memcpy");
@@ -584,7 +582,7 @@ void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t
         "gathered_o must be 16-byte aligned for async memcpy");
     // TODO: Figure out why this constraint is specific to this implementation and not the legacy one.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) <= MAX_KV_LORA_BYTES,
-        "kv_lora_rank * sizeof(T) must be <= %zu bytes", MAX_KV_LORA_BYTES);
+        "kv_lora_rank * sizeof(T) must be <= %zu bytes", static_cast<size_t>(MAX_KV_LORA_BYTES));
     // Check that kv_lora_rank * sizeof(T) is a multiple of 16.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) % 16 == 0,
         "kv_lora_rank * sizeof(T) must be a multiple of 16 for async memcpy");

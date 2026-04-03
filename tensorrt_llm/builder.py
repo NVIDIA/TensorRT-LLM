@@ -22,14 +22,16 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 import tensorrt as trt
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
+from ._deprecation import emit_engine_arch_deprecation
 from ._utils import (get_sm_version, np_bfloat16, np_float8, str_dtype_to_trt,
                      to_json_file, trt_gte)
 from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
 from .llmapi.kv_cache_type import KVCacheType
+from .llmapi.utils import StrictBaseModel
 from .logger import logger
 from .lora_helper import LoraConfig
 from .models import PretrainedConfig, PretrainedModel
@@ -450,7 +452,7 @@ class Builder():
         logger.info(f'Config saved to {config_path}.')
 
 
-class BuildConfig(BaseModel):
+class BuildConfig(StrictBaseModel):
     """Configuration class for TensorRT LLM engine building parameters.
 
     This class contains all the configuration parameters needed to build a TensorRT LLM engine,
@@ -975,6 +977,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
        to avoid cloning a model since normally the LLM models consumes large memory.
        Create a new fresh model object if you need to build with different options.
     '''
+    emit_engine_arch_deprecation("builder.build()")
     tic = time.time()
     # avoid changing the input config
     build_config = build_config.model_copy(deep=True)

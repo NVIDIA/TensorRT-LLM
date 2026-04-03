@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -586,7 +586,7 @@ def analyze_graph_structure(graph_module: GraphModule) -> Dict[str, Any]:
 
 
 def _get_node_label(graph_module: GraphModule, node: fx.Node) -> str:
-    """Get node label"""
+    """Get node label, including the dtype of the attribute if it is a tensor"""
     if node.op == "call_function":
         func_name = _get_function_name(node.target)
         tokens = func_name.split(".")
@@ -599,6 +599,18 @@ def _get_node_label(graph_module: GraphModule, node: fx.Node) -> str:
     elif node.op == "get_attr":
         attr_name = str(node.target).split(".")[-1] if "." in str(node.target) else str(node.target)
         label = attr_name
+        # Try to get actual dtype from state_dict/parameters
+        try:
+            # Traverse the attribute path to get the actual tensor
+            target_path = str(node.target)
+            obj = graph_module
+            for attr in target_path.split("."):
+                obj = getattr(obj, attr)
+            if isinstance(obj, torch.Tensor):
+                dtype_str = str(obj.dtype).replace("torch.", "")
+                label = f"{attr_name}\n({dtype_str})"
+        except (AttributeError, RuntimeError):
+            pass  # Keep original label if attribute not found
     elif node.op == "placeholder":
         label = "ph: " + str(node.name)
     elif node.op == "output":
@@ -674,6 +686,7 @@ def _calculate_graph_depth(nodes) -> int:
     depths = {}
 
     def calculate_depth(node_name):
+        """Calculate the depth of a node based on its dependencies (memoized)."""
         if node_name in depths:
             return depths[node_name]
 

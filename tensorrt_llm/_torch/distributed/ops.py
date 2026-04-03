@@ -10,6 +10,7 @@ from torch import nn
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
@@ -691,7 +692,26 @@ class AllReduce(nn.Module):
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
-        if self.mapping.tp_size > 1:
+
+        # Propagate model-level prealloc config to AllReduceRunner once per
+        # process.  extra_attrs is only active during model __init__, so we
+        # read it here and stash the values as class-level attributes that
+        # AllReduceRunner.forward can use during the autotuner warm-up phase.
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs:
+            from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+                AllReduceRunner
+            max_num_tokens = extra_attrs.get('allreduce_max_num_tokens')
+            hidden_size = extra_attrs.get('allreduce_hidden_size')
+            if max_num_tokens is not None:
+                AllReduceRunner._prealloc_max_num_tokens = max_num_tokens
+            if hidden_size is not None:
+                AllReduceRunner._prealloc_hidden_size = hidden_size
+            prealloc_dtype = extra_attrs.get('allreduce_dtype')
+            if prealloc_dtype is not None:
+                AllReduceRunner._prealloc_dtype = prealloc_dtype
+
+        if self.mapping.tp_size > 1 and not self.mapping.enable_attention_dp:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
                 try:
@@ -772,6 +792,7 @@ class AllReduce(nn.Module):
         Returns:
             A tensor lists with different tensor outptus according to the fusion_op.
             NONE: [hidden_states]
+            RMS_NORM: [hidden_states]
             RESIDUAL_RMS_NORM: [hidden_states, residual]
             RESIDUAL_RMS_NORM_QUANT_FP8: [norm_quant, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
@@ -943,8 +964,9 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
         else:
-            assert all_reduce_params.residual.shape[
-                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+            if all_reduce_params.residual is not None:
+                assert all_reduce_params.residual.shape[
+                    0] <= self.max_token, "Num tokens must be less than or equal to max_token"
 
             return torch.ops.trtllm.moe_finalize_allreduce(
                 input=input,
@@ -1082,3 +1104,77 @@ def all_to_all_4d(
             output = output_reshaped.view(batch, seq, heads, head_dim)
 
     return output
+
+
+def all_to_all_5d(
+    input: torch.Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """
+    All-to-all for 5D tensors with a fused QKV dimension.
+
+    Operates on [B, S, 3, H, D] tensors where dim 2 is the QKV count.
+    Used for Ulysses sequence parallelism with fused QKV to reduce the
+    number of all-to-all collectives from 3 (one per Q/K/V) to 1.
+
+    Supported scatter/gather combinations:
+    - scatter_dim=3 (heads), gather_dim=1 (seq): [B, S/P, 3, H, D] -> [B, S, 3, H/P, D]
+    - scatter_dim=1 (seq), gather_dim=3 (heads): [B, S, 3, H/P, D] -> [B, S/P, 3, H, D]
+    """
+    if not mpi_disabled():
+        raise NotImplementedError(
+            "all_to_all_5d currently only supports PyTorch distributed mode.")
+
+    world_size = torch.distributed.get_world_size(group=process_group)
+    if world_size == 1:
+        return input
+
+    assert input.dim() == 5, f"Expected 5D tensor, got {input.dim()}D"
+    assert scatter_dim in [1, 3] and gather_dim in [1, 3]
+    assert scatter_dim != gather_dim
+
+    batch, seq, qkv_count, heads, head_dim = input.shape
+    assert input.shape[scatter_dim] % world_size == 0, \
+        f"Dim {scatter_dim} size {input.shape[scatter_dim]} not divisible by world_size {world_size}"
+
+    if scatter_dim == 3 and gather_dim == 1:
+        # [B, S/P, 3, H, D] -> [B, S, 3, H/P, D]
+        sharded_heads = heads // world_size
+        inp = input.reshape(batch, seq, qkv_count, world_size, sharded_heads,
+                            head_dim)
+        inp = inp.permute(3, 0, 1, 2, 4,
+                          5).contiguous()  # [P, B, S/P, 3, H/P, D]
+
+        out_flat = torch.empty_like(inp.flatten())
+        torch.distributed.all_to_all_single(out_flat,
+                                            inp.flatten(),
+                                            group=process_group)
+        out = out_flat.view_as(inp)
+
+        out = out.permute(1, 0, 2, 3, 4,
+                          5).contiguous()  # [B, P, S/P, 3, H/P, D]
+        gathered_seq = seq * world_size
+        return out.reshape(batch, gathered_seq, qkv_count, sharded_heads,
+                           head_dim)
+
+    else:  # scatter_dim == 1, gather_dim == 3
+        # [B, S, 3, H/P, D] -> [B, S/P, 3, H, D]
+        sharded_seq = seq // world_size
+        inp = input.reshape(batch, world_size, sharded_seq, qkv_count, heads,
+                            head_dim)
+        inp = inp.permute(1, 0, 2, 3, 4,
+                          5).contiguous()  # [P, B, S/P, 3, H/P, D]
+
+        out_flat = torch.empty_like(inp.flatten())
+        torch.distributed.all_to_all_single(out_flat,
+                                            inp.flatten(),
+                                            group=process_group)
+        out = out_flat.view_as(inp)
+
+        out = out.permute(1, 2, 3, 0, 4,
+                          5).contiguous()  # [B, S/P, 3, P, H/P, D]
+        gathered_heads = heads * world_size
+        return out.reshape(batch, sharded_seq, qkv_count, gathered_heads,
+                           head_dim)

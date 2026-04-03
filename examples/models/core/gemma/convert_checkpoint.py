@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional, Type
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.gemma.config import GEMMA_ARCHITECTURE, GemmaConfig
@@ -172,8 +173,9 @@ def compute_quant_algo(args: argparse.Namespace) -> Optional[QuantAlgo]:
 def create_quant_config(args: argparse.Namespace) -> QuantConfig:
     quant_algo = compute_quant_algo(args)
     GemmaForCausalLM.assert_valid_quant_algo(quant_algo)
-    quant_config = QuantConfig(quant_algo=quant_algo,
-                               smoothquant_val=args.smoothquant)
+    quant_config = QuantConfig(quant_algo=quant_algo)
+    if args.smoothquant is not None:
+        quant_config.smoothquant_val = args.smoothquant
 
     if args.fp8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.FP8
@@ -196,6 +198,7 @@ def create_quant_config(args: argparse.Namespace) -> QuantConfig:
 
 
 def main() -> None:
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     tik = time.time()
     quant_config = create_quant_config(args)

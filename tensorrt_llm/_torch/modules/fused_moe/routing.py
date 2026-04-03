@@ -75,7 +75,7 @@ def precompute_common_perfect_router_logits(num_experts: int,
         5120,
         6144,
         7168,
-        8192  # Powers of 2 and common sizes
+        8192  # Common sizes
     ]
 
     print(

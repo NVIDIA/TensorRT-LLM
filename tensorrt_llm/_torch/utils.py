@@ -23,6 +23,7 @@ aux_stream_name_list = [
     'MoeChunkingOverlap',
     'MoeBalancer',
     'MoeOutputMemset',
+    'MoeFc2Alpha',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -52,8 +53,12 @@ class ActivationType(IntEnum):
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
+    # act = x0 * x1 * sigmoid(x1)
     SwiGlu = 0
+    # act = relu(x0) ^ 2
     Relu2 = 1
+    # act = x0 * sigmoid(x0)
+    Silu = 2
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
@@ -290,6 +295,16 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
     return tuple(num_token_buckets[::-1])
+
+
+def deep_gemm_gen_tuning_buckets(x: int):
+    buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
+    if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
+        buckets += tuple(range(128, x, 128))
+    return buckets
 
 
 def fp4_scale_infer_shape(input_shapes: List[List[int]]):

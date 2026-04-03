@@ -9,6 +9,7 @@ from utils.util import force_ampere
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.sampling_utils import top_k_top_p_sampling_batch
 from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import _StrategyImpls
+from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
 prompts = ["A B C"]
@@ -17,15 +18,14 @@ global_kvcache_config = KvCacheConfig(
     enable_block_reuse=True,
 )
 
-
-@pytest.fixture(scope="module", params=[False, True])
-def gather_generation_logits_fixture(request) -> bool:
-    return request.param
-
-
-@pytest.fixture(scope="module", params=[False, True])
-def gather_context_logits_fixture(request) -> bool:
-    return request.param
+global_kvcache_config_prompt_logprobs = KvCacheConfig(
+    max_tokens=10000,
+    # FIXME: block reuse is disabled for prompt logprobs
+    # because prompt logprobs are computed from context logits
+    # and context logits may not be calculated when using block reuse
+    # See https://nvbugs/5577178
+    enable_block_reuse=False,
+)
 
 
 @pytest.fixture(scope="module", params=[False, True])
@@ -61,44 +61,21 @@ class CacheSalter:
 
 @pytest.fixture(scope="module")
 def llm(
-    gather_context_logits_fixture: bool,
-    gather_generation_logits_fixture: bool,
     sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
 ):
-    gather_generation_logits = gather_generation_logits_fixture
     sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
-        gather_generation_logits=gather_generation_logits,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         sampler_type=sampler_type,
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
-
-    # FIXME: Sometimes LLM shutdown hangs, might be related to https://nvbugs/5577178.
-    #        Remove patch below once fixed.
-    old_exit = LLM.__exit__
-
-    def _exit_with_xfail_on_timeout(self, exc_type, exc_value, traceback) -> bool:
-        import _pytest.outcomes
-
-        try:
-            return old_exit(self, exc_type, exc_value, traceback)
-        except _pytest.outcomes.Failed as e:
-            if e.msg and "pytest-timeout" in e.msg.lower():
-                pytest.xfail("Known LLM shutdown issue (https://nvbugs/5577178).")
-            else:
-                raise
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(LLM, "__exit__", _exit_with_xfail_on_timeout)
-
-        with llm:
-            yield llm
+    with llm:
+        yield llm
 
 
 @pytest.fixture(scope="module", params=[False, True])
@@ -108,93 +85,73 @@ def simple_llm(request) -> LLM:
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         max_batch_size=8,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
+        kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
     return llm
 
 
-@force_ampere  # Save H100 resource
-@pytest.mark.parametrize("reuse_cache", [False, True])
-@pytest.mark.parametrize("return_log_probs", [False, True])
-# FIXME: sometimes LLM shutdown hangs, might be related to https://nvbugs/5577178
-# NB: Timeout covers fixtures https://github.com/pytest-dev/pytest-timeout/issues/134
-@pytest.mark.timeout(120, method="signal")
-@pytest.mark.threadleak(enabled=False)
-def test_generate_with_return_logits(
-    llm,
-    gather_context_logits_fixture: bool,
-    gather_generation_logits_fixture: bool,
-    reuse_cache: bool,
-    return_log_probs: bool,
+def check_generated_output(
+    gather_context_logits,
+    gather_generation_logits,
+    sampling_params,
+    reuse_cache,
+    return_log_probs,
+    idx,
+    output,
+    streaming,
 ):
-    gather_context_logits = gather_context_logits_fixture
-    gather_generation_logits = gather_generation_logits_fixture
+    if gather_context_logits:
+        assert output.context_logits is not None
+        # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
+        expected_len = len(prompts[0].split()) + 1
+        assert expected_len == output.context_logits.shape[0]
+    else:
+        assert output.context_logits is None
 
-    if not (gather_context_logits or gather_generation_logits or return_log_probs):  # prune space
-        pytest.skip("Nothing to test")
-
-    sampling_params = SamplingParams(
-        max_tokens=8,
-        return_context_logits=gather_context_logits,
-        return_generation_logits=gather_generation_logits,
-        logprobs=return_log_probs,
-    )
-
-    for output in llm.generate(
-        prompts,
-        sampling_params=sampling_params,
-        cache_salt=[CacheSalter.get_salt(reuse_cache) for _ in prompts],
-    ):
-        if gather_context_logits:
-            assert output.context_logits is not None
-            # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
-            expected_len = len(prompts[0].split()) + 1
-            try:
-                assert expected_len == output.context_logits.shape[0]
-            except AssertionError:
-                # FIXME: Remove this once the bug has been fixed
-                if gather_context_logits and reuse_cache:
-                    pytest.xfail("Known bug: https://nvbugs/5577178")
-                raise
+    for sequence in output.outputs:
+        if streaming:
+            assert sequence.length == idx + 1
         else:
-            assert output.context_logits is None
-
-        for sequence in output.outputs:
             assert sequence.length == sampling_params.max_tokens
 
-            if gather_generation_logits:
-                gen_logits = sequence.generation_logits
-                assert gen_logits is not None
-                assert gen_logits.ndim == 2
+        if gather_generation_logits:
+            gen_logits = sequence.generation_logits
+            assert gen_logits is not None
+            assert gen_logits.ndim == 2
+            if streaming:
+                assert gen_logits.shape[0] == 1
+                assert torch.argmax(gen_logits, dim=1).tolist()[0] == sequence.token_ids[-1]
+            else:
                 assert gen_logits.shape[0] == sampling_params.max_tokens
                 assert torch.argmax(gen_logits, dim=1).tolist() == sequence.token_ids
-            else:
-                assert sequence.generation_logits is None
-
-            if return_log_probs:
-                assert len(sequence.logprobs) == sampling_params.max_tokens
-            else:
-                assert len(sequence.logprobs) == 0
+        else:
+            assert sequence.generation_logits is None
+        if return_log_probs:
+            assert len(sequence.logprobs) == sequence.length
+        else:
+            assert len(sequence.logprobs) == 0
 
 
 @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("reuse_cache", [False, True])
 @pytest.mark.parametrize("return_log_probs", [False, True])
-# FIXME: sometimes LLM shutdown hangs, might be related to https://nvbugs/5577178
-# NB: Timeout covers fixtures https://github.com/pytest-dev/pytest-timeout/issues/134
+@pytest.mark.parametrize("gather_generation_logits", [False, True])
+@pytest.mark.parametrize("gather_context_logits", [False, True])
+@pytest.mark.parametrize("async_generation", [False, True])
 @pytest.mark.timeout(120, method="signal")
 @pytest.mark.threadleak(enabled=False)
-def test_generate_async_with_return_logits(
+def test_generation_with_return_logits(
     llm,
-    gather_context_logits_fixture: bool,
-    gather_generation_logits_fixture: bool,
+    gather_context_logits: bool,
+    gather_generation_logits: bool,
     reuse_cache: bool,
     return_log_probs: bool,
+    async_generation: bool,
 ):
-    gather_context_logits = gather_context_logits_fixture
-    gather_generation_logits = gather_generation_logits_fixture
-
     if not (gather_context_logits or gather_generation_logits or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
+    if reuse_cache and gather_context_logits:
+        pytest.skip("nvbugs/5577178")
 
     sampling_params = SamplingParams(
         max_tokens=8,
@@ -203,48 +160,45 @@ def test_generate_async_with_return_logits(
         logprobs=return_log_probs,
     )
 
-    for idx, output in enumerate(
-        llm.generate_async(
-            prompts[0],
-            sampling_params=sampling_params,
-            streaming=True,
-            cache_salt=CacheSalter.get_salt(reuse_cache),
-        )
-    ):
-        if gather_context_logits:
-            assert output.context_logits is not None
-            # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
-            expected_len = len(prompts[0].split()) + 1
-            try:
-                assert expected_len == output.context_logits.shape[0]
-            except AssertionError:
-                # FIXME: Remove this once the bug has been fixed
-                if gather_context_logits and reuse_cache:
-                    pytest.xfail("Known bug: https://nvbugs/5577178")
-                raise
-        else:
-            assert output.context_logits is None
-
-        for sequence in output.outputs:
-            assert sequence.length == idx + 1
-
-            if gather_generation_logits:
-                gen_logits = sequence.generation_logits
-                assert gen_logits is not None
-                assert gen_logits.ndim == 2
-                assert gen_logits.shape[0] == 1
-                try:
-                    assert torch.argmax(gen_logits, dim=1).tolist()[0] == sequence.token_ids[-1]
-                except AssertionError:
-                    # FIXME: Remove xfail once the bug is fixed
-                    pytest.xfail("Known bug: https://nvbugs/5573238")
-            else:
-                assert sequence.generation_logits is None
-
-            if return_log_probs:
-                assert len(sequence.logprobs) == idx + 1
-            else:
-                assert len(sequence.logprobs) == 0
+    if async_generation:
+        for idx, output in enumerate(
+            llm.generate_async(
+                prompts[0],
+                sampling_params=sampling_params,
+                streaming=True,
+                cache_salt=CacheSalter.get_salt(reuse_cache),
+            )
+        ):
+            check_generated_output(
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
+                sampling_params=sampling_params,
+                reuse_cache=reuse_cache,
+                return_log_probs=return_log_probs,
+                idx=idx,
+                output=output,
+                streaming=True,
+            )
+        assert idx == sampling_params.max_tokens - 1
+    else:
+        for idx, output in enumerate(
+            llm.generate(
+                prompts,
+                sampling_params=sampling_params,
+                cache_salt=[CacheSalter.get_salt(reuse_cache) for _ in prompts],
+            )
+        ):
+            check_generated_output(
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
+                sampling_params=sampling_params,
+                reuse_cache=reuse_cache,
+                return_log_probs=return_log_probs,
+                idx=idx,
+                output=output,
+                streaming=False,
+            )
+        assert idx == len(prompts) - 1
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 1, 3], ids=["top_0", "top_1", "top_3"])
@@ -295,10 +249,10 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
                 assert len(token_logprobs) <= logprobs_k + 1, (
                     f"Token {token_idx}: Expected at most {logprobs_k + 1} logprobs, got {len(token_logprobs)}"
                 )
-                assert len(token_logprobs) >= 1
+                assert len(token_logprobs) >= max(logprobs_k, 1)
 
             sorted_tokens_by_prob = sorted(
-                token_logprobs.items(), key=lambda x: x[1].logprob, reverse=True
+                token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
             )
 
             if logprobs_k > 0:
@@ -328,6 +282,207 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
                     )
 
         print(f"{'=' * 80}\n")
+
+
+@pytest.mark.parametrize("logprobs_k", [0, 1, 3], ids=["top_0", "top_1", "top_3"])
+@pytest.mark.threadleak(enabled=False)
+def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LLM):
+    """Two scenarios:
+    - logprobs=0: Returns only sampled token (1 element)
+    - logprobs=K (K>0): Returns top-K tokens + sampled token if not in top-K (up to K+1 elements)
+    """
+
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        prompt_logprobs=logprobs_k,
+    )
+
+    for output in simple_llm.generate(["The future of AI is"], sampling_params=sampling_params):
+        print(f"\n{'=' * 80}")
+        print(f"Prompt text: {output.prompt!r}")
+        print(f"Prompt token IDs: {output.prompt_token_ids}")
+
+        logprobs = output.outputs[0].prompt_logprobs
+        token_ids = output.prompt_token_ids[1:] + output.outputs[0].token_ids[:1]
+
+        assert len(logprobs) == len(token_ids), (
+            f"Expected {len(token_ids)} logprob entries, got {len(logprobs)}"
+        )
+
+        for token_idx, (sampled_token_id, token_logprobs) in enumerate(zip(token_ids, logprobs)):
+            print(
+                f"\n  Token {token_idx}: "
+                f"ID={sampled_token_id}, "
+                f"Text={simple_llm.tokenizer.decode([sampled_token_id])!r}"
+            )
+
+            assert sampled_token_id in token_logprobs, (
+                f"Token {token_idx}: Sampled token ID {sampled_token_id} not in logprobs dict: {token_logprobs.keys()}"
+            )
+
+            if logprobs_k == 0:
+                assert len(token_logprobs) == 1, (
+                    f"Token {token_idx}: Expected 1 logprob (sampled only), got {len(token_logprobs)}"
+                )
+            else:
+                assert len(token_logprobs) <= logprobs_k + 1, (
+                    f"Token {token_idx}: Expected at most {logprobs_k + 1} logprobs, got {len(token_logprobs)}"
+                )
+                assert len(token_logprobs) >= 1
+
+            sorted_tokens_by_prob = sorted(
+                token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
+            )
+
+            if logprobs_k > 0:
+                sampled_token_rank = token_logprobs[sampled_token_id].rank
+                sampled_in_topk = sampled_token_rank <= logprobs_k
+
+                if not sampled_in_topk:
+                    assert sorted_tokens_by_prob[-1][0] == sampled_token_id, (
+                        f"Token {token_idx}: Sampled token (ID={sampled_token_id}, rank={sampled_token_rank}) "
+                        f"not in top-{logprobs_k}, should be last in sorted list, "
+                        f"but last token is ID={sorted_tokens_by_prob[-1][0]}"
+                    )
+
+        print(f"{'=' * 80}\n")
+
+
+@pytest.mark.parametrize("logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
+@pytest.mark.parametrize("prompt_logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
+@pytest.mark.threadleak(enabled=False)
+def test_logprobs_against_logits(
+    logprobs_k: int | None, prompt_logprobs_k: int | None, simple_llm: LLM
+):
+    """
+    Test combination of logprobs and prompt_logprobs against manually calculated log probabilities from logits
+    """
+
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        logprobs=logprobs_k,
+        prompt_logprobs=prompt_logprobs_k,
+        return_generation_logits=True,
+        return_context_logits=True,
+    )
+
+    def check_logprobs(
+        num_logprobs: int,
+        tokens: list[int],
+        logprobs: TokenLogprobs,
+        logits_cuda: torch.Tensor,
+        case_str: str,
+        logprobs_offset: int = 0,
+    ):
+        """Checks if the provided logprobs match the logprobs calculated from the logits"""
+        expected_logprobs = torch.nn.functional.log_softmax(logits_cuda, dim=-1).to(device="cpu")
+        sorted_expected_logprobs = torch.sort(expected_logprobs, descending=True, dim=-1)[0]
+        for generation_idx, token_logprobs in enumerate(logprobs):
+            assert len(token_logprobs) <= num_logprobs + 1, "too many logprobs provided"
+            assert len(token_logprobs) >= num_logprobs, "not enough logprobs provided"
+            expected_logprobs_per_token = expected_logprobs[generation_idx]
+            sorted_expected_logprobs_per_token = sorted_expected_logprobs[generation_idx]
+            # For each rank store the corresponding logprob to ensure that shared ranks have the same logprob
+            processed_ranks_and_logprobs: dict[int, float] = {}
+            for token_id, logprob_obj in token_logprobs.items():
+                # the sampled token may have any rank > 0
+                if token_id != tokens[generation_idx + logprobs_offset]:
+                    # All other tokens should have a rank <= num_logprobs
+                    assert logprob_obj.rank <= num_logprobs, (
+                        f"{case_str} logprob rank is greater than {num_logprobs}"
+                    )
+                assert logprob_obj.rank >= 1, f"{case_str} logprob rank is smaller than 1"
+
+                # Shared ranks should not exist
+                assert logprob_obj.rank not in processed_ranks_and_logprobs, (
+                    f"Found shared rank {logprob_obj.rank} with logprob {logprob_obj.logprob}"
+                )
+                processed_ranks_and_logprobs[logprob_obj.rank] = logprob_obj.logprob
+
+                # Check if the logprob matches the top-rank logprob from the logits
+                torch.testing.assert_close(
+                    torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                    torch.tensor(
+                        sorted_expected_logprobs_per_token[logprob_obj.rank - 1],
+                        dtype=torch.float32,
+                    ),
+                    msg=f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
+                        {sorted_expected_logprobs_per_token[logprob_obj.rank - 1]} at rank {logprob_obj.rank}",
+                )
+                # Check if the logprob matches the token-id logprob from the logits
+                torch.testing.assert_close(
+                    torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                    torch.tensor(expected_logprobs_per_token[token_id], dtype=torch.float32),
+                    msg=f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
+                        {expected_logprobs_per_token[token_id]} for token {token_id}",
+                )
+
+    for output in simple_llm.generate(["The future of AI is"], sampling_params=sampling_params):
+        if logprobs_k is not None:
+            generation_tokens = output.outputs[0].token_ids
+            generation_logprobs = output.outputs[0].logprobs
+            generation_logits = output.outputs[0].generation_logits.to(device="cuda")
+            check_logprobs(
+                logprobs_k,
+                generation_tokens,
+                generation_logprobs,
+                generation_logits,
+                "generation",
+                logprobs_offset=0,
+            )
+        if prompt_logprobs_k is not None:
+            context_tokens = output.prompt_token_ids + output.outputs[0].token_ids[:1]
+            context_logprobs = output.outputs[0].prompt_logprobs
+            context_logits = output.context_logits.to(device="cuda")
+            check_logprobs(
+                prompt_logprobs_k,
+                context_tokens,
+                context_logprobs,
+                context_logits,
+                "context",
+                logprobs_offset=1,  # Prompt logprobs are offset by 1 relative to the prompt token ids
+            )
+        # The last context logprob dict and the first generation logprob dict should agree on
+        # the top-n entries (n = min(prompt_logprobs_k, logprobs_k)) and the sampled token's logprob.
+        if prompt_logprobs_k is not None and logprobs_k is not None:
+            last_context_logprob = context_logprobs[-1]
+            first_generation_logprob = generation_logprobs[0]
+            less_prompt_logprobs = prompt_logprobs_k <= logprobs_k
+            expected = last_context_logprob if less_prompt_logprobs else first_generation_logprob
+            compare = first_generation_logprob if less_prompt_logprobs else last_context_logprob
+            sampled_token_id = generation_tokens[0]
+            assert sampled_token_id in last_context_logprob, (
+                f"Sampled token {sampled_token_id} is not a valid key in the last entry "
+                f"of the context logprob dict: {list(last_context_logprob.keys())}"
+            )
+            assert sampled_token_id in first_generation_logprob, (
+                f"Sampled token {sampled_token_id} is not a valid key in the first entry "
+                f"of the generation logprob dict: {list(first_generation_logprob.keys())}"
+            )
+            torch.testing.assert_close(
+                last_context_logprob[sampled_token_id].logprob,
+                first_generation_logprob[sampled_token_id].logprob,
+                msg=(
+                    f"logprob {last_context_logprob[sampled_token_id].logprob} in the last "
+                    f"entry of the context logprob dict does not match the corresponding "
+                    f"logprob {first_generation_logprob[sampled_token_id].logprob} in the "
+                    f"first entry of the generation logprob dict for token {sampled_token_id}"
+                ),
+            )
+            for token_id, logprob_obj in expected.items():
+                assert token_id in compare, (
+                    f"Token {token_id} is not a valid key in the other dict: {list(compare.keys())}"
+                )
+                expected_logprob = logprob_obj.logprob
+                compare_logprob = compare[token_id].logprob
+                torch.testing.assert_close(
+                    expected_logprob,
+                    compare_logprob,
+                    msg=(
+                        f"logprob {expected_logprob} does not match the corresponding "
+                        f"logprob {compare_logprob} in the other dict for token {token_id}"
+                    ),
+                )
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
@@ -403,11 +558,25 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int, simple_llm:
             expected_logprobs = torch.nn.functional.log_softmax(logits_for_token, dim=-1).to(
                 device="cpu"
             )
-            expected_logprob = expected_logprobs[sampled_token_id].item()
+            expected_logprob = expected_logprobs[sampled_token_id]
             print(
-                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
+                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, "
+                f"expected={expected_logprob.item():.6f}"
             )
-            torch.testing.assert_close(returned_logprob, expected_logprob)
+            torch.testing.assert_close(
+                torch.tensor(returned_logprob, dtype=torch.float32),
+                expected_logprob,
+            )
+
+
+@pytest.mark.parametrize("logprobs_k", [-5], ids=["invalid_negative_value"])
+@pytest.mark.threadleak(enabled=False)
+def test_invalid_logprobs(logprobs_k: int):
+    """Test invalid logprobs values"""
+    with pytest.raises(ValueError):
+        SamplingParams(logprobs=logprobs_k)
+    with pytest.raises(ValueError):
+        SamplingParams(prompt_logprobs=logprobs_k)
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
@@ -529,13 +698,16 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                 adjusted_logits_for_token, dim=-1
             ).to(device="cpu")
             for logprob_token, logprob_values in token_logprobs_dict.items():
-                expected_logprob = expected_logprobs[logprob_token].item()
+                expected_logprob = expected_logprobs[logprob_token]
                 returned_logprob = logprob_values.logprob
                 print(
                     f"Req {req_idx}, Token {token_idx}: "
-                    f"returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
+                    f"returned={returned_logprob:.6f}, expected={expected_logprob.item():.6f}"
                 )
-                torch.testing.assert_close(returned_logprob, expected_logprob)
+                torch.testing.assert_close(
+                    torch.tensor(returned_logprob, dtype=torch.float32),
+                    expected_logprob,
+                )
 
 
 @force_ampere

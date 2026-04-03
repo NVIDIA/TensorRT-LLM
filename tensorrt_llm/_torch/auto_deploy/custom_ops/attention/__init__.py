@@ -19,9 +19,10 @@ This module provides various attention implementations and backends:
 - torch_attention: PyTorch reference implementations
 - torch_backend_attention: PyTorch-based attention backend
 - flashinfer_attention: FlashInfer-based optimized attention
+- trtllm_attention: TRT-LLM thop.attention-based optimized attention
 - triton_attention: Triton-based attention implementations
 - triton_attention_with_kv_cache: Triton attention with KV cache support
-- triton_attention_with_paged_kv_cache: Triton attention with paged KV cache
+- triton_paged_attention: Triton paged attention (two-stage flash-decode) with HND layout
 - onnx_attention: Placeholder ops for ONNX export of attention mechanisms
 """
 
@@ -29,8 +30,10 @@ __all__ = [
     "torch_attention",
     "torch_backend_attention",
     "flashinfer_attention",
+    "trtllm_attention",
     "triton_attention",
     "triton_attention_with_kv_cache",
     "triton_attention_with_paged_kv_cache",
+    "triton_paged_attention",
     "onnx_attention",
 ]

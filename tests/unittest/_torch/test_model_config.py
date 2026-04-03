@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 def make_pretrained_config(
@@ -71,20 +73,46 @@ def test_get_bindings_model_config_attention_dp_attn_tp_override(
     # bindings hidden_size is sharded by attn_tp_size and attn_cp_size.
     attn_tp_size = mapping.attn_tp_size if not mapping.enable_attention_dp else 1
     attn_cp_size = mapping.attn_cp_size
-    assert bindings_cfg.num_heads == cfg.num_attention_heads // (attn_tp_size * attn_cp_size)
+
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    assert bindings_cfg.num_heads == ceil_div(cfg.num_attention_heads, attn_tp_size * attn_cp_size)
     # bindings hidden_size is sharded by attn_tp_size.
-    assert bindings_cfg.hidden_size == cfg.hidden_size // attn_tp_size
+    assert bindings_cfg.hidden_size == ceil_div(cfg.hidden_size, attn_tp_size)
     if isinstance(cfg.num_key_value_heads, (list, tuple)):
         expected_num_kv_heads_per_layer = [
-            kv // (attn_tp_size * attn_cp_size) for kv in cfg.num_key_value_heads
+            ceil_div(kv, attn_tp_size * attn_cp_size) for kv in cfg.num_key_value_heads
         ]
         assert list(bindings_cfg.num_kv_heads_per_layer) == expected_num_kv_heads_per_layer
         assert bindings_cfg.num_kv_heads(0) == expected_num_kv_heads_per_layer[0]
     else:
-        assert bindings_cfg.num_kv_heads(0) == cfg.num_key_value_heads // (
-            attn_tp_size * attn_cp_size
+        assert bindings_cfg.num_kv_heads(0) == ceil_div(
+            cfg.num_key_value_heads, attn_tp_size * attn_cp_size
         )
 
     # tp_size-dependent value (uses mapping.tp_size, not attn_tp_size).
-    assert bindings_cfg.mlp_hidden_size == (cfg.intermediate_size // mapping.tp_size)
+    assert bindings_cfg.mlp_hidden_size == ceil_div(cfg.intermediate_size, mapping.tp_size)
     assert bindings_cfg.tokens_per_block == tokens_per_block
+
+
+def _make_model_config_with_kv_quant(kv_cache_quant_algo):
+    return ModelConfig(quant_config=QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo))
+
+
+def test_validate_and_set_kv_cache_quant_auto_uses_checkpoint():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "auto")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "nvfp4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    with pytest.raises(ValueError, match="Accepted types are"):
+        validate_and_set_kv_cache_quant(model_config, "invalid_dtype")

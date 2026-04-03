@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 from ._eviction_controller import NodeRef
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
-from ._storage._core import PoolIndex0, Slot
+from ._storage._core import Slot
 from ._utils import (
     CachedCudaEvent,
     assert_critical,
@@ -394,9 +394,6 @@ class _SharedPageLock:
             beam_index, ordinal, life_cycle, PageIndex(self.page.slot_id)
         )
         assert old_base_index == BAD_PAGE_INDEX
-        new_index = self._get_page_index()
-        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
-        assert old_index == BAD_PAGE_INDEX
 
     def __del__(self) -> None:
         if self._uniq_lock is not None:
@@ -415,16 +412,8 @@ class _SharedPageLock:
             beam_index, ordinal, life_cycle, new_index
         )
         assert NDEBUG or old_base_index == self._get_base_page_index()
-        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
-        assert NDEBUG or old_index == self._get_page_index()
         self._uniq_lock = None
         return page
-
-    def _get_page_index(self) -> PageIndex:
-        storage = unwrap_rawref(self._user.kv_cache).manager._storage
-        user = self._user
-        num_buffers_per_slot = storage._slot_to_page_indices[user.life_cycle][PoolIndex0]
-        return PageIndex(self.page.slot_id * num_buffers_per_slot)
 
     def _get_base_page_index(self) -> PageIndex:
         return PageIndex(self.page.slot_id)
@@ -448,18 +437,17 @@ def batched_lock_to_gpu(
     assert not tasks or storage is get_uniform_attribute(tasks, lambda p: p.page.manager)
     requirements = filled_list(0, storage.num_pool_groups)
     scheduled_for_eviction = [t.page.scheduled_for_eviction for t in tasks]
+    lc2pg = storage._life_cycle_grouping
     for t, e in zip(tasks, scheduled_for_eviction):
         if e:
             storage.exclude_from_eviction(t.page)
         if t.page.cache_level == GPU_LEVEL:
             continue
-        requirements[storage.get_pool_group_index(t.life_cycle)] += 1
+        requirements[lc2pg[t.life_cycle]] += 1
 
     try:
         storage.prepare_free_slots(GPU_LEVEL, requirements)
-        partitioned = partition(
-            tasks, lambda p: (p.page.cache_level, storage.get_pool_group_index(p.life_cycle))
-        )
+        partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue

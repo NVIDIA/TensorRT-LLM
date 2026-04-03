@@ -24,6 +24,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 
 def main():
+    """CLI entry point for exporting HuggingFace models to ONNX format."""
     parser = argparse.ArgumentParser(
         description="Export HuggingFace model to ONNX format using AutoDeploy."
     )
@@ -69,6 +70,7 @@ def main():
     ad_config.attn_backend = "torch"
     if args.output_dir is not None:
         ad_config.transforms["export_to_onnx"]["output_dir"] = args.output_dir
+        ad_config.transforms["rewrite_embedding_to_inputs_embeds"]["output_dir"] = args.output_dir
 
     # Use direct InferenceOptimizer instead of LLM to avoid executor initialization
     export_onnx(ad_config)

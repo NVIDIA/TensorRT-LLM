@@ -23,9 +23,10 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_qwen3_hybrid_layer_masks,
     is_mla,
     is_nemotron_hybrid,
-    is_qwen3_next,
+    is_qwen3_hybrid,
     load_pretrained_config,
 )
 from tensorrt_llm._torch.pyexecutor.model_loader import (
@@ -648,12 +649,11 @@ class Runner:
         )
         kwargs = {}
 
-        if is_nemotron_hybrid(pretrained_config) or is_qwen3_next(pretrained_config):
-            # Please refer to `tensorrt_llm/_torch/models/modeling_qwen3_next.py` for the magic number chunk_size=128
+        if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
             mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests,
                 chunk_size=128
-                if is_qwen3_next(pretrained_config)
+                if is_qwen3_hybrid(pretrained_config)
                 else pretrained_config.chunk_size,
             )
             mamba_metadata.prepare(attn_metadata)
@@ -776,12 +776,12 @@ class Runner:
             assert tokens_per_block == 64
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
-        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config)
         config = model_config.pretrained_config
         kv_cache_config = KvCacheConfig(
             max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
             enable_block_reuse=False,
         )
+        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
             "FP8": tensorrt_llm.bindings.DataType.FP8,
             "NVFP4": tensorrt_llm.bindings.DataType.NVFP4,
@@ -842,17 +842,13 @@ class Runner:
                 dtype=kv_cache_dtype,
                 spec_config=None,
             )
-        elif is_qwen3_next(config):
-            mamba_layer_mask = [
-                i in layer_indices
-                if i % config.full_attention_interval != config.full_attention_interval - 1
-                else False
-                for i in range(config.num_hidden_layers)
-            ]
+        elif is_qwen3_hybrid(config):
+            full_layer_mask, full_mamba_layer_mask = get_qwen3_hybrid_layer_masks(config)
             layer_mask = [
-                False
-                if i % config.full_attention_interval != config.full_attention_interval - 1
-                else i in layer_indices
+                full_layer_mask[i] and i in layer_indices for i in range(config.num_hidden_layers)
+            ]
+            mamba_layer_mask = [
+                full_mamba_layer_mask[i] and i in layer_indices
                 for i in range(config.num_hidden_layers)
             ]
             num_mamba_layers = sum(mamba_layer_mask)

@@ -227,19 +227,23 @@ def _clear_video_store():
 
 @pytest.fixture(autouse=True)
 def _mock_video_encoding():
-    """Mock MP4 encoding to avoid PyAV dependency in unit tests.
+    """Mock video encoding to avoid ffmpeg dependency in unit tests.
 
-    Replaces MediaStorage._save_mp4 with a stub that writes a small
-    dummy file so FileResponse can serve it.
+    Replaces MediaStorage._save_encoded_video with a stub that writes a small
+    dummy file so FileResponse can serve it. Also mocks ffmpeg availability
+    so resolve_video_format always resolves to mp4.
     """
 
-    def _dummy_save_mp4(video, audio, output_path, frame_rate):
+    def _dummy_save_encoded_video(video, audio, output_path, frame_rate):
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
         with open(str(output_path), "wb") as f:
             f.write(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 32)
         return str(output_path)
 
-    with patch.object(MediaStorage, "_save_mp4", staticmethod(_dummy_save_mp4)):
+    with (
+        patch.object(MediaStorage, "_save_encoded_video", staticmethod(_dummy_save_encoded_video)),
+        patch("tensorrt_llm.serve.media_storage._check_ffmpeg_available", return_value=True),
+    ):
         yield
 
 
@@ -874,3 +878,40 @@ class TestDeleteVideo:
         resp = video_client.get("/v1/videos")
         assert resp.status_code == 200
         assert resp.json()["data"] == []
+
+
+# =========================================================================
+# Test video generation failure handling (async)
+# =========================================================================
+
+
+class TestAsyncVideoFailureHandling:
+    def test_async_video_null_output_updates_job_status(self, tmp_path):
+        """When output.video is None in async generation, job status should be set to failed."""
+        import time
+
+        gen = MockVisualGen(video_output=None)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        # Create async video job
+        create_resp = client.post(
+            "/v1/videos",
+            json={"prompt": "null video", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert create_resp.status_code == 202
+        video_id = create_resp.json()["id"]
+
+        # Wait briefly for background task to complete
+        time.sleep(0.5)
+
+        # Check job status
+        resp = client.get(f"/v1/videos/{video_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "failed"
+        assert "error" in data
+        assert "output.video is None" in data["error"]
+
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)

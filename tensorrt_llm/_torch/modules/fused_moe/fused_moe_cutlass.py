@@ -22,7 +22,8 @@ from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
     INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
     W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
@@ -76,14 +77,17 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("min", 89),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # FP8_BLOCK_SCALES: SM == 90 only
+        # FP8_BLOCK_SCALES: SM in {90, 120}
         QuantAlgo.FP8_BLOCK_SCALES: {
-            "sm_constraint": ("exact", 90),
-            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+            "sm_constraint": ("in", {90, 120}),
+            "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103}
+        # NVFP4: SM in {100, 103, 120, 121}
+        # SM 120 = desktop Blackwell (e.g. RTX 5090 / GB202)
+        # SM 121 = GB10 / DGX Spark
+        # C++ kernel: isValidSM120MOESpecialisation() supports FP4xFP4 and FP8xFP4
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A8_AWQ: SM in {89, 90} only
@@ -113,15 +117,15 @@ class CutlassFusedMoE(MoE):
         },
     }
 
-    # Quantization algorithms that support gptoss_style
     _GPTOSS_SUPPORTED_ALGOS = {QuantAlgo.W4A8_MXFP4_MXFP8}
+    """set[QuantAlgo]: Quantization algorithms that support swiglu_gptoss_style."""
 
     @classmethod
     def can_implement(
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if CutlassFusedMoE can implement the given quantization algorithm.
@@ -129,8 +133,8 @@ class CutlassFusedMoE(MoE):
         CutlassFusedMoE supports:
         - Unquantized (FP16/BF16): SM >= 80
         - FP8 per-tensor (QDQ): SM >= 89
-        - FP8_BLOCK_SCALES: SM == 90 only
-        - NVFP4: SM in {100, 103}
+        - FP8_BLOCK_SCALES: SM in {90, 120}
+        - NVFP4: SM in {100, 103, 120, 121}
         - W4A8_AWQ: SM in {89, 90} only
         - W8A16: SM >= 80
         - W4A16_MXFP4: SM == 90 only
@@ -145,8 +149,8 @@ class CutlassFusedMoE(MoE):
                 - FP8/FP8_BLOCK_SCALES/W4A8_MXFP4_FP8: float16, bfloat16, float32
                 - NVFP4: float16, bfloat16, float8_e4m3fn
                 - W4A16_MXFP4/W4A8_AWQ/W8A16/W4A8_MXFP4_MXFP8: float16, bfloat16
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CutlassFusedMoE only supports gptoss_style for W4A8_MXFP4_MXFP8 quantization.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CutlassFusedMoE only supports swiglu_gptoss_style for W4A8_MXFP4_MXFP8 quantization.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -160,10 +164,10 @@ class CutlassFusedMoE(MoE):
             return _warn_and_return(
                 f"CutlassFusedMoE requires SM >= 80, got SM{sm_version}")
 
-        # Check gptoss_style support
-        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+        # Check swiglu_gptoss_style support
+        if swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
             return _warn_and_return(
-                f"CutlassFusedMoE gptoss_style only supports W4A8_MXFP4_MXFP8 "
+                f"CutlassFusedMoE swiglu_gptoss_style only supports W4A8_MXFP4_MXFP8 "
                 f"(got quant_algo={quant_algo})")
 
         # Check if quant_algo is supported
@@ -454,8 +458,9 @@ class CutlassFusedMoE(MoE):
                 # No quantization needed here, handled in kernel
                 pass
             elif self.has_w4a16_mxfp4:
-                pad_size = self.hidden_size - x.shape[1]
-                x = torch.nn.functional.pad(x, (0, pad_size))
+                # Padding deferred to run_moe so that dispatch sends
+                # unpadded tensors (avoids NVLink workspace overallocation).
+                pass
             elif self.has_int8_woq_per_channel:
                 # No quantization needed here, handled in kernel
                 pass
@@ -514,7 +519,10 @@ class CutlassFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                if get_sm_version() == 120:
+                    return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+                else:
+                    return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
@@ -583,6 +591,14 @@ class CutlassFusedMoE(MoE):
         Returns:
             final_hidden_states: Output tensor from MoE computation
         """
+        # Pad input for mxfp4 alignment (128-aligned hidden_size).
+        # Done here rather than in quantize_input so that dispatch sends
+        # unpadded tensors and avoids NVLink workspace overallocation.
+        if self.has_w4a16_mxfp4:
+            pad_size = self.hidden_size - x.shape[-1]
+            if pad_size > 0:
+                x = torch.nn.functional.pad(x, (0, pad_size))
+
         # Determine weight dtype based on quantization mode
         weight_dtype = self.w3_w1_weight.dtype
         if self.has_any_quant:

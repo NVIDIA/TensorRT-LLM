@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,9 +76,6 @@ def cached_residual_add_fake(
 class DetectHiddenStatesForCaptureConfig(TransformConfig):
     """Configuration for the hidden states detection transform."""
 
-    # Whether to capture hidden states at all. If False we will not capture any layers.
-    capture_hidden_states: bool = False
-
     # TODO: figure out how to get layers to capture.
     # We should consider if we can use the layer indices stored in eagle checkpoints, e.g.
     # https://huggingface.co/nvidia/gpt-oss-120b-Eagle3/blob/main/config.json#L9-L14
@@ -153,15 +150,23 @@ class DetectHiddenStatesForCapture(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        if not self.config.capture_hidden_states:
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+        """Apply the hidden states capture transform to a single graph module.
 
+        Returns:
+            The transformed graph module and transform info.
+        """
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Skip if already processed
         if gm.graph.find_nodes(
             op="call_function", target=torch.ops.auto_deploy.residual_add_for_capture.default
         ):
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         residual_add_nodes = self.collect_residual_add_nodes(gm)
 
@@ -169,16 +174,20 @@ class DetectHiddenStatesForCapture(BaseTransform):
             num_hidden_layers = len(residual_add_nodes)
             self.config.set_default_eagle3_layers_to_capture(num_hidden_layers)
 
-        residual_add_nodes = {
-            k: v for k, v in residual_add_nodes.items() if k in self.config.eagle3_layers_to_capture
-        }
+        layers_to_capture = self.config.eagle3_layers_to_capture.copy()
+        if -1 in layers_to_capture:
+            num_hidden_layers = len(residual_add_nodes)
+            layers_to_capture.remove(-1)
+            layers_to_capture.add(num_hidden_layers - 1)
 
-        assert residual_add_nodes.keys() == self.config.eagle3_layers_to_capture, (
-            f"Unable to find residual add nodes for layers. Expected: {self.config.eagle3_layers_to_capture}, \
-            Found: {residual_add_nodes.keys()}"
+        residual_add_nodes = {k: v for k, v in residual_add_nodes.items() if k in layers_to_capture}
+
+        assert residual_add_nodes.keys() == layers_to_capture, (
+            f"Unable to find residual add nodes for layers. "
+            f"Expected: {layers_to_capture}, Found: {residual_add_nodes.keys()}"
         )
 
-        # replace residual add nodes with special placeholder nodes
+        # Replace residual add nodes with special placeholder nodes
         for layer_number, res_node in residual_add_nodes.items():
             with gm.graph.inserting_before(res_node):
                 new_node = gm.graph.call_function(
@@ -190,10 +199,9 @@ class DetectHiddenStatesForCapture(BaseTransform):
             gm.graph.erase_node(res_node)
 
         cnt = len(residual_add_nodes)
-        info = TransformInfo(
+        return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=(cnt == 0), has_valid_shapes=(cnt == 0)
         )
-        return gm, info
 
 
 class HiddenStatesResourceHandler(ResourceHandler):
@@ -233,12 +241,12 @@ class CachedResidualAdd(AttentionDescriptor):
         return torch.ops.auto_deploy.residual_add_for_capture
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return torch.ops.auto_deploy.cached_residual_add
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         hidden_size = source_attn_node.meta["val"].shape[-1]
         hidden_type = source_attn_node.meta["val"].dtype

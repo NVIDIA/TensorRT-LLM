@@ -207,14 +207,67 @@ ${SERDES_LIBRARY}
 
 For source packages that have a compatible cmake (e.g. where add\_subdirectory
 will work correctly), please use [FetchContent][12] to download the sources and
-integrate them into the build. Please add new invocations of
-FetchContent\_Declare in [3rdparty/CMakeLists.txt][13]. Add new invocations for
-FetchContent\_MakeAvailable wherever it makes sense in the build where you are
-integrating it, but prefer the root listfile for that build
-([cpp/CMakeLists.txt][14] for the primary build).
+integrate them into the build.
 
-CODEOWNERS for this file will consist of PLC reviewers who verify that
+**To add a new FetchContent dependency**, add an entry to
+[3rdparty/fetch\_content.json][13]. This JSON file is the single source of truth
+for all FetchContent dependencies - `3rdparty/CMakeLists.txt` reads from this file to
+generate `FetchContent_Declare` calls automatically.
+
+Then add an invocation of `FetchContent_MakeAvailable` wherever it makes sense
+in the build where you are integrating it, but prefer the root listfile for that
+build ([cpp/CMakeLists.txt][14] for the primary build).
+
+CODEOWNERS for fetch\_content.json will consist of PLC reviewers who verify that
 third-party license compliance strategies are being followed.
+
+#### fetch\_content.json Schema
+
+fetch_content.json is a JSON object with two top-level keys: schema_version and dependencies. This section describes schema version 1. When the schema is changed, please increment the schema version.
+
+Each dependency in the `dependencies` array supports the following fields:
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `name` | Yes | string | The FetchContent name (used for `FetchContent_MakeAvailable`) |
+| `git_repository` | Yes | string | Git repository URL. Use `${github_base_url}` for GitHub repos that should respect the `GITHUB_MIRROR` environment variable. |
+| `git_tag` | Yes | string | Git tag, branch, or commit SHA to fetch |
+| `git_shallow` | No | boolean | If true, performs a shallow clone (default: false) |
+| `git_submodules_recurse` | No | boolean | If true, recursively fetches submodules (default: false) |
+| `source_subdir` | No | string | Subdirectory to use as source root. Set to `"dont-add-this-project-with-add-subdirectory"` to prevent automatic `add_subdirectory`. |
+| `use_url` | No | boolean | If true, fetches as a tarball URL instead of git clone (constructs URL as `{git_repository}/archive/{git_tag}.tar.gz`) |
+
+**Example entry:**
+
+3rdparty/fetch\_content.json
+
+```json
+{
+  "name": "pybind11",
+  "git_repository": "https://github.com/pybind/pybind11",
+  "git_tag": "f99ffd7e03001810a3e722bf48ad1a9e08415d7d"
+}
+```
+
+cpp/CMakeLists.txt
+
+```cmake
+FetchContent_MakeAvailable(pybind11)
+```
+
+**Example with all optional fields:**
+
+```json
+{
+  "name": "cutlass",
+  "git_repository": "https://github.com/NVIDIA/cutlass",
+  "git_tag": "v4.3.0",
+  "git_shallow": true,
+  "source_subdir": "dont-add-this-project-with-add-subdirectory"
+}
+```
+
+#### Modified Sources
 
 If the dependency you are adding has modified sources, please do the
 following:
@@ -237,27 +290,10 @@ following:
     build process.
 
 [12]: https://cmake.org/cmake/help/latest/module/FetchContent.html
-[13]: https://github.com/NVIDIA/TensorRT-LLM/tree/main//3rdparty/CMakeLists.txt?ref_type=heads
+[13]: https://github.com/NVIDIA/TensorRT-LLM/blob/main/3rdparty/fetch_content.json
 [14]: https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/CMakeLists.txt
 [15]: https://cmake.org/cmake/help/latest/module/ExternalProject.html#patch-step-options
 
-**Example:**
-
-3rdparty/CMakeLists.txt
-
-```.cmake
-FetchContent_Declare(
-  pybind11
-  GIT_REPOSITORY https://github.com/pybind/pybind11.git
-  GIT_TAG        f99ffd7e03001810a3e722bf48ad1a9e08415d7d
-)
-```
-
-cpp/CmakeLists.txt
-
-```.cmake
-FetchContent_MakeAvailable(pybind11)
-```
 
 ### ExternalProject
 

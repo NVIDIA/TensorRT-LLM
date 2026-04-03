@@ -175,8 +175,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     }
     def nodeLabelPrefix = "cpu"
     def jobName = "llm-build-images"
-    def buildID = env.BUILD_ID
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
+    def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix, jobName)
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -272,7 +271,7 @@ def buildImage(config, imageKeyToTag)
     stage (config.stageName) {
         // Step 1: Clone TRT-LLM source codes
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
-        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, false, true)
     }
 
     // Step 2: Build the images
@@ -307,6 +306,8 @@ def buildImage(config, imageKeyToTag)
 
         if (target == "rockylinux8") {
             BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        } else if (target =~ /^ubuntu\d+$/) {
+            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^${target}_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
 
         // Replace the base image and triton image with the internal mirror
@@ -450,6 +451,12 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         ],
         "Build CI Image (RockyLinux8 Python312)": [
             target: "rockylinux8",
+            args: "PYTHON_VERSION=3.12.3",
+            postTag: "-py312",
+        ],
+        "Build CI Image (SBSA Ubuntu24.04 Python312)": [
+            arch: "arm64",
+            target: "ubuntu24",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],

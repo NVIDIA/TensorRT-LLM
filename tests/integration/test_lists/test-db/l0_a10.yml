@@ -20,13 +20,18 @@ l0_a10:
   - unittest/_torch/test_model_config.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
+  - unittest/_torch/modeling/test_modeling_cohere2.py
+  - unittest/_torch/modeling/test_nemotron_nano_preprocessing.py
+  - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
+  - unittest/_torch/executor/test_kv_cache_estimation.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
+  - unittest/others/test_convert_utils.py
   - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
@@ -39,11 +44,10 @@ l0_a10:
   - unittest/disaggregated/test_disagg_cluster_manager_worker.py
   - unittest/disaggregated/test_cluster_storage.py
   - unittest/disaggregated/test_extractor.py
-  - unittest/disaggregated/test_extractor_v2.py
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/region/test_block.py
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
@@ -52,6 +56,7 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
@@ -79,6 +84,8 @@ l0_a10:
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
+  # visual_gen
+  - unittest/_torch/visual_gen/test_media_storage.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py
@@ -86,7 +93,9 @@ l0_a10:
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
+  - unittest/llmapi/test_request_priority.py
   # executor
   - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
@@ -107,6 +116,9 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[False]
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[True]
   - llmapi/test_llm_api_connector.py::test_connector_multi_request
+  - llmapi/test_llm_api_connector.py::test_connector_priorities
+  - llmapi/test_llm_api_connector.py::test_connector_priorities_default
+  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules
@@ -174,20 +186,6 @@ l0_a10:
   - unittest/bindings
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
-  - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
-  - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
-  - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins
-  - accuracy/test_cli_flow.py::TestGpt2::test_variable_beam_width_search # 1 mins
-  - accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
-  - accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph # 1 min
-  - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
-  - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
-  - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=False-chunked_context=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=True] # 5 mins
-  - accuracy/test_cli_flow.py::TestLlama2_7B::test_auto_dtype
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
@@ -224,14 +222,6 @@ l0_a10:
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-disable_gemm_plugin] # 3 mins
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-disable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-disable_gemm_plugin] # 4 mins
-  - accuracy/test_cli_flow.py::TestGpt2::test_context_fmha_disabled # 1 min
-  - accuracy/test_cli_flow.py::TestLlama7B::test_auto_dtype # 2 mins
-  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache
-  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
-  - accuracy/test_cli_flow.py::TestGpt2::test_attention_ootb
-  - accuracy/test_cli_flow.py::TestStarcoder2_3B::test_auto_dtype
-  - accuracy/test_cli_flow.py::TestPhi2::test_auto_dtype # 2 mins
-  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-enable_gemm_plugin] # 2 mins
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
   - llmapi/test_llm_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min

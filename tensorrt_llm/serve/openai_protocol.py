@@ -118,6 +118,8 @@ class ResponseFormat(OpenAIBaseModel):
 class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
     first_gen_tokens: Optional[List[int]] = None
+    first_gen_log_probs: Optional[List] = None
+    first_gen_logits: Optional[List] = None
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
@@ -218,8 +220,12 @@ def _response_format_to_guided_decoding_params(
             raise ValueError(
                 f"response_format.json_schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        guided_decoding_params = GuidedDecodingParams(
-            json=response_format.json_schema)
+        # OpenAI API spec wraps the actual JSON schema under a "schema" key.
+        # Extract the actual schema if the wrapper format is used.
+        json_schema = response_format.json_schema
+        if isinstance(json_schema, dict) and "schema" in json_schema:
+            json_schema = json_schema["schema"]
+        guided_decoding_params = GuidedDecodingParams(json=json_schema)
     elif response_format.type == "json_object":
         guided_decoding_params = GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
@@ -502,7 +508,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    top_logprobs: List[ChatCompletionLogProb] = None
+    top_logprobs: Optional[List[ChatCompletionLogProb]] = None
 
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
@@ -541,6 +547,9 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     """Assistant message that includes reasoning tokens."""
     reasoning: Optional[str]
+    # NOTE: some older benchmarks and chat templates assume the below, which has been deprecated
+    # in other inference frameworks in favor of the above `reasoning` field.
+    reasoning_content: Optional[str]
 
 
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
@@ -609,6 +618,7 @@ class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -1086,6 +1096,94 @@ def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
     return base64.b64decode(encoded_opaque_state)
 
 
+def _serialize_first_gen_log_probs(
+    first_gen_log_probs: Optional[list], ) -> Optional[List]:
+    """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
+    if first_gen_log_probs is None:
+        return None
+    if not isinstance(first_gen_log_probs, list):
+        raise ValueError("first_gen_log_probs must be a list")
+    result = []
+    for i, pos in enumerate(first_gen_log_probs):
+        if not isinstance(pos, dict):
+            raise ValueError(
+                f"first_gen_log_probs[{i}] must be a dict, got {type(pos)}")
+        result.append([{
+            "token_id": tid,
+            "logprob": lp.logprob,
+            "rank": lp.rank
+        } for tid, lp in pos.items()])
+    return result
+
+
+def _deserialize_first_gen_log_probs(
+    serialized: Optional[List], ) -> Optional[list]:
+    """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
+    if serialized is None:
+        return None
+    from tensorrt_llm.executor.result import Logprob
+    result = []
+    for i, pos in enumerate(serialized):
+        if not isinstance(pos, list):
+            raise ValueError(
+                f"first_gen_log_probs[{i}] must be a list, got {type(pos)}")
+        token_map = {}
+        for j, item in enumerate(pos):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"first_gen_log_probs[{i}][{j}] must be a dict")
+            if "token_id" not in item or "logprob" not in item:
+                raise ValueError(
+                    f"first_gen_log_probs[{i}][{j}] missing required keys "
+                    "'token_id' and/or 'logprob'")
+            token_map[item["token_id"]] = Logprob(logprob=item["logprob"],
+                                                  rank=item.get("rank"))
+        result.append(token_map)
+    return result
+
+
+def _serialize_first_gen_logits(
+    first_gen_logits: Optional[list], ) -> Optional[List]:
+    """Serialize list[torch.Tensor] to JSON-safe list[dict] with base64 data."""
+    if first_gen_logits is None:
+        return None
+    result = []
+    for i, tensor in enumerate(first_gen_logits):
+        t = tensor.contiguous().cpu()
+        if t.dtype == torch.bfloat16:
+            t = t.to(torch.float16)
+        np_array = t.numpy()
+        result.append({
+            "data": base64.b64encode(np_array.tobytes()).decode(),
+            "shape": list(np_array.shape),
+            "dtype": str(np_array.dtype),
+        })
+    return result
+
+
+def _deserialize_first_gen_logits(
+    serialized: Optional[List], ) -> Optional[list]:
+    """Deserialize JSON list[dict] back to list[torch.Tensor]."""
+    if serialized is None:
+        return None
+    import numpy as np
+    result = []
+    for i, item in enumerate(serialized):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"first_gen_logits[{i}] must be a dict, got {type(item)}")
+        for key in ("data", "shape", "dtype"):
+            if key not in item:
+                raise ValueError(
+                    f"first_gen_logits[{i}] missing required key '{key}'")
+        np_array = np.frombuffer(
+            base64.b64decode(item["data"]),
+            dtype=np.dtype(item["dtype"]),
+        ).reshape(item["shape"])
+        result.append(torch.from_numpy(np_array.copy()))
+    return result
+
+
 def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
@@ -1093,6 +1191,10 @@ def to_disaggregated_params(
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
+        first_gen_log_probs=_serialize_first_gen_log_probs(
+            tllm_disagg_params.first_gen_log_probs),
+        first_gen_logits=_serialize_first_gen_logits(
+            tllm_disagg_params.first_gen_logits),
         ctx_request_id=tllm_disagg_params.ctx_request_id,
         encoded_opaque_state=encode_opaque_state(
             tllm_disagg_params.opaque_state),
@@ -1111,6 +1213,10 @@ def to_llm_disaggregated_params(
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
+        first_gen_log_probs=_deserialize_first_gen_log_probs(
+            disaggregated_params.first_gen_log_probs),
+        first_gen_logits=_deserialize_first_gen_logits(
+            disaggregated_params.first_gen_logits),
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
@@ -1281,6 +1387,14 @@ class VideoGenerationRequest(OpenAIBaseModel):
         description="Text describing what to avoid in the generated video.")
     seed: Optional[int] = Field(default=None,
                                 description="Random seed for reproducibility.")
+    output_format: Literal["mp4", "avi", "auto"] = Field(
+        default="auto",
+        description=(
+            "Video encode format. "
+            "'mp4' for H.264 encoding (requires ffmpeg installed on server), "
+            "'avi' for MJPEG encoding (always available, no audio support), "
+            "'auto' to use best available (H.264 if ffmpeg installed, "
+            "otherwise MJPEG)."))
 
     @field_validator("size")
     @classmethod
@@ -1327,6 +1441,8 @@ class VideoJob(OpenAIBaseModel):
     fps: Optional[int] = Field(default=None, description="Frames per second")
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    output_path: Optional[str] = Field(
+        default=None, description="Actual path where the video file was saved")
 
 
 class VideoJobList(OpenAIBaseModel):

@@ -20,29 +20,23 @@ Uses diffusion-specific wrappers (TrtllmAttention, VanillaAttention)
 that handle metadata preparation internally for simplified usage.
 """
 
-from typing import TYPE_CHECKING, Optional, Type, Union
+from typing import Optional, Type
 
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-# Lazy imports to avoid circular dependency
-if TYPE_CHECKING:
-    from .trtllm import TrtllmAttention
-    from .vanilla import VanillaAttention
-
-    # Type alias for diffusion attention backends
-    DiffusionAttentionBackend = Union[TrtllmAttention, VanillaAttention]
+from .interface import AttentionBackend
 
 
 def get_visual_gen_attention_backend(
     backend_name: str,
-) -> Type["DiffusionAttentionBackend"]:
+) -> Type[AttentionBackend]:
     """
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4")
 
     Returns:
         Diffusion attention backend class
@@ -52,8 +46,11 @@ def get_visual_gen_attention_backend(
                      Uses torch SDPA backend
         - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths)
                     Better performance but requires fused QKV
+        - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
+                         Requires flash-attn package with cute interface
     """
     # Lazy imports to avoid circular dependency
+    from .flash_attn4 import FlashAttn4Attention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
@@ -63,6 +60,8 @@ def get_visual_gen_attention_backend(
         return VanillaAttention
     elif backend_name == "TRTLLM":
         return TrtllmAttention
+    elif backend_name == "FA4":
+        return FlashAttn4Attention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
@@ -79,7 +78,7 @@ def create_attention(
     max_batch_size: int = 16,
     max_seq_len: int = 4096,
     **kwargs,
-) -> "DiffusionAttentionBackend":
+) -> AttentionBackend:
     """
     Factory function to create attention backend instance for visual generation.
 
@@ -87,7 +86,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -101,7 +100,7 @@ def create_attention(
         **kwargs: Additional backend-specific arguments
 
     Returns:
-        Diffusion attention backend instance (TrtllmAttention or VanillaAttention)
+        AttentionBackend instance
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 

@@ -21,6 +21,7 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_nemotron_nano_v2_vl"
   - unittest/_torch/modeling -k "modeling_phi4mm"
   - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
+  - unittest/_torch/modeling/test_modeling_llava_next.py::test_llava_next_expand_prompt_token_ids_for_mm
   - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py::TestQwen3VLMoe::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
@@ -65,6 +66,7 @@ l0_l40s:
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - examples/test_gpt.py::test_llm_gpt_starcoder_lora_1gpu[peft-lora-starcoder2-15b-unity-copilot-starcoder2-lora_fp16-base_fp16]
   - llmapi/test_llm_examples.py::test_llmapi_quickstart
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - llmapi/test_llm_examples.py::test_llmapi_example_inference
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
@@ -85,11 +87,6 @@ l0_l40s:
       stage: post_merge
       backend: tensorrt
   tests:
-  - accuracy/test_cli_flow.py::TestGpt2::test_attention_ootb
-  - accuracy/test_cli_flow.py::TestStarcoder2_3B::test_auto_dtype
-  - accuracy/test_cli_flow.py::TestPhi2::test_auto_dtype
-  - accuracy/test_cli_flow.py::TestPhi3Small8kInstruct::test_auto_dtype
-  - accuracy/test_cli_flow.py::TestQwen1_5MoeA2_7BChat::test_weight_only
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_cpp_session-tp1] # 10 mins
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp1]
   - examples/test_llama.py::test_llm_llama_1gpu_fp8_kv_cache[llama-v2-7b-hf-bfloat16] #4 mins

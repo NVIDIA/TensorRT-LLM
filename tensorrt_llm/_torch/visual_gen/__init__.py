@@ -11,12 +11,14 @@ from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from .checkpoints import WeightLoader
 from .config import (
     AttentionConfig,
-    DiffusionArgs,
+    CudaGraphConfig,
     DiffusionModelConfig,
     ParallelConfig,
     PipelineComponent,
     PipelineConfig,
     TeaCacheConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
     discover_pipeline_components,
 )
 from .models import AutoPipeline, BasePipeline, WanPipeline
@@ -24,7 +26,9 @@ from .pipeline_loader import PipelineLoader
 
 __all__ = [
     # Config classes
-    "DiffusionArgs",
+    "TorchCompileConfig",
+    "CudaGraphConfig",
+    "VisualGenArgs",
     "DiffusionModelConfig",
     "ParallelConfig",
     "PipelineComponent",

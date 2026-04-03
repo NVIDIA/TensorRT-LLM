@@ -28,23 +28,31 @@ namespace tensorrt_llm::batch_manager::eviction_policy
 
 auto const kMinPriority = executor::KvCacheRetentionConfig::kMinRetentionPriority;
 auto const kMaxPriority = executor::KvCacheRetentionConfig::kMaxRetentionPriority;
+auto const kNumPriorities = kMaxPriority - kMinPriority + 1;
 
 auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority;
 executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
 int const kNumCacheLevels = 2;
+int const kPlaceholderLevel = kNumCacheLevels; // placeholder blocks live at level 2
 
 namespace
 {
 SizeType32 getCacheLevel(BlockPtr const& block)
 {
+    if (block->isPlaceholder())
+    {
+        return kPlaceholderLevel;
+    }
     return block->isPrimary() ? 0 : 1;
 }
 
-SizeType32 getPriorityIdx(executor::RetentionPriority priority)
+constexpr SizeType32 getPriorityIdx(executor::RetentionPriority priority)
 {
     return priority - kMinPriority;
 }
+
+constexpr auto defaultPriorityIdx = getPriorityIdx(kDefaultPriority);
 } // namespace
 
 void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
@@ -52,48 +60,74 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
 {
     SizeType32 startIdx = 0;
 
-    auto const defaultPriorityIdx = getPriorityIdx(kDefaultPriority);
+    // Create queues for all levels: primary, secondary, and placeholder (initially empty).
+    mFreeQueues.resize(kPlaceholderLevel + 1, std::vector<FreeBlocksQueue>(kNumPriorities));
+    mFreeBlockIterators.positive.resize(mAllBlocksById.size());
+    mNumFreeBlocksPerLevel.resize(kPlaceholderLevel + 1, 0);
 
-    // For each cache level, create a separate list of queues.
     for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
     {
-        mFreeBlockIterators.reserve(mFreeBlockIterators.size() + sizes[cacheLevel]);
-        mFreeQueues.emplace_back(std::vector<FreeBlocksQueue>(kMaxPriority - kMinPriority + 1));
-
         auto& freeQueue = mFreeQueues[cacheLevel][defaultPriorityIdx];
 
         for (SizeType32 blockId = 0; blockId < sizes[cacheLevel]; blockId++)
         {
             // Initialize all blocks to be the default priority level
-            mFreeBlockIterators.emplace_back(freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]));
+            mFreeBlockIterators[startIdx + blockId]
+                = freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]);
         }
 
+        mNumFreeBlocksPerLevel[cacheLevel] = sizes[cacheLevel];
         startIdx += sizes[cacheLevel];
     }
-    mNumFreeBlocksPerLevel = sizes;
 
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultSecondaryOffloadMinPriority);
 }
 
+void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById)
+{
+    auto const len = static_cast<SizeType32>(allPlaceholderBlocksById.size());
+
+    // Placeholder IDs -2, -3, ... map to indices 2, 3, ... via abs(id).
+    // Indices 0 and 1 are unused (0 is invalid, 1 corresponds to kCachedBlocksRootId).
+    mFreeBlockIterators.negative.resize(len);
+
+    auto& freeQueue = mFreeQueues[kPlaceholderLevel][defaultPriorityIdx];
+
+    for (auto const& block : allPlaceholderBlocksById)
+    {
+        if (block)
+        {
+            mFreeBlockIterators[block->getBlockId()] = freeQueue.insert(freeQueue.end(), block);
+            mNumFreeBlocksPerLevel[kPlaceholderLevel]++;
+        }
+    }
+}
+
 bool LRUEvictionPolicy::verifyQueueIntegrity()
 {
+    static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
+    static const std::function<bool(BlockPtr const&)> levelValidators[]
+        = {[](BlockPtr const& block) { return block->isPrimary(); },
+            [](BlockPtr const& block) { return !block->isPrimary(); },
+            [](BlockPtr const& block) { return block->isPlaceholder(); }};
     bool queueCompromised = false;
-    for (SizeType32 cacheLevel = 0; cacheLevel < 2; cacheLevel++)
+    for (SizeType32 queueLevel = 0; queueLevel < kNumCacheLevels + 1; queueLevel++)
     {
-        for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
+        for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
         {
-            for (auto const& block : mFreeQueues[cacheLevel][level])
+            for (auto const& block : mFreeQueues[queueLevel][pri])
             {
-                if ((cacheLevel == 0 && !block->isPrimary()) || (cacheLevel == 1 && block->isPrimary()))
+                bool const valid = levelValidators[queueLevel](block);
+                if (!valid)
                 {
-                    TLLM_LOG_WARNING("Found %s block (id %d) at cacheLevel %d",
-                        block->isPrimary() ? "primary" : "secondary", block->getBlockId(), cacheLevel);
+                    TLLM_LOG_WARNING("Block (id %d) has level=%s, but misplaced at queueLevel %s", block->getBlockId(),
+                        levelToStr[queueLevel], levelToStr[queueLevel]);
                     queueCompromised = true;
                 }
                 if (block->hasRefs())
                 {
-                    TLLM_LOG_WARNING(
-                        "Found block (id %d) with references at cacheLevel %d", block->getBlockId(), cacheLevel);
+                    TLLM_LOG_WARNING("Found block (id %d) with references at queueLevel %s", block->getBlockId(),
+                        levelToStr[queueLevel]);
                     queueCompromised = true;
                 }
             }
@@ -103,20 +137,24 @@ bool LRUEvictionPolicy::verifyQueueIntegrity()
     return !queueCompromised;
 }
 
-std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel)
+std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
-    for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
+    SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;
+
+    for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
     {
         // Find the first non-empty queue, and return the first block.
-        if (!mFreeQueues[cacheLevel][level].empty())
+        if (!mFreeQueues[level][pri].empty())
         {
-            auto block = mFreeQueues[cacheLevel][level].front();
+            auto block = mFreeQueues[level][pri].front();
 
             // mFreeQueues only contains leaf blocks, so no need to iterate through the next block pointers.
             // It's possible to have a primary block with children in secondary memory. We handle this
             // by freeing all descendants in WindowBlockManager::getFreeBlock. This is done either by
             // offloading (preferred method) or explicitly.
-            return std::make_tuple(block, cacheLevel == 0 && level >= mSecondaryOffloadMinPriority);
+            bool const canOffload
+                = !wantPlaceholder && cacheLevel == 0 && pri >= getPriorityIdx(mSecondaryOffloadMinPriority);
+            return std::make_tuple(block, canOffload);
         }
     }
     TLLM_THROW("No free block found. This shouldn't happen!");
@@ -129,6 +167,11 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 {
+    // The dummy root block (kCachedBlocksRootId) is permanently attached to the lookup tree
+    // via setAsRoot() and must never enter the eviction queue — it is not a real cache block.
+    TLLM_CHECK_WITH_INFO(
+        block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
+        "Attempted to release the cached-blocks root into the eviction queue");
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
@@ -211,7 +254,7 @@ void LRUEvictionPolicy::refresh()
         {
             // This is already in another queue. Delete it, and bring it down to the default queue
             mFreeQueues[level][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
-            auto& q = mFreeQueues[level][getPriorityIdx(kDefaultPriority)];
+            auto& q = mFreeQueues[level][defaultPriorityIdx];
             mFreeBlockIterators[id] = q.insert(q.end(), block);
         }
         block->setPriority(kDefaultPriority);

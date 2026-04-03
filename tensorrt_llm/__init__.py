@@ -114,6 +114,7 @@ import tensorrt_llm.tools as tools
 
 from ._common import _init, default_net, default_trtnet, precision
 from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
+from ._torch.visual_gen.config import VisualGenArgs
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                      set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
@@ -132,6 +133,7 @@ from .parameter import Parameter
 from .python_plugin import PluginBase
 from .sampling_params import SamplingParams
 from .version import __version__
+from .visual_gen import VisualGen, VisualGenParams
 
 __all__ = [
     'AutoConfig',
@@ -179,9 +181,12 @@ __all__ = [
     'TorchLlmArgs',
     'TrtLlmArgs',
     'SamplingParams',
+    'VisualGenArgs',
     'DisaggregatedParams',
     'KvCacheConfig',
     'math_utils',
+    'VisualGen',
+    'VisualGenParams',
     '__version__',
 ]
 

@@ -1,13 +1,19 @@
+import itertools
+import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from .config import PipelineComponent
+from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
@@ -24,6 +30,9 @@ class BasePipeline(nn.Module):
         self.model_config = model_config
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
+        self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._parallel_vae_enabled: bool = False
+        self._warmed_up_shapes: Set[tuple] = set()
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -34,6 +43,40 @@ class BasePipeline(nn.Module):
 
         # Initialize transformer
         self._init_transformer()
+
+        # CUDA graph runner - wrap transformer.forward
+        # Order matters: TeaCache will wrap on top of it and still call the
+        # graphed transformer.forward if should_compute == True.
+        self._setup_cuda_graphs()
+
+    def _setup_cuda_graphs(self):
+        """Wrap all transformer components with CUDA graph capture/replay."""
+        if not self.model_config.cuda_graph.enable_cuda_graph:
+            return
+
+        if self.model_config.torch_compile.enable_torch_compile:
+            logger.warning(
+                "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
+            )
+            return
+
+        if len(self.transformer_components) > 1:
+            logger.info(
+                "CUDA graph runner: multiple transformer components, using shared graph pool"
+            )
+            shared_pool = SharedGraphPool()
+        else:
+            shared_pool = None
+
+        for name in self.transformer_components:
+            model = getattr(self, name, None)
+            if model is None:
+                continue
+
+            runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True), shared_pool)
+            logger.info(f"CUDA graph runner: wrapping {name}.forward")
+            model.forward = runner.wrap(model.forward)
+            self._cuda_graph_runners[name] = runner
 
     @property
     def rank(self):
@@ -53,6 +96,118 @@ class BasePipeline(nn.Module):
     def device(self):
         return self.transformer.device
 
+    @property
+    def transformer_components(self) -> list:
+        """Return list of transformer components this pipeline needs."""
+        return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
+
+    def warmup_cache_key(self, height: int, width: int, num_frames: int) -> tuple:
+        """Return the cache key for a given warmup shape.
+
+        Image models (FLUX) override to return (height, width), ignoring
+        num_frames.  Video models use the default (height, width, num_frames).
+        The executor uses this to check whether a request shape was warmed up.
+        """
+        return (height, width, num_frames)
+
+    @property
+    def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
+        """Model-specific default warmup resolutions (height, width).
+
+        Subclasses should override. Combined with default_warmup_num_frames
+        via Cartesian product to produce warmup shapes.
+        """
+        return []
+
+    @property
+    def default_warmup_num_frames(self) -> List[int]:
+        """Model-specific default warmup frame counts.
+
+        Subclasses should override. Combined with default_warmup_resolutions
+        via Cartesian product to produce warmup shapes.
+        """
+        return []
+
+    @property
+    def default_warmup_steps(self) -> int:
+        """Model-specific default denoising steps for warmup. Subclass override."""
+        return 2
+
+    @property
+    def resolution_multiple_of(self) -> Tuple[int, int]:
+        """(h_multiple, w_multiple) resolution constraint. Subclass override."""
+        return (1, 1)
+
+    def validate_resolution(self, height: int, width: int, num_frames: int) -> None:
+        """Validate resolution against model constraints. Raises ValueError.
+
+        Only checks resolution constraints (must be positive and divisible by
+        model-specific multiples). Frame count is NOT validated here — following
+        HuggingFace diffusers convention, invalid frame counts are silently
+        rounded in forward() instead of rejected.
+        """
+        if height <= 0 or width <= 0 or num_frames <= 0:
+            raise ValueError(
+                f"Dimensions must be positive: height={height}, width={width}, "
+                f"num_frames={num_frames} for {self.__class__.__name__}."
+            )
+        h_mul, w_mul = self.resolution_multiple_of
+        if h_mul > 1 or w_mul > 1:
+            if height % h_mul != 0 or width % w_mul != 0:
+                raise ValueError(
+                    f"Resolution ({height}x{width}) must be multiples of "
+                    f"({h_mul}x{w_mul}) for {self.__class__.__name__}."
+                )
+
+    def resolve_warmup_plan(self) -> Tuple[List[Tuple[int, int, int]], int]:
+        """Resolve warmup shapes and steps from config or model defaults.
+
+        Shapes are the Cartesian product of resolutions x num_frames.
+
+        Priority:
+            1. User-specified: model_config.compilation.resolutions / num_frames
+            2. Model defaults: default_warmup_resolutions / default_warmup_num_frames
+            3. Empty: skip warmup
+
+        Steps: always from model subclass (default_warmup_steps).
+
+        Returns:
+            (shapes, steps) tuple where shapes = list of (h, w, f)
+        """
+        warmup_cfg = self.model_config.compilation
+
+        if warmup_cfg.resolutions is not None or warmup_cfg.num_frames is not None:
+            resolutions = (
+                warmup_cfg.resolutions
+                if warmup_cfg.resolutions is not None
+                else self.default_warmup_resolutions
+            )
+            num_frames_list = (
+                warmup_cfg.num_frames
+                if warmup_cfg.num_frames is not None
+                else self.default_warmup_num_frames
+            )
+        else:
+            resolutions = self.default_warmup_resolutions
+            num_frames_list = self.default_warmup_num_frames
+
+        all_shapes = [(h, w, f) for (h, w), f in itertools.product(resolutions, num_frames_list)]
+
+        valid_shapes = []
+        for h, w, f in all_shapes:
+            try:
+                self.validate_resolution(h, w, f)
+                valid_shapes.append((h, w, f))
+            except ValueError as e:
+                logger.warning(f"Skipping invalid warmup shape ({h}x{w}, {f} frames): {e}")
+
+        return valid_shapes, self.default_warmup_steps
+
+    @property
+    def vae_adapter_class(self) -> Type[ParallelVAEFactory] | None:
+        """Return the VAE adapter class for the pipeline."""
+        return None
+
     def infer(self, req: Any):
         raise NotImplementedError
 
@@ -62,11 +217,37 @@ class BasePipeline(nn.Module):
     def forward(self, *args, **kwargs):
         raise NotImplementedError
 
+    def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+        """Load transformer weights from checkpoint.
+
+        Default implementation reads from a ``transformer/`` sub-directory
+        using :class:`WeightLoader`.  Override for custom checkpoint formats
+        (e.g. LTX-2 single-safetensor with embedded prefix).
+        """
+        if self.transformer is None:
+            raise ValueError("Pipeline has no transformer component")
+
+        transformer_components = self.transformer_components
+        logger.info(f"Transformer components: {transformer_components}")
+
+        transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
+        if not os.path.exists(transformer_path):
+            raise FileNotFoundError(
+                f"Transformer path does not exist: {transformer_path}. "
+                f"Checkpoint directory must contain a 'transformer' subdirectory."
+            )
+
+        from .checkpoints import WeightLoader
+
+        weight_loader = WeightLoader(components=transformer_components)
+        return weight_loader.load_weights(checkpoint_dir, self.mapping)
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
         device: torch.device,
         skip_components: Optional[list] = None,
+        **kwargs,
     ) -> None:
         raise NotImplementedError
 
@@ -111,16 +292,178 @@ class BasePipeline(nn.Module):
                         if mode in coeff_data:
                             teacache_cfg.coefficients = coeff_data[mode]
                             logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                        # Apply model-specific default threshold if user didn't explicitly set one
+                        default_thresh = coeff_data.get("default_thresh")
+                        if (
+                            default_thresh is not None
+                            and "teacache_thresh" not in teacache_cfg.model_fields_set
+                        ):
+                            teacache_cfg.teacache_thresh = default_thresh
+                            logger.info(
+                                f"TeaCache: Using {model_size} default threshold {default_thresh}"
+                            )
                     else:
                         # Single coefficient list (no mode distinction)
                         teacache_cfg.coefficients = coeff_data
                         logger.info(f"TeaCache: Using {model_size} coefficients")
                     break
+            else:
+                raise ValueError(
+                    f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
+                    f"Available variants: {list(coefficients.keys())}. "
+                    f"TeaCache is not supported for this model variant."
+                )
 
         # Initialize and enable TeaCache backend
         logger.info("TeaCache: Initializing...")
         self.cache_backend = TeaCacheBackend(teacache_cfg)
         self.cache_backend.enable(model)
+
+    def setup_parallel_vae(self):
+        if not self.model_config.parallel.enable_parallel_vae:
+            return
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+        if self.vae is None:
+            return
+
+        # Uses all ranks today; replace with a subset to dedicate specific ranks to VAE.
+        pg = dist.new_group(list(range(dist.get_world_size())))
+        try:
+            self.vae = ParallelVAEFactory.from_vae(
+                self.vae,
+                split_dim=self.model_config.parallel.parallel_vae_split_dim,
+                pg=pg,
+            )
+        except ValueError:
+            logger.warning(
+                f"Parallel VAE not supported for {self.__class__.__name__} "
+                f"(VAE type: {type(self.vae).__name__}). "
+                "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
+                "parallel VAE for this VAE type."
+            )
+            return
+
+        self._parallel_vae_enabled = True
+        logger.info(
+            f"Parallel VAE enabled: {type(self.vae).__name__}, "
+            f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
+            f"world_size={dist.get_world_size(pg)}"
+        )
+
+    def torch_compile(self) -> None:
+        """Apply torch.compile to pipeline components based on TorchCompileConfig.
+
+        For transformer models, compiles each block in the ModuleList individually.
+        This enables future block-wise offloading and keeps compilation efficient
+        (all blocks share the same structure, so compile cost is paid once).
+
+        For non-transformer components, compiles the entire module.
+        """
+        tc_config = self.model_config.torch_compile
+
+        # Using default as max-autotune mode takes more initialization time and
+        # does not improve performance a lot.
+        compile_mode = "default"
+
+        # Compiling transformer blocks provides max performance value.
+        targets = self.transformer_components
+
+        for name in targets:
+            model = getattr(self, name, None)
+            if model is None:
+                logger.warning(f"torch.compile: component '{name}' not found, skipping")
+                continue
+
+            blocks_attr = self._find_transformer_blocks(model)
+            if blocks_attr:
+                for block_name in blocks_attr:
+                    blocks = getattr(model, block_name)
+                    logger.info(
+                        f"torch.compile: {name}.{block_name} "
+                        f"({len(blocks)} blocks, mode={compile_mode})"
+                    )
+                    compiled_blocks = []
+                    for block in blocks:
+                        compiled_blocks.append(
+                            torch.compile(
+                                block,
+                                mode=compile_mode,
+                                dynamic=None,
+                                fullgraph=tc_config.enable_fullgraph,
+                            )
+                        )
+                    setattr(model, block_name, nn.ModuleList(compiled_blocks))
+            else:
+                logger.info(f"torch.compile: {name} (whole module, mode={compile_mode})")
+                compiled = torch.compile(
+                    model,
+                    mode=compile_mode,
+                    dynamic=None,
+                    fullgraph=tc_config.enable_fullgraph,
+                )
+                setattr(self, name, compiled)
+
+    @staticmethod
+    def _find_transformer_blocks(model: nn.Module) -> list:
+        """Find ModuleList children that look like transformer blocks.
+
+        Returns list of attribute names containing nn.ModuleList with >1 elements.
+        """
+        block_names = []
+        for name, child in model.named_children():
+            if isinstance(child, nn.ModuleList) and len(child) > 1:
+                block_names.append(name)
+        return block_names
+
+    def warmup(self) -> None:
+        """Run warmup inference to trigger torch.compile and CUDA initialization.
+
+        Resolves warmup shapes from user config or model defaults, then runs
+        a short denoising loop with dummy inputs for each shape. This:
+        1. Triggers torch.compile's lazy compilation (first forward trace + codegen)
+        2. Pre-captures CUDA graphs (if enabled)
+        3. Warms up CUDA kernels and allocators
+        4. Populates any lazy caches (e.g., RoPE frequencies)
+
+        Called automatically by PipelineLoader after model loading and torch.compile.
+        OOM is not caught — if a warmup shape OOMs, the server fails fast at startup.
+        """
+        shapes, steps = self.resolve_warmup_plan()
+        if not shapes:
+            logger.info("Warmup disabled (no warmup shapes)")
+            return
+
+        logger.info(
+            f"Running warmup for {self.__class__.__name__} "
+            f"with {len(shapes)} shapes and {steps} steps..."
+        )
+        warmup_start = time.time()
+
+        for height, width, num_frames in shapes:
+            logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
+            self._run_warmup(height, width, num_frames, steps)
+            torch.cuda.synchronize()
+
+        self._warmed_up_shapes = set(
+            self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
+        )
+        elapsed = time.time() - warmup_start
+        logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        """Run warmup for a single shape. Subclasses must override.
+
+        Args:
+            height: Video/image height in pixels
+            width: Video/image width in pixels
+            num_frames: Number of frames (1 for image models)
+            steps: Number of denoising steps
+        """
+        logger.warning(
+            f"{self.__class__.__name__} does not implement _run_warmup(); "
+            "skipping warmup for this shape."
+        )
 
     def decode_latents(
         self,
@@ -129,6 +472,7 @@ class BasePipeline(nn.Module):
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
         """Execute VAE decoding. Only rank 0 performs decoding.
+        If parallel VAE is enabled, all processes perform decoding.
 
         Args:
             latents: Primary latents to decode (e.g., video)
@@ -141,6 +485,14 @@ class BasePipeline(nn.Module):
             Single result if no extra_latents, tuple of results if extra_latents provided.
             Non-rank-0 processes return None placeholders.
         """
+
+        if self._parallel_vae_enabled:
+            primary_result = decode_fn(latents)
+            if extra_latents:
+                extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
+                return (primary_result,) + tuple(extra_results)
+            return primary_result
+
         if self.rank == 0:
             primary_result = decode_fn(latents)
 
@@ -261,7 +613,8 @@ class BasePipeline(nn.Module):
 
         c_start = time.time()
 
-        # All-gather primary noise
+        # All-gather primary noise (must be contiguous for NCCL)
+        noise_pred_local = noise_pred_local.contiguous()
         gather_list = [torch.empty_like(noise_pred_local) for _ in range(self.world_size)]
         dist.all_gather(gather_list, noise_pred_local)
         noise_cond = gather_list[0]
@@ -271,6 +624,7 @@ class BasePipeline(nn.Module):
         # All-gather extra stream noises
         extra_noise_preds = {}
         for name, noise_local in extra_noise_locals.items():
+            noise_local = noise_local.contiguous()
             gather_list_extra = [torch.empty_like(noise_local) for _ in range(self.world_size)]
             dist.all_gather(gather_list_extra, noise_local)
             noise_cond_extra = gather_list_extra[0]
@@ -355,6 +709,7 @@ class BasePipeline(nn.Module):
 
         return noise_pred, extra_noise_preds, t_transformer, t_cfg
 
+    @nvtx_range("_scheduler_step", color="blue")
     def _scheduler_step(
         self,
         latents,
@@ -379,6 +734,7 @@ class BasePipeline(nn.Module):
         t_sched = time.time() - t_start
         return latents, extra_stream_latents, t_sched
 
+    @nvtx_range("denoise_loop", color="blue")
     def denoise(
         self,
         latents: torch.Tensor,
@@ -476,30 +832,31 @@ class BasePipeline(nn.Module):
                     current_guidance_scale = guidance_scale_2
 
             # Denoise
-            if do_cfg_parallel:
-                timestep = t.expand(latents.shape[0])
-                noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
-                    latents,
-                    extra_stream_latents,
-                    timestep,
-                    cfg_config["local_embeds"],
-                    forward_fn,
-                    current_guidance_scale,
-                    guidance_rescale,
-                    cfg_config["ulysses_size"],
-                    local_extras,
-                )
-            else:
-                noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
-                    latents,
-                    extra_stream_latents,
-                    t,
-                    prompt_embeds,
-                    forward_fn,
-                    current_guidance_scale,
-                    guidance_rescale,
-                    local_extras,
-                )
+            with nvtx_range(f"denoise_step {i}"):
+                if do_cfg_parallel:
+                    timestep = t.expand(latents.shape[0])
+                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
+                        latents,
+                        extra_stream_latents,
+                        timestep,
+                        cfg_config["local_embeds"],
+                        forward_fn,
+                        current_guidance_scale,
+                        guidance_rescale,
+                        cfg_config["ulysses_size"],
+                        local_extras,
+                    )
+                else:
+                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
+                        latents,
+                        extra_stream_latents,
+                        t,
+                        prompt_embeds,
+                        forward_fn,
+                        current_guidance_scale,
+                        guidance_rescale,
+                        local_extras,
+                    )
 
             # Scheduler step for all streams
             latents, extra_stream_latents, t_sched = self._scheduler_step(
@@ -542,3 +899,9 @@ class BasePipeline(nn.Module):
                     )
 
         return (latents, extra_stream_latents) if has_extra_streams else latents
+
+    def cleanup(self):
+        """Call before dist.destroy_process_group()."""
+        for name, runner in self._cuda_graph_runners.items():
+            logger.info(f"Releasing CUDA graphs for {name}")
+            runner.clear()

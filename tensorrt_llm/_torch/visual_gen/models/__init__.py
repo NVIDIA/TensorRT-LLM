@@ -19,11 +19,15 @@ Example structure:
 
 from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
+from .flux import Flux2Pipeline, FluxPipeline
+from .ltx2 import LTX2Pipeline  # noqa: F401
 from .wan import WanImageToVideoPipeline, WanPipeline
 
 __all__ = [
     "AutoPipeline",
     "BasePipeline",
+    "FluxPipeline",
+    "Flux2Pipeline",
     "WanPipeline",
     "WanImageToVideoPipeline",
     "register_pipeline",

@@ -19,6 +19,8 @@ from ..custom_ops.attention_interface import (
     ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
+    SpecCausalConvResourceHandler,
+    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
 )
@@ -59,6 +61,7 @@ class CachedSequenceInterface:
         kv_cache_config: Optional[KvCacheConfig] = None,
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
+        spec_config=None,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -70,6 +73,8 @@ class CachedSequenceInterface:
             max_num_tokens: Maximum total tokens across all sequences. If None, computed from
                 max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
+            spec_config: Speculative decoding configuration. Used to set num_extra_kv_tokens,
+                max_draft_len, max_total_draft_tokens on KVCacheManager after creation.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -97,6 +102,7 @@ class CachedSequenceInterface:
         self._kv_cache_manager: Optional[Union[KVCacheManager, MambaHybridCacheManager]] = None
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
+        self._spec_config = spec_config
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -107,6 +113,15 @@ class CachedSequenceInterface:
     def named_args(self) -> Dict[str, torch.Tensor]:
         """Return all the named arguments owned by this interface."""
         return {**self.info.named_args, **self._caches}
+
+    def get_arg(
+        self, name: str, truncate: Optional[bool] = None, unflatten: Optional[bool] = None
+    ) -> torch.Tensor:
+        """Get the argument from the sequence info or caches."""
+        if name in self._caches:
+            assert not (truncate or unflatten), "truncate or unflatten is not supported for caches"
+            return self._caches[name]
+        return self.info.get_arg(name, truncate=truncate, unflatten=unflatten)
 
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)
@@ -123,9 +138,15 @@ class CachedSequenceInterface:
             else:
                 raise ValueError(f"Invalid KVCacheConfig field: {k}")
 
-    def add_resource(self, name: str, resource_handler: ResourceHandler) -> None:
-        """Add a resource handler to the cache interface."""
-        self._resource_lookup[name] = resource_handler
+    def add_resource(self, suffix: str, resource_handler: ResourceHandler) -> str:
+        """Add a resource handler to the cache interface.
+
+        Low-level method that adds a single resource. If you have a group of related resources
+        that should share the same index, use add_resource_group() instead.
+        """
+        full_name = f"r{len(self._resource_lookup)}_{suffix}"
+        self._resource_lookup[full_name] = resource_handler
+        return full_name
 
     @staticmethod
     def _check_n_groups_constraint(
@@ -177,8 +198,15 @@ class CachedSequenceInterface:
             d_state = ssm_ref.d_state
             ssm_dtype = ssm_ref.dtype
         else:
-            # Dummy SSM params - d_state=0 means empty tensor (no memory used)
-            num_heads, head_dim, d_state = 1, 1, 0
+            # Dummy SSM params - d_state=0 means empty tensor (no memory used).
+            # MambaCacheManager computes conv_dim = head_dim * num_heads + 2 * n_groups * d_state.
+            # When only conv resources exist (e.g. GDN/linear-attention models like Qwen3-Next),
+            # we set num_heads = conv_ref.conv_dim so that the formula yields the correct conv_dim
+            # (with d_state=0, n_groups=0: conv_dim = head_dim * num_heads = 1 * conv_dim).
+            if conv_ref:
+                num_heads, head_dim, d_state = conv_ref.conv_dim, 1, 0
+            else:
+                num_heads, head_dim, d_state = 1, 1, 0
             ssm_dtype = torch.float32
 
         # Get Conv parameters (or dummy if not managing Conv)
@@ -246,23 +274,34 @@ class CachedSequenceInterface:
 
     def _identify_managed_state_resources(
         self,
-    ) -> Tuple[Optional[SSMResourceHandler], list, Optional[CausalConvResourceHandler], list]:
+    ) -> Tuple[
+        Optional[SSMResourceHandler],
+        list,
+        list,
+        Optional[CausalConvResourceHandler],
+        list,
+        list,
+    ]:
         """Identify SSM and Conv resources compatible with MambaHybridCacheManager.
 
-        Finds reference handlers for SSM and Conv resources, checks the n_groups constraint,
-        and collects all compatible resources for each type.
+        Finds reference handlers for SSM and Conv resources, checks the n_groups
+        constraint, and collects all compatible resources for each type.
 
         Returns:
-            Tuple of (ssm_ref, ssm_managed, conv_ref, conv_managed) where:
+            Tuple of (ssm_ref, ssm_managed, ssm_spec, conv_ref, conv_managed, conv_spec) where:
             - ssm_ref: Reference SSM handler or None
-            - ssm_managed: List of (name, handler) tuples for compatible SSM resources
-            - conv_ref: Reference Conv handler or None (may be None if constraint fails)
-            - conv_managed: List of (name, handler) tuples for compatible Conv resources
+            - ssm_managed: List of (name, handler) tuples for compatible base SSM resources
+            - ssm_spec: List of (name, handler) tuples for compatible speculative SSM resources.
+              This is only nonempty when speculative decoding is enabled.
+            - conv_ref: Reference Conv handler or None (may be None if the n_groups constraint fails)
+            - conv_managed: List of (name, handler) tuples for compatible base Conv resources
+            - conv_spec: List of (name, handler) tuples for compatible speculative Conv resources.
+              This is only nonempty when speculative decoding is enabled.
         """
         ssm_ref: Optional[SSMResourceHandler] = None
         conv_ref: Optional[CausalConvResourceHandler] = None
 
-        # Find reference handlers for each state resource type
+        # Find the first base (non-spec) handler of each type as reference.
         for handler in self._resource_lookup.values():
             if isinstance(handler, SSMResourceHandler) and ssm_ref is None:
                 ssm_ref = handler
@@ -280,11 +319,44 @@ class CachedSequenceInterface:
             )
             conv_ref = None  # Don't manage Conv via cache manager
 
-        # Collect compatible resources for each managed type (using __eq__ for comparison)
-        ssm_managed = [(n, h) for n, h in self._resource_lookup.items() if ssm_ref == h]
-        conv_managed = [(n, h) for n, h in self._resource_lookup.items() if conv_ref == h]
+        # Collect resources compatible with the reference handlers for each managed type,
+        # using handler equality to match shape and dtype.
+        ssm_managed = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, SSMResourceHandler) and handler == ssm_ref
+        ]
+        ssm_spec = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, SpecSSMResourceHandler)
+            and handler == SpecSSMResourceHandler.from_base(ssm_ref)
+        ]
+        conv_managed = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, CausalConvResourceHandler) and handler == conv_ref
+        ]
+        conv_spec = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, SpecCausalConvResourceHandler)
+            and handler == SpecCausalConvResourceHandler.from_base(conv_ref)
+        ]
 
-        return ssm_ref, ssm_managed, conv_ref, conv_managed
+        # When speculative decoding is enabled, the backend must supply matching spec buffers.
+        # When it is not enabled, spec buffers may still be registered by the backend (e.g.
+        # triton_ssm always registers intermediate_ssm_state_cache) but will not be bound.
+        if self._spec_config is not None:
+            assert len(ssm_spec) == len(ssm_managed), (
+                f"Mismatched SSM spec layer count: expected {len(ssm_managed)}, got {len(ssm_spec)}"
+            )
+            assert len(conv_spec) == len(conv_managed), (
+                f"Mismatched Conv spec layer count: expected {len(conv_managed)}, "
+                f"got {len(conv_spec)}"
+            )
+
+        return ssm_ref, ssm_managed, ssm_spec, conv_ref, conv_managed, conv_spec
 
     def _prepare_kv_cache_config(
         self,
@@ -391,7 +463,8 @@ class CachedSequenceInterface:
                 "max_seq_len": self.info.max_seq_len,
                 "max_batch_size": self.info.max_batch_size,
                 "mapping": Mapping(),
-                "layer_mask": None,
+                "layer_mask": [True] * kv_cache_kwargs["num_layers"],
+                "spec_config": self._spec_config,
                 # NOTE (lucaslie): we can always run with False here since when we are estimating,
                 # we are explicitly setting the max_tokens in which case it's okay to use False here
                 # since we don't rely on free_gpu_memory_fraction inside the KVCacheManager. This is
@@ -408,25 +481,30 @@ class CachedSequenceInterface:
         kv_cache_kwargs: Dict,
         ssm_ref: Optional[SSMResourceHandler],
         ssm_managed: list,
+        ssm_spec: list,
         conv_ref: Optional[CausalConvResourceHandler],
         conv_managed: list,
+        conv_spec: list,
     ) -> Tuple[MambaHybridCacheManager, int]:
         """Create MambaHybridCacheManager and assign views for state resources.
 
         Creates the hybrid cache manager with mamba parameters derived from the reference
-        handlers, then retrieves and assigns buffer views for all managed SSM and Conv resources.
+        handlers, then retrieves and assigns buffer views for all managed SSM and Conv resources,
+        as well as speculative resources if they exist.
 
         Args:
             kv_cache_kwargs: Base kwargs for cache manager (will be extended with mamba params).
             ssm_ref: Reference SSM handler or None.
-            ssm_managed: List of (name, handler) tuples for SSM resources.
+            ssm_managed: List of base SSM resources.
+            ssm_spec: List of speculative SSM resources.
             conv_ref: Reference Conv handler or None.
-            conv_managed: List of (name, handler) tuples for Conv resources.
+            conv_managed: List of base Conv resources.
+            conv_spec: List of speculative Conv resources.
 
         Returns:
             Tuple of (manager, num_managed_mamba_layers).
         """
-        # Derive Mamba parameters from reference handlers
+        # Mamba state params can be derived from reference handlers and number of managed (non-speculative) resources.
         mamba_params = self._get_mamba_state_params(
             ssm_ref, len(ssm_managed), conv_ref, len(conv_managed)
         )
@@ -438,31 +516,63 @@ class CachedSequenceInterface:
             **kv_cache_kwargs,
         )
 
-        # Retrieve and assign views for Mamba-managed resources (up to num_managed_mamba_layers)
+        # Retrieve and assign views for Mamba-managed resources (up to num_managed_mamba_layers).
         for layer_idx in range(num_managed_mamba_layers):
             if ssm_managed:
+                ssm_name = ssm_managed[layer_idx][0]
                 ssm_view = manager.get_ssm_states(layer_idx)
-                assert ssm_view.is_contiguous(), f"Non-contiguous state {ssm_managed[layer_idx][0]}"
-                self._caches[ssm_managed[layer_idx][0]] = ssm_view
+                assert ssm_view.is_contiguous(), f"Non-contiguous state {ssm_name}"
+                self._caches[ssm_name] = ssm_view
+            if ssm_spec and self._spec_config is not None:
+                spec_ssm_name = ssm_spec[layer_idx][0]
+                spec_view = manager.get_intermediate_ssm_states(layer_idx)
+                if spec_view is None:
+                    raise RuntimeError(
+                        f"Intermediate SSM state binding returned no view for {spec_ssm_name}. "
+                        "Are we using a backend that supports speculative decoding?"
+                    )
+                assert spec_view.is_contiguous(), f"Non-contiguous state {spec_ssm_name}"
+                self._caches[spec_ssm_name] = spec_view
             if conv_managed:
+                conv_name = conv_managed[layer_idx][0]
                 conv_view = manager.get_conv_states(layer_idx)
-                assert conv_view.is_contiguous(), (
-                    f"Non-contiguous state {conv_managed[layer_idx][0]}"
-                )
-                self._caches[conv_managed[layer_idx][0]] = conv_view
+                assert conv_view.is_contiguous(), f"Non-contiguous state {conv_name}"
+                self._caches[conv_name] = conv_view
+            if conv_spec and self._spec_config is not None:
+                spec_conv_name = conv_spec[layer_idx][0]
+                spec_view = manager.get_intermediate_conv_states(layer_idx)
+                if spec_view is None:
+                    raise RuntimeError(
+                        f"Intermediate conv state binding returned no view for {spec_conv_name}. "
+                        "Are we using a backend that supports speculative decoding?"
+                    )
+                assert spec_view.is_contiguous(), f"Non-contiguous state {spec_conv_name}"
+                self._caches[spec_conv_name] = spec_view
 
         return manager, num_managed_mamba_layers
 
-    def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> None:
+    def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> int:
         """Retrieve and assign buffer views for managed KV paged resources.
 
         Args:
             kv_managed: Dict of KV resources managed by the cache manager.
+
+        Returns:
+            block_offset_multiplier derived from the first KV cache view's strides.
         """
+        block_offset_multiplier = 0
         for idx, (name, h) in enumerate(kv_managed.items()):
             view = self._kv_cache_manager.get_buffers(idx, kv_layout=h.kv_layout)
             assert view[0].is_contiguous(), f"Non-contiguous kv cache resource for {name}"
             self._caches[name] = view
+
+            # Compute block_offset_multiplier from the first layer's kv_cache strides.
+            # This is stride(0)/stride(1) which equals kv_factor for per-layer views
+            # or num_layers*kv_factor for interleaved pools.
+            if idx == 0:
+                block_offset_multiplier = view.stride(0) // view.stride(1)
+
+        return block_offset_multiplier
 
     def _allocate_unmanaged_resources(self) -> None:
         """Allocate resources not managed by cache managers.
@@ -502,7 +612,9 @@ class CachedSequenceInterface:
         """
         # 1. Identify managed resources
         kv_ref, kv_managed = self._identify_managed_kv_resources()
-        ssm_ref, ssm_managed, conv_ref, conv_managed = self._identify_managed_state_resources()
+        ssm_ref, ssm_managed, ssm_spec, conv_ref, conv_managed, conv_spec = (
+            self._identify_managed_state_resources()
+        )
 
         # 2. Prepare configuration
         kv_cache_config = self._prepare_kv_cache_config(max_tokens, kv_managed)
@@ -514,45 +626,74 @@ class CachedSequenceInterface:
             # NOTE: +1 for cuda graph padding
             kv_cache_kwargs["max_batch_size"] = self.info.max_num_state_slots
             self._kv_cache_manager, _ = self._create_and_assign_state_views(
-                kv_cache_kwargs, ssm_ref, ssm_managed, conv_ref, conv_managed
+                kv_cache_kwargs,
+                ssm_ref,
+                ssm_managed,
+                ssm_spec,
+                conv_ref,
+                conv_managed,
+                conv_spec,
             )
         else:
             # No typed state resources - use pure KVCacheManager
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
 
-        # 4. Store tuned config and ensure capacity
+        # 4. Store tuned config
         self._kv_cache_config_tuned = kv_cache_config
-        self.info.estimate_cache_loc_capacity(self._kv_cache_manager.blocks_in_primary_pool)
 
-        # 5. Assign KV views
-        self._assign_kv_cache_views(kv_managed)
+        # 5. Assign KV views (compute block_offset_multiplier from first view's strides)
+        block_offset_multiplier = self._assign_kv_cache_views(kv_managed)
 
-        # 6. Allocate remaining unmanaged resources
+        # 6. Update cache information (resize cache_loc, set max_seq_info with all max sizes)
+        self.info.update_cache_information(
+            num_blocks=self._kv_cache_manager.blocks_in_primary_pool,
+            block_offset_multiplier=block_offset_multiplier,
+        )
+
+        # 7. Allocate remaining unmanaged resources
         self._allocate_unmanaged_resources()
 
-        # 7. Patch shutdown
+        # 8. Patch shutdown
         self._kv_cache_manager.shutdown = with_pre_callback(
             self._kv_cache_manager.shutdown,
             self._clear_caches,
         )
 
-        # 8. Compute final token count and cache statistics
+        # 9. Compute final token count and cache statistics
         max_resource_count = self._kv_cache_manager.get_max_resource_count()
         max_tokens_final = max_resource_count * self._kv_cache_manager.tokens_per_block
 
-        # 9. Collect statistics of different types of resources
+        # 10. Collect statistics of different types of resources
         num_state_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, StateResourceHandler)
         )
-        num_ssm_total = sum(
+        num_ssm_base_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, SSMResourceHandler)
         )
-        num_conv_total = sum(
+        num_ssm_spec_total = sum(
+            1 for h in self._resource_lookup.values() if isinstance(h, SpecSSMResourceHandler)
+        )
+        num_ssm_total = num_ssm_base_total + num_ssm_spec_total
+        num_conv_base_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, CausalConvResourceHandler)
         )
+        num_conv_spec_total = sum(
+            1
+            for h in self._resource_lookup.values()
+            if isinstance(h, SpecCausalConvResourceHandler)
+        )
+        num_conv_total = num_conv_base_total + num_conv_spec_total
         num_state_other = num_state_total - num_ssm_total - num_conv_total
 
-        total_managed = len(kv_managed) + len(ssm_managed) + len(conv_managed)
+        # Count individual cache buffers owned by the cache manager.
+        # Spec buffers are only cache-manager-owned when spec decoding is enabled.
+        ssm_managed_count = len(ssm_managed) + (
+            len(ssm_spec) if self._spec_config is not None else 0
+        )
+        conv_managed_count = len(conv_managed) + (
+            len(conv_spec) if self._spec_config is not None else 0
+        )
+        total_managed = len(kv_managed) + ssm_managed_count + conv_managed_count
 
         paged_total = sum(1 for h in self._resource_lookup.values() if h.is_paged)
         kv_total = sum(
@@ -569,9 +710,9 @@ class CachedSequenceInterface:
             "kv_managed": len(kv_managed),
             "paged_other": paged_other,
             "ssm_total": num_ssm_total,
-            "ssm_managed": len(ssm_managed),
+            "ssm_managed": ssm_managed_count,
             "conv_total": num_conv_total,
-            "conv_managed": len(conv_managed),
+            "conv_managed": conv_managed_count,
             "state_other": num_state_other,
             "other": other_total,
             "max_tokens": max_tokens_final,

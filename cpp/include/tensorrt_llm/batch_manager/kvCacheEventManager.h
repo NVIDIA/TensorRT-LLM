@@ -24,6 +24,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -70,6 +71,8 @@ private:
     // Add an event to mEventQueue
     void enqueueEvent(executor::KVCacheEvent&& event);
 
+    void flushRemovedEvents(SizeType32 windowSize);
+
     /// @brief Flag to terminate the worker
     std::atomic<bool> mRun;
     /// @brief Worker thread
@@ -98,6 +101,8 @@ private:
     size_t mMaxSize;
     /// @brief An auto-incrementing event id counter
     size_t mEventId;
+
+    std::unordered_map<SizeType32, std::optional<executor::KVCacheRemovedData>> mLatestRemovedEvents;
 
     /// @brief Attention DP ranks and size
     /// If set, we will exchange KV cache events and accumulate on rank 0

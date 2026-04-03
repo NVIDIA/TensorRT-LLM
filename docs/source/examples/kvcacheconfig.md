@@ -1,6 +1,6 @@
 # How to Change KV Cache Behavior
 
-Set KV cache behavior by providing the optional ```kv_cache_config argument``` when you create the LLM engine. Consider the quickstart example found in ```examples/pytorch/quickstart.py```:
+Set KV cache behavior by providing the optional `kv_cache_config` argument when you create the LLM engine. Consider the quickstart example found in `examples/llm-api/quickstart_example.py`:
 
 ```python
 from tensorrt_llm import LLM, SamplingParams

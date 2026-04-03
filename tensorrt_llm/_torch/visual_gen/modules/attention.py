@@ -44,7 +44,9 @@ class Attention(nn.Module):
         head_dim: Optional[int] = None,
         qkv_mode: QKVMode = QKVMode.FUSE_QKV,
         qk_norm: bool = True,
-        eps: float = 1e-6,  # TODO: remove this, we should add this to the config
+        qk_norm_mode: str = "full",
+        eps: float = 1e-6,
+        bias: bool = True,
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: Optional[int] = None,
     ):
@@ -62,17 +64,20 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
+        self.bias = bias
 
         # Select compute backend (orthogonal to parallelism)
         ulysses_size = config.parallel.dit_ulysses_size
         base_backend = config.attention.backend
 
-        if self.qkv_mode == QKVMode.SEPARATE_QKV:
-            backend_name = "VANILLA"  # Cross-attention requires VANILLA
+        # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
+        if self.qkv_mode == QKVMode.SEPARATE_QKV and base_backend == "TRTLLM":
+            backend_name = "VANILLA"
         else:
             backend_name = base_backend
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
+        self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.eps = eps
 
@@ -82,11 +87,15 @@ class Attention(nn.Module):
         self._init_qkv_proj()
 
         if self.qk_norm:
+            # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
+            # "per_head": norm over each head independently (e.g. FLUX, dim=head_dim)
+            q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
+            k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
             self.norm_q = RMSNorm(
-                hidden_size=self.q_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=q_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
             self.norm_k = RMSNorm(
-                hidden_size=self.kv_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=k_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
 
         # TODO: Use weight mapper to create just a Linear module
@@ -95,6 +104,7 @@ class Attention(nn.Module):
                 Linear(
                     self.q_dim,
                     self.hidden_size,
+                    bias=self.bias,
                     dtype=self.dtype,
                     mapping=self.mapping,
                     quant_config=self.quant_config,
@@ -140,6 +150,7 @@ class Attention(nn.Module):
             self.qkv_proj = Linear(
                 self.hidden_size,
                 qkv_out_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -158,6 +169,7 @@ class Attention(nn.Module):
             self.to_q = Linear(
                 self.hidden_size,
                 self.q_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -167,6 +179,7 @@ class Attention(nn.Module):
             self.to_k = Linear(
                 self.hidden_size,
                 self.kv_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -176,6 +189,7 @@ class Attention(nn.Module):
             self.to_v = Linear(
                 self.hidden_size,
                 self.kv_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -211,12 +225,13 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: Optional[int] = None,
-        seq_len: Optional[int] = None,
-        kv_seq_len: Optional[int] = None,
+        **kwargs,
     ) -> torch.Tensor:
         """
         Call attention backend with appropriate tensor layout.
+
+        Dimensions are derived from tensor shapes. Extra ``**kwargs``
+        (e.g. ``attention_mask``) are forwarded to the backend.
 
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
@@ -224,9 +239,7 @@ class Attention(nn.Module):
         """
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
-        batch_size = batch_size or q.shape[0]
-        seq_len = seq_len or q.shape[1]
-        kv_seq_len = kv_seq_len or k.shape[1]
+        batch_size = q.shape[0]
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:
@@ -238,15 +251,7 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
 
-        # Call backend
-        out = self.attn.forward(
-            q=q,
-            k=k,
-            v=v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            seq_len_kv=kv_seq_len if kv_seq_len != seq_len else None,
-        )
+        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:
@@ -279,6 +284,6 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v, batch_size, seq_len, kv_seq_len)
+        out = self._attn_impl(q, k, v)
         out = self.to_out[0](out)
         return out

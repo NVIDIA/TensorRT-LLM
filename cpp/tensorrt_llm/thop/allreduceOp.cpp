@@ -523,7 +523,7 @@ private:
             {
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
                 auto [symmetricInput, symmetricBuffer0]
-                    = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+                    = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
                 if (!symmetricBuffer0.isValid())
                 {
                     TLLM_LOG_DEBUG(
@@ -549,7 +549,7 @@ private:
         }
 
         // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
         torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
@@ -706,6 +706,13 @@ private:
         }
         // Handle allreduce fusion here
         // Prepare required output tensors for each fusion pattern
+        else if (mOp == AllReduceFusionOp::RMS_NORM)
+        {
+            norm_out = torch::empty_like(input);
+
+            allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+            allreduce_fusion_params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARRMSNorm;
+        }
         else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             norm_out = torch::empty_like(input);
@@ -790,7 +797,10 @@ private:
 
         if (mOp != AllReduceFusionOp::NONE)
         {
-            allreduce_fusion_params.residual_in = residual.value().data_ptr();
+            if (mOp != AllReduceFusionOp::RMS_NORM)
+            {
+                allreduce_fusion_params.residual_in = residual.value().data_ptr();
+            }
             allreduce_fusion_params.rms_gamma = norm_weight.value().data_ptr();
             allreduce_fusion_params.rms_eps = mEps;
         }
@@ -811,6 +821,7 @@ private:
         switch (mOp)
         {
         case AllReduceFusionOp::NONE: return {reduce_out};
+        case AllReduceFusionOp::RMS_NORM: return {norm_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {norm_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quant_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {norm_out, quant_out, residual_out};
@@ -845,6 +856,17 @@ private:
         params.fusion_params.hidden_size = hidden_size;
         params.fusion_params.eps = mEps;
         params.fusion_params.intermediate_buffer = reduce_output.mutable_data_ptr();
+
+        if (mOp == AllReduceFusionOp::RMS_NORM)
+        {
+            // RMS_NORM: no residual addition — force nullptr so the kernel
+            // dispatches with Residual=false regardless of what the caller passed.
+            params.fusion_params.residual_buffer = nullptr;
+            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
+            return {norm_out};
+        }
+
+        // All remaining patterns use residual + rmsnorm.
         tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
 
         // If no quantization is needed, return the norm and residual outputs.
@@ -1405,7 +1427,6 @@ private:
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
         // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL fallback.
-        // TODO: Use NCCL_SYMMETRIC once the memory allocation issue is resolved.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;
@@ -1645,15 +1666,15 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
 //     expanded_idx_to_permuted_idx [m, top_k]
 //     expert_scale_factor [m, top_k]
 //     shared_expert_output [m, hidden_dim]
-std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, torch::Tensor const& residual,
-    torch::Tensor const& norm_weight, torch::Tensor const& expanded_idx_to_permuted_idx,
-    torch::optional<torch::Tensor> const& shared_expert_output,
+std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::Tensor const& norm_weight,
+    torch::Tensor const& expanded_idx_to_permuted_idx, torch::optional<torch::Tensor> const& shared_expert_output,
     torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
     int64_t const nranks, double const eps)
 {
     auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
 
-    int hidden_dim = residual.size(-1);
+    int hidden_dim = norm_weight.size(0);
     int top_k = expanded_idx_to_permuted_idx.size(-1);
 
     allreduce_fusion_params.quant_out = nullptr;
@@ -1662,15 +1683,32 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
     allreduce_fusion_params.nranks = static_cast<int>(nranks);
     allreduce_fusion_params.rank = static_cast<int>(rank);
     allreduce_fusion_params.dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+
+    // Determine num_tokens from either residual or shared_expert_output
+    int num_tokens;
+    if (residual.has_value())
+    {
+        num_tokens = residual.value().size(0);
+    }
+    else if (shared_expert_output.has_value())
+    {
+        num_tokens = shared_expert_output.value().size(0);
+    }
+    else
+    {
+        // Fallback: infer from expanded_idx_to_permuted_idx
+        num_tokens = expanded_idx_to_permuted_idx.size(0);
+    }
+
     // size: num_token * hidden_dim
-    allreduce_fusion_params.size = residual.numel();
+    allreduce_fusion_params.size = num_tokens * hidden_dim;
     allreduce_fusion_params.hidden_dim = hidden_dim;
 
     // workspace: AR scratch space
     allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
     allreduce_fusion_params.rms_gamma = norm_weight.data_ptr();
     allreduce_fusion_params.rms_eps = static_cast<float>(eps);
-    allreduce_fusion_params.residual_in = residual.data_ptr();
+    allreduce_fusion_params.residual_in = residual.has_value() ? residual.value().data_ptr() : nullptr;
     allreduce_fusion_params.stream = at::cuda::getCurrentCUDAStream(norm_weight.get_device());
 
     // MOE Reduction specific params
@@ -1687,16 +1725,30 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
     allreduce_fusion_params.shared_expert_output
         = shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
 
-    // output tensors
-    torch::Tensor norm_out = torch::empty_like(residual);
-    torch::Tensor residual_out = torch::empty_like(residual);
+    // output tensors — shape based on [num_tokens, hidden_dim]
+    auto output_opts = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+    torch::Tensor norm_out = torch::empty({num_tokens, hidden_dim}, output_opts);
+    torch::Tensor residual_out;
 
     allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
-    allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+
+    if (residual.has_value())
+    {
+        residual_out = torch::empty_like(residual.value());
+        allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+    }
+    else
+    {
+        allreduce_fusion_params.residual_out = nullptr;
+    }
 
     tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
 
-    return {norm_out, residual_out};
+    if (residual.has_value())
+    {
+        return {norm_out, residual_out};
+    }
+    return {norm_out};
 }
 
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
@@ -1824,7 +1876,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_finalize_allreduce("
         "Tensor input,"
-        "Tensor residual,"
+        "Tensor? residual,"
         "Tensor norm_weight,"
         "Tensor expanded_idx_to_permuted_idx,"
         "Tensor? shared_expert_output,"

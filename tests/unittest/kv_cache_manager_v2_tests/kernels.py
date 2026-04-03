@@ -51,7 +51,7 @@ def enable_kernel_delay() -> Iterator[None]:
 
 
 @lru_cache(maxsize=None)
-def get_program(debug: bool, max_tokens: int, sleep_time: int) -> ObjectCode:
+def get_program(debug: bool, max_tokens: int) -> ObjectCode:
     assert max_tokens > 0 and (max_tokens & (max_tokens - 1)) == 0, (
         "max_tokens must be a power of 2"
     )
@@ -74,8 +74,6 @@ __device__ inline void check(bool condition) {
 using uint32_t = unsigned int;
 using uint16_t = unsigned short;
 
-constexpr uint32_t sleepTime = SLEEP_TIME_NS;
-
 struct alignas(16) Value {
     uint32_t token;
     uint32_t layer;
@@ -96,50 +94,57 @@ struct Tokens {
     uint32_t tokens[kMAX_TOKENS];
 };
 
-extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerToken, uint32_t layer,
-        uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens, uint32_t numTokens) {
-    if (sleepTime > 0) {
-        __nanosleep(sleepTime);
-    }
+extern "C" __global__ void fillValues(Value* data, uint32_t valuesPerHead, uint32_t numHeads,
+        uint32_t maxNumTokens, uint32_t layer, uint32_t buf_id, uint32_t beam,
+        __grid_constant__ const Tokens tokens, uint32_t numTokens, uint32_t sleepTime)
+{
     check(numTokens <= kMAX_TOKENS);
     auto const tid = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
-    auto const idxToken = tid / valuesPerToken;
-    if (idxToken >= numTokens) {
-        return;
+    auto const valuesPerHeadSeq = valuesPerHead * maxNumTokens;
+    auto const idxHead = tid / valuesPerHeadSeq;
+    auto const idxToken = tid % valuesPerHeadSeq / valuesPerHead;
+    if (idxToken < numTokens && idxHead < numHeads) {
+        auto const token = tokens.tokens[idxToken];
+        auto const value = Value{token, layer, buf_id, beam};
+        data[tid] = value;
     }
-    auto const token = tokens.tokens[idxToken];
-    auto const value = Value{token, layer, buf_id, beam};
-    data[tid] = value;
+    if (sleepTime > 0 && tid == 0) {
+        __nanosleep(sleepTime);
+    }
 }
 
-__device__ inline void assertEq(Value const& a, Value const& b) {
+__device__ inline void assertEq(Value const& a, Value const& b, uint32_t idxToken) {
 #ifndef NDEBUG
     if (a != b) {
-        printf("(%d, %d, %d, %d) != (%d, %d, %d, %d)\n",
-                a.token, a.layer, a.role, a.beam,
-                b.token, b.layer, b.role, b.beam);
+        printf("idxToken %03d:(%d, %d, %d, %d) != (%d, %d, %d, %d), ctaId=%d, thrdId=%d\n",
+                idxToken, a.token, a.layer, a.role, a.beam,
+                b.token, b.layer, b.role, b.beam,
+                blockIdx.x, threadIdx.x);
     }
 #endif
     check(a == b);
 }
 
-extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToken, uint32_t layer,
-        uint32_t buf_id, uint32_t beam, __grid_constant__ const Tokens tokens, uint32_t numTokens) {
-    if (sleepTime > 0) {
-        __nanosleep(sleepTime);
-    }
+extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerHead, uint32_t numHeads,
+        uint32_t maxNumTokens, uint32_t layer, uint32_t buf_id, uint32_t beam,
+        __grid_constant__ const Tokens tokens, uint32_t numTokens, uint32_t sleepTime)
+{
     check(numTokens <= kMAX_TOKENS);
     auto const tid = (static_cast<uint32_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
-    auto const idxToken = tid / valuesPerToken;
-    if (idxToken >= numTokens) {
-        return;
+    auto const valuesPerHeadSeq = valuesPerHead * maxNumTokens;
+    auto const idxHead = tid / valuesPerHeadSeq;
+    auto const idxToken = tid % valuesPerHeadSeq / valuesPerHead;
+    if (idxToken < numTokens && idxHead < numHeads) {
+        auto const token = tokens.tokens[idxToken];
+        auto const value = Value{token, layer, buf_id, beam};
+        assertEq(data[tid], value, idxToken);
     }
-    auto const token = tokens.tokens[idxToken];
-    auto const value = Value{token, layer, buf_id, beam};
-    assertEq(data[tid], value);
+    if (sleepTime > 0 && tid == 0) {
+        __nanosleep(sleepTime);
+    }
 }
     """
-    macros = [("MAX_TOKENS", str(max_tokens)), ("SLEEP_TIME_NS", str(sleep_time))]
+    macros = [("MAX_TOKENS", str(max_tokens))]
     program_options = ProgramOptions(std="c++17", lineinfo=True, debug=debug, define_macro=macros)  # type: ignore[arg-type]
     if not debug:
         program_options.use_fast_math = True
@@ -148,22 +153,22 @@ extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerToke
     return mod
 
 
-def get_kernel(name: str, num_tokens: int, sleep_time: int) -> tuple[Kernel, int]:
+def get_kernel(name: str, num_tokens: int) -> tuple[Kernel, int]:
     assert num_tokens > 0
 
     @lru_cache(maxsize=None)
-    def impl(name: str, max_tokens: int, sleep_time: int) -> Kernel:
+    def impl(name: str, max_tokens: int) -> Kernel:
         assert name in ("fillValues", "checkValues")
         assert max_tokens != 0 and (max_tokens & (max_tokens - 1)) == 0, (
             "max_tokens must be a power of 2"
         )
         debug = False
         # debug = not NDEBUG
-        return get_program(debug, max_tokens, sleep_time).get_kernel(name)
+        return get_program(debug, max_tokens).get_kernel(name)
 
     # Round up to the next power of two
     max_tokens = 2 ** ((num_tokens - 1).bit_length())
-    return impl(name, max_tokens, sleep_time), max_tokens
+    return impl(name, max_tokens), max_tokens
 
 
 class Value(ctypes.Structure):
@@ -217,26 +222,31 @@ def _make_tokens(tokens: Sequence[TokenIdExt], max_tokens: int) -> ctypes.Struct
 
 def fill_values(
     address: MemAddress,
-    bytes_per_token: int,
+    bytes_per_head: int,
+    num_heads: int,
+    max_num_tokens: int,
     layer: LayerId,
     buf_id: int,
     beam: int,
     tokens: Sequence[TokenIdExt],
     stream: CudaStream,
 ):
-    values_per_token = exact_div(bytes_per_token, ctypes.sizeof(Value))
+    values_per_head = exact_div(bytes_per_head, ctypes.sizeof(Value))
     num_tokens = len(tokens)
     if num_tokens == 0:
         return
-    kernel, max_tokens = get_kernel("fillValues", len(tokens), _SLEEP_TIME_NS)
+    kernel, max_tokens = get_kernel("fillValues", len(tokens))
     args = (
         address,
-        values_per_token,
+        values_per_head,
+        num_heads,
+        max_num_tokens,
         layer,
         buf_id,
         beam,
         _make_tokens(tokens, max_tokens),
         num_tokens,
+        _SLEEP_TIME_NS,
     )
     arg_types = (
         ctypes.c_void_p,
@@ -244,10 +254,13 @@ def fill_values(
         ctypes.c_uint32,
         ctypes.c_uint32,
         ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
         None,
         ctypes.c_uint32,
+        ctypes.c_uint32,
     )
-    num_threads = values_per_token * num_tokens
+    num_threads = values_per_head * num_heads * max_num_tokens
     cta_size = 256
     _unwrap(
         drv.cuLaunchKernel(
@@ -268,26 +281,31 @@ def fill_values(
 
 def check_values(
     address: MemAddress,
-    bytes_per_token: int,
+    bytes_per_head: int,
+    num_heads: int,
+    max_num_tokens: int,
     layer: LayerId,
     buf_id: int,
     beam: int,
     tokens: Sequence[TokenIdExt],
     stream: CudaStream,
 ):
-    values_per_token = exact_div(bytes_per_token, ctypes.sizeof(Value))
+    values_per_head = exact_div(bytes_per_head, ctypes.sizeof(Value))
     num_tokens = len(tokens)
     if num_tokens == 0:
         return
-    kernel, max_tokens = get_kernel("checkValues", len(tokens), _SLEEP_TIME_NS)
+    kernel, max_tokens = get_kernel("checkValues", len(tokens))
     args = (
         address,
-        values_per_token,
+        values_per_head,
+        num_heads,
+        max_num_tokens,
         layer,
         buf_id,
         beam,
         _make_tokens(tokens, max_tokens),
         num_tokens,
+        _SLEEP_TIME_NS,
     )
     arg_types = (
         ctypes.c_void_p,
@@ -295,10 +313,13 @@ def check_values(
         ctypes.c_uint32,
         ctypes.c_uint32,
         ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
         None,
         ctypes.c_uint32,
+        ctypes.c_uint32,
     )
-    num_threads = values_per_token * num_tokens
+    num_threads = values_per_head * num_heads * max_num_tokens
     cta_size = 256
     _unwrap(
         drv.cuLaunchKernel(

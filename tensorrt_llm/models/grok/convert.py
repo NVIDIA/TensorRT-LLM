@@ -428,7 +428,7 @@ def create_config_from_xai(dtype,
         True,
     })
 
-    config['quantization'] = quantization.to_dict()
+    config['quantization'] = quantization.model_dump()
     config.update(override_fields)
 
     return config

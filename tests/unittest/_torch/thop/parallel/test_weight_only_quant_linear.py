@@ -11,7 +11,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
     "dtype",
     [torch.float16, torch.bfloat16],
 )
-def test_weight_only_quant_linear(dtype, weights_dtype):
+@pytest.mark.parametrize("bias", [True, False])
+def test_weight_only_quant_linear(dtype, weights_dtype, bias):
 
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
@@ -27,6 +28,8 @@ def test_weight_only_quant_linear(dtype, weights_dtype):
     w = w.cuda()
     w_processed = w_processed.cuda()
     w_scales = w_scales.cuda()
+    b = torch.randn(
+        (OUT_FEATURES), dtype=dtype, device="cuda") if bias else None
 
     if weights_dtype == torch.int8:
         qc = QuantConfig(quant_algo=QuantAlgo.W8A16, group_size=1)
@@ -37,14 +40,14 @@ def test_weight_only_quant_linear(dtype, weights_dtype):
 
     linear_woq = Linear(in_features=HIDDEN_SIZE,
                         out_features=OUT_FEATURES,
-                        bias=False,
+                        bias=bias,
                         dtype=dtype,
                         quant_config=qc)
 
-    linear_woq.load_weights([{
-        'weight': w.T,
-        'weight_scale': w_scales,
-    }])
+    load_dict = {'weight': w.T, 'weight_scale': w_scales}
+    if bias:
+        load_dict['bias'] = b
+    linear_woq.load_weights([load_dict])
 
     linear_woq = linear_woq.cuda()
 
@@ -57,5 +60,7 @@ def test_weight_only_quant_linear(dtype, weights_dtype):
     with torch.inference_mode():
         output_ref = torch.ops.trtllm.weight_only_quant_gemm(
             x.contiguous(), w_processed, weights_dtype, w_scales, dtype)
+        if bias:
+            output_ref = output_ref + b
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref)

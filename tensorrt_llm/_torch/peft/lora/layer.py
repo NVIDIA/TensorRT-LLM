@@ -74,6 +74,16 @@ class LoraModuleType(IntEnum):
     MLP_ROUTER = 17  # MLP router
     MLP_GATE_UP = 18  # Combined gate and up projections
 
+    SHARED_EXPERT_H_TO_4H = 19  # Shared expert first projection
+    SHARED_EXPERT_4H_TO_H = 20  # Shared expert second projection
+    SHARED_EXPERT_GATE = 21  # Shared expert gate projection
+
+    MAMBA_IN_PROJ = 22  # Mamba input projection
+    MAMBA_OUT_PROJ = 23  # Mamba output projection
+
+    MOE_LATENT_FC1 = 24  # MoE latent fc1 projection (fc1_latent_proj)
+    MOE_LATENT_FC2 = 25  # MoE latent fc2 projection (fc2_latent_proj)
+
     def __str__(self):
         """Return the name of the enum value."""
         return self.name
@@ -118,8 +128,14 @@ class LoraModuleType(IntEnum):
     def is_moe(self) -> bool:
         """Check if this is a Mixture of Experts (MoE) module type."""
         return self in {
-            self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER
+            self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER,
+            self.MOE_LATENT_FC1, self.MOE_LATENT_FC2
         }
+
+    @property
+    def is_mamba(self) -> bool:
+        """Check if this is a Mamba module type."""
+        return self in {self.MAMBA_IN_PROJ, self.MAMBA_OUT_PROJ}
 
 
 class LoraLayer(torch.nn.Module):
@@ -475,14 +491,16 @@ class LoraLayer(torch.nn.Module):
         lora_weight_pointers = []
         active_lora_module_ids = []
 
+        # Check if this layer has any LoRA weights
+        layer_params = lora_params.get(layer_idx, {})
+
         for module_idx in self.lora_module_types:
             module_idx = int(module_idx)
-            if module_idx in lora_params[layer_idx]:
+            if module_idx in layer_params:
                 active_lora_module_ids.append(module_idx)
-                lora_ranks.append(
-                    lora_params[layer_idx][module_idx]['adapter_size'])
+                lora_ranks.append(layer_params[module_idx]['adapter_size'])
                 lora_weight_pointers.append(
-                    lora_params[layer_idx][module_idx]['weight_pointers'])
+                    layer_params[module_idx]['weight_pointers'])
 
         num_seqs = lora_params['num_seqs']
 

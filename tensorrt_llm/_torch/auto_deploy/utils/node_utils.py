@@ -39,16 +39,17 @@ class LayerType(Enum):
     MLP = "mlp"
     MOE = "moe"
     MLA = "mla"
+    DELTA = "delta"
     UNKNOWN = "unknown"
 
 
 class LayerSubgraph(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    opening_nodes: List[Node]
-    subgraph_nodes: List[Node]
-    terminating_node: Union[Node, None]
     layer_type: LayerType
+    opening_nodes: List[Node]
+    terminating_node: Union[Node, None]
     min_local_shape: int = 1
+    subgraph_nodes: List[Node]
 
 
 class WeightNode(BaseModel):
@@ -321,11 +322,44 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             ],
             biases=[],
         )
+    elif is_fake_quantized_linear_op(node):
+        # For quantized linear ops (FP8, FP4, etc.), only args[1] is the actual shardable
+        # weight. Scale buffers (input_scale, weight_scale, alpha, ...) are also registered
+        # as get_attr nodes in the graph and would otherwise be picked up by the generic
+        # all_input_nodes scan below -- causing shard_weight_tensor to overwrite them as
+        # nn.Parameters, which then breaks quantization_cb's get_buffer() call.
+        # The quantization_cb (QuantizationShardingMixin) is responsible for sharding scales.
+        weight_node = find_get_attr_node(node.args[1])
+        if weight_node is None:
+            return WeightNodes(weights=[], biases=[])
+        biases = []
+        if len(node.args) > 2 and isinstance(node.args[2], Node):
+            b = find_get_attr_node(node.args[2])
+            if b is not None and b.target.rsplit(".", 1)[-1] == "bias":
+                biases = [
+                    WeightNode(
+                        node=node.args[2],
+                        node_key=b.target,
+                        submod=gm.get_submodule(b.target.rpartition(".")[0]),
+                        tensor=get_param_or_buffer(b.target, gm),
+                    )
+                ]
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node.args[1],
+                    node_key=weight_node.target,
+                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
+                    tensor=get_param_or_buffer(weight_node.target, gm),
+                )
+            ],
+            biases=biases,
+        )
     elif is_weight_node(node):
         weights = []
         biases = []
 
-        if node.target.endswith("bias"):
+        if node.target.rsplit(".", 1)[-1] == "bias":
             biases = [
                 WeightNode(
                     node=node,
@@ -355,7 +389,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             if (attr_node := find_get_attr_node(n)) is not None
         ]
         # separate weight nodes and bias nodes
-        bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
+        bias_nodes = [n for n in all_weight_nodes if n.target.rsplit(".", 1)[-1] == "bias"]
         weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]
         weight_nodes = [
             WeightNode(
@@ -379,11 +413,18 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
 
 
 def get_weight_node(node: Node) -> Node:
-    """Get the primary weight node for a compute node."""
+    """Get the primary weight node for a compute node.
+
+    When the node itself is a bias get_attr node (i.e. extract_weight_nodes
+    puts it into .biases rather than .weights), return the bias node so that
+    num_users_of_weight_node gives the correct user count instead of 0.
+    """
     weight_nodes = extract_weight_nodes(node)
-    if len(weight_nodes.weights) == 0:
-        raise ValueError(f"Node {node.name} has no weight")
-    return weight_nodes.weights[0].node
+    if len(weight_nodes.weights) > 0:
+        return weight_nodes.weights[0].node
+    if len(weight_nodes.biases) > 0:
+        return weight_nodes.biases[0].node
+    raise ValueError(f"Node {node.name} has no weight or bias")
 
 
 def num_users_of_weight_node(node: Node) -> int:
@@ -429,6 +470,106 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
         is_match = False
 
     return is_match
+
+
+def is_trivial_passthrough_user(node: Node) -> bool:
+    """Check whether a node is a trivial layout/index passthrough op."""
+    if node.op == "call_method":
+        return node.target in {
+            "view",
+            "reshape",
+            "transpose",
+            "permute",
+            "contiguous",
+            "__getitem__",
+        }
+    if node.op == "call_function":
+        if node.target is operator.getitem:
+            return True
+        return (
+            is_op(node, torch.ops.aten.view)
+            or is_op(node, torch.ops.aten.reshape)
+            or is_op(node, torch.ops.aten.transpose)
+            or is_op(node, torch.ops.aten.permute)
+            or is_op(node, torch.ops.aten.contiguous)
+        )
+    return False
+
+
+def collect_terminal_users_through_passthrough(
+    source_node: Node,
+    *,
+    max_traversal_nodes: int = 256,
+) -> Tuple[List[Node], bool]:
+    """Collect terminal users while traversing trivial passthrough users.
+
+    Only follows passthrough nodes whose primary data argument (args[0])
+    comes from the source data path.  This prevents the traversal from
+    leaking into unrelated graph regions when the source node is referenced
+    as a non-data argument (e.g. shape) of a passthrough op.
+
+    Returns:
+        (terminal_users, traversal_ok)
+    """
+    terminal_users: List[Node] = []
+    data_nodes = {source_node}
+    stack = list(source_node.users)
+    seen = set()
+    while stack:
+        user = stack.pop()
+        if user in seen:
+            continue
+        seen.add(user)
+        if len(seen) > max_traversal_nodes:
+            return [], False
+        if is_trivial_passthrough_user(user):
+            if user.args and isinstance(user.args[0], Node) and user.args[0] in data_nodes:
+                data_nodes.add(user)
+                stack.extend(list(user.users))
+                continue
+        terminal_users.append(user)
+    return terminal_users, True
+
+
+def get_shared_input_scale_for_fp8_linears(
+    nodes: Iterable[Node],
+) -> Tuple[List[Node], Optional[Node]]:
+    """Return FP8 linear nodes and their shared input_scale if one exists."""
+    supported_fp8_linear_ops = (
+        torch.ops.auto_deploy.trtllm_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_quant_fp8_linear,
+    )
+    fp8_linear_nodes: List[Node] = [
+        node for node in nodes if any(is_op(node, op) for op in supported_fp8_linear_ops)
+    ]
+    if not fp8_linear_nodes:
+        return [], None
+
+    first_scale = extract_op_args(
+        fp8_linear_nodes[0], "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+    )[3]
+    if not isinstance(first_scale, Node):
+        return [], None
+
+    for node in fp8_linear_nodes[1:]:
+        scale = extract_op_args(node, "input", "weight_fp8", "bias", "input_scale", "weight_scale")[
+            3
+        ]
+        if not isinstance(scale, Node):
+            return [], None
+        if scale is first_scale:
+            continue
+
+        # Allow equivalent scale nodes only when both are stable get_attr reads
+        # of the same module attribute.
+        if not (
+            first_scale.op == "get_attr"
+            and scale.op == "get_attr"
+            and scale.target == first_scale.target
+        ):
+            return [], None
+
+    return fp8_linear_nodes, first_scale
 
 
 def filtered_nodes(
@@ -510,7 +651,17 @@ def is_any_moe_op(node: Node) -> bool:
             torch.ops.auto_deploy.torch_moe,
             torch.ops.auto_deploy.torch_quant_fp8_moe,
             torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+            torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
             torch.ops.auto_deploy.triton_mxfp4_moe,
+        ],
+    )
+
+
+def is_any_delta_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_gated_delta_rule,
         ],
     )
 
@@ -536,6 +687,7 @@ def is_any_conv_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_causal_conv1d,
+            torch.ops.aten.conv1d,  # Support regular conv1d for tests
         ],
     )
 
@@ -577,6 +729,7 @@ def is_fake_quantized_linear_op(node: Node) -> bool:
     quantized_linear_op = {
         torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
         torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
     }
 
     return is_op(node, quantized_linear_op)
@@ -605,6 +758,89 @@ def is_weight_node(node: Node) -> bool:
     return node.op == "get_attr" and node.target and has_shape(node) and len(shape(node)) > 0
 
 
+# Auxiliary ops that may appear between a weight node and its consumer compute node
+_WEIGHT_AUX_OPS = frozenset(
+    {
+        torch.ops.aten.to.dtype,
+        torch.ops.aten.view.default,
+    }
+)
+
+
+def precompute_weight_node_mapping(gm: GraphModule) -> None:
+    """
+    Pre-compute weight-to-consumer mapping for all weight nodes in the graph.
+
+    For each weight node (get_attr), finds the consumer compute node by traversing
+    through auxiliary ops (to.dtype, view.default). Stores the mapping in consumer
+    node's metadata:
+      - node.meta["weight_nodes"]: list of weight nodes (non-bias)
+      - node.meta["bias_nodes"]: list of bias nodes
+
+    This enables O(1) weight node lookup instead of O(depth) backward traversal.
+    Called automatically on first weight lookup via lazy initialization.
+
+    GUARANTEES (verified by assertions for debugging):
+      - Called exactly once per GraphModule
+      - No duplicate weight/bias nodes in any consumer's lists
+      - Each weight node mapped to exactly one consumer
+    """
+    # Early return if already computed
+    if "_weight_mapping_computed" in gm.meta and gm.meta["_weight_mapping_computed"]:
+        return
+    gm.meta["_weight_mapping_computed"] = True
+
+    for node in gm.graph.nodes:
+        if not is_weight_node(node):
+            continue
+
+        is_bias = node.target.rsplit(".", 1)[-1] == "bias"
+
+        # the weight to user mapping is reflective - the weight node "owns" itself
+        node.meta["weight_nodes"] = [node]
+
+        # Find the consumer compute node by traversing through auxiliary ops
+        current = node
+        visited = {current}
+
+        while True:
+            # Get users of current node
+            users = list(current.users.keys())
+            if not users:
+                break
+
+            aux_node = None
+
+            for user in users:
+                if is_bias:
+                    if "bias_nodes" not in user.meta:
+                        user.meta["bias_nodes"] = []
+                    # ASSERTION: Each weight node should be mapped exactly once
+                    assert node not in user.meta["bias_nodes"], (
+                        f"Duplicate bias node {node.name} found for consumer {user.name}"
+                    )
+                    user.meta["bias_nodes"].append(node)
+                else:
+                    if "weight_nodes" not in user.meta:
+                        user.meta["weight_nodes"] = []
+                    # ASSERTION: Each weight node should be mapped exactly once
+                    assert node not in user.meta["weight_nodes"], (
+                        f"Duplicate weight node {node.name} found for consumer {user.name}"
+                    )
+                    user.meta["weight_nodes"].append(node)
+                if user.target in _WEIGHT_AUX_OPS:
+                    # This is an auxiliary op, continue traversing
+                    aux_node = user
+
+            if aux_node is not None and aux_node not in visited:
+                # Continue through auxiliary op
+                current = aux_node
+                visited.add(current)
+            else:
+                # No more nodes to traverse
+                break
+
+
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
     """Get a user from a node if the node matches a given op set and num of users."""
     if node is None:
@@ -623,7 +859,7 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     Right now, we split the regions according to the following structure:
         1. Input node
         2. Embedding node
-        3. Residual nodes from the embedding node onwards (no other nodes in-between0)
+        3. Residual nodes from the embedding node onwards (no other nodes in-between)
         4. Output node
 
     The list will contain the boundary nodes between the regions.
@@ -657,11 +893,14 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     boundary_nodes.append(n_user)
 
     # find residual nodes from here on
-    # NOTE: for now, we assume that the residual nodes do not go through point-wise operations like
-    # activations. We are just looking for a "straight" path to the output.
-    for node in gm.graph.nodes:
-        if is_op(node, torch.ops.aten.add) and any(n == node for n in boundary_nodes[-1].users):
-            boundary_nodes.append(node)
+    while True:
+        next_res_add, _ = bfs(
+            boundary_nodes[-1], lambda n: is_op(n, torch.ops.aten.add), include_root=False
+        )
+        if next_res_add is None:
+            break
+        else:
+            boundary_nodes.append(next_res_add)
 
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
@@ -674,7 +913,9 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
+def get_all_layer_subgraphs(
+    gm: GraphModule, linear_nodes: Optional[List[Node]] = None
+) -> tuple[List[LayerSubgraph], set[Node]]:
     """
     Get subgraphs for all consecutive layers (attention, MLP, SSM, MoE) in the graph.
 
@@ -707,7 +948,14 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
 
     assert gm.graph.nodes, "Graph is empty"
     layer_subgraphs = []
-    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    if linear_nodes is None:
+        linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+
+    # get residual add nodes to correctly identify layer boundaries
+    residuals = identify_regions_between_residuals(gm)
+
+    # Pre-compute weight-to-consumer mapping for O(1) weight node lookup
+    precompute_weight_node_mapping(gm)
 
     # Cache weight shapes for all linear nodes
     for lin_node in linear_nodes:
@@ -729,7 +977,9 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
 
     # For each linear node, find its layer subgraph defined as regions between consecutive linear nodes.
     while last_lin_index < len(linear_nodes):
-        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices, embd=embd)
+        layer_subgraph = get_layer_after_linear_node(
+            linear_nodes, terminating_indices, embd=embd, residuals=residuals
+        )
 
         if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
             unprocessed_linear_nodes -= (
@@ -799,6 +1049,18 @@ def extract_output_tuple(node: Node, count: int = 2):
     return results
 
 
+def _get_op_schema(node: Node):
+    """Return the op schema for a call_function node."""
+    if node.op != "call_function":
+        raise ValueError(f"_get_op_schema only supports call_function nodes, got {node.op}")
+    op = node.target
+    if hasattr(op, "_schemas"):
+        return next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        return op._schema
+    raise RuntimeError(f"No schema found on op {op}")
+
+
 def extract_op_args(node: Node, *arg_names):
     """
     Given a call_function node for torch custom op,
@@ -807,16 +1069,7 @@ def extract_op_args(node: Node, *arg_names):
     2. node.args[position_in_schema]
     3. the schema default
     """
-    if node.op != "call_function":
-        raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
-
-    op = node.target
-    if hasattr(op, "_schemas"):
-        schema = next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        schema = op._schema
-    else:
-        raise RuntimeError(f"No schema found on op {op}")
+    schema = _get_op_schema(node)
     args_meta = schema.arguments
 
     # name→index in signature, and name→default_value
@@ -834,7 +1087,7 @@ def extract_op_args(node: Node, *arg_names):
             return args[i]
         if name in defs:
             return defs[name]
-        raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
+        raise RuntimeError(f"Could not find a value for '{name}' on op {node.target}")
 
     return [_get(n) for n in arg_names]
 
@@ -854,17 +1107,7 @@ def set_op_args(node: Node, **name_value_pairs) -> None:
     This is the write-side complement to :func:`extract_op_args` and avoids
     manual index arithmetic when injecting new arguments into a node.
     """
-    if node.op != "call_function":
-        raise ValueError(f"set_op_args only supports call_function nodes, got {node.op}")
-
-    op = node.target
-    if hasattr(op, "_schemas"):
-        schema = next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        schema = op._schema
-    else:
-        raise RuntimeError(f"No schema found on op {op}")
-
+    schema = _get_op_schema(node)
     pos = {a.name: i for i, a in enumerate(schema.arguments)}
 
     args = list(node.args)
@@ -872,7 +1115,7 @@ def set_op_args(node: Node, **name_value_pairs) -> None:
 
     for name, value in name_value_pairs.items():
         if name not in pos:
-            raise RuntimeError(f"'{name}' is not a valid argument for op {op}")
+            raise RuntimeError(f"'{name}' is not a valid argument for op {node.target}")
         if name in kwargs:
             kwargs[name] = value
         elif pos[name] < len(args):
@@ -1052,6 +1295,7 @@ def get_layer_after_linear_node(
     linear_nodes: List[Node],
     terminating_indices: List[int],
     embd: int,
+    residuals: List[Node],
     match_on_shapes: bool = True,
     enforce_strict_linear_history: bool = True,
 ) -> LayerSubgraph:
@@ -1096,18 +1340,27 @@ def get_layer_after_linear_node(
     def boundary_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
             if is_any_lin_op(node):
-                return node.meta["lin_node_shape"][dim] == embd
+                # MLA latent projections like q_b_proj can map back to the embedding width while
+                # still feeding the downstream MLA op. Those are internal attention projections,
+                # not true layer boundaries.
+                feeds_mla, _ = bfs(
+                    node,
+                    target=is_any_mla_op,
+                    attr_next="users",
+                    include_root=False,
+                )
+                return node.meta["lin_node_shape"][dim] == embd and feeds_mla is None
             return (
                 is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
-                or is_residual_add(node)
+                or node in residuals
             )
         else:
             return (
                 is_any_lin_op(node)
                 or is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
-                or is_residual_add(node)
+                or node in residuals
             )
 
     def filter_condition(node: Node, dim: int) -> bool:
@@ -1139,17 +1392,26 @@ def get_layer_after_linear_node(
             filtered_nodes(forward_subgraph, lambda n: filter_condition(n, dim=0))
         )
         if len(lin_nodes_in_subgraph) > 1:
-            # it means that probably we went over the boundary of the layer.
-            # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2 projection,
-            # when the subgraph spanned over fc2 "spills" over consecutive layers.
-            # Then, wrap this single linear node in  LayerType.UNKNOWN and return.
-            terminating_indices.append(start_lin_index)
-            return LayerSubgraph(
-                opening_nodes=[linear_nodes[start_lin_index]],
-                subgraph_nodes=[],
-                terminating_node=linear_nodes[start_lin_index],
-                layer_type=LayerType.UNKNOWN,
-            )
+            # MLA can legitimately expose multiple embedding-shaped linear nodes in the forward
+            # slice: latent projections like q_b_proj may match the embedding width while still
+            # feeding the downstream MLA op, and o_proj is the true layer terminator. In that
+            # case we keep the deepest linear sink instead of wrapping the opening projection as
+            # an unknown one-node layer.
+            mla_nodes_forward = list(filtered_nodes(forward_subgraph, is_any_mla_op))
+            if len(mla_nodes_forward) == 1:
+                lin_nodes_in_subgraph = [max(lin_nodes_in_subgraph, key=linear_nodes.index)]
+            else:
+                # it means that probably we went over the boundary of the layer.
+                # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2
+                # projection, when the subgraph spanned over fc2 "spills" over consecutive layers.
+                # Then, wrap this single linear node in LayerType.UNKNOWN and return.
+                terminating_indices.append(start_lin_index)
+                return LayerSubgraph(
+                    opening_nodes=[linear_nodes[start_lin_index]],
+                    subgraph_nodes=[],
+                    terminating_node=linear_nodes[start_lin_index],
+                    layer_type=LayerType.UNKNOWN,
+                )
         start_lin_index += 1
     start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
@@ -1180,6 +1442,7 @@ def get_layer_after_linear_node(
         if n not in set(opening_linear_nodes).union([terminating_linear_node])
     ]
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
+    delta_nodes = list(filtered_nodes(interior_nodes, is_any_delta_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
     mla_nodes = list(filtered_nodes(interior_nodes, is_any_mla_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
@@ -1194,9 +1457,28 @@ def get_layer_after_linear_node(
     ####################################################
 
     def classify_layer_type() -> [LayerType, int]:
-        if len(ssm_nodes) + len(attention_nodes) + len(mla_nodes) > 1:
+        if len(ssm_nodes) + len(attention_nodes) + len(mla_nodes) + len(delta_nodes) > 1:
             # ambiguous layer type
             return LayerType.UNKNOWN, 1
+
+        if len(delta_nodes) == 1:
+            head_size = shape(delta_nodes[0])[-1]
+            # Gated DeltaNet layers should have 2 opening linear nodes (fused qkvz + ba,
+            # e.g. Qwen3Next) or 4 opening linear nodes (unfused qkv + z + b + a,
+            # e.g. Qwen3.5 MoE) and one terminating node.
+            if len(intermediate_lin_nodes) > 0 or len(opening_linear_nodes) not in (2, 4):
+                return LayerType.UNKNOWN, 1
+            # Gated DeltaNet layer should have 4 to 6 intermediate weight nodes:
+            # - conv1d weight
+            # - attn_A (attn_a_log))
+            # - attn_norm_weight
+            # - layernorm_weight
+            # - attn_dt_bias [optional]
+            # - conv1d bias [optional]
+
+            if len(intermediate_weight_nodes) not in list(range(4, 7)):
+                return LayerType.UNKNOWN, 1
+            return LayerType.DELTA, head_size
 
         if len(attention_nodes) == 1:
             head_size = shape(attention_nodes[0])[-1]
@@ -1296,3 +1578,47 @@ def draw_graph(gm: GraphModule, filename: str):
     drawer = FxGraphDrawer(gm, filename)
     with open(f"{filename}.svg", "wb") as f:
         f.write(drawer.get_dot_graph().create_svg())
+
+
+def sync_weight_meta_dtype(gm: GraphModule) -> int:
+    """Sync .meta['val'] dtype with actual state_dict dtype for weight nodes.
+
+    During graph tracing, .meta['val'] is set with the dtype at tracing time.
+    However, quantization transforms may change the actual weight dtype (e.g., FP16 -> FP8)
+    without updating .meta['val']. This causes ONNX export to see incorrect dtypes.
+
+    This function iterates through all get_attr nodes and updates their .meta['val']
+    to match the actual tensor dtype from the GraphModule's state.
+
+    Args:
+        gm: The GraphModule containing weights to sync.
+
+    Returns:
+        Number of weight meta dtypes that were synced.
+    """
+    num_synced = 0
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            try:
+                # Traverse the attribute path to get the actual tensor
+                target_path = str(node.target)
+                obj = gm
+                for attr in target_path.split("."):
+                    obj = getattr(obj, attr)
+
+                # Update .meta["val"] if dtype differs
+                if isinstance(obj, torch.Tensor) and "val" in node.meta:
+                    old_val = node.meta["val"]
+                    if hasattr(old_val, "dtype") and old_val.dtype != obj.dtype:
+                        # Create new meta tensor with correct dtype
+                        node.meta["val"] = torch.empty(
+                            obj.shape, dtype=obj.dtype, device=old_val.device
+                        )
+                        ad_logger.debug(
+                            f"Synced {node.target} meta dtype: {old_val.dtype} -> {obj.dtype}"
+                        )
+                        num_synced += 1
+            except (AttributeError, RuntimeError):
+                pass  # Skip if attribute not found
+
+    return num_synced

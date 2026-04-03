@@ -13,7 +13,7 @@ from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import is_llm_response
+from .utils import ErrorResponse, is_llm_response
 
 if TYPE_CHECKING:
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
@@ -71,6 +71,7 @@ class PostprocWorker:
         metrics: Optional[dict[str, float]] = None
         request_perf_metrics: Any = None
         disaggregated_params: Any = None
+        should_abort: bool = False
 
     def __init__(
         self,
@@ -181,10 +182,18 @@ class PostprocWorker:
                 inp, PostprocWorker.Input
             ), f"Expect PostprocWorker.Input, got {type(inp)}."
             client_id = inp.rsp.client_id
+            # ErrorResponse has no 'result' attribute; pass it through
+            # directly so the proxy handles it via its ErrorResponse path.
+            if isinstance(inp.rsp, ErrorResponse):
+                batch.append(inp.rsp)
+                self._records.pop(client_id, None)
+                return
             is_final = inp.rsp.result.is_final if is_llm_response(
                 inp.rsp) else True
             res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                 inp)
+            record = self._records.get(client_id)
+            should_abort = record._aborted if record else False
             batch.append(
                 PostprocWorker.Output(
                     client_id=client_id,
@@ -193,6 +202,7 @@ class PostprocWorker:
                     metrics=metrics,
                     request_perf_metrics=perf_metrics,
                     disaggregated_params=disaggregated_params,
+                    should_abort=should_abort,
                 ))
             if is_final:
                 self._records.pop(client_id)

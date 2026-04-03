@@ -15,7 +15,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
    - [YAML Configuration](#yaml-configuration)
    - [Starting the Server](#starting-the-server)
    - [Client Usage](#client-usage)
-5. [TRTLLM bench with LORA](#trtllm-bench-with-lora)
+5. [TRTLLM bench with LoRA](#trtllm-bench-with-lora)
    - [YAML Configuration](#yaml-configuration)
    - [Run trtllm-bench](#run-trtllm-bench)
 
@@ -194,7 +194,7 @@ response = client.completions.create(
 )
 ```
 
-## TRTLLM bench with LORA
+## TRTLLM bench with LoRA
 
 ### YAML Configuration
 

@@ -1,5 +1,11 @@
 # EAGLE speculative Decoding
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a model using EAGLE decoding ([`GitHub`](https://github.com/SafeAILab/EAGLE/tree/main), [`BLOG`](https://sites.google.com/view/eagle-llm)) in TensorRT LLM on a single node with one or multiple GPUs.
 
 ## Overview
@@ -8,7 +14,7 @@ Different from other models, EAGLE decoding needs a base model and an EAGLE mode
 The TensorRT LLM EAGLE decoding implementation can be found in [tensorrt_llm/models/eagle/model.py](../../tensorrt_llm/models/eagle/model.py).
 The implementation adds an EAGLE drafter network to a base model.
 
-For more info about EAGLE, refer to [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
+For more info about EAGLE, refer to [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/features/speculative-decoding.html).
 
 ## Limitations
   * EAGLE-2 is not supported.
@@ -85,7 +91,7 @@ To run a TensorRT LLM model with EAGLE-1 decoding support, you can use `../run.p
 The `--eagle_choices` argument is of type `list[list[int]]`. If you do not specify any choices, the
 default, [mc_sim_7b_63](https://github.com/FasterDecoding/Medusa/blob/main/medusa/model/medusa_choices.py#L1) choices
 are used. For more information regarding choices tree, refer
-to [Medusa Tree](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html#medusa-tree).
+to [Medusa Tree](https://nvidia.github.io/TensorRT-LLM/legacy/advanced/speculative-decoding.html#medusa-tree).
 
 The number of non-leaf nodes at each level can not exceed `max_non_leaves_per_layer` set
 to `convert_checkpoint`. For example, in the tree below (`mc_sim_7b_63`) the minimum number of

@@ -128,7 +128,10 @@ class ModelWeightsLoader:
         return tllm_keys[0] if len(tllm_keys) == 1 else tllm_keys
 
     def detect_format(self):
-        if os.path.isfile(self.model_dir):
+        if isinstance(self.model_dir, dict) or isinstance(
+                self.model_dir, PreTrainedModel):
+            self.format = ModelWeightsFormat.IN_MEMORY
+        elif os.path.isfile(self.model_dir):
             if self.model_dir.endswith(".safetensors"):
                 self.format = ModelWeightsFormat.SAFETENSORS
             elif self.model_dir.endswith(".bin"):
@@ -149,9 +152,6 @@ class ModelWeightsLoader:
             else:
                 raise NotImplementedError(
                     "Only safetensors/pickle/binary directories are supported.")
-        elif isinstance(self.model_dir, dict) or isinstance(
-                self.model_dir, PreTrainedModel):
-            self.format = ModelWeightsFormat.IN_MEMORY
         else:
             raise NotImplementedError(
                 "args.model_dir is not a directory, a file or an in-memory module!"
@@ -159,14 +159,14 @@ class ModelWeightsLoader:
 
     def preload(self):
         # Initialize shards and load_func
-        if os.path.isdir(self.model_dir):
-            shard_files = glob.glob(self.model_dir + "/*." + self.format.value)
-        elif os.path.isfile(self.model_dir):
-            shard_files = [self.model_dir]
+        if isinstance(self.model_dir, PreTrainedModel):
+            shard_files = [dict(self.model_dir.named_parameters())]
         elif isinstance(self.model_dir, dict):
             shard_files = [self.model_dir]
-        elif isinstance(self.model_dir, PreTrainedModel):
-            shard_files = [dict(self.model_dir.named_parameters())]
+        elif os.path.isfile(self.model_dir):
+            shard_files = [self.model_dir]
+        elif os.path.isdir(self.model_dir):
+            shard_files = glob.glob(self.model_dir + "/*." + self.format.value)
         else:
             raise NotImplementedError(
                 "args.model_dir is not a directory, a file or an in-memory module!"

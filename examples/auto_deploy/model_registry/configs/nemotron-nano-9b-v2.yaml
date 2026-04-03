@@ -1,0 +1,25 @@
+# Configuration for NVIDIA Nemotron Nano 9B v2 (SSM/hybrid model)
+
+skip_tokenizer_init: false
+trust_remote_code: true
+
+# SSMs do not support cache reuse.
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+
+# Keep max_batch_size as in the PyTorch test to avoid OOM
+max_batch_size: 128
+
+# Model context length is 8K
+max_seq_len: 8192
+
+# Set explicitly to match default build_config behavior
+max_num_tokens: 8192
+
+skip_loading_weights: false
+
+transforms:
+  compile_model:
+    backend: torch-cudagraph
+    cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]

@@ -8,7 +8,7 @@ def get_local_ip() -> str:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("10.255.255.255", 1))
             ip = s.getsockname()[0]
-            if not ip.startswith("127."):
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
                 return ip
 
     except (ImportError, OSError, ValueError):

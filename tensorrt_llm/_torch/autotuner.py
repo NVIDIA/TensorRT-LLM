@@ -19,8 +19,9 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.bindings.internal.runtime import delay_kernel
+from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
+                                                    record_global_timer)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -200,7 +201,7 @@ class TunableRunner(ABC):
 
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
-            * when the autotuner cannot find a valid tactic in it's cache.
+            * when the autotuner cannot find a valid tactic in its cache.
             * in eager mode, w/o autotunning the custom op should have at least one kernel, which makes the autotuning
               process an optional process, such that user can opt out.
 
@@ -254,12 +255,18 @@ class TunableRunner(ABC):
 
 
 @contextlib.contextmanager
-def autotune(tune_mode: bool = True, cache_path: str = None):
+def autotune(tune_mode: bool = True,
+             cache_path: str = None,
+             skip_dynamic_tuning_buckets: bool = False):
     """Context manager for autotuning with distributed support.
 
     Args:
         tune_mode: Whether to enable tuning mode
         cache_path: Path to save/load cache files
+        skip_dynamic_tuning_buckets: When True, suppress bucket generation in
+            _optimization_profiles() so only actual input shapes from warmup
+            are profiled. Useful for workloads (e.g. diffusion) where the
+            LLM-oriented M-bucket sweep is unnecessary.
     """
     autotuner = AutoTuner.get()
     rank = autotuner.mapping.rank
@@ -276,7 +283,9 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
 
     # record the old tuning mode
     old_mode = autotuner.is_tuning_mode
+    old_skip = autotuner.skip_dynamic_tuning_buckets
     autotuner.is_tuning_mode = tune_required
+    autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
@@ -286,6 +295,7 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
         yield
     finally:
         autotuner.is_tuning_mode = old_mode
+        autotuner.skip_dynamic_tuning_buckets = old_skip
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
 
@@ -725,6 +735,22 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self.is_tuning_mode = False
+        self.skip_dynamic_tuning_buckets = False
+
+        # Timing backend: globaltimer kernel vs cuda events.
+        # TLLM_PROFILING_TIMER env var overrides auto-detection:
+        #   "globaltimer" -> force globaltimer
+        #   "cuda_event"  -> force cuda events
+        #   unset/default -> auto-detect via confidential_compute_enabled()
+        timer_env = os.getenv("TLLM_PROFILING_TIMER", "").lower()
+        if timer_env == "globaltimer":
+            self._use_global_timer = True
+        elif timer_env == "cuda_event":
+            self._use_global_timer = False
+        else:
+            self._use_global_timer = confidential_compute_enabled()
+
+        logger.debug(f"[Autotuner] use_global_timer: {self._use_global_timer}")
 
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
@@ -1150,9 +1176,34 @@ class AutoTuner:
         avg_time = float('inf')
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
             graph = torch.cuda.CUDAGraph()
+
+            if self._use_global_timer:
+                start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
+                end_ts = torch.empty(1, dtype=torch.int64, device='cuda')
+
+                def record_start():
+                    record_global_timer(start_ts.data_ptr(), stream)
+
+                def record_end():
+                    record_global_timer(end_ts.data_ptr(), stream)
+
+                def elapsed_time():
+                    # GPU %globaltimer counts in ns; convert to ms to match the
+                    # units of Torch.cuda.Event.elapsed_time()
+                    return (end_ts.item() - start_ts.item()) / 1e6
+            else:
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
+
+                def record_start():
+                    start_evt.record()
+
+                def record_end():
+                    end_evt.record()
+
+                def elapsed_time():
+                    return start_evt.elapsed_time(end_evt)
 
             with torch.cuda.stream(stream):
                 if use_cuda_graph:
@@ -1176,7 +1227,7 @@ class AutoTuner:
                 else:
                     delay_kernel(self.stream_delay_micro_secs, stream)
 
-                start.record()
+                record_start()
 
                 if use_cuda_graph:
                     graph.replay()
@@ -1188,10 +1239,10 @@ class AutoTuner:
                             **kwargs,
                         )
 
-                end.record()
+                record_end()
                 stream.synchronize()
 
-                return start.elapsed_time(end) / repeat
+                return elapsed_time() / repeat
 
         # warm up, no timing
         for _ in range(self.warmup):
@@ -1250,7 +1301,17 @@ class AutoTuner:
         for spec in tuning_config.dynamic_tensor_specs:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if callable(spec.gen_tuning_buckets):
+            if self.skip_dynamic_tuning_buckets:
+                if spec.map_to_tuning_buckets is not None:
+                    # Still include the bucketed value of the actual shape so the
+                    # cache key used during profiling (raw) aligns with the key
+                    # used during inference (bucketed via map_to_tuning_buckets).
+                    actual_val = base_profile.shapes[spec.input_idx][
+                        spec.dim_idx].val
+                    opt_shapes = (spec.map_to_tuning_buckets(actual_val), )
+                else:
+                    opt_shapes = ()
+            elif callable(spec.gen_tuning_buckets):
                 if tuning_config.tune_max_num_tokens is None:
                     # Use the current input size as the opt value
                     opt_shapes = spec.gen_tuning_buckets(
@@ -1396,10 +1457,10 @@ class AutoTuner:
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         # It must not use all zero tensors. Otherwise the timing results become unreliable.
         if dtype == torch.float4_e2m1fn_x2:
-            return torch.randint(-5, 5, shapes,
-                                 device=device).to(torch.uint8).view(dtype)
+            return (torch.rand(shapes, device=device) * 10 - 5).to(
+                torch.uint8).view(dtype)
         else:
-            return torch.randint(-5, 5, shapes, device=device).to(dtype)
+            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,
@@ -1612,7 +1673,8 @@ class AutoTuner:
             self, all_valid_tactics: List[Any],
             strategy: DistributedTuningStrategy) -> List[Any]:
         """Parallelize tactics across all TP ranks if strategy is PARALLEL."""
-        if strategy == DistributedTuningStrategy.PARALLEL:
+        if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
+        ):
             # only distribute across TP ranks
             # each TP rank will only tune the tactics that are assigned to it
             tp_size = self.mapping.tp_size

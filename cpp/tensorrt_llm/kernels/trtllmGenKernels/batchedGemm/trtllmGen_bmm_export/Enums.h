@@ -107,6 +107,10 @@ enum class EltwiseActType
     // act = relu(x0) ^ 2
     // where x0 is the output of the Gemm.
     Relu2,
+    // Silu is defined as the following operation:
+    // act = x0 * sigmoid(x0)
+    // where x0 is the output of the Gemm.
+    Silu,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

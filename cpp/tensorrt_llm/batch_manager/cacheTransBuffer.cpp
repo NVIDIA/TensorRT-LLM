@@ -249,6 +249,7 @@ CacheTransBufferManager::CacheTransBufferManager(
                               : cacheManager->getPrimaryPool(0)->getDataType(),
         maxNumTokens)
     , mCacheManager{cacheManager}
+    , mTransferIndexerKCache{transferIndexerKCache}
 {
     // TODO: FP4 dataSize
     TLLM_CHECK(mCacheManager);

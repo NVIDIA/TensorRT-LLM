@@ -187,7 +187,8 @@ class MLPBlock(torch.nn.Module):
             'bias': True,
             'swiglu_alpha': self.swiglu_alpha,
             'swiglu_beta': self.swiglu_beta,
-            'swiglu_limit': self.swiglu_limit
+            'swiglu_limit': self.swiglu_limit,
+            'layer_idx': self.layer_idx,
         }
 
         self.experts = create_moe(**moe_params)
@@ -513,7 +514,8 @@ class Transformer(DecoderModel):
         # Use custom cublas since we need LUT to tune the perf.
         prop = torch.cuda.get_device_properties(0)
         sm_version = prop.major * 10 + prop.minor
-        self.use_custom_cublas_mm = sm_version == 121
+        # Use custom cublas to bypass F.linear's additional memory copy for biases on SM 100+
+        self.use_custom_cublas_mm = sm_version >= 100
 
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since

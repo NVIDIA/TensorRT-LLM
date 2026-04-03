@@ -32,6 +32,18 @@ from tqdm.auto import tqdm
 from tensorrt_llm.logger import Singleton, logger
 
 
+class StrictBaseModel(BaseModel):
+    """
+    A base model that forbids arbitrary fields.
+
+    All user-facing configuration classes should inherit from this to ensure
+    typos and invalid fields are caught at validation time.
+    """
+
+    class Config:
+        extra = "forbid"
+
+
 def print_traceback_on_error(func):
 
     @wraps(func)

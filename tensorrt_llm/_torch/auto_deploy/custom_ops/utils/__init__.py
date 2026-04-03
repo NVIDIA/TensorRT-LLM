@@ -16,11 +16,13 @@
 """Utility operations.
 
 This module provides utility functions and helpers:
+- block_table_ragged: Block table <-> ragged tensor conversions
 - torch_gather_logits: Logit gathering operations
 - triton_utils: Triton utility functions and helpers
 """
 
 __all__ = [
+    "block_table_ragged",
     "torch_gather_logits",
     "triton_utils",
 ]

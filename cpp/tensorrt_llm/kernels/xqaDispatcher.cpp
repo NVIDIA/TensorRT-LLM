@@ -85,6 +85,8 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.spec_decoding_position_offsets
         = params.cross_attention ? nullptr : params.spec_decoding_position_offsets;
     preprocessingParms.mrope_position_deltas = params.mrope_position_deltas;
+    preprocessingParms.helix_position_offsets = params.helix_position_offsets;
+    preprocessingParms.helix_is_inactive_rank = params.helix_is_inactive_rank;
     // Scalar parameters.
     preprocessingParms.batch_size = int(batch_beam_size);
     preprocessingParms.max_input_seq_len = params.generation_input_length;
@@ -333,19 +335,7 @@ void XqaDispatcher::runImpl(
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        KvCacheDataType cache_type{KvCacheDataType::BASE};
-        if (params.kv_cache_quant_mode.hasInt8KvCache())
-        {
-            cache_type = KvCacheDataType::INT8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp8KvCache())
-        {
-            cache_type = KvCacheDataType::FP8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp4KvCache())
-        {
-            cache_type = KvCacheDataType::NVFP4;
-        }
+        KvCacheDataType cache_type = cacheTypeFromQuantMode(params.kv_cache_quant_mode);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;
@@ -505,6 +495,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = params.skip_softmax_threshold_scale_factor;
+        tllmRunnerParams.softmaxStatsPtr = params.softmax_stats;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

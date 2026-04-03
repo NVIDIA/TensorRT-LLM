@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import torch
@@ -8,6 +9,11 @@ from test_modeling_multimodal import llm_models_root
 from test_modeling_nemotron_h import extract_decode_logprobs
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.models.modeling_nemotron_nano import (
+    NanoV2VLVisionEncoder,
+    NemotronH_Nano_VL_V2,
+)
+from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
 from tensorrt_llm.inputs import (
     create_input_processor,
     create_input_processor_with_hash,
@@ -90,8 +96,8 @@ def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modal
                 "num_patches": torch.tensor([1]),
             },
             "multiple": {
-                "prompt_pattern": "<image 1><image> <image 2><image>",
-                "prompt_token_ids_length": 550,
+                "prompt_pattern": "<image><image>",
+                "prompt_token_ids_length": 540,
                 "pixel_values_shape": (2, 3, 512, 512),
                 "num_patches": torch.tensor([2]),
             },
@@ -104,8 +110,8 @@ def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modal
                 "num_patches": torch.tensor([8]),
             },
             "multiple": {
-                "prompt_pattern": "<video>\n<video>\n",
-                "prompt_token_ids_length": 4381,
+                "prompt_pattern": "<video><video>",
+                "prompt_token_ids_length": 4380,
                 "pixel_values_shape": (16, 3, 512, 512),
                 "num_patches": torch.tensor([16]),
             },
@@ -204,3 +210,53 @@ def test_nemotron_nano_v2_vl_model_sanity_check(
         )
     else:
         print("Passed! Max difference is within tolerance")
+
+
+class TestEncodeMultimodalDispatch:
+    def _make_mock_model(self):
+        """Create a minimal mock with the attributes `_encode_multimodal` needs."""
+        model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
+        model.vision_encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
+        model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
+        return model
+
+    def test_encode_multimodal_dispatches_audio(self):
+        model = self._make_mock_model()
+        fake_audio_embeds = torch.randn(10, 128)
+        model._encode_audio = mock.MagicMock(return_value=fake_audio_embeds)
+
+        mm_param = mock.MagicMock()
+        mm_param.multimodal_data = {"modality_type": "audio", "audio": {}}
+
+        # Call the real method on our mock
+        result_embeds, result_nones = NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
+
+        model._encode_audio.assert_called_once_with(mm_param)
+        model.vision_encoder.assert_not_called()
+        assert len(result_embeds) == 1
+        assert torch.equal(result_embeds[0], fake_audio_embeds)
+
+    def test_encode_multimodal_dispatches_image(self):
+        model = self._make_mock_model()
+        fake_image_embeds = torch.randn(1, 10, 128)
+        model.vision_encoder.return_value = ([fake_image_embeds], [None])
+
+        mm_param = mock.MagicMock()
+        mm_param.multimodal_data = {
+            "modality_type": "image",
+            "image": {"pixel_values": torch.randn(1, 100, 768)},
+        }
+
+        result_embeds, result_nones = NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
+
+        model.vision_encoder.assert_called_once_with([mm_param])
+        assert len(result_embeds) == 1
+
+    def test_encode_multimodal_unknown_modality_raises(self):
+        """Unknown modality raises ValueError."""
+        model = self._make_mock_model()
+        mm_param = mock.MagicMock()
+        mm_param.multimodal_data = {"modality_type": "smell"}
+
+        with pytest.raises(ValueError, match="Unknown modality"):
+            NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])

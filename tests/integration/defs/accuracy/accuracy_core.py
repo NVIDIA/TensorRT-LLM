@@ -567,7 +567,8 @@ class CliFlowAccuracyTestHarness:
             if "quantization_config" in hf_config:
                 is_prequantized = True
 
-        quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
+        quant_config = QuantConfig(quant_algo=self.quant_algo,
+                                   kv_cache_quant_algo=self.kv_cache_quant_algo)
         if not is_prequantized and quant_config._requires_modelopt_quantization:
             script = f"{self.llm_root}/examples/quantization/quantize.py"
         else:

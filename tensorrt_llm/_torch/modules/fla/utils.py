@@ -4,6 +4,7 @@
 
 import contextlib
 import functools
+import inspect
 import logging
 import os
 import sys
@@ -130,40 +131,75 @@ def tensor_cache(
     return wrapper
 
 
-def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+def input_guard(fn=None, *, exclude_args: Optional[list[str]] = None):
     """
-    A decorator to make sure all input tensors are contiguous and set the device based on input tensors.
+    A decorator to make sure all input tensors are contiguous and set the
+    device based on input tensors.
+
+    Args:
+        exclude_args: Optional list of parameter names whose tensor arguments
+            should not be made contiguous.
+
+    Usage::
+
+        @input_guard
+        def foo(a, b): ...
+
+        @input_guard(exclude_args=["initial_state_source"])
+        def bar(a, initial_state_source): ...
     """
 
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        contiguous_args = (i if not isinstance(i, torch.Tensor) else
-                           i.contiguous() for i in args)
-        contiguous_kwargs = {
-            k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
-            for k, v in kwargs.items()
-        }
+    def decorator(
+            func: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        sig = inspect.signature(func) if exclude_args else None
 
-        tensor = None
-        for arg in args:
-            if isinstance(arg, torch.Tensor):
-                tensor = arg
-                break
-        if tensor is None:
-            for value in kwargs.values():
-                if isinstance(value, torch.Tensor):
-                    tensor = value
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if exclude_args and sig is not None:
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                for name, value in bound.arguments.items():
+                    if isinstance(value,
+                                  torch.Tensor) and name not in exclude_args:
+                        bound.arguments[name] = value.contiguous()
+                contiguous_args = bound.args
+                contiguous_kwargs = bound.kwargs
+            else:
+                contiguous_args = tuple(
+                    i if not isinstance(i, torch.Tensor) else i.contiguous()
+                    for i in args)
+                contiguous_kwargs = {
+                    k:
+                    (v if not isinstance(v, torch.Tensor) else v.contiguous())
+                    for k, v in kwargs.items()
+                }
+
+            tensor = None
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    tensor = arg
                     break
+            if tensor is None:
+                for value in kwargs.values():
+                    if isinstance(value, torch.Tensor):
+                        tensor = value
+                        break
 
-        if tensor is not None:
-            ctx = custom_device_ctx(tensor.device.index)
-        else:
-            ctx = contextlib.nullcontext()
+            if tensor is not None:
+                ctx = custom_device_ctx(tensor.device.index)
+            else:
+                ctx = contextlib.nullcontext()
 
-        with ctx:
-            return fn(*contiguous_args, **contiguous_kwargs)
+            with ctx:
+                return func(*contiguous_args, **contiguous_kwargs)
 
-    return wrapper
+        return wrapper
+
+    if fn is not None:
+        # Called as @input_guard without arguments
+        return decorator(fn)
+    # Called as @input_guard(exclude_args=[...])
+    return decorator
 
 
 contiguous = input_guard

@@ -29,7 +29,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
-from .interface import AttentionTensorLayout
+from .interface import AttentionBackend, AttentionTensorLayout
 
 
 class TrtllmAttentionMetadata:
@@ -145,7 +145,7 @@ class TrtllmAttentionMetadata:
         return self._metadata
 
 
-class TrtllmAttention(BaseTrtllmAttention):
+class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     """
     TRTLLM Attention wrapper for diffusion models.
 
@@ -185,45 +185,65 @@ class TrtllmAttention(BaseTrtllmAttention):
             max_seq_len=max_seq_len,
         )
 
-    def forward(
+    # Needed to work with torch compile cause of attention metadata
+    # make attn metadata as input for it to work
+    @torch.compiler.disable
+    def _prepare_metadata(self, batch_size: int, seq_len: int):
+        return self.metadata.prepare(batch_size, seq_len)
+
+    @torch.compile
+    def _concat_qkv(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         batch_size: int,
         seq_len: int,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
-        seq_len_kv: Optional[int] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Forward pass with automatic metadata handling.
-
-        For diffusion models, expects:
-        - Fused QKV: q contains [Q, K, V] concatenated, k and v are None
-        - OR separate Q, K, V which will be fused internally
-
-        Args:
-            q: Query tensor [num_tokens, hidden] or fused QKV [num_tokens, qkv_hidden]
-            k: Key tensor [num_tokens, kv_hidden] or None if fused
-            v: Value tensor [num_tokens, kv_hidden] or None if fused
-            batch_size: Batch size (required if not inferable)
-            seq_len: Sequence length for Q (required if not inferable)
-            attention_mask: Attention mask type
-            seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
-
-        Returns:
-            Output tensor [num_tokens, q_hidden]
-        """
-        # Handle cross-attention where K/V have different sequence length than Q
-        kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
-
+        kv_seq_len: int,
+    ):
         # Separate Q, K, V provided - fuse them
         q = q.view(batch_size * seq_len, -1)
         k = k.view(batch_size * kv_seq_len, -1)
         v = v.view(batch_size * kv_seq_len, -1)
         qkv = torch.cat([q, k, v], dim=-1)
-        prepared_metadata = self.metadata.prepare(batch_size, seq_len)
+        return qkv
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass with automatic metadata handling.
+
+        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
+
+        For diffusion models, expects:
+        - Fused QKV: q contains [Q, K, V] stacked, k and v are None
+        - OR separate Q, K, V which will be fused internally
+
+        Args:
+            q: Fused QKV [B, S, 3, H, D] or Query [B, S, H, D]
+            k: Key tensor [B, S_kv, H_kv, D] or None if fused
+            v: Value tensor [B, S_kv, H_kv, D] or None if fused
+            attention_mask: Attention mask type
+
+        Returns:
+            Output tensor [B, S, H*D]
+        """
+        batch_size = q.shape[0]
+        seq_len = q.shape[1]
+        kv_seq_len = k.shape[1] if k is not None else seq_len
+
+        if k is None and v is None:
+            qkv = q.reshape(batch_size * seq_len, -1)
+        else:
+            qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
+        prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         output = super().forward(
             q=qkv,
             k=None,

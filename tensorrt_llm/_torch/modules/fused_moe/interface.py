@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import weakref
 from abc import abstractmethod
@@ -32,6 +47,7 @@ def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
 
 
 from ...model_config import ModelConfig
+from ...pyexecutor.dwdp import get_global_dwdp_manager
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
@@ -158,7 +174,7 @@ class MoE(nn.Module):
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if this MoE backend can implement the given quantization algorithm.
@@ -176,7 +192,7 @@ class MoE(nn.Module):
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type.
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -290,6 +306,30 @@ class MoE(nn.Module):
                 range(self.slot_start, self.slot_end))
             self.initial_global_assignments = list(range(self.num_experts))
             self.allreduce = None
+
+        # Override expert layout if DWDP is enabled
+        self._init_dwdp_expert_layout()
+
+    def _init_dwdp_expert_layout(self):
+        """Override expert layout when DWDP is enabled."""
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is None:
+            return
+        assert self.layer_load_balancer is None, (
+            "DWDP and EPLB (MoE load balancer) cannot be used together. "
+            "Disable one of dwdp_config or moe_load_balancer.")
+        self.num_slots = self.num_experts
+        self.expert_size_per_partition = dwdp_manager.num_experts_per_worker
+        dwdp_size = dwdp_manager.dwdp_size
+        self.initial_global_assignments = [
+            (ep_rank * self.num_experts // dwdp_size + local_slot_id) %
+            self.num_experts for ep_rank in range(dwdp_size)
+            for local_slot_id in range(self.expert_size_per_partition)
+        ]
+        self.slot_start = dwdp_manager.start_expert_id
+        self.slot_end = self.slot_start + self.expert_size_per_partition
+        self.initial_local_expert_ids = list(
+            range(self.slot_start, self.slot_end))
 
     def _init_load_balancer(
         self,

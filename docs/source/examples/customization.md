@@ -115,7 +115,7 @@ async for output in llm.generate_async(<prompt>, streaming=True):
     print(output)
 ```
 
-When the `streaming` flag is set to `True`, the `generate_async` method will return a generator that yields each token as soon as it is available. Otherwise, it returns a generator that wait for and yields only the final results.
+When the `streaming` flag is set to `True`, the `generate_async` method will return a generator that yields each token as soon as it is available. Otherwise, it returns a generator that waits for and yields only the final results.
 
 ### Future-Style Generation
 
@@ -129,7 +129,7 @@ generation = llm.generate_async(<prompt>)
 output = generation.result()
 ```
 
-The `.result()` method works like the [result](https://docs.python.org/zh-cn/3/library/asyncio-future.html#asyncio.Future.result) method in the Python Future, you can specify a timeout to wait for the result.
+The `.result()` method works like the [result](https://docs.python.org/3/library/asyncio-future.html#asyncio.Future.result) method in the Python Future, you can specify a timeout to wait for the result.
 
 ```python
 output = generation.result(timeout=10)

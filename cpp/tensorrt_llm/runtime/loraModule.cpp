@@ -15,16 +15,28 @@
  */
 
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/common/assert.h"
 
 namespace tensorrt_llm::runtime
 {
 
 std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> const& loraModuleNames,
     SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
-    SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts)
+    SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts, SizeType32 sharedExpertHiddenSize,
+    SizeType32 moeHiddenSize, SizeType32 mambaInProjSize, SizeType32 mambaInnerSize, SizeType32 moeLatentSize)
 {
     auto const hidden = hiddenSize * tpSize;
     auto const mlpHidden = mlpHiddenSize * tpSize;
+    auto const sharedExpertHidden = sharedExpertHiddenSize > 0 ? sharedExpertHiddenSize * tpSize : mlpHidden;
+    auto const moeHidden = moeHiddenSize > 0 ? moeHiddenSize * tpSize : mlpHidden;
+    // Mamba dimensions: in_proj outputs d_in_proj, out_proj inputs d_inner
+    TLLM_CHECK_WITH_INFO((mambaInProjSize > 0) == (mambaInnerSize > 0),
+        "mambaInProjSize and mambaInnerSize must both be zero or both be non-zero");
+    auto const mambaInProj = mambaInProjSize * tpSize;
+    auto const mambaInner = mambaInnerSize * tpSize;
+    // MoE latent projections are replicated (not TP-sharded), so moeLatentSize
+    // is the actual per-GPU dimension and should not be scaled by tpSize.
+    auto const moeLatent = moeLatentSize;
     auto const numHeads = numAttentionHeads * tpSize;
     auto const numKvHeads = numKvAttentionHeads * tpSize;
     auto const attnHeadSize = attentionHeadSize;
@@ -54,17 +66,29 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMLP_H_TO_4H: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_GATE: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_4H_TO_H: modules.emplace_back(t, mlpHidden, hidden, false, true, 1, -1); break;
-        // TODO(TRTLLM-379): Support MOE LoRA weights
+        case ModuleType::kSHARED_EXPERT_H_TO_4H:
+        case ModuleType::kSHARED_EXPERT_GATE:
+            modules.emplace_back(t, hidden, sharedExpertHidden, false, true, -1, 0);
+            break;
+        case ModuleType::kSHARED_EXPERT_4H_TO_H:
+            modules.emplace_back(t, sharedExpertHidden, hidden, false, true, 1, -1);
+            break;
         case ModuleType::kMOE_H_TO_4H:
         case ModuleType::kMOE_GATE:
-            modules.emplace_back(t, hidden * numExperts, mlpHidden * numExperts, false, true, -1, 0);
+            modules.emplace_back(t, hidden * numExperts, moeHidden * numExperts, false, true, -1, 0);
             break;
         case ModuleType::kMOE_4H_TO_H:
-            modules.emplace_back(t, mlpHidden * numExperts, hidden * numExperts, false, true, 1, -1);
+            modules.emplace_back(t, moeHidden * numExperts, hidden * numExperts, false, true, 1, -1);
             break;
         case ModuleType::kMOE_ROUTER: modules.emplace_back(t, hidden, numExperts, false, true, -1, -1); break;
         case ModuleType::kMLP_ROUTER: modules.emplace_back(t, hidden, 1, false, true, -1, -1); break;
         case ModuleType::kMLP_GATE_UP: modules.emplace_back(t, hidden, 2 * mlpHidden, false, true, -1, 0); break;
+        // Mamba modules: in_proj (hidden -> d_in_proj), out_proj (d_inner -> hidden)
+        case ModuleType::kMAMBA_IN_PROJ: modules.emplace_back(t, hidden, mambaInProj, false, true, -1, 0); break;
+        case ModuleType::kMAMBA_OUT_PROJ: modules.emplace_back(t, mambaInner, hidden, false, true, 1, -1); break;
+        // MoE latent projections: replicated (not TP-sharded), no TP split dims
+        case ModuleType::kMOE_LATENT_FC1: modules.emplace_back(t, hidden, moeLatent, false, true, -1, -1); break;
+        case ModuleType::kMOE_LATENT_FC2: modules.emplace_back(t, moeLatent, hidden, false, true, -1, -1); break;
         case ModuleType::kINVALID: throw std::runtime_error("Invalid LoRA module " + moduleName);
         }
     }

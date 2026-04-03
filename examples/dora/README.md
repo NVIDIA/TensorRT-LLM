@@ -33,13 +33,13 @@ python ./normalize_weights.py -i DoRA-weights/llama_dora_commonsense_checkpoints
 
 The script will create a new adapter checkpoint, with normalized DoRA vectors, in the provided path.
 
-Now we may convert our Llama checkpoint and build our TRT engine as described in the Llama [examples](../llama/README.md). When doing so, ensure you pass `--dora_plugin=enable` to the `trtllm-build` command, as well as enabling the lora plugin:
+Now we may convert our Llama checkpoint and build our TRT engine as described in the Llama [examples](../models/core/llama/README.md). When doing so, ensure you pass `--dora_plugin=enable` to the `trtllm-build` command, as well as enabling the lora plugin:
 
 ``` bash
 export CHECKPOINT_DIR=path/to/trtllm/ckpt
 export ENGIRE_DIR=path/to/trtllm/engine
 
-python ../llama/convert_checkpoint.py --model_dir Meta-Llama-3-8B \
+python ../models/core/llama/convert_checkpoint.py --model_dir Meta-Llama-3-8B \
                                       --output_dir $CHECKPOINT_DIR \
                                       --dtype float16
 

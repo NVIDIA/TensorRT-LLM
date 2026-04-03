@@ -1,6 +1,6 @@
 # How to Change Block Priorities
 
-You can change block priority by providing the optional ```kv_cache_retention_config``` argument when you submit a request to the LLM engine. Consider the quick start example found in ```examples/pytorch/quickstart.py```:
+You can change block priority by providing the optional `kv_cache_retention_config` argument when you submit a request to the LLM engine. Consider the quick start example found in `examples/llm-api/quickstart_example.py`:
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
