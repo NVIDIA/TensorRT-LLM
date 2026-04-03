@@ -395,9 +395,9 @@ NOTE:
     placeholder for the model needs to be added in retrieve_multimodal_placeholder().
 """
 
-HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama", "mistral_large_3"]
+HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama", "mistral_large_3", "mistral3"]
 PLACEHOLDER_EXCEPTIONS = [
-    "llava_next", "NemotronH_Nano_VL_V2", "mistral_large_3"
+    "llava_next", "NemotronH_Nano_VL_V2", "mistral_large_3", "mistral3"
 ]
 
 

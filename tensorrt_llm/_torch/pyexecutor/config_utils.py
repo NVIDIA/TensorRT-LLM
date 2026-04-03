@@ -280,6 +280,17 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = getattr(
             MistralConfigLoader().load(model_name_or_path).pretrained_config,
             "text_config")
+
+    elif model_type == "mistral3" and "layer_types" in config_dict:
+        # TODO: update this for transformers v5.0
+        config_class = "MinistralConfig"
+        model_config = config_class.from_pretrained(model_name_or_path,
+                                                    **kwargs)
+
+    elif model_type in _CONFIG_REGISTRY:
+        config_class = _CONFIG_REGISTRY[model_type]
+        model_config = config_class.from_pretrained(model_name_or_path,
+                                                    **kwargs)
     else:
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)

@@ -376,10 +376,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             # When the input only contains text, we use the text processor to process the input.
             self._processor = MistralCommonImageProcessor(
                 tokenizer=self._tokenizer, dtype=self.dtype)
-            self.text_processor = AutoProcessor.from_pretrained(
-                model_path,
-                use_fast=self.use_fast,
-                trust_remote_code=trust_remote_code)
+            self.text_processor = self._processor
         else:
             # For other mistral models, we use the AutoProcessor to process the input.
             self._processor = AutoProcessor.from_pretrained(
@@ -509,7 +506,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
     def load_tokenizer(model_path: str,
                        config: PretrainedConfig,
                        tokenizer: AutoTokenizer | None = None):
-        if getattr(config, "input_processor_type", None) == "mistral_large_3":
+        if getattr(config, "input_processor_type", None) in ("mistral_large_3"):
             try:
                 return MistralTokenizer.from_pretrained(model_path)
 
@@ -626,13 +623,24 @@ class Mistral3VLM(PreTrainedModel):
 
         llm_weights = filter_weights(weights=weights, prefix="language_model")
         logger.debug(f"Loading weights for {type(self.llm)}")
-        self.llm.load_weights(llm_weights)
+        if weight_mapper:
+            weight_mapper.permute_qk(weights=llm_weights,
+                                     config=self.llm.config)
+            self.llm.load_weights(llm_weights,
+                                  weight_mapper=weight_mapper,
+                                  params_map=weight_mapper.mistral_llm_mapping)
+        else:
+            self.llm.load_weights(llm_weights)
         logger.debug(f"Successfully loaded weights for {type(self.llm)}")
 
         vit_weights = filter_weights(weights=weights, prefix="vision_tower")
         logger.debug(f"Loading weights for {type(self._vision_tower)}")
 
         if vit_params_map is not None:
+            # Pixtral uses num_attention_heads = num_key_value_heads
+            self._vision_tower.config.num_key_value_heads = self._vision_tower.config.num_attention_heads
+            weight_mapper.permute_qk(weights=vit_weights,
+                                     config=self._vision_tower.config)
             vit_weights = weight_mapper.rename_by_params_map(
                 weights=vit_weights, params_map=vit_params_map)
 
