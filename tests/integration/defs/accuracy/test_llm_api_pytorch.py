@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,7 +59,8 @@ from tensorrt_llm.llmapi import (
     DeepSeekSparseAttentionConfig, Eagle3DecodingConfig, KvCacheConfig,
     MoeConfig, MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
     RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
-    SchedulerConfig, SkipSoftmaxAttentionConfig, TorchCompileConfig)
+    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
+    TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -373,7 +374,35 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         spec_config = Eagle3DecodingConfig(max_draft_len=4,
                                            speculative_model=eagle_model_dir,
                                            eagle3_one_model=True,
-                                           use_sa_spec=True)
+                                           sa_config=SAEnhancerConfig())
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
+
+    @skip_pre_hopper
+    def test_eagle3_sa_global_pool(self):
+        """Accuracy test for EAGLE3 One-Model + Suffix Automaton with global pool enabled."""
+        max_batch_size = 32
+        pytorch_config = dict(
+            max_batch_size=max_batch_size,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
+        target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=4,
+            speculative_model=eagle_model_dir,
+            eagle3_one_model=True,
+            sa_config=SAEnhancerConfig(enable_global_pool=True))
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
@@ -428,7 +457,35 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         spec_config = PARDDecodingConfig(max_draft_len=4,
                                          speculative_model=pard_model_dir,
-                                         use_sa_spec=True)
+                                         sa_config=SAEnhancerConfig())
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
+
+    @skip_pre_hopper
+    @pytest.mark.skip(reason="PARD accuracy issue with batch size > 1")
+    def test_pard_sa_global_pool(self):
+        """Accuracy test for PARD + Suffix Automaton with global pool enabled."""
+        max_batch_size = 32
+        pytorch_config = dict(
+            max_batch_size=max_batch_size,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        pard_model_dir = f"{llm_models_root()}/PARD-Llama-3.2-1B"
+        target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+        spec_config = PARDDecodingConfig(
+            max_draft_len=4,
+            speculative_model=pard_model_dir,
+            sa_config=SAEnhancerConfig(enable_global_pool=True))
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
@@ -467,7 +524,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
-    def test_suffix_automaton(self):
+    @parametrize_with_ids("enable_global_pool", [False, True])
+    def test_suffix_automaton(self, enable_global_pool):
         max_bs = 16
 
         pytorch_config = dict(
@@ -482,6 +540,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         spec_config = SADecodingConfig(
             max_draft_len=4,
             max_matching_ngram_size=-1,  # longest match via suffix automaton
+            enable_global_pool=enable_global_pool,
         )
 
         with LLM(model=self.MODEL_PATH,
@@ -1685,7 +1744,29 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(),
         )
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=2,
-                                       use_sa_spec=True)
+                                       sa_config=SAEnhancerConfig())
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 max_num_tokens=8192,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
+
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_bfloat16_mtp_sa_global_pool(self):
+        """Accuracy test for MTP + Suffix Automaton with global pool enabled."""
+        max_batch_size = 32
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            max_batch_size=max_batch_size,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                              enable_padding=True),
+        )
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=2,
+            sa_config=SAEnhancerConfig(enable_global_pool=True))
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  max_num_tokens=8192,
@@ -3045,22 +3126,24 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,enable_heuristic_topk",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False),
-            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
-            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True),
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, False),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False, False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False),
+            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "latency_default", "disable_skip_indexer"
+            "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1"
         ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size, moe_backend, disable_skip_indexer):
+                            max_batch_size, moe_backend, disable_skip_indexer,
+                            enable_heuristic_topk):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -3084,10 +3167,16 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 )
             kv_cache_config.dtype = "fp8"
 
+        if enable_heuristic_topk and get_sm_version() < 100:
+            pytest.skip("Heuristic TopK requires Blackwell (SM >= 100)")
+
         dsa_config = None
         if disable_skip_indexer:
             dsa_config = DeepSeekSparseAttentionConfig(
                 skip_indexer_for_short_seqs=False)
+        if enable_heuristic_topk:
+            dsa_config = DeepSeekSparseAttentionConfig(
+                enable_heuristic_topk=True)
 
         mtp_config = None
         if mtp_nextn > 0:
