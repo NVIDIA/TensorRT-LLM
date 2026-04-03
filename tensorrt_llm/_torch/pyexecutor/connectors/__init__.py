@@ -12,17 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Registry of named KV cache connector presets.
 
-Each entry maps a short name to the import path and class names needed
-by KvCacheConnectorConfig. The connector module is NOT imported here —
-it is resolved at runtime via importlib in py_executor_creator.py.
-"""
+from tensorrt_llm._torch.pyexecutor.connectors.registry import CONNECTOR_REGISTRY
 
-CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
-    "lmcache": {
-        "connector_module": "lmcache.integration.tensorrt_llm.tensorrt_adapter",
-        "connector_scheduler_class": "LMCacheKvConnectorScheduler",
-        "connector_worker_class": "LMCacheKvConnectorWorker",
-    },
-}
+__all__ = ["CONNECTOR_REGISTRY"]
