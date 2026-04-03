@@ -66,6 +66,7 @@ class SessionStatus(Enum):
     - KV_TRANSFERRED: KV cache transfer completed; auxiliary data transfer may still be pending.
     - FULLY_TRANSFERRED: Both KV cache and auxiliary data (e.g. tokens) transferred successfully.
     - ERROR: A transfer error occurred; the session cannot complete.
+    - CANCELLED: The session was explicitly cancelled before or during transfer.
     """
 
     INIT = "INIT"
@@ -74,6 +75,7 @@ class SessionStatus(Enum):
     KV_TRANSFERRED = "KV_TRANSFERRED"
     FULLY_TRANSFERRED = "FULLY_TRANSFERRED"
     ERROR = "ERROR"
+    CANCELLED = "CANCELLED"
 
 
 class WaitResult(Enum):
