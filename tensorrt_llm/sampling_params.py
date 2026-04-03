@@ -288,8 +288,8 @@ class SamplingParams:
     truncate_prompt_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
-    # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
-    # TODO: make this a per-request parameter.
+    stream_interval: Optional[int] = None
+    # _stream_interval is the resolved value (per-request or engine default), used internally.
     _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
@@ -314,6 +314,10 @@ class SamplingParams:
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
+        if self.stream_interval is not None and self.stream_interval <= 0:
+            raise ValueError(
+                f"require stream_interval > 0, got stream_interval={self.stream_interval}"
+            )
         if self.top_p is not None and (self.top_p < 0 or self.top_p > 1):
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:

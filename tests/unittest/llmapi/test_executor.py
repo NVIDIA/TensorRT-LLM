@@ -172,6 +172,62 @@ def test_invalid_sampling_params():
         SamplingParams(max_tokens=4, n=4, best_of=3, use_beam_search=True)
 
 
+def test_stream_interval_validation():
+    # Valid values
+    sp = SamplingParams(stream_interval=1)
+    assert sp.stream_interval == 1
+    sp = SamplingParams(stream_interval=10)
+    assert sp.stream_interval == 10
+    sp = SamplingParams(stream_interval=None)
+    assert sp.stream_interval is None
+
+    # Invalid values
+    with pytest.raises(ValueError, match="stream_interval"):
+        SamplingParams(stream_interval=0)
+    with pytest.raises(ValueError, match="stream_interval"):
+        SamplingParams(stream_interval=-1)
+
+
+def test_stream_interval_openai_protocol():
+    from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                     CompletionRequest)
+
+    # CompletionRequest: valid stream_interval passes through
+    req = CompletionRequest(model="m", prompt="hi", stream_interval=5)
+    sp = req.to_sampling_params()
+    assert sp.stream_interval == 5
+
+    # CompletionRequest: None leaves stream_interval unset
+    req = CompletionRequest(model="m", prompt="hi")
+    sp = req.to_sampling_params()
+    assert sp.stream_interval is None
+
+    # CompletionRequest: invalid stream_interval is caught
+    req = CompletionRequest(model="m", prompt="hi", stream_interval=-1)
+    with pytest.raises(ValueError, match="stream_interval"):
+        req.to_sampling_params()
+
+    # ChatCompletionRequest: valid stream_interval passes through
+    req = ChatCompletionRequest(model="m",
+                                messages=[{
+                                    "role": "user",
+                                    "content": "hi"
+                                }],
+                                stream_interval=10)
+    sp = req.to_sampling_params()
+    assert sp.stream_interval == 10
+
+    # ChatCompletionRequest: invalid stream_interval is caught
+    req = ChatCompletionRequest(model="m",
+                                messages=[{
+                                    "role": "user",
+                                    "content": "hi"
+                                }],
+                                stream_interval=0)
+    with pytest.raises(ValueError, match="stream_interval"):
+        req.to_sampling_params()
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,
                     reason="Must run on 2 MPI ranks with at least 2 GPUs")
 def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
