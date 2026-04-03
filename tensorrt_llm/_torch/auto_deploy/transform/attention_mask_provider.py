@@ -93,6 +93,25 @@ class AttentionMaskProviderContext:
 
         return add_graph_input(self.gm, name=name, val=val)
 
+    def register_default_extra_arg(
+        self,
+        name: str,
+        factory: Callable,
+    ) -> None:
+        """Register a callable default factory for ``name`` in the SequenceInfo.
+
+        ``factory`` receives the ``SequenceInfo`` and returns the default value
+        for ``name``.  It is called at the start of every ``nest_sequences``
+        so that initialization-time forward passes (e.g. ``resize_kv_cache``)
+        always receive a valid tensor for ``name`` even when no per-request data
+        is available.
+
+        Has no effect when ``cm`` is ``None`` (e.g. during DemoLLM export).
+        """
+        if self.cm is None:
+            return
+        self.cm.info.register_default_extra_arg(name, factory)
+
     def get_or_create_cached_node(self, key: str, builder: Callable[[], Node]) -> Node:
         """Memoize provider-created nodes so shared masks are built once per forward."""
         if key not in self.cache:

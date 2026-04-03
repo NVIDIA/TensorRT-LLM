@@ -17,9 +17,31 @@
 
 from __future__ import annotations
 
+import operator
+
 import torch
 
 from .attention_mask_provider import AttentionMaskProviderRegistry
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _token_type_ids_default_factory(seq_info):
+    """Return a zeros tensor with the same (batch, seq) shape as ``input_ids``.
+
+    Used as the default factory for ``token_type_ids`` so that initialization-time
+    forward passes (e.g. ``resize_kv_cache``, CUDA-graph warmup) always receive a
+    valid tensor even when no per-request multimodal data is present.
+
+    ``get_arg("input_ids")`` already unflattens (input_ids is in _shapeable_args),
+    so the result has shape [batch_size, seq_len].
+    """
+    input_ids_2d = seq_info.get_arg("input_ids")
+    return torch.zeros(
+        input_ids_2d.shape[0], input_ids_2d.shape[1], dtype=torch.int64, device=seq_info.device
+    )
 
 
 def _build_gemma4_token_type_mask(ctx, source_attn_node):
@@ -35,11 +57,18 @@ def _build_gemma4_token_type_mask(ctx, source_attn_node):
     # Set fake tensor meta directly — add_graph_input's static_shapes=True would
     # concretise symbolic dims, but we need them to stay dynamic.
     token_type_ids.meta["val"] = fake_val
+    # Register a default factory so cm.named_args always includes token_type_ids
+    # during initialization-time forward passes (resize_kv_cache, CUDA-graph warmup)
+    # even when no multimodal per-request data is available.
+    ctx.register_default_extra_arg("token_type_ids", _token_type_ids_default_factory)
     zeros = ctx.gm.graph.call_function(torch.ops.aten.zeros_like.default, args=(token_type_ids,))
     non_text = ctx.gm.graph.call_function(torch.ops.aten.ne.Scalar, args=(token_type_ids, 0))
 
+    # Derive seq_len inside the graph so the symbolic variable survives recompile.
+    g_seq_len = ctx.gm.graph.call_function(torch.ops.aten.sym_size.int, args=(token_type_ids, 1))
+    g_seq_len_m1 = ctx.gm.graph.call_function(operator.sub, args=(g_seq_len, 1))
     prev_token_types = ctx.gm.graph.call_function(
-        torch.ops.aten.slice.Tensor, args=(token_type_ids, 1, 0, seq_len - 1)
+        torch.ops.aten.slice.Tensor, args=(token_type_ids, 1, 0, g_seq_len_m1)
     )
     prev_token_types = ctx.gm.graph.call_function(
         torch.ops.aten.cat.default,

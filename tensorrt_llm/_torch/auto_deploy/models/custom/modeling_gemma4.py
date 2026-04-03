@@ -35,7 +35,7 @@ Key architectural features of Gemma 4 vs standard transformers:
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -48,10 +48,11 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry, SubModuleExportInfo
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
+    TextModelExportInfo,
 )
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -997,9 +998,32 @@ class Gemma4ADInputProcessor:
         return token_ids, extra
 
 
+class Gemma4TextModelExportInfo(TextModelExportInfo):
+    """Export config for the Gemma4 text submodule.
+
+    Extends the base ``TextModelExportInfo`` with ``token_type_ids`` as a
+    dynamically-shaped input so that it is exported with symbolic batch/seq
+    dimensions rather than concrete static shapes.
+    """
+
+    def _init_dynamic_shape_lookup(self):
+        lookup = super()._init_dynamic_shape_lookup()
+        # Reuse the same dynamic dim objects from input_ids so export can verify
+        # that batch and seq dimensions are semantically identical across inputs.
+        batch_dim = lookup["input_ids"][0]
+        seq_dim = lookup["input_ids"][1]
+        lookup["token_type_ids"] = {0: batch_dim, 1: seq_dim}
+        return lookup
+
+
 @ModelFactoryRegistry.register("Gemma4ForConditionalGeneration")
 class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
     """Factory for Gemma 4 VLM with custom attention mask support."""
+
+    def get_export_infos(self, model) -> List[SubModuleExportInfo]:
+        """Return export info with token_type_ids as a dynamic input."""
+        base_info = TextModelExportInfo.from_autoinferred(model)
+        return [Gemma4TextModelExportInfo(base_info.submodule_name)]
 
     def init_tokenizer(self) -> Optional[Any]:
         if self.tokenizer is None:
