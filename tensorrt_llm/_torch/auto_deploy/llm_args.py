@@ -360,6 +360,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             model_kwargs=self.model_kwargs,
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
             tokenizer_kwargs=self.tokenizer_kwargs,
+            trust_remote_code=self.trust_remote_code,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
             # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)

@@ -8,6 +8,7 @@ from accelerate.utils import modeling
 from transformers import AutoModelForCausalLM
 from transformers.models.llama4.configuration_llama4 import Llama4Config
 
+from tensorrt_llm._torch.auto_deploy import LlmArgs
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     hf_load_state_dict_with_device,
@@ -132,6 +133,78 @@ def test_recursive_update_config(mock_factory):
     # Check that complex nested updates were applied correctly
     assert config.text_config.rope_scaling["factor"] == 2.0
     assert config.text_config.rope_scaling["type"] == "linear"
+
+
+def test_create_factory_threads_trust_remote_code():
+    factory = LlmArgs(
+        model="dummy_model",
+        trust_remote_code=False,
+        tokenizer_kwargs={"trust_remote_code": True},
+    ).create_factory()
+
+    assert isinstance(factory, AutoModelForCausalLMFactory)
+    assert factory.trust_remote_code is False
+    assert factory.tokenizer_kwargs["trust_remote_code"] is False
+
+
+def test_get_model_config_uses_factory_trust_remote_code(mock_factory):
+    with patch.object(
+        AutoModelForCausalLMFactory,
+        "prefetch_checkpoint",
+    ), patch(
+        "tensorrt_llm._torch.auto_deploy.models.hf.AutoConfig.from_pretrained",
+        return_value=(Llama4Config(), {}),
+    ) as mock_from_pretrained:
+        mock_factory._get_model_config()
+
+    assert mock_from_pretrained.call_args.kwargs["trust_remote_code"] is False
+
+
+def test_init_tokenizer_uses_factory_trust_remote_code(mock_factory):
+    with patch(
+        "tensorrt_llm._torch.auto_deploy.models.hf.AutoTokenizer.from_pretrained",
+        return_value=MagicMock(),
+    ) as mock_from_pretrained:
+        mock_factory.init_tokenizer()
+
+    assert mock_from_pretrained.call_args.kwargs["trust_remote_code"] is False
+
+
+def test_build_model_uses_factory_trust_remote_code(mock_factory):
+    dummy_model = SimpleModel()
+    dummy_model.config = MagicMock()
+
+    with patch.object(
+        AutoModelForCausalLMFactory,
+        "_get_model_config",
+        return_value=(Llama4Config(), {"trust_remote_code": True, "foo": "bar"}),
+    ), patch.object(AutoModelForCausalLM, "from_config", return_value=dummy_model) as from_config:
+        mock_factory.build_model(device="meta")
+
+    assert from_config.call_args.kwargs["foo"] == "bar"
+    assert from_config.call_args.kwargs["trust_remote_code"] is False
+
+
+def test_build_and_load_model_uses_factory_trust_remote_code(mock_factory):
+    dummy_model = SimpleModel()
+
+    with patch.object(
+        AutoModelForCausalLMFactory,
+        "_get_model_config",
+        return_value=(Llama4Config(), {"trust_remote_code": True}),
+    ), patch.object(
+        AutoModelForCausalLMFactory,
+        "prefetch_checkpoint",
+    ), patch.object(
+        AutoModelForCausalLM,
+        "from_pretrained",
+        return_value=dummy_model,
+    ) as from_pretrained:
+        mock_factory.build_and_load_model(device="cuda")
+
+    assert from_pretrained.call_args.kwargs["trust_remote_code"] is False
+    assert from_pretrained.call_args.kwargs["tp_plan"] == "auto"
+    assert from_pretrained.call_args.kwargs["dtype"] == "auto"
 
 
 def test_register_custom_model_cls():

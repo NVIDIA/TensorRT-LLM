@@ -119,6 +119,7 @@ class ModelFactory(ABC):
         model_kwargs: Optional[Dict[str, Any]] = None,
         tokenizer: Optional[str] = None,
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+        trust_remote_code: bool = False,
         skip_loading_weights: bool = False,
         max_seq_len: int = 512,
         **kwargs,
@@ -127,6 +128,7 @@ class ModelFactory(ABC):
         self.model_kwargs = copy.deepcopy(model_kwargs or {})
         self._tokenizer = tokenizer
         self.tokenizer_kwargs = copy.deepcopy(tokenizer_kwargs or {})
+        self.trust_remote_code = trust_remote_code
         self.skip_loading_weights = skip_loading_weights
         self.max_seq_len = max_seq_len
         self._prefetched_model_path: Optional[str] = None
