@@ -13,6 +13,45 @@ from ...distributed import AllReduceFusionOp, AllReduceStrategy
 aten = torch.ops.aten
 from tensorrt_llm.mapping import Mapping
 
+from . import MATCHER_SUBSYSTEM
+
+
+def _append_named_pass(custom_passes: List[PatternMatcherPass], pass_name: str):
+    custom_passes.append(PatternMatcherPass(pass_name, MATCHER_SUBSYSTEM))
+
+
+def _check_getitem_only_users(match: Match, pattern_node) -> bool:
+    node = match.ctx.pattern_to_node[pattern_node]
+    if not isinstance(node, torch.fx.graph.Node):
+        return False
+    for user in node.users:
+        if user.op != "call_function" or user.target is not getitem:
+            return False
+    return True
+
+
+def _has_getitem_user(match: Match, pattern_node, index: int) -> bool:
+    node = match.ctx.pattern_to_node[pattern_node]
+    if not isinstance(node, torch.fx.graph.Node):
+        return False
+    for user in node.users:
+        if (user.op == "call_function" and user.target is getitem
+                and user.args[1] == index):
+            return True
+    return False
+
+
+def _make_fp8_quant_extra_check(input_node, strategy_node, quant_node,
+                                require_scale_output: bool):
+
+    def extra_check(match: Match) -> bool:
+        return (check_f16_bf16_input(match, input_node)
+                and check_non_ub_strategy(match, strategy_node)
+                and _check_getitem_only_users(match, quant_node) and
+                _has_getitem_user(match, quant_node, 1) == require_scale_output)
+
+    return extra_check
+
 
 def register_ar_residual_norm(custom_pass: PatternMatcherPass, mapping: Mapping,
                               allreduce_func: Callable):
@@ -134,15 +173,16 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
         torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor.default,
         getitem_0,
         KeywordArg("scale"),
-        _users=2)
-    getitem_2 = CallFunction(getitem,
-                             static_quantize_e4m3_per_tensor_default,
-                             0,
-                             _users=2)
+        _users=MULTIPLE)
+    getitem_2 = CallFunction(getitem, static_quantize_e4m3_per_tensor_default,
+                             0)
     getitem_3 = CallFunction(getitem, static_quantize_e4m3_per_tensor_default,
                              1)
-    pattern = MultiOutputPattern([getitem_0, getitem_1, getitem_2, getitem_3
-                                  ])  # norm_out, residual_out, quant_out, scale
+    pattern_with_scale = MultiOutputPattern(
+        [getitem_0, getitem_1, getitem_2,
+         getitem_3])  # norm_out, residual_out, quant_out, scale
+    pattern_without_scale = MultiOutputPattern(
+        [getitem_0, getitem_1, getitem_2])  # norm_out, residual_out, quant_out
 
     def empty_pattern(
         input: torch.Tensor,
@@ -173,9 +213,29 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
             trigger_completion_at_end)
         return allreduce[0], allreduce[2], allreduce[1], scale
 
-    def extra_check(match: Match) -> bool:
-        return check_f16_bf16_input(
-            match, input_node) and check_non_ub_strategy(match, strategy_node)
+    def target_pattern_without_scale(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        workspace: torch.LongTensor,
+        strategy: int,
+        eps: float,
+        scale: torch.Tensor,
+        trigger_completion_at_end: bool,
+    ):
+        allreduce = allreduce_func(
+            input, residual, gamma, scale, None, workspace, mapping.tp_group,
+            int(strategy),
+            int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8), float(eps),
+            trigger_completion_at_end)
+        return allreduce[0], allreduce[2], allreduce[1]
+
+    extra_check_with_scale = _make_fp8_quant_extra_check(
+        input_node, strategy_node, static_quantize_e4m3_per_tensor_default,
+        True)
+    extra_check_without_scale = _make_fp8_quant_extra_check(
+        input_node, strategy_node, static_quantize_e4m3_per_tensor_default,
+        False)
 
     register_replacement(
         empty_pattern,
@@ -183,8 +243,18 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
         [],
         fwd_only,
         custom_pass,
-        search_fn_pattern=pattern,
-        extra_check=extra_check,
+        search_fn_pattern=pattern_with_scale,
+        extra_check=extra_check_with_scale,
+    )
+
+    register_replacement(
+        empty_pattern,
+        target_pattern_without_scale,
+        [],
+        fwd_only,
+        custom_pass,
+        search_fn_pattern=pattern_without_scale,
+        extra_check=extra_check_without_scale,
     )
 
 
@@ -212,15 +282,15 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
         torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor.default,
         getitem_0,
         KeywordArg("scale"),
-        _users=2)
-    getitem_2 = CallFunction(getitem,
-                             static_quantize_e4m3_per_tensor_default,
-                             0,
-                             _users=2)
+        _users=MULTIPLE)
+    getitem_2 = CallFunction(getitem, static_quantize_e4m3_per_tensor_default,
+                             0)
     getitem_3 = CallFunction(getitem, static_quantize_e4m3_per_tensor_default,
                              1)
-    pattern = MultiOutputPattern([getitem_1, getitem_2,
-                                  getitem_3])  # residual_out, quant_out, scale
+    pattern_with_scale = MultiOutputPattern(
+        [getitem_1, getitem_2, getitem_3])  # residual_out, quant_out, scale
+    pattern_without_scale = MultiOutputPattern([getitem_1, getitem_2
+                                                ])  # residual_out, quant_out
 
     def empty_pattern(
         input: torch.Tensor,
@@ -250,9 +320,28 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
             float(eps), trigger_completion_at_end)
         return allreduce[1], allreduce[0], scale
 
-    def extra_check(match: Match) -> bool:
-        return check_f16_bf16_input(
-            match, input_node) and check_non_ub_strategy(match, strategy_node)
+    def target_pattern_without_scale(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        workspace: torch.LongTensor,
+        strategy: int,
+        eps: float,
+        scale: torch.Tensor,
+        trigger_completion_at_end: bool,
+    ):
+        allreduce = allreduce_func(
+            input, residual, gamma, scale, None, workspace, mapping.tp_group,
+            int(strategy), int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8),
+            float(eps), trigger_completion_at_end)
+        return allreduce[1], allreduce[0]
+
+    extra_check_with_scale = _make_fp8_quant_extra_check(
+        input_node, strategy_node, static_quantize_e4m3_per_tensor_default,
+        True)
+    extra_check_without_scale = _make_fp8_quant_extra_check(
+        input_node, strategy_node, static_quantize_e4m3_per_tensor_default,
+        False)
 
     register_replacement(
         empty_pattern,
@@ -260,8 +349,18 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
         [],
         fwd_only,
         custom_pass,
-        search_fn_pattern=pattern,
-        extra_check=extra_check,
+        search_fn_pattern=pattern_with_scale,
+        extra_check=extra_check_with_scale,
+    )
+
+    register_replacement(
+        empty_pattern,
+        target_pattern_without_scale,
+        [],
+        fwd_only,
+        custom_pass,
+        search_fn_pattern=pattern_without_scale,
+        extra_check=extra_check_without_scale,
     )
 
 
@@ -772,16 +871,20 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             extra_check=extra_check,
         )
 
-    custom_passes.append(PatternMatcherPass())
+    _append_named_pass(
+        custom_passes,
+        f"ub_convert_supported_ar_to_ub:{allreduce_func.__name__}")
     register_convert_supported_ar_to_ub(custom_passes[-1])
 
-    custom_passes.append(PatternMatcherPass())
+    _append_named_pass(custom_passes, f"ub_prologue:{allreduce_func.__name__}")
     register_ub_prologue_patterns(custom_passes[-1])
 
-    custom_passes.append(PatternMatcherPass())
+    _append_named_pass(custom_passes, f"ub_finalize:{allreduce_func.__name__}")
     register_ub_finalize_patterns(custom_passes[-1])
 
-    custom_passes.append(PatternMatcherPass())
+    _append_named_pass(
+        custom_passes,
+        f"insert_copy_for_graph_output:{allreduce_func.__name__}")
     insert_copy_for_graph_output(custom_passes[-1])
 
 
@@ -792,7 +895,7 @@ def register_ar_fusions(custom_passes: List[PatternMatcherPass],
     register_ar_residual_norm(custom_passes[-1], mapping,
                               torch.ops.trtllm.tunable_allreduce)
 
-    custom_passes.append(PatternMatcherPass())
+    _append_named_pass(custom_passes, "ar_residual_norm_quant")
     for allreduce_func in [
             torch.ops.trtllm.allreduce, torch.ops.trtllm.tunable_allreduce
     ]:
