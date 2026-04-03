@@ -2428,8 +2428,18 @@ def test_indexer_k_cache_gather_custom_op():
     """
     torch.manual_seed(123)
 
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import \
-        _unravel_indices
+    def _unravel_indices(flat_indices, shape):
+        d3 = shape[3]
+        i3 = flat_indices % d3
+        flat_indices = flat_indices // d3
+        d2 = shape[2]
+        i2 = flat_indices % d2
+        flat_indices = flat_indices // d2
+        d1 = shape[1]
+        i1 = flat_indices % d1
+        flat_indices = flat_indices // d1
+        i0 = flat_indices
+        return i0, i1, i2, i3
 
     # Test parameters
     head_dim = 128
