@@ -181,6 +181,11 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
         },
+        "triton_paged": {
+            "max_batch_size": 128,
+            "max_seq_len": 8192,
+            "compile_backend": "torch-cudagraph",
+        },
     }
 
     def get_default_kwargs(self,
@@ -232,7 +237,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm", "torch"])
+    @pytest.mark.parametrize("attn_backend",
+                             ["flashinfer", "trtllm", "torch", "triton_paged"])
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
