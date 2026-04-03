@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -281,15 +281,27 @@ class SAWorker(SpecWorkerBase):
             # No SA manager available, throw error
             raise ValueError("No SA manager available")
 
-        # extend_ngram is CUDA graph compatible
-        # It extends SA states with accepted tokens and performs pattern matching
-        match_len, draft_tokens = sa_manager.extend_ngram(
-            request_ids,
-            accepted_tokens,
-            num_accepted_tokens,
-            max_draft_len,
-            max_ngram_size=self._max_matching_ngram_size,
-        )
+        if sa_manager.enable_global_pool:
+            match_len, draft_tokens = sa_manager.extend_global(
+                request_ids,
+                accepted_tokens,
+                num_accepted_tokens,
+                max_draft_len,
+                max_ngram_size=self._max_matching_ngram_size,
+            )
+        else:
+            match_len, draft_tokens = sa_manager.extend_ngram(
+                request_ids,
+                accepted_tokens,
+                num_accepted_tokens,
+                max_draft_len,
+                max_ngram_size=self._max_matching_ngram_size,
+            )
+
+        # Gate draft tokens by match_len: zero out rows where no match was found,
+        # so stale or uninitialized draft tokens are never used (CUDA graph safe).
+        mask = (match_len > 0).unsqueeze(1).to(draft_tokens.dtype)
+        draft_tokens = draft_tokens * mask
 
         return draft_tokens  # [batch_size, max_draft_len] GPU tensor
 

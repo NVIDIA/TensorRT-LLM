@@ -536,3 +536,81 @@ def test_processor_get_num_tokens_per_image(
     mocked_auto_processor.from_pretrained.return_value._get_num_multimodal_tokens.assert_called_once_with(
         [(height, width)]
     )
+
+
+def test_mistral_attention_swa_wiring():
+    """Verify MistralAttention.forward passes sliding_window to Attention.forward."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=4096,
+    )
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+    attn = modeling_mistral.MistralAttention(mc, layer_idx=0)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.Attention.forward"
+    ) as mocked_forward:
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+
+    mocked_forward.assert_called_once()
+    _, call_kwargs = mocked_forward.call_args
+    assert call_kwargs["attention_window_size"] == config.sliding_window
+
+
+def test_mistral_attention_swa_none_when_unset():
+    """Verify MistralAttention.forward passes None when sliding_window is unset."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=None,
+    )
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+    attn = modeling_mistral.MistralAttention(mc, layer_idx=0)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.Attention.forward"
+    ) as mocked_forward:
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+
+    mocked_forward.assert_called_once()
+    _, call_kwargs = mocked_forward.call_args
+    assert call_kwargs["attention_window_size"] is None
+
+
+def test_mistral_attention_swa_layer_types():
+    """Ministral-style layer_types: sliding layers get SWA, full layers get None."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=32768,
+    )
+    # Ministral pattern: alternating sliding/full attention
+    config.layer_types = [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+
+    # Layer 0: sliding_attention → should use SWA
+    attn_sliding = modeling_mistral.MistralAttention(mc, layer_idx=0)
+    assert attn_sliding.attention_window_size == 32768
+
+    # Layer 1: full_attention → should be None
+    attn_full = modeling_mistral.MistralAttention(mc, layer_idx=1)
+    assert attn_full.attention_window_size is None
