@@ -65,6 +65,33 @@ def _should_use_short_mha(
     return effective_len <= mla.short_seq_mha_threshold
 
 
+def _run_sparse_attn_indexer(
+    mla: MLA,
+    q: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    is_generation: bool = False,
+    **kwargs,
+) -> torch.Tensor:
+    """Run sparse_attn_indexer using intermediates from pre_attn_process.
+
+    Used by the FlashMLA path (SM < 100) which needs topk_indices at the
+    Python level rather than inside the trtllm C++ kernel.
+    """
+    q_fp8 = kwargs.get("q_fp8")
+    k_fp8 = kwargs.get("k_fp8")
+    k_scale = kwargs.get("k_scale")
+    weights = kwargs.get("weights")
+    return mla.mqa.indexer.sparse_attn_indexer(
+        attn_metadata,
+        q,
+        q_fp8,
+        k_fp8,
+        k_scale,
+        weights,
+        is_generation=is_generation,
+    )
+
+
 @nvtx_range("forward_sparse_mla_kvcache_bf16")
 def _forward_sparse_mla_kvcache_bf16(
     mla: MLA,
@@ -265,13 +292,18 @@ class DSASparseMethod:
                 **kwargs,
             )
         else:
+            # FlashMLA path (SM < 100): run sparse indexing here since this
+            # path doesn't go through the trtllm C++ wrapper.plan().
+            topk_indices = _run_sparse_attn_indexer(
+                mla, q, attn_metadata, is_generation=False, **kwargs
+            )
             _forward_sparse_mla_kvcache_bf16(
                 mla,
                 q,
                 latent_cache,
                 attn_metadata,
                 output,
-                kwargs.get("topk_indices"),
+                topk_indices,
                 is_generation=False,
             )
 
@@ -298,12 +330,17 @@ class DSASparseMethod:
                 **kwargs,
             )
         else:
+            # FlashMLA path (SM < 100): run sparse indexing here since this
+            # path doesn't go through the trtllm C++ wrapper.plan().
+            topk_indices = _run_sparse_attn_indexer(
+                mla, q, attn_metadata, is_generation=True, **kwargs
+            )
             _forward_sparse_mla_kvcache_bf16(
                 mla,
                 q,
                 latent_cache,
                 attn_metadata,
                 output,
-                kwargs.get("topk_indices"),
+                topk_indices,
                 is_generation=True,
             )
