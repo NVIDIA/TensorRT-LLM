@@ -1062,6 +1062,12 @@ class Sharding(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Draft models are not sharded — they run unsharded inside EagleWrapper.
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
         config = self.config
@@ -1180,6 +1186,12 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Draft models are not sharded — they run unsharded inside EagleWrapper.
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
