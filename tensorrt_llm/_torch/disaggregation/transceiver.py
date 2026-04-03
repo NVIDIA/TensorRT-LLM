@@ -382,8 +382,36 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
 
-    def cancel_request(self, req: LlmRequest):
-        raise NotImplementedError("cancel_request is not implemented")
+    def cancel_request(self, req: LlmRequest) -> bool:
+        """Cancel the transfer for the given request.
+
+        Returns False if any task is mid-write (TRANSFERRING); caller must
+        retry next iteration. Returns True when safe to free KV memory.
+        """
+        rid = get_unique_rid(req)
+
+        # Not yet started (generation-first wait queue).
+        self._wait_reqs.pop(rid, None)
+
+        has_transferring = False
+
+        if rid in self._send_sessions:
+            self._send_sessions[rid].cancel()
+            if self._send_sessions[rid].has_transferring_tasks():
+                has_transferring = True
+            else:
+                self._close_failed_sessions(self._send_sessions, self._send_reqs, [rid])
+
+        if rid in self._recv_sessions:
+            self._recv_sessions[rid].cancel()
+            if self._recv_sessions[rid].has_transferring_tasks():
+                has_transferring = True
+            else:
+                self._close_failed_sessions(self._recv_sessions, self._recv_reqs, [rid])
+
+        if has_transferring:
+            return False  # mid-write; caller must retry
+        return True
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
         # Keep this aligned with fields populated in respond_and_send_async().
