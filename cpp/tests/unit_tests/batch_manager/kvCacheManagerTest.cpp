@@ -344,7 +344,7 @@ void runPartialCopyTest()
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
     }
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
 
@@ -426,9 +426,9 @@ void runPartialCopyTest()
     EXPECT_TRUE(block2->isPrimary());
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq1.getRequestId());
     blockManager.releaseSequence(seq2.getRequestId());
@@ -663,7 +663,7 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     auto cacheBlockIds = kvCacheManager.getSequence(requestId).getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
 
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(requestId, llmRequest0);
 
     inputTokens->pop_back();
@@ -780,7 +780,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 0, 1, 2 are stored for reuse (blocks contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9])
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -808,7 +808,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // block 3 matches block 2 and will be freed (blocks contain [8, 9])
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -854,13 +854,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
     // block 2 is stored for reuse (block contains [8]). nb! Last token of last block is never stored
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block is never stored
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -918,11 +918,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // block 5 is not stored since it is last block and has only one token
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq2.getRequestId());
     // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block not stored
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -958,7 +958,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // llmRequest4Short tokens [0, 1, 2, 3, 4, 5, 6, 7, 8]
     // blocks 0 and 1 ([0, 1, 2, 3], [4, 5, 6, 7]) are already stored,
     // block 4 is freed
-    llmRequest4Short->setContextCurrentPosition(llmRequest4Short->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4Short);
     blockManager.releaseBlocks(seq4, llmRequest4Short);
     blockManager.releaseSequence(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -987,7 +987,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
-    llmRequest4->setContextCurrentPosition(llmRequest4->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4_dup, llmRequest4);
     blockManager.releaseSequence(seq4_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1016,7 +1016,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), blocksInPrimaryPool);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 
-    llmRequest5->setContextCurrentPosition(llmRequest5->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest5);
     blockManager.releaseBlocks(seq5, llmRequest5);
     blockManager.releaseSequence(seq5.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1045,7 +1045,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 1);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - 1);
 
-    llmRequest6->setContextCurrentPosition(llmRequest6->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest6);
     blockManager.releaseBlocks(seq6, llmRequest6);
     blockManager.releaseSequence(seq6.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1122,7 +1122,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 0, 1, 2 are stored for reuse (block 2 contains [(2, 0), (3, 0)])
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1154,7 +1154,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // block 3 matches block 2 and will be freed
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1206,13 +1206,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks + 1);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 2 is stored for reuse (block contains [(2, 0), (3, 0), (4, 0)])
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1274,9 +1274,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks * 2);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq2.getRequestId());
     blockManager.releaseSequence(seq3.getRequestId());
@@ -1364,7 +1364,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // Block 0: [100, 101, 102, 103] ← Contains multimodal (102, 103)
     // Block 1: [104, 105, 0, 1]     ← Contains multimodal (104, 105)
     // Block 2: [2, 3, 4]            ← No multimodal
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1396,7 +1396,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // block 3 matches block 2 and will be freed
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1474,9 +1474,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
     // clean up
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq2.getRequestId());
     blockManager.releaseSequence(seq3.getRequestId());
@@ -1550,7 +1550,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // store blocks 0, 1, 2 for reuse ([0,1,2,3], [4,5,6,7], [8,9])
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1580,7 +1580,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // store block 3 for reuse ([8,9])
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1633,13 +1633,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
     // store block 4 for reuse ([8])
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 2 is stored for reuse (block contains [8, 9]). nb! Last token of last block is not stored
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1671,7 +1671,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // store blocks 5, 6, 7 for reuse ([0,1,2,3], [4,5,6,7], [8]) with loraTaskId 1
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq2.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1702,7 +1702,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // store block 7 for reuse ([8,9]) with loraTaskId 1
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1735,7 +1735,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 8 is stored with [4] and loraTaskId 0
-    llmRequest4->setContextCurrentPosition(llmRequest4->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4, llmRequest4);
     blockManager.releaseSequence(seq4.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1763,7 +1763,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     // blocks 9, 10, 11 are stored without loraTaskId
-    llmRequest5->setContextCurrentPosition(llmRequest5->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest5);
     blockManager.releaseBlocks(seq5, llmRequest5);
     blockManager.releaseSequence(seq5.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1840,7 +1840,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 0, 1, 2 are stored for reuse (block 2 contains [(2, 0), (3, 0)] with loraTaskId 1)
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1873,7 +1873,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // blocks 3, 4, 5 are stored for reuse (block 5 contains [(2, 0), (3, 0)] with loraTaskId 2)
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1925,12 +1925,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks * 2);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     blockManager.releaseSequence(seq0_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     blockManager.releaseSequence(seq1_dup.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2019,11 +2019,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks * 3);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 3);
 
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
-    llmRequest4->setContextCurrentPosition(llmRequest4->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4, llmRequest4);
     blockManager.releaseSequence(seq2.getRequestId());
     blockManager.releaseSequence(seq3.getRequestId());
@@ -2108,7 +2108,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // Release blocks to make them available for reuse
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
     blockManager.releaseSequence(seq0.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2145,7 +2145,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // Release blocks
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq1.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2181,7 +2181,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     // Release blocks
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq2.getRequestId());
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2248,9 +2248,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
 
     // Clean up
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
-    llmRequest4->setContextCurrentPosition(llmRequest4->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     blockManager.releaseBlocks(seq4, llmRequest4);
     blockManager.releaseSequence(seq3.getRequestId());
     blockManager.releaseSequence(seq4.getRequestId());
@@ -2302,7 +2302,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerPerRequestStatsTest)
     EXPECT_EQ(llmRequest0->getAllocNewBlocksPerRequest(), numBlocks);
     EXPECT_EQ(llmRequest0->getMissedBlocksPerRequest(), numBlocks);
 
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     EXPECT_NO_THROW((void) kvCacheManager.removeSequence(requestId, llmRequest0));
 
     requestId = 1;
@@ -2378,9 +2378,9 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
 
     // Release both sequences
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     blockManager.releaseBlocks(seq0, llmRequest0);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseSequence(seq0.getRequestId());
     blockManager.releaseSequence(seq1.getRequestId());
@@ -2397,7 +2397,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     auto prepopulatedPromptLen2 = blockManager.addSequence(
         seq2, llmRequest2->getNumTokens(0), numContextBlocks2, *llmRequest2, maxAttentionWindow);
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     blockManager.releaseSequence(seq2.getRequestId());
 
@@ -2414,7 +2414,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
 
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
 
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     blockManager.releaseSequence(seq3.getRequestId());
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 4);
@@ -2516,10 +2516,10 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
 
     // remove both sequences, blocks get stored
     // leaf block 3 (priority 90), context blocks 2, 1, 0 (priority 5)
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
     // leaf block 7 (priority 5), context blocks 6, 5, 4 (priority 90)
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
 
     // all blocks are available again.
@@ -2535,7 +2535,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
     // leaf block 2 (priority 35), context blocks 3, 7 (priority 35)
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
     // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
@@ -2587,7 +2587,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerTimedEvictionTest)
     llmRequest0->setKvCacheRetentionConfig(
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 80, 10ms)}, 80));
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
 
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23});
@@ -2596,7 +2596,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerTimedEvictionTest)
     llmRequest1->setKvCacheRetentionConfig(
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 50)}, 80));
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2609,7 +2609,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerTimedEvictionTest)
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
     // Check that the [12, 13, 14, 15] block is still in the cache
@@ -2670,7 +2670,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
             kvCacheManager.addToken(0);
             llmRequest0->addNewToken(0, 0);
         }
-        llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+        kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
         (void) kvCacheManager.removeSequence(0, llmRequest0);
     }
     {
@@ -2690,7 +2690,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
             kvCacheManager.addToken(1);
             llmRequest1->addNewToken(0, 0);
         }
-        llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+        kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
         (void) kvCacheManager.removeSequence(1, llmRequest1);
     }
 
@@ -2702,7 +2702,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
     // 12 tokens, reusing block 4, 5. Block 6 is overwritten so no reuse.
@@ -2750,7 +2750,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     // 12 tokens, get block 0, 1, 2
     // [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
     // store blocks 0, 1, 2 for reuse ([0,1,2,3], [4,5,6,7], [8,9,10])
 
@@ -2763,7 +2763,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     // Block 4 is now in primary (replacing 2)
     // Block 5 is now in primary (replacing 1)
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
     // store blocks 3, 4, 5 for reuse ([1,1,2,3], [4,5,6,7], [8,9,10])
 
@@ -2799,7 +2799,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     // If we do this, then the context current position at the bottom of this
     // unit test will be 9 because then the block content [4,5,6,7] can be
     // found and reused.
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
     // 10 tokens, reusing the block 0 only because when we want to acquire
@@ -2938,7 +2938,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
     kvCacheManager.addToken(0);
 
     // The second block allocated should be first in line for eviction.
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
 
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{1, 1, 2, 3});
@@ -2957,9 +2957,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
 
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
@@ -3052,7 +3052,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 
     // Free first sequence
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(requestId0, llmRequest0);
 
     // Verify that 3 primary blocks are free.
@@ -3093,7 +3093,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     EXPECT_FALSE(block0->isPrimary());
 
     // Cleanup
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(requestId1, llmRequest1);
 }
 
@@ -3622,7 +3622,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
     EXPECT_EQ(numBlocks, 3);
     EXPECT_THAT(seq0.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
 
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     EXPECT_NO_THROW((void) kvCacheManager.removeSequence(requestId, llmRequest));
     // no blocks stored because reuse is disabled
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -3684,7 +3684,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     EXPECT_EQ(std::get<tle::KVCacheStoredData>(events.front().data).blocks[0].cacheLevel, 0);
     kvCacheManager.addToken(0);
     llmRequest0->addNewToken(0, 0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
 
     auto newEvents = getEvents(kvCacheManager);
@@ -3703,7 +3703,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     llmRequest1->setLoraTaskId(42);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
 
     events = getEvents(kvCacheManager);
@@ -3734,9 +3734,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     EXPECT_THAT(std::get<tle::KVCacheRemovedData>(events.front().data).blockHashes,
         ::testing::ElementsAreArray({firstSwapped}));
 
-    llmRequest2->setContextCurrentPosition(llmRequest2->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
-    llmRequest3->setContextCurrentPosition(llmRequest3->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest3);
     (void) kvCacheManager.removeSequence(3, llmRequest3);
 
     events = getEvents(kvCacheManager);
@@ -3791,7 +3791,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     EXPECT_EQ(offloadedBlocks, 2);
     EXPECT_EQ(removedBlocks, 1);
 
-    llmRequest4->setContextCurrentPosition(llmRequest4->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest4);
     kvCacheManager.storeContextBlocks(*llmRequest4);
 
     events = getEvents(kvCacheManager);
@@ -3867,7 +3867,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
     EXPECT_THAT(seq0.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3, 4}));
 
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
     numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
     EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
@@ -3894,7 +3894,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addToken(requestId);
     numTokens = llmRequest->getNumTokens(beamIdx);
     EXPECT_THAT(seq1.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 5, 6}));
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 
     ///////////////////////////////////////////////////////////////////////////
@@ -3909,7 +3909,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     GenerationRequest const& seq2 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 9);
     EXPECT_THAT(seq2.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 7}));
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 
     ///////////////////////////////////////////////////////////////////////////
@@ -3932,7 +3932,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
     EXPECT_THAT(seq3.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 8, 9}));
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
 
@@ -4011,9 +4011,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSWAInvalidateReuseTest)
     EXPECT_FALSE(blockManager.isSequenceValidForStoreForReuse(seq0.getRequestId(), onlyWindowSize));
     EXPECT_TRUE(blockManager.isSequenceValidForStoreForReuse(seq1.getRequestId(), onlyWindowSize));
 
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(seq0.getRequestId(), llmRequest0)));
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(seq1.getRequestId(), llmRequest1)));
 }
 
@@ -4104,7 +4104,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     assertBlocks(seq0, {0, 1, 2}, {0, 1, 2});
     auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPoolPerWindow * numWindows;
 
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
     numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPoolPerWindow * numWindows;
     EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
@@ -4131,7 +4131,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     llmRequest->addNewToken(1009, beamIdx);
     kvCacheManager.addToken(requestId);
     assertBlocks(seq1, {0, 3, 4}, {0, 3, 4});
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
 
@@ -4169,7 +4169,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     llmRequest0->setLoraTaskId(42);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     auto events = getEvents(kvCacheManager);
@@ -4185,7 +4185,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)
     events = getEvents(kvCacheManager);
     EXPECT_EQ(events.size(), 0);
 
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
 
     events = getEvents(kvCacheManager);
@@ -4231,7 +4231,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     llmRequest0->setKvCacheRetentionConfig(tle::KvCacheRetentionConfig(
         std::vector{tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 50)}, 35));
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
     auto events = getEvents(kvCacheManager);
@@ -4249,7 +4249,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     auto llmRequest1 = std::make_shared<LlmRequest>(1, 0, inputTokens1, samplingConfig, true);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
 
     events = getEvents(kvCacheManager);
@@ -4401,7 +4401,7 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     ASSERT_TRUE(lastBlockIdOpt.has_value());
     auto const& allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
     std::vector<SizeType32> pinnedBlockIds(allBlockIds.begin(), allBlockIds.end());
-    llmRequest->setContextCurrentPosition(llmRequest->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     (void) kvCacheManager.removeSequence(requestId, llmRequest);
     auto const freeAfterRemovePinned = kvCacheManager.getNumFreeBlocks();
     EXPECT_LT(freeAfterRemovePinned, totalBlocks);
@@ -4455,7 +4455,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     kvCacheManager.flushIterationEvents();
@@ -4511,7 +4511,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     events = getEvents(kvCacheManager);
@@ -5178,7 +5178,7 @@ std::vector<LlmRequest> fillKvCacheManager(KVCacheManager& kvCacheManager, SizeT
     {
         kvCacheManager.addSequence(request.mRequestId, request.getPromptLen(), maxBeamWidth, request);
         request.mState = LlmRequestState::kGENERATION_IN_PROGRESS;
-        request.setContextCurrentPosition(request.getPromptLen());
+        kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(request);
         kvCacheManager.storeContextBlocks(request);
     }
 
@@ -5304,7 +5304,7 @@ TEST_P(FillKvCacheAndCompleteRequestsTest, FillKvCacheWithRequestsAndCompleteOne
             llmRequest.addNewToken(0, 0);
             kvCacheManager->addToken(llmRequest.mRequestId);
         }
-        llmRequest.setContextCurrentPosition(llmRequest.getPromptLen());
+        kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(llmRequest);
         (void) kvCacheManager->removeSequence(llmRequest.mRequestId, llmRequest);
     }
     auto const [expectedNumFreeBlocks, _] = params.kvCacheManagerInstantiationParameters.blocksPerWindow.at(
@@ -5969,10 +5969,10 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
         true,
     };
     kvCacheManager->addSequence(req0.mRequestId, req0.getPromptLen(), maxBeamWidth, req0);
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->storeContextBlocks(req0);
     // Release the sequence to make blocks available in the radix tree for reuse
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->removeSequence(req0.mRequestId, req0);
 
     auto req1 = LlmRequest{
@@ -6098,10 +6098,10 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
         true,
     };
     kvCacheManager->addSequence(req0.mRequestId, req0.getPromptLen(), maxBeamWidth, req0);
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->storeContextBlocks(req0);
     // Release the sequence to make blocks available in the radix tree for reuse
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->removeSequence(req0.mRequestId, req0);
 
     // Second request: shares first 2 blocks worth of tokens, then diverges
@@ -6172,10 +6172,10 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
         true,
     };
     kvCacheManager->addSequence(req0.mRequestId, req0.getPromptLen(), maxBeamWidth, req0);
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->storeContextBlocks(req0);
     // Release the sequence to make blocks available in the radix tree for reuse
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->removeSequence(req0.mRequestId, req0);
 
     // Second request with identical tokens
@@ -6241,10 +6241,10 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
         true,
     };
     kvCacheManager->addSequence(req0.mRequestId, req0.getPromptLen(), maxBeamWidth, req0);
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->storeContextBlocks(req0);
     // Release the sequence to make blocks available in the radix tree for reuse
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->removeSequence(req0.mRequestId, req0);
 
     // Second request with identical tokens - all context blocks should be reusable
@@ -6371,10 +6371,10 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         true,
     };
     kvCacheManager->addSequence(req0.mRequestId, req0.getPromptLen(), maxBeamWidth, req0);
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->storeContextBlocks(req0);
     // Release the sequence to make blocks available in the radix tree for reuse
-    req0.setContextCurrentPosition(req0.getPromptLen());
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(req0);
     kvCacheManager->removeSequence(req0.mRequestId, req0);
 
     // Second request with same shared prefix + different unique suffix
@@ -6443,18 +6443,18 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4});
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, true);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
 
     // Seq1: stores blockB([10,11,12,13]) as a separate leaf in the radix tree.
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14});
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, true);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
 
     (void) getEvents(kvCacheManager); // drain seq0/seq1 stored events
@@ -6529,9 +6529,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedOrderedBeforeStore)
                                    KvCacheRetentionConfig::TokenRangeRetentionConfig(4, std::nullopt, highPriority)},
             highPriority));
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
     (void) getEvents(kvCacheManager); // drain
 
@@ -6542,7 +6542,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedOrderedBeforeStore)
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108});
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, true);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
 
     auto events = getEvents(kvCacheManager);
@@ -6626,9 +6626,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStoreForDifferentWindowDoesNotFlus
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, true);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
-    llmRequest0->setContextCurrentPosition(llmRequest0->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
     (void) getEvents(kvCacheManager); // drain
 
@@ -6642,7 +6642,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStoreForDifferentWindowDoesNotFlus
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108});
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, true);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
-    llmRequest1->setContextCurrentPosition(llmRequest1->getPromptLen());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
 
     auto events = getEvents(kvCacheManager);
