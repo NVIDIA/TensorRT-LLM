@@ -2,6 +2,9 @@
 
 This file maps each YAML config parameter to the log patterns that confirm or deny its application.
 
+> **Source of truth for default config values**: `tensorrt_llm/_torch/auto_deploy/config/default.yaml`
+> That file defines all available transforms and their default settings. The patterns below document how each parameter's application (or failure) appears in server logs.
+
 ## How Transforms Are Logged
 
 Every transform logs with prefix: `[stage=<stage>, transform=<name>]`
@@ -93,6 +96,10 @@ All transforms log `[stage=X, transform=<name>]` prefix. Check for `[SUMMARY]` l
 
 ### `multi_stream_mla_attn.enabled`
 - **Transform key**: `multi_stream_mla_attn`
+- **Success**: `[SUMMARY] matches=N` (N > 0)
+- **Success**: `"Fork point ...: moving ... kv ... to aux stream"`
+- **Failure**: `"Could not find KV projection fork point"`
+- **Failure**: `"No fork point ... MLA"`
 - **Check**: `[SUMMARY]` line for matches vs skipped.
 
 ### `gather_logits_before_lm_head.enabled`

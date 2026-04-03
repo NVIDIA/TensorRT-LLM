@@ -31,6 +31,7 @@ FAILED = "FAILED"
 SKIPPED = "SKIPPED"
 DISABLED = "DISABLED"
 UNKNOWN = "UNKNOWN"  # no log evidence found
+CONFLICT = "CONFLICT"  # log and graph evidence contradict each other
 
 
 # ── Graph dump analyzer ──────────────────────────────────────────────────────
@@ -54,7 +55,7 @@ class GraphAnalyzer:
     def _parse_dir(self):
         """Parse graph dump directory to index files by transform name."""
         for f in sorted(self.graph_dir.glob("*.txt")):
-            m = re.match(r"(\d+)_(\w+?)_(.+)\.txt$", f.name)
+            m = re.match(r"(\d+)_([a-z][a-z_]*)_(.+)\.txt$", f.name)
             if m:
                 idx, stage, transform = int(m.group(1)), m.group(2), m.group(3)
                 self._files[transform] = f
@@ -139,8 +140,9 @@ class GraphAnalyzer:
         if not target_linear:
             return None
 
-        # Extract the node name from the linear op
-        node_match = re.match(r"%(\S+)", target_linear)
+        # Extract the node name from the linear op.
+        # Allow optional leading whitespace/annotations before the '%' sigil.
+        node_match = re.search(r"%(\S+)", target_linear)
         if not node_match:
             return None
         node_name = node_match.group(1)
@@ -194,7 +196,26 @@ class GraphAnalyzer:
         return None
 
     def verify_dist_mapping(self, mapping: dict) -> Optional[Tuple[str, str]]:
-        """Verify dist_mapping by checking collective op counts match expected TP/EP config."""
+        """Verify dist_mapping by comparing weight shapes before/after sharding.
+
+        Extracts the expected TP factor from *mapping* (``tp`` key) and checks
+        that weight dimensions in the graph were actually divided by that factor
+        after the sharding transform.  Falls back to collective-op counting when
+        before/after graphs are unavailable.
+        """
+        tp = mapping.get("tp", mapping.get("moe_tp"))
+        if tp is not None:
+            tp = int(tp)
+
+        before = self.get_graph_before("sharding_transform_executor")
+        after = self.get_graph_after("sharding_transform_executor")
+
+        if before and after and tp and tp > 1:
+            result = self._verify_sharding_ratio(before, after, tp)
+            if result:
+                return result
+
+        # Fallback: count collective ops in the final graph
         final = self.get_final_graph()
         if not final:
             return None
@@ -203,6 +224,69 @@ class GraphAnalyzer:
         if n_allreduce > 0 or n_allgather > 0:
             return APPLIED, f"Graph: {n_allreduce} all_reduce + {n_allgather} all_gather ops"
         return None
+
+    def _verify_sharding_ratio(
+        self, before: str, after: str, expected_tp: int
+    ) -> Optional[Tuple[str, str]]:
+        """Compare weight shapes before/after sharding to verify TP factor.
+
+        Looks for ``torch_linear_simple`` weight placeholders whose first
+        dimension changed by the expected TP ratio.  Returns a summary of
+        matched / mismatched weights.
+        """
+        before_shapes = self._extract_weight_shapes(before)
+        after_shapes = self._extract_weight_shapes(after)
+
+        matched = 0
+        mismatched = 0
+        mismatch_examples: List[str] = []
+
+        for name in before_shapes:
+            if name not in after_shapes:
+                continue
+            b_dim = before_shapes[name]
+            a_dim = after_shapes[name]
+            if b_dim == a_dim:
+                continue  # not sharded — skip (could be non-TP weight)
+            if b_dim == a_dim * expected_tp:
+                matched += 1
+            else:
+                mismatched += 1
+                if len(mismatch_examples) < 3:
+                    short = name.split("_")[-2] if "_" in name else name
+                    mismatch_examples.append(f"{short}: {b_dim}->{a_dim} (expect /{expected_tp})")
+
+        if matched == 0 and mismatched == 0:
+            return None
+
+        if mismatched == 0:
+            return (
+                APPLIED,
+                f"Graph: {matched} weights sharded by TP={expected_tp} (shape verified)",
+            )
+
+        evidence = f"Graph: {matched} matched, {mismatched} mismatched for TP={expected_tp}"
+        if mismatch_examples:
+            evidence += f" e.g. {'; '.join(mismatch_examples)}"
+        if matched > mismatched:
+            return APPLIED, evidence
+        return FAILED, evidence
+
+    @staticmethod
+    def _extract_weight_shapes(graph_text: str) -> Dict[str, int]:
+        """Extract first dimension of weight placeholders from graph text.
+
+        Looks for lines like:
+            %model_layers_0_linear_weight : 12288x4096 : torch.bfloat16
+        Returns {name: first_dim_int}.
+        """
+        shapes: Dict[str, int] = {}
+        # Matches 2D+ shapes (e.g., 12288x4096, 64x128x256); captures only the first dim.
+        for m in re.finditer(r"^%(\S*weight\S*)\s*:\s*(\d+)(?:x\d+)+", graph_text, re.MULTILINE):
+            name = m.group(1)
+            first_dim = int(m.group(2))
+            shapes[name] = first_dim
+        return shapes
 
     def verify_fuse_nvfp4_moe(self) -> Optional[Tuple[str, str]]:
         """Verify fuse_nvfp4_moe by checking for fused MoE ops in graph."""
@@ -289,21 +373,19 @@ class GraphAnalyzer:
         if not final:
             return None
         lines = final.splitlines()
-        lm_head_idx = None
-        gather_before_lm_head = False
-        for i, line in enumerate(lines):
-            if "lm_head" in line and "linear" in line.lower():
-                lm_head_idx = i
-            if lm_head_idx is not None:
-                break
-        if lm_head_idx is not None:
-            # Check for gather/index_select operations before lm_head
-            for i in range(max(0, lm_head_idx - 10), lm_head_idx):
-                if "gather" in lines[i].lower() or "index_select" in lines[i].lower():
-                    gather_before_lm_head = True
-                    break
-        if gather_before_lm_head:
-            return APPLIED, "Graph: gather/index_select found before lm_head"
+
+        # Find the first lm_head linear op
+        lm_head_idx = next(
+            (i for i, ln in enumerate(lines) if "lm_head" in ln and "linear" in ln.lower()),
+            None,
+        )
+        if lm_head_idx is None:
+            return None
+
+        # Check for gather/index_select operations before lm_head (scan all preceding lines)
+        for i in range(max(0, lm_head_idx - 50), lm_head_idx):
+            if "gather" in lines[i].lower() or "index_select" in lines[i].lower():
+                return APPLIED, "Graph: gather/index_select found before lm_head"
         return None
 
     def verify_export_to_gm(self) -> Optional[Tuple[str, str]]:
@@ -338,21 +420,77 @@ class GraphAnalyzer:
 # Each checker returns (status, evidence_line_or_None).
 
 
-def _search(log: str, pattern: str) -> Optional[str]:
-    """Return first matching line or None."""
+def _search(log: str, pattern: str, context_lines: int = 0) -> Optional[str]:
+    """Return the full line containing the first match, or None.
+
+    When *context_lines* > 0, up to that many continuation lines are appended
+    (useful for multi-line log entries such as tracebacks).  Continuation lines
+    are included only while the next line does NOT look like a new log entry
+    (heuristic: starts with ``[`` or a timestamp-like ``YYYY-`` / ``HH:MM``).
+    """
     m = re.search(pattern, log, re.MULTILINE | re.IGNORECASE)
-    return m.group(0).strip() if m else None
+    if not m:
+        return None
+    # Find the full line containing the match
+    start = log.rfind("\n", 0, m.start()) + 1
+    end = log.find("\n", m.end())
+    if end == -1:
+        end = len(log)
+    result = log[start:end].strip()
+
+    if context_lines > 0:
+        _NEW_ENTRY = re.compile(r"^\s*(\[|(\d{4}-|\d{2}:\d{2}))")
+        pos = end
+        for _ in range(context_lines):
+            if pos >= len(log):
+                break
+            next_end = log.find("\n", pos + 1)
+            if next_end == -1:
+                next_end = len(log)
+            next_line = log[pos + 1 : next_end].strip()
+            if not next_line or _NEW_ENTRY.match(next_line):
+                break
+            result += " | " + next_line
+            pos = next_end
+
+    return result
 
 
 def _search_all(log: str, pattern: str) -> List[str]:
-    """Return all matching lines."""
-    return [m.group(0).strip() for m in re.finditer(pattern, log, re.MULTILINE | re.IGNORECASE)]
+    """Return the full lines containing all matches."""
+    lines = []
+    for m in re.finditer(pattern, log, re.MULTILINE | re.IGNORECASE):
+        start = log.rfind("\n", 0, m.start()) + 1
+        end = log.find("\n", m.end())
+        if end == -1:
+            end = len(log)
+        lines.append(log[start:end].strip())
+    return lines
+
+
+def _check_numeric_config(log: str, key: str, expected: int) -> Tuple[str, Optional[str]]:
+    """Check a numeric config by finding all ``key=<number>`` in the log.
+
+    Returns APPLIED if the expected value appears, FAILED if a different value
+    appears (mismatch), or UNKNOWN if the key is not found at all.
+    """
+    matches = re.findall(rf"\b{re.escape(key)}=(\d+)", log)
+    if not matches:
+        return UNKNOWN, f"No explicit log for {key} (consumed by downstream transforms)"
+    values = sorted(set(int(v) for v in matches))
+    if expected in values:
+        if len(values) == 1:
+            return APPLIED, f"{key}={expected}"
+        others = [v for v in values if v != expected]
+        return APPLIED, f"{key}={expected} (also seen: {others})"
+    # Key found but configured value never appeared
+    return FAILED, f"{key} configured={expected} but log shows {values}"
 
 
 def _check_transform_summary(log: str, transform_key: str) -> Tuple[str, Optional[str]]:
     """Check the [SUMMARY] line for a given transform."""
     # Pattern: [stage=..., transform=<key>] ... [SUMMARY] ...
-    prefix_pat = rf"\[stage=\w+,\s*transform={re.escape(transform_key)}\]"
+    prefix_pat = rf"\[stage=[^\]]+,\s*transform={re.escape(transform_key)}\]"
 
     # Look for summary line
     summary_pat = rf"^.*{prefix_pat}.*\[SUMMARY\].*$"
@@ -396,13 +534,53 @@ def check_compile_backend(log: str, value: str) -> Tuple[str, Optional[str]]:
 
 
 def check_cuda_graph_batch_sizes(log: str, sizes: list) -> Tuple[str, Optional[str]]:
+    try:
+        configured = sorted(int(s) for s in sizes)
+    except (ValueError, TypeError) as exc:
+        return FAILED, f"Invalid cuda_graph_batch_sizes in YAML: {sizes} ({exc})"
+
+    # Primary: parse the logged batch size list
     ev = _search(log, r"Using cuda_graph_batch_sizes:.*")
     if ev:
-        return APPLIED, ev
-    # Fallback: check individual captures
-    captured = _search_all(log, r"Capturing graph for batch size: \d+")
+        # Extract numbers from the bracketed list (e.g., "[1, 2, 4, 8]") to
+        # avoid picking up stray digits from timestamps or other log content.
+        bracket_match = re.search(r"\[([^\]]+)\]", ev)
+        if bracket_match:
+            logged = sorted(int(x) for x in re.findall(r"\d+", bracket_match.group(1)))
+        else:
+            # Fallback: take digits after the last colon in the evidence key
+            logged = sorted(int(x) for x in re.findall(r"\d+", ev.rsplit(":", 1)[-1]))
+        if logged == configured:
+            return APPLIED, ev
+        missing = sorted(set(configured) - set(logged))
+        extra = sorted(set(logged) - set(configured))
+        parts = []
+        if missing:
+            parts.append(f"missing {missing}")
+        if extra:
+            parts.append(f"extra {extra}")
+        return FAILED, f"{ev} (MISMATCH: {', '.join(parts)})"
+
+    # Fallback: check individual capture lines
+    captured = _search_all(log, r"Capturing graph for batch size: (\d+)")
     if captured:
-        return APPLIED, f"Captured {len(captured)} batch sizes"
+        captured_sizes = sorted(
+            int(m) for line in captured for m in re.findall(r"batch size: (\d+)", line)
+        )
+        if captured_sizes == configured:
+            return APPLIED, f"Captured {len(captured_sizes)} batch sizes: {captured_sizes}"
+        missing = sorted(set(configured) - set(captured_sizes))
+        extra = sorted(set(captured_sizes) - set(configured))
+        parts = []
+        if missing:
+            parts.append(f"missing {missing}")
+        if extra:
+            parts.append(f"extra {extra}")
+        return (
+            FAILED,
+            f"Captured {len(captured_sizes)} batch sizes: {captured_sizes} (MISMATCH: {', '.join(parts)})",
+        )
+
     return UNKNOWN, None
 
 
@@ -410,8 +588,10 @@ def check_piecewise_enabled(log: str, enabled: bool) -> Tuple[str, Optional[str]
     if not enabled:
         return DISABLED, "piecewise_enabled=false in config"
 
-    # Check for failure first
-    fail = _search(log, r"model is not a GraphModule.*piecewise CUDA graph.*Falling back")
+    # Check for failure first (include continuation lines for traceback context)
+    fail = _search(
+        log, r"model is not a GraphModule.*piecewise CUDA graph.*Falling back", context_lines=3
+    )
     if fail:
         return FAILED, fail
 
@@ -443,60 +623,82 @@ def check_allreduce_strategy(log: str, strategy: str) -> Tuple[str, Optional[str
 
 
 def check_sharding_source(log: str, sources: list) -> Tuple[str, Optional[str]]:
-    evidences = []
+    applied = []
+    skipped = []
     for src in sources:
         if src == "manual":
             ev = _search(log, r"Applying sharding from manual config")
             skip = _search(log, r"No manual config found\. Skipping")
-            if skip:
-                return FAILED, skip
             if ev:
-                evidences.append(ev)
+                applied.append(f"manual: {ev}")
+            elif skip:
+                skipped.append(f"manual: {skip}")
         elif src == "factory":
             ev = _search(log, r"Applying sharding from factory config")
             skip = _search(log, r"No factory config found\. Skipping")
-            if skip:
-                return FAILED, skip
             if ev:
-                evidences.append(ev)
+                applied.append(f"factory: {ev}")
+            elif skip:
+                skipped.append(f"factory: {skip}")
         elif src == "heuristic":
             ev = _search(log, r"Running autodeploy TP sharding heuristics")
             if ev:
-                evidences.append(ev)
-    if evidences:
-        return APPLIED, "; ".join(evidences)
+                applied.append(f"heuristic: {ev}")
+            else:
+                skipped.append("heuristic: no log evidence")
+
+    n_applied = len(applied)
+    n_skipped = len(skipped)
+
+    if n_applied > 0:
+        evidence = "; ".join(applied + skipped)
+        if n_skipped > 0:
+            return APPLIED, f"APPLIED({n_applied}), SKIPPED({n_skipped}): {evidence}"
+        return APPLIED, "; ".join(applied)
+    if n_skipped > 0:
+        return SKIPPED, f"All sources skipped ({n_skipped}): " + "; ".join(skipped)
     return UNKNOWN, None
 
 
 def check_sharding_dims(log: str, dims: list) -> Tuple[str, Optional[str]]:
-    evidences = []
+    applied = []
+    skipped = []
     for dim in dims:
         if dim == "tp":
             ev = _search(log, r"Applied \d+ TP shards from config")
             if ev:
-                evidences.append(ev)
+                applied.append(ev)
             else:
                 skip = _search(log, r"Skipping TP sharding for single device")
                 if skip:
-                    evidences.append(f"TP: {skip}")
+                    skipped.append(f"TP: {skip}")
         elif dim == "ep":
             ev = _search(log, r"Running autodeploy EP sharding heuristics")
             if ev:
-                evidences.append(ev)
+                applied.append(ev)
             else:
                 skip = _search(log, r"Skipping EP sharding for single device")
                 if skip:
-                    evidences.append(f"EP: {skip}")
+                    skipped.append(f"EP: {skip}")
         elif dim == "bmm":
             ev = _search(log, r"Running autodeploy BMM sharding heuristics")
             if ev:
-                evidences.append(ev)
+                applied.append(ev)
             else:
                 skip = _search(log, r"Skipping DP BMM sharding for single device")
                 if skip:
-                    evidences.append(f"BMM: {skip}")
-    if evidences:
-        return APPLIED, "; ".join(evidences)
+                    skipped.append(f"BMM: {skip}")
+
+    n_applied = len(applied)
+    n_skipped = len(skipped)
+    all_evidence = "; ".join(applied + skipped)
+
+    if n_applied > 0 and n_skipped > 0:
+        return APPLIED, f"APPLIED({n_applied}), SKIPPED({n_skipped}): {all_evidence}"
+    if n_applied > 0:
+        return APPLIED, "; ".join(applied)
+    if n_skipped > 0:
+        return SKIPPED, f"All dims skipped ({n_skipped}): {all_evidence}"
     return UNKNOWN, None
 
 
@@ -518,6 +720,27 @@ def check_multi_stream_gemm(log: str) -> Tuple[str, Optional[str]]:
     success = _search(log, r"Fork point.*: moving.*to aux stream")
     if success:
         return APPLIED, success
+    return UNKNOWN, None
+
+
+def check_multi_stream_mla_attn(log: str) -> Tuple[str, Optional[str]]:
+    status, ev = _check_transform_summary(log, "multi_stream_mla_attn")
+    if status != UNKNOWN:
+        return status, ev
+    # MLA-specific: aux-stream KV projection
+    success = _search(log, r"Fork point.*: moving.*kv.*to aux stream")
+    if success:
+        return APPLIED, success
+    success = _search(log, r"multi_stream_mla_attn.*\[APPLY\]")
+    if success:
+        return APPLIED, success
+    # Check for failure patterns specific to MLA
+    fail = _search(log, r"Could not find KV projection fork point")
+    if fail:
+        return FAILED, fail
+    fail = _search(log, r"No fork point.*MLA")
+    if fail:
+        return FAILED, fail
     return UNKNOWN, None
 
 
@@ -572,22 +795,54 @@ def _generic_check(log: str, key: str, value) -> Tuple[str, Optional[str]]:
             if apply_ev:
                 return APPLIED, apply_ev
 
-    # Strategy 3: search for the value directly (only if specific enough)
+    # Strategy 3: search for key near value (require both to reduce false positives)
+    # Exclude generic values that match too broadly across log lines
+    _GENERIC_STR_EXCLUDES = frozenset(
+        {
+            "true",
+            "false",
+            "none",
+            "auto",
+            "default",
+            "enabled",
+            "disabled",
+            "on",
+            "off",
+            "yes",
+            "no",
+            "null",
+        }
+    )
+    _GENERIC_KEY_EXCLUDES = frozenset(
+        {
+            "enabled",
+            "stage",
+            "type",
+            "mode",
+            "name",
+            "value",
+            "kind",
+        }
+    )
     if (
         isinstance(value, str)
         and len(str_val) >= 4
-        and str_val.lower() not in ("true", "false", "none")
+        and str_val.lower() not in _GENERIC_STR_EXCLUDES
+        and short_key.lower() not in _GENERIC_KEY_EXCLUDES
     ):
-        ev = _search(log, re.escape(str_val))
-        if ev:
-            return APPLIED, ev
+        esc_key = re.escape(short_key)
+        esc_val = re.escape(str_val)
+        # Assignment pattern: key=value / key: value / key to value
+        key_ev = _search(log, rf"(?i)\b{esc_key}\s*[=:]\s*{esc_val}\b")
+        if key_ev:
+            return APPLIED, key_ev
     elif isinstance(value, (int, float)) and value not in (0, 1, True, False):
-        ev = _search(log, rf"\b{re.escape(str_val)}\b")
-        if ev:
-            # Only count if the key name is also nearby or it's in a relevant context
-            key_ev = _search(log, rf"(?i){re.escape(short_key)}.*{re.escape(str_val)}")
-            if key_ev:
-                return APPLIED, key_ev
+        esc_key = re.escape(short_key)
+        esc_val = re.escape(str_val)
+        # Assignment pattern: key=value / key: value
+        key_ev = _search(log, rf"(?i)\b{esc_key}\s*[=:]\s*{esc_val}\b")
+        if key_ev:
+            return APPLIED, key_ev
 
     return UNKNOWN, f"No log evidence found for {key}={str_val}"
 
@@ -623,7 +878,10 @@ def flatten_yaml(cfg: dict, prefix: str = "") -> List[Tuple[str, str, object]]:
 
 
 def check_config(
-    yaml_paths: List[str], log_path: str, graph_dir: Optional[str] = None
+    yaml_paths: List[str],
+    log_path: str,
+    graph_dir: Optional[str] = None,
+    verbose: bool = False,
 ) -> List[Dict]:
     """Parse YAML(s) and log, return list of {config, value, status, evidence} dicts.
 
@@ -632,6 +890,9 @@ def check_config(
 
     If *graph_dir* is provided, also analyzes graph dumps for additional evidence.
     Graph evidence can upgrade UNKNOWN results or supplement existing evidence.
+
+    If *verbose* is True, each result dict includes a ``checker`` key indicating
+    which checker produced it (``dedicated`` or ``generic``).
     """
     cfg: dict = {}
     for yp in yaml_paths:
@@ -647,15 +908,22 @@ def check_config(
 
     results = []
 
-    def add(config_key: str, value, status: str, evidence: Optional[str]):
-        results.append(
-            {
-                "config": config_key,
-                "value": str(value),
-                "status": status,
-                "evidence": evidence or "-",
-            }
-        )
+    def add(
+        config_key: str,
+        value,
+        status: str,
+        evidence: Optional[str],
+        checker: str = "dedicated",
+    ):
+        entry = {
+            "config": config_key,
+            "value": str(value),
+            "status": status,
+            "evidence": evidence or "-",
+        }
+        if verbose:
+            entry["checker"] = checker
+        results.append(entry)
 
     def add_with_graph(
         config_key: str,
@@ -663,33 +931,94 @@ def check_config(
         status: str,
         evidence: Optional[str],
         graph_result: Optional[Tuple[str, str]] = None,
+        checker: str = "dedicated",
     ):
-        """Add result, using graph evidence to upgrade UNKNOWN or supplement."""
+        """Add result, using graph evidence to upgrade UNKNOWN or supplement.
+
+        Detects contradictions between log and graph (e.g., log says SKIPPED
+        but graph says APPLIED) and flags them as CONFLICT.
+        """
         if graph_result and status == UNKNOWN:
             # Graph evidence upgrades UNKNOWN
-            results.append(
-                {
+            entry = {
+                "config": config_key,
+                "value": str(value),
+                "status": graph_result[0],
+                "evidence": graph_result[1],
+            }
+            if verbose:
+                entry["checker"] = checker + "+graph"
+            results.append(entry)
+        elif graph_result and status in (APPLIED, SKIPPED, FAILED):
+            graph_status = graph_result[0]
+            combined = (evidence or "-") + f" | {graph_result[1]}"
+            # Check for contradictions between log and graph
+            contradicts = (
+                (status == SKIPPED and graph_status == APPLIED)
+                or (status == APPLIED and graph_status == FAILED)
+                or (status == FAILED and graph_status == APPLIED)
+            )
+            if contradicts:
+                entry = {
                     "config": config_key,
                     "value": str(value),
-                    "status": graph_result[0],
-                    "evidence": graph_result[1],
+                    "status": CONFLICT,
+                    "evidence": f"Log={status} vs Graph={graph_status}: {combined}",
                 }
-            )
-        elif graph_result and status in (APPLIED, SKIPPED):
-            # Append graph evidence as supplementary
-            combined = (evidence or "-") + f" | {graph_result[1]}"
-            results.append(
-                {
+                if verbose:
+                    entry["checker"] = checker + "+graph"
+                results.append(entry)
+            else:
+                entry = {
                     "config": config_key,
                     "value": str(value),
                     "status": status,
                     "evidence": combined,
                 }
-            )
+                if verbose:
+                    entry["checker"] = checker + "+graph"
+                results.append(entry)
         else:
-            add(config_key, value, status, evidence)
+            add(config_key, value, status, evidence, checker=checker)
 
     # ── Top-level parameters ──────────────────────────────────────────────
+    if "runtime" in cfg:
+        rt = cfg["runtime"]
+        # Use tight assignment-style patterns to avoid matching the runtime
+        # string in unrelated contexts (transform names, paths, etc.)
+        _RUNTIME_PATTERNS = {
+            "trtllm": r"(?i)runtime\s*[=:]\s*trtllm|Using TRT-LLM\b",
+            "demollm": r"(?i)runtime\s*[=:]\s*demollm|Using DemoLLM\b",
+        }
+        ev = _search(log, _RUNTIME_PATTERNS.get(rt, rf"(?i)runtime\s*[=:]\s*{re.escape(str(rt))}"))
+        if ev:
+            add("runtime", rt, APPLIED, ev)
+        else:
+            # Check if a *different* runtime was logged (mismatch detection)
+            other_runtimes = [r for r in _RUNTIME_PATTERNS if r != rt]
+            for other in other_runtimes:
+                mismatch_ev = _search(log, _RUNTIME_PATTERNS[other])
+                if mismatch_ev:
+                    add(
+                        "runtime",
+                        rt,
+                        FAILED,
+                        f"Configured {rt} but log shows {other}: {mismatch_ev}",
+                    )
+                    break
+            else:
+                add("runtime", rt, UNKNOWN, "No explicit log (infer from startup)")
+
+    if "world_size" in cfg:
+        ws = int(cfg["world_size"])
+        s, e = _check_numeric_config(log, "world_size", ws)
+        if s == UNKNOWN:
+            # Fallback: check tp_size or process count
+            tp_ev = _search(log, rf"(?i)tp_size={ws}|tensor_parallel.*{ws}|num_gpus.*{ws}")
+            if tp_ev:
+                s, e = APPLIED, tp_ev
+        add("world_size", ws, s, e)
+
     if "compile_backend" in cfg:
         s, e = check_compile_backend(log, cfg["compile_backend"])
         add("compile_backend", cfg["compile_backend"], s, e)
@@ -722,25 +1051,30 @@ def check_config(
         add("model_factory", cfg["model_factory"], s, ev)
 
     if "max_seq_len" in cfg:
-        val = cfg["max_seq_len"]
-        ev = _search(log, rf"max_seq_len={val}")
-        adjusted = _search(log, r"Adjusted max_seq_len to \d+")
-        if ev and adjusted:
-            add("max_seq_len", val, APPLIED, f"{ev} (WARNING: {adjusted})")
-        elif ev:
-            add("max_seq_len", val, APPLIED, ev)
+        val = int(cfg["max_seq_len"])
+        s, e = _check_numeric_config(log, "max_seq_len", val)
+        adjusted = _search(log, r"Adjusted max_seq_len to (\d+)")
+        if adjusted and s == APPLIED:
+            add("max_seq_len", val, APPLIED, f"{e} (WARNING: {adjusted})")
+        elif adjusted and s != APPLIED:
+            add(
+                "max_seq_len",
+                val,
+                APPLIED,
+                f"Runtime adjusted: {adjusted} (WARNING: configured {val} not found in log)",
+            )
         else:
-            add("max_seq_len", val, UNKNOWN, "No explicit log (consumed by downstream transforms)")
+            add("max_seq_len", val, s, e)
 
     if "max_num_tokens" in cfg:
-        ev = _search(log, rf"max_num_tokens={cfg['max_num_tokens']}")
-        s = APPLIED if ev else UNKNOWN
-        add("max_num_tokens", cfg["max_num_tokens"], s, ev)
+        val = int(cfg["max_num_tokens"])
+        s, e = _check_numeric_config(log, "max_num_tokens", val)
+        add("max_num_tokens", val, s, e)
 
     if "max_batch_size" in cfg:
-        ev = _search(log, rf"max_batch_size={cfg['max_batch_size']}")
-        s = APPLIED if ev else UNKNOWN
-        add("max_batch_size", cfg["max_batch_size"], s, ev)
+        val = int(cfg["max_batch_size"])
+        s, e = _check_numeric_config(log, "max_batch_size", val)
+        add("max_batch_size", val, s, e)
 
     # ── kv_cache_config ───────────────────────────────────────────────────
     kv_cfg = cfg.get("kv_cache_config", {})
@@ -804,7 +1138,9 @@ def check_config(
                     else:
                         add(f"model_kwargs.{k}", v, UNKNOWN, "No explicit log (model init kwargs)")
             else:
-                ev = _search(log, rf"{re.escape(k)}.*{re.escape(str(v))}")
+                # Use assignment-style pattern (key=value or key: value) to
+                # avoid false positives from loose "key.*value" matching.
+                ev = _search(log, rf"(?i)\b{re.escape(k)}\s*[=:]\s*{re.escape(str(v))}\b")
                 if ev:
                     add(f"model_kwargs.{k}", v, APPLIED, ev)
                 else:
@@ -833,6 +1169,12 @@ def check_config(
                     UNKNOWN,
                     "Check piecewise capture logs for actual tokens used",
                 )
+            # Check remaining sub-params via generic fallback
+            for k, v in t_cfg.items():
+                if k in ("piecewise_enabled", "piecewise_num_tokens", "stage"):
+                    continue
+                s, e = _generic_check(log, f"transforms.compile_model.{k}", v)
+                add(f"transforms.compile_model.{k}", v, s, e, checker="generic")
             continue
 
         if t_name == "detect_sharding":
@@ -852,7 +1194,10 @@ def check_config(
             eadp = t_cfg.get("enable_attention_dp")
             if eadp is not None:
                 ev = _search(log, r"Attention DP is enabled")
-                s = APPLIED if (ev and eadp) else (UNKNOWN if eadp else UNKNOWN)
+                if not eadp:
+                    s = FAILED if ev else DISABLED
+                else:
+                    s = APPLIED if ev else UNKNOWN
                 add("transforms.detect_sharding.enable_attention_dp", eadp, s, ev)
             # Other detect_sharding params with specific checkers
             for k, v in t_cfg.items():
@@ -865,26 +1210,11 @@ def check_config(
                 ):
                     continue
                 if k == "dist_mapping" and isinstance(v, dict):
-                    # Check process grid log for moe_tp / moe_ep values
                     grid_ev = _search(log, r"process grid:.*\[TP, MoE_TP, MoE_EP\].*")
+                    gr = ga.verify_dist_mapping(v) if ga else None
                     if grid_ev:
-                        # Verify the values match
-                        tp_match = re.search(
-                            r"MoE_TP.*?=.*?(\d+)", grid_ev.replace(" ", "")
-                        ) or re.search(
-                            r"\[TP, MoE_TP, MoE_EP\]\s*=\s*\[(\d+),\s*(\d+),\s*(\d+)\]", grid_ev
-                        )
-                        gr = ga.verify_dist_mapping(v) if ga else None
-                        if tp_match:
-                            add_with_graph(
-                                f"transforms.detect_sharding.{k}", v, APPLIED, grid_ev, gr
-                            )
-                        else:
-                            add_with_graph(
-                                f"transforms.detect_sharding.{k}", v, APPLIED, grid_ev, gr
-                            )
+                        add_with_graph(f"transforms.detect_sharding.{k}", v, APPLIED, grid_ev, gr)
                     else:
-                        gr = ga.verify_dist_mapping(v) if ga else None
                         add_with_graph(
                             f"transforms.detect_sharding.{k}",
                             v,
@@ -950,6 +1280,12 @@ def check_config(
                 add("transforms.multi_stream_moe.enabled", True, s, e)
             else:
                 add("transforms.multi_stream_moe.enabled", False, DISABLED, "Disabled in config")
+                continue  # skip sub-params for disabled transforms
+            for k, v in t_cfg.items():
+                if k in ("enabled", "stage"):
+                    continue
+                s, e = _generic_check(log, f"transforms.multi_stream_moe.{k}", v)
+                add(f"transforms.multi_stream_moe.{k}", v, s, e, checker="generic")
             continue
 
         if t_name == "multi_stream_gemm":
@@ -958,6 +1294,31 @@ def check_config(
                 add("transforms.multi_stream_gemm.enabled", True, s, e)
             else:
                 add("transforms.multi_stream_gemm.enabled", False, DISABLED, "Disabled in config")
+                continue  # skip sub-params for disabled transforms
+            for k, v in t_cfg.items():
+                if k in ("enabled", "stage"):
+                    continue
+                s, e = _generic_check(log, f"transforms.multi_stream_gemm.{k}", v)
+                add(f"transforms.multi_stream_gemm.{k}", v, s, e, checker="generic")
+            continue
+
+        if t_name == "multi_stream_mla_attn":
+            if t_cfg.get("enabled"):
+                s, e = check_multi_stream_mla_attn(log)
+                add("transforms.multi_stream_mla_attn.enabled", True, s, e)
+            else:
+                add(
+                    "transforms.multi_stream_mla_attn.enabled",
+                    False,
+                    DISABLED,
+                    "Disabled in config",
+                )
+                continue  # skip sub-params for disabled transforms
+            for k, v in t_cfg.items():
+                if k in ("enabled", "stage"):
+                    continue
+                s, e = _generic_check(log, f"transforms.multi_stream_mla_attn.{k}", v)
+                add(f"transforms.multi_stream_mla_attn.{k}", v, s, e, checker="generic")
             continue
 
         if t_name == "fuse_gemms_mixed_children":
@@ -972,41 +1333,54 @@ def check_config(
                     DISABLED,
                     "Disabled in config",
                 )
+            # Check remaining sub-params via generic fallback
+            for k, v in t_cfg.items():
+                if k in ("enabled", "stage"):
+                    continue
+                s, e = _generic_check(log, f"transforms.fuse_gemms_mixed_children.{k}", v)
+                add(f"transforms.fuse_gemms_mixed_children.{k}", v, s, e, checker="generic")
             continue
 
         # ── Generic transform with enabled flag ──────────────────────────
         enabled = t_cfg.get("enabled")
+        # Pre-compute summary and graph result once for reuse across sub-params
+        t_summary_status, t_summary_ev = _check_transform_summary(log, t_name)
+        t_graph_result = ga.verify_transform_applied(t_name) if ga else None
+
         if enabled is not None:
             if enabled:
-                s, e = _check_transform_summary(log, t_name)
-                gr = ga.verify_transform_applied(t_name) if ga else None
-                add_with_graph(f"transforms.{t_name}.enabled", True, s, e, gr)
+                add_with_graph(
+                    f"transforms.{t_name}.enabled",
+                    True,
+                    t_summary_status,
+                    t_summary_ev,
+                    t_graph_result,
+                )
             else:
                 add(f"transforms.{t_name}.enabled", False, DISABLED, "Disabled in config")
+                continue  # skip sub-params for disabled transforms
 
-        # Non-enabled params in this transform — try SUMMARY for the transform
+        # Non-enabled params in this transform — reuse cached summary/graph
         for k, v in t_cfg.items():
             if k in ("enabled", "stage"):
                 continue
-            # Try to find evidence via the transform's SUMMARY or APPLY lines
-            ts, te = _check_transform_summary(log, t_name)
-            if ts == APPLIED:
-                gr = ga.verify_transform_applied(t_name) if ga else None
+            if t_summary_status == APPLIED:
                 add_with_graph(
                     f"transforms.{t_name}.{k}",
                     v,
                     APPLIED,
-                    f"{t_name} transform applied ({te})" if te else f"{t_name} transform applied",
-                    gr,
+                    f"{t_name} transform applied ({t_summary_ev})"
+                    if t_summary_ev
+                    else f"{t_name} transform applied",
+                    t_graph_result,
                 )
             else:
-                gr = ga.verify_transform_applied(t_name) if ga else None
                 add_with_graph(
                     f"transforms.{t_name}.{k}",
                     v,
                     UNKNOWN,
                     f"Check {t_name} transform logs for details",
-                    gr,
+                    t_graph_result,
                 )
 
     # ── Catch-all: pick up any YAML keys not already covered ────────────
@@ -1016,25 +1390,30 @@ def check_config(
     for dotted_key, _display_key, value in all_flat:
         if dotted_key in covered_keys:
             continue
-        # Skip if a parent key is already covered (e.g., dist_mapping covered
-        # as a dict means we don't need dist_mapping.moe_tp separately)
-        parent_covered = any(dotted_key.startswith(ck + ".") for ck in covered_keys)
-        if parent_covered:
-            continue
-        # Skip keys that are purely structural or internal-only
-        if dotted_key in ("runtime", "world_size"):
+        # Skip if any ancestor key is already covered (e.g., dist_mapping
+        # covered as a dict means we don't need dist_mapping.moe_tp
+        # separately).  Walk up parent segments — O(depth) per key.
+        parts = dotted_key.split(".")
+        ancestor_covered = False
+        for i in range(1, len(parts)):
+            if ".".join(parts[:i]) in covered_keys:
+                ancestor_covered = True
+                break
+        if ancestor_covered:
             continue
         # Skip dict values (they were expanded into sub-keys)
         if isinstance(value, dict):
             continue
         s, e = _generic_check(log, dotted_key, value)
-        add(dotted_key, value, s, e)
+        add(dotted_key, value, s, e, checker="generic")
 
     return results
 
 
 def format_table(results: List[Dict], use_color: bool = True) -> str:
-    """Format results as a 3-column table: Config (with value), Status, Evidence."""
+    """Format results as a table: Config (with value), Status, Evidence, and optionally Checker."""
+    has_checker = any("checker" in r for r in results)
+
     # Status icons
     icons = {
         APPLIED: "\033[32mAPPLIED\033[0m" if use_color else "APPLIED",
@@ -1042,6 +1421,7 @@ def format_table(results: List[Dict], use_color: bool = True) -> str:
         SKIPPED: "\033[33mSKIPPED\033[0m" if use_color else "SKIPPED",
         DISABLED: "\033[90mDISABLED\033[0m" if use_color else "DISABLED",
         UNKNOWN: "\033[33mUNKNOWN\033[0m" if use_color else "UNKNOWN",
+        CONFLICT: "\033[35mCONFLICT\033[0m" if use_color else "CONFLICT",
     }
 
     # Build config display strings: "key = value"
@@ -1056,23 +1436,33 @@ def format_table(results: List[Dict], use_color: bool = True) -> str:
     w_cfg = max((len(s) for s in config_strs), default=10)
     w_sta = 10  # fixed for "DISABLED" (longest)
     w_evi = 90
+    w_chk = 16  # "dedicated+graph" is 15 chars
 
     w_cfg = max(w_cfg, 6)
 
     lines = []
-    header = f"| {'Config':<{w_cfg}} | {'Result':<{w_sta}} | {'Evidence':<{w_evi}} |"
-    sep = f"|{'-' * (w_cfg + 2)}|{'-' * (w_sta + 2)}|{'-' * (w_evi + 2)}|"
+    if has_checker:
+        header = f"| {'Config':<{w_cfg}} | {'Result':<{w_sta}} | {'Checker':<{w_chk}} | {'Evidence':<{w_evi}} |"
+        sep = f"|{'-' * (w_cfg + 2)}|{'-' * (w_sta + 2)}|{'-' * (w_chk + 2)}|{'-' * (w_evi + 2)}|"
+    else:
+        header = f"| {'Config':<{w_cfg}} | {'Result':<{w_sta}} | {'Evidence':<{w_evi}} |"
+        sep = f"|{'-' * (w_cfg + 2)}|{'-' * (w_sta + 2)}|{'-' * (w_evi + 2)}|"
     lines.append(header)
     lines.append(sep)
 
     for r, cfg_str in zip(results, config_strs):
-        evi = r["evidence"][:w_evi] if r["evidence"] else "-"
+        raw_evi = r["evidence"] if r["evidence"] else "-"
+        evi = (raw_evi[: w_evi - 3] + "...") if len(raw_evi) > w_evi else raw_evi
         status_display = icons.get(r["status"], r["status"])
         # For alignment, pad based on raw status length
         raw_status = r["status"]
         padding = w_sta - len(raw_status)
         status_col = status_display + " " * padding
-        lines.append(f"| {cfg_str:<{w_cfg}} | {status_col} | {evi:<{w_evi}} |")
+        if has_checker:
+            chk = r.get("checker", "dedicated")
+            lines.append(f"| {cfg_str:<{w_cfg}} | {status_col} | {chk:<{w_chk}} | {evi:<{w_evi}} |")
+        else:
+            lines.append(f"| {cfg_str:<{w_cfg}} | {status_col} | {evi:<{w_evi}} |")
 
     return "\n".join(lines)
 
@@ -1083,7 +1473,7 @@ def format_summary(results: List[Dict]) -> str:
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     parts = []
-    for s in [APPLIED, FAILED, SKIPPED, DISABLED, UNKNOWN]:
+    for s in [APPLIED, FAILED, SKIPPED, DISABLED, UNKNOWN, CONFLICT]:
         if s in counts:
             parts.append(f"{s}: {counts[s]}")
     return f"Total configs checked: {len(results)} | " + " | ".join(parts)
@@ -1104,6 +1494,12 @@ def main():
     )
     parser.add_argument("--output", "-o", help="Optional output file path for results")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show which checker was used for each config (dedicated, generic, or +graph)",
+    )
     args = parser.parse_args()
 
     for yp in args.yaml_paths:
@@ -1136,7 +1532,9 @@ def main():
         n_graphs = len(list(Path(args.graph_dir).glob("*.txt")))
         print(f"Using graph dump directory: {args.graph_dir} ({n_graphs} graph files)\n")
 
-    results = check_config(args.yaml_paths, args.log, graph_dir=args.graph_dir)
+    results = check_config(
+        args.yaml_paths, args.log, graph_dir=args.graph_dir, verbose=args.verbose
+    )
     use_color = not args.no_color and sys.stdout.isatty()
 
     table = format_table(results, use_color=use_color)
@@ -1146,13 +1544,20 @@ def main():
     print(table)
     print(f"\n{summary}\n")
 
-    # Highlight failures
+    # Highlight failures and conflicts
     failures = [r for r in results if r["status"] == FAILED]
+    conflicts = [r for r in results if r["status"] == CONFLICT]
     if failures:
         print("WARNING: The following configs FAILED to apply:")
         for f in failures:
             print(f"  - {f['config']} = {f['value']}")
             print(f"    Evidence: {f['evidence']}")
+        print()
+    if conflicts:
+        print("CONFLICT: Log and graph evidence contradict for these configs:")
+        for c in conflicts:
+            print(f"  - {c['config']} = {c['value']}")
+            print(f"    Evidence: {c['evidence']}")
         print()
 
     if args.output:
@@ -1165,6 +1570,11 @@ def main():
                 for fail in failures:
                     f.write(f"  - {fail['config']} = {fail['value']}\n")
                     f.write(f"    Evidence: {fail['evidence']}\n")
+            if conflicts:
+                f.write("\nCONFLICT: Log and graph evidence contradict for these configs:\n")
+                for c in conflicts:
+                    f.write(f"  - {c['config']} = {c['value']}\n")
+                    f.write(f"    Evidence: {c['evidence']}\n")
         print(f"Results saved to: {args.output}")
 
 

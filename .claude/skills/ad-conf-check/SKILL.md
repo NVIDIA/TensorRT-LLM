@@ -21,8 +21,9 @@ Verify that AutoDeploy YAML configs were applied at runtime by cross-referencing
    - **Server log file path** (required) — the log output from the server
    - **Graph dump directory** (optional but recommended) — the `AD_DUMP_GRAPHS_DIR` output directory containing per-transform graph snapshots. Files are named `NNN_stage_transform.txt` and show the graph AFTER each transform. When provided, the checker uses graph analysis to provide additional evidence (e.g., verifying sharded weights, collective ops, fused ops). This is especially useful for resolving UNKNOWN results.
    - Example configs: `examples/auto_deploy/model_registry/configs/*.yaml`
+   - Default transform config (all available transforms and their defaults): `tensorrt_llm/_torch/auto_deploy/config/default.yaml`
 
-2. Run the checker script:
+2. Run the checker script (`<skill_dir>` is the directory containing this SKILL.md file):
    ```bash
    python3 <skill_dir>/scripts/check_config.py <yaml_path1> [<yaml_path2> ...] --log <log_path>
    ```
@@ -34,6 +35,9 @@ Verify that AutoDeploy YAML configs were applied at runtime by cross-referencing
    ```bash
    python3 <skill_dir>/scripts/check_config.py <yaml_path1> [<yaml_path2> ...] --log <log_path> --graph-dir <graph_dir> --output <output_path>
    ```
+   Additional flags:
+   - `--no-color` — disable colored output (useful when piping to a file or non-TTY)
+   - `--verbose` / `-v` — add a **Checker** column showing which checker produced each result (`dedicated`, `generic`, or `dedicated+graph`/`generic+graph`). Useful for debugging why a config was marked UNKNOWN.
 
 3. **ALWAYS show the full detailed table to the user.** Do NOT summarize or condense the script output. Present the complete table as-is with all rows. The table has 3 columns:
    - **Config** — the config key and its value (e.g., `compile_backend = torch-cudagraph`)
@@ -46,6 +50,7 @@ Verify that AutoDeploy YAML configs were applied at runtime by cross-referencing
    - **SKIPPED** — transform ran but found nothing to do (0 matches)
    - **DISABLED** — config explicitly set `enabled: false`
    - **UNKNOWN** — no log evidence found (config may still be active but unlogged)
+   - **CONFLICT** — log and graph evidence contradict (e.g., log says SKIPPED but graph shows the transform modified ops). Requires manual investigation.
 
 4. After the table, show the summary line (e.g., `Total configs checked: 29 | APPLIED: 23 | ...`) and any FAILED/WARNING details.
 
