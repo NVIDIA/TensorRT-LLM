@@ -287,8 +287,9 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
         int num_threads = NumDeepseekExperts;
         if (is_single_group)
         {
-            // Special case for Nemotron, which selects top 22 from 512 experts, and 1 group only.
-            if (num_experts == NumNemotronExperts && n_group == 1 && topk == MaxSupportedTopExperts)
+            // Nemotron models: 512 experts, 1 group, top_k up to 22.
+            // Variants use varying top_k (4..22) across layers.
+            if (num_experts == NumNemotronExperts && n_group == 1 && topk <= MaxSupportedTopExperts)
             {
                 kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumNemotronExperts, false,
                     MaxSupportedTopExperts>;

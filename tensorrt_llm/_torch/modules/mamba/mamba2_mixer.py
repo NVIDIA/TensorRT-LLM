@@ -41,7 +41,7 @@ from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
-from .ssd_combined import mamba_chunk_scan_combined
+from .ssd_combined import is_int_pow_2, mamba_chunk_scan_combined
 
 
 class Mamba2Mixer(nn.Module):
@@ -155,8 +155,11 @@ class Mamba2Mixer(nn.Module):
         supported_head_group_ratios = [1, 8, 16]
         head_group_ratio = (self.tp_nheads //
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
+        # FlashInfer's PackedAligned requires d_state to be a power of 2
+        # (d_state=96 yields alignas(12) which is invalid).
         self._use_flashinfer = (head_dim in supported_head_dims and
-                                head_group_ratio in supported_head_group_ratios)
+                                head_group_ratio in supported_head_group_ratios
+                                and is_int_pow_2(d_state))
         # Stochastic rounding requires FlashInfer and fp16 cache
         self._use_stochastic_rounding = (
             config.quant_config.mamba_ssm_stochastic_rounding
