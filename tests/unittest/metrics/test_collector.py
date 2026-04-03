@@ -394,6 +394,37 @@ class TestPerRequestTokenCounters:
         assert _get_counter_value(collector.counter_generation_tokens,
                                   labels) == 0
 
+    def test_n_greater_than_1_prompt_tokens_counted_once(self, collector):
+        """For n>1, PROMPT_TOKENS should be counted once (candidate 0 only),
+        while GENERATION_TOKENS accumulates per candidate.
+
+        This simulates what record_stats in executor/result.py produces:
+        candidate 0 emits both PROMPT_TOKENS and GENERATION_TOKENS,
+        candidates 1+ emit only GENERATION_TOKENS (prompt is shared).
+        """
+        labels = {"model_name": "test_model"}
+        # Candidate 0: prompt + generation tokens
+        collector.log_request_metrics_dict({
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.PROMPT_TOKENS: 128,
+            MetricNames.GENERATION_TOKENS: 50,
+        })
+        # Candidate 1: only generation tokens (shared prompt not re-counted)
+        collector.log_request_metrics_dict({
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.GENERATION_TOKENS: 42,
+        })
+        # Candidate 2: only generation tokens
+        collector.log_request_metrics_dict({
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.GENERATION_TOKENS: 38,
+        })
+        # Prompt counted once, generation tokens summed across all candidates
+        assert _get_counter_value(collector.counter_prompt_tokens,
+                                  labels) == 128
+        assert _get_counter_value(collector.counter_generation_tokens,
+                                  labels) == 130  # 50 + 42 + 38
+
 
 def _get_histogram_sum(histogram, labels):
     """Return the sum of all observations in a Prometheus histogram."""
