@@ -90,20 +90,25 @@ objects, and depends on metadata and KV-cache contract. It owns:
 (`is_lite == True`). In lite mode there is no separate Q low-rank compression
 stage. `is_lite` changes the projection structure, not just a small code path.
 
-**DSA dispatch.** DSA-style MLA uses a multi-stage dispatch: projection and
-attention are separated, context and generation paths are separated, and a
-short-seq gate inside the context path can route to a dense MHA fallback. The
-short-seq MHA path should stay inside `forward_context()`. Do not bypass the
-dispatcher and call `forward_context_default()` directly — it only handles
-fresh context, not cached-KV or chunked-context cases.
+**Non-DSA MLA dispatch.** Non-DSA MLA uses absorption: Q, K, V are projected
+through low-rank decomposition and then absorbed into the backend call. The
+context path still dispatches through `forward_context()`, which handles fresh
+context, cached-KV context, and chunked prefill as separate cases. Chunked
+prefill routing depends on architecture (SM90 vs SM100+). Do not assume all
+context goes through the same handler.
+
+**DSA dispatch.** DSA-style MLA adds a further split: projection and attention
+are separated, context and generation paths are separated, and a short-seq
+gate inside the context path can route to a dense MHA fallback.
+
+**For both DSA and non-DSA MLA:** the short-seq MHA path should stay inside
+`forward_context()`. Do not bypass the dispatcher and call
+`forward_context_default()` directly — it only handles fresh context, not
+cached-KV or chunked-context cases.
 
 **Practical notes:**
 
 - `self.mha` being present does not mean DSA is disabled.
-- `_should_use_short_mha()` uses `max_ctx_kv_len` when available, not just the
-  new-token count.
-- Under `torch.compile`, `_should_use_short_mha()` returns `False`, so the
-  split DSA path is always used.
 - Helix CP wraps the attention body with allgather/output-projection helpers.
 
 ## 2. Backend Layer Reference
@@ -176,10 +181,11 @@ metadata and cache behavior.
 ### 2.5 `TRTLLM` internal kernel paths
 
 `TrtllmAttention` can dispatch to `trtllm_gen.py` for supported dense cases.
-That is an internal fast path, not a separate top-level backend selection.
+That is an internal fast path, not a separate top-level backend selection. It
+is disabled by default and gated by `TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION`.
 
-It only applies to a subset of dense cases. If it does not apply,
-`TrtllmAttention` stays on its regular runtime path.
+It only applies to a narrow subset of dense cases. If it does not apply or is
+not enabled, `TrtllmAttention` stays on its regular runtime path.
 
 ## 3. Runtime Contract Reference
 
