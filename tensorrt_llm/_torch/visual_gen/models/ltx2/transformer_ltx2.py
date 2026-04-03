@@ -131,8 +131,6 @@ class LTX2Attention(Attention):
                 num_kv_heads=self.num_key_value_heads,
                 quant_config=self.quant_config,
                 dtype=self.dtype,
-                attention_config=config.attention,
-                attention_metadata_state=config.attention_metadata_state,
             )
             self._has_dual_attn = True
 
