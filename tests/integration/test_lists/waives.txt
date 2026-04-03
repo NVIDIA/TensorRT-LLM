@@ -248,8 +248,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_gptoss_style_nvfp4[limitinf-beta0-alpha0.1-RoutingGPTOSS-512-512-1] SKIP (https://nvbugs/5819042)
 unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py::test_flashinfer_fused_moe_matches_torch_moe SKIP (https://nvbugs/5920779)
 test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b] SKIP (https://nvbugs/5884677)
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (https://nvbugs/5849648)
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5849648)
 unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py::test_build_ad[deepseek-ai/DeepSeek-V3-llm_extra_args10] SKIP (https://nvbugs/5888827)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingDSv3-swiglu-1024-1024-1] SKIP (https://nvbugspro.nvidia.com/bug/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_qwen_next-swiglu-1024-1024-150] SKIP (https://nvbugspro.nvidia.com/bug/5908070)
