@@ -50,9 +50,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 Here is a simple example to generate a video with Wan 2.1:
 
-```{literalinclude} ../../../examples/visual_gen/quickstart_example.py
-    :language: python
-    :linenos:
+```bash
+python examples/visual_gen/quickstart_example.py
 ```
 
 To learn more about VisualGen, see [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen) for more examples including text-to-image, image-to-video, and batch generation.
