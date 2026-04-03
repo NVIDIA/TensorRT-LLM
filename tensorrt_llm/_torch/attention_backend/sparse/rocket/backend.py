@@ -63,19 +63,11 @@ class RocketTrtllmAttention(TrtllmAttention):
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
 
-    def prepare_sparse_params(self, q, k, metadata, **kwargs):
-        """Prepare SparseParams for RocketKV."""
+    def sparse_params(self, metadata):
+        """Return non-index sparse parameters for RocketKV."""
         from ..params import SparseParams
 
-        sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, **kwargs)
-        sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-            q, k, metadata, **kwargs
-        )
         return SparseParams(
-            sparse_kv_indices=sparse_kv_indices,
-            sparse_kv_offsets=sparse_kv_offsets,
-            sparse_attn_indices=sparse_attn_indices,
-            sparse_attn_offsets=sparse_attn_offsets,
             sparse_attn_indices_block_size=(self.sparse_attention_config.get_indices_block_size()),
             sparse_mla_topk=(
                 metadata.sparse_mla_topk if hasattr(metadata, "sparse_mla_topk") else 0

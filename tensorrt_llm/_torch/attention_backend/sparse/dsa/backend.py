@@ -202,19 +202,11 @@ class DSATrtllmAttention(TrtllmAttention):
     # Sparse parameter preparation for wrapper.plan()
     # ------------------------------------------------------------------
 
-    def prepare_sparse_params(self, q, k, metadata, **kwargs):
-        """Prepare SparseParams for DSA.
-
-        Calls sparse_attn_predict to run the indexer and transform indices.
-        """
+    def sparse_params(self, metadata):
+        """Return non-index sparse parameters for DSA."""
         from ..params import SparseParams
 
-        sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-            q, k, metadata, **kwargs
-        )
         return SparseParams(
-            sparse_attn_indices=sparse_attn_indices,
-            sparse_attn_offsets=sparse_attn_offsets,
             sparse_attn_indices_block_size=(self.sparse_attention_config.get_indices_block_size()),
             sparse_mla_topk=(
                 metadata.sparse_mla_topk if hasattr(metadata, "sparse_mla_topk") else 0
@@ -250,15 +242,6 @@ class DSATrtllmAttention(TrtllmAttention):
         )
 
         return topk_indices_global, None
-
-    def sparse_kv_predict(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        metadata: DSAtrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        return None, None
 
     # ------------------------------------------------------------------
     # MLA RoPE + paged KV cache ops

@@ -12,25 +12,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SkipSoftmax sparse attention parameter preparation."""
+"""SkipSoftmax sparse attention backend.
+
+Inherits TrtllmAttention and only overrides sparse_params() to provide
+skip-softmax threshold scale factors. No index prediction is needed.
+"""
 
 from __future__ import annotations
+
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 from ..params import SparseParams
 
 
-def prepare_skip_softmax_params(
-    sparse_attention_config,
-    metadata,
-) -> SparseParams:
-    """Prepare SparseParams for the SkipSoftmax attention method."""
-    params = SparseParams(
-        sparse_mla_topk=(metadata.sparse_mla_topk if hasattr(metadata, "sparse_mla_topk") else 0),
-        skip_softmax_threshold_scale_factor_prefill=(
-            sparse_attention_config.threshold_scale_factor_prefill
-        ),
-        skip_softmax_threshold_scale_factor_decode=(
-            sparse_attention_config.threshold_scale_factor_decode
-        ),
-    )
-    return params
+class SkipSoftmaxTrtllmAttention(TrtllmAttention):
+    """TrtllmAttention subclass for SkipSoftmax sparse attention.
+
+    Only overrides sparse_params() to populate threshold scale factors.
+    sparse_kv_predict and sparse_attn_predict remain as base (return None).
+    """
+
+    def sparse_params(self, metadata: TrtllmAttentionMetadata) -> SparseParams:
+        return SparseParams(
+            skip_softmax_threshold_scale_factor_prefill=(
+                self.sparse_attention_config.threshold_scale_factor_prefill
+            ),
+            skip_softmax_threshold_scale_factor_decode=(
+                self.sparse_attention_config.threshold_scale_factor_decode
+            ),
+        )

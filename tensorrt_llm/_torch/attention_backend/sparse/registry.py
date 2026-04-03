@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 from .dsa import DSACacheManager, DSATrtllmAttention
 from .rocket import RocketKVCacheManager, RocketTrtllmAttention, RocketVanillaAttention
+from .skip_softmax.backend import SkipSoftmaxTrtllmAttention
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
@@ -38,7 +38,7 @@ def get_trtllm_sparse_attn_attention_backend(sparse_attn_config: "SparseAttentio
     elif sparse_attn_config.algorithm == "dsa":
         return DSATrtllmAttention
     elif sparse_attn_config.algorithm == "skip_softmax":
-        return TrtllmAttention
+        return SkipSoftmaxTrtllmAttention
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_attn_config.algorithm}"
