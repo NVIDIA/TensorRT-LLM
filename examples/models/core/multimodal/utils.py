@@ -132,8 +132,8 @@ def add_common_args(parser):
         action='store_true',
         default=False,
         help='Allow loading models with custom remote code from HuggingFace Hub. '
-             'Only enable this for models from trusted sources.')
-        return parser
+        'Only enable this for models from trusted sources.')
+    return parser
 
 
 def levenshtein_distance(s1, s2):

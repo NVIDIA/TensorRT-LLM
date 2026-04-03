@@ -595,7 +595,8 @@ class MultimodalModelRunner:
                 self.args.hf_model_dir,
                 use_fast=use_fast,
                 use_legacy=False,
-                trust_remote_code=getattr(self.args, "trust_remote_code", False))
+                trust_remote_code=getattr(self.args, "trust_remote_code",
+                                          False))
 
         self.tokenizer.padding_side = "right"
 
@@ -630,7 +631,10 @@ class MultimodalModelRunner:
                 'phi-4-multimodal'
         ]:
             self.processor = AutoProcessor.from_pretrained(
-                self.args.hf_model_dir, trust_remote_code=getattr(self.args, "trust_remote_code", False), num_crops=16)
+                self.args.hf_model_dir,
+                trust_remote_code=getattr(self.args, "trust_remote_code",
+                                          False),
+                num_crops=16)
 
         elif 'pixtral' in self.model_type:
             self.processor = AutoProcessor.from_pretrained(
@@ -675,7 +679,8 @@ class MultimodalModelRunner:
             model = AutoModel.from_pretrained(
                 self.args.hf_model_dir,
                 device_map='auto',
-                trust_remote_code=getattr(self.args, "trust_remote_code", False),
+                trust_remote_code=getattr(self.args, "trust_remote_code",
+                                          False),
             )
             vision_tower = model.get_vision_tower()
             vision_tower.image_processor
@@ -695,10 +700,12 @@ class MultimodalModelRunner:
 
         # Phi-4-multimodal uses pytorch engine due to issues with creating TRT engine.
         if self.model_type == "phi-4-multimodal":
-            model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
-                                                         dtype=torch.float16,
-                                                         trust_remote_code=getattr(self.args, "trust_remote_code", False),
-                                                         device_map='cpu')
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.hf_model_dir,
+                dtype=torch.float16,
+                trust_remote_code=getattr(self.args, "trust_remote_code",
+                                          False),
+                device_map='cpu')
             self.vision_model = model.model.embed_tokens_extend.image_embed.to(
                 self.device).eval()
             self.image_newlines = {}
@@ -709,10 +716,12 @@ class MultimodalModelRunner:
             return
 
         if self.model_type == "phi-3-vision":
-            model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
-                                                         dtype=torch.float16,
-                                                         trust_remote_code=getattr(self.args, "trust_remote_code", False),
-                                                         device_map='cpu')
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.hf_model_dir,
+                dtype=torch.float16,
+                trust_remote_code=getattr(self.args, "trust_remote_code",
+                                          False),
+                device_map='cpu')
             self.vision_model = model.model.vision_embed_tokens.to(
                 self.device).eval()
 
@@ -765,10 +774,11 @@ class MultimodalModelRunner:
 
     def init_audio_encoder(self):
         assert self.model_type == "phi-4-multimodal"
-        model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
-                                                     dtype=torch.float16,
-                                                     trust_remote_code=getattr(self.args, "trust_remote_code", False),
-                                                     device_map='cpu')
+        model = AutoModelForCausalLM.from_pretrained(
+            self.args.hf_model_dir,
+            dtype=torch.float16,
+            trust_remote_code=getattr(self.args, "trust_remote_code", False),
+            device_map='cpu')
         self.audio_model = model.model.embed_tokens_extend.audio_embed.to(
             self.device).eval()
 
