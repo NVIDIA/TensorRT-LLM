@@ -25,7 +25,7 @@ from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig, VisualGen)
+                                 SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
@@ -43,6 +43,7 @@ from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
     resolve_auto_tool_parser
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
+from tensorrt_llm.visual_gen import VisualGen
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None

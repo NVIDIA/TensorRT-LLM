@@ -274,8 +274,8 @@ class MTPWorker(SpecWorkerBase):
         self.model_config = model_config
         self.is_thop = False
         self.sa_enhancer: Optional[SADraftEnhancer] = None
-        if spec_config.use_sa_spec:
-            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
+        if spec_config.sa_config is not None:
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
 
     @property
     def max_draft_len(self) -> int:
@@ -1132,6 +1132,13 @@ class MTPEagleWorker(MTPWorker):
         position_ids = inputs["position_ids"][gather_ids] + 1
         return hidden_states, position_ids
 
+    @torch.compile(options={"max-autotune": True})
+    def prepare_position_ids_and_last_tokens(self, position_ids, seq_lens_cuda):
+        position_ids = position_ids.squeeze(0)
+        last_tokens_idx = torch.cumsum(seq_lens_cuda, dim=0,
+                                       dtype=torch.long) - 1
+        return position_ids, last_tokens_idx
+
     def forward(
         self,
         input_ids,
@@ -1167,16 +1174,8 @@ class MTPEagleWorker(MTPWorker):
         # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
-        # Prepare inputs for the 1st MTP layer
-        @torch.compile(options={"max-autotune": True})
-        def prepare_position_ids_and_last_tokens(position_ids, attn_metadata):
-            position_ids = position_ids.squeeze(0)
-            last_tokens_idx = torch.cumsum(
-                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            return position_ids, last_tokens_idx
-
-        position_ids, last_tokens_idx = prepare_position_ids_and_last_tokens(
-            position_ids, attn_metadata)
+        position_ids, last_tokens_idx = self.prepare_position_ids_and_last_tokens(
+            position_ids, attn_metadata.seq_lens_cuda)
         inputs = self.prepare_drafter_inputs(input_ids=input_ids,
                                              position_ids=position_ids,
                                              last_tokens_idx=last_tokens_idx,
@@ -1301,12 +1300,9 @@ class MTPEagleWorker(MTPWorker):
                     # as draft model only infer 1 token for the subsequent inference.
                     attn_metadata.use_spec_decoding = False
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
+                    # update kv_lens_cuda
+                    attn_metadata.kv_lens_cuda[:batch_size] += 1
 
-                    @torch.compile(options={"max-autotune": True})
-                    def update_kv_lens(kv_lens_cuda, batch_size):
-                        kv_lens_cuda[:batch_size] += 1
-
-                    update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
                     # update metadata
                     # some attention metadata needs to be updated when changing kv_lens
                     attn_metadata.update_for_spec_dec()

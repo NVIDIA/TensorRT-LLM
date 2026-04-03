@@ -15,10 +15,13 @@
 """
 Visual Generation Attention Backend Interface
 
-Defines shared types and enums for attention backends.
+Defines shared types, enums, and the abstract base class for attention backends.
 """
 
+from abc import ABC, abstractmethod
 from enum import Enum
+
+import torch
 
 
 class AttentionTensorLayout(str, Enum):
@@ -31,3 +34,32 @@ class AttentionTensorLayout(str, Enum):
 
     NHD = "NHD"  # [B, S, H, D] - batch, seq, heads, dim
     HND = "HND"  # [B, H, S, D] - batch, heads, seq, dim
+
+
+class AttentionBackend(ABC):
+    """Contract for all visual-gen attention backends.
+
+    Every backend must implement ``forward`` and declare a ``preferred_layout``.
+    Backends pick the kwargs they need from the caller and ignore the rest
+    via ``**kwargs``.
+    """
+
+    def __call__(self, *args, **kwargs) -> torch.Tensor:
+        return self.forward(*args, **kwargs)
+
+    @abstractmethod
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor: ...
+
+    @property
+    @abstractmethod
+    def preferred_layout(self) -> AttentionTensorLayout: ...
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False

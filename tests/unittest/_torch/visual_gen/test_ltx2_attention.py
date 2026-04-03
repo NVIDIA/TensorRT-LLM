@@ -16,11 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.config import (
-    AttentionConfig,
-    DiffusionModelConfig,
-    create_attention_metadata_state,
-)
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -106,7 +102,6 @@ class TestLTX2SelfAttention(unittest.TestCase):
 
         torch.manual_seed(42)
         config = _create_config("TRTLLM")
-        config.attention_metadata_state = create_attention_metadata_state()
 
         attn = (
             LTX2Attention(
@@ -292,7 +287,6 @@ class TestLTX2BackendEquivalence(unittest.TestCase):
 
         # Create TRTLLM attention and copy weights
         config_trtllm = _create_config("TRTLLM")
-        config_trtllm.attention_metadata_state = create_attention_metadata_state()
         trtllm_attn = (
             LTX2Attention(
                 query_dim=query_dim,
