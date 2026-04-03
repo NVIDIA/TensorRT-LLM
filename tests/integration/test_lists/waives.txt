@@ -358,3 +358,4 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_sch
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False] SKIP (https://nvbugs/6037653)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency] SKIP (https://nvbugs/6037654)
 accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype SKIP (https://nvbugs/6040098)
+unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6043312)
