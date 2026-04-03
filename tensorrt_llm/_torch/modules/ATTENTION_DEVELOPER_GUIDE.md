@@ -86,90 +86,25 @@ objects, and depends on metadata and KV-cache contract. It owns:
 - short-seq MHA routing
 - MLA-specific RoPE and latent-cache flow
 
-`MLA` has two projection layouts.
+`MLA` has two projection layouts: non-lite (`is_lite == False`) and lite
+(`is_lite == True`). In lite mode there is no separate Q low-rank compression
+stage. `is_lite` changes the projection structure, not just a small code path.
 
-Non-lite MLA (`is_lite == False`):
+**DSA dispatch.** DSA-style MLA uses a multi-stage dispatch: projection and
+attention are separated, context and generation paths are separated, and a
+short-seq gate inside the context path can route to a dense MHA fallback. The
+short-seq MHA path should stay inside `forward_context()`. Do not bypass the
+dispatcher and call `forward_context_default()` directly — it only handles
+fresh context, not cached-KV or chunked-context cases.
 
-```text
-MLA(nn.Module)
-├── kv_a_proj_with_mqa
-├── q_a_layernorm
-├── q_b_proj
-├── kv_a_layernorm
-├── kv_b_proj
-├── mha   # dense backend, used by short-seq MHA path
-├── mqa   # sparse / DSA backend
-└── short_seq_mha_threshold
-```
+**Practical notes:**
 
-Lite MLA (`is_lite == True`):
-
-```text
-MLA(nn.Module)
-├── kv_a_proj_with_mqa
-├── q_proj   # also assigned to q_b_proj
-├── kv_a_layernorm
-├── kv_b_proj
-├── mha
-├── mqa
-└── short_seq_mha_threshold
-```
-
-In lite mode there is no separate `q_a_proj`, `q_a_layernorm`, or `kv_a_proj`.
-`q_proj` is used as `q_b_proj`.
-
-### 1.3 MLA dispatch reference
-
-For DSA-style MLA models, the dispatch is:
-
-```text
-forward()
-  -> forward_impl_with_dsa()
-     -> forward_dsa_proj()
-     -> forward_dsa_attn()
-        -> context tokens?
-           -> yes: forward_context_dsa()
-              -> short-seq gate?
-                 -> yes: forward_context()
-                    -> forward_context_default()
-                    -> forward_context_with_cached_kv()
-                    -> forward_context_with_chunked_prefill()
-                 -> no: absorption / sparse MLA path
-        -> generation tokens?
-           -> yes: forward_generation_dsa()
-```
-
-For MLA maintenance:
-
-- the short-seq MHA path should stay inside `forward_context()`
-- do not bypass the dispatcher and call `forward_context_default()` directly
-
-`forward_context_default()` only handles fresh context. It does not cover
-cached-KV or chunked-context cases.
-
-### 1.4 Practical MLA notes
-
-Structure and dispatch:
-
-- `is_lite` changes the projection structure, not just a small code path.
-- `self.is_dsa == True` means the DSA path is active.
-- `self.mqa` is the sparse DSA backend.
-- `self.mha` is a dense backend used only for the short-seq dense context path.
 - `self.mha` being present does not mean DSA is disabled.
 - `_should_use_short_mha()` uses `max_ctx_kv_len` when available, not just the
   new-token count.
-
-`torch.compile` path:
-
-- the compiled path may use custom-op based execution paths
-- under `torch.compile`, `_should_use_short_mha()` returns `False`, so the
-  split DSA path is always used
-
-Helix CP path:
-
-- `_helix_cp_allgather_input()` runs before the attention body on layers after
-  the first
-- `_helix_cp_output_projection()` runs after the attention body
+- Under `torch.compile`, `_should_use_short_mha()` returns `False`, so the
+  split DSA path is always used.
+- Helix CP wraps the attention body with allgather/output-projection helpers.
 
 ## 2. Backend Layer Reference
 
@@ -197,19 +132,19 @@ Base backend families:
 ### 2.2 Sparse backend families
 
 Sparse attention is not selected by a separate top-level module. It is resolved
-through `sparse_attention_config` on top of a base backend family.
+through `sparse_attention_config` on top of a base backend family. Sparse
+selection can change the backend class, metadata subtype, and KV-cache manager.
 
 Current sparse registrations:
 
-| Base backend | Sparse algorithm | Resulting backend class | Metadata subtype | KV-cache manager |
-|---|---|---|---|---|
-| `TRTLLM` | `rocket` | `RocketTrtllmAttention` | `RocketTrtllmAttentionMetadata` | `RocketKVCacheManager` |
-| `TRTLLM` | `dsa` | `DSATrtllmAttention` | `DSAtrtllmAttentionMetadata` | `DSACacheManager` |
-| `TRTLLM` | `skip_softmax` | `TrtllmAttention` | `TrtllmAttentionMetadata` | standard `KVCacheManager` |
-| `VANILLA` | `rocket` | `RocketVanillaAttention` | `RocketVanillaAttentionMetadata` | `RocketKVCacheManager` |
-| `VANILLA` | `dsa` | unsupported | none | none |
-| `VANILLA` | `skip_softmax` | unsupported | none | none |
-| `FLASHINFER` | sparse variants | unsupported | none | none |
+| Base backend | Sparse algorithm | Resulting backend class | KV-cache manager |
+|---|---|---|---|
+| `TRTLLM` | `rocket` | `RocketTrtllmAttention` | `RocketKVCacheManager` |
+| `TRTLLM` | `dsa` | `DSATrtllmAttention` | `DSACacheManager` |
+| `TRTLLM` | `skip_softmax` | `TrtllmAttention` | standard `KVCacheManager` |
+| `VANILLA` | `rocket` | `RocketVanillaAttention` | `RocketKVCacheManager` |
+| `VANILLA` | `dsa` | unsupported | — |
+| `FLASHINFER` | sparse variants | unsupported | — |
 
 ### 2.3 Backend contract
 
@@ -228,8 +163,6 @@ Those capability hooks are coarse checks. They do not prove that every
 required operator or sparse path already exists.
 
 ### 2.4 Capability reference
-
-The current coarse capability picture is:
 
 | Backend family | Fused RoPE | Fused QKV input | MLA |
 |---|---|---|---|
@@ -252,77 +185,27 @@ It only applies to a subset of dense cases. If it does not apply,
 
 ### 3.1 Metadata families
 
-All backend metadata types inherit from `AttentionMetadata`.
+All backend metadata types inherit from `AttentionMetadata`. The base contract
+includes sequence-length and request-level state, KV-cache manager and
+parameters, runtime feature flags, optional sparse state, and optional
+CUDA-graph buffer management.
 
-#### 3.1.1 Base `AttentionMetadata`
+**`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
+block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix
+state, and MLA-specific state. If a source attention needs paged KV, chunked
+prefill, FlashMLA, speculative decoding, or Helix-aware execution, the fit
+question is mostly a `TrtllmAttentionMetadata` fit question.
 
-The common contract includes:
+**`VanillaAttentionMetadata`** is lighter — base metadata plus simple
+cache-index information. Use it when the `Attention` module boundary fits but
+the fused TRTLLM path is too restrictive.
 
-- sequence-length and request-level runtime state
-- KV-cache manager and KV-cache parameters
-- runtime feature flags
-- optional sparse-attention state
-- optional CUDA-graph buffer management
+**`FlashInferAttentionMetadata`** adds a planning-oriented contract with
+workspace, page-table KV metadata, and prefill/decode wrapper state.
 
-The base metadata also supports cross attention through `seq_lens_kv` and
-cross sub-metadata. Backend support is not uniform:
-
-- `FlashInferAttention` has explicit cross-attention handling
-- `TrtllmAttention` currently asserts that cross attention is not supported
-
-#### 3.1.2 `TrtllmAttentionMetadata`
-
-`TrtllmAttentionMetadata` is the main metadata family for the standard TRTLLM
-path.
-
-It extends the base metadata with:
-
-- paged-KV block information
-- request and sequence state for TRTLLM runtime execution
-- runtime state for chunked prefill, speculative decode, and Helix
-- MLA-specific runtime state when MLA is active
-
-If a source attention implementation needs paged KV, chunked prefill,
-FlashMLA, speculative decoding, or Helix-aware execution, the fit question is
-mostly a `TrtllmAttentionMetadata` fit question.
-
-#### 3.1.3 `VanillaAttentionMetadata`
-
-`VanillaAttentionMetadata` mainly prepares:
-
-- base attention metadata
-- simple cache-index information for torch-side cache access
-
-The actual attention computation is mostly done in torch. Use it when the
-current `Attention` module boundary still fits but the fused TRTLLM path is
-too restrictive.
-
-#### 3.1.4 `FlashInferAttentionMetadata`
-
-`FlashInferAttentionMetadata` adds a planning-oriented runtime contract:
-
-- workspace and planning state
-- page-table style KV metadata
-- prefill and decode wrapper state
-
-This backend requires a planning step and a paged-table runtime shape.
-
-#### 3.1.5 Sparse metadata families
-
-Sparse backends extend the base metadata family rather than inventing an
-unrelated attention interface.
-
-`DSAtrtllmAttentionMetadata` extends `TrtllmAttentionMetadata` with:
-
-- indexer-side sparse runtime state
-- top-k and token-to-request routing state
-- extra state for sparse context and generation flows
-
-`RocketTrtllmAttentionMetadata` and `RocketVanillaAttentionMetadata` add:
-
-- sparse-window and routing state
-- sparse offsets and sequence state
-- KT-cache related state
+**Sparse metadata** families extend the base backend metadata with
+sparse-specific runtime state (indexer buffers, routing state, side-cache
+state).
 
 ### 3.2 KV-cache and decode-time semantics
 
@@ -343,269 +226,105 @@ update pattern.
 #### 3.2.1 Common paged-KV model
 
 All current `_torch` backends are built on top of paged KV cache.
+`KVCacheManager.get_buffers()` exposes a per-layer view of the primary pool:
 
-At the cache-manager level, `KVCacheManager.get_buffers()` exposes a per-layer
-view of the primary pool in two common layouts:
+- For standard dense attention, `kv_factor = 2` (separate K and V planes).
+- For MLA-style cache, `kv_factor = 1` (one latent-cache tensor per token).
 
-- `NHD`: `[num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim]`
-- `HND`: `[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]`
+The main differences across backends:
 
-For standard dense attention, `kv_factor = 2`, which means separate K and V
-planes.
+| Backend | Cache write | Cache read | Notes |
+|---|---|---|---|
+| `TRTLLM` | Backend-managed (C++ ops like `qkv_preprocessing`) | Block-table + pool pointers | Python does not call `index_copy_` in the regular path |
+| `VANILLA` | Python-side (`index_copy_`) | Python-side slicing from same cache tensor | Most direct path for inspecting what is written to cache |
+| `FlashInfer` | Python-side (explicit append) | Page-table metadata | Requires a planning step and its own page-table shape |
 
-For MLA-style cache, `kv_factor = 1`. The cache stores one latent-cache tensor
-per token rather than separate K and V planes.
+#### 3.2.2 `TRTLLM` internal `trtllm_gen` path
 
-The main differences across backends are:
+`trtllm_gen.py` is not a separate backend, but it has its own KV view
+assumptions. It bridges the TRTLLM block-offset format into the page-table
+shape expected by its kernels. This path is narrower than the main `TRTLLM`
+backend (dense only, no MLA, no sparse, fused QKV only). If `trtllm_gen` does
+not fit, that does not rule out the main `TRTLLM` backend.
 
-- which tensor view or block table the backend expects
-- whether the backend writes cache internally or Python writes it explicitly
-- whether extra side cache is required in addition to the main KV cache
+#### 3.2.3 MLA cached-context semantics
 
-#### 3.2.2 `TRTLLM` backend
-
-At the C++ boundary, the main contract is a block-offset table plus pool
-pointers, not only a reshaped cache tensor view.
-
-In the Python metadata path, this appears as fields such as:
-
-- `kv_cache_block_offsets`
-- `host_kv_cache_pool_pointers`
-- `host_kv_cache_pool_mapping`
-- `cache_indirection`
-
-Read and write behavior:
-
-- decode and prefill cache updates are backend-managed
-- dense cache writes go through backend ops such as `qkv_preprocessing`
-- some sparse updates go through backend postprocessing
-- the regular path reads cached KV through the block-table and pool-pointer
-  contract
-
-Python does not update the main KV cache with `index_copy_` in the regular
-`TRTLLM` path.
-
-#### 3.2.3 `TRTLLM` internal `trtllm_gen` path
-
-`trtllm_gen.py` is not a separate top-level backend, but it has its own KV
-view assumptions.
-
-It still starts from the same paged cache state, but it bridges the TRTLLM
-block-offset format into the page-table shape expected by the FlashInfer
-`trtllm_gen` kernels.
-
-In practice:
-
-- cache writes still begin from TRTLLM preprocessing
-- the fast path converts K-side block offsets into shared page indices
-- it reads cache again through `KVCacheManager.get_buffers(...)`
-
-This path is narrower than the main `TRTLLM` backend:
-
-- dense only
-- no MLA
-- no sparse attention
-- no cross attention
-- fused QKV only
-
-If `trtllm_gen` does not fit, that does not rule out the main `TRTLLM`
-backend.
-
-#### 3.2.4 `FlashInfer` backend
-
-`FlashInfer` also uses paged KV cache, but its runtime contract is more
-directly page-table oriented. It reads the cache through
-`kv_cache_manager.get_buffers(...)` using the layout requested by
-`metadata.kv_layout`.
-
-Read and write behavior:
-
-- Python explicitly appends current K and V into paged cache
-- FlashInfer wrappers then read from that paged cache using page-table metadata
-
-#### 3.2.5 `VANILLA` backend
-
-`VANILLA` gets a paged cache tensor from `kv_cache_manager.get_buffers()` and
-request block ids from `block_ids_per_seq`.
-
-Read and write behavior:
-
-- Python writes K and V directly into cache
-- Python slices the same cache tensor to rebuild key and value states
-- sparse token filtering, if any, also happens around this Python-side path
-
-#### 3.2.6 MLA cached-context semantics
-
-MLA adds a different cache shape and different decode-time assumptions.
-
-The main difference is that MLA cached state is not regular dense K and V.
-The paged cache stores latent-cache state, and backend ops handle:
+MLA cached state is not regular dense K and V. The paged cache stores
+latent-cache state, and backend ops handle:
 
 - appending latent cache into paged storage
 - applying RoPE as part of that flow
 - loading paged cached state back for attention use
 
-MLA fit cannot be judged from attention math alone. The module and backend also
-have to agree on:
+MLA fit cannot be judged from attention math alone. The module and backend must
+agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
+context behavior. The short-seq MHA path is only correct if cached-KV behavior
+stays inside the top-level `forward_context()` dispatcher.
 
-- latent-cache layout
-- paged-KV read path
-- paged-KV write path
-- cached-context and chunked-context behavior
+#### 3.2.4 Sparse side-cache semantics
 
-The short-seq MHA path is only correct if cached-KV behavior stays inside the
-top-level `forward_context()` dispatcher.
+Sparse backends may add side caches beyond the main KV cache:
 
-#### 3.2.7 Sparse side-cache semantics
+- `skip_softmax` keeps the standard `KVCacheManager`, no side cache.
+- `DSA` uses `DSACacheManager` and adds `indexer_k_cache` for sparse indexing.
+- `Rocket` uses `RocketKVCacheManager` and adds `KT` cache for sparse routing.
 
-Sparse backends may change more than the attention score path. They may also
-add side caches.
-
-`skip_softmax` keeps the standard `KVCacheManager`.
-
-`DSA` uses `DSACacheManager`:
-
-- the main cache is still the paged MLA-style cache
-- DSA also adds `indexer_k_cache`
-- this side cache is used for sparse indexing and top-k related work
-
-`Rocket` uses `RocketKVCacheManager`:
-
-- the main cache still follows the base backend family
-- Rocket also adds `KT` cache
-- this side cache is used for sparse routing and sparse block selection
-
-When evaluating a new sparse attention implementation, check:
-
-- the main KV-cache contract
-- the side-cache contract
+When evaluating new sparse attention, check both the main KV-cache contract
+and the side-cache contract.
 
 ## 4. Evaluating New Attention
 
-### 4.1 First-pass fit against the current `TRTLLM` backend
+### 4.1 First-pass fit
 
-For a new model, first compare it against the current `TRTLLM` backend surface
-in four parts.
+For a new model, compare it against the current stack in four parts:
 
-| What to compare | Current `TRTLLM` backend surface |
-|---|---|
-| Module-layer math around the backend call | `Attention` and `MLA` already handle QKV projection, fused or split QKV conversion, optional unfused RoPE, Q/K normalization hooks, output gating, LoRA, TP/CP handling, and Helix wrappers. |
-| Backend-side execution | `TrtllmAttention` handles the standard dense path. It supports fused RoPE, fused QKV input, MLA mode, sliding-window style `attention_window_size`, mRoPE config, attention sinks, and sparse variants through registered sparse backends. |
-| Metadata and runtime contract | The direct path expects `TrtllmAttentionMetadata` or one of its sparse subclasses. That means the new attention must still fit request-based metadata, paged-KV metadata, runtime feature flags, and any extra sparse or MLA buffers required by the path. |
-| KV-cache semantics | The direct path assumes paged-KV ownership. Dense TRTLLM uses the standard `KVCacheManager`. Sparse paths can swap in `DSACacheManager` or `RocketKVCacheManager`. Backend choice also implies assumptions about KV-cache layout, decode-time reads, and inplace append or update behavior. If the new attention needs a different cache ownership model or different decode-time cache semantics, it is not a direct fit. |
+1. **Module math**: can `Attention` or `MLA` express the new math with
+   module-side code only?
+2. **Backend execution**: can `TrtllmAttention.forward(...)` handle the needed
+   call shape (fused/split QKV, dense/sparse, RoPE/mRoPE, MLA/non-MLA)?
+3. **Metadata**: can the runtime state fit in `TrtllmAttentionMetadata` or a
+   known sparse subclass?
+4. **KV-cache**: can the cache behavior stay inside the current paged-KV and
+   cache-manager model?
 
-A practical check:
+If yes to all four, start with the `TRTLLM` backend. Treat the first mismatch
+as the current blocker.
 
-1. Write down the new attention in four buckets:
-   - module math before or after the backend call
-   - backend features it needs
-   - metadata and runtime state it needs
-   - KV-cache ownership, layout assumptions, and update rules it needs
-2. Compare each bucket against the current `TRTLLM` backend surface above.
-3. Treat the first mismatch as the current blocker.
+### 4.2 Checklist
 
-For direct fit, ask these questions in order:
+#### Module-level math
 
-1. Can `Attention` or `MLA` express the new math with module-side code only?
-2. Can `TrtllmAttention.forward(...)` express the backend call shape that is
-   needed?
-   - fused or split QKV
-   - dense or sparse path
-   - RoPE or mRoPE handling
-   - windowed masking
-   - MLA or non-MLA
-3. Can the runtime state be stored in `TrtllmAttentionMetadata` or a known
-   sparse metadata subclass?
-4. Can the KV-cache behavior stay inside the current paged-KV and cache-manager
-   model?
+- Q/K/V layout, fused or split QKV, MQA/GQA structure
+- Q/K normalization, extra scaling, output gating
+- Pre-backend and post-backend transforms
 
-If the answer stays "yes" through all four questions, start with the current
-`TRTLLM` backend and then check the runtime contract in Section 3.
+#### Backend capability
 
-### 4.2 Detailed checklist
+- Which backend family can run the source behavior
+- Fused RoPE, fused QKV, MLA, sparse, chunked-context support
+- Do not use backend name alone as proof of support
 
-#### 4.2.1 Module-level math
+#### Positional embedding and masking
 
-Check all math around the backend call:
+- RoPE applied outside vs fused, standard RoPE vs mRoPE
+- Causal, full, sliding-window, or custom masks
 
-- Q/K/V layout
-- fused or split QKV input
-- MQA or GQA structure
-- Q/K normalization
-- extra QK scaling terms
-- output gating
-- pre-backend and post-backend transforms
+#### Metadata and runtime contract
 
-The first question is whether this math can stay at the module layer by
-overriding or extending `Attention` / `MLA`, without changing the outer runtime
-contract.
-
-#### 4.2.2 Backend capability mapping
-
-Check which backend family can actually run the source behavior:
-
-- `TRTLLM`
-- `VANILLA`
-- `FLASHINFER`
-- sparse variants on top of those families
-
-Then check capability assumptions explicitly:
-
-- fused RoPE
-- fused QKV input
-- MLA support
-- sparse operator support
-- chunked-context support
-
-Do not use backend name alone as proof of support. For a first-pass fit check,
-use Section 4.1 before looking at other backends.
-
-#### 4.2.3 Positional embedding and mask contract
-
-Check:
-
-- whether RoPE is applied outside the backend or fused into it
-- standard RoPE vs mRoPE
-- causal, full, sliding-window, or custom masks
-- any sink-token or mask-side special logic
-
-#### 4.2.4 Metadata and runtime contract
-
-Check which metadata subtype is required:
-
-- `TrtllmAttentionMetadata`
-- `VanillaAttentionMetadata`
-- `FlashInferAttentionMetadata`
-- sparse metadata subclasses
-
-Then check whether the source behavior needs runtime state such as:
-
-- request-level state
-- KV-cache manager handles and KV-cache parameters
-- runtime feature flags
-- planning or sparse buffers
+- Which metadata subtype, what runtime state is needed
 - CUDA-graph assumptions
 
-#### 4.2.5 KV-cache ownership and decode-time semantics
+#### KV-cache ownership
 
-Check:
-
-- how K/V are appended
-- what KV-cache layout the backend expects
-- how tokens are indexed in cache
-- whether cached KV is revisited during context
-- whether decode updates require inplace cache writes
-- whether cache reuse or chunked prefill is required
-- whether speculative decoding assumptions are involved
-- whether sparse state is attached to cache ownership
+- How K/V are appended, what layout, how indexed
+- Cache reuse, chunked prefill, speculative decoding assumptions
+- Sparse side-cache requirements
 
 ### 4.3 Bring-up order
 
-Start with the `TRTLLM` backend when the new attention fits the existing
-runtime contract or only needs limited changes. If that path is too costly for
-initial bring-up or quick experiments, use `VANILLA` to validate the math and
-outer module behavior first, then re-evaluate whether the implementation
-should move back to `TRTLLM`.
+Start with `TRTLLM` when the new attention fits or only needs limited changes.
+Use `VANILLA` for quick bring-up or experiments when the module boundary fits
+but the fused path is too costly to change initially.
 
 Working rules:
 
@@ -624,36 +343,26 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention_backend/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention_backend/trtllm.py` | TRTLLM backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/trtllm_gen.py` | Internal dense fast path used by `TrtllmAttention` on supported Blackwell configurations |
+| `tensorrt_llm/_torch/attention_backend/trtllm_gen.py` | Internal dense fast path |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` | DSA sparse backend, metadata, indexer, cache manager |
-| `tensorrt_llm/_torch/attention_backend/sparse/kernel.py` | Triton helper kernels used by sparse attention implementations |
-| `tensorrt_llm/_torch/attention_backend/sparse/rocket.py` | Rocket sparse backends, metadata, cache manager |
-| `tensorrt_llm/_torch/attention_backend/sparse/utils.py` | Sparse backend and sparse cache-manager registration |
-| `tensorrt_llm/_torch/models/modeling_deepseekv3.py` | DeepSeek weight loading, including `kv_b_proj` layout transforms |
+| `tensorrt_llm/_torch/attention_backend/sparse/` | DSA, Rocket sparse backends, metadata, cache managers |
 
 ## 6. Testing Notes
 
-- `mla.to(device)` does not move `mla.mqa.indexer` weights automatically.
-- Copy indexer weights explicitly in A/B tests.
-- Initialize `kv_b_proj` weights in loaded TRT-LLM layout, not HuggingFace
-  layout.
 - Test lite and non-lite MLA separately when changing projection logic.
-- Test eager and compiled paths separately when changing DSA MLA dispatch or
-  custom-op behavior.
+- Test eager and compiled paths separately when changing DSA MLA dispatch.
 - Test fresh context, cached context, chunked context, and generation
   separately.
 - Any dispatch change touching `forward_context()` needs chunked-context tests.
 
-Useful tests:
+Key test files:
 
 - `tests/unittest/_torch/attention/test_attention.py`
 - `tests/unittest/_torch/attention/test_attention_mla.py`
 - `tests/unittest/_torch/attention/test_vanilla_attention.py`
 - `tests/unittest/_torch/attention/test_flashinfer_attention.py`
-- `tests/unittest/_torch/attention/sparse/test_short_seq_mha.py`
-- `tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py`
+- `tests/unittest/_torch/attention/sparse/`
 
 ## 7. Anti-Patterns
 
