@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -1164,6 +1164,8 @@ class FlashInferTrtllmGenAttention:
             kv_layout=self._layout,
             sinks=params.attention_sinks,
             uses_shared_paged_kv_idx=False,
+            enable_pdl=get_env_enable_pdl(),
+            backend="trtllm-gen",
         )
 
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
@@ -1366,6 +1368,8 @@ class FlashInferTrtllmGenAttention:
                 max_q_len=params.input_seq_length,
                 cum_seq_lens_q=cu_seqlens,
                 uses_shared_paged_kv_idx=False,
+                enable_pdl=get_env_enable_pdl(),
+                backend="trtllm-gen",
             )
         else:
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1383,6 +1387,8 @@ class FlashInferTrtllmGenAttention:
                 sinks=params.attention_sinks,
                 q_len_per_req=params.input_seq_length,
                 uses_shared_paged_kv_idx=False,
+                enable_pdl=get_env_enable_pdl(),
+                backend="trtllm-gen",
             )
 
     def run_mla_generation(self, params: EnqueueGenerationParams) -> None:
@@ -1395,14 +1401,25 @@ class FlashInferTrtllmGenAttention:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * params.beam_width
-        block_tables = self._build_block_tables(
-            params.kv_cache_block_offsets,
-            params.host_kv_cache_pool_mapping,
-            params.layer_idx,
-            params.global_layer_idx,
-            params.seq_offset,
-            batch_beam,
+        kv_cache_tuple, block_tables = self._get_kv_cache_and_block_tables(
+            kv_cache_block_offsets=params.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            layer_idx=params.layer_idx,
+            global_layer_idx=params.global_layer_idx,
+            num_kv_heads=params.num_kv_heads,
+            tokens_per_block=params.tokens_per_block,
+            head_dim=params.head_size,
+            kv_cache_quant_mode=params.kv_cache_quant_mode,
+            batch_start=params.seq_offset,
+            batch_size=batch_beam,
+            dtype=params.attention_input.dtype,
+            is_mla_enable=params.is_mla_enable,
         )
+
+        # MLA decode API takes a single kv tensor [num_pages, 1, page_size, head_dim],
+        # not the (K_pool, V_pool) tuple.
+        kv_cache = kv_cache_tuple[0]
 
         pages_per_superblock = 128 // params.tokens_per_block
         if pages_per_superblock > 1:
@@ -1416,12 +1433,6 @@ class FlashInferTrtllmGenAttention:
         q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
 
         query = params.qkv_input.view(batch_beam, q_len_per_req, params.num_heads, mla_head_dim_qk)
-
-        kv_cache = self._kv_cache_manager.get_buffers(
-            params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
-        )
-        if kv_cache.ndim == 5:
-            kv_cache = kv_cache.squeeze(2)
 
         bmm1_scale = 1.0 / (
             params.q_scaling * math.sqrt(params.qk_nope_head_dim + params.qk_rope_head_dim)
@@ -1451,6 +1462,9 @@ class FlashInferTrtllmGenAttention:
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             sinks=params.attention_sinks,
+            uses_shared_paged_kv_idx=False,
+            enable_pdl=get_env_enable_pdl(),
+            backend="trtllm-gen",
         )
 
         if q_len_per_req > 1:
