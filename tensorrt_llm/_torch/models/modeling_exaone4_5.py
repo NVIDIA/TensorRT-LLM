@@ -206,8 +206,8 @@ class Exaone4_5_VLModel(Qwen2VLModelBase):
     model_type="exaone4_5",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
-            "image": "<|vision_start|><|image_pad|><|vision_end|>",
-            "video": "<|vision_start|><|video_pad|><|vision_end|>",
+            "image": "<vision><|image_pad|></vision>",
+            "video": "<vision><|video_pad|></vision>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ),

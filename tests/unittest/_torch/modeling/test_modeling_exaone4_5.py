@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import os
 from dataclasses import dataclass
 from typing import List
 
 import torch
+import transformers
+from packaging.version import Version
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from transformers import PreTrainedModel
 
@@ -183,6 +186,15 @@ EXAONE_4_5_TEST_CONFIG = {
 }
 
 
+def _transformers_version_at_most_5_3() -> bool:
+    """True when installed transformers is at most 5.3.x (no Exaone4.5 in HF yet)."""
+    ver = Version(transformers.__version__)
+    if not ver.release:
+        return True
+    major, minor = ver.release[0], ver.release[1] if len(ver.release) > 1 else 0
+    return (major < 5) or (major == 5 and minor <= 3)
+
+
 @dataclass(repr=False)
 class TestExaone4_5Scenario(MultimodalScenario):
     """Scenario config (name avoids pytest collecting as Test* class)."""
@@ -200,10 +212,9 @@ class TestExaone4_5(TestModelingMultimodal):
     skip HF and use ``load_weights=False`` (see ``skip_hf_inference``).
     """
 
-    # TODO: Remove this once we have a proper transformers version for Exaone4.5
     @property
     def skip_hf_inference(self) -> bool:
-        return True
+        return _transformers_version_at_most_5_3()
 
     @property
     def trust_remote_code(self) -> bool:
@@ -216,8 +227,17 @@ class TestExaone4_5(TestModelingMultimodal):
         return Exaone4_5_ForConditionalGeneration
 
     def get_hf_model_class(self):
-        # TODO: Change to EXAONE4_5ForConditionalGeneration
-        return PreTrainedModel
+        if _transformers_version_at_most_5_3():
+            return PreTrainedModel
+        hf_cls = getattr(transformers, "Exaone4_5ForConditionalGeneration", None)
+        if hf_cls is not None:
+            return hf_cls
+        try:
+            mod = importlib.import_module("transformers.models.exaone4_5.modeling_exaone4_5")
+            hf_cls = getattr(mod, "Exaone4_5ForConditionalGeneration", None)
+            return hf_cls if hf_cls is not None else PreTrainedModel
+        except ImportError:
+            return PreTrainedModel
 
     def get_weight_mapper_class(self):
         return Exaone4_5HfWeightMapper
