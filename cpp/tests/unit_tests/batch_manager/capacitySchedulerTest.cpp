@@ -401,6 +401,7 @@ int runTest(CapacityScheduler& capacityScheduler,
 
                 if (llmReq->getContextRemainingLength() == 0)
                 {
+                    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(*llmReq);
                     kvCacheManager->storeContextBlocks(*llmReq);
                     if (crossKvCacheManager)
                     {

@@ -1247,6 +1247,7 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerSetsReusableTokensForMicroBatch)
     // Process request 0: addSequence → complete context → store blocks
     kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
     req0->moveToNextContextChunk();
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(*req0);
     kvCacheManager->storeContextBlocks(*req0);
     req0->addNewTokens({0});
     req0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
@@ -1347,6 +1348,7 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerReusableTokensWithChunkedMicroBat
 
     kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
     req0->moveToNextContextChunk();
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(*req0);
     kvCacheManager->storeContextBlocks(*req0);
     req0->addNewTokens({0});
     req0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
