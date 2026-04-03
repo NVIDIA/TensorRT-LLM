@@ -33,6 +33,7 @@ SUBMIT_DWDP_SCRIPT = BENCHMARK_DIR / "submit_dwdp.py"
 DEFAULT_ENV_CONFIG = SCRIPT_DIR / "env.yaml"
 DEFAULT_REPRODUCE_CONFIG = SCRIPT_DIR / "dwdp_reproduce.yaml"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "generated"
+TOTAL_EXPERTS = 256
 
 DEFAULT_WORKER_ENV_VAR = (
     "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 "
@@ -176,13 +177,22 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
 
     if dwdp_group <= 0:
         raise ValueError("dwdp_group must be greater than zero")
+    if prefetch < 0:
+        raise ValueError("prefetch must be greater than or equal to zero")
     if dwdp_enabled and num_ctx_servers % dwdp_group != 0:
         raise ValueError("num_ctx_servers must be divisible by dwdp_group when DWDP is enabled")
 
     ctx_max_seq_len, gen_max_seq_len = calc_seq_lens(isl, osl, ratio)
     max_tokens_in_buffer = math.ceil(ctx_max_seq_len / 64) * 64
     dwdp_size = num_ctx_servers // dwdp_group if dwdp_enabled else 1
-    experts_per_worker = int(256 - (dwdp_size - 1) * prefetch)
+    experts_per_worker = int(TOTAL_EXPERTS - (dwdp_size - 1) * prefetch)
+    if dwdp_enabled and experts_per_worker <= 0:
+        raise ValueError(
+            "Invalid DWDP configuration: "
+            f"TOTAL_EXPERTS={TOTAL_EXPERTS}, dwdp_size={dwdp_size}, and prefetch={prefetch} "
+            "produce a non-positive num_experts_per_worker. "
+            "Reduce prefetch or use a smaller DWDP size."
+        )
 
     gen_cfg: Dict[str, Any] = {
         "tensor_parallel_size": gen_tp,
