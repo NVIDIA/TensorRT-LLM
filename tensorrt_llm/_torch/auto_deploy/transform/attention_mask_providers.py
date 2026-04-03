@@ -77,7 +77,13 @@ def _build_gemma4_token_type_mask(ctx, source_attn_node):
         torch.ops.aten.bitwise_and.Tensor, args=(same_blob, media_query)
     )
 
-    positions = ctx.gm.graph.call_function(torch.ops.aten.arange.default, args=(seq_len,))
+    # Derive 1D positions [seq_len] from token_type_ids to inherit correct device
+    # during shape propagation (meta) and runtime (cuda).
+    ones_2d = ctx.gm.graph.call_function(torch.ops.aten.ones_like.default, args=(token_type_ids,))
+    # Take first row to get 1D [seq_len]
+    ones_1d = ctx.gm.graph.call_function(torch.ops.aten.select.int, args=(ones_2d, 0, 0))
+    positions = ctx.gm.graph.call_function(torch.ops.aten.cumsum.default, args=(ones_1d, 0))
+    positions = ctx.gm.graph.call_function(torch.ops.aten.sub.Tensor, args=(positions, ones_1d))
     pos_q = ctx.gm.graph.call_function(torch.ops.aten.unsqueeze.default, args=(positions, 0))
     pos_k = ctx.gm.graph.call_function(torch.ops.aten.unsqueeze.default, args=(positions, 1))
     causal_mask = ctx.gm.graph.call_function(torch.ops.aten.le.Tensor, args=(pos_q, pos_k))
