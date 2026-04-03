@@ -1116,6 +1116,7 @@ def test_session_cancel_before_send():
 @pytest.mark.timeout(60)
 def test_session_cancel_after_send():
     """TxSession cancelled after send() queues INIT tasks; future raises."""
+    tensorrt_llm.logger.set_level("debug")
     setup = create_transfer_worker_setup(
         ctx_tp=1,
         ctx_pp=1,
@@ -1167,6 +1168,8 @@ def test_session_cancel_after_send():
         tx_session.close()
     finally:
         ctx_transfer_worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 
 @pytest.mark.timeout(60)
