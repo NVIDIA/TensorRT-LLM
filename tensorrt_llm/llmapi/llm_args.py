@@ -1180,19 +1180,37 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return False
 
 
+class SAEnhancerConfig(StrictBaseModel):
+    """Configuration for the Suffix Automaton (SA) draft enhancer.
+
+    Use this to combine SA pattern-matching drafting with another speculative
+    decoding method (Eagle3, MTP, PARD).  When provided as ``sa_config`` on a
+    decoding config, SA drafting is enabled and may override neural draft
+    tokens when the suffix match length meets the *threshold*.
+
+    For standalone SA speculative decoding (no neural drafter), use
+    :class:`SADecodingConfig` instead.
+    """
+
+    threshold: PositiveInt = Field(
+        default=4,
+        description="Minimum suffix match length required for the SA output "
+        "to override neural draft tokens.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True, each request searches all active SA states "
+        "for the longest match, not just its own. Improves acceptance rates "
+        "when requests share common patterns.")
+
+
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
-    # Suffix Automaton speculative decoding settings
-    use_sa_spec: Optional[bool] = Field(
-        default=False,
+    sa_config: Optional[SAEnhancerConfig] = Field(
+        default=None,
         status="beta",
-        description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: PositiveInt = Field(
-        default=4,
-        description="The threshold for the Suffix Automaton Decoding. If the"
-        " length of the suffix match exceeds the threshold, use"
-        " the suffix automaton output for the next draft tokens.")
+        description="Optional Suffix Automaton configuration. When set, "
+        "combines SA drafting with Eagle3 speculative decoding.")
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -1329,17 +1347,37 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class SADecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+    """Configuration for standalone Suffix Automaton (SA) speculative decoding.
 
-    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
-    the target model forward; supports CUDA graph and overlap scheduler.
+    Uses a GPU-native suffix automaton for pattern matching. Drafting runs
+    inside the target model forward; supports CUDA graph and overlap scheduler.
+
+    To combine SA with a neural drafter (Eagle3, MTP, PARD) instead of using
+    it standalone, pass :class:`SAEnhancerConfig` via ``sa_config``.
     """
     decoding_type: Literal["SA"] = "SA"
     max_matching_ngram_size: int = Field(
         default=-1,
         description="Positive value (e.g., 3): fixed-size ngram matching. "
         "-1: longest possible match via suffix automaton. 0 is invalid.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True, each request searches all active SA states "
+        "for the longest match, not just its own. Improves acceptance rates "
+        "when requests share common patterns. "
+        "Limitations: at most 1024 concurrent slots; suffix matching is "
+        "capped at 64 tokens per request.")
+
+    global_pool_size: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of SA slots in the global pool. "
+        "When None and enable_global_pool=True, defaults to "
+        "max(64, max_batch_size) — a fixed-size pool independent of batch size. "
+        "When set explicitly, must be >= max_batch_size. "
+        "Completed requests' SA states are retained in the pool for "
+        "cross-request search until the pool is full, at which point "
+        "the oldest completed request is evicted. "
+        "Only effective when enable_global_pool=True.")
 
     @model_validator(mode='after')
     def validate_sa_config(self):
@@ -1347,8 +1385,20 @@ class SADecodingConfig(DecodingBaseConfig):
             raise ValueError(
                 "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
                 "Got 0.")
+        if self.enable_global_pool and self.max_matching_ngram_size != -1 and not (
+                1 <= self.max_matching_ngram_size <= 64):
+            raise ValueError(
+                "max_matching_ngram_size must be -1 (longest match) or in [1, 64] "
+                "when enable_global_pool is True. "
+                f"Got {self.max_matching_ngram_size}.")
         if self.max_draft_len is None or self.max_draft_len <= 0:
             raise ValueError("max_draft_len must be > 0 for SA")
+        if self.global_pool_size is not None:
+            if self.global_pool_size < 1:
+                raise ValueError("global_pool_size must be >= 1")
+            if not self.enable_global_pool:
+                raise ValueError(
+                    "global_pool_size requires enable_global_pool=True")
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
@@ -1415,16 +1465,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
 
-    # Suffix Automaton speculative decoding settings
-    use_sa_spec: Optional[bool] = Field(
-        default=False,
+    sa_config: Optional[SAEnhancerConfig] = Field(
+        default=None,
         status="beta",
-        description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: PositiveInt = Field(
-        default=4,
-        description="The threshold for the Suffix Automaton Decoding. If the"
-        " length of the suffix match exceeds the threshold, use"
-        " the suffix automaton output for the next draft tokens.")
+        description="Optional Suffix Automaton configuration. When set, "
+        "combines SA drafting with MTP speculative decoding.")
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -1462,7 +1507,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend in ("pytorch", "_autodeploy")
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
@@ -1504,16 +1549,11 @@ class PARDDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["PARD"] = "PARD"
 
-    # Suffix Automaton speculative decoding settings
-    use_sa_spec: Optional[bool] = Field(
-        default=False,
+    sa_config: Optional[SAEnhancerConfig] = Field(
+        default=None,
         status="beta",
-        description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: PositiveInt = Field(
-        default=4,
-        description="The threshold for the Suffix Automaton Decoding. If the"
-        " length of the suffix match exceeds the threshold, use"
-        " the suffix automaton output for the next draft tokens.")
+        description="Optional Suffix Automaton configuration. When set, "
+        "combines SA drafting with PARD speculative decoding.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -3643,6 +3683,14 @@ class TorchLlmArgs(BaseLlmArgs):
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
+
+            if isinstance(self.speculative_config, SADecodingConfig):
+                pool_size = self.speculative_config.global_pool_size
+                if pool_size is not None and self.max_batch_size is not None:
+                    if pool_size < self.max_batch_size:
+                        raise ValueError(
+                            f"global_pool_size ({pool_size}) must be >= "
+                            f"max_batch_size ({self.max_batch_size})")
 
             if isinstance(self.speculative_config,
                           SaveHiddenStatesDecodingConfig):
