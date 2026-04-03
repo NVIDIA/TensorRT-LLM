@@ -2146,6 +2146,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.gather_ids = self.gather_ids_cuda[:total_num_tokens]
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:
                                                                                           num_extend_requests]
+            spec_metadata.num_generations = num_extend_requests
 
         # Determine if we're using extend_ctx mode for linear tree decoding
         num_extend_ctx_requests = 0

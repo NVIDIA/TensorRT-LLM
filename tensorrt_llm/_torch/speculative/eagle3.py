@@ -446,8 +446,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                       draft_model)
 
         batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
+        # Use spec_metadata.num_generations for the real gen/ctx split.
+        # attn_metadata.num_contexts and num_ctx_tokens may be inflated by
+        # extend_ctx mode (which treats gen draft tokens as context for attn).
+        num_gens = spec_metadata.num_generations
+        num_contexts = batch_size - num_gens
+        num_ctx_tokens = attn_metadata._seq_lens[:num_contexts].sum().item(
+        ) if num_contexts > 0 else 0
 
         raw_logits = logits
 
@@ -499,7 +504,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         (runtime_draft_len + 1)).long()
                     gather_ids_gen = (start_ids_gen +
                                       num_accepted_tokens[num_contexts:] - 1 +
-                                      attn_metadata.num_ctx_tokens)
+                                      num_ctx_tokens)
                     gather_ids = torch.concat([
                         spec_metadata.gather_ids[:num_contexts], gather_ids_gen
                     ],
@@ -609,8 +614,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         spec_metadata: Eagle3OneModelSpecMetadata,
     ):
         batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
+        num_gens = spec_metadata.num_generations
+        num_contexts = batch_size - num_gens
 
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, spec_metadata.runtime_draft_len)
@@ -653,7 +658,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         spec_metadata: Eagle3OneModelSpecMetadata,
         draft_model: nn.Module,
     ):
-        num_contexts = attn_metadata.num_contexts
+        num_contexts = attn_metadata.num_seqs - spec_metadata.num_generations
+        num_ctx_tokens = attn_metadata._seq_lens[:num_contexts].sum().item(
+        ) if num_contexts > 0 else 0
         num_tokens = input_ids.shape[0]
 
         # prepare hidden states
@@ -665,7 +672,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # context
         input_ids_ctx = self._prepare_context_input_ids(
-            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
+            input_ids, num_ctx_tokens, spec_metadata.gather_ids,
             accepted_tokens, num_contexts)
 
         # generation
