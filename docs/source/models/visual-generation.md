@@ -134,7 +134,7 @@ Key components:
 
 | Component | Location | Role |
 |---|---|---|
-| `VisualGen` | `tensorrt_llm/llmapi/visual_gen.py` | High-level API: manages workers, `generate()` / `generate_async()` |
+| `VisualGen` | `tensorrt_llm/visual_gen/__init__.py` | High-level API: manages workers, `generate()` / `generate_async()` |
 | `DiffusionExecutor` | `visual_gen/executor.py` | Worker process: loads pipeline, processes requests via ZeroMQ |
 | `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, TeaCache, CUDA graph |
 | `AutoPipeline` | `visual_gen/pipeline_registry.py` | Factory: auto-detects model type, selects pipeline class |

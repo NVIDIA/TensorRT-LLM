@@ -18,13 +18,13 @@ By NVIDIA TensorRT LLM team
   - [Acknowledgment](#acknowledgment)
 
 ## Introduction
-The open source DeepSeek R1 model's innovative architecture including the multi-head latent attention (MLA) and large sparse Mixture-of-Experts (MoE) significantly improved the inference efficiency of the LLM models. However, harnessing the full potential of such an innovative structure requires equally important hardware/software co-optimization. This post delves into the optimization strategies for DeepSeek R1 throughput oriented scenarios (TPS/GPU), developed by NVIDIA within TensorRT LLM on NVIDIA's Blackwell B200 GPUs. We will explore the rationale behind each enhancement. [The other min-latency optimization blog](./blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) explained in detail how TensorRT LLM optimizes the R1 performance to achieve the best of the TPS/USER.
+The open source DeepSeek R1 model's innovative architecture including the multi-head latent attention (MLA) and large sparse Mixture-of-Experts (MoE) significantly improved the inference efficiency of the LLM models. However, harnessing the full potential of such an innovative structure requires equally important hardware/software co-optimization. This post delves into the optimization strategies for DeepSeek R1 throughput oriented scenarios (TPS/GPU), developed by NVIDIA within TensorRT LLM on NVIDIA's Blackwell B200 GPUs. We will explore the rationale behind each enhancement. [The other min-latency optimization blog](./blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) explained in detail how TensorRT LLM optimizes the R1 performance to achieve the best of the TPS/USER.
 
 These optimizations have significantly boosted DeepSeek R1 throughput on Blackwell. Performance increased from approximately 2000 TPS/GPU in February to 4600 TPS/GPU on ISL/OSL 1K/2K dataset. The optimizations are general and applicable to other ISL/OSL configs too. These optimization items were broadly categorized into three areas: MLA layers, MoE layers, and runtime.
 
 ## Precision strategy
 
-The mixed precision recipe for DeepSeek R1 throughput scenario is almost the same as [what](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md#precision-strategy) is used for latency oriented scenario, with the following differences:
+The mixed precision recipe for DeepSeek R1 throughput scenario is almost the same as [what](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md#precision-strategy) is used for latency oriented scenario, with the following differences:
 
 * FP8 KV cache and FP8 attention, rather than BF16 precision.
 * FP4 Allgather for better communication bandwidth utilization.
@@ -157,7 +157,7 @@ These optimizations target the overall execution flow, scheduling, and resource 
 
     There is a feature called CUDA Graph padding in TensorRT LLM, which is a good trade-off between the number of CUDA Graphs and the CUDA Graph hit ratio; it tries to pad a batch to the nearest one with a captured CUDA Graph. Normally you should enable the CUDA Graph padding feature to increase the CUDA Graph hit rate, but the padding itself has some overhead due to wasted tokens computation.
 
-    Users can opt-out the CUDA Graph padding feature to see the perf benefits, by setting the `cuda_graph_config:\n  enable_padding: False`, see API here [Pytorch backend config](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/config.py#L41)
+    Users can opt-out the CUDA Graph padding feature to see the perf benefits, by setting the `cuda_graph_config:\n  enable_padding: False`, see API here [CudaGraphConfig](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_args.py#L102)
 
 * Overlap Scheduler:
 

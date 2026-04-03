@@ -1501,6 +1501,11 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
+        attn_meta = inputs.get('attn_metadata')
+        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
+        if attn_meta is not None:
+            attn_meta.on_update_kv_lens()
+
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_total_draft_tokens. But we need to use
@@ -3612,9 +3617,9 @@ class PyTorchModelEngine(ModelEngine):
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
         # Initialize SA state for new requests (MTP+SA, EAGLE3+SA, PARD+SA, etc.)
-        use_sa_spec = (self.spec_config is not None
-                       and getattr(self.spec_config, 'use_sa_spec', False))
-        if use_sa_spec and resource_manager is not None and self.mapping.is_last_pp_rank(
+        has_sa_enhancer = (self.spec_config is not None and getattr(
+            self.spec_config, 'sa_config', None) is not None)
+        if has_sa_enhancer and resource_manager is not None and self.mapping.is_last_pp_rank(
         ):
             from tensorrt_llm._torch.speculative.suffix_automaton import \
                 SuffixAutomatonManager

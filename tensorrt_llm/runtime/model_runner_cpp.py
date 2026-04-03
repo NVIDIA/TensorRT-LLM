@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from .. import profiler
+from .._deprecation import emit_engine_arch_deprecation
 from .._utils import maybe_pin_memory, mpi_broadcast
 from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
 from ..bindings import executor as trtllm
@@ -75,6 +76,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  world_config: WorldConfig,
                  use_kv_cache: bool,
                  lora_manager: Optional[LoraManager] = None) -> None:
+        emit_engine_arch_deprecation("ModelRunnerCpp")
         self.session = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
@@ -126,6 +128,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         use_variable_beam_width_search: bool = False,
         mm_embedding_offloading: bool = False,
         fail_fast_on_attention_window_too_large: bool = False,
+        normalize_log_probs: bool = False,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -402,6 +405,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             use_gpu_direct_storage=use_gpu_direct_storage,
             gpu_weights_percent=gpu_weights_percent,
             gather_generation_logits=gather_generation_logits,
+            normalize_log_probs=normalize_log_probs,
         )
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config

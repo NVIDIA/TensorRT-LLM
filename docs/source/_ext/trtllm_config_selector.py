@@ -51,13 +51,14 @@ def _write_config_db_json(app) -> None:
         return
 
     _ensure_repo_root_on_syspath()
-    from examples.configs.database.database import DATABASE_LIST_PATH
+    from examples.configs.database.database import CURATED_LIST_PATH, DATABASE_LIST_PATH
     from scripts.generate_config_table import generate_json
 
     out_static = Path(builder.outdir) / "_static"
     out_static.mkdir(parents=True, exist_ok=True)
     out_path = out_static / "config_db.json"
-    generate_json(Path(DATABASE_LIST_PATH), output_file=out_path)
+    curated_path = CURATED_LIST_PATH if CURATED_LIST_PATH.exists() else None
+    generate_json(Path(DATABASE_LIST_PATH), output_file=out_path, curated_yaml_path=curated_path)
     LOGGER.info("Wrote config selector database: %s", out_path)
 
 
