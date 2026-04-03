@@ -2397,7 +2397,8 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     auto usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
     if (isRecurrentState())
     {
-        usableUniqueTokenCount = std::min(llmRequest->getPromptLen() - 1, usableUniqueTokenCount); // TODO: enable store for completed sequences
+        usableUniqueTokenCount = std::min(
+            llmRequest->getPromptLen() - 1, usableUniqueTokenCount); // TODO: enable store for completed sequences
     }
     TLLM_LOG_DEBUG("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
         mLogPrefix.c_str(), llmRequest->mRequestId, mWindowSize, uniqueTokens.size(), usableUniqueTokenCount);
