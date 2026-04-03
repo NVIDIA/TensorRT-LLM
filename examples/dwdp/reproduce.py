@@ -33,7 +33,6 @@ SUBMIT_DWDP_SCRIPT = BENCHMARK_DIR / "submit_dwdp.py"
 DEFAULT_ENV_CONFIG = SCRIPT_DIR / "env.yaml"
 DEFAULT_REPRODUCE_CONFIG = SCRIPT_DIR / "dwdp_reproduce.yaml"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "generated"
-DEFAULT_LOG_DIR = SCRIPT_DIR / "logs"
 
 DEFAULT_WORKER_ENV_VAR = (
     "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 "
@@ -383,7 +382,6 @@ def build_full_config(env_config: Dict[str, Any], experiment: Dict[str, Any]) ->
         "cuda_architectures": environment_config.get("cuda_architectures", ""),
         "trtllm_wheel_path": environment_config.get("trtllm_wheel_path", ""),
         "work_dir": launcher_work_dir,
-        "log_dir": str(environment_config.get("log_dir", DEFAULT_LOG_DIR)),
         "worker_env_var": environment_config.get("worker_env_var", DEFAULT_WORKER_ENV_VAR),
         "server_env_var": environment_config.get("server_env_var", DEFAULT_SERVER_ENV_VAR),
     }
@@ -391,6 +389,8 @@ def build_full_config(env_config: Dict[str, Any], experiment: Dict[str, Any]) ->
         if key in environment_config:
             full_environment[key] = environment_config[key]
     full_environment = merge_nested_dicts(full_environment, experiment.get("environment", {}))
+    if not full_environment.get("log_dir"):
+        full_environment.pop("log_dir", None)
     benchmark_config = {
         "mode": benchmark_defaults.get("mode", "e2e"),
         "use_nv_sa_benchmark": _as_bool(benchmark_defaults.get("use_nv_sa_benchmark", False)),
