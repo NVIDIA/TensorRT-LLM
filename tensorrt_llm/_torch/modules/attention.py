@@ -1269,10 +1269,6 @@ class MLA(nn.Module):
             aux_stream=aux_stream,
         )
 
-        # Register MLA context with sparse backends that need it
-        if hasattr(self.mqa, 'register_mla_context'):
-            self.mqa.register_mla_context(self)
-
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
 
         self.aux_stream = aux_stream
