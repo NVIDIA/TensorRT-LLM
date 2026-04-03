@@ -1,5 +1,3 @@
-from torch import nn
-
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
@@ -92,20 +90,14 @@ class MistralWeightMapper(HfWeightMapper):
         # If using quantized model in mistral format,
         # quantization scales (qscale_weight) also need to be sliced
         for name in weights.keys():
-            # TODO: add scales if dequant is necessary 
+            # TODO: add scales if dequant is necessary
             if ".wq.weight" in name:
                 weights[name] = permute(
-                    weights[name],
-                    config.num_attention_heads,
-                    config.head_dim,
-                    config.hidden_size
+                    weights[name], config.num_attention_heads, config.head_dim, config.hidden_size
                 )
             elif ".wk.weight" in name:
                 weights[name] = permute(
-                    weights[name],
-                    config.num_key_value_heads,
-                    config.head_dim,
-                    config.hidden_size
+                    weights[name], config.num_key_value_heads, config.head_dim, config.hidden_size
                 )
         return weights
 

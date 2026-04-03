@@ -283,7 +283,7 @@ def load_pretrained_config(model_name_or_path: str,
 
     elif model_type == "mistral3" and "layer_types" in config_dict:
         # TODO: update this for transformers v5.0
-        config_class = "MinistralConfig" 
+        config_class = "MinistralConfig"
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
 

@@ -623,13 +623,14 @@ class Mistral3VLM(PreTrainedModel):
 
         llm_weights = filter_weights(weights=weights, prefix="language_model")
         logger.debug(f"Loading weights for {type(self.llm)}")
-        if weight_mapper:    
-            weight_mapper.permute_qk(weights=llm_weights, config=self.llm.config)                                                                                                                                         
-            self.llm.load_weights(llm_weights, 
-                                  weight_mapper=weight_mapper, 
-                                  params_map=weight_mapper.mistral_llm_mapping)  
-        else:                                                                                       
-            self.llm.load_weights(llm_weights)   
+        if weight_mapper:
+            weight_mapper.permute_qk(weights=llm_weights,
+                                     config=self.llm.config)
+            self.llm.load_weights(llm_weights,
+                                  weight_mapper=weight_mapper,
+                                  params_map=weight_mapper.mistral_llm_mapping)
+        else:
+            self.llm.load_weights(llm_weights)
         logger.debug(f"Successfully loaded weights for {type(self.llm)}")
 
         vit_weights = filter_weights(weights=weights, prefix="vision_tower")
@@ -638,7 +639,8 @@ class Mistral3VLM(PreTrainedModel):
         if vit_params_map is not None:
             # Pixtral uses num_attention_heads = num_key_value_heads
             self._vision_tower.config.num_key_value_heads = self._vision_tower.config.num_attention_heads
-            weight_mapper.permute_qk(weights=vit_weights, config=self._vision_tower.config)
+            weight_mapper.permute_qk(weights=vit_weights,
+                                     config=self._vision_tower.config)
             vit_weights = weight_mapper.rename_by_params_map(
                 weights=vit_weights, params_map=vit_params_map)
 
