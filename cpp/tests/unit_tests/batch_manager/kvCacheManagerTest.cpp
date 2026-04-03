@@ -366,6 +366,7 @@ void runPartialCopyTest()
     auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({0, 1, 6}));
     // store blocks 0, 1 ([0,1,2,3,4,5,6,7], [8,9,10,11,12,13,14,15])
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.storeContextBlocks(seq1, *llmRequest1);
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -2664,6 +2665,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
             KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 50)},
                 50)); // Set all blocks to priority 50.
         kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
+        kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
         kvCacheManager.storeContextBlocks(*llmRequest0);
         // Occupy a new block, block 3, adding 3 tokens to block 3.
         // [1, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [0, 0, 0]
@@ -2684,6 +2686,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
         llmRequest1->setKvCacheRetentionConfig(KvCacheRetentionConfig(
             {}, KvCacheRetentionConfig::kMaxRetentionPriority, 20ms)); // Set decode blocks to max priority for 20ms.
         kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
+        kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
         kvCacheManager.storeContextBlocks(*llmRequest1);
         // Occupy a new block, block 3, adding 3 tokens to block 3.
         // [1, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [0, 0, 0]
@@ -2934,6 +2937,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
     auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     llmRequest0->addNewToken(0, 0);
@@ -3020,6 +3024,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto llmRequest0
         = std::make_shared<LlmRequest>(requestId0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId0, inputLength0, beamWidth, llmRequest0);
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
     GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId0);
 
@@ -3047,6 +3052,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto llmRequest1
         = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId1, inputLength1, beamWidth, llmRequest1);
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
     GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId1);
 
@@ -3673,7 +3679,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     llmRequest0->setLoraTaskId(42);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-    llmRequest0->setContextCurrentPosition(inputTokens0->size());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     events = getEvents(kvCacheManager);
@@ -3704,7 +3710,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto llmRequest1 = std::make_shared<LlmRequest>(1, 0, inputTokens1, samplingConfig, true);
     llmRequest1->setLoraTaskId(42);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
-    llmRequest1->setContextCurrentPosition(inputTokens1->size());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
     kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
@@ -4251,7 +4257,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto llmRequest1 = std::make_shared<LlmRequest>(1, 0, inputTokens1, samplingConfig, true);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
-    llmRequest1->setContextCurrentPosition(inputTokens1->size());
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
     kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
@@ -4312,6 +4318,7 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
         {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, highPriority)}, highPriority));
 
     kvCacheManager.addSequence(0, inputLength, beamWidth, llmRequest);
+    kvCacheManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest);
     kvCacheManager.storeContextBlocks(*llmRequest);
 
     // Get block IDs for the sequence
@@ -6062,6 +6069,7 @@ TEST(KVCacheManagerReuseAccountingTest, NeededBlocksOneStepCapsAllocatedReuseAtE
 
     auto seedReq = makeRequest(0, reusableTokens);
     kvCacheManager->addSequence(seedReq.mRequestId, seedReq.getPromptLen(), maxBeamWidth, seedReq);
+    kvCacheManager->simulatePrefillCompletionOnlyUseForTesting(seedReq);
     kvCacheManager->removeSequence(seedReq.mRequestId, seedReq);
 
     // Keep a request with 49 prompt tokens active so all 3 full prefix blocks remain
@@ -6921,9 +6929,9 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
 
     // reuse enabled: basic allocation
     GenerationRequest seq0{requestId, numTokens0, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, linearWindowSizeCode);
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, maxAttentionWindow);
     blockManager.holdSequence(seq0.getRequestId());
     ASSERT_EQ(llmRequest0->getContextCurrentPosition(), 0);
@@ -6966,7 +6974,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     ASSERT_EQ(idSetNegative.size(), placeholderBlocks);
 
     // pretend the prefill is done
-    llmRequest0->setContextCurrentPosition(inputLength);
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest0);
     llmRequest0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
     blockManager.storeContextBlocks(seq0, *llmRequest0);
     blockManager.releaseBlocks(seq0);
@@ -6980,9 +6988,9 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     auto llmRequestNoise
         = std::make_shared<LlmRequest>(9999, numTokens1, inputTokensNoise, samplingConfig, isStreaming);
     GenerationRequest seqNoise{9999, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, linearWindowSizeCode);
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, maxAttentionWindow);
     blockManager.holdSequence(seqNoise.getRequestId());
 
@@ -6998,13 +7006,14 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
 
     auto llmRequest1 = std::make_shared<LlmRequest>(1, numTokens1, inputTokens1, samplingConfig, isStreaming);
     GenerationRequest seq1{1, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, linearWindowSizeCode);
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, maxAttentionWindow);
 
     blockManager.holdSequence(seq1.getRequestId());
 
+    blockManager.simulatePrefillCompletionOnlyUseForTesting(*llmRequest1);
     blockManager.storeContextBlocks(seq1, *llmRequest1);
     int numReusedBlocks = numReusedTokens / tokensPerBlock;
     for (; numReusedBlocks > 0; --numReusedBlocks)
