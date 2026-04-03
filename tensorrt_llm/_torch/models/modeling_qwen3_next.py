@@ -20,6 +20,8 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
