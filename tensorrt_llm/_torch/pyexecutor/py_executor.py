@@ -463,8 +463,10 @@ class PyExecutor:
 
         self.is_shutdown = False
         self._fatal_error: Optional[BaseException] = None
-        self._consecutive_error_count: int = 0
-        self._max_consecutive_errors: int = 10
+        self._error_budget: float = 1.0
+        self._last_error_time: Optional[float] = None
+        self._error_budget_recovery_rate: float = 0.1
+        self._error_budget_cost: float = 0.1
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
@@ -2095,7 +2097,6 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
-                self._consecutive_error_count = 0
                 self.iter_counter += 1
 
     def _prepare_draft_requests(self):
@@ -3367,19 +3368,76 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    def _is_fatal_error(self, error_msg: str) -> bool:
-        """Check if an error message indicates an unrecoverable CUDA/system error."""
-        fatal_patterns = [
-            "cuda out of memory",
-            "cuda error",
-            "cudaerrorillegaladd",
-            "cudaerrorlaunchfailure",
-            "nccl error",
-            "device-side assert",
-            "unrecoverable",
-        ]
+    # Errors matching these patterns corrupt the CUDA context or system
+    # state beyond recovery — crash immediately on the first occurrence.
+    _IMMEDIATE_FATAL_PATTERNS = [
+        "cudaerrorillegaladd",
+        "cudaerrorlaunchfailure",
+        "device-side assert",
+        "unrecoverable",
+    ]
+
+    # Errors matching these patterns are serious but *might* be transient
+    # (e.g., a one-off OOM under a memory spike).  They drain the error
+    # budget faster (×5) but still allow a brief window for recovery.
+    _SEVERE_ERROR_PATTERNS = [
+        "cuda out of memory",
+        "cuda error",
+        "nccl error",
+    ]
+
+    def _classify_error(self, error_msg: str) -> str:
+        """Classify an error as 'immediate_fatal', 'severe', or 'transient'."""
         error_lower = error_msg.lower()
-        return any(p in error_lower for p in fatal_patterns)
+        for p in self._IMMEDIATE_FATAL_PATTERNS:
+            if p in error_lower:
+                return "immediate_fatal"
+        for p in self._SEVERE_ERROR_PATTERNS:
+            if p in error_lower:
+                return "severe"
+        return "transient"
+
+    def _is_fatal_error(self, error_msg: str) -> bool:
+        """Check if an error message indicates an unrecoverable error."""
+        return self._classify_error(error_msg) == "immediate_fatal"
+
+    def _consume_error_budget(self, error_msg: str) -> bool:
+        """Consume error budget and return True if the budget is exhausted.
+
+        Uses a token-bucket scheme: the budget (starting at 1.0) recovers
+        at ``_error_budget_recovery_rate`` per second of *error-free* wall
+        time, and each error costs ``_error_budget_cost`` (transient) or
+        ``5 * _error_budget_cost`` (severe).  Immediate-fatal errors
+        bypass the budget entirely.
+        """
+        import time
+        now = time.monotonic()
+
+        classification = self._classify_error(error_msg)
+
+        if classification == "immediate_fatal":
+            return True
+
+        # Replenish budget based on elapsed time since the last error
+        if self._last_error_time is not None:
+            elapsed = now - self._last_error_time
+            self._error_budget = min(
+                1.0,
+                self._error_budget + elapsed * self._error_budget_recovery_rate)
+        self._last_error_time = now
+
+        cost = self._error_budget_cost
+        if classification == "severe":
+            cost *= 5
+
+        self._error_budget -= cost
+        if self._error_budget < 1e-9:
+            logger.error(
+                f"Error budget exhausted (budget={self._error_budget:.3f}), "
+                "treating as fatal")
+            return True
+
+        return False
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
@@ -3388,21 +3446,12 @@ class PyExecutor:
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
 
-        is_fatal = self._is_fatal_error(error_msg)
-
-        # Track consecutive errors to detect persistent failure loops
-        self._consecutive_error_count += 1
-        if self._consecutive_error_count >= self._max_consecutive_errors:
-            is_fatal = True
-            logger.error(
-                "Consecutive error threshold reached "
-                f"({self._consecutive_error_count}), treating as fatal")
+        is_fatal = self._consume_error_budget(error_msg)
 
         if is_fatal:
             self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
             logger.error(
                 f"Fatal error detected, initiating shutdown: {error_msg}")
-            # Fail ALL active requests on fatal error, not just the current batch
             requests = None
 
         failed_requests = requests if requests is not None else self.active_requests

@@ -168,12 +168,22 @@ class GenerationExecutorProxy(GenerationExecutor):
                                 self.shutdown()
                             return
 
-                # Check error queue
+                # Drain the error queue directly instead of calling
+                # _handle_background_error (which is documented for
+                # main-thread use and calls shutdown() + raise, creating
+                # re-entrancy risk on the monitor thread).
                 if not self._error_queue.empty():
                     try:
-                        self._handle_background_error()
+                        e = self._error_queue.get_nowait()
+                        self._error_queue.task_done()
+                        self._set_fatal_error(e)
+                        logger.error(
+                            "Error monitor: background error detected: "
+                            f"{repr(e)}")
+                        if not self.doing_shutdown:
+                            self.shutdown()
                     except Exception:
-                        pass  # shutdown already triggered inside
+                        pass
                     if self._fatal_error is not None:
                         return
             except Exception:
@@ -381,8 +391,9 @@ class GenerationExecutorProxy(GenerationExecutor):
                 pass
 
         # step2: notify the background threads to quit
-        if hasattr(self, '_error_monitor_thread'
-                   ) and self._error_monitor_thread.is_alive():
+        if (hasattr(self, '_error_monitor_thread')
+                and self._error_monitor_thread.is_alive() and
+                threading.current_thread() is not self._error_monitor_thread):
             self._error_monitor_thread.join(timeout=5)
 
         if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(

@@ -41,35 +41,65 @@ import pytest
 class MockPyExecutorForFatalError:
     """Minimal mock of PyExecutor with fatal error detection logic."""
 
+    _IMMEDIATE_FATAL_PATTERNS = [
+        "cudaerrorillegaladd",
+        "cudaerrorlaunchfailure",
+        "device-side assert",
+        "unrecoverable",
+    ]
+
+    _SEVERE_ERROR_PATTERNS = [
+        "cuda out of memory",
+        "cuda error",
+        "nccl error",
+    ]
+
     def __init__(self):
         self._fatal_error = None
-        self._consecutive_error_count = 0
-        self._max_consecutive_errors = 10
+        self._error_budget: float = 1.0
+        self._last_error_time = None
+        self._error_budget_recovery_rate: float = 0.1
+        self._error_budget_cost: float = 0.1
         self.active_requests = []
         self.executor_request_queue = Mock()
         self._enqueue_responses = Mock()
 
-    def _is_fatal_error(self, error_msg: str) -> bool:
-        fatal_patterns = [
-            "cuda out of memory",
-            "cuda error",
-            "cudaerrorillegaladd",
-            "cudaerrorlaunchfailure",
-            "nccl error",
-            "device-side assert",
-            "unrecoverable",
-        ]
+    def _classify_error(self, error_msg: str) -> str:
         error_lower = error_msg.lower()
-        return any(p in error_lower for p in fatal_patterns)
+        for p in self._IMMEDIATE_FATAL_PATTERNS:
+            if p in error_lower:
+                return "immediate_fatal"
+        for p in self._SEVERE_ERROR_PATTERNS:
+            if p in error_lower:
+                return "severe"
+        return "transient"
+
+    def _is_fatal_error(self, error_msg: str) -> bool:
+        return self._classify_error(error_msg) == "immediate_fatal"
+
+    def _consume_error_budget(self, error_msg: str) -> bool:
+        import time
+
+        now = time.monotonic()
+        classification = self._classify_error(error_msg)
+        if classification == "immediate_fatal":
+            return True
+        if self._last_error_time is not None:
+            elapsed = now - self._last_error_time
+            self._error_budget = min(
+                1.0, self._error_budget + elapsed * self._error_budget_recovery_rate
+            )
+        self._last_error_time = now
+        cost = self._error_budget_cost
+        if classification == "severe":
+            cost *= 5
+        self._error_budget -= cost
+        return self._error_budget < 1e-9
 
     def _handle_errors(self, error_msg=None, *, requests=None):
         error_msg = error_msg or "error"
 
-        is_fatal = self._is_fatal_error(error_msg)
-
-        self._consecutive_error_count += 1
-        if self._consecutive_error_count >= self._max_consecutive_errors:
-            is_fatal = True
+        is_fatal = self._consume_error_budget(error_msg)
 
         if is_fatal:
             self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
@@ -88,7 +118,7 @@ class MockPyExecutorForFatalError:
             self.executor_request_queue.enqueue_shutdown_request()
 
 
-class TestIsFatalError:
+class TestClassifyError:
     @pytest.fixture
     def executor(self):
         return MockPyExecutorForFatalError()
@@ -96,17 +126,27 @@ class TestIsFatalError:
     @pytest.mark.parametrize(
         "error_msg",
         [
-            "CUDA out of memory. Tried to allocate 2.00 GiB",
-            "RuntimeError: CUDA error: an illegal memory access was encountered",
             "cudaErrorIllegalAddress: an illegal memory access",
             "cudaErrorLaunchFailure: unspecified launch failure",
-            "NCCL error: unhandled system error",
             "RuntimeError: device-side assert triggered",
             "Unrecoverable error in the engine",
         ],
     )
-    def test_fatal_errors_detected(self, executor, error_msg):
+    def test_immediate_fatal_errors(self, executor, error_msg):
+        assert executor._classify_error(error_msg) == "immediate_fatal"
         assert executor._is_fatal_error(error_msg) is True
+
+    @pytest.mark.parametrize(
+        "error_msg",
+        [
+            "CUDA out of memory. Tried to allocate 2.00 GiB",
+            "RuntimeError: CUDA error: an illegal memory access was encountered",
+            "NCCL error: unhandled system error",
+        ],
+    )
+    def test_severe_errors(self, executor, error_msg):
+        assert executor._classify_error(error_msg) == "severe"
+        assert executor._is_fatal_error(error_msg) is False
 
     @pytest.mark.parametrize(
         "error_msg",
@@ -120,13 +160,14 @@ class TestIsFatalError:
             "",
         ],
     )
-    def test_non_fatal_errors_not_flagged(self, executor, error_msg):
+    def test_transient_errors(self, executor, error_msg):
+        assert executor._classify_error(error_msg) == "transient"
         assert executor._is_fatal_error(error_msg) is False
 
     def test_case_insensitive_matching(self, executor):
-        assert executor._is_fatal_error("cuda OUT OF MEMORY") is True
-        assert executor._is_fatal_error("Nccl Error: timeout") is True
-        assert executor._is_fatal_error("DEVICE-SIDE ASSERT triggered") is True
+        assert executor._classify_error("DEVICE-SIDE ASSERT triggered") == "immediate_fatal"
+        assert executor._classify_error("Nccl Error: timeout") == "severe"
+        assert executor._classify_error("cuda OUT OF MEMORY") == "severe"
 
 
 # ---------------------------------------------------------------------------
@@ -156,50 +197,70 @@ class TestHandleErrors:
         assert req1 not in executor.active_requests
         executor.executor_request_queue.enqueue_shutdown_request.assert_not_called()
 
-    def test_fatal_error_fails_all_active_requests(self, executor):
+    def test_immediate_fatal_error_fails_all_active_requests(self, executor):
         req1 = self._make_request(1)
         req2 = self._make_request(2)
         req3 = self._make_request(3)
         executor.active_requests = [req1, req2, req3]
 
-        executor._handle_errors("CUDA out of memory", requests=[req1])
+        executor._handle_errors("cudaErrorIllegalAddress", requests=[req1])
 
         assert executor._fatal_error is not None
-        assert "CUDA out of memory" in str(executor._fatal_error)
         assert len(executor.active_requests) == 0
         executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
 
-    def test_consecutive_error_threshold_triggers_fatal(self, executor):
-        executor._max_consecutive_errors = 3
-        req = self._make_request(1)
-
+    def test_severe_errors_exhaust_budget(self, executor):
+        """Severe errors (CUDA OOM) cost 5x and exhaust budget quickly."""
+        # Disable recovery so elapsed time doesn't interfere
+        executor._error_budget_recovery_rate = 0.0
+        # budget=1.0, severe cost=0.5 each → 2 severe errors exhaust it
         for i in range(2):
+            executor.active_requests = [self._make_request(i + 10)]
+            executor._handle_errors("CUDA out of memory", requests=executor.active_requests[:])
+
+        assert executor._fatal_error is not None
+        executor.executor_request_queue.enqueue_shutdown_request.assert_called()
+
+    def test_transient_errors_exhaust_budget_slowly(self, executor):
+        """Transient errors cost 0.25 each — need 4 to exhaust budget=1.0."""
+        executor._error_budget_recovery_rate = 0.0
+        executor._error_budget_cost = 0.25
+        for i in range(3):
             executor.active_requests = [self._make_request(i + 10)]
             executor._handle_errors("some transient error", requests=executor.active_requests[:])
             assert executor._fatal_error is None
 
-        executor.active_requests = [req]
-        executor._handle_errors("some transient error", requests=[req])
-
+        executor.active_requests = [self._make_request(99)]
+        executor._handle_errors("some transient error", requests=[self._make_request(99)])
         assert executor._fatal_error is not None
-        assert executor._consecutive_error_count == 3
-        executor.executor_request_queue.enqueue_shutdown_request.assert_called()
 
-    def test_consecutive_error_count_resets_concept(self, executor):
-        """Verify the counter can be manually reset (as done in the main loop)."""
-        executor._handle_errors("some error", requests=[self._make_request(1)])
-        assert executor._consecutive_error_count == 1
+    def test_budget_recovers_over_time(self, executor):
+        """After time passes, the budget replenishes and errors are tolerated."""
+        import time
 
-        executor._consecutive_error_count = 0
+        executor._handle_errors("some transient error", requests=[self._make_request(1)])
+        assert executor._error_budget < 1.0
+        budget_after_first = executor._error_budget
+
+        # Simulate 5 seconds passing (recovery = 0.1/s × 5s = 0.5)
+        executor._last_error_time = time.monotonic() - 5.0
 
         executor.active_requests = [self._make_request(2)]
-        executor._handle_errors("some error", requests=[self._make_request(2)])
-        assert executor._consecutive_error_count == 1
+        executor._handle_errors("some transient error", requests=[self._make_request(2)])
+        # Budget should have recovered before the second deduction
         assert executor._fatal_error is None
+        assert executor._error_budget > budget_after_first - 0.1
+
+    def test_immediate_fatal_bypasses_budget(self, executor):
+        """Immediate-fatal errors crash regardless of remaining budget."""
+        assert executor._error_budget == 1.0
+        executor.active_requests = []
+        executor._handle_errors("device-side assert triggered")
+        assert executor._fatal_error is not None
 
     def test_fatal_error_with_no_active_requests(self, executor):
         executor.active_requests = []
-        executor._handle_errors("CUDA error: illegal address")
+        executor._handle_errors("cudaErrorLaunchFailure: failure")
 
         assert executor._fatal_error is not None
         executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
@@ -207,8 +268,6 @@ class TestHandleErrors:
     def test_default_error_message(self, executor):
         executor.active_requests = []
         executor._handle_errors()
-
-        assert executor._consecutive_error_count == 1
         assert executor._fatal_error is None
 
 
@@ -357,7 +416,11 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                             return
                 if not self._error_queue.empty():
                     try:
-                        self._handle_background_error()
+                        e = self._error_queue.get_nowait()
+                        self._error_queue.task_done()
+                        self._set_fatal_error(e)
+                        if not self.doing_shutdown:
+                            self.shutdown()
                     except Exception:
                         pass
                     if self._fatal_error is not None:
