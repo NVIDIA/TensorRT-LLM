@@ -148,6 +148,7 @@ def _safe_request_get(url: str,
             break
         redirect_url = resp.headers.get("Location", "")
         _validate_url(redirect_url)
+        resp.close()
         resp = requests.get(
             redirect_url,
             stream=stream,
