@@ -70,6 +70,38 @@ class DynamicTreeOpsConverter:
             max_batch_size, max_path_len, dtype=torch.int64, device=device
         )
 
+        # Pre-allocated output buffers for verify_dynamic_tree_rejection_out
+        self._rej_accept_index_buf = torch.zeros(
+            max_batch_size, max_path_len, dtype=torch.int64, device=device
+        )
+        self._rej_accept_token_num_buf = torch.zeros(
+            max_batch_size, dtype=torch.int64, device=device
+        )
+        self._rej_accept_token_buf = torch.zeros(
+            max_batch_size, max_path_len, dtype=torch.int64, device=device
+        )
+        self._rej_seed_buf = torch.zeros(1, dtype=torch.int64, device=device)
+        self._rej_offset_buf = torch.zeros(1, dtype=torch.int64, device=device)
+
+    def _get_rejection_rng_tensor(
+        self,
+        value: int | torch.Tensor,
+        buffer: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        if isinstance(value, int):
+            buffer.fill_(value)
+            return buffer
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be an int or torch.Tensor, got {type(value)!r}")
+        if value.dtype != torch.int64:
+            raise TypeError(f"{name} must be int64 tensor, got {value.dtype}")
+        if value.numel() < 1:
+            raise ValueError(f"{name} tensor must have at least one element")
+        if value.device != buffer.device:
+            raise ValueError(f"{name} tensor must be on device {buffer.device}, got {value.device}")
+        return value.reshape(-1)[:1]
+
     def build_dynamic_tree(
         self,
         history_draft_tokens_parent_buffer: torch.Tensor,
@@ -196,3 +228,78 @@ class DynamicTreeOpsConverter:
             ) from e
 
         return predicts, accept_index, accept_token_num, accept_token
+
+    def verify_dynamic_tree_rejection_out(
+        self,
+        candidates: torch.Tensor,
+        draft_probs_tree: torch.Tensor,
+        target_probs_tree: torch.Tensor,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        num_gens: int,
+        num_spec_step: int,
+        seed: int | torch.Tensor = 0,
+        offset: int | torch.Tensor = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tree-aware rejection sampling for speculative decoding (CUDA kernel).
+
+        Traverses the draft tree for each request, accepting or rejecting tokens
+        at each node using rejection sampling. At each depth, siblings are tried
+        in order; the first accepted sibling continues the path. If all siblings
+        are rejected, a correction token is sampled from (target - draft)_+.
+
+        This method does NOT require a prior greedy verification pass.
+
+        Args:
+            candidates: [num_gens, N] int64 — col 0 = root (target's prediction),
+                cols 1..N-1 = draft tokens at each tree position.
+            draft_probs_tree: [num_gens, N-1, vocab] float32 — draft prob distribution
+                for each draft node (index 0 = tree position 1, i.e. candidates[:, 1]).
+            target_probs_tree: [num_gens, N, vocab] float32 — target prob distribution
+                at each tree position (index 0 = root position).
+            retrieve_next_token: [num_gens, N] int32 — first child position (-1 = none).
+            retrieve_next_sibling: [num_gens, N] int32 — next sibling position (-1 = none).
+            num_gens: Number of generation requests.
+            num_spec_step: max_path_len (= max_draft_len + 1).
+            seed: Philox RNG seed for reproducibility.
+            offset: Philox RNG offset (increment between calls).
+
+        Returns:
+            Tuple of (None, accept_index, accept_token_num, accept_token) matching
+            the interface of verify_dynamic_tree_greedy_out, where:
+              accept_index[req, d]     = tree position of the d-th accepted draft token
+                                        with slot 0 reserved for the root position
+              accept_token_num[req]    = number of accepted draft tokens
+                                        (+1 in caller for total emitted tokens)
+              accept_token[req, 0..D] = emitted token sequence:
+                                        accepted draft tokens followed by the
+                                        final bonus/correction token
+        """
+        accept_index = self._rej_accept_index_buf[:num_gens]
+        accept_token = self._rej_accept_token_buf[:num_gens]
+        accept_tok_num = self._rej_accept_token_num_buf[:num_gens]
+        seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
+        offset_tensor = self._get_rejection_rng_tensor(offset, self._rej_offset_buf, "offset")
+
+        try:
+            torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
+                candidates,
+                draft_probs_tree,
+                target_probs_tree,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                accept_index,
+                accept_tok_num,
+                accept_token,
+                num_spec_step,
+                seed_tensor,
+                offset_tensor,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"verify_dynamic_tree_rejection_out_op failed: {e}\n"
+                f"Inputs: num_gens={num_gens}, N={candidates.shape[1]}, "
+                f"vocab={target_probs_tree.shape[-1]}, num_spec_step={num_spec_step}"
+            ) from e
+
+        return None, accept_index, accept_tok_num, accept_token

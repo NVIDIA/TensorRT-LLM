@@ -14,7 +14,7 @@
 # limitations under the License.
 """Eagle3 one-model dynamic tree speculative decoding."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -279,6 +279,19 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         sm = get_sm_version()
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
+        # Rejection sampling buffers
+        # Per-depth draft logits: flat tensor [max_draft_len * max_batch_size * K, vocab_size]
+        # Lazily allocated on first use when use_rejection_sampling=True.
+        # Layout: depth d, logit row r → flat index = d * max_batch_size * K + r
+        #   depth 0: r = req (one row per request)
+        #   depth d>0: r = req * K + parent_k (K rows per request)
+        self._draft_depth_logits_cat: Optional[torch.Tensor] = None
+        # topk_score_indices from resampling_final_draft_tokens for path tracing
+        # Shape: [max_batch_size, max_total_draft_tokens]
+        self._topk_score_indices_buf = torch.zeros(
+            max_batch_size, self.max_total_draft_tokens, dtype=torch.int64, device="cuda"
+        )
+
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
         """XQA indexes mask flat via cuQSeqLens; padded [n_req, buf_dim, maskW] has
         batch stride buf_dim*maskW, so when n_tok < buf_dim and n_req > 1 packed
@@ -520,6 +533,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     ):
         """Dynamic tree draft loop with growing context."""
         spec_tree_manager = self.spec_tree_manager
+        self._d2t = getattr(draft_model.model, "d2t", None)
 
         assert batch_size <= self._max_batch_size, (
             f"batch_size {batch_size} exceeds pre-allocated max_batch_size {self._max_batch_size}"
@@ -572,6 +586,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             logits = draft_model.logits_processor(
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
             )
+
+            # Capture depth-0 draft logits for rejection sampling.
+            # logits has shape [batch_size, vocab_size] with context rows first.
+            # The buffer at depth 0 is indexed by gen-request index (0..num_gens-1),
+            # so only copy the gen-request rows (logits[num_contexts:]).
+            if spec_metadata.use_rejection_sampling and num_gens > 0:
+                self._lazy_alloc_draft_logits_buf(logits.shape[-1], logits.dtype, logits.device)
+                self._draft_depth_logits_cat[:num_gens].copy_(logits[num_contexts:])
 
             new_draft_tokens, new_draft_scores = self.sample(
                 logits, self.K, draft_model=draft_model
@@ -639,6 +661,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     selected_hs, draft_model.lm_head, attn_metadata, True
                 )
 
+                # Capture depth-layer_idx draft logits for rejection sampling.
+                # logits has shape [batch_size * K, vocab_size] with context rows first.
+                # The buffer at depth > 0 is indexed as req * K + parent_k for gen requests
+                # (req = 0..num_gens-1), so only copy the gen-request K rows
+                # (logits[num_contexts*K:]).
+                if spec_metadata.use_rejection_sampling and num_gens > 0:
+                    row_start = layer_idx * self._max_batch_size * self.K
+                    self._draft_depth_logits_cat[row_start : row_start + num_gens * self.K].copy_(
+                        logits[num_contexts * self.K :]
+                    )
+
                 new_draft_tokens, new_draft_scores = self.sample(
                     logits, self.K, draft_model=draft_model
                 )
@@ -667,6 +700,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Resample final tokens and build tree
         real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
+
+        # Save topk_score_indices for rejection sampling path tracing.
+        # Rejection sampling needs to map each final draft token back to its history
+        # buffer index to retrieve the corresponding draft logits. Greedy verification
+        # doesn't need this mapping since it only compares token IDs.
+        if spec_metadata.use_rejection_sampling:
+            self._topk_score_indices_buf[:batch_size].copy_(topk_score_indices)
 
         if spec_tree_manager is not None:
             # Gen-only; spec-dec batch is [:num_gens] (not num_contexts-offset).
@@ -735,6 +775,91 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ]
             tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
 
+            if self._can_use_rejection_sampling(spec_metadata):
+                # Rejection sampling path: compute draft/target probs for ALL tree
+                # nodes, then do tree-aware rejection sampling in a single operator.
+                from .one_model_sampler import compute_probs_from_logits
+
+                vocab_size = logits.shape[-1]
+                num_ctx_tokens = logits.shape[0] - num_gens * N
+                device = logits.device
+                max_draft_len = self.max_draft_len
+
+                # 1) Draft probs for all N-1 tree draft positions
+                draft_probs_tree = self._compute_all_draft_probs(
+                    num_gens, num_contexts, vocab_size, spec_metadata
+                )  # [num_gens, max_total_draft_tokens, vocab_size]
+
+                # 2) Target probs for all N positions (root + N-1 draft).
+                # Slice [num_contexts:batch_size] to select only gen-request params.
+                gen_logits = logits[num_ctx_tokens:].reshape(-1, vocab_size).float()
+                gen_slice = slice(num_contexts, num_contexts + num_gens)
+                if spec_metadata.temperatures is not None:
+                    temps = spec_metadata.temperatures[gen_slice].repeat_interleave(N)
+                    top_ks = (
+                        spec_metadata.top_ks[gen_slice].repeat_interleave(N)
+                        if spec_metadata.top_ks is not None
+                        else None
+                    )
+                    top_ps = (
+                        spec_metadata.top_ps[gen_slice].repeat_interleave(N)
+                        if spec_metadata.top_ps is not None
+                        else None
+                    )
+                else:
+                    temps = torch.ones(num_gens * N, dtype=torch.float32, device=device)
+                    top_ks = None
+                    top_ps = None
+                target_probs_tree = compute_probs_from_logits(
+                    gen_logits, temps, top_ks, top_ps
+                ).reshape(num_gens, N, vocab_size)
+
+                # 3) Tree rejection sampling operator
+                # Lazily initialize seed/offset tensors on correct device
+                if self.seed is None:
+                    self.seed = torch.tensor([0], dtype=torch.int64, device=device)
+                    self.offset = torch.tensor([0], dtype=torch.int64, device=device)
+                # Use in-place operations for CUDA graph compatibility
+                self.seed.add_(1).remainder_(2**31)
+                _, accept_index, accept_token_num, accept_token = (
+                    self.tree_ops_converter.verify_dynamic_tree_rejection_out(
+                        candidates,
+                        draft_probs_tree,
+                        target_probs_tree,
+                        spec_tree_manager.retrieve_next_token[:num_gens],
+                        spec_tree_manager.retrieve_next_sibling[:num_gens],
+                        num_gens,
+                        self._max_path_len,
+                        seed=self.seed,
+                        offset=self.offset,
+                    )
+                )
+
+                # 4) Write output buffers
+                rej_num_accepted = (accept_token_num[:num_gens] + 1).to(torch.int32)
+                rej_num_accepted = self._apply_force_accepted_tokens(
+                    rej_num_accepted, 0, max_draft_len
+                )
+                num_accepted_tokens[num_contexts:batch_size] = rej_num_accepted
+                accepted_tokens[num_contexts:batch_size] = accept_token[:num_gens].to(torch.int32)
+                self._accept_token[:num_gens] = accept_token[:num_gens]
+
+                d_prime = (rej_num_accepted - 1).long()
+                depth_range = torch.arange(max_draft_len, device=device).unsqueeze(0)
+                keep_mask = depth_range < d_prime.unsqueeze(1)
+                # accept_index has shape [num_gens, _max_path_len]. The slice
+                # 1:max_path_len produces max_draft_len columns, which must match
+                # keep_mask's second dimension. Verify the invariant explicitly.
+                assert max_path_len == max_draft_len + 1, (
+                    f"_max_path_len ({max_path_len}) must equal max_draft_len + 1 "
+                    f"({max_draft_len + 1}); accept_index column count would be wrong"
+                )
+                tree_positions = (accept_index[:num_gens, 1:max_path_len] - 1).to(torch.int32)
+                self._accepted_draft_indices_tensor[num_contexts:batch_size] = torch.where(
+                    keep_mask, tree_positions, torch.full_like(tree_positions, -1)
+                )
+                return accepted_tokens, num_accepted_tokens
+
             _, accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_greedy_out(
                     candidates,
@@ -762,6 +887,121 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         return accepted_tokens, num_accepted_tokens
+
+    def _can_use_rejection_sampling(self, spec_metadata) -> bool:
+        """Check if rejection sampling can be used for dynamic tree verification.
+
+        Dynamic tree uses a per-depth logit capture buffer (_draft_depth_logits_cat)
+        instead of spec_metadata.draft_probs, so we check that buffer's allocation
+        status rather than draft_probs_valid. The buffer is lazily allocated and
+        populated during the first forward pass with generation requests (see
+        _forward_draft_loop around line 558-559).
+
+        Args:
+            spec_metadata: Speculative decoding metadata
+
+        Returns:
+            True if rejection sampling is enabled and the draft logit buffer is allocated
+        """
+        return spec_metadata.use_rejection_sampling and self._draft_depth_logits_cat is not None
+
+    def _lazy_alloc_draft_logits_buf(self, vocab_size: int, dtype, device):
+        """Lazily allocate per-depth draft logit capture buffer."""
+        if self._draft_depth_logits_cat is None:
+            rows = self.max_draft_len * self._max_batch_size * self.K
+            self._draft_depth_logits_cat = torch.empty(rows, vocab_size, dtype=dtype, device=device)
+
+    def _compute_all_draft_probs(
+        self,
+        num_gens: int,
+        num_contexts: int,
+        vocab_size: int,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Compute draft probabilities for all tree nodes.
+
+        Uses _draft_depth_logits_cat (populated during _forward_draft_loop) to
+        compute draft prob distributions for every draft position in the tree,
+        applies temperature/top_k/top_p, and expands to target vocab size via d2t.
+
+        Args:
+            num_gens: Number of generation requests.
+            num_contexts: Number of context (prefill) requests in the batch.
+            vocab_size: Target vocabulary size.
+            spec_metadata: Spec decoding metadata (sampling params).
+
+        Returns:
+            draft_probs: [num_gens, max_total_draft_tokens, vocab_size] float32
+        """
+        from .one_model_sampler import compute_probs_from_logits
+
+        K = self.K
+        N = self.max_total_draft_tokens
+        max_bs = self._max_batch_size
+        device = self._topk_score_indices_buf.device
+
+        # topk_score_indices[req, i] → history index for the i-th final draft token
+        all_hist_idx = self._topk_score_indices_buf[:num_gens]  # [num_gens, N]
+
+        # History index → depth d and logit row within that depth:
+        #   hist_idx < K         → depth 0,  logit_row = req
+        #   hist_idx >= K        → depth d = 1 + (hist_idx - K) // K²
+        #                          parent_k = ((hist_idx - K) % K²) // K
+        #                          logit_row = req * K + parent_k
+        is_depth0 = all_hist_idx < K
+        relative = (all_hist_idx - K).clamp(min=0)
+        layer = 1 + relative // (K * K)
+        parent_k = (relative % (K * K)) // K
+
+        req_ids = torch.arange(num_gens, device=device).unsqueeze(1).expand(-1, N)
+        logit_row = torch.where(is_depth0, req_ids, req_ids * K + parent_k)
+
+        # Flat index into _draft_depth_logits_cat: depth d, row r → d * max_bs * K + r
+        flat_row = layer * max_bs * K + logit_row  # [num_gens, N]
+
+        path_logits = self._draft_depth_logits_cat[
+            flat_row.reshape(-1)
+        ].float()  # [num_gens*N, vocab]
+
+        # Per-request sampling params, broadcast over N draft positions per request.
+        # Slice [num_contexts : num_contexts+num_gens] to skip context requests.
+        num_tokens = num_gens * N
+        gen_slice = slice(num_contexts, num_contexts + num_gens)
+        if spec_metadata.temperatures is not None:
+            temps = spec_metadata.temperatures[gen_slice].repeat_interleave(N)
+            top_ks = (
+                spec_metadata.top_ks[gen_slice].repeat_interleave(N)
+                if spec_metadata.top_ks is not None
+                else None
+            )
+            top_ps = (
+                spec_metadata.top_ps[gen_slice].repeat_interleave(N)
+                if spec_metadata.top_ps is not None
+                else None
+            )
+        else:
+            temps = torch.ones(num_tokens, dtype=torch.float32, device=device)
+            top_ks = None
+            top_ps = None
+
+        draft_probs = compute_probs_from_logits(path_logits, temps, top_ks, top_ps)
+        draft_vocab_size = self._draft_depth_logits_cat.shape[-1]
+        draft_probs = draft_probs.reshape(num_gens, N, draft_vocab_size)
+
+        # Expand to target vocab size if there is a mismatch (using d2t scatter mapping)
+        if draft_vocab_size != vocab_size:
+            assert draft_vocab_size < vocab_size
+            full = torch.zeros((num_gens, N, vocab_size), dtype=torch.float32, device=device)
+            d2t = self._d2t
+            if d2t is not None:
+                src_idx = torch.arange(draft_vocab_size, device=device)
+                tgt_idx = src_idx + d2t[:draft_vocab_size].long()
+                full.scatter_(2, tgt_idx.expand(num_gens, N, -1), draft_probs)
+            else:
+                full[:, :, :draft_vocab_size] = draft_probs
+            draft_probs = full
+
+        return draft_probs  # [num_gens, N, vocab_size]
 
     @nvtx_range("eagle3_dyn.sample")
     def sample(
