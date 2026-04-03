@@ -285,8 +285,12 @@ public:
 
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
+        bool isLlama70bFp4Tp4 = options.mHeadDimQk == 128 && options.mHeadDimV == 128
+            && options.mDtypeKv == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
+
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
-            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64;
+            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4;
+
         if (shouldUseNvrtc)
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
