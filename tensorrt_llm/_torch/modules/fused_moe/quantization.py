@@ -3583,6 +3583,44 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             self._shuffle_and_interleave_w2_weight_scale(
                 module.w2_weight_scale.data[expert_idx])
 
+        # Compute fc31_scale_c now that global input_scale and alphas are finalized.
+        from ...utils import ActivationType
+        if hasattr(module, 'activation_type') and module.activation_type in [
+                ActivationType.Relu2, ActivationType.Silu
+        ]:
+            module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
+                module.expert_size_per_partition),
+                                           non_blocking=True)
+        else:
+            module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
+                                           module.fc31_alpha.data,
+                                           non_blocking=True)
+
+        # Finalize shared weight alphas and fc31_scale_c
+        if hasattr(module, 'tmp_trtllmgen_shared_weight_scale_2'):
+            num_shared = len(module.tmp_trtllmgen_shared_weight_scale_2)
+            local_shared_fc31_alpha = torch.empty(
+                (num_shared, ) + module.fc31_alpha.data.shape[1:],
+                dtype=module.fc31_alpha.data.dtype,
+                device='cpu')
+            local_shared_fc2_alpha = torch.empty(
+                (num_shared, ) + module.fc2_alpha.data.shape[1:],
+                dtype=module.fc2_alpha.data.dtype,
+                device='cpu')
+            self._reconcile_and_compute_alphas(
+                module, module.tmp_trtllmgen_shared_weight_scale_2,
+                local_shared_fc31_alpha, local_shared_fc2_alpha)
+
+            local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+            ) * local_shared_fc31_alpha
+
+            module.register_all_parameter_slot_and_to_fix_weight_fns({
+                'fc31_scale_c':
+                local_shared_fc31_scale_c,
+            })
+
+            delattr(module, 'tmp_trtllmgen_shared_weight_scale_2')
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Check if quant scale keys are present; skip if not (e.g., during partial weight loading)
         if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
