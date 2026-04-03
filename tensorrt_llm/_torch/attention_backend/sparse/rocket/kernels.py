@@ -748,7 +748,6 @@ def triton_rocket_paged_kt_cache_bmm(
         output: BMM results [num_kv_heads, num_heads_per_kv, total_kt_tokens]
     """
     num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim = q.shape
-    num_kv_heads * num_heads_per_kv
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)

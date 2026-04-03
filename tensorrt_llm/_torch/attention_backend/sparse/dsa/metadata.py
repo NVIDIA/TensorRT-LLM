@@ -752,5 +752,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.on_update_kv_lens()
 
 
-# Alias for backward compatibility
+# Alias for backward compatibility (old all-caps "DSA" prefix).
+# TODO: Remove once all downstream references have migrated to DSAtrtllmAttentionMetadata.
 DSATrtllmAttentionMetadata = DSAtrtllmAttentionMetadata

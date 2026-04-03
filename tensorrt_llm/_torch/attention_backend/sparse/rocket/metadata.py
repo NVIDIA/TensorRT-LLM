@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 from triton import next_power_of_2
@@ -10,9 +10,6 @@ from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttentionMetada
 from tensorrt_llm._utils import prefer_pinned
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
-
-if TYPE_CHECKING:
-    pass
 
 
 class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):

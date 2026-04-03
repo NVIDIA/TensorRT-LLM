@@ -1939,8 +1939,11 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Sparse attention context dispatch (e.g. DSA)
-        if hasattr(self.mqa, 'forward_sparse_context') and kwargs:
+        # Sparse attention context dispatch (e.g. DSA).
+        # Check for sparse_intermediates keys (e.g. q_fp8) rather than
+        # bare kwargs truthiness to avoid accidental dispatch.
+        if hasattr(self.mqa, 'forward_sparse_context') and any(
+                v is not None for v in kwargs.values()):
             return self.mqa.forward_sparse_context(self, q, compressed_kv, k_pe,
                                                    attn_metadata, output,
                                                    latent_cache, position_ids,
@@ -1981,8 +1984,11 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Sparse attention generation dispatch (e.g. DSA)
-        if hasattr(self.mqa, 'forward_sparse_generation') and kwargs:
+        # Sparse attention generation dispatch (e.g. DSA).
+        # Check for sparse_intermediates keys (e.g. q_fp8) rather than
+        # bare kwargs truthiness to avoid accidental dispatch.
+        if hasattr(self.mqa, 'forward_sparse_generation') and any(
+                v is not None for v in kwargs.values()):
             return self.mqa.forward_sparse_generation(self, q, compressed_kv,
                                                       k_pe, attn_metadata,
                                                       output, latent_cache,

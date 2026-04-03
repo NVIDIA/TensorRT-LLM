@@ -675,9 +675,6 @@ class Indexer(nn.Module):
             head_dim = kv_cache_manager.index_head_dim
             quant_block_size = kv_cache_manager.quant_block_size
             cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-            scale_size = head_dim // quant_block_size * 4
-            tokens_per_block * (head_dim + scale_size)
-            tokens_per_block * head_dim
             start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
             total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
@@ -800,10 +797,12 @@ class Indexer(nn.Module):
         # When phase is specified, only run that phase.
         # token_offset adjusts buffer indexing: in full-batch mode gen tokens
         # start at num_ctx_tokens, but in gen-only mode they start at 0.
+        # When phase is specified the caller pre-slices inputs, so offset is
+        # always 0.
         if is_generation is not None:
             has_prefill = not is_generation and num_contexts > 0
             has_decode = is_generation and num_generations > 0
-            token_offset = 0 if is_generation else 0
+            token_offset = 0
         else:
             has_prefill = num_contexts > 0
             has_decode = num_generations > 0

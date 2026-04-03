@@ -22,7 +22,7 @@ the prepare_sparse_params() interface on TrtllmAttention subclasses.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional
 
 import torch
@@ -42,14 +42,9 @@ class SparseParams:
     skip_softmax_threshold_scale_factor_decode: Optional[float] = None
 
     def as_dict(self) -> dict:
-        """Convert to dict for unpacking into wrapper.plan() kwargs."""
-        return {
-            "sparse_kv_indices": self.sparse_kv_indices,
-            "sparse_kv_offsets": self.sparse_kv_offsets,
-            "sparse_attn_indices": self.sparse_attn_indices,
-            "sparse_attn_offsets": self.sparse_attn_offsets,
-            "sparse_attn_indices_block_size": self.sparse_attn_indices_block_size,
-            "sparse_mla_topk": self.sparse_mla_topk,
-            "skip_softmax_threshold_scale_factor_prefill": self.skip_softmax_threshold_scale_factor_prefill,
-            "skip_softmax_threshold_scale_factor_decode": self.skip_softmax_threshold_scale_factor_decode,
-        }
+        """Convert to dict for unpacking into wrapper.plan() kwargs.
+
+        Uses a shallow copy to avoid deep-copying torch.Tensor fields
+        (which dataclasses.asdict would do).
+        """
+        return {f.name: getattr(self, f.name) for f in fields(self)}
