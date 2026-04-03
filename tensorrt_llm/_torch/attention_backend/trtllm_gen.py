@@ -1165,7 +1165,6 @@ class FlashInferTrtllmGenAttention:
             sinks=params.attention_sinks,
             uses_shared_paged_kv_idx=False,
             enable_pdl=get_env_enable_pdl(),
-            backend="trtllm-gen",
         )
 
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
