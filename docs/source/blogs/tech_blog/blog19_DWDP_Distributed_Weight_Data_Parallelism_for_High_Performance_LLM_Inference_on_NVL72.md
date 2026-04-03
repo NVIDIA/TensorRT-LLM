@@ -2,7 +2,7 @@
 
 By NVIDIA TensorRT LLM Team
 
-In LLM inference, workload imbalances and communication bottlenecks often lead to excessive synchronization overhead, limiting GPU utilization. We present DWDP (Distributed Weight Data Parallelism), an inference parallelization strategy that preserves data-parallel execution while offloading MoE weights across peer GPUs. By removing collective inter-rank synchronization, DWDP allows each GPU to progress independently. Implemented in TensorRT-LLM and evaluated with DeepSeek-R1 on GB200 NVL72, DWDP improves end-to-end output TPS/GPU by 8.8% at comparable TPS/user in the 20-100 TPS/user serving range under 8K input sequence length and 1K output sequence length. The DWDP implementation has been merged into TensorRT-LLM ([PR #12136](https://github.com/NVIDIA/TensorRT-LLM/pull/12136)). A more detailed technical introduction is also available on arXiv ([arXiv:2604.01621](https://arxiv.org/abs/2604.01621)).
+In LLM inference, workload imbalances and communication bottlenecks often lead to excessive synchronization overhead, limiting GPU utilization. We present DWDP (Distributed Weight Data Parallelism), an inference parallelization strategy that preserves data-parallel execution while offloading MoE weights across peer GPUs. By removing collective inter-rank synchronization, DWDP allows each GPU to progress independently. Implemented in TensorRT LLM and evaluated with DeepSeek-R1 on GB200 NVL72, DWDP improves end-to-end output TPS/GPU by 8.8% at comparable TPS/user in the 20-100 TPS/user serving range under 8K input sequence length and 1K output sequence length. The DWDP implementation has been merged into TensorRT LLM ([PR #12136](https://github.com/NVIDIA/TensorRT-LLM/pull/12136)). A more detailed technical introduction is also available on arXiv ([arXiv:2604.01621](https://arxiv.org/abs/2604.01621)).
 
 ## Table of Contents
 
@@ -94,7 +94,7 @@ In this section, we focus on the main DWDP runtime components and the runtime fl
 
 #### `DwdpConfig`
 
-The configuration surface lives in `tensorrt_llm/llmapi/llm_args.py`. DWDP is off by default. In the current productized flow, this config is used on the context server of disaggregated serving.
+The configuration surface lives in [`tensorrt_llm/llmapi/llm_args.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/llmapi/llm_args.py). DWDP is off by default. In the current productized flow, this config is used on the context server of disaggregated serving.
 
 The four fields are:
 
@@ -126,7 +126,7 @@ Each DWDP-enabled MoE layer registers a `DwdpLayerHandleCollector`. During model
 
 #### `DwdpManager`
 
-`DwdpManager`, implemented in `tensorrt_llm/_torch/pyexecutor/dwdp.py`, is the control center of the DWDP runtime. It owns the DWDP lifecycle and orchestrates when prefetch happens, while `DwdpPrefetchBuffer` provides the storage, stream, and events used by that pipeline. `DwdpManager` is responsible for:
+`DwdpManager`, implemented in [`tensorrt_llm/_torch/pyexecutor/dwdp.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/pyexecutor/dwdp.py), is the control center of the DWDP runtime. It owns the DWDP lifecycle and orchestrates when prefetch happens, while `DwdpPrefetchBuffer` provides the storage, stream, and events used by that pipeline. `DwdpManager` is responsible for:
 
 - forming the DWDP group from the global MPI world
 - creating and tracking one `DwdpLayerHandleCollector` for each DWDP-enabled MoE layer
@@ -190,12 +190,12 @@ That extra merge is expensive because it inserts another bandwidth-heavy step di
 
 To remove that overhead, we extend the cuteDSL groupedGEMM kernels to support TensorList-based inputs so the groupedGEMM kernel can consume multiple weight buffers directly. Instead of first materializing a merged expert-weight buffer, the kernel performs the required indexing and address calculation internally while remaining compatible with the existing layout and sharding scheme. Although this design introduces a small amount of additional instruction overhead, including extra address computations and descriptor loads, profiling and end-to-end evaluation show no meaningful performance regression. In practice, the dominant bottlenecks remain the main compute workload and memory traffic, indicating that the proposed approach effectively removes pre-merge D2D overhead without negatively affecting overall performance.
 
-The relevant code changes are in:
+The relevant code changes in [PR #12136](https://github.com/NVIDIA/TensorRT-LLM/pull/12136) are in:
 
-- `tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py`
-- `tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py`
-- `tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py`
-- `tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py`
+- [`tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py)
+- [`tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py)
+- [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py)
+- [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py)
 
 ### Mitigating Asynchronous Communication Contention
 
@@ -224,7 +224,7 @@ The experiments in this section use the following setup.
 Unless otherwise stated, the results in this section do not include the additional performance gain from the contention-mitigation optimization described above.
 
 - Hardware: GB200 NVL72
-- Commit: the DWDP implementation evaluated in this section was developed based on TensorRT-LLM commit `3a89495`
+- Commit: the DWDP implementation evaluated in this section was developed based on TensorRT LLM commit `3a89495`
 - Model: [DeepSeek-R1-0528-NVFP4-v2](https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4-v2)
 - Serving mode: disaggregated serving, with DWDP applied on the context server
 
