@@ -49,7 +49,10 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.models.hf import (
+    AutoModelForCausalLMFactory,
+    AutoModelForImageTextToTextFactory,
+)
 from tensorrt_llm._torch.utils import ActivationType
 
 # ---------------------------------------------------------------------------
@@ -793,14 +796,14 @@ class Gemma4PreTrainedModel(PreTrainedModel):
 class Gemma4Model(Gemma4PreTrainedModel):
     def __init__(self, config: Gemma4Config):
         super().__init__(config)
-        self.language_model = Gemma4TextModel(config.text_config)
+        self.language_model = Gemma4ForCausalLM(config.text_config)
         self.vision_tower = nn.Module()  # stub
         self.embed_vision = Gemma4MultimodalEmbedder(config.vision_config, config.text_config)
-        self._register_load_state_dict_pre_hook(self._drop_unsupported_weights)
+        self._register_load_state_dict_pre_hook(self._remap_and_drop_weights)
         self.post_init()
 
     @staticmethod
-    def _drop_unsupported_weights(state_dict, prefix, *_args, **_kwargs):
+    def _remap_and_drop_weights(state_dict, prefix, *_args, **_kwargs):
         unsupported_prefixes = (
             prefix + "vision_tower.",
             prefix + "audio_tower.",
@@ -824,18 +827,10 @@ class Gemma4Model(Gemma4PreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        input_features: Optional[torch.Tensor] = None,
-        input_features_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Gemma4TextOutput:
-        del kwargs, input_features_mask
+    ) -> Gemma4CausalLMOutput:
+        del kwargs
         assert position_ids is not None, "position_ids must be provided"
-        if pixel_values is not None or input_features is not None:
-            raise NotImplementedError(
-                "Gemma4 multimodal inputs are not supported by the current AutoDeploy export "
-                "path. Use text-only prompts for this onboarding."
-            )
         return self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -845,16 +840,22 @@ class Gemma4Model(Gemma4PreTrainedModel):
 
 class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
     config_class = Gemma4Config
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = ["model.language_model.lm_head.weight"]
 
     def __init__(self, config: Gemma4Config, **kwargs):
         del kwargs
         super().__init__(config)
         self.model = Gemma4Model(config)
-        self.lm_head = nn.Linear(
-            config.text_config.hidden_size, config.text_config.vocab_size, bias=False
-        )
+        self._register_load_state_dict_pre_hook(self._remap_lm_head_weight)
         self.post_init()
+
+    @staticmethod
+    def _remap_lm_head_weight(state_dict, prefix, *_args, **_kwargs):
+        """Remap lm_head into language_model so TextModelExportInfo exports it."""
+        old_key = prefix + "lm_head.weight"
+        new_key = prefix + "model.language_model.lm_head.weight"
+        if old_key in state_dict and new_key not in state_dict:
+            state_dict[new_key] = state_dict.pop(old_key)
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -863,10 +864,10 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         self.model.set_input_embeddings(value)
 
     def get_output_embeddings(self):
-        return self.lm_head
+        return self.model.language_model.lm_head
 
     def set_output_embeddings(self, value):
-        self.lm_head = value
+        self.model.language_model.lm_head = value
 
     def get_decoder(self):
         return self.model.get_decoder()
@@ -876,26 +877,17 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        input_features: Optional[torch.Tensor] = None,
-        input_features_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4ConditionalOutput:
-        outputs = self.model(
+        # Forward all kwargs (including token_type_ids from extra_args) to the
+        # exported CausalLM which includes lm_head + softcapping.
+        outputs = self.model.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            pixel_values=pixel_values,
-            input_features=input_features,
-            input_features_mask=input_features_mask,
             **kwargs,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
-        if self.config.text_config.final_logit_softcapping is not None:
-            logits = logits / self.config.text_config.final_logit_softcapping
-            logits = torch.tanh(logits)
-            logits = logits * self.config.text_config.final_logit_softcapping
-        return Gemma4ConditionalOutput(logits=logits)
+        return Gemma4ConditionalOutput(logits=outputs.logits)
 
 
 # ---------------------------------------------------------------------------
@@ -971,14 +963,50 @@ class ADGemma4Tokenizer(PreTrainedTokenizerFast):
         return tokenizer
 
 
+class Gemma4ADInputProcessor:
+    """Input processor that ensures ``token_type_ids`` is always present.
+
+    Every request (text-only or multimodal) gets a ``token_type_ids`` tensor in
+    its multimodal data.  For text-only requests this is all-zeros (standard
+    causal attention).  For multimodal requests the HF processor already
+    provides it with per-blob IDs.  This guarantees the batched
+    ``token_type_ids`` tensor in ``extra_args`` always covers the full
+    flattened batch, including mixed image + text-only batches.
+    """
+
+    def __init__(self, base):
+        self.base = base
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def __call__(self, inputs, sampling_params):
+        token_ids, extra = self.base(inputs, sampling_params)
+        if extra is None:
+            extra = {}
+        mm_data = extra.setdefault("multimodal_data", {})
+        if "token_type_ids" not in mm_data:
+            mm_data["token_type_ids"] = torch.zeros(1, len(token_ids), dtype=torch.int64)
+        return token_ids, extra
+
+
 @ModelFactoryRegistry.register("Gemma4ForConditionalGeneration")
-class Gemma4ForConditionalGenerationFactory(AutoModelForCausalLMFactory):
-    """Factory that wires the wrapper tokenizer for Gemma 4."""
+class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
+    """Factory for Gemma 4 VLM with custom attention mask support."""
 
     def init_tokenizer(self) -> Optional[Any]:
         if self.tokenizer is None:
             return None
         return ADGemma4Tokenizer.from_pretrained(self.tokenizer)
+
+    def init_processor(self) -> Optional[Any]:
+        """Return the tokenizer as the processor for ADInputProcessor."""
+        if self.tokenizer is None:
+            return None
+        return ADGemma4Tokenizer.from_pretrained(self.tokenizer)
+
+    def init_input_processor(self, base):
+        return Gemma4ADInputProcessor(base)
 
 
 # ---------------------------------------------------------------------------
