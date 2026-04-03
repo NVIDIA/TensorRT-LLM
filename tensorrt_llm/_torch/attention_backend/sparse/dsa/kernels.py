@@ -6,6 +6,7 @@ import triton.language as tl
 # Convert request-local indices to global KV cache pool indices
 ########################################################
 
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel_with_stride_factor(
     req_id_ptr,  # int32 [num_tokens]
@@ -73,16 +74,14 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
 
 
 def triton_convert_req_index_to_global_index(
-        req_id: torch.Tensor,  # int32 [num_tokens]
-        block_table: torch.
-    Tensor,  # int32 [num_requests, max_num_blocks_per_req]
-        token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-        BLOCK_SIZE: int,
-        NUM_TOPK_TOKENS: int = 2048,
-        BLOCK_N: int = 128,  # tile width along columns
-        stride_factor:
-    int = None,  # for strided memory layout (with layer interleaving), defaults to BLOCK_SIZE
-        layer_id: int = 0,  # for layer interleaving layout
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
+    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    BLOCK_SIZE: int,
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,  # tile width along columns
+    stride_factor: int = None,  # for strided memory layout (with layer interleaving), defaults to BLOCK_SIZE
+    layer_id: int = 0,  # for layer interleaving layout
 ):
     """
     Convert request-local token indices to global KV cache pool indices.
@@ -107,9 +106,9 @@ def triton_convert_req_index_to_global_index(
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by" \
-        f"BLOCK_N ({BLOCK_N})"
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible byBLOCK_N ({BLOCK_N})"
+    )
 
     num_tokens = req_id.shape[0]
     num_requests, max_num_blocks_per_req = block_table.shape
@@ -170,16 +169,11 @@ def _triton_gather_k_cache_kernel(
     BLOCK_TOKENS: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    token_offsets = (pid * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)).to(
-        tl.int64)
+    token_offsets = (pid * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)).to(tl.int64)
     token_mask = token_offsets < num_k_tokens
 
-    fp8_base = tl.load(slot_fp8_ptr + k_token_start + token_offsets,
-                       mask=token_mask,
-                       other=0)
-    scale_base = tl.load(slot_scale_ptr + k_token_start + token_offsets,
-                         mask=token_mask,
-                         other=0)
+    fp8_base = tl.load(slot_fp8_ptr + k_token_start + token_offsets, mask=token_mask, other=0)
+    scale_base = tl.load(slot_scale_ptr + k_token_start + token_offsets, mask=token_mask, other=0)
 
     byte_offsets = tl.arange(0, HEAD_DIM).to(tl.int64)
     src_fp8 = fp8_base[:, None] + byte_offsets[None, :]
@@ -191,8 +185,7 @@ def _triton_gather_k_cache_kernel(
 
     scale_byte_offsets = tl.arange(0, SCALE_BYTES).to(tl.int64)
     src_scale = scale_base[:, None] + scale_byte_offsets[None, :]
-    dst_scale = token_offsets[:,
-                              None] * SCALE_BYTES + scale_byte_offsets[None, :]
+    dst_scale = token_offsets[:, None] * SCALE_BYTES + scale_byte_offsets[None, :]
 
     scale_data = tl.load(k_cache_ptr + src_scale, mask=gather_mask, other=0)
     tl.store(out_scale_ptr + dst_scale, scale_data, mask=gather_mask)
@@ -241,16 +234,10 @@ def triton_gather_k_cache(
     BLOCK_TOKENS = 32
 
     k_cache_flat = k_cache.reshape(-1)
-    out_fp8 = torch.empty(num_k_tokens,
-                          head_dim,
-                          dtype=torch.uint8,
-                          device=device)
-    out_scale = torch.empty(num_k_tokens,
-                            SCALE_BYTES,
-                            dtype=torch.uint8,
-                            device=device)
+    out_fp8 = torch.empty(num_k_tokens, head_dim, dtype=torch.uint8, device=device)
+    out_scale = torch.empty(num_k_tokens, SCALE_BYTES, dtype=torch.uint8, device=device)
 
-    grid = (triton.cdiv(num_k_tokens, BLOCK_TOKENS), )
+    grid = (triton.cdiv(num_k_tokens, BLOCK_TOKENS),)
     _triton_gather_k_cache_kernel[grid](
         k_cache_flat,
         slot_mapping_fp8,

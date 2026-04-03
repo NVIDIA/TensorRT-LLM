@@ -1,22 +1,19 @@
 import math
 from typing import TYPE_CHECKING, List, Optional, Union
 
-import torch
-
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.bindings.internal.batch_manager import \
-    CacheType as CacheTypeCpp
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
-                                               SparseAttentionConfig)
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
+
 
 class DSACacheManager(KVCacheManager):
     """KV cache manager for DSA with additional indexer K-cache pools."""
@@ -85,7 +82,8 @@ class DSACacheManager(KVCacheManager):
         per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
-            self.num_blocks, block_size, 1, per_token_size)
+            self.num_blocks, block_size, 1, per_token_size
+        )
 
     def shutdown(self):
         # Clear Python references BEFORE C++ frees the underlying CUDA buffers
@@ -93,10 +91,9 @@ class DSACacheManager(KVCacheManager):
         super().shutdown()
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 mapping: Mapping,
-                                 num_layers: Optional[int] = None,
-                                 **kwargs):
+    def get_cache_size_per_token(
+        model_config: ModelConfig, mapping: Mapping, num_layers: Optional[int] = None, **kwargs
+    ):
         config = model_config.pretrained_config
         sparse_attn_config = model_config.sparse_attention_config
         index_head_dim = sparse_attn_config.index_head_dim
@@ -105,41 +102,45 @@ class DSACacheManager(KVCacheManager):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
             mem_per_token = 1
 
         # get head dim
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
-            model_config, mapping, num_layers)
+            model_config, mapping, num_layers
+        )
         mem_per_token *= num_attention_layers * head_dim
 
         # 1 for K, others for indexer K cache
-        head_dim_factor = (index_head_dim +
-                           index_head_dim // quant_block_size * 4) / head_dim
+        head_dim_factor = (index_head_dim + index_head_dim // quant_block_size * 4) / head_dim
         kv_factor = 1 + head_dim_factor
         mem_per_token *= kv_factor
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
         # self.kv_factor for K, others for indexer K cache
-        head_dim_factor = (self.index_head_dim + self.index_head_dim //
-                           self.quant_block_size * 4) / self.head_dim
+        head_dim_factor = (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        ) / self.head_dim
         kv_factor = self.kv_factor + head_dim_factor
         cache_size_per_token = math.ceil(
-            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
+            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim
+        )
 
-        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                              DataType.FLOAT, DataType.NVFP4):
-            raise ValueError(f'Cannot support {self.dtype} KV cache.')
+        if self.dtype not in (
+            DataType.FP8,
+            DataType.HALF,
+            DataType.BF16,
+            DataType.FLOAT,
+            DataType.NVFP4,
+        ):
+            raise ValueError(f"Cannot support {self.dtype} KV cache.")
 
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       self.dtype)
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, self.dtype)
         if self.dtype == DataType.NVFP4:
             cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
-                cache_size_per_token,
-                quant_vector_size=16,
-                scaling_factor_dtype=DataType.FP8)
+                cache_size_per_token, quant_vector_size=16, scaling_factor_dtype=DataType.FP8
+            )
         return cache_size_bytes_per_token

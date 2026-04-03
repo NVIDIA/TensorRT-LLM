@@ -88,6 +88,7 @@ class DSATrtllmAttention(TrtllmAttention):
         Called from MLA.forward() when register_to_config is True.
         """
         # Ensure custom ops are registered
+        import tensorrt_llm._torch.attention_backend.sparse.dsa.custom_ops  # noqa: F401
 
         proj_outputs = torch.ops.trtllm.mla_dsa_proj(hidden_states, position_ids, layer_idx_str)
         q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
