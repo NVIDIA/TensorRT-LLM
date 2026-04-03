@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/heuristicTopKDecode.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -32,6 +33,7 @@ namespace kernels
 {
 namespace
 {
+
 template <int step>
 static inline __device__ uint32_t extractBinIdx(float x)
 {
@@ -120,12 +122,12 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
             skip_cnt = len;
         }
         WideT const* in_cast = reinterpret_cast<decltype(in_cast)>(in + skip_cnt);
-        const idxT len_cast = (len - skip_cnt) / items_per_scalar;
+        idxT const len_cast = (len - skip_cnt) / items_per_scalar;
 
         for (idxT i = thread_rank; i < len_cast; i += num_threads)
         {
             wide.scalar = in_cast[i];
-            const idxT real_i = skip_cnt + i * items_per_scalar;
+            idxT const real_i = skip_cnt + i * items_per_scalar;
 #pragma unroll
             for (int j = 0; j < items_per_scalar; ++j)
             {
@@ -145,7 +147,7 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
         // and so
         // len - (skip_cnt + len_cast * items_per_scalar) < items_per_scalar <=
         // WARP_SIZE no need to use loop
-        const idxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
+        idxT const remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
         if (remain_i < len)
         {
             f(in[remain_i], remain_i);
@@ -665,14 +667,24 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
 
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK, cudaStream_t const stream)
+    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
+    int const preIdxCount, float* heuristicScratch, cudaStream_t const stream)
 {
 
     constexpr int kSortingAlgorithmThreshold = 12288;
-    constexpr int kSplitWorkThreshold = 200 * 1000;
+    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
     constexpr int kNumThreadsPerBlock = 512;
+    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
+    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
+        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+        && heuristicScratch != nullptr;
 
-    if (numColumns < kSortingAlgorithmThreshold)
+    if (canUseHeuristic)
+    {
+        launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
+            preIdxStride, preIdxCount, numRows, stream);
+    }
+    else if (numColumns < kSortingAlgorithmThreshold)
     {
         // Use insertion sort
         auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, false>;
@@ -691,7 +703,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         cudaLaunchKernelEx(
             &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
     }
-    else if (numColumns < kSplitWorkThreshold)
+    else if (numColumns < effectiveSplitWorkThreshold)
     {
         // From this threshold, use radix sort instead
         auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, true>;

@@ -29,6 +29,7 @@ from utils import (compare_bertcls_result, compare_bertqa_result,
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import trt_dtype_to_torch
 from tensorrt_llm.runtime import Session, TensorInfo
 
@@ -58,6 +59,7 @@ def parse_arguments():
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("run.py")
     args = parse_arguments()
 
     tensorrt_llm.logger.set_level(args.log_level)

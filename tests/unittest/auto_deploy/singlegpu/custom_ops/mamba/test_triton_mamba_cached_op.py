@@ -103,6 +103,7 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
         None,  # seq_idx_prefill
         # CACHES
         ssm_state_cache_triton,
+        None,
         # CONSTANTS
         time_step_limit,
         chunk_size,
@@ -203,6 +204,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         seq_idx_prefill,
         # CACHES
         ssm_state_cache_triton,
+        None,
         # CONSTANTS
         time_step_limit,
         chunk_size,

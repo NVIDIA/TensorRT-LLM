@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,10 +32,11 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
+from ....llmapi.llm_args import MTPDecodingConfig
 from ..utils.logger import ad_logger
 from .custom.modeling_eagle import (
-    Eagle3DrafterForCausalLM,
     EagleConfig,
+    EagleDrafterForCausalLM,
     EagleWrapper,
     EagleWrapperConfig,
 )
@@ -47,41 +48,27 @@ from .hf import AutoModelForCausalLMFactory
 class EagleDrafterFactory(AutoModelForCausalLMFactory):
     """Factory for building Eagle drafter models.
 
-    This factory handles the mapping from base model types (e.g., "llama") to
-    their corresponding Eagle drafter model implementations. It overrides
-    _build_model() to directly construct the appropriate drafter class based
-    on the checkpoint's model_type.
+    The drafter builds its own model-specific layers internally based on
+    config.model_type, allowing it to work with different base models
+    (Llama, NemotronH, etc.) without the factory needing to know the details.
 
     The checkpoint config is expected to have the base model's model_type
     (e.g., "llama") along with Eagle-specific fields like draft_vocab_size.
     """
 
-    _drafter_classes: Dict[str, type] = {
-        "llama": Eagle3DrafterForCausalLM,
-    }
-
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         model_config, unused_kwargs = self._get_model_config()
 
-        # Select the appropriate drafter class and config based on the base model type
+        # Get model type for config
         model_type = model_config.model_type
-        if model_type not in self._drafter_classes:
-            raise ValueError(
-                f"Unsupported model_type '{model_type}' for Eagle drafter. "
-                f"Supported types: {list(self._drafter_classes.keys())}"
-            )
-        drafter_cls = self._drafter_classes[model_type]
-        ad_logger.info(
-            f"EagleDrafterFactory: model_type='{model_type}' -> drafter_cls={drafter_cls.__name__}"
-        )
+        ad_logger.info(f"EagleDrafterFactory: building drafter for model_type='{model_type}'")
 
         # Convert base config to EagleConfig, preserving existing values
         # and applying model-specific defaults based on model_type
         model_config = EagleConfig(model_config, model_type)
 
-        # Build the model (same pattern as parent's _build_model)
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = drafter_cls._from_config(model_config, **unused_kwargs)
+            model = EagleDrafterForCausalLM._from_config(model_config, **unused_kwargs)
 
         if device == "meta":
             # post-init must be called explicitly for HF models with init_empty_weights
@@ -128,9 +115,6 @@ class TargetModelExportInfo(SubModuleExportInfo):
         """Preserve embedding (always) and optionally lm_head on the exported GraphModule."""
         # --- Embedding: always needed (target embeds input_ids for both target and draft) ---
         embed_tokens = sub_mod.get_input_embeddings()
-        sub_gm.get_input_embeddings = types.MethodType(
-            sub_mod.get_input_embeddings.__func__, sub_gm
-        )
         # Find the submodule path for the embedding
         for embed_name, subsubmod in sub_mod.named_modules():
             if subsubmod is embed_tokens:
@@ -138,6 +122,9 @@ class TargetModelExportInfo(SubModuleExportInfo):
         else:
             raise RuntimeError("Could not find embedding module in target model.")
         sub_gm.set_submodule(embed_name, embed_tokens)
+        sub_gm.get_input_embeddings = types.MethodType(
+            lambda self, _n=embed_name: self.get_submodule(_n), sub_gm
+        )
         # Add impure node to prevent GC
         n_embed = sub_gm.graph.get_attr(f"{embed_name}.weight")
         sub_gm.graph.call_function(
@@ -147,18 +134,35 @@ class TargetModelExportInfo(SubModuleExportInfo):
         # --- lm_head: only if draft model loads it from target ---
         if self.load_lm_head_from_target:
             lm_head = sub_mod.get_output_embeddings()
-            sub_gm.get_output_embeddings = types.MethodType(
-                sub_mod.get_output_embeddings.__func__, sub_gm
-            )
             for lm_head_name, subsubmod in sub_mod.named_modules():
                 if subsubmod is lm_head:
                     break
             else:
                 raise RuntimeError("Could not find lm_head module in target model.")
             sub_gm.set_submodule(lm_head_name, lm_head)
+            sub_gm.get_output_embeddings = types.MethodType(
+                lambda self, _n=lm_head_name: self.get_submodule(_n), sub_gm
+            )
             n_lm_head = sub_gm.graph.get_attr(f"{lm_head_name}.weight")
             sub_gm.graph.call_function(
                 torch._assert, args=(n_lm_head, "Avoid lm_head getting deleted from graph.")
+            )
+
+        # --- Final normalization: only if target model exposes it (e.g., NemotronH for MTP) ---
+        if hasattr(sub_mod, "get_final_normalization"):
+            norm_module = sub_mod.get_final_normalization()
+            for norm_name, subsubmod in sub_mod.named_modules():
+                if subsubmod is norm_module:
+                    break
+            else:
+                raise RuntimeError("Could not find final normalization module in target model.")
+            sub_gm.set_submodule(norm_name, norm_module)
+            sub_gm.get_final_normalization = types.MethodType(
+                lambda self, _n=norm_name: self.get_submodule(_n), sub_gm
+            )
+            n_norm = sub_gm.graph.get_attr(f"{norm_name}.weight")
+            sub_gm.graph.call_function(
+                torch._assert, args=(n_norm, "Avoid final norm getting deleted from graph.")
             )
 
 
@@ -189,22 +193,34 @@ class DraftModelExportInfo(SubModuleExportInfo):
 
         # --- Embedding (only if draft model has its own) ---
         if not self.load_embedding_from_target:
-            sub_gm.set_submodule("model.embed_tokens", inner_model.embed_tokens)
+            embed_tokens = sub_mod.get_input_embeddings()
+            for embed_name, subsubmod in sub_mod.named_modules():
+                if subsubmod is embed_tokens:
+                    break
+            else:
+                raise RuntimeError("Could not find embedding module in draft model.")
+            sub_gm.set_submodule(embed_name, embed_tokens)
             sub_gm.get_input_embeddings = types.MethodType(
-                sub_mod.get_input_embeddings.__func__, sub_gm
+                lambda self, _n=embed_name: self.get_submodule(_n), sub_gm
             )
-            n_embed = sub_gm.graph.get_attr("model.embed_tokens.weight")
+            n_embed = sub_gm.graph.get_attr(f"{embed_name}.weight")
             sub_gm.graph.call_function(
                 torch._assert, args=(n_embed, "Avoid draft embedding getting deleted.")
             )
 
         # --- lm_head (only if draft model has its own) ---
         if not self.load_lm_head_from_target:
-            sub_gm.set_submodule("lm_head", sub_mod.lm_head)
+            lm_head = sub_mod.get_output_embeddings()
+            for lm_head_name, subsubmod in sub_mod.named_modules():
+                if subsubmod is lm_head:
+                    break
+            else:
+                raise RuntimeError("Could not find lm_head module in draft model.")
+            sub_gm.set_submodule(lm_head_name, lm_head)
             sub_gm.get_output_embeddings = types.MethodType(
-                sub_mod.get_output_embeddings.__func__, sub_gm
+                lambda self, _n=lm_head_name: self.get_submodule(_n), sub_gm
             )
-            n_lm_head = sub_gm.graph.get_attr("lm_head.weight")
+            n_lm_head = sub_gm.graph.get_attr(f"{lm_head_name}.weight")
             sub_gm.graph.call_function(
                 torch._assert, args=(n_lm_head, "Avoid draft lm_head getting deleted.")
             )
@@ -267,6 +283,13 @@ class EagleOneModelFactory(ModelFactory):
             raise ValueError("speculative_config is required for EagleOneModelFactory.")
 
         self.speculative_config = speculative_config
+        # For MTP, derive Eagle-pipeline fields from MTP-specific fields.
+        if isinstance(speculative_config, MTPDecodingConfig):
+            draft_model_path = speculative_config.speculative_model or model
+        else:
+            draft_model_path = speculative_config.speculative_model
+        if draft_model_path is None:
+            raise ValueError("speculative_config.speculative_model must be set.")
 
         # Create target factory (AutoModelForCausalLM)
         self.target_factory = AutoModelForCausalLMFactory(
@@ -279,9 +302,6 @@ class EagleOneModelFactory(ModelFactory):
         )
 
         # Create draft factory (EagleDrafter)
-        draft_model_path = speculative_config.speculative_model
-        if draft_model_path is None:
-            raise ValueError("speculative_config.speculative_model must be set.")
         self.draft_factory = EagleDrafterFactory(
             model=str(draft_model_path),
             model_kwargs=speculative_model_kwargs,
@@ -303,6 +323,9 @@ class EagleOneModelFactory(ModelFactory):
             max_draft_len=self.speculative_config.max_draft_len,
             load_embedding_from_target=getattr(draft_config, "load_embedding_from_target", True),
             load_lm_head_from_target=getattr(draft_config, "load_lm_head_from_target", True),
+            normalize_target_hidden_state=getattr(
+                draft_config, "normalize_target_hidden_state", False
+            ),
         )
 
         return EagleWrapper(
@@ -337,6 +360,11 @@ class EagleOneModelFactory(ModelFactory):
 
     def get_sharding_config(self) -> Dict[str, Any]:
         return self.target_factory.get_sharding_config()
+
+    # TODO(govind): It's possible that draft models have different quant configs than target models.
+    # We need to address this possibility.
+    def get_quant_config(self) -> Dict[str, Any]:
+        return self.target_factory.get_quant_config()
 
     def get_cache_config_updates(self) -> Dict[str, Any]:
         return self.target_factory.get_cache_config_updates()

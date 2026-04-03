@@ -105,9 +105,12 @@ def allocate_gpus(
             server_allocations[server_type][i] = server_allocation
             port += 1
 
-    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
-                   gpus_per_node)
+    # Keep the allocation order aligned with disagg_utils, which builds
+    # server_configs as ctx_cfgs + gen_cfgs and assigns rank offsets in that
+    # same order during split_world_comm().
     assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
+                   gpus_per_node)
+    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
                    gpus_per_node)
 
     return allocations
@@ -506,17 +509,13 @@ def submit_job(config, log_dir, dry_run):
         }
     }
 
-    # Generate start worker commands with placeholder hostnames
     for server_type in allocations.keys():
         server_cfg = server_configs[server_type]
 
         for server_id in allocations[server_type].keys():
             allocation = allocations[server_type][server_id]
-            # Get GPU IDs for this server from allocation
-            # When multi-node, all nodes have same device list, so use first node [0]
             gpu_ids = list(allocation["nodes"].values())[0]
 
-            # Build environment for this worker
             cuda_devices = ','.join(map(str, gpu_ids))
             worker_env = build_worker_environment(
                 worker_config=worker_config,
@@ -529,7 +528,6 @@ def submit_job(config, log_dir, dry_run):
             )
             export_str = format_export_string(worker_env)
 
-            # Use script_dir for start_worker.sh
             cmd = [
                 "srun -l",
                 f"--nodelist {','.join(allocation['nodes'].keys())}",

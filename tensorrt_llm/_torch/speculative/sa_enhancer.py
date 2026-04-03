@@ -33,18 +33,44 @@ class SADraftEnhancer:
     override draft tokens) so that any worker (MTP, EAGLE3, PARD, etc.) can
     opt into SA enhancement.
 
+    The SA extend+search kernels are launched on a dedicated CUDA side-stream
+    so they overlap with the compute-heavy draft model forward passes on the
+    main stream.  Results are synchronized lazily — only when
+    ``maybe_override_all_draft_tokens`` is called after the draft loop.
+
     Usage:
-        1. Construct once during worker ``__init__`` when ``use_sa_spec`` is True.
+        1. Construct once during worker ``__init__`` when ``sa_config`` is set.
         2. Call ``extend_and_prepare`` after ``sample_and_accept_draft_tokens``.
         3. Call ``maybe_override_all_draft_tokens`` once after all draft layers
            have finished, so that neural draft layers never see SA tokens.
     """
 
-    def __init__(self, sa_spec_threshold: int):
-        self.sa_spec_threshold = sa_spec_threshold
+    def __init__(self, threshold: int):
+        self.threshold = threshold
         self.sa_match_len: Optional[torch.Tensor] = None
         self.sa_draft_tokens: Optional[torch.Tensor] = None
         self.sa_spec_index: int = 0
+        self._sa_stream: Optional[torch.cuda.Stream] = None
+        self._sa_event: Optional[torch.cuda.Event] = None
+        self._num_gens: int = 0
+
+    def _ensure_stream(self) -> None:
+        if self._sa_stream is None:
+            self._sa_stream = torch.cuda.Stream()
+            self._sa_event = torch.cuda.Event()
+
+    def _ensure_buffers(self, num_gens: int, max_draft_len: int) -> None:
+        """Pre-allocate / reuse GPU buffers for SA match results."""
+        if self.sa_match_len is None or self.sa_match_len.shape[0] < num_gens:
+            self.sa_match_len = torch.zeros((num_gens,), dtype=torch.int32, device="cuda")
+        if (
+            self.sa_draft_tokens is None
+            or self.sa_draft_tokens.shape[0] < num_gens
+            or self.sa_draft_tokens.shape[1] < max_draft_len
+        ):
+            self.sa_draft_tokens = torch.zeros(
+                (num_gens, max_draft_len), dtype=torch.int32, device="cuda"
+            )
 
     def extend_and_prepare(
         self,
@@ -59,7 +85,8 @@ class SADraftEnhancer:
         """Extend SA states with accepted tokens and prepare override buffers.
 
         Must be called after ``sample_and_accept_draft_tokens`` and before the
-        draft generation loop.
+        draft generation loop.  The SA kernels are launched on a side-stream so
+        the caller can immediately proceed with the draft model forward passes.
 
         Args:
             sa_manager: The SuffixAutomatonManager instance.
@@ -71,10 +98,8 @@ class SADraftEnhancer:
             num_contexts: Number of context requests in the batch.
             max_draft_len: Number of draft positions to produce.
         """
-        self.sa_match_len = torch.zeros((num_gens,), dtype=torch.int32, device="cuda")
-        self.sa_draft_tokens = torch.zeros(
-            (num_gens, max_draft_len), dtype=torch.int32, device="cuda"
-        )
+        self._ensure_buffers(num_gens, max_draft_len)
+        self._num_gens = num_gens
         self.sa_spec_index = 0
 
         if num_gens > 0:
@@ -86,14 +111,30 @@ class SADraftEnhancer:
             # slice + .contiguous() below compacts memory so the stride
             # matches the kernel expectation.
             gen_accepted = accepted_tokens[num_contexts:, : max_draft_len + 1].contiguous()
-            match_len, draft_tokens_sa = sa_manager.extend(
-                gen_request_ids,
-                gen_accepted,
-                num_accepted_tokens[num_contexts:],
-                max_draft_len,
-            )
-            self.sa_match_len.copy_(match_len)
-            self.sa_draft_tokens.copy_(draft_tokens_sa)
+
+            self._ensure_stream()
+            main_stream = torch.cuda.current_stream()
+            self._sa_stream.wait_stream(main_stream)
+
+            with torch.cuda.stream(self._sa_stream):
+                if sa_manager.enable_global_pool:
+                    match_len, draft_tokens_sa = sa_manager.extend_global(
+                        gen_request_ids,
+                        gen_accepted,
+                        num_accepted_tokens[num_contexts:],
+                        max_draft_len,
+                    )
+                else:
+                    match_len, draft_tokens_sa = sa_manager.extend(
+                        gen_request_ids,
+                        gen_accepted,
+                        num_accepted_tokens[num_contexts:],
+                        max_draft_len,
+                    )
+                self.sa_match_len[:num_gens].copy_(match_len)
+                self.sa_draft_tokens[:num_gens, :max_draft_len].copy_(draft_tokens_sa)
+
+            self._sa_event.record(self._sa_stream)
 
     def maybe_override_all_draft_tokens(
         self,
@@ -110,11 +151,13 @@ class SADraftEnhancer:
         Returns:
             The (potentially overridden) draft tokens tensor.
         """
-        if self.sa_match_len is not None and self.sa_match_len.shape[0] > 0:
+        if self.sa_match_len is not None and self._num_gens > 0:
+            if self._sa_event is not None:
+                torch.cuda.current_stream().wait_event(self._sa_event)
+
+            n = self._num_gens
             K = draft_tokens.shape[1]
-            mask = (
-                (self.sa_match_len >= self.sa_spec_threshold).unsqueeze(1).expand_as(draft_tokens)
-            )
-            draft_tokens = torch.where(mask, self.sa_draft_tokens[:, :K], draft_tokens)
+            mask = (self.sa_match_len[:n] >= self.threshold).unsqueeze(1).expand_as(draft_tokens)
+            draft_tokens = torch.where(mask, self.sa_draft_tokens[:n, :K], draft_tokens)
 
         return draft_tokens
