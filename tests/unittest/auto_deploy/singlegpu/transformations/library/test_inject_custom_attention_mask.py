@@ -74,9 +74,34 @@ class DummyFactory:
         return SimpleNamespace(model_type="unit_test_mask_model"), {}
 
 
+class Gemma4Factory:
+    def _get_model_config(self):
+        return SimpleNamespace(model_type="gemma4"), {}
+
+
 def _build_segment_mask(segment_ids: torch.Tensor) -> torch.Tensor:
     same_segment = segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)
     return same_segment.unsqueeze(1)
+
+
+def _build_token_type_mask(token_type_ids: torch.Tensor) -> torch.Tensor:
+    non_text = token_type_ids != 0
+    prev = torch.cat(
+        [
+            torch.zeros(token_type_ids.shape[0], 1, dtype=token_type_ids.dtype),
+            token_type_ids[:, :-1],
+        ],
+        dim=1,
+    )
+    blob_starts = non_text & (token_type_ids != prev)
+    blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+    token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+    media_mask = (token_blob_ids.unsqueeze(2) == token_blob_ids.unsqueeze(1)) & (
+        token_blob_ids.unsqueeze(2) != 0
+    )
+    positions = torch.arange(token_type_ids.shape[1])
+    causal_mask = positions.unsqueeze(0) <= positions.unsqueeze(1)
+    return (causal_mask.unsqueeze(0) | media_mask).unsqueeze(1)
 
 
 _provider_build_counts = {"mask": 0}
@@ -143,4 +168,39 @@ def test_inject_custom_attention_mask():
     expected = model.forward_with_mask(input_ids, expected_mask)
     actual = gm_transformed(input_ids, position_ids, segment_ids=segment_ids)
 
+    torch.testing.assert_close(actual, expected)
+
+
+@torch.inference_mode()
+def test_inject_gemma4_custom_attention_mask_for_torch_backend():
+    model = DualAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    token_type_ids = torch.tensor([[0, 1, 1, 2, 2]], dtype=torch.int64)
+
+    gm = torch_export_to_gm(model, args=(input_ids, position_ids), clone=True)
+    gm_transformed = InferenceOptimizer(
+        Gemma4Factory(),
+        {
+            "inject_custom_attention_mask": {
+                "stage": "pattern_matcher",
+                "backend": "torch",
+            },
+        },
+    )(None, gm)
+
+    attn_nodes = [
+        node
+        for node in gm_transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.torch_attention)
+    ]
+    assert len(attn_nodes) == 2
+    assert all(
+        (node.args[3] if len(node.args) > 3 else node.kwargs["attn_mask"]) is not None
+        for node in attn_nodes
+    )
+
+    expected_mask = _build_token_type_mask(token_type_ids)
+    expected = model.forward_with_mask(input_ids, expected_mask)
+    actual = gm_transformed(input_ids, position_ids, token_type_ids=token_type_ids)
     torch.testing.assert_close(actual, expected)

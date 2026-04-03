@@ -10,6 +10,66 @@ import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
+@torch.inference_mode()
+def test_torch_backend_attention_custom_bool_mask_context():
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, seq_len, num_heads, head_dim = 1, 5, 2, 8
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.zeros(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    v_cache = torch.zeros(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+
+    token_type_ids = torch.tensor([[0, 1, 1, 2, 2]], device=device, dtype=torch.int64)
+    non_text = token_type_ids != 0
+    prev = torch.cat(
+        [
+            torch.zeros(batch_size, 1, device=device, dtype=token_type_ids.dtype),
+            token_type_ids[:, :-1],
+        ],
+        dim=1,
+    )
+    blob_starts = non_text & (token_type_ids != prev)
+    blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+    token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+    media_mask = (token_blob_ids.unsqueeze(2) == token_blob_ids.unsqueeze(1)) & (
+        token_blob_ids.unsqueeze(2) != 0
+    )
+    positions = torch.arange(seq_len, device=device)
+    attn_mask = (positions.unsqueeze(0) <= positions.unsqueeze(1)).unsqueeze(0) | media_mask
+    attn_mask = attn_mask.unsqueeze(1)
+
+    batch_info = BatchInfo()
+    batch_info.update([batch_size, batch_size * seq_len, 0, 0, 0, 0])
+    seq_len_tensor = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    input_positions = torch.tensor([0], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
+    seq_start = torch.tensor([0], device=device, dtype=torch.int32)
+
+    expected = torch.ops.auto_deploy.torch_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=False, scale=scale, layout="bsnd"
+    )
+    actual = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
+        q,
+        k,
+        v,
+        batch_info.serialize(),
+        seq_len_tensor,
+        input_positions,
+        slot_idx,
+        seq_start,
+        k_cache,
+        v_cache,
+        attn_mask,
+        scale,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
 def numpy_attention_reference(
     q,
     k,

@@ -67,6 +67,7 @@ class TorchAttentionReference:
             seq_start,
             k_cache,
             v_cache,
+            None,
             scale,
         )
 
@@ -108,6 +109,7 @@ class TorchAttentionReference:
             seq_start,
             k_cache,
             v_cache,
+            None,
             scale,
         )
 
@@ -162,6 +164,7 @@ class TorchAttentionReference:
             k_cache,
             v_cache,
             None,
+            None,
         )
 
         # Return in flattened format to match flashinfer backend behavior [batch, seq=1, n_heads * head_dim]
@@ -198,6 +201,7 @@ class TorchAttentionReference:
             seq_start,
             k_cache,
             v_cache,
+            None,
             scale,
             None,  # sinks
             sliding_window_size,
