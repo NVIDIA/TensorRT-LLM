@@ -157,8 +157,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 if hasattr(self, 'mpi_futures') and self.mpi_futures:
                     for f in self.mpi_futures:
                         if f.done():
-                            exc = f.exception(
-                            ) if not f.cancelled() else None
+                            exc = f.exception() if not f.cancelled() else None
                             error = exc or RuntimeError(
                                 "MPI worker exited unexpectedly")
                             self._set_fatal_error(error)
@@ -382,6 +381,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 pass
 
         # step2: notify the background threads to quit
+        if hasattr(self, '_error_monitor_thread'
+                   ) and self._error_monitor_thread.is_alive():
+            self._error_monitor_thread.join(timeout=5)
+
         if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
         ):
             self.dispatch_result_thread.stop()
