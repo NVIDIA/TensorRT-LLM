@@ -588,7 +588,8 @@ public:
 
     explicit WindowBlockManager(nvinfer1::DataType dtype, SizeType32 windowSize,
         std::vector<SizeType32> const& managedLayers, std::vector<SizeType32> const& numKvHeadsPerLayer,
-        SizeType32 sizePerHead, SizeType32 tokensPerBlock, bool isSWA, SizeType32 blocksInPrimaryPool,
+        std::vector<SizeType32> const& sizePerHeadPerLayer, SizeType32 tokensPerBlock, bool isSWA,
+        SizeType32 blocksInPrimaryPool,
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
@@ -1058,8 +1059,9 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using BaseEvictionPolicy = tensorrt_llm::batch_manager::eviction_policy::BaseEvictionPolicy;
 
-    explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
-        SizeType32 tokensPerBlock, BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences,
+    explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer,
+        std::vector<SizeType32> const& sizePerHeadPerLayer, SizeType32 tokensPerBlock,
+        BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences,
         CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
@@ -1669,7 +1671,7 @@ public:
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
-    // Sum of numLayers * kvFactor * numKvHeads * sizePerHead for each pool
+    // Sum of kvFactor * numKvHeads[i] * sizePerHead[i] for each layer in the window
     [[nodiscard]] static SizeType32 calculateCacheSizePerTokenForSingleWindowSize(
         tensorrt_llm::runtime::ModelConfig const& modelConfig, std::vector<SizeType32> const& windowSizeLayers,
         bool isCrossAttention, SizeType32 kvFactor)
@@ -1680,6 +1682,19 @@ public:
         // address it here
         // consider only local layers for the calculation
         return sumLocalHeads * kvFactor * modelConfig.getSizePerHead();
+    }
+
+    // Overload for per-layer sizePerHead: sum of kvFactor * numKvHeads[i] * sizePerHead[i] for each layer
+    [[nodiscard]] static SizeType32 calculateCacheSizePerTokenForSingleWindowSize(
+        std::vector<SizeType32> const& numKvHeadsPerLayer, std::vector<SizeType32> const& sizePerHeadPerLayer,
+        std::vector<SizeType32> const& windowSizeLayers, SizeType32 kvFactor)
+    {
+        SizeType32 cacheSize = 0;
+        for (auto const layerIdx : windowSizeLayers)
+        {
+            cacheSize += numKvHeadsPerLayer.at(layerIdx) * sizePerHeadPerLayer.at(layerIdx) * kvFactor;
+        }
+        return cacheSize;
     }
 
     /// @brief Groups model layers by their attention window size.
@@ -1753,7 +1768,8 @@ public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
     using CacheType = tensorrt_llm::batch_manager::kv_cache_manager::CacheType;
 
-    KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
+    KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer,
+        std::vector<SizeType32> const& sizePerHeadPerLayer, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
@@ -1766,7 +1782,8 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0);
 
-    KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
+    KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer,
+        std::vector<SizeType32> const& sizePerHeadPerLayer, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
