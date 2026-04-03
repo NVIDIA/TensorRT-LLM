@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Performance regression pipeline utilities.
+"""Performance regression pipeline utilities.
 
 Generic regression detection and upload logic that can be reused across
 different test scripts (perf sanity, module perf, accuracy, etc.).
 """
+
 import json
 import os
 import re
@@ -32,11 +32,11 @@ from .open_search_db_utils import add_id, get_history_data, post_new_perf_data
 POST_MERGE_THRESHOLD = 0.05
 PRE_MERGE_THRESHOLD = 0.1
 
+_URM_BASE = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main"
+
 
 def get_job_info():
-    """
-    Get job info from environment variables
-    """
+    """Get job info from environment variables."""
     # Read environment variables
     host_node_name = os.getenv("HOST_NODE_NAME", "")
     build_id = os.getenv("BUILD_ID", "")
@@ -66,7 +66,7 @@ def get_job_info():
     branch = ""
     commit = os.getenv("gitlabCommit", "")
     if job_url:
-        branch_match = re.search(r'/job/LLM/job/([^/]+)/job/', job_url)
+        branch_match = re.search(r"/job/LLM/job/([^/]+)/job/", job_url)
         if branch_match:
             branch = branch_match.group(1)
 
@@ -86,32 +86,32 @@ def get_job_info():
                 trigger_mr_id = pr_match.group(1)
                 # Convert API URL to web URL
                 trigger_mr_link = github_pr_api_url.replace(
-                    "api.github.com/repos/",
-                    "github.com/").replace("/pulls/", "/pull/")
+                    "api.github.com/repos/", "github.com/"
+                ).replace("/pulls/", "/pull/")
 
         # Extract user from trigger_info
         # Pattern: target="_blank">Barry-Delaney</a><br/>Git Commit:
-        trigger_info = global_vars.get("action_info",
-                                       {}).get("trigger_info", "")
+        trigger_info = global_vars.get("action_info", {}).get("trigger_info", "")
         # Try to extract username from patterns like 'target="_blank">username</a><br/>Git Commit:'
-        user_match = re.search(r'target="_blank">([^<]+)</a><br/>Git Commit:',
-                               trigger_info)
+        user_match = re.search(r'target="_blank">([^<]+)</a><br/>Git Commit:', trigger_info)
         if user_match:
             trigger_mr_user = user_match.group(1)
 
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
-        artifact_url = f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_MergeRequest_PR/{job_id}" if job_id else ""
+        artifact_url = (
+            f"{_URM_BASE}/L0_MergeRequest_PR/{job_id}" if job_id else ""
+        )
     else:
-        artifact_url = f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/{job_id}" if job_id else ""
+        artifact_url = (
+            f"{_URM_BASE}/L0_PostMerge/{job_id}" if job_id else ""
+        )
 
     return {
         "b_is_baseline": False,
         "b_is_valid": True,
-
         # Unique identifier
         "_id": "",
-
         # Job Config
         "s_host_node_name": host_node_name,
         "s_build_id": build_id,
@@ -133,8 +133,8 @@ def get_job_info():
 
 
 def get_common_values(new_data_dict, match_keys):
-    """
-    Find keys from match_keys where all data entries in new_data_dict have identical values.
+    """Find keys from match_keys where all entries have identical values.
+
     Returns a dict with those common key-value pairs.
     Skips entries that don't have the key or have None/empty values.
     """
@@ -176,7 +176,7 @@ def _rolling_smooth(values, window=3):
     smoothed = []
     for i in range(len(values)):
         start = max(0, i - window + 1)
-        w = values[start:i + 1]
+        w = values[start : i + 1]
         smoothed.append(sum(w) / len(w))
     return smoothed
 
@@ -224,8 +224,7 @@ def _daily_aggregate_values(data_list, metric):
     return result
 
 
-def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics,
-                               minimize_metrics):
+def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics, minimize_metrics):
     """Calculate baseline metrics using rolling smooth + percentile algorithm.
 
     For each metric, aggregates data to daily values, applies a trailing
@@ -259,8 +258,8 @@ def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics,
 
 
 def _calculate_diff(metric, new_value, baseline_value, maximize_metrics):
-    """
-    Calculate the percentage difference between new and baseline values.
+    """Calculate the percentage difference between new and baseline values.
+
     Returns a positive number if perf is better, negative if worse.
     """
     if baseline_value == 0:
@@ -273,9 +272,14 @@ def _calculate_diff(metric, new_value, baseline_value, maximize_metrics):
         return (baseline_value - new_value) / baseline_value * 100
 
 
-def prepare_regressive_test_cases(latest_history_data_dict, history_data_dict,
-                                  new_data_dict, maximize_metrics,
-                                  minimize_metrics, regression_metrics):
+def prepare_regressive_test_cases(
+    latest_history_data_dict,
+    history_data_dict,
+    new_data_dict,
+    maximize_metrics,
+    minimize_metrics,
+    regression_metrics,
+):
     """Update regression info for all data in new_data_dict.
 
     Uses embedded baseline fields from latest history data when available,
@@ -316,8 +320,8 @@ def prepare_regressive_test_cases(latest_history_data_dict, history_data_dict,
                 if fallback_baseline is None:
                     history_list = history_data_dict.get(cmd_idx, [])
                     fallback_baseline = calculate_baseline_metrics(
-                        history_list, new_data, maximize_metrics,
-                        minimize_metrics)
+                        history_list, new_data, maximize_metrics, minimize_metrics
+                    )
                 baseline_value = fallback_baseline.get(metric)
                 if baseline_value is None or baseline_value <= 0:
                     continue
@@ -334,12 +338,13 @@ def prepare_regressive_test_cases(latest_history_data_dict, history_data_dict,
             if threshold is None or threshold <= 0:
                 threshold = default_threshold
 
-            diff = _calculate_diff(metric, new_value, baseline_value,
-                                   maximize_metrics)
-            info_lines.append(f"  {metric}: value={new_value:.4f} "
-                              f"baseline={baseline_value:.4f} "
-                              f"threshold={threshold * 100:.2f}% "
-                              f"diff={diff:+.2f}%")
+            diff = _calculate_diff(metric, new_value, baseline_value, maximize_metrics)
+            info_lines.append(
+                f"  {metric}: value={new_value:.4f} "
+                f"baseline={baseline_value:.4f} "
+                f"threshold={threshold * 100:.2f}% "
+                f"diff={diff:+.2f}%"
+            )
 
             # Check if this metric is regressive (only for key regression metrics)
             if metric in regression_metrics:
@@ -358,9 +363,9 @@ def prepare_regressive_test_cases(latest_history_data_dict, history_data_dict,
         new_data["b_is_regression"] = len(regressive_metrics) > 0
 
 
-def add_baseline_fields_to_post_merge_data(latest_history_data_dict,
-                                           new_data_dict, maximize_metrics,
-                                           minimize_metrics):
+def add_baseline_fields_to_post_merge_data(
+    latest_history_data_dict, new_data_dict, maximize_metrics, minimize_metrics
+):
     """Embed baseline fields directly into each post-merge data entry.
 
     For each metric, adds:
@@ -393,23 +398,25 @@ def add_baseline_fields_to_post_merge_data(latest_history_data_dict,
                 new_data[pre_merge_key] = PRE_MERGE_THRESHOLD
 
             # Baseline value: inherit from latest history if positive, else -1
-            if (latest_history and baseline_key in latest_history
-                    and latest_history[baseline_key] is not None
-                    and latest_history[baseline_key] > 0):
+            if (
+                latest_history
+                and baseline_key in latest_history
+                and latest_history[baseline_key] is not None
+                and latest_history[baseline_key] > 0
+            ):
                 new_data[baseline_key] = latest_history[baseline_key]
             else:
                 new_data[baseline_key] = -1
 
 
 def check_perf_regression(new_data_dict, fail_on_regression=False):
-    """
-    Check performance regression by printing s_regression_info for each
-    regressive entry. Post-merge regressions log warnings. Pre-merge
+    """Check performance regression by printing s_regression_info.
+
+    Post-merge regressions log warnings. Pre-merge
     regressions raise RuntimeError when fail_on_regression is True.
     """
     regressive_data_list = [
-        data for data in new_data_dict.values()
-        if data.get("b_is_regression", False)
+        data for data in new_data_dict.values() if data.get("b_is_regression", False)
     ]
 
     if not regressive_data_list:
@@ -417,12 +424,10 @@ def check_perf_regression(new_data_dict, fail_on_regression=False):
         return
 
     post_merge_regressions = [
-        data for data in regressive_data_list
-        if data.get("b_is_post_merge", False)
+        data for data in regressive_data_list if data.get("b_is_post_merge", False)
     ]
     pre_merge_regressions = [
-        data for data in regressive_data_list
-        if not data.get("b_is_post_merge", False)
+        data for data in regressive_data_list if not data.get("b_is_post_merge", False)
     ]
 
     # Print post-merge regression details as warnings
@@ -485,19 +490,24 @@ def process_and_upload_test_results(
 
     # Step 4: Query history data
     latest_history_data_dict, history_data_dict = get_history_data(
-        new_data_dict, match_keys, common_values_dict)
+        new_data_dict, match_keys, common_values_dict
+    )
 
     # Step 5: Compute regression info
-    prepare_regressive_test_cases(latest_history_data_dict, history_data_dict,
-                                  new_data_dict, maximize_metrics,
-                                  minimize_metrics, regression_metrics)
+    prepare_regressive_test_cases(
+        latest_history_data_dict,
+        history_data_dict,
+        new_data_dict,
+        maximize_metrics,
+        minimize_metrics,
+        regression_metrics,
+    )
 
     # Step 6: For post-merge, embed baseline fields
     if is_post_merge:
-        add_baseline_fields_to_post_merge_data(latest_history_data_dict,
-                                               new_data_dict,
-                                               maximize_metrics,
-                                               minimize_metrics)
+        add_baseline_fields_to_post_merge_data(
+            latest_history_data_dict, new_data_dict, maximize_metrics, minimize_metrics
+        )
 
     # Step 7: Upload to DB
     if upload_to_db:
