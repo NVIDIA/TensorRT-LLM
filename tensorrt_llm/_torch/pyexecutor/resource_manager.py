@@ -357,7 +357,6 @@ class KVCacheManager(BaseResourceManager):
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
                                        1) if spec_config is not None else 0
-        self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
         self.linear_attention_metadata = linear_attention_metadata
 
         # Determine max_attention_window_vec
@@ -378,7 +377,9 @@ class KVCacheManager(BaseResourceManager):
                              if kv_cache_config.sink_token_length is not None
                              else 0)
 
-        # Determine if this is VSWA (Variable Sliding Window Attention)
+        # Determine if this is VSWA (Variable Sliding Window Attention).
+        # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
+        # values (negative) used by hybrid linear attention models.
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
             w > 0 for w in self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
@@ -485,9 +486,6 @@ class KVCacheManager(BaseResourceManager):
             max_seq_len=self.max_seq_len,
             max_beam_width=max_beam_width,
         )
-
-        if os.environ.get("USE_FAKE_POOL", "0") == "1":
-            blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (128, 0)
 
         if kv_cache_type != CacheTypeCpp.SELF:
             assert len(
@@ -1087,7 +1085,7 @@ class KVCacheManager(BaseResourceManager):
     def get_num_free_blocks(self) -> int:
         if self.is_vswa or self.is_linear_attention:
             logger.info(
-                f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
+                f"For {'linear attention' if self.is_linear_attention else 'VSWA'} case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
             )
             return min(self.impl.get_kv_cache_stats().
                        num_free_blocks_per_window_size.values())

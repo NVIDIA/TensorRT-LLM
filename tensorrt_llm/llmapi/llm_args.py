@@ -2366,13 +2366,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 )
         return v
 
-    @field_validator('max_attention_window')
-    @classmethod
-    def validate_max_attention_window(cls, v: Optional[List[int]]):
-        if v is None:
-            return v
-        return v
-
     @field_validator('max_util_for_resume')
     @classmethod
     def validate_max_util_for_resume(cls, v: float):

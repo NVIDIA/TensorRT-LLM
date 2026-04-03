@@ -27,11 +27,9 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
 
-import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, ModelConfigCpp,
-    get_pp_layers)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
@@ -717,7 +715,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
-        model_config: Optional[ModelConfigCpp] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -766,9 +763,9 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         MambaCacheManager.prepare_resources(self, scheduled_batch)
         KVCacheManager.prepare_resources(self, scheduled_batch)
 
-    def free_resources(self, request: LlmRequest):
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         MambaCacheManager.free_resources(self, request)
-        KVCacheManager.free_resources(self, request)
+        KVCacheManager.free_resources(self, request, pin_on_release)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
         MambaCacheManager.add_dummy_requests(self, request_ids)
@@ -795,8 +792,8 @@ def calc_context_stop_positions(prompt_len: int,
                                 tokens_per_block: int,
                                 mamba_prefix_cache_step: int,
                                 save_last_snapshot: bool = False) -> list[int]:
-    stop_positions = range(0, prompt_len, mamba_prefix_cache_step)
-    stop_positions = list(stop_positions)
+    stop_positions = list(
+        range(mamba_prefix_cache_step, prompt_len, mamba_prefix_cache_step))
     last_ckpt = prompt_len // tokens_per_block * tokens_per_block
     if save_last_snapshot and (last_ckpt not in stop_positions):
         stop_positions.append(last_ckpt)
@@ -951,8 +948,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             self.ssm_states_mapping[layer_id] = ssm_states
             self.conv_states_mapping[layer_id] = conv_states
 
-        self._request_block_ids = {}
-        self.iter = 0
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
     def shutdown(self):
@@ -1003,7 +998,6 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
     @nvtx_range("hybrid_prepare_resources")
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
-        self.iter += 1
         self.requests = scheduled_batch.context_requests + \
             scheduled_batch.generation_requests
         for req in self.requests:
@@ -1018,6 +1012,13 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
     def is_speculative(self) -> bool:
         # Not implemented yet.
         return False
+
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor):
+        raise NotImplementedError(
+            "CppMambaHybridCacheManager does not support speculative decoding. "
+            "Use MixedMambaHybridCacheManager (spec_config or TRTLLM_USE_CPP_MAMBA=1) instead."
+        )
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self.ssm_states_mapping[layer_idx]
@@ -1037,7 +1038,7 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             self.requests.remove(request)
         super().free_resources(request, pin_on_release)
 
-    def _setup_state_indices(self) -> torch.Tensor:
+    def _setup_state_indices(self) -> None:
         block_indices = []
         for req in self.requests:
             if req.is_context_finished:
@@ -1059,8 +1060,12 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
             # (no longer multiplied by num_linear_layers)
             value = self.host_block_offsets[self.recurrent_states_pool_index, i,
                                             0, block_indices[i]]
-            assert value >= 0 and value < self.blocks_per_window[
+            max_blocks = self.blocks_per_window[
                 LinearCacheType.RECURRENT_STATES.value][0]
+            if value < 0 or value >= max_blocks:
+                raise RuntimeError(
+                    f"Invalid recurrent state block index {value} "
+                    f"(expected 0 <= index < {max_blocks}) for request {i}")
             host_linear_block_offsets[i] = value
 
         torch.fill_(self._cuda_state_indices, 0)
@@ -1104,13 +1109,17 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
 
     # [total_block_num, *ssm_state_shape] (one block for one layer)
     def _get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        total_bytes = self.ssm_bytes + self.conv_bytes
+        if total_bytes % self.ssm_state_dtype.itemsize != 0:
+            raise RuntimeError(
+                f"Total state bytes ({total_bytes}) not divisible by "
+                f"ssm_state_dtype size ({self.ssm_state_dtype.itemsize})")
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_linear_layers, -1,
-                                 self.ssm_bytes + self.conv_bytes)
-        layer_idx = self.linear_layer_offsets[layer_idx]
+            torch.uint8).reshape(self.num_linear_layers, -1, total_bytes)
+        layer_offset = self.linear_layer_offsets[layer_idx]
         # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
-        layer_pool = pool[layer_idx]
+        layer_pool = pool[layer_offset]
         flat = layer_pool.view(self.ssm_state_dtype)
         assert flat.data_ptr() == layer_pool.data_ptr()
         total_elems_per_block = (
@@ -1129,17 +1138,24 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         return my_ssm_states
 
     def _get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        total_bytes = self.ssm_bytes + self.conv_bytes
+        if total_bytes % self.conv_state_dtype.itemsize != 0:
+            raise RuntimeError(
+                f"Total state bytes ({total_bytes}) not divisible by "
+                f"conv_state_dtype size ({self.conv_state_dtype.itemsize})")
+        if self.ssm_bytes % self.conv_state_dtype.itemsize != 0:
+            raise RuntimeError(
+                f"SSM state bytes ({self.ssm_bytes}) not divisible by "
+                f"conv_state_dtype size ({self.conv_state_dtype.itemsize})")
         # Pool layout: {numLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.num_linear_layers, -1,
-                                 self.ssm_bytes + self.conv_bytes)
-        layer_idx = self.linear_layer_offsets[layer_idx]
+            torch.uint8).reshape(self.num_linear_layers, -1, total_bytes)
+        layer_offset = self.linear_layer_offsets[layer_idx]
         # layer_pool: {numBlocks, ssm_bytes + conv_bytes}, contiguous
-        layer_pool = pool[layer_idx]
+        layer_pool = pool[layer_offset]
         flat = layer_pool.view(self.conv_state_dtype)
         assert flat.data_ptr() == layer_pool.data_ptr()
-        total_elems_per_block = (
-            self.ssm_bytes + self.conv_bytes) // self.conv_state_dtype.itemsize
+        total_elems_per_block = total_bytes // self.conv_state_dtype.itemsize
         offset = self.ssm_bytes // self.conv_state_dtype.itemsize
         target_shape = [flat.shape[0], *self.conv_state_shape]
         target_strides = [total_elems_per_block, self.conv_state_shape[-1], 1]
@@ -1174,7 +1190,7 @@ class _MambaHybridCacheManagerMeta(type):
 
     def __getattr__(cls, name):
         """Forward class-level attribute access (e.g. static methods) to
-        the KVCacheManager."""
+        KVCacheManager. Add attributes here as needed."""
         return getattr(KVCacheManager, name)
 
 

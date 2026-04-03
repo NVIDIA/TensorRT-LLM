@@ -695,9 +695,6 @@ class ModelConfig(Generic[TConfig]):
         num_key_value_heads = getattr(self.pretrained_config,
                                       "num_key_value_heads", num_heads)
 
-        def ceil_div(a, b):
-            return (a + b - 1) // b
-
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
@@ -805,6 +802,16 @@ class ModelConfig(Generic[TConfig]):
             self,
             kv_cache_config: Optional[KvCacheConfig] = None,
             spec_config: Optional['SpeculativeConfig'] = None):
+        """Return the number of layers that need KV cache blocks.
+
+        For hybrid models using the V1 (MixedMambaHybridCacheManager) path
+        (speculative decoding or TRTLLM_USE_CPP_MAMBA=1), only attention layers
+        need KV cache blocks, so we return the attention-only count.
+
+        For the default CppMambaHybridCacheManager path, both attention and
+        mamba layers are managed in the unified KV cache pool, so we return
+        num_hidden_layers (all layers).
+        """
         use_disagg = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
         use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
         use_spec = spec_config is not None
