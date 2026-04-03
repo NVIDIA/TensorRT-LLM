@@ -3395,30 +3395,30 @@ nvidia-cublas = "*"
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.21.0"
+version = "1.22.0"
 description = "CUDNN FrontEnd python library"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "nvidia_cudnn_frontend-1.21.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:23dddbdc42d01fbfbfffc8a79f8ac2c1c99cc84382a39d442c9fd44d38d119c5"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:43938ddba2ce3e6be6e28f340dcc97edbe3e61b97847ba5ecc6d5cbdb9ea0dd2"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp310-cp310-win_amd64.whl", hash = "sha256:7a464a73f3d6cb7be268739237078c2677df96623d7c053c0fc89bbdc41132cd"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:301cc20fdc90936252c986d71feacf74981bc5cb4fa703e091d5c3550f3070fa"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:247a4c4d79f7c9243da01713189ee777a56142516df9d3702085fe4ace089ee2"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp311-cp311-win_amd64.whl", hash = "sha256:21a1a9663e307db0da1de6c9666972cf7f36bea0dc7d214a83a1379249747352"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:22f8abb69124f2bc6750e7d7e8625680964cb61caab4c3aaee641d5ad295f37b"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ae3feffb22a9c90007fc54d27642e160dab750401ac5399589dd450e8d01780f"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp312-cp312-win_amd64.whl", hash = "sha256:3e5f28d29cef9a57568942ff66f6c8814a6815b369b3bf850bdcdd67c9cd41cd"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c3153affbefad49dba1e8643dad59642b54f7d2724bf7286acc5830619ada5ba"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:69ad047e47580e76f3694d8e6c74c6d939ce2fff199145f3ea1e6a494c8ea84f"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp313-cp313-win_amd64.whl", hash = "sha256:2a787d4d44ecce7542fae4715630e3427ee4c1feda62069643c010b81e72aa35"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:eee3f650d8573c39ae7add45881b2d80d1a1b540fae75a9fecead3d756bc2640"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a2c9101c7c8845225505b446be49b6eded60c9718f9befceb00c8be34cf3f954"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp314-cp314-win_amd64.whl", hash = "sha256:304d150ca768837eaca9f2ad8a94bb80c1f161eeeb71b696c5807d375bc27915"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:dbd5a7a0f45c6f94fc1453f7a0f99fa6e465c011e25576cfd53ec7d024587a12"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f3782a55d18992d854869cb1cb310d0042bc2262cc744e36c19399677d621295"},
-    {file = "nvidia_cudnn_frontend-1.21.0-cp39-cp39-win_amd64.whl", hash = "sha256:9694e436406704d7e41ef5e8f0f5457d4d91f11e4a3e9405f50b86b0ecb0ae72"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:dbd3100ae212dd1f4691f8c096fe3aded46491f9a6cb258bfb802d07ca1a88fc"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:62bf9c8569caf4d9518dae0755507ad36a4e311726aa015fde104c38a1630f76"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp310-cp310-win_amd64.whl", hash = "sha256:22748b41049d02c029719467924ea20d928517dd8f35e204a390f97407298eb2"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cdff54c945fbabf9da06fd64ded60cf1ec94d580474f5746786c0effd759fedc"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bb50bd2758c6d47c6210451c5c1932ed16e7563d7629228f4cc97edc0e01d0c5"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp311-cp311-win_amd64.whl", hash = "sha256:49f817377a19e10e4aafa5797cd68315739dfdb2fc6a67dd1052b64c805d24ec"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bc9c12891d5427ef49b72b26df2b7889d623086d77c9e33b021c2de417d3e4dc"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:98ffa05699d71795372f112fa2361c13be716fa3fda911c1e809903163ea5d11"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp312-cp312-win_amd64.whl", hash = "sha256:81fde93d9b86ad631e17da1e2c103c4a7a541ec7abcb7f9a121cbd018c8eff26"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c9bdf48cf989b2a77f8b52623fc31c078362fd34389207d11cdb0b5624a7b311"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d02c4b4aae3e243ddb08ad4eb939988bcf7b1aefe25f5d400f6858c7276a6631"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp313-cp313-win_amd64.whl", hash = "sha256:4906a38954725e35bc8431874f4d9db60d50e0d9dbc40ecaf8e5f40df545350b"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0f650058bda46a6542dfc3d021803021e7932e1cd6bb78cf46e81fa219717b5e"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:90f30b0d6563d050ca1972efa594a31d5affe5c3eeb467542e715d7ee73e3b5b"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp314-cp314-win_amd64.whl", hash = "sha256:5994400a7f76a1be5e327a9ac1a4a635ee734d2ac8a5875e52481c52cf2b0922"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:57e3ea7ecc6a69b5ed548e50f006180236c964ff63e4ac1a66aab6621cacb430"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:596319a2503ee39b21688d33ac12966d2149d407573726aa2065f50b53b05a5d"},
+    {file = "nvidia_cudnn_frontend-1.22.0-cp39-cp39-win_amd64.whl", hash = "sha256:007f569d38be5c921c42165080eb02e8e687a08a7e4a25dac1ee02e36dbae66e"},
 ]
 
 [package.extras]
