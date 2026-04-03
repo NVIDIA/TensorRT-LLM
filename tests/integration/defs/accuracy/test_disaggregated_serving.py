@@ -1260,7 +1260,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 llm,
                 model_name,
                 test_sets=["GSM8K"],
-                extra_evaluator_kwargs={"GSM8K": self.extra_evaluator_kwargs})
+                extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
