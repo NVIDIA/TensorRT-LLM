@@ -383,6 +383,7 @@ def _run_all_optimizations_worker_i2v(rank, world_size, checkpoint_path, inputs_
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            cache_backend="teacache",
             teacache=TeaCacheConfig(
                 enable_teacache=True,
                 teacache_thresh=0.2,
@@ -699,6 +700,7 @@ class TestWanI2VIntegration:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
+            cache_backend="teacache",
             teacache=TeaCacheConfig(
                 enable_teacache=True,
                 teacache_thresh=0.2,
@@ -746,6 +748,7 @@ class TestWanI2VIntegration:
             skip_components=SKIP_MINIMAL,
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             attention=AttentionConfig(backend="VANILLA"),  # VANILLA more stable with all opts
+            cache_backend="teacache",
             teacache=TeaCacheConfig(
                 enable_teacache=True,
                 teacache_thresh=0.2,

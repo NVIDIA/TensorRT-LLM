@@ -316,8 +316,8 @@ class Flux2Pipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.2-specific polynomial coefficients
-            self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
+            # TeaCache or Cache-DiT
+            self._setup_cache_acceleration(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

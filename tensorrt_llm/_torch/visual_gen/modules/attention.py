@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,9 +8,7 @@ from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
-
-if TYPE_CHECKING:
-    from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig
 
 
 class QKVMode(str, Enum):
@@ -47,7 +45,7 @@ class Attention(nn.Module):
         qk_norm_mode: str = "full",
         eps: float = 1e-6,
         bias: bool = True,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
     ):
         super().__init__()

@@ -1085,6 +1085,7 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            cache_backend="teacache",
             teacache=TeaCacheConfig(
                 enable_teacache=True,
                 teacache_thresh=0.2,
@@ -1101,7 +1102,10 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
             "Ulysses parallel not enabled"
         )
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"
-        assert hasattr(pipeline, "cache_backend"), "TeaCache not enabled"
+        assert (
+            getattr(pipeline, "cache_accelerator", None) is not None
+            and pipeline.cache_accelerator.is_enabled()
+        ), "TeaCache not enabled"
         assert transformer.transformer_blocks[0].attn.attn_backend == "TRTLLM", "TRTLLM not enabled"
 
         if rank == 0:
@@ -1112,8 +1116,8 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
             print(f"    - Ulysses: ulysses_size={world_size}")
 
         # Initialize TeaCache for single-step inference
-        if hasattr(pipeline, "cache_backend") and pipeline.cache_backend:
-            pipeline.cache_backend.refresh(num_inference_steps=1)
+        if getattr(pipeline, "cache_accelerator", None) and pipeline.cache_accelerator.is_enabled():
+            pipeline.cache_accelerator.refresh(num_inference_steps=1)
 
         # Load inputs on this GPU
         inputs = {k: v.to(f"cuda:{rank}") for k, v in inputs_cpu.items()}

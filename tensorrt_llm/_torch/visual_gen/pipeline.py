@@ -11,12 +11,14 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from .cache import CacheDiTAccelerator, TeaCacheAccelerator
+from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
+    from .cache import CacheAccelerator
     from .config import DiffusionModelConfig
 
 
@@ -33,6 +35,9 @@ class BasePipeline(nn.Module):
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+
+        # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
+        self.cache_accelerator: Optional["CacheAccelerator"] = None
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -237,8 +242,6 @@ class BasePipeline(nn.Module):
                 f"Checkpoint directory must contain a 'transformer' subdirectory."
             )
 
-        from .checkpoints import WeightLoader
-
         weight_loader = WeightLoader(components=transformer_components)
         return weight_loader.load_weights(checkpoint_dir, self.mapping)
 
@@ -259,65 +262,83 @@ class BasePipeline(nn.Module):
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
 
-    def _setup_teacache(self, model, coefficients: Optional[Dict] = None):
-        """Setup TeaCache optimization for the transformer model.
-
-        TeaCache caches transformer block outputs when timestep embeddings change slowly,
-        reducing computation during the denoising loop.
-
-        Args:
-            model: The transformer model to optimize
-            coefficients: Optional dict of model-specific polynomial coefficients for cache decisions
-                         Format: {model_size: {"ret_steps": [...], "standard": [...]}}
-        """
-        self.cache_backend = None
-
-        # Get teacache config from model_config (always present now)
+    def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
+        """Pick TeaCache coefficients from checkpoint path; updates model_config.teacache in place."""
+        if not coefficients:
+            return
         teacache_cfg = self.model_config.teacache
-        if not teacache_cfg.enable_teacache:
+        checkpoint_path = (
+            getattr(getattr(self.model_config, "pretrained_config", None), "_name_or_path", "")
+            or ""
+        )
+        matched = False
+        for model_size, coeff_data in coefficients.items():
+            if model_size.lower() in checkpoint_path.lower():
+                matched = True
+                if isinstance(coeff_data, dict):
+                    mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
+                    if mode in coeff_data:
+                        teacache_cfg.coefficients = coeff_data[mode]
+                        logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                    default_thresh = coeff_data.get("default_thresh")
+                    if (
+                        default_thresh is not None
+                        and "teacache_thresh" not in teacache_cfg.model_fields_set
+                    ):
+                        teacache_cfg.teacache_thresh = default_thresh
+                        logger.info(
+                            f"TeaCache: Using {model_size} default threshold {default_thresh}"
+                        )
+                else:
+                    teacache_cfg.coefficients = coeff_data
+                    logger.info(f"TeaCache: Using {model_size} coefficients")
+                break
+        if not matched:
+            raise ValueError(
+                f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
+                f"Available variants: {list(coefficients.keys())}. "
+                f"TeaCache is not supported for this model variant."
+            )
+
+    def _setup_cache_acceleration(
+        self,
+        model: Optional[nn.Module] = None,
+        coefficients: Optional[Dict] = None,
+    ) -> None:
+        """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
+
+        if getattr(self, "cache_accelerator", None) is not None:
+            self.cache_accelerator.unwrap()
+            self.cache_accelerator = None
+
+        cfg = self.model_config
+
+        if cfg.cache_backend == "cache_dit":
+            acc = CacheDiTAccelerator.try_create(self, cfg.cache_dit)
+            if acc is None:
+                return
+            try:
+                acc.wrap()
+            except Exception as exc:
+                logger.error("Cache-DiT: failed to enable: %s", exc)
+                return
+            self.cache_accelerator = acc
             return
 
-        # Apply model-specific polynomial coefficients
-        # Coefficients are used to rescale embedding distances for cache decisions
-        if coefficients:
-            checkpoint_path = (
-                getattr(self.model_config.pretrained_config, "_name_or_path", "") or ""
-            )
-            for model_size, coeff_data in coefficients.items():
-                # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")
-                if model_size.lower() in checkpoint_path.lower():
-                    if isinstance(coeff_data, dict):
-                        # Select coefficient set based on warmup mode
-                        mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
-                        if mode in coeff_data:
-                            teacache_cfg.coefficients = coeff_data[mode]
-                            logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
-                        # Apply model-specific default threshold if user didn't explicitly set one
-                        default_thresh = coeff_data.get("default_thresh")
-                        if (
-                            default_thresh is not None
-                            and "teacache_thresh" not in teacache_cfg.model_fields_set
-                        ):
-                            teacache_cfg.teacache_thresh = default_thresh
-                            logger.info(
-                                f"TeaCache: Using {model_size} default threshold {default_thresh}"
-                            )
-                    else:
-                        # Single coefficient list (no mode distinction)
-                        teacache_cfg.coefficients = coeff_data
-                        logger.info(f"TeaCache: Using {model_size} coefficients")
-                    break
-            else:
-                raise ValueError(
-                    f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
-                    f"Available variants: {list(coefficients.keys())}. "
-                    f"TeaCache is not supported for this model variant."
-                )
+        use_teacache = cfg.cache_backend == "teacache"
+        if not use_teacache:
+            return
 
-        # Initialize and enable TeaCache backend
-        logger.info("TeaCache: Initializing...")
-        self.cache_backend = TeaCacheBackend(teacache_cfg)
-        self.cache_backend.enable(model)
+        if coefficients is not None:
+            BasePipeline._apply_teacache_coefficients(self, coefficients)
+
+        if model is None:
+            return
+
+        acc = TeaCacheAccelerator(cfg.teacache)
+        acc.wrap(model=model)
+        if acc.is_enabled():
+            self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
         if not self.model_config.parallel.enable_parallel_vae:
@@ -786,14 +807,9 @@ class BasePipeline(nn.Module):
         total_steps = len(timesteps)
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
 
-        # Reset TeaCache state for new generation
-        # Sets warmup/cutoff steps based on total_steps
-        if (
-            hasattr(self, "cache_backend")
-            and self.cache_backend
-            and self.cache_backend.is_enabled()
-        ):
-            self.cache_backend.refresh(total_steps)
+        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
+        if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+            self.cache_accelerator.refresh(total_steps)
 
         if self.rank == 0:
             if has_extra_streams:
@@ -885,18 +901,19 @@ class BasePipeline(nn.Module):
             logger.info("=" * 80)
             logger.info(f"Denoising done: {total_time:.2f}s ({total_time / total_steps:.2f}s/step)")
 
-            # Log TeaCache performance statistics
-            # Shows how many transformer steps were skipped (cache hits) vs computed
-            if (
-                hasattr(self, "cache_backend")
-                and self.cache_backend
-                and self.cache_backend.is_enabled()
-            ):
-                stats = self.cache_backend.get_stats()
+            # Single logging site for TeaCache and Cache-DiT.
+            if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+                stats = self.cache_accelerator.get_stats()
                 if stats:
-                    logger.info(
-                        f"TeaCache: {stats['hit_rate']:.1%} hit rate ({stats['cached']}/{stats['total']} steps)"
-                    )
+                    if self.model_config.cache_backend == "cache_dit":
+                        logger.info("Cache-DiT stats: %s", stats)
+                    elif "hit_rate" in stats:
+                        logger.info(
+                            f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                            f"({stats['cached']}/{stats['total']} steps)"
+                        )
+                    else:
+                        logger.info("Cache acceleration stats: %s", stats)
 
         return (latents, extra_stream_latents) if has_extra_streams else latents
 
