@@ -879,8 +879,15 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4ConditionalOutput:
-        # Forward all kwargs (including token_type_ids from extra_args) to the
-        # exported CausalLM which includes lm_head + softcapping.
+        # Ensure token_type_ids is always present for the custom attention mask.
+        # Text-only / decode / warmup steps won't have it in named_args.
+        if "token_type_ids" not in kwargs:
+            ref = input_ids if input_ids is not None else inputs_embeds
+            if ref is not None:
+                kwargs["token_type_ids"] = torch.zeros(
+                    ref.shape[0], ref.shape[1], dtype=torch.int64, device=ref.device
+                )
+
         outputs = self.model.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
