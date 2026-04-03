@@ -142,6 +142,7 @@ class _InsertCachedOperator(BaseTransform):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
+        dynamic_inputs: List[Optional[Node]],
         constants: List[Constant],
     ):
         """Insert a cached attention node into the graph."""
@@ -153,6 +154,7 @@ class _InsertCachedOperator(BaseTransform):
                     *meta_nodes_std,
                     *meta_nodes_extra,
                     *cache_nodes,
+                    *dynamic_inputs,
                     *constants,
                 ),
             )
@@ -235,6 +237,7 @@ class _InsertCachedOperator(BaseTransform):
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
 
             # retrieve constants for attention_op
+            dynamic_inputs = attn_descriptor.get_dynamic_inputs(attn_node)
             constants = attn_descriptor.get_constants(attn_node)
 
             # insert cached attention replacement op
@@ -246,6 +249,7 @@ class _InsertCachedOperator(BaseTransform):
                 meta_nodes_std,
                 meta_nodes_extra,
                 cache_in_nodes,
+                dynamic_inputs,
                 constants,
             )
 
