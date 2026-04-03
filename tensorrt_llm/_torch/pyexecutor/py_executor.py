@@ -468,7 +468,7 @@ class PyExecutor:
         # Token-bucket error budget: starts at 1.0, each error deducts a
         # cost (0.1 for transient, 0.5 for severe), and the budget recovers
         # at 0.1 per second of error-free wall time.  When the budget drops
-        # below zero the error is promoted to fatal.  Immediate-fatal errors
+        # below a near-zero threshold the error is promoted to fatal.  Immediate-fatal errors
         # (corrupted CUDA context) bypass the budget entirely.
         self._error_budget: float = 1.0
         self._last_error_time: Optional[float] = None

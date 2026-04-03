@@ -23,6 +23,7 @@ so that it can be imported and tested in any environment.
 IMMEDIATE_FATAL_PATTERNS: list[str] = [
     "cudaerrorillegaladdress",
     "cudaerrorlaunchfailure",
+    "illegal memory access",
     "device-side assert",
     "unrecoverable",
 ]

@@ -126,8 +126,9 @@ class ConcreteExecutor:
             try:
                 e = self._error_queue.get_nowait()
                 self._error_queue.task_done()
-                self._set_fatal_error(e)
-                self.doing_shutdown = True
+                if not isinstance(e, str):
+                    self._set_fatal_error(e)
+                    self.doing_shutdown = True
             except Exception:
                 pass
             return self._fatal_error is None and not self.doing_shutdown
@@ -220,8 +221,9 @@ class TestClassifyError:
             ("cudaErrorLaunchFailure: unspecified failure", "immediate_fatal"),
             ("RuntimeError: device-side assert triggered", "immediate_fatal"),
             ("Unrecoverable error in the engine", "immediate_fatal"),
+            ("CUDA error: an illegal memory access was encountered", "immediate_fatal"),
             ("CUDA out of memory. Tried to allocate 2 GiB", "severe"),
-            ("RuntimeError: CUDA error: illegal memory access", "severe"),
+            ("RuntimeError: CUDA error: out of memory", "severe"),
             ("NCCL error: unhandled system error", "severe"),
             ("Input length exceeds maximum", "transient"),
             ("Request timed out", "transient"),
@@ -468,7 +470,9 @@ class TestGrpcHealthCheck:
                 if not self.llm._executor.check_health():
                     error_msg = "Executor is unhealthy"
                     if self.llm._executor._fatal_error is not None:
-                        error_msg = f"Fatal error: {self.llm._executor._fatal_error}"
+                        exc = self.llm._executor._fatal_error
+                        short = str(exc).splitlines()[0][:200]
+                        error_msg = f"{type(exc).__name__}: {short}"
                     return False, error_msg
             return True, "OK"
         except Exception as e:
