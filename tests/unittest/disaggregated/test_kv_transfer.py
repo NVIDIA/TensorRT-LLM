@@ -126,11 +126,12 @@ def test_session_status_enum():
         "KV_TRANSFERRED",
         "FULLY_TRANSFERRED",
         "ERROR",
+        "CANCELLED",
     ]
     for name in expected:
         assert hasattr(SessionStatus, name)
         assert SessionStatus[name].value == name
-    assert len(SessionStatus) == 6
+    assert len(SessionStatus) == 7
 
 
 def create_transfer_worker_setup(
@@ -1045,6 +1046,269 @@ def test_transfer_worker_v2_with_window(
             worker.shutdown()
         for worker in setup["gen_transfer_workers"]:
             worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_cancel_before_send():
+    """TxSession/RxSession cancelled before any transfer starts."""
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+    ctx_request = LlmRequest(
+        request_id=100,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    gen_request = LlmRequest(
+        request_id=101,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    try:
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        assert tx_session.status == SessionStatus.INIT
+        assert not tx_session.has_failed()
+
+        tx_session.cancel()
+        assert tx_session.status == SessionStatus.CANCELLED
+        assert tx_session.has_failed()
+        assert not tx_session.is_completed()
+        tx_session.close()
+
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        assert rx_session.status == SessionStatus.INIT
+        assert not rx_session.has_failed()
+
+        rx_session.cancel()
+        assert rx_session.status == SessionStatus.CANCELLED
+        assert rx_session.has_failed()
+        assert not rx_session.is_completed()
+        rx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        gen_transfer_worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_cancel_after_send():
+    """TxSession cancelled after send() queues INIT tasks; future raises."""
+    tensorrt_llm.logger.set_level("debug")
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    ctx_kv_cache_manager = setup["ctx_kv_cache_managers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+    ctx_request = LlmRequest(
+        request_id=200,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+    ctx_kv_cache_manager.impl.add_sequence(
+        ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
+    )
+
+    try:
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        block_ids_per_groups = get_block_ids_per_layer_groups(
+            ctx_kv_cache_manager,
+            ctx_transfer_worker,
+            ctx_request.py_request_id,
+            use_v2=False,
+            tokens_per_block=setup["tokens_per_block"],
+        )
+        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        future = tx_session.send(kv_slice)
+
+        # No receiver registered yet; task is INIT.
+        tx_session.cancel()
+
+        assert tx_session.status == SessionStatus.CANCELLED
+        assert tx_session.has_failed()
+        # Future for the cancelled INIT task must raise.
+        with pytest.raises(Exception):
+            future.result(timeout=5.0)
+        tx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_cancel_twice():
+    """cancel() called twice must be a no-op on the second call."""
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+    ctx_request = LlmRequest(
+        request_id=300,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    gen_request = LlmRequest(
+        request_id=301,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    try:
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        tx_session.cancel()
+        tx_session.cancel()  # Second call must be a no-op
+        assert tx_session.status == SessionStatus.CANCELLED
+        assert not tx_session.has_transferring_tasks()
+        tx_session.close()
+
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        rx_session.cancel()
+        rx_session.cancel()  # Second call must be a no-op
+        assert rx_session.status == SessionStatus.CANCELLED
+        assert not rx_session.has_transferring_tasks()
+        rx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        gen_transfer_worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_has_transferring_tasks_false():
+    """has_transferring_tasks() returns False when no tasks or tasks are INIT."""
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    ctx_kv_cache_manager = setup["ctx_kv_cache_managers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+    gen_kv_cache_manager = setup["gen_kv_cache_managers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+
+    ctx_request = LlmRequest(
+        request_id=400,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+    ctx_kv_cache_manager.impl.add_sequence(
+        ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
+    )
+
+    gen_request = LlmRequest(
+        request_id=401,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        disagg_request_id=unique_rid,
+        ctx_request_id=ctx_request.py_request_id,
+        schedule_style=1,
+    )
+    gen_kv_cache_manager.impl.add_sequence(
+        gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
+    )
+
+    try:
+        # TxSession: no tasks yet
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        assert not tx_session.has_transferring_tasks()
+
+        # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
+        block_ids_per_groups = get_block_ids_per_layer_groups(
+            ctx_kv_cache_manager,
+            ctx_transfer_worker,
+            ctx_request.py_request_id,
+            use_v2=False,
+            tokens_per_block=setup["tokens_per_block"],
+        )
+        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        tx_session.send(kv_slice)
+        assert not tx_session.has_transferring_tasks()
+        tx_session.close()
+
+        # RxSession: no tasks yet
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        assert not rx_session.has_transferring_tasks()
+        rx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        gen_transfer_worker.shutdown()
 
 
 if __name__ == "__main__":
